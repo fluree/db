@@ -11,6 +11,7 @@
 //! Only INSERT/DELETE templates are parsed here, which generate flakes rather
 //! than match patterns.
 
+use super::edge_annotations::{lower_expanded, Clause, Lowering};
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
 use crate::ir::{
@@ -34,6 +35,7 @@ use fluree_vocab::{
     rdf_names,
 };
 use serde_json::Value;
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -147,27 +149,15 @@ fn parse_rooted(
     read_body_constraints(json, &mut opts)?;
     refuse_query_only_opts(json)?;
 
-    // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
-    // `f:reifies*` system encoding before JSON-LD expansion, rejecting
-    // user-authored `f:reifies*` IRIs and every deferred shape (literal-
-    // valued annotations, multi-triple reifiers, annotation-of-annotation).
-    //
-    // The firewall always runs on the *original* document (read-only) — it
-    // is the security guard against user-authored system IRIs, so it must
-    // not be gated. Only the mutating lowering passes need the payload
-    // clone, and only when an `@annotation` / `@edge` / `@reifies` block is
-    // actually present: a large non-annotated transaction then skips the
-    // clone and both rewrite walks entirely.
     // The document's top-level context, read once: every stage below
     // resolves against it, and the expander does not apply it again.
     let root = top_context(json)
         .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?;
 
-    // Reserved predicates are refused in what the user wrote, by the IRIs
-    // the parser resolves. An annotated document is checked as written,
-    // since the lowering adds statements of its own; any other is checked on
-    // the expansion the parser makes anyway. An update's `where` and
-    // `values` get the check a query's clauses get.
+    // Each clause is expanded once. Reserved predicates are refused in that
+    // expansion, which is the document as written, by the IRIs the parser
+    // writes; then the annotations in it are lowered, from the same IRIs. An
+    // update's `where` and `values` get the check a query's clauses get.
     let annotated = super::edge_annotations::document_has_annotation_keys(json);
     if matches!(txn_type, TxnType::Update) {
         for clause in ["where", "values"] {
@@ -177,60 +167,20 @@ fn parse_rooted(
             }
         }
     }
-
-    // Two-pass lowering for UPDATE transactions:
-    //
-    // 1. The delete-clause pre-pass rewrites `@annotation` blocks inside
-    //    `delete:` into explicit `f:reifies*` retract templates so the
-    //    assertion-shaped lowering below doesn't synthesize spurious
-    //    sibling nodes. Insert / Upsert paths skip it — their docs carry no
-    //    `delete` key, so it would be a structural no-op anyway.
-    // 2. The standard assertion-shaped lowering rewrites the rest. Both
-    //    passes synthesize `f:reifies*` IRIs internally, which is why the
-    //    firewall ran first on the un-rewritten input.
-    let lowered = if annotated {
-        let mut lowered = json.clone();
-        if matches!(txn_type, TxnType::Update) {
-            super::edge_annotations::lower_delete_annotation_blocks(&mut lowered, &root)?;
-        }
-        super::edge_annotations::lower_edge_annotations_after_firewall(
-            &mut lowered,
-            &root,
-            lpg_mode,
-        )?;
-        // After the lowering, which refuses some documents for a reason of
-        // its own; the check reads the document as written.
-        let update = matches!(txn_type, TxnType::Update);
-        let data = if update {
-            std::borrow::Cow::Borrowed(json)
-        } else {
-            strip_opts_for_expansion(json, &root)?
-        };
-        super::edge_annotations::refuse_reserved_iris_in_document(&data, &root, update)?;
-        std::borrow::Cow::Owned(lowered)
-    } else {
-        std::borrow::Cow::Borrowed(json)
-    };
+    let pass = ExpandedPass::for_document(annotated, lpg_mode);
 
     let mut txn = match txn_type {
         TxnType::Insert | TxnType::Upsert => parse_data(
-            &lowered,
+            json,
             &root,
-            ExpandedPass::for_document(annotated),
+            pass,
             txn_type,
             opts,
             ns_registry,
             ledger_id,
             request_graph,
         )?,
-        TxnType::Update => parse_update(
-            &lowered,
-            &root,
-            ExpandedPass::for_document(annotated),
-            opts,
-            ns_registry,
-            ledger_id,
-        )?,
+        TxnType::Update => parse_update(json, &root, pass, opts, ns_registry, ledger_id)?,
     };
     if annotated {
         refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
@@ -468,7 +418,12 @@ fn parse_data(
     // Strip top-level `opts` so it is not expanded as data (single-object form)
     let json_for_expand = strip_opts_for_expansion(json, context)?;
     let mut expanded = expand_with_root_context(&json_for_expand, context, strict)?;
-    pass.apply(&mut expanded)?;
+    let mut lowering = pass.lowering(0);
+    check_and_lower(
+        &mut expanded,
+        lowering.as_mut().map(|l| (Clause::Assert, l)),
+        None,
+    )?;
 
     let no_aliases = HashMap::new();
     let mut blanks = BlankIssuer::default();
@@ -582,14 +537,14 @@ fn parse_update(
 
     let has_where = obj.get("where").is_some();
     let has_values = obj.get("values").is_some();
-    let allow_object_vars = has_where || has_values;
-    let object_var_parsing = allow_object_vars && opts.object_var_parsing.unwrap_or(true);
+    let reads_object_vars = opts.object_var_parsing.unwrap_or(true);
+    let mut object_var_parsing = (has_where || has_values) && reads_object_vars;
 
     // The template clauses and VALUES share one blank-node issuer; they are
     // parsed a second time only when a user `_:bN` label collided with an
     // anonymous node's (see `BlankIssuer`).
     let mut blanks = BlankIssuer::default();
-    let clauses = loop {
+    let mut clauses = loop {
         let clauses = parse_update_clauses(
             obj,
             context,
@@ -601,10 +556,21 @@ fn parse_update(
             ledger_id,
             &mut blanks,
         )?;
+        // A retraction by selector binds its annotations in a `where`: the
+        // update is one with a `where`, and reads its object variables so.
+        if !object_var_parsing && reads_object_vars && !clauses.where_patterns.is_empty() {
+            object_var_parsing = true;
+            blanks = BlankIssuer::default();
+            continue;
+        }
         if !blanks.needs_reparse()? {
             break clauses;
         }
     };
+    let where_val = with_patterns(
+        obj.get("where"),
+        std::mem::take(&mut clauses.where_patterns),
+    );
 
     let where_default_graph_iris =
         parse_update_where_default_graph_iris(obj.get("from"), context, &from_named_aliases)?
@@ -618,39 +584,40 @@ fn parse_update(
     // This reuses full pattern support (OPTIONAL, UNION, FILTER, etc.)
     // Variables remain as strings in UnresolvedPattern; they'll be assigned VarIds
     // during lowering in stage.rs using the same VarRegistry as INSERT/DELETE.
-    let (where_patterns, reads_ledger_default_by_name) = if let Some(where_val) = obj.get("where") {
-        let mut query = UnresolvedQuery::new(context.clone());
-        let mut subject_counter: u32 = 0;
-        let mut nested_counter: u32 = 0;
-        let parse_policy = JsonLdParsePolicy {
-            strict_compact_iri: strict,
-        };
-        // Graph names in the WHERE resolve as in the templates: this ledger's
-        // keywords, the same `fromNamed` aliases, and `default` for the
-        // ledger's default graph. A `["graph", …]` name the update's
-        // `fromNamed` spells is that alias, even where it reads as a compact
-        // IRI; any other compact IRI expands.
-        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
-            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
-                ledger_id: Some(ledger_id.to_string()),
-                aliases: from_named_aliases.clone(),
-                default_by_name,
-            })
-            .with_dataset_names(from_named_aliases.keys().cloned().collect());
-        parse_where_with_counters(
-            where_val,
-            &ctx,
-            &mut query,
-            &mut subject_counter,
-            &mut nested_counter,
-            object_var_parsing,
-        )
-        .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
+    let (where_patterns, reads_ledger_default_by_name) =
+        if let Some(where_val) = where_val.as_deref() {
+            let mut query = UnresolvedQuery::new(context.clone());
+            let mut subject_counter: u32 = 0;
+            let mut nested_counter: u32 = 0;
+            let parse_policy = JsonLdParsePolicy {
+                strict_compact_iri: strict,
+            };
+            // Graph names in the WHERE resolve as in the templates: this ledger's
+            // keywords, the same `fromNamed` aliases, and `default` for the
+            // ledger's default graph. A `["graph", …]` name the update's
+            // `fromNamed` spells is that alias, even where it reads as a compact
+            // IRI; any other compact IRI expands.
+            let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
+                .with_graph_names(fluree_db_query::parse::GraphNameEnv {
+                    ledger_id: Some(ledger_id.to_string()),
+                    aliases: from_named_aliases.clone(),
+                    default_by_name,
+                })
+                .with_dataset_names(from_named_aliases.keys().cloned().collect());
+            parse_where_with_counters(
+                where_val,
+                &ctx,
+                &mut query,
+                &mut subject_counter,
+                &mut nested_counter,
+                object_var_parsing,
+            )
+            .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
 
-        (query.patterns, ctx.reads_ledger_default())
-    } else {
-        (Vec::new(), false)
-    };
+            (query.patterns, ctx.reads_ledger_default())
+        } else {
+            (Vec::new(), false)
+        };
 
     let mut txn = Txn::update()
         .with_wheres(where_patterns)
@@ -667,6 +634,20 @@ fn parse_update(
         txn = txn.with_values(values);
     }
     Ok(txn)
+}
+
+/// An update's `where` with `patterns` (a retraction's, by selector) after
+/// its own.
+fn with_patterns(where_val: Option<&Value>, patterns: Vec<Value>) -> Option<Cow<'_, Value>> {
+    if patterns.is_empty() {
+        return where_val.map(Cow::Borrowed);
+    }
+    let items = match where_val {
+        None => patterns,
+        Some(Value::Array(items)) => items.iter().cloned().chain(patterns).collect(),
+        Some(other) => std::iter::once(other.clone()).chain(patterns).collect(),
+    };
+    Some(Cow::Owned(Value::Array(items)))
 }
 
 /// Whether an update's WHERE, reading `iris` as its default graph (empty:
@@ -698,6 +679,8 @@ struct UpdateClauses {
     delete: Vec<TripleTemplate>,
     insert: Vec<TripleTemplate>,
     values: Option<InlineValues>,
+    /// The `where` patterns the delete's retractions by selector bind with.
+    where_patterns: Vec<Value>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -714,6 +697,7 @@ fn parse_update_clauses(
 ) -> Result<UpdateClauses> {
     let mut vars = VarRegistry::new();
     let mut write_graphs = WriteGraphs::new();
+    let mut lowering = pass.lowering(super::edge_annotations::next_synth_var_index(obj));
 
     // Optional transaction-level default graph (SPARQL `WITH`): the root scope
     // of both template clauses, and the WHERE's default graph unless `from`
@@ -771,7 +755,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
-        ctx.pass = pass;
+        ctx.lowering = lowering.as_mut().map(|l| (Clause::Retract, l));
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -818,7 +802,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
-        ctx.pass = pass;
+        ctx.lowering = lowering.as_mut().map(|l| (Clause::Assert, l));
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
             // As with delete: `"insert": []` is a no-op, an empty node is not.
@@ -855,6 +839,9 @@ fn parse_update_clauses(
         delete,
         insert,
         values,
+        where_patterns: lowering
+            .map(Lowering::into_where_patterns)
+            .unwrap_or_default(),
     })
 }
 
@@ -1168,36 +1155,49 @@ pub(crate) enum GraphRole {
     UpdateDefault,
 }
 
-/// What a document's expansion goes through before its statements are built.
-#[derive(Clone, Copy, Debug, Default)]
+/// What a clause's expansion goes through before its statements are built:
+/// reserved predicates are refused in what the user wrote, and then, in a
+/// document with annotations, the annotations are lowered.
+#[derive(Clone, Copy, Debug)]
 enum ExpandedPass {
-    #[default]
-    None,
-    /// The document as written: refuse reserved predicates in it.
-    RefuseReserved,
-    /// The annotation lowering's output, already checked as written:
-    /// resolve the predicate slots the lowering wrote.
-    ResolvePredicateSlots,
+    Check,
+    /// [`Self::Check`], then the lowering (`lpg_mode`: `opts.lpgEdgeLifecycle`).
+    CheckAndLower {
+        lpg_mode: bool,
+    },
 }
 
 impl ExpandedPass {
-    fn for_document(annotated: bool) -> Self {
+    fn for_document(annotated: bool, lpg_mode: bool) -> Self {
         if annotated {
-            Self::ResolvePredicateSlots
+            Self::CheckAndLower { lpg_mode }
         } else {
-            Self::RefuseReserved
+            Self::Check
         }
     }
 
-    fn apply(self, expanded: &mut Value) -> Result<()> {
+    /// The lowering this pass runs, its retractions' variables numbered from
+    /// `first_var`.
+    fn lowering(self, first_var: u32) -> Option<Lowering> {
         match self {
-            Self::None => Ok(()),
-            Self::RefuseReserved => super::edge_annotations::refuse_reserved_iris(expanded),
-            Self::ResolvePredicateSlots => {
-                super::edge_annotations::resolve_predicate_slots(expanded);
-                Ok(())
-            }
+            Self::Check => None,
+            Self::CheckAndLower { lpg_mode } => Some(Lowering::new(lpg_mode, first_var)),
         }
+    }
+}
+
+/// Refuse reserved predicates in `expanded`, a clause as written, then lower
+/// its annotations as the clause `lowering` names, when there is one. `graph`
+/// is the graph the clause is written in.
+fn check_and_lower(
+    expanded: &mut Value,
+    lowering: Option<(Clause, &mut Lowering)>,
+    graph: Option<&str>,
+) -> Result<()> {
+    super::edge_annotations::refuse_reserved_iris(expanded)?;
+    match lowering {
+        Some((clause, lowering)) => lower_expanded(expanded, clause, graph, lowering),
+        None => Ok(()),
     }
 }
 
@@ -1218,9 +1218,9 @@ struct TemplateParseCtx<'a> {
     fixed_root: Option<GraphScope>,
     /// The document's anonymous-node labels.
     blanks: &'a mut BlankIssuer,
-    /// What this clause's expansion goes through before its templates are
-    /// built.
-    pass: ExpandedPass,
+    /// The lowering this clause's annotations go through, as the clause
+    /// they are in.
+    lowering: Option<(Clause, &'a mut Lowering)>,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -1249,14 +1249,17 @@ impl<'a> TemplateParseCtx<'a> {
             role,
             fixed_root: None,
             blanks,
-            pass: ExpandedPass::None,
+            lowering: None,
         }
     }
 
-    /// Expand a JSON-LD document, respecting strict policy.
-    fn expand_document(&self, json: &Value) -> std::result::Result<Value, TransactError> {
+    /// Expand a clause, respecting strict policy, then check it and lower its
+    /// annotations ([`check_and_lower`]). `graph` is the graph it is written
+    /// in.
+    fn expand_document(&mut self, json: &Value, graph: Option<&str>) -> Result<Value> {
         let mut expanded = expand_with_context_policy(json, self.context, self.strict_compact_iri)?;
-        self.pass.apply(&mut expanded)?;
+        let lowering = self.lowering.as_mut().map(|(c, l)| (*c, &mut **l));
+        check_and_lower(&mut expanded, lowering, graph)?;
         Ok(expanded)
     }
 
@@ -1444,20 +1447,20 @@ fn parse_update_templates_with_ctx(
                     ));
                 };
                 let scope = ctx.selector_scope(raw)?;
-                let expanded = ctx.expand_document(pattern)?;
+                let expanded = ctx.expand_document(pattern, Some(raw))?;
                 parse_expanded_nodes(&expanded, &scope, ctx, &mut out)?;
                 continue;
             }
             plain_items.push(item.clone());
         }
         if !plain_items.is_empty() {
-            let expanded = ctx.expand_document(&Value::Array(plain_items))?;
+            let expanded = ctx.expand_document(&Value::Array(plain_items), None)?;
             parse_expanded_nodes(&expanded, root, ctx, &mut out)?;
         }
         return Ok(out);
     }
 
-    let expanded = ctx.expand_document(val)?;
+    let expanded = ctx.expand_document(val, None)?;
     parse_expanded_nodes(&expanded, root, ctx, &mut out)?;
     Ok(out)
 }
@@ -2950,7 +2953,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2976,7 +2979,7 @@ mod tests {
         let err = parse_update(
             &cypher_envelope,
             &top_context(&cypher_envelope).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2995,7 +2998,7 @@ mod tests {
         let err = parse_update(
             &where_only,
             &top_context(&where_only).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3014,7 +3017,7 @@ mod tests {
         let txn = parse_update(
             &explicit_empty_delete,
             &top_context(&explicit_empty_delete).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3043,7 +3046,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3075,7 +3078,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3107,7 +3110,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            ExpandedPass::RefuseReserved,
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -5369,46 +5372,72 @@ mod tests {
         }
     }
 
-    /// A key defined in a property-scoped context names the edge's predicate
-    /// in its annotation's link as it does in the edge: the slot is resolved
-    /// where the parser resolves the key, not against the document's top
-    /// context.
+    /// A key a scoped context defines names the edge's predicate in its
+    /// annotation's link as it does in the edge: the link takes the IRI the
+    /// expander resolved the key to, by a property-scoped context or by the
+    /// subject's type-scoped one (which the nodes the subject holds, the
+    /// annotation among them, do not see), in an insert and in a delete.
     #[test]
     fn an_annotation_links_a_scoped_term_as_its_edge_names_it() {
-        let doc = json!({
+        let annotated = |ann: Value| json!({"@id": "http://example.org/o", "@annotation": ann});
+        let label = json!({"http://example.org/label": "a"});
+        let property_scoped = json!({
             "@context": {
                 "@vocab": "http://outer.example/",
                 "child": {"@id": "http://example.org/child", "@context": {"p": "http://inner.example/p"}}
             },
             "@id": "http://example.org/parent",
-            "child": {"@id": "http://example.org/s", "p": {
-                "@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}}}
+            "child": {"@id": "http://example.org/s", "p": annotated(label.clone())}
         });
-        let mut ns = test_registry();
-        let txn = parse_transaction(
-            &doc,
-            TxnType::Insert,
-            TxnOpts::default(),
-            &mut ns,
-            TEST_LEDGER,
-        )
-        .unwrap();
-        let expected = ns.sid_for_iri("http://inner.example/p");
-        let link = txn
-            .insert_templates
-            .iter()
-            .find_map(|t| match &t.object {
-                TemplateTerm::TripleTerm(term) => match &term.p {
-                    TemplateTerm::Sid(p) => Some(p.clone()),
-                    _ => None,
-                },
-                _ => None,
+        let type_scoped = |ann: Value| {
+            json!({
+                "@id": "http://example.org/s",
+                "@type": "Emp",
+                "p": annotated(ann)
             })
-            .expect("a link");
-        assert_eq!(link, expected);
-        assert!(txn
-            .insert_templates
-            .iter()
-            .any(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == expected)));
+        };
+        let context = json!({
+            "@vocab": "http://outer.example/",
+            "Emp": {"@id": "http://example.org/Emp", "@context": {"p": "http://inner.example/p"}}
+        });
+        let mut type_scoped_insert = type_scoped(label);
+        type_scoped_insert["@context"] = context.clone();
+        let type_scoped_delete = json!({
+            "@context": context,
+            "delete": type_scoped(json!({"@id": "http://example.org/ann"}))
+        });
+        for (doc, txn_type) in [
+            (property_scoped, TxnType::Insert),
+            (type_scoped_insert, TxnType::Insert),
+            (type_scoped_delete, TxnType::Update),
+        ] {
+            let mut ns = test_registry();
+            let txn = parse_transaction(&doc, txn_type, TxnOpts::default(), &mut ns, TEST_LEDGER)
+                .unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let expected = ns.sid_for_iri("http://inner.example/p");
+            let templates = match txn_type {
+                TxnType::Update => &txn.delete_templates,
+                _ => &txn.insert_templates,
+            };
+            let link = templates
+                .iter()
+                .find_map(|t| match &t.object {
+                    TemplateTerm::TripleTerm(term) => match &term.p {
+                        TemplateTerm::Sid(p) => Some(p.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a link: {doc}"));
+            assert_eq!(link, expected, "{doc}");
+            if txn_type == TxnType::Insert {
+                assert!(
+                    templates
+                        .iter()
+                        .any(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == expected)),
+                    "{doc}"
+                );
+            }
+        }
     }
 }

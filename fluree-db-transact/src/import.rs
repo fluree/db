@@ -1564,35 +1564,35 @@ mod inner {
             }
         };
 
-        // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
-        // `f:reifies*` encoding before expansion, exactly as the transact path
-        // does — otherwise the JSON-LD expander silently drops them and a bulk
-        // import loses every edge property. RDF mode (lpg_mode=false): a
-        // non-empty `@annotation` lowers to a reifier bundle; the CSV/LPG
-        // loader never emits an empty `@annotation: {}`.
+        // Every expansion below is the file as written: reserved predicates
+        // are refused in it, by the IRIs the expander resolves, and then its
+        // edge annotations (`@annotation` / `@edge` / `@reifies`, `@ttl` /
+        // `@expiresAt`) are lowered into the `f:reifies*` slots the sink turns
+        // into links, exactly as the transact path does — otherwise a bulk
+        // import loses every edge property. RDF mode: a non-empty
+        // `@annotation` lowers to a reifier; the CSV/LPG loader never emits
+        // an empty `@annotation: {}`. One lowering serves the chunk, so the
+        // nodes it mints are distinct across its lines.
         //
         // The lowering is gated on a cheap presence check so the common
-        // (non-annotated) bulk import pays nothing. Reserved predicates are
-        // refused in what the file wrote, by the IRIs the expander resolves:
-        // an annotated document's here, before the lowering adds statements
-        // of its own, and any other's on the expansion below.
+        // (non-annotated) bulk import pays nothing for it.
         let needs_lowering = jsonld.contains("@annotation")
             || jsonld.contains("@edge")
             || jsonld.contains("@reifies")
             || jsonld.contains("@ttl")
             || jsonld.contains("@expiresAt");
-        if needs_lowering {
-            let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
-            crate::parse::edge_annotations::check_then_lower(&mut doc, &top_ctx, false, false)?;
-        }
-        // What each expansion goes through: the lowering's predicate slots
-        // resolved, or, for a document the lowering did not touch, the check.
-        let after_expansion = |expanded: &mut serde_json::Value| {
-            if needs_lowering {
-                crate::parse::edge_annotations::resolve_predicate_slots(expanded);
-                Ok(())
-            } else {
-                crate::parse::edge_annotations::refuse_reserved_iris(expanded)
+        let mut lowering =
+            needs_lowering.then(|| crate::parse::edge_annotations::Lowering::new(false, 0));
+        let mut after_expansion = |expanded: &mut serde_json::Value| -> Result<()> {
+            crate::parse::edge_annotations::refuse_reserved_iris(expanded)?;
+            match lowering.as_mut() {
+                Some(lowering) => crate::parse::edge_annotations::lower_expanded(
+                    expanded,
+                    crate::parse::edge_annotations::Clause::Assert,
+                    None,
+                    lowering,
+                ),
+                None => Ok(()),
             }
         };
 

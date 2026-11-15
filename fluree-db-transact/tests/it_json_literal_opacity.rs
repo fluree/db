@@ -1,12 +1,10 @@
-//! `@json` literals are opaque documents, for every walker in
-//! `parse/edge_annotations.rs`.
+//! `@json` literals are opaque documents, for the reserved-predicate check,
+//! the annotation lowering, and the scan that decides whether the lowering
+//! runs (`parse/edge_annotations.rs`).
 //!
 //! JSON-LD 1.1 defines the `@value` of a `@json` literal as a document carried
 //! verbatim — the transactor serializes the whole thing into one `rdf:JSON`
-//! flake value. Nothing inside it is a keyword this parser owns. Four walkers
-//! in that module read into documents, and the rule they need is a property of
-//! the document, not of any one of them: the first fix for this guarded a
-//! single call site, and the other three kept reading.
+//! flake value. Nothing inside it is a keyword this parser owns.
 //!
 //! These run at the lowering entry point, so each shape is one assertion
 //! rather than a ledger round-trip. The end-to-end contract (a stored rule is
@@ -40,8 +38,6 @@ fn lower(mut doc: Value) -> Result<(), String> {
 }
 
 /// The same opaque payload in the five positions a document can put it in.
-/// A fix sited at one walker's call site covers some of these and not others;
-/// which ones depends on which call site, which is the point.
 fn five_positions(type_key: &str, type_val: &str, ctx: Value) -> Vec<(&'static str, Value)> {
     let w = || wrapper(type_key, type_val);
     vec![
@@ -141,13 +137,11 @@ fn a_datatype_iri_that_expands_to_rdf_json_still_names_a_json_literal() {
 }
 
 #[test]
-fn a_deferred_keyword_in_a_non_value_sibling_is_still_refused() {
-    // Only `@value` is skipped. A sibling of the payload is ordinary JSON-LD
-    // the parser owns, so a deferred keyword nested in one is still deferred.
-    // This is what makes the skip safe to put inside the scanner and delete
-    // from the call site: the scanner distinguishes the payload from its
-    // siblings, where a wholesale "skip this wrapper" does not.
-    let doc = json!({
+fn nothing_beside_a_value_objects_payload_is_read() {
+    // A value object holds its value, datatype, language and annotation; the
+    // expander keeps nothing else of it, so a keyword in another entry is
+    // neither lowered nor written.
+    let mut doc = json!({
         "@context": {"ex": "http://example.org/"},
         "@id": "ex:r",
         "ex:rule": {
@@ -156,27 +150,21 @@ fn a_deferred_keyword_in_a_non_value_sibling_is_still_refused() {
             "ex:sibling": {"ex:inner": {"@reifies": {"@id": "ex:e"}}}
         }
     });
-    let err = lower(doc).expect_err("a nested @reifies beside the payload must stay refused");
+    lower_edge_annotations(&mut doc).expect("the sibling is not read");
+    let lowered = doc.to_string();
     assert!(
-        err.contains("@reifies"),
-        "must name the keyword found: {err}"
+        !lowered.contains("sibling") && !lowered.contains("reifies"),
+        "{lowered}"
     );
 }
 
 #[test]
 fn an_annotation_key_on_a_wrapper_is_still_refused() {
-    // The scanner checks the map's own keys before it skips the payload, so an
-    // `@annotation` **on** a wrapper is caught. These three shapes reach the
-    // wrapper without passing through `intercept_annotations_for_predicate`
-    // (which strips the supported literal-annotation form first), so the check
-    // is live rather than vestigial — the reason the scanner takes the map
-    // rather than skipping wrappers wholesale.
-    //
-    // The `@json` rows matter on their own: the first attempt at this fix
-    // scanned only the *values* of a `@json` wrapper's non-`@value` keys and
-    // never the keys themselves, so it accepted these three where `main`
-    // refuses them. Making the payload opaque must not widen what the wrapper
-    // around it may be.
+    // An `@annotation` names the statement the value it is on completes. On a
+    // value no property holds it names none, whatever the value's payload, so
+    // making the payload opaque must not widen what the wrapper around it may
+    // be. As graph content a value object is refused before that: it is not a
+    // node.
     for (name, doc) in [
         (
             "clause value",
@@ -206,20 +194,20 @@ fn an_annotation_key_on_a_wrapper_is_still_refused() {
         let err = lower(doc).expect_err(&format!(
             "{name}: an @annotation on a wrapper must be refused"
         ));
-        assert!(
-            err.contains("@annotation"),
-            "{name}: refusal must name the key it found: {err}"
-        );
+        let reason = if name.starts_with("envelope") {
+            "invalid @graph value"
+        } else {
+            "@annotation"
+        };
+        assert!(err.contains(reason), "{name}: {err}");
     }
 }
 
 #[test]
 fn the_firewall_does_not_read_into_an_opaque_payload() {
-    // Walker 1 rejects user-authored `f:reifies*` IRIs before lowering runs.
+    // The check refuses user-authored `f:reifies*` IRIs before lowering runs.
     // Inside a `@json` document there is nothing to guard: the payload is
-    // serialized whole into one literal and never becomes triples. Both of
-    // these are refused without the gate, and neither refusal is about
-    // anything the user did wrong.
+    // serialized whole into one literal and never becomes triples.
     let system_predicate_in_payload = json!({
         "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
         "@id": "ex:r",
@@ -239,10 +227,9 @@ fn the_firewall_does_not_read_into_an_opaque_payload() {
 
 #[test]
 fn the_lowering_gate_is_not_opened_by_a_keyword_inside_an_opaque_payload() {
-    // Walker 2 decides whether the mutating lowering passes run at all. A
-    // keyword that exists only inside a `@json` document is not a block those
-    // passes would rewrite, so counting it buys a document clone and two walks
-    // that find nothing.
+    // This scan decides whether the lowering runs at all. A keyword that
+    // exists only inside a `@json` document is not a block it would rewrite,
+    // so counting it buys a walk that finds nothing.
     let opaque_only = json!({
         "@id": "ex:r",
         "ex:rule": {"@type": "@json", "@value": {"@annotation": {"ex:c": 1}}}

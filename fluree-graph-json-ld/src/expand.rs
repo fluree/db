@@ -602,8 +602,21 @@ fn parse_value_object(
             obj.insert(key.to_string(), JsonValue::Array(expanded));
         }
     }
+    keep_lifetime_shorthand(map, &mut obj);
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// `@ttl` / `@expiresAt`: a transaction's shorthand for the lifetime of the
+/// value they are on, kept as written for the transaction to read.
+const LIFETIME_KEYS: [&str; 2] = ["@ttl", "@expiresAt"];
+
+fn keep_lifetime_shorthand(map: &Map<String, JsonValue>, result: &mut Map<String, JsonValue>) {
+    for key in LIFETIME_KEYS {
+        if let Some(value) = map.get(key) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 /// Whether a value object typed `type_iri` may hold an array or a map: a JSON
@@ -914,6 +927,10 @@ fn expand_node_entries(
             continue;
         }
         if k == keys.type_key || Some(k.as_str()) == keys.type_id {
+            continue;
+        }
+        if LIFETIME_KEYS.contains(&k.as_str()) {
+            result.insert(k.clone(), v.clone());
             continue;
         }
 

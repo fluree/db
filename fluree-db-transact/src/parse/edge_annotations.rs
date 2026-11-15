@@ -1,17 +1,19 @@
-//! Edge-annotation pre-expansion lowering for the JSON-LD transactor
-//! parser.
+//! Edge-annotation lowering for the JSON-LD transactor parser.
 //!
-//! Walks the raw transaction document **before** JSON-LD expansion and
-//! rewrites every `@annotation` / `@edge` / `@reifies` block into
-//! `f:reifies*` slot keys naming the annotated edge. JSON-LD has no
-//! triple-term syntax, so the slots are how the edge travels through
-//! `expand_with_context_policy` and `parse_expanded_triples_with_ctx`
-//! unchanged; [`fold_slots_into_links`] then turns each annotation's slots
-//! into its `rdf:reifies <<( s p o )>>` link, and bulk import's sink does
-//! the same. The slots are never stored.
+//! Runs on a clause's **expansion**, after [`refuse_reserved_iris`] has read
+//! it, and rewrites every `@annotation` / `@edge` / `@reifies` (and the
+//! `@ttl` / `@expiresAt` shorthand) into `f:reifies*` slots naming the
+//! annotated edge. JSON-LD has no triple-term syntax, so the slots are how the
+//! edge reaches `parse_expanded_triples_with_ctx`; [`fold_slots_into_links`]
+//! then turns each annotation's slots into its `rdf:reifies <<( s p o )>>`
+//! link, and bulk import's sink does the same. The slots are never stored.
 //!
-//! The accepted insert shape is the **inline form** (`@annotation` /
-//! `@edge` on the *object* node of a predicate):
+//! Every IRI a slot holds is one the expander resolved: the edge's predicate
+//! is the key its value is under, by whatever context (scoped ones included)
+//! resolved it, and its object is the value as the parser writes it.
+//!
+//! The **inline form** (`@annotation` / `@edge` on the value of a property)
+//! annotates the edge from the node to that value:
 //!    ```json
 //!    { "@id": "ex:alice",
 //!      "ex:worksFor": {
@@ -20,42 +22,25 @@
 //!      }
 //!    }
 //!    ```
-//! The annotation reifies the edge `(ex:alice, ex:worksFor, ex:acme)`.
-//! The annotation subject is the `@id` inside the `@annotation` block,
-//! or a freshly-minted blank node when absent. Annotated literal objects
-//! (plain, typed, and language-tagged) are supported, provided they
-//! carry an explicit `@type` / `@language` — `@context` coercion of an
-//! annotated literal is rejected (see
-//! [`reject_context_coercion_on_annotated_literal`]) so the reified
-//! `f:reifiesObject` bundle can't silently diverge from the base flake.
+//! Each annotation node reifies the edge `(ex:alice, ex:worksFor, ex:acme)`;
+//! its subject is its `@id`, or a fresh blank node. A literal value
+//! (`{"@value": ...}`) can be annotated too.
 //!
-//! The **annotation-rooted form** (`@reifies` on an enclosing node) is
-//! *not* an insert surface in v1: user-authored `@reifies` on a write is
-//! rejected as deferred by [`lower_reifies_block`]. `@reifies` is a
-//! query-side construct; the only writer that produces the
-//! `@reifies`-rooted shape is the internal delete-by-id rewrite.
+//! The **annotation-rooted form** (`@reifies` on a node) makes the node a
+//! reifier of each triple named, without asserting it.
 //!
-//! Strict deferred-shape rejection (per the contract in
-//! `docs/concepts/edge-annotations.md` "Current limits"):
+//! In an update's `delete`, an annotation retracts: by its `@id`, or, without
+//! one, every annotation of the edge whose properties match its body, through
+//! a `where` pattern the lowering adds.
 //!
-//! - User-authored `@reifies` on the insert side → error.
-//! - Multi-triple `@reifies` (more than one predicate-object pair) →
-//!   error.
-//! - Annotation-of-annotation (nested `@annotation` inside an
-//!   annotation body) → error.
-//! - Reifiers attached to triple-term values, list elements, etc. →
-//!   error.
-//!
-//! After lowering, the document additionally goes through a write-
-//! surface firewall pass that rejects any user-authored `f:reifies*`
-//! IRI (full or compact). This pre-lowering scan is run before the
-//! lowering itself, so the firewall doesn't block the IRIs that this
-//! module emits.
+//! Deferred shapes are refused (see `docs/concepts/edge-annotations.md`
+//! "Current limits"): annotation-of-annotation, an annotation on a `@list`,
+//! `@set` or `@reverse` value, and annotation keywords inside a list or a
+//! triple term.
 
 use crate::error::{Result, TransactError};
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, expand_with_root_context, is_graph_key,
-    parse_context, GraphValue, ParsedContext, TypeValue,
+    expand_with_context_policy, expand_with_root_context, parse_context, ParsedContext,
 };
 use fluree_vocab::{rdf, reifies_iris};
 use serde_json::{json, Map, Value};
@@ -86,7 +71,7 @@ fn is_ttl_key(key: &str) -> bool {
 fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
     let ttl = map.remove(TTL_KEY);
     let expires = map.remove(EXPIRES_AT_KEY);
-    let instruction = match (ttl, expires) {
+    let (instruction, value) = match (ttl, expires) {
         (None, None) => return Ok(()),
         (Some(_), Some(_)) => {
             return Err(TransactError::Parse(
@@ -96,7 +81,10 @@ fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
         (Some(ttl), None) => {
             let seconds = crate::ttl_input::ttl_seconds_from_json(&ttl)
                 .map_err(|e| TransactError::Parse(format!("@ttl: {e}")))?;
-            (fluree_vocab::retention_iris::TTL, json!(seconds))
+            (
+                fluree_vocab::retention_iris::TTL,
+                json!({ "@value": seconds }),
+            )
         }
         (None, Some(expires)) => {
             let Value::String(text) = &expires else {
@@ -120,40 +108,35 @@ fn fold_ttl_shorthand(map: &mut Map<String, Value>) -> Result<()> {
     } else {
         ANNOTATION_KEY
     };
-    let block = map.entry(key).or_insert_with(|| Value::Object(Map::new()));
-    let Value::Object(block) = block else {
+    let blocks = map.entry(key).or_insert_with(|| json!([{}]));
+    let Some([Value::Object(block)]) = blocks.as_array_mut().map(Vec::as_mut_slice) else {
         return Err(TransactError::Parse(
-            "@ttl / @expiresAt need an @annotation that is an object".to_string(),
+            "@ttl / @expiresAt need one @annotation, an object".to_string(),
         ));
     };
-    for spelled in [
-        "f:ttl",
-        "f:expiresAt",
+    for iri in [
         fluree_vocab::retention_iris::TTL,
         fluree_vocab::retention_iris::EXPIRES_AT,
     ] {
-        if block.contains_key(spelled) {
+        if block.contains_key(iri) {
             return Err(TransactError::Parse(format!(
-                "a value takes one TTL instruction: @ttl / @expiresAt or {spelled} in its \
+                "a value takes one TTL instruction: @ttl / @expiresAt or {iri} in its \
                  @annotation, not both"
             )));
         }
     }
-    block.insert(instruction.0.to_string(), instruction.1);
+    block.insert(instruction.to_string(), json!([value]));
     Ok(())
 }
 
 /// Classification of the object position on a reified base edge. Drives
-/// every site that produces an `f:reifies*` bundle (insert sibling,
-/// delete template, delete-by-selector WHERE), so that all writers mint
-/// the same `EdgeKey` for the same logical edge.
-///
-/// Constructed via [`classify_reified_object`] after `@annotation` /
-/// `@edge` have been removed from the object map.
+/// every site that produces an `f:reifies*` bundle (an annotation, a
+/// retraction, a `@reifies` triple), so that all writers mint the same
+/// `EdgeKey` for the same logical edge.
 #[derive(Debug, Clone)]
 pub(crate) enum ReifiedObjectShape {
     /// Object is an IRI or blank-node reference. The `String` is the
-    /// IRI / blank-node identifier (possibly minted upstream).
+    /// IRI / blank-node identifier (possibly minted).
     Iri(String),
     /// Object is a literal. Fields capture the canonicalized JSON-LD
     /// value object: only `@value` (always), `@type` (when explicit),
@@ -161,10 +144,7 @@ pub(crate) enum ReifiedObjectShape {
     /// rejected upstream.
     Literal {
         /// Canonical value-object JSON: `{"@value": ..., ?"@type": ...,
-        /// ?"@language": ...}`. Suitable for direct insertion under
-        /// `f:reifiesObject`. Callers needing the datatype string for
-        /// delete-WHERE generation can extract it via
-        /// `value.get("@type")`.
+        /// ?"@language": ...}`, the value as the parser writes it.
         value: Value,
         /// `@language` payload if explicit. Drives `f:reifiesLang`
         /// emission — required so the link `fold_slots_into_links` builds
@@ -176,17 +156,8 @@ pub(crate) enum ReifiedObjectShape {
     TripleTerm(Value),
 }
 
-/// The triple-term shape of an object written `{"@id": {"@id": s, p: o}}`.
-fn triple_term_shape(map: &Map<String, Value>, id_alias: &str) -> Option<ReifiedObjectShape> {
-    map.get("@id")
-        .or_else(|| map.get(id_alias))
-        .filter(|id| id.is_object())
-        .map(|node| ReifiedObjectShape::TripleTerm(node.clone()))
-}
-
 /// Reject the deferred JSON-LD wrapper shapes that can't carry an edge
-/// annotation in v1: `@list`, `@set`, `@reverse`, `@variable`. Called
-/// before either classifier branch so wrapper rejection is uniform.
+/// annotation in v1: `@list`, `@set`, `@reverse`, `@variable`.
 pub(crate) fn reject_deferred_object_wrappers(map: &Map<String, Value>) -> Result<()> {
     for key in ["@list", "@set", "@reverse", "@variable"] {
         if map.contains_key(key) {
@@ -198,44 +169,11 @@ pub(crate) fn reject_deferred_object_wrappers(map: &Map<String, Value>) -> Resul
     Ok(())
 }
 
-/// Reject an annotated literal value object under a term typed `@json`
-/// that does not name its own `@type`.
-///
-/// A value object is otherwise taken as written, so the base flake and the
-/// reified bundle (which copies the object's explicit `@type` / `@language`)
-/// agree. A `@json` term is the exception: JSON-LD makes its whole value,
-/// value object included, one JSON literal, while the bundle would carry the
-/// plain `@value`, and the two `EdgeKey`s would diverge.
-///
-/// Called after `@annotation` is stripped from the map and before
-/// `classify_reified_object`; it has no effect on the Ref / `@id` branch.
-pub(crate) fn reject_context_coercion_on_annotated_literal(
-    map: &Map<String, Value>,
-    predicate: &str,
-    context: &ParsedContext,
-) -> Result<()> {
-    let json_term = context
-        .get(predicate)
-        .is_some_and(|e| e.type_ == Some(TypeValue::Json));
-    if json_term && !map.contains_key("@type") {
-        return Err(TransactError::Parse(format!(
-            "annotated literal on '{predicate}' relies on @context term coercion \
-             (@type='@json'); annotated literals must carry an explicit @type so the \
-             reified f:reifiesObject bundle matches the base edge's EdgeKey. \
-             Add @type to the value object."
-        )));
-    }
-    Ok(())
-}
-
 /// Classify an object-position map (with `@annotation`/`@edge` already
 /// stripped) into either a reference or a literal value-object.
 ///
 /// Rules:
-/// - `{"@id": "..."}` → `Iri`. (Aliased `@id` keys, e.g. `"id"` under a
-///   custom JSON-LD context, are NOT resolved here — the caller must
-///   resolve aliasing via `ensure_subject_id` before invoking this
-///   function for the Ref path.)
+/// - `{"@id": "..."}` → `Iri`.
 /// - `{"@value": "...", "@type": "@id"}` → `Iri` (JSON-LD identifier-
 ///   typed literal form). The `@value` payload must be a string.
 /// - `{"@value": ..., ?"@type": ..., ?"@language": ...}` → `Literal`.
@@ -389,37 +327,6 @@ pub(crate) fn emit_reifies_object_payload(shape: &ReifiedObjectShape) -> (Value,
     }
 }
 
-/// Mutable counter used to mint unique blank-node IDs for anonymous
-/// annotation subjects. Threaded through the recursion so the minted
-/// labels don't collide.
-pub(crate) struct LowerCtx {
-    /// Counter for `_:fluree_ann_N` blank-node IDs.
-    next_anon_id: usize,
-    /// When `true`, an empty `@annotation: {}` block mints a fresh
-    /// property-less annotation subject (LPG mode — Cypher
-    /// relationships retain identity without properties). When
-    /// `false` (RDF default), an empty block is a no-op: no
-    /// annotation subject is minted, no attachment row is written,
-    /// and inserts remain idempotent at the `(s, p, o)` level.
-    /// See `docs/concepts/edge-annotations.md` "Empty annotation blocks".
-    lpg_mode: bool,
-}
-
-impl LowerCtx {
-    fn new(lpg_mode: bool) -> Self {
-        Self {
-            next_anon_id: 0,
-            lpg_mode,
-        }
-    }
-
-    fn mint_blank(&mut self) -> String {
-        let id = format!("{ANN_BLANK_PREFIX}{}", self.next_anon_id);
-        self.next_anon_id += 1;
-        id
-    }
-}
-
 /// Label prefix of the blank nodes the lowering mints for anonymous
 /// annotation subjects and objects. Reserved: the firewall refuses user
 /// labels that start with it.
@@ -477,86 +384,52 @@ pub(crate) fn refuse_reserved_predicate(iri: &str) -> Result<()> {
     Ok(())
 }
 
-/// [`refuse_reserved_iris`] over the data a document holds before any
-/// lowering, expanded against `root`, which holds the document's own
-/// `@context`: an update's `insert`, `delete` and `upsert` clauses when
-/// `clauses` is set (the caller knows the transaction is an update), and
-/// otherwise the whole document, whose keys are all data.
-pub(crate) fn refuse_reserved_iris_in_document(
-    doc: &Value,
-    root: &ParsedContext,
-    clauses: bool,
-) -> Result<()> {
-    if clauses {
-        for clause in ["insert", "delete", "upsert"] {
-            if let Some(value) = doc.get(clause) {
-                refuse_reserved_iris(&expand_with_context_policy(value, root, false)?)?;
-            }
-        }
-        return Ok(());
-    }
-    refuse_reserved_iris(&expand_with_root_context(doc, root, false)?)
-}
-
-/// Top-level entry point. Walks `doc` and rewrites all
-/// `@annotation` / `@edge` / `@reifies` blocks into the equivalent
-/// `f:reifies*` triples.
-///
-/// The transformation is in place: each annotation becomes a node
-/// included (`@included`) in the node that is its edge's subject, so the
-/// parser writes it in exactly the scope (graph) it writes that edge in.
-/// The document keeps its shape.
+/// Lower `doc`'s annotations as a transaction does: expanded against its own
+/// `@context` (each of an update's `insert`, `upsert` and `delete` clauses on
+/// its own), checked by [`refuse_reserved_iris`], and lowered, in RDF mode.
+/// `doc` becomes that lowered expansion; an update's clauses are replaced in
+/// place, and a retraction's `where` patterns are appended to its `where`.
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
-    let top_ctx = top_level_context(doc)?;
-    // Test / external callers that don't carry transaction options
-    // default to RDF mode (empty `@annotation: {}` is a no-op).
-    let clauses = doc.as_object().is_some_and(is_transaction_wrapper);
-    check_then_lower(doc, &top_ctx, false, clauses)
-}
-
-/// [`refuse_reserved_iris_in_document`] on `doc` as written, then the
-/// lowering. A document the check refuses is still lowered first, so one
-/// the lowering refuses for a reason of its own reports that reason.
-pub(crate) fn check_then_lower(
-    doc: &mut Value,
-    top_ctx: &ParsedContext,
-    lpg_mode: bool,
-    clauses: bool,
-) -> Result<()> {
-    if let Err(refused) = refuse_reserved_iris_in_document(doc, top_ctx, clauses) {
-        lower_edge_annotations_after_firewall(doc, top_ctx, lpg_mode)?;
-        return Err(refused);
-    }
-    lower_edge_annotations_after_firewall(doc, top_ctx, lpg_mode)
-}
-
-/// Same as [`lower_edge_annotations`] minus the firewall scan.
-///
-/// Use this when the caller has already run the firewall on the
-/// original (pre-rewritten) document — e.g. when chaining the
-/// `delete`-clause pre-pass before the standard lowering. Both
-/// passes synthesize `f:reifies*` IRIs internally; running the
-/// firewall a second time would falsely flag those.
-///
-/// `lpg_mode` controls the empty-block contract: `false` (RDF
-/// default) makes `@annotation: {}` a no-op; `true` mints a fresh
-/// property-less annotation subject (Cypher relationship identity).
-pub fn lower_edge_annotations_after_firewall(
-    doc: &mut Value,
-    top_ctx: &ParsedContext,
-    lpg_mode: bool,
-) -> Result<()> {
-    let mut ctx = LowerCtx::new(lpg_mode);
-    let walk_ctx = WalkCtx {
-        json_ld: top_ctx,
-        root: true,
+    let root = top_level_context(doc)?;
+    let mut lowering = Lowering::new(false, 0);
+    let Some(wrapper) = doc
+        .as_object_mut()
+        .filter(|map| is_transaction_wrapper(map))
+    else {
+        let mut expanded = expand_with_root_context(doc, &root, false)?;
+        refuse_reserved_iris(&expanded)?;
+        lower_expanded(&mut expanded, Clause::Assert, None, &mut lowering)?;
+        *doc = expanded;
+        return Ok(());
     };
-    lower_value_with_subject(doc, None, &walk_ctx, &mut ctx)
+    for (key, clause) in [
+        ("insert", Clause::Assert),
+        ("upsert", Clause::Assert),
+        ("delete", Clause::Retract),
+    ] {
+        if let Some(value) = wrapper.get_mut(key) {
+            let mut expanded = expand_with_context_policy(value, &root, false)?;
+            refuse_reserved_iris(&expanded)?;
+            lower_expanded(&mut expanded, clause, None, &mut lowering)?;
+            *value = expanded;
+        }
+    }
+    let patterns = lowering.into_where_patterns();
+    if !patterns.is_empty() {
+        let items = match wrapper.remove("where") {
+            None => patterns,
+            Some(Value::Array(mut items)) => {
+                items.extend(patterns);
+                items
+            }
+            Some(other) => std::iter::once(other).chain(patterns).collect(),
+        };
+        wrapper.insert("where".to_string(), Value::Array(items));
+    }
+    Ok(())
 }
 
-/// Parse the document's top-level `@context` once. Used by both the
-/// firewall scan and the lowering walker so they share IRI
-/// resolution for compact forms.
+/// Parse the document's top-level `@context` once.
 pub fn top_level_context(doc: &Value) -> Result<ParsedContext> {
     Ok(doc
         .as_object()
@@ -568,23 +441,22 @@ pub fn top_level_context(doc: &Value) -> Result<ParsedContext> {
 }
 
 /// Cheap read-only check for whether `doc` contains any `@annotation` /
-/// `@edge` / `@reifies` block that the lowering passes would rewrite.
+/// `@edge` / `@reifies` block (or `@ttl` / `@expiresAt` shorthand) for the
+/// lowering to rewrite.
 ///
-/// Lets the transactor skip the payload clone and the mutating lowering
-/// walks for the common non-annotated transaction. The firewall is a
-/// separate concern and must still run unconditionally — it guards against
-/// user-authored `f:reifies*` IRIs, which this scan does not look for.
+/// Lets the transactor skip the lowering walk for the common non-annotated
+/// transaction. The reserved-predicate check is a separate concern and runs
+/// on every document.
 ///
 /// Opaque subtrees ([`opaque_subtree`]) don't count: a keyword that exists
-/// only inside a `@json` document is not a block the lowering passes would
-/// rewrite, so letting it open the pass is pure work. This runs before the
-/// document's `@context` is parsed, so it recognizes only the canonical
-/// `@type` spelling — an aliased one falls through and opens the pass,
-/// which costs a walk and changes no answer.
+/// only inside a `@json` document is not a block the lowering would rewrite.
+/// This runs before the document's `@context` is parsed, so it recognizes
+/// only the canonical `@type` spelling — an aliased one falls through and
+/// opens the pass, which costs a walk and changes no answer.
 pub fn document_has_annotation_keys(doc: &Value) -> bool {
     match doc {
         Value::Object(map) => {
-            let opaque = opaque_subtree(map, None);
+            let opaque = opaque_subtree(map);
             map.iter().any(|(k, v)| {
                 if opaque && k == "@value" {
                     return false;
@@ -600,167 +472,24 @@ pub fn document_has_annotation_keys(doc: &Value) -> bool {
     }
 }
 
-/// Pre-pass for UPDATE transactions: rewrite `@annotation` blocks
-/// inside the `delete` clause into explicit `f:reifies*` retract
-/// templates **before** the main `lower_edge_annotations` walker runs.
-///
-/// The default lowering treats `@annotation` as an assertion — it
-/// synthesizes a sibling node with `f:reifiesSubject` etc. and a
-/// freshly-minted blank-node SID. That works for inserts but is
-/// wrong for deletes: the synthesized SID never matches existing
-/// data, so the delete becomes a silent no-op. This pre-pass
-/// rewrites delete-clause `@annotation` blocks into delete-template
-/// shape directly.
-///
-/// **Supported shape — by annotation id:**
-///
-/// ```json
-/// {"delete": {
-///     "@id": "ex:alice",
-///     "ex:worksFor": {
-///         "@id": "ex:acme",
-///         "@annotation": { "@id": "ex:emp/A" }
-///     }
-/// }}
-/// ```
-///
-/// becomes (after this pass):
-///
-/// ```json
-/// {"delete": [
-///     {"@id": "ex:emp/A",
-///      "f:reifiesSubject":   {"@id": "ex:alice"},
-///      "f:reifiesPredicate": {"@id": "ex:worksFor"},
-///      "f:reifiesObject":    {"@id": "ex:acme"}}
-/// ]}
-/// ```
-///
-/// The base-edge selector (the surrounding `{@id alice ex:worksFor:
-/// {@id acme}}`) is *not* lowered into a base-edge retract — per the
-/// design contract, this shape retracts exactly the targeted
-/// annotation occurrence, not the edge it reifies. Users who want
-/// both the annotation and the edge gone should issue two delete
-/// statements.
-///
-/// **Selector shape:** an `@annotation` block without an explicit
-/// `@id` (e.g. `{ ex:role: "Engineer" }`) requires runtime
-/// resolution against live data. The pre-pass mints a fresh
-/// variable `?_fluree_del_ann_<n>`, synthesizes a `@reifies`-rooted
-/// WHERE pattern that binds the variable to every live annotation
-/// matching the selector body and reifying the named edge, and
-/// emits a by-variable delete template for the bundle. The standard
-/// SPARQL UPDATE machinery then runs the WHERE, instantiates the
-/// template per binding, and the resulting bundle retracts trigger
-/// the LPG body cleanup pass at stage time.
-pub fn lower_delete_annotation_blocks(doc: &mut Value, top_ctx: &ParsedContext) -> Result<()> {
-    let Some(obj) = doc.as_object_mut() else {
-        return Ok(());
-    };
-    if !obj.contains_key("delete") {
-        return Ok(());
-    }
-    // Seed the variable counter past any user-authored
-    // `?_fluree_del_ann_N` occurrences in the original `where`,
-    // `delete`, `insert`, `upsert`, and `values` clauses. A naive
-    // `next_var = 0` would collide with a user-provided variable of
-    // the same name and silently mis-join the selector retract
-    // against the wrong bindings. This scan MUST run before the
-    // `obj.remove` calls below — otherwise it sees an empty doc and
-    // returns 0 regardless of user state.
-    let mut next_var: u32 = next_synth_var_index(obj);
-
-    // Take ownership of `delete` (and the `where` clause if any) so
-    // we can splice both. Re-insert at the end. `obj.get_mut`
-    // borrows can't compose with subsequent inserts, so the
-    // remove/walk/insert dance keeps the borrow checker happy.
-    let mut delete_val = obj.remove("delete").expect("checked above");
-    let where_val = obj.remove("where");
-
-    let mut new_templates: Vec<Value> = Vec::new();
-    let mut new_where_patterns: Vec<Value> = Vec::new();
-    // Top-level graph context: the transactor's UPDATE doc has no
-    // envelope `@graph` (that's the insert/upsert envelope form),
-    // so we start from `None` and let per-node `@graph: "<iri>"`
-    // selectors inside the delete clause set the inherited graph as
-    // we recurse. The `@graph` value gets threaded into the
-    // synthesized retract template so the retract flake's
-    // `g = Some(graph_sid)` matches the original assertion's flake
-    // identity.
-    let mut sink = DeleteAnnotationSink {
-        out_templates: &mut new_templates,
-        out_where: &mut new_where_patterns,
-        next_var: &mut next_var,
-    };
-    match &mut delete_val {
-        Value::Array(items) => {
-            for item in items.iter_mut() {
-                match graph_sugar_mut(item) {
-                    Some((name, pattern)) => {
-                        walk_delete_for_annotations(pattern, top_ctx, name.as_deref(), &mut sink)?;
-                    }
-                    None => walk_delete_for_annotations(item, top_ctx, None, &mut sink)?,
-                }
-            }
-        }
-        other => walk_delete_for_annotations(other, top_ctx, None, &mut sink)?,
-    }
-
-    // Splice the new templates into the delete clause. Convert
-    // single-object form to an array, then append.
-    if !new_templates.is_empty() {
-        let mut items: Vec<Value> = match delete_val {
-            Value::Array(arr) => arr.into_iter().filter(|v| !is_empty_node(v)).collect(),
-            Value::Null => Vec::new(),
-            other => {
-                if is_empty_node(&other) {
-                    Vec::new()
-                } else {
-                    vec![other]
-                }
-            }
-        };
-        items.extend(new_templates);
-        delete_val = Value::Array(items);
-    }
-    obj.insert("delete".to_string(), delete_val);
-
-    // Splice the new WHERE patterns into the existing where clause
-    // (or create one). Selector-form retracts depend on these
-    // patterns to bind their variables to live annotations. The
-    // parser accepts an array or a single object — normalize to
-    // array when we need to merge.
-    if !new_where_patterns.is_empty() {
-        let merged = match where_val {
-            None => Value::Array(new_where_patterns),
-            Some(Value::Array(mut arr)) => {
-                arr.extend(new_where_patterns);
-                Value::Array(arr)
-            }
-            Some(other) => {
-                let mut items = vec![other];
-                items.extend(new_where_patterns);
-                Value::Array(items)
-            }
-        };
-        obj.insert("where".to_string(), merged);
-    } else if let Some(w) = where_val {
-        obj.insert("where".to_string(), w);
-    }
-
-    Ok(())
+/// True when `map`'s `@value` is a JSON-LD 1.1 `@json` literal written with
+/// the canonical `@type` key: a JSON document carried verbatim, in which
+/// nothing is a keyword this parser owns.
+fn opaque_subtree(map: &Map<String, Value>) -> bool {
+    map.contains_key("@value")
+        && map
+            .get("@type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t == "@json" || t == rdf::JSON)
 }
 
-/// Internal variable name prefix used by the selector-form retract
-/// rewrite. Kept in one place so the scanner and the minter agree.
+/// Internal variable name prefix of a retraction by selector.
 const SYNTH_VAR_PREFIX: &str = "?_fluree_del_ann_";
 
-/// Walk the UPDATE document's user-visible clauses (`where`, `delete`,
-/// `insert`, `upsert`, `values`) and return the smallest counter
-/// value that will produce a fresh `?_fluree_del_ann_N` name. A
-/// user-authored pattern that happens to reference our internal
-/// prefix would otherwise collide with the minter and mis-bind the
-/// selector retract against the user's variable.
-fn next_synth_var_index(obj: &Map<String, Value>) -> u32 {
+/// The smallest index past every `?_fluree_del_ann_N` the update's clauses
+/// (`where`, `delete`, `insert`, `upsert`, `values`) write, so a retraction's
+/// variable never joins one of the user's.
+pub(crate) fn next_synth_var_index(obj: &Map<String, Value>) -> u32 {
     let mut max_seen: Option<u32> = None;
     for clause in super::CLAUSE_KEYS {
         if let Some(v) = obj.get(*clause) {
@@ -793,921 +522,12 @@ fn scan_synth_var_usage(value: &Value, max_seen: &mut Option<u32>) {
     }
 }
 
-/// True iff `v` is `{"@id": ...}` or `{}` with no other keys — a
-/// node-map that contributes no triples and would error out as a
-/// "structurally empty" delete template. We strip these after
-/// removing an `@annotation` block.
-fn is_empty_node(v: &Value) -> bool {
-    let Some(obj) = v.as_object() else {
-        return false;
-    };
-    if obj.is_empty() {
-        return true;
-    }
-    obj.iter().all(|(k, _)| k == "@id" || k == "@context")
-}
-
-/// Accumulator state threaded through the delete-clause annotation
-/// walker, predicate-value lifter, and template builder. Bundles the
-/// three accumulating mutables (template list, WHERE pattern list,
-/// fresh-var counter) so the recursion can pass a single `&mut`
-/// borrow instead of three positional args.
-///
-/// `ParsedContext` and the per-subtree `inherited_graph` stay as
-/// recursion-local args — they're swapped per-node when a child
-/// brings its own `@context` or `@graph` selector, so packing them
-/// into the sink would force every recursive call to construct a
-/// new sink just to override one field.
-struct DeleteAnnotationSink<'a> {
-    out_templates: &'a mut Vec<Value>,
-    out_where: &'a mut Vec<Value>,
-    next_var: &'a mut u32,
-}
-
-/// Walk the delete clause looking for `@annotation` blocks. For each
-/// one with an explicit `@id`, build a retract template, then strip
-/// the `<predicate>: { ... @annotation: ... }` pair from its parent
-/// so the base edge isn't accidentally retracted alongside.
-///
-/// `inherited_graph` is the named-graph IRI in scope for this
-/// subtree. Per-node `@graph: "<iri>"` selectors override it for
-/// their subtree. The graph IRI is threaded into the synthesized
-/// retract template so the retract flake matches the original
-/// assertion's flake identity (which carries `g = Some(graph_sid)`
-/// for named-graph annotations).
-fn walk_delete_for_annotations(
-    val: &mut Value,
-    ctx: &ParsedContext,
-    inherited_graph: Option<&str>,
-    sink: &mut DeleteAnnotationSink<'_>,
-) -> Result<()> {
-    match val {
-        Value::Array(items) => {
-            for item in items {
-                walk_delete_for_annotations(item, ctx, inherited_graph, sink)?;
-            }
-            Ok(())
-        }
-        Value::Object(map) => {
-            // Value/list/variable wrappers are not node-maps, so their
-            // structural keys are not predicates and their contents are
-            // not delete templates. Mirrors the assertion-side walker's
-            // early return in `lower_object_with_subject`.
-            //
-            // Reaching this arm at all means the wrapper survived the
-            // first pass — i.e. it carried no `@annotation`, since one
-            // that did would have been lifted and its predicate stripped
-            // by `lift_annotations_under_predicate`. What the walk would
-            // otherwise do is descend through `@value` into a `@json`
-            // document and lift a keyword out of it, rewriting the
-            // literal the delete was supposed to match. The delete then
-            // commits and retracts nothing.
-            if is_jsonld_value_object(map) {
-                return Ok(());
-            }
-
-            // Merge any per-node `@context` into the parent context.
-            // Symmetric with the insert walker — without this, a
-            // node-local term coercion would apply at expansion time
-            // but be invisible to
-            // `reject_context_coercion_on_annotated_literal`, masking
-            // an EdgeKey mismatch.
-            let local_merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
-                Some(
-                    fluree_graph_json_ld::parse_context_with_base(ctx, local_ctx).map_err(|e| {
-                        TransactError::Parse(format!(
-                            "failed to parse nested @context during delete-clause \
-                                     annotation lowering: {e}"
-                        ))
-                    })?,
-                )
-            } else {
-                None
-            };
-            let effective_ctx: &ParsedContext = local_merged.as_ref().unwrap_or(ctx);
-
-            // Capture the parent's @id for `f:reifiesSubject`. Honor
-            // context-aliased `@id` keys (e.g. `id: ...` when context
-            // says `"id": "@id"`).
-            let parent_id = map
-                .get("@id")
-                .and_then(Value::as_str)
-                .or_else(|| {
-                    let alias = effective_ctx.id_key.as_str();
-                    if alias != "@id" {
-                        map.get(alias).and_then(Value::as_str)
-                    } else {
-                        None
-                    }
-                })
-                .map(String::from);
-
-            // A per-node graph selector overrides the inherited graph for
-            // this subtree, and a named graph's content is in the graph its
-            // `@id` names: the same classifier and the same reading as the
-            // assertion-side walker and the parser.
-            let graph_key = graph_entry_key(map, effective_ctx, false);
-            let (node_graph, content_graph): (Option<String>, Option<String>) = match graph_key
-                .as_ref()
-                .and_then(|k| map.get(k))
-                .map(classify_graph_value)
-            {
-                Some(GraphValue::Selector(raw)) => (Some(raw.to_string()), None),
-                Some(GraphValue::Content(_)) => (
-                    None,
-                    parent_id.as_deref().map(|id| {
-                        fluree_graph_json_ld::expand_iri_with_vocab(id, effective_ctx, false)
-                    }),
-                ),
-                _ => (None, None),
-            };
-            let node_graph_ref = node_graph.as_deref();
-            let effective_graph: Option<&str> = node_graph_ref.or(inherited_graph);
-
-            // First pass: find the edges whose value carries an
-            // `@annotation`, lift them into retract templates, and
-            // remove them from the parent. Keys are read as the insert
-            // walker reads them (`classify_edge_key`): a property, a term
-            // defined with `@reverse`, or the `@reverse` keyword's map.
-            // The retract goes to the edge's graph: this node's scope.
-            let keys: Vec<String> = map
-                .keys()
-                .filter(|k| {
-                    *k != effective_ctx.id_key.as_str() && graph_key.as_deref() != Some(k.as_str())
-                })
-                .cloned()
-                .collect();
-
-            let mut keys_to_remove: Vec<String> = Vec::new();
-            for key in keys {
-                let edge = classify_edge_key(&key, effective_ctx);
-                let value = map.get_mut(&key).expect("collected key");
-                match edge {
-                    EdgeKey::Forward => lift_annotations_under_predicate(
-                        Direction::Forward {
-                            subject: parent_id.as_deref().unwrap_or_default(),
-                        },
-                        parent_id.is_some(),
-                        &key,
-                        value,
-                        effective_ctx,
-                        effective_graph,
-                        sink,
-                        &mut |strip| {
-                            if strip {
-                                keys_to_remove.push(key.clone());
-                            }
-                        },
-                    )?,
-                    EdgeKey::Reverse(property) => lift_annotations_under_predicate(
-                        Direction::Reverse {
-                            object: parent_id.as_deref().unwrap_or_default(),
-                        },
-                        parent_id.is_some(),
-                        &property,
-                        value,
-                        effective_ctx,
-                        effective_graph,
-                        sink,
-                        &mut |strip| {
-                            if strip {
-                                keys_to_remove.push(key.clone());
-                            }
-                        },
-                    )?,
-                    EdgeKey::Keyword("@reverse") => {
-                        if let Value::Object(reverse) = value {
-                            let mut properties_to_remove: Vec<String> = Vec::new();
-                            for (property, values) in reverse.iter_mut() {
-                                lift_annotations_under_predicate(
-                                    Direction::Reverse {
-                                        object: parent_id.as_deref().unwrap_or_default(),
-                                    },
-                                    parent_id.is_some(),
-                                    property,
-                                    values,
-                                    effective_ctx,
-                                    effective_graph,
-                                    sink,
-                                    &mut |strip| {
-                                        if strip {
-                                            properties_to_remove.push(property.clone());
-                                        }
-                                    },
-                                )?;
-                            }
-                            for property in properties_to_remove {
-                                reverse.remove(&property);
-                            }
-                            if reverse.is_empty() {
-                                keys_to_remove.push(key.clone());
-                            }
-                        }
-                    }
-                    EdgeKey::Keyword(_) => {}
-                }
-            }
-            for k in keys_to_remove {
-                map.remove(&k);
-            }
-
-            // Second pass: recurse into remaining (non-stripped)
-            // child values to handle nested delete shapes. A named graph's
-            // content is in the graph it names.
-            let remaining: Vec<String> = map.keys().cloned().collect();
-            for key in remaining {
-                let scope = match content_graph.as_deref() {
-                    Some(named) if graph_key.as_deref() == Some(key.as_str()) => Some(named),
-                    _ => effective_graph,
-                };
-                if let Some(v) = map.get_mut(&key) {
-                    walk_delete_for_annotations(v, effective_ctx, scope, sink)?;
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Process the value of a single edge inside a delete clause. When the
-/// value is an object containing an `@annotation` block, lift it into a
-/// retract template (appended to `out`) and signal the caller to strip
-/// the edge from the parent.
-///
-/// `edge_graph` is the graph the edge is in: the scope of the node that
-/// states it (its own selector, else the inherited one). A value's own
-/// `@graph` scopes that value's subtree, not the edge, exactly as on the
-/// insert side. `has_parent_id` says whether the node carries an `@id`
-/// (the edge's subject, or for a reverse property its object).
-#[allow(clippy::too_many_arguments)]
-fn lift_annotations_under_predicate(
-    direction: Direction<'_>,
-    has_parent_id: bool,
-    predicate: &str,
-    value: &mut Value,
-    ctx: &ParsedContext,
-    edge_graph: Option<&str>,
-    sink: &mut DeleteAnnotationSink<'_>,
-    strip_callback: &mut dyn FnMut(bool),
-) -> Result<()> {
-    match value {
-        Value::Array(items) => {
-            // Each array item gets the same parent context. We
-            // process and remove the items that carry annotations,
-            // leaving the rest in place. If every item is stripped,
-            // the parent's predicate becomes redundant.
-            let mut survivors: Vec<Value> = Vec::with_capacity(items.len());
-            for mut item in std::mem::take(items) {
-                let mut item_stripped = false;
-                lift_annotations_under_predicate(
-                    direction,
-                    has_parent_id,
-                    predicate,
-                    &mut item,
-                    ctx,
-                    edge_graph,
-                    sink,
-                    &mut |s| item_stripped = s,
-                )?;
-                if !item_stripped {
-                    survivors.push(item);
-                }
-            }
-            if survivors.is_empty() {
-                strip_callback(true);
-            } else {
-                *items = survivors;
-            }
-            Ok(())
-        }
-        Value::Object(map) => {
-            if map.contains_key(TTL_KEY) || map.contains_key(EXPIRES_AT_KEY) {
-                return Err(TransactError::Parse(
-                    "@ttl / @expiresAt set the lifetime of an inserted value; they do not \
-                     apply in a delete"
-                        .to_string(),
-                ));
-            }
-            if !map.contains_key(ANNOTATION_KEY) && !map.contains_key(EDGE_KEY) {
-                return Ok(());
-            }
-            if !has_parent_id {
-                return Err(TransactError::Parse(
-                    "delete-clause @annotation requires the enclosing predicate to have a \
-                     parent @id (the subject of the reified edge)"
-                        .to_string(),
-                ));
-            }
-            // The value's own `@graph` selector scopes the value's node, not
-            // the edge: it is stripped below before classifying.
-            let object_graph_key = graph_entry_key(map, ctx, false);
-
-            let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
-            let Some(ann_block) = ann_block else {
-                return Ok(());
-            };
-
-            // Wrapper rejection runs in both branches.
-            reject_deferred_object_wrappers(map)?;
-
-            // Classify the post-strip base-edge object. The value-
-            // object form drives a literal-shaped `f:reifiesObject`
-            // payload (plus `f:reifiesLang` when language-tagged); the
-            // node-map form resolves the @id (with context aliasing)
-            // and produces a Ref shape. Strip the per-node @graph
-            // selector before classifying so it doesn't trip the
-            // identifier-typed value-object stray-key check (it lives
-            // on the parent node, not on a value-object).
-            if let Some(key) = &object_graph_key {
-                map.remove(key);
-            }
-            let is_value_object = map.contains_key("@value") || map.contains_key("@language");
-            if is_value_object && matches!(direction, Direction::Reverse { .. }) {
-                return Err(TransactError::Parse(format!(
-                    "a reverse property's value is a node, the subject of the edge; \
-                     '{predicate}' has a literal value"
-                )));
-            }
-            let value_shape = if is_value_object {
-                // Mirror the insert-path guard: annotated literals
-                // must NOT rely on @context coercion, since the
-                // synthesized f:reifies* bundle would otherwise decode
-                // to an EdgeKey that doesn't match the original
-                // assertion's. A by-id delete that doesn't match
-                // becomes a silent no-op.
-                reject_context_coercion_on_annotated_literal(map, predicate, ctx)?;
-                classify_reified_object(map)?
-            } else if let Some(shape) = triple_term_shape(map, ctx.id_key.as_str()) {
-                shape
-            } else {
-                let id_alias = ctx.id_key.as_str();
-                let object_id = map
-                    .get("@id")
-                    .and_then(Value::as_str)
-                    .or_else(|| {
-                        if id_alias != "@id" {
-                            map.get(id_alias).and_then(Value::as_str)
-                        } else {
-                            None
-                        }
-                    })
-                    .map(String::from)
-                    .ok_or_else(|| {
-                        TransactError::Parse(
-                            "delete-clause @annotation requires the parent object node to carry \
-                             an explicit @id (the object of the reified edge)"
-                                .to_string(),
-                        )
-                    })?;
-                ReifiedObjectShape::Iri(object_id)
-            };
-
-            let (subject, object_shape) = match (direction, value_shape) {
-                (Direction::Forward { subject }, shape) => (subject.to_string(), shape),
-                (Direction::Reverse { object }, ReifiedObjectShape::Iri(value_id)) => {
-                    (value_id, ReifiedObjectShape::Iri(object.to_string()))
-                }
-                (Direction::Reverse { .. }, _) => unreachable!("refused above"),
-            };
-            build_annotation_delete(
-                &subject,
-                predicate,
-                &object_shape,
-                ann_block,
-                ctx,
-                edge_graph,
-                sink,
-            )?;
-
-            // After lifting, the parent's predicate-value is just
-            // `{@id: <object>}`. That alone is a structurally empty
-            // node — but stripping the *entire* predicate from the
-            // parent matches the design contract: by-id retracts
-            // do not delete the base edge.
-            strip_callback(true);
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// Build the retract delete template(s) for one `@annotation` block,
-/// dispatching on shape:
-///
-/// - **By-id** (block has explicit `@id`): emit a single delete
-///   template with the same seven-fact `f:reifies*` shape used by the
-///   assertion-side lowering. The standard
-///   `parse_update_templates_with_ctx` path turns it into per-flake
-///   retracts. Pushed to `out_templates` only — no WHERE pattern
-///   needed.
-///
-/// - **By-selector** (no `@id`, body holds selector properties): mint
-///   a fresh variable `?_fluree_del_ann_<n>`, push a `@reifies`-rooted
-///   WHERE pattern that binds the variable to every live annotation
-///   matching the selector body and reifying the named edge, and push
-///   a delete template keyed by the variable. The SPARQL UPDATE
-///   machinery instantiates the template per WHERE binding.
-fn build_annotation_delete(
-    parent_subject: &str,
-    predicate: &str,
-    object: &ReifiedObjectShape,
-    ann_block: Value,
-    ctx: &ParsedContext,
-    graph_iri: Option<&str>,
-    sink: &mut DeleteAnnotationSink<'_>,
-) -> Result<()> {
-    let Value::Object(mut ann_map) = ann_block else {
-        return Err(TransactError::Parse(
-            "@annotation value must be a JSON object".to_string(),
-        ));
-    };
-
-    // Compute the `f:reifiesObject` JSON payload plus optional
-    // `f:reifiesLang` companion once. Both the selector WHERE pattern
-    // and the delete template emit identical shape so the synthesized
-    // retract bundle decodes to the same EdgeKey as the original
-    // assertion (the contract the gate tests pin in
-    // `it_edge_annotations.rs`).
-    let (object_payload, lang_payload) = emit_reifies_object_payload(object);
-    let id_alias = ctx.id_key.as_str();
-    let explicit_id: Option<String> = ann_map
-        .get("@id")
-        .and_then(Value::as_str)
-        .or_else(|| {
-            if id_alias != "@id" {
-                ann_map.get(id_alias).and_then(Value::as_str)
-            } else {
-                None
-            }
-        })
-        .map(String::from);
-
-    let template_id: String = if let Some(ann_id) = explicit_id {
-        // Reject client-authored blank-node @ids: those are skolemized
-        // fresh at insert time, so they can't pin an existing annotation.
-        // Stable Fluree ids (`_:fdb-...`, obtained from a query) DO denote
-        // the stored node and pass through to the delete template.
-        if ann_id.starts_with("_:") && crate::namespace::stable_blank_node_sid(&ann_id).is_none() {
-            return Err(TransactError::UnsupportedFeature(
-                "delete by anonymous annotation @id is not supported — client blank-node \
-                 labels are minted fresh at insert time and not user-addressable. Use the \
-                 stable `_:fdb-...` id returned by a query, a selector form (no @id, body \
-                 properties only), or attach an explicit @id at insert."
-                    .to_string(),
-            ));
-        }
-        ann_id
-    } else {
-        // Selector form. Mint a unique variable, build a WHERE
-        // pattern that constrains it to live annotations matching
-        // the selector body and reifying the named edge, and use
-        // the variable as the delete-template @id.
-        let var = format!("{SYNTH_VAR_PREFIX}{}", *sink.next_var);
-        *sink.next_var += 1;
-
-        // Strip the alias so we don't carry duplicate @id keys into
-        // the WHERE pattern (we'll insert our own).
-        ann_map.remove("@id");
-        if id_alias != "@id" {
-            ann_map.remove(id_alias);
-        }
-
-        // Reject nested annotations / @reifies inside the selector
-        // body — same deferral rule as inserts.
-        scan_annotation_keywords_in_map(&ann_map, ctx)?;
-
-        // The WHERE node: the body properties (remaining in `ann_map`) act
-        // as selector predicates, and the query-side `@reifies` pins the
-        // annotation to the (parent_subject, predicate, object) edge through
-        // its `rdf:reifies` link.
-        let mut where_node = ann_map.clone();
-        where_node.insert("@id".to_string(), Value::String(var.clone()));
-        let mut edge = Map::new();
-        edge.insert("@id".to_string(), json!(parent_subject));
-        edge.insert(predicate.to_string(), object_payload.clone());
-        where_node.insert(REIFIES_KEY.to_string(), Value::Object(edge));
-        // The annotation lives in its edge's graph: scope the pattern to
-        // it with a node-level `@graph`, whose name the `where` resolves
-        // exactly as the delete template's (a compact IRI, `"default"`,
-        // `"config"`, a `fromNamed` alias).
-        if let Some(graph) = graph_iri {
-            where_node.insert("@graph".to_string(), Value::String(graph.to_string()));
-        }
-        sink.out_where.push(Value::Object(where_node));
-
-        var
-    };
-
-    let mut template = Map::new();
-    template.insert("@id".to_string(), Value::String(template_id));
-    template.insert(
-        reifies_iris::SUBJECT.to_string(),
-        json!({"@id": parent_subject}),
-    );
-    template.insert(
-        reifies_iris::PREDICATE.to_string(),
-        predicate_slot(predicate),
-    );
-    template.insert(reifies_iris::OBJECT.to_string(), object_payload);
-    if let Some(lang) = lang_payload {
-        template.insert(reifies_iris::LANG.to_string(), json!(lang));
-    }
-    // For named-graph annotations, both the f:reifies* flakes and
-    // the synthetic annotation node live in the reified edge's
-    // graph. Without this, the parser would emit default-graph
-    // retract flakes (`g = None`) which can't cancel named-graph
-    // assertions — flake identity includes `g`. Mirrors the
-    // assertion-side `build_annotation_sibling` graph emission so
-    // assert and retract round-trip exactly; the parser adds the
-    // `f:reifiesGraph` retraction from the scope (`GraphScope::emit`).
-    if let Some(graph) = graph_iri {
-        template.insert("@graph".to_string(), Value::String(graph.to_string()));
-    }
-    sink.out_templates.push(Value::Object(template));
-    Ok(())
-}
-
-/// Inherited context for the lowering walker.
-///
-/// `json_ld` is used for compact-IRI resolution checks (the same
-/// context the firewall scan resolves against). The walker tracks no
-/// graph: an annotation node is included in its edge's subject node,
-/// so the parser places both in one scope.
-#[derive(Clone, Copy)]
-pub(crate) struct WalkCtx<'a> {
-    json_ld: &'a ParsedContext,
-    /// The document root: its bare `graph` key is a routing key.
-    root: bool,
-}
-
-/// Recursively reject `@annotation` / `@edge` / `@reifies` anywhere
-/// inside `value`. Used to enforce the annotation-of-annotation
-/// deferral on annotation bodies.
-///
-/// Stops at the `@value` of an opaque subtree ([`opaque_subtree`]).
-/// That skip lives here, in the scanner, rather than at any of its
-/// callers: opacity is a property of the document, and a rule that
-/// only one call site knows is a rule the other call sites break.
-/// Only `@value` is skipped, so a deferred keyword in a *sibling* of
-/// the payload — which is ordinary JSON-LD, not part of the opaque
-/// document — is refused exactly as before.
-fn scan_nested_annotation_keywords(value: &Value, ctx: &ParsedContext) -> Result<()> {
-    match value {
-        Value::Object(map) => scan_annotation_keywords_in_map(map, ctx),
-        Value::Array(items) => {
-            for item in items {
-                scan_nested_annotation_keywords(item, ctx)?;
-            }
-            Ok(())
-        }
-        _ => Ok(()),
-    }
-}
-
-/// [`scan_nested_annotation_keywords`] over a map the caller already
-/// holds. Every call site has one, and routing through `&Value` meant
-/// cloning the whole subtree just to borrow it back.
-fn scan_annotation_keywords_in_map(map: &Map<String, Value>, ctx: &ParsedContext) -> Result<()> {
-    // The keyword checks below run on the map's own keys before the
-    // payload skip, so an `@annotation` **on** a wrapper is still
-    // refused — that wrapper key is JSON-LD the parser owns, whatever
-    // the payload beside it is.
-    let opaque = opaque_subtree(map, Some(ctx));
-    for (k, v) in map {
-        if is_annotation_key(k) {
-            return Err(TransactError::UnsupportedFeature(format!(
-                "{k} nested inside an @annotation body is the deferred \
-                 annotation-of-annotation shape (v1)"
-            )));
-        }
-        if k == REIFIES_KEY {
-            return Err(TransactError::UnsupportedFeature(
-                "@reifies nested inside an @annotation body is the \
-                 deferred nested-triple-term shape (v1)"
-                    .to_string(),
-            ));
-        }
-        if opaque && k == "@value" {
-            continue;
-        }
-        scan_nested_annotation_keywords(v, ctx)?;
-    }
-    Ok(())
-}
-
-/// Read or mint the `@id` of `map`, ensuring future references resolve
-/// to the same identifier. When the node has no `@id`, we add
-/// `"@id": "_:fluree_ann_N"` so the subsequent annotation lowering and
-/// the standard parser see the same blank node.
-///
-/// Honors `walk.json_ld.id_key` so context-aliased ids (e.g.
-/// `"@context": {"id": "@id"}` with node `{"id": "foo", ...}`) are
-/// recognized and the synthetic blank is not minted on top of them.
-/// Inserting a literal `@id` alongside an aliased one would leave the
-/// JSON-LD expander with two `@id` candidates and silently drop the
-/// surrounding predicates.
-fn ensure_subject_id(
-    map: &mut Map<String, Value>,
-    walk: &WalkCtx<'_>,
-    ctx: &mut LowerCtx,
-) -> String {
-    if let Some(Value::String(s)) = map.get("@id") {
-        return s.clone();
-    }
-    let id_alias = walk.json_ld.id_key.as_str();
-    if id_alias != "@id" {
-        if let Some(Value::String(s)) = map.get(id_alias) {
-            return s.clone();
-        }
-    }
-    let new_id = ctx.mint_blank();
-    map.insert("@id".to_string(), json!(new_id.clone()));
-    new_id
-}
-
-/// The node for one annotation of the edge `(subject, predicate, object)`:
-/// `@id` (the annotation subject), the `f:reifies*` predicates pinning the
-/// edge, and the body properties. The caller includes it in the edge's
-/// subject node, so it is written in the edge's own scope; the parser then
-/// anchors the bundle to the graph it lands in (`f:reifiesGraph`,
-/// `GraphScope::emit`).
-fn build_annotation_node(
-    subject: &str,
-    predicate: &str,
-    object: &ReifiedObjectShape,
-    ann_block: Value,
-    json_ld: &ParsedContext,
-    ctx: &mut LowerCtx,
-) -> Result<Option<Value>> {
-    let Value::Object(mut ann_map) = ann_block else {
-        return Err(TransactError::Parse(
-            "@annotation value must be a JSON object describing the annotation subject".to_string(),
-        ));
-    };
-
-    // Empty-body contract (per `docs/concepts/edge-annotations.md`
-    // "Empty annotation blocks"). `@context` is purely structural and
-    // doesn't count as a property; everything else does — including
-    // an explicit `@id`, which signals the user wants annotation
-    // identity. So the no-op case is exactly `{}` (or `{"@context": ...}`).
-    //
-    // - RDF mode (default): no annotation subject is minted, no
-    //   attachment row is written. Inserts remain idempotent at the
-    //   `(s, p, o)` level.
-    // - LPG mode (`opts.lpgEdgeLifecycle: true`): mint a fresh
-    //   property-less annotation subject so the relationship retains
-    //   identity (matches Cypher).
-    let body_is_empty = ann_map.iter().all(|(k, _)| k == "@context");
-    if body_is_empty && !ctx.lpg_mode {
-        return Ok(None);
-    }
-
-    // Reject nested @annotation / @edge / @reifies anywhere in the body
-    // — annotation-of-annotation is the deferred shape (v1).
-    scan_annotation_keywords_in_map(&ann_map, json_ld)?;
-
-    // Annotation subject: explicit @id or a fresh blank node.
-    let ann_id = if let Some(Value::String(s)) = ann_map.get("@id") {
-        s.clone()
-    } else {
-        ctx.mint_blank()
-    };
-    ann_map.insert("@id".to_string(), json!(ann_id.clone()));
-
-    // f:reifies* predicates pinning the base edge.
-    ann_map.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
-    ann_map.insert(
-        reifies_iris::PREDICATE.to_string(),
-        predicate_slot(predicate),
-    );
-
-    // f:reifiesObject and (optional) f:reifiesLang. For a literal
-    // object, the value payload is the canonical value-object built by
-    // the classifier; `fold_slots_into_links` takes the term's `lang`
-    // from a separate `f:reifiesLang` slot, so language-tagged literals
-    // MUST emit it explicitly — otherwise the link's term would not
-    // name the base edge.
-    let (object_payload, lang_payload) = emit_reifies_object_payload(object);
-    ann_map.insert(reifies_iris::OBJECT.to_string(), object_payload);
-    if let Some(lang) = lang_payload {
-        ann_map.insert(reifies_iris::LANG.to_string(), json!(lang));
-    }
-
-    // f:reifiesDatatype is intentionally omitted at lowering time —
-    // we don't know the object's datatype before JSON-LD expansion.
-    // `fold_slots_into_links` takes it from the `f:reifiesObject` value.
-
-    Ok(Some(Value::Object(ann_map)))
-}
-
-/// Lower a `@reifies` block on the enclosing node: the node is a reifier,
-/// and each triple the block describes becomes its `rdf:reifies` link
-/// without being asserted (RDF 1.2). An array reifies several triples; the
-/// first rides on the node, the rest on nodes with the same `@id` included
-/// in it, so in its scope.
-fn lower_reifies_block(
-    map: &mut Map<String, Value>,
-    reifier: &str,
-    reifies_val: Value,
-    json_ld: &ParsedContext,
-) -> Result<()> {
-    let blocks = match reifies_val {
-        Value::Array(blocks) if !blocks.is_empty() => blocks,
-        Value::Array(_) => {
-            return Err(TransactError::Parse(
-                "@reifies must describe at least one triple".to_string(),
-            ))
-        }
-        block => vec![block],
-    };
-    let mut included = Vec::new();
-    for (i, block) in blocks.into_iter().enumerate() {
-        let slots = reifies_slots(block)?;
-        if i == 0 {
-            map.extend(slots);
-        } else {
-            let mut node = slots;
-            node.insert("@id".to_string(), json!(reifier));
-            included.push(Value::Object(node));
-        }
-    }
-    if !included.is_empty() {
-        include_nodes(map, json_ld, included);
-    }
-    Ok(())
-}
-
-/// The label of the node a predicate slot holds until it is resolved: in the
-/// reserved prefix, so a document cannot write it.
-const PREDICATE_HELPER: &str = "_:fluree_ann_predicate";
-
-/// The slot value naming the edge's predicate, a key as written. It is
-/// written as a key, on a helper node in the slot, so the expander resolves
-/// it by the rules and the contexts (scoped ones included) that a key there
-/// gets, rather than as an `@id`, which falls back to `@base`.
-/// [`resolve_predicate_slots`] replaces the helper with the IRI.
-fn predicate_slot(predicate: &str) -> Value {
-    json!({ predicate: {"@id": PREDICATE_HELPER} })
-}
-
-/// Replace each predicate slot's helper node (see [`predicate_slot`]) with a
-/// reference to the IRI its one key expanded to. Runs on the expansion of a
-/// lowered document, before its statements are built.
-pub(crate) fn resolve_predicate_slots(expanded: &mut Value) {
-    match expanded {
-        Value::Object(map) => {
-            if let Some(Value::Array(values)) = map.get_mut(reifies_iris::PREDICATE) {
-                for value in values.iter_mut() {
-                    let iri = value.as_object().and_then(|helper| {
-                        let mut keys = helper.keys().filter(|k| !k.starts_with('@'));
-                        match (keys.next(), keys.next()) {
-                            (Some(iri), None) if !helper.contains_key("@id") => Some(iri.clone()),
-                            _ => None,
-                        }
-                    });
-                    if let Some(iri) = iri {
-                        *value = json!({"@id": iri});
-                    }
-                }
-            }
-            for value in map.values_mut() {
-                resolve_predicate_slots(value);
-            }
-        }
-        Value::Array(items) => {
-            for item in items {
-                resolve_predicate_slots(item);
-            }
-        }
-        _ => {}
-    }
-}
-
-/// The `f:reifies*` slots naming the one triple a `@reifies` block
-/// describes: `{"@id": s, p: o}`.
-fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
-    let Value::Object(block) = block else {
-        return Err(TransactError::Parse(
-            "@reifies value must be a JSON object describing a triple".to_string(),
-        ));
-    };
-    for k in block.keys() {
-        if is_annotation_key(k) || k == REIFIES_KEY {
-            return Err(TransactError::UnsupportedFeature(format!(
-                "{k} inside @reifies is the deferred nested-triple-term shape"
-            )));
-        }
-    }
-    let Some(Value::String(subject)) = block.get("@id") else {
-        return Err(TransactError::Parse(
-            "@reifies must include an @id naming the triple's subject".to_string(),
-        ));
-    };
-    let pairs: Vec<(&String, &Value)> = block.iter().filter(|(k, _)| !k.starts_with('@')).collect();
-    let [(predicate, object)] = pairs.as_slice() else {
-        return Err(TransactError::Parse(format!(
-            "@reifies must describe exactly one triple (got {} predicates); \
-             use an array to reify several",
-            pairs.len()
-        )));
-    };
-    if reifies_iris::ALL.contains(&predicate.as_str()) || *predicate == fluree_vocab::rdf::REIFIES {
-        return Err(TransactError::UnsupportedFeature(format!(
-            "'{predicate}' is a system-controlled predicate"
-        )));
-    }
-    let shape = match object {
-        Value::Object(object)
-            if object.contains_key("@value") || object.contains_key("@language") =>
-        {
-            classify_reified_object(object)?
-        }
-        Value::Object(object) => match object.get("@id") {
-            Some(Value::String(id)) if object.len() == 1 => ReifiedObjectShape::Iri(id.clone()),
-            Some(node @ Value::Object(_)) if object.len() == 1 => {
-                ReifiedObjectShape::TripleTerm(node.clone())
-            }
-            _ => {
-                return Err(TransactError::Parse(
-                    "@reifies object must be an @id reference or a value".to_string(),
-                ))
-            }
-        },
-        Value::Array(_) => {
-            return Err(TransactError::Parse(
-                "@reifies must describe exactly one triple; use an array of @reifies \
-                 blocks to reify several"
-                    .to_string(),
-            ))
-        }
-        scalar => {
-            classify_reified_object(&Map::from_iter([("@value".to_string(), (*scalar).clone())]))?
-        }
-    };
-
-    let mut slots = Map::new();
-    slots.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
-    slots.insert(
-        reifies_iris::PREDICATE.to_string(),
-        predicate_slot(predicate),
-    );
-    let (object, lang) = emit_reifies_object_payload(&shape);
-    slots.insert(reifies_iris::OBJECT.to_string(), object);
-    if let Some(lang) = lang {
-        slots.insert(reifies_iris::LANG.to_string(), json!(lang));
-    }
-    Ok(slots)
-}
-
-// ---------------------------------------------------------------------------
-// Two-pass lowering: the first pass needs the *parent's* `@id` to set
-// `f:reifiesSubject`, but the parent's id may be assigned (via a fresh
-// blank node) only when it's processed. We resolve this with an
-// explicit two-pass approach implemented by `lower_with_subject`.
-// ---------------------------------------------------------------------------
-
-/// Recursive variant that knows the subject and graph context of the
-/// enclosing node.
-///
-/// Used internally to thread the parent's `@id` (resolved via
-/// `ensure_subject_id`) and the inherited graph selector into the
-/// inline-annotation lowering.
-pub(crate) fn lower_value_with_subject(
-    value: &mut Value,
-    parent_subject: Option<&str>,
-    walk: &WalkCtx<'_>,
-    ctx: &mut LowerCtx,
-) -> Result<()> {
-    match value {
-        Value::Array(items) => {
-            let item_walk = WalkCtx {
-                root: false,
-                ..*walk
-            };
-            for item in items {
-                lower_value_with_subject(item, parent_subject, &item_walk, ctx)?;
-            }
-            Ok(())
-        }
-        Value::Object(map) => lower_object_with_subject(map, parent_subject, walk, ctx),
-        _ => Ok(()),
-    }
-}
-
 /// True when `map` is a transaction wrapper (UPDATE / explicit
 /// Insert+opts shape) rather than a node-map. The wrapper carries
 /// clause keys ([`super::CLAUSE_KEYS`]) plus the optional `@context` and
 /// any transactor-reserved keys ([`super::RESERVED_TXN_KEYS`] — `opts`,
 /// `ledger`, `txn-meta`, `from`, `fromNamed`, `from-named`, `graph`), but
-/// no predicates of its own — so we must not mint an `@id` for it. Each
-/// clause's value is itself a fresh top-level payload that we recurse into.
-///
-/// The check fires when at least one clause key is present and every key is
-/// either a clause key, `@context`, or a reserved key. Sourcing the reserved
-/// set from the shared const keeps this in lock-step with the strip / envelope
-/// stages: a drift there is what dropped `@annotation` reification on UPDATE
-/// wrappers carrying `txn-meta` / `from-named` / `graph`.
+/// no predicates of its own. Each clause's value is a document of its own.
 fn is_transaction_wrapper(map: &Map<String, Value>) -> bool {
     let has_clause = super::CLAUSE_KEYS.iter().any(|k| map.contains_key(*k));
     if !has_clause {
@@ -1720,631 +540,759 @@ fn is_transaction_wrapper(map: &Map<String, Value>) -> bool {
     })
 }
 
-/// True when `map` is a JSON-LD value/list/variable wrapper rather
-/// than a node-map. These objects describe a literal value, a list,
-/// or a variable reference — they must not be treated as nodes (we
-/// must not mint `@id` for them or walk their structural keys as
-/// predicates).
-///
-/// Detection mirrors the transactor's expanded-value parser: presence
-/// of `@value`, `@language`, `@list`, or `@variable` makes this a
-/// value-class object.
-fn is_jsonld_value_object(map: &Map<String, Value>) -> bool {
-    map.contains_key("@value")
-        || map.contains_key("@language")
-        || map.contains_key("@list")
-        || map.contains_key("@variable")
+/// Which statements a clause's annotations stand for: an update's `delete`
+/// retracts them, every other clause asserts them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Clause {
+    Assert,
+    Retract,
 }
 
-/// True when `map`'s `@value` is a subtree this parser must not read
-/// into.
-///
-/// Today that is exactly one shape: a JSON-LD 1.1 `@json` literal,
-/// whose `@value` is a JSON document carried verbatim rather than
-/// JSON-LD to interpret. Nothing inside it is a keyword this module
-/// owns — the whole document is serialized into a single `rdf:JSON`
-/// flake value — so every walker in this file consults this one
-/// predicate rather than special-casing `@json` at its own site. Four
-/// of them read into documents; guarding one leaves three.
-///
-/// The accepted `@type` spellings mirror the transactor's own literal
-/// parser (`jsonld::parse_literal_value_with_meta`): the keyword
-/// `@json`, or any IRI that expands to `rdf:JSON`. Deciding this by
-/// comparing the raw key `"@type"` against the raw value `"@json"` is
-/// what let the original bug survive its first fix: the expander
-/// resolves both through the context, so `{"type": "@type"}` — among
-/// the most ordinary things a JSON-LD context does — produced a
-/// literal the expander called opaque and this file did not. The key
-/// honors `type_key` for the same reason [`ensure_subject_id`] honors
-/// `id_key`.
-///
-/// `ctx` is `None` for the one caller that runs before the document's
-/// context is parsed ([`document_has_annotation_keys`]). That degrades
-/// in the safe direction: an aliased or compact spelling is not
-/// recognized, the subtree is treated as ordinary, and the caller does
-/// more work rather than less.
-///
-/// **Known gap:** term-level coercion (`"rule": {"@type": "@json"}` in
-/// the context, with no `@type` in the document) also produces a
-/// `@json` literal at expansion time. That is a property of the
-/// enclosing *predicate*, not of the object, so no map-shaped
-/// predicate can see it; closing it means threading the predicate
-/// through all four walkers.
-fn opaque_subtree(map: &Map<String, Value>, ctx: Option<&ParsedContext>) -> bool {
-    if !map.contains_key("@value") {
-        return false;
-    }
-    let type_val = map.get("@type").or_else(|| {
-        let alias = ctx?.type_key.as_str();
-        if alias == "@type" {
-            None
-        } else {
-            map.get(alias)
+/// What one transaction's lowering threads through its clauses: the labels
+/// and variables it mints, and the `where` patterns its retractions by
+/// selector add.
+pub(crate) struct Lowering {
+    /// When `true`, an empty `@annotation: {}` mints a property-less
+    /// annotation node (LPG mode — a Cypher relationship keeps its identity
+    /// without properties). When `false` (RDF default), an empty block is a
+    /// no-op and inserts stay idempotent at the `(s, p, o)` level. See
+    /// `docs/concepts/edge-annotations.md` "Empty annotation blocks".
+    lpg_mode: bool,
+    next_blank: usize,
+    next_var: u32,
+    where_patterns: Vec<Value>,
+}
+
+impl Lowering {
+    /// `first_var`: the first index a retraction's variable may take
+    /// ([`next_synth_var_index`]).
+    pub(crate) fn new(lpg_mode: bool, first_var: u32) -> Self {
+        Self {
+            lpg_mode,
+            next_blank: 0,
+            next_var: first_var,
+            where_patterns: Vec::new(),
         }
-    });
-    let Some(type_iri) = type_val.and_then(Value::as_str) else {
-        return false;
-    };
-    if type_iri == "@json" || type_iri == rdf::JSON {
-        return true;
     }
-    // Compact / aliased datatype IRIs resolve the same way the literal
-    // parser resolves them. Non-strict: an unresolvable datatype is
-    // some other type's problem, not this predicate's.
-    ctx.is_some_and(|c| {
-        super::jsonld::expand_datatype_iri(type_iri, c, false)
-            .is_ok_and(|expanded| expanded == rdf::JSON)
-    })
+
+    /// The `where` patterns that bind the retractions by selector.
+    pub(crate) fn into_where_patterns(self) -> Vec<Value> {
+        self.where_patterns
+    }
+
+    fn mint_blank(&mut self) -> String {
+        let id = format!("{ANN_BLANK_PREFIX}{}", self.next_blank);
+        self.next_blank += 1;
+        id
+    }
+
+    fn mint_var(&mut self) -> String {
+        let var = format!("{SYNTH_VAR_PREFIX}{}", self.next_var);
+        self.next_var += 1;
+        var
+    }
 }
 
-fn lower_object_with_subject(
-    map: &mut Map<String, Value>,
-    _parent_subject: Option<&str>,
-    walk: &WalkCtx<'_>,
-    ctx: &mut LowerCtx,
+/// Lower the annotations in `expanded`, a clause's expansion that
+/// [`refuse_reserved_iris`] has read. Each annotation on a property's value
+/// becomes a node naming the edge in `f:reifies*` slots, included in the node
+/// the edge is written from, so it is written in the edge's scope; each
+/// `@reifies` names its triple in slots on its own node. `graph` is the graph
+/// the clause is written in (a `["graph", <name>, …]` item's name), which a
+/// retraction's `where` pattern reads.
+pub(crate) fn lower_expanded(
+    expanded: &mut Value,
+    clause: Clause,
+    graph: Option<&str>,
+    lowering: &mut Lowering,
 ) -> Result<()> {
-    // Value/list/variable objects must not be lowered as nodes —
-    // they describe a literal, an ordered collection, or a variable
-    // reference, none of which are subjects in their own right.
-    //
-    // The early-return must NOT skip the annotation-keyword scan
-    // inside the wrapper's contents: e.g. `@list` items are full
-    // node-maps and could carry `@annotation` (the deferred list-
-    // occurrence shape), and `@variable` wrappers could be misused
-    // to embed a deferred shape. We scan the wrapper once and
-    // reject any deferred mention before returning.
-    //
-    // The scanner decides for itself what it may not read into (see
-    // [`opaque_subtree`]); there is deliberately no `@json` branch
-    // here. A wrapper may declare the alias it is typed with, so
-    // merge its own `@context` first — the walker's merge below is
-    // past this return. An unparseable one is an error everywhere
-    // else in this module, and the firewall scan has already rejected
-    // it by the time we get here.
-    if is_jsonld_value_object(map) {
-        let wrapper_ctx: Option<ParsedContext> = match map.get("@context") {
-            Some(local_ctx) => Some(
-                fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(
-                    |e| {
-                        TransactError::Parse(format!(
-                            "failed to parse nested @context during edge-annotation lowering: {e}"
-                        ))
-                    },
-                )?,
-            ),
-            None => None,
-        };
-        scan_annotation_keywords_in_map(map, wrapper_ctx.as_ref().unwrap_or(walk.json_ld))?;
-        return Ok(());
-    }
+    lower_nodes(expanded, Walk { clause, graph }, lowering)
+}
 
-    // Transaction-wrapper form: an UPDATE-style document
-    // `{"where": ..., "delete": ..., "insert": ..., "upsert": ...,
-    // "values": ..., "opts": ..., "ledger": ..., "@context": ...}`.
-    // The wrapper itself is not a node — it carries no predicates of
-    // its own — so we must not mint an `@id` for it. Recurse into the
-    // value of each clause that can carry annotations as if it were
-    // a fresh top-level document. `where`, `values`, `opts`, and
-    // `ledger` are query/control clauses (no annotations to lower at
-    // this layer) so we skip them.
-    //
-    // The update's own `graph` key needs no handling here: each annotation
-    // node is included in its edge's subject node, so it is written in
-    // whatever scope the parser gives that node. `next_anon_id` stays
-    // shared so blank-node ids don't collide across clauses.
-    if is_transaction_wrapper(map) {
-        let clause_walk = WalkCtx {
-            root: false,
-            ..*walk
-        };
-        for clause in ["insert", "delete", "upsert"] {
-            if let Some(clause_val) = map.get_mut(clause) {
-                lower_clause_value(clause_val, &clause_walk, ctx)?;
+/// Where the walk is: the clause, and the graph a retraction's `where`
+/// pattern names (as written, for the `where` to resolve as the templates do).
+#[derive(Clone, Copy)]
+struct Walk<'g> {
+    clause: Clause,
+    graph: Option<&'g str>,
+}
+
+/// Nodes no property holds: the document, a graph's content, `@included`.
+fn lower_nodes(value: &mut Value, walk: Walk<'_>, lowering: &mut Lowering) -> Result<()> {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                lower_nodes(item, walk, lowering)?;
             }
+            Ok(())
         }
-        return Ok(());
+        Value::Object(map) => lower_node(map, walk, lowering),
+        _ => Ok(()),
     }
+}
 
-    // Merge any per-node `@context` into the walker's parent context.
-    // Without this, a node-local term definition (e.g. `"joinedAt":
-    // { "@id": "...", "@type": "xsd:date" }`) would apply at JSON-LD
-    // expansion time but be invisible to
-    // `reject_context_coercion_on_annotated_literal`, allowing the
-    // base flake's `EdgeKey` to diverge from the synthesized
-    // `f:reifies*` bundle. Mirrors the firewall scanner's context
-    // merge logic. The root's own `@context` is already in `walk.json_ld`.
-    let local_merged: Option<ParsedContext> = if walk.root {
-        None
-    } else if let Some(local_ctx) = map.get("@context") {
-        Some(
-            fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(
-                |e| {
-                    TransactError::Parse(format!(
-                        "failed to parse nested @context during edge-annotation lowering: {e}"
-                    ))
-                },
-            )?,
-        )
-    } else {
-        None
-    };
-    let effective_json_ld: &ParsedContext = local_merged.as_ref().unwrap_or(walk.json_ld);
-
-    // This node's `@graph` entry, read by the classifier the parser uses.
-    let graph_key = graph_entry_key(map, effective_json_ld, walk.root);
-    let has_id = map.contains_key("@id")
-        || (effective_json_ld.id_key != "@id" && map.contains_key(&effective_json_ld.id_key));
-    // The document's own top-level `@graph` is read the way the parser reads
-    // it (`doc_shape`): without an `@id`, any node content, a bare `{"@id"}`
-    // included, makes the document an envelope.
-    let root_envelope = walk.root
-        && !has_id
-        && map
-            .get("@graph")
-            .is_some_and(|g| matches!(fluree_graph_json_ld::is_envelope_graph(g, false), Ok(true)));
-    let (content_graph, content_in_scope) = match graph_key
-        .as_ref()
-        .and_then(|k| map.get(k))
-        .map(classify_graph_value)
+/// Lower one expanded node object: its `@reifies`, the annotations on its
+/// properties' values, and the nodes it holds. The annotations a property's
+/// value carries are taken off it before the value is walked, so one left on
+/// a node is on a node no property holds, and names no edge.
+fn lower_node(map: &mut Map<String, Value>, walk: Walk<'_>, lowering: &mut Lowering) -> Result<()> {
+    if let Some(key) = [ANNOTATION_KEY, EDGE_KEY]
+        .into_iter()
+        .find(|k| map.contains_key(*k))
     {
-        _ if root_envelope => (false, true),
-        Some(GraphValue::Selector(_)) => (false, false),
-        // A JSON-LD named graph: its content is nodes in the graph its `@id`
-        // names.
-        Some(GraphValue::Content(_)) if has_id => (true, false),
-        // An envelope (a graph object without `@id`): the content nodes are
-        // in this scope, and the wrapper's other keys are not a node's
-        // properties.
-        Some(GraphValue::Content(_)) => (false, true),
-        // An invalid `@graph` value (a value object, a number, ...) is the
-        // parser's to refuse, but an annotation keyword inside it is refused
-        // here by name, as on any other value wrapper.
-        Some(GraphValue::Invalid(_)) => {
-            if let Some(value) = graph_key.as_ref().and_then(|k| map.get(k)) {
-                scan_nested_annotation_keywords(value, effective_json_ld)?;
-            }
-            (false, false)
-        }
-        None => (false, false),
-    };
-    let child_walk = WalkCtx {
-        json_ld: effective_json_ld,
-        root: false,
-    };
-    if content_in_scope {
-        if let Some(content) = graph_key.as_ref().and_then(|k| map.get_mut(k)) {
-            lower_value_with_subject(content, None, &child_walk, ctx)?;
-        }
+        return Err(TransactError::UnsupportedFeature(format!(
+            "{key} as a top-level node property (without an enclosing predicate) \
+             is the deferred unasserted-reifier shape (v1)"
+        )));
+    }
+    // A literal: its `@value` is not JSON-LD (a `@json` one is a document of
+    // its own).
+    if map.contains_key("@value") {
         return Ok(());
     }
-
-    // 1. Honor `@reifies` on this node. Subject minting must use the
-    //    merged context so a node-local `@id` alias is recognized.
-    if map.contains_key(REIFIES_KEY) {
-        let val = map.remove(REIFIES_KEY).unwrap();
-        // The lower function reads `map`'s `@id` directly, so the mint
-        // must run first.
-        let reifier = ensure_subject_id(map, &child_walk, ctx);
-        lower_reifies_block(map, &reifier, val, effective_json_ld)?;
+    if let Some(items) = map.get("@list") {
+        return refuse_annotations_within(items, "a @list");
+    }
+    if let Some(Value::Object(term)) = map.get("@id") {
+        refuse_annotations_within_map(term, "a triple term")?;
     }
 
-    // 2. Walk predicate-value pairs. Skip JSON-LD keywords plus their
-    //    context aliases (e.g. `"id": "@id"`) so we don't treat the
-    //    aliased subject reference as a regular predicate. Use the
-    //    merged context for alias resolution — a node-local `"id":
-    //    "@id"` override must be honored or the surrounding mints /
-    //    intercepts would treat the aliased id as a regular predicate.
-    //
-    // **Lazy @id minting.** Only mint `@id` for this node when an
-    // annotation is actually being intercepted on one of its
-    // predicates. Minting unconditionally would:
-    //   (a) corrupt non-node objects that flow through this path
-    //       (e.g. txn-meta values like `ex:invalid: {"foo": "bar"}`),
-    //       making them look like valid JSON-LD nodes and bypassing
-    //       downstream validation; and
-    //   (b) introduce stray subjects that the rest of the parser
-    //       would expand into spurious flakes.
-    //
-    // The original eager-mint behavior caused regressions in
-    // `it_select_star_novelty_retract::expansion_applies_novelty_retractions`,
-    // `it_transact::object_var_test`, and the `it_txn_meta::*`
-    // negative-validation tests when the lowering pass ran on
-    // ordinary (non-annotation) transactions.
-    //
-    // Each annotation found becomes a node included in this node (the
-    // subject or, for a reverse property, the object of the edges it
-    // annotates), added once the walk is done.
-    let id_alias = effective_json_ld.id_key.as_str();
-    let type_alias = effective_json_ld.type_key.as_str();
-    let keys: Vec<String> = map.keys().cloned().collect();
-    let mut minted_id: Option<String> = read_existing_subject_id(map, &child_walk);
-    let mut included: Vec<Value> = Vec::new();
-    for key in keys {
-        if key == "@id" || key == "@context" || key == "@graph" || key == "@type" {
+    // The graph this node's statements are in: its own selector, else the
+    // enclosing node's; a named graph's content is in the graph it names.
+    let selector = match map.get("@graph") {
+        Some(Value::String(raw)) => Some(raw.clone()),
+        _ => None,
+    };
+    let walk = Walk {
+        graph: selector.as_deref().or(walk.graph),
+        ..walk
+    };
+    let named = match (map.get("@graph"), map.get("@id")) {
+        (Some(Value::Array(_) | Value::Object(_)), Some(Value::String(id))) => Some(id.clone()),
+        _ => None,
+    };
+
+    if let Some(reifies) = map.remove(REIFIES_KEY) {
+        let reifier = node_id(map, lowering)?;
+        lower_reifies_block(map, &reifier, reifies)?;
+    }
+
+    if let Some(nodes) = map.get_mut("@included") {
+        lower_nodes(nodes, walk, lowering)?;
+    }
+    if let Some(content) = map.get_mut("@graph").filter(|g| !g.is_string()) {
+        let content_walk = Walk {
+            graph: named.as_deref().or(walk.graph),
+            ..walk
+        };
+        lower_nodes(content, content_walk, lowering)?;
+    }
+
+    let mut included = Vec::new();
+    let properties: Vec<String> = map
+        .keys()
+        .filter(|k| !k.starts_with('@'))
+        .cloned()
+        .collect();
+    for property in properties {
+        let end = edge_end(map, &property, walk.clause, lowering)?;
+        let Some(Value::Array(values)) = map.get_mut(&property) else {
             continue;
-        }
-        if graph_key.as_deref() == Some(key.as_str()) {
-            continue;
-        }
-        if key == id_alias || key == type_alias {
-            continue;
-        }
-        if is_annotation_key(&key) {
-            return Err(TransactError::UnsupportedFeature(format!(
-                "{key} as a top-level node property (without an enclosing predicate) \
-                 is the deferred unasserted-reifier shape (v1)"
-            )));
-        }
-
-        let edge = classify_edge_key(&key, effective_json_ld);
-        match edge {
-            EdgeKey::Keyword("@index") => continue,
-            // Included nodes are nodes in their own right, in this scope.
-            EdgeKey::Keyword("@included") => {
-                if let Some(v) = map.get_mut(&key) {
-                    lower_value_with_subject(v, None, &child_walk, ctx)?;
-                }
-                continue;
-            }
-            // A nested value's properties are this node's: an annotation
-            // inside it would be lowered against the wrong edge.
-            EdgeKey::Keyword("@nest") => {
-                if map.get(&key).is_some_and(value_subtree_carries_annotation) {
-                    return Err(TransactError::Parse(
-                        "edge annotations inside @nest are not supported; state the edge as an \
-                         ordinary property of its subject"
-                            .to_string(),
-                    ));
-                }
-                continue;
-            }
-            _ => {}
-        }
-
-        // Mint this node's @id lazily — only if the value actually carries
-        // an annotation we'll need to anchor. Use an immutable peek first so
-        // the borrow of `map` is released before we hand it back mutably to
-        // `ensure_subject_id`.
-        if minted_id.is_none() && map.get(&key).is_some_and(value_subtree_carries_annotation) {
-            minted_id = Some(ensure_subject_id(map, &child_walk, ctx));
-        }
-        // `intercept_annotations_for_edges` only consults the node's id
-        // when it finds an annotation block; a placeholder is safe when no
-        // annotation is present because it returns early without using it.
-        let node_id = minted_id.clone().unwrap_or_default();
-
-        let value = map.get_mut(&key).expect("key collected from this map");
-        match edge {
-            // `@reverse`: a map of properties whose values are the subjects
-            // of edges pointing at this node.
-            EdgeKey::Keyword("@reverse") => {
-                if let Value::Object(reverse) = value {
-                    for (property, values) in reverse.iter_mut() {
-                        let direction = Direction::Reverse { object: &node_id };
-                        intercept_annotations_for_edges(
-                            direction,
-                            property,
-                            values,
-                            &child_walk,
-                            ctx,
-                            &mut included,
-                        )?;
-                    }
-                }
-            }
-            // A term defined with `@reverse`: its values are the subjects.
-            EdgeKey::Reverse(property) => {
-                let direction = Direction::Reverse { object: &node_id };
-                intercept_annotations_for_edges(
-                    direction,
-                    &property,
-                    value,
-                    &child_walk,
-                    ctx,
-                    &mut included,
-                )?;
-            }
-            _ => {
-                let direction = Direction::Forward { subject: &node_id };
-                intercept_annotations_for_edges(
-                    direction,
-                    &key,
-                    value,
-                    &child_walk,
-                    ctx,
-                    &mut included,
-                )?;
-            }
-        }
-
-        // Recurse into the rewritten value to catch nested forms.
-        if let Some(v) = map.get_mut(&key) {
-            let parent_ref = minted_id.as_deref();
-            lower_value_with_subject(v, parent_ref, &child_walk, ctx)?;
+        };
+        let values = std::mem::take(values);
+        let edge = Edge::Forward {
+            subject: end.as_deref(),
+            predicate: &property,
+        };
+        let kept = lower_values(values, edge, walk, lowering, &mut included)?;
+        if kept.is_empty() {
+            map.remove(&property);
+        } else {
+            map.insert(property, Value::Array(kept));
         }
     }
 
-    // A named graph's content: nodes in the graph the node names.
-    if content_graph {
-        if let Some(content) = graph_key.as_ref().and_then(|key| map.get_mut(key)) {
-            lower_value_with_subject(content, None, &child_walk, ctx)?;
+    // `@reverse`: properties whose values are the subjects of edges pointing
+    // at this node.
+    if let Some(Value::Object(reverse)) = map.get_mut("@reverse") {
+        let mut reverse = std::mem::take(reverse);
+        let annotated = reverse.values().any(values_carry_annotation);
+        let end = if annotated {
+            end_id(map, walk.clause, lowering)?
+        } else {
+            None
+        };
+        let properties: Vec<String> = reverse.keys().cloned().collect();
+        for property in properties {
+            let Some(Value::Array(values)) = reverse.get_mut(&property) else {
+                continue;
+            };
+            let values = std::mem::take(values);
+            let edge = Edge::Reverse {
+                object: end.as_deref(),
+                predicate: &property,
+            };
+            let kept = lower_values(values, edge, walk, lowering, &mut included)?;
+            if kept.is_empty() {
+                reverse.remove(&property);
+            } else {
+                reverse.insert(property, Value::Array(kept));
+            }
+        }
+        if reverse.is_empty() {
+            map.remove("@reverse");
+        } else {
+            map.insert("@reverse".to_string(), Value::Object(reverse));
         }
     }
 
     if !included.is_empty() {
-        include_nodes(map, effective_json_ld, included);
+        include_nodes(map, included);
     }
     Ok(())
 }
 
-/// What a node's key is, as an edge of that node: a JSON-LD keyword
-/// (directly or through a context alias), a term defined with `@reverse`
-/// (its values are the subjects of edges pointing at the node; the reverse
-/// property's IRI), or an ordinary property.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum EdgeKey<'a> {
-    Keyword(&'a str),
-    Reverse(String),
-    Forward,
-}
-
-/// Classify `key` against `ctx`. Shared by the insert and delete walkers, so
-/// both read a key the same way the expander does.
-fn classify_edge_key<'a>(key: &'a str, ctx: &'a ParsedContext) -> EdgeKey<'a> {
-    if key.starts_with('@') {
-        return EdgeKey::Keyword(key);
-    }
-    match ctx.get(key) {
-        Some(entry) => match (&entry.id, &entry.reverse) {
-            (Some(id), _) if id.starts_with('@') => EdgeKey::Keyword(id.as_str()),
-            (None, Some(reverse)) => EdgeKey::Reverse(reverse.clone()),
-            _ => EdgeKey::Forward,
-        },
-        None => EdgeKey::Forward,
+/// The node's end of the edges `property` writes, when one of its values
+/// carries an annotation: the node's `@id` (minted when an assertion needs
+/// one). `None` when no value is annotated.
+fn edge_end(
+    map: &mut Map<String, Value>,
+    property: &str,
+    clause: Clause,
+    lowering: &mut Lowering,
+) -> Result<Option<String>> {
+    if map.get(property).is_some_and(values_carry_annotation) {
+        end_id(map, clause, lowering)
+    } else {
+        Ok(None)
     }
 }
 
-/// Add `nodes` to `map`'s `@included` (under the key the document already
-/// uses for it, a context alias included), keeping any nodes already there.
-fn include_nodes(map: &mut Map<String, Value>, ctx: &ParsedContext, nodes: Vec<Value>) {
-    let key = map
-        .keys()
-        .find(|k| classify_edge_key(k, ctx) == EdgeKey::Keyword("@included"))
-        .cloned()
-        .unwrap_or_else(|| "@included".to_string());
-    match map.get_mut(&key) {
+/// This node's `@id`, as an end of an annotated edge. An assertion mints a
+/// blank node for a node without one; a retraction names the node it
+/// retracts from, and gets `None` here.
+fn end_id(
+    map: &mut Map<String, Value>,
+    clause: Clause,
+    lowering: &mut Lowering,
+) -> Result<Option<String>> {
+    match clause {
+        Clause::Assert => node_id(map, lowering).map(Some),
+        Clause::Retract => Ok(map.get("@id").and_then(Value::as_str).map(String::from)),
+    }
+}
+
+/// `map`'s `@id`, minting a blank node when it has none, so the annotation
+/// and the parser name the same node.
+fn node_id(map: &mut Map<String, Value>, lowering: &mut Lowering) -> Result<String> {
+    match map.get("@id") {
+        Some(Value::String(id)) => Ok(id.clone()),
+        Some(_) => Err(TransactError::Parse(
+            "an annotated edge's subject must be a node named by an IRI or a blank node"
+                .to_string(),
+        )),
+        None => {
+            let id = lowering.mint_blank();
+            map.insert("@id".to_string(), json!(id));
+            Ok(id)
+        }
+    }
+}
+
+/// Whether one of a property's expanded values carries an annotation or the
+/// lifetime shorthand.
+fn values_carry_annotation(values: &Value) -> bool {
+    let carries = |v: &Value| {
+        v.as_object()
+            .is_some_and(|m| m.keys().any(|k| is_annotation_key(k) || is_ttl_key(k)))
+    };
+    match values {
+        Value::Array(items) => items.iter().any(carries),
+        other => carries(other),
+    }
+}
+
+/// Which end of an annotated edge the walked node is.
+#[derive(Clone, Copy)]
+enum Edge<'a> {
+    /// The node is the subject; each value is an edge's object.
+    Forward {
+        subject: Option<&'a str>,
+        predicate: &'a str,
+    },
+    /// A reverse property: each value is an edge's subject, and the node is
+    /// the object.
+    Reverse {
+        object: Option<&'a str>,
+        predicate: &'a str,
+    },
+}
+
+/// Lower the annotations on one property's values and walk the nodes among
+/// them. Returns the values kept: a retraction takes its edge out, as a
+/// retraction by annotation does not retract the edge.
+fn lower_values(
+    values: Vec<Value>,
+    edge: Edge<'_>,
+    walk: Walk<'_>,
+    lowering: &mut Lowering,
+    included: &mut Vec<Value>,
+) -> Result<Vec<Value>> {
+    let mut kept = Vec::with_capacity(values.len());
+    for mut value in values {
+        if !lower_value(&mut value, edge, walk, lowering, included)? {
+            continue;
+        }
+        if let Value::Object(node) = &mut value {
+            lower_node(node, walk, lowering)?;
+        }
+        kept.push(value);
+    }
+    Ok(kept)
+}
+
+/// Lower the annotation on `value`, one value of an edge: an assertion
+/// includes an annotation node, a retraction a retract template (and, by
+/// selector, a `where` pattern). Returns whether the value stays.
+fn lower_value(
+    value: &mut Value,
+    edge: Edge<'_>,
+    walk: Walk<'_>,
+    lowering: &mut Lowering,
+    included: &mut Vec<Value>,
+) -> Result<bool> {
+    let Value::Object(map) = value else {
+        return Ok(true);
+    };
+    if map.contains_key(ANNOTATION_KEY) && map.contains_key(EDGE_KEY) {
+        return Err(TransactError::Parse(
+            "edge annotation: cannot specify both @annotation and @edge on the same object"
+                .to_string(),
+        ));
+    }
+    match walk.clause {
+        Clause::Assert => fold_ttl_shorthand(map)?,
+        Clause::Retract if map.keys().any(|k| is_ttl_key(k)) => {
+            return Err(TransactError::Parse(
+                "@ttl / @expiresAt set the lifetime of an inserted value; they do not \
+                 apply in a delete"
+                    .to_string(),
+            ))
+        }
+        Clause::Retract => {}
+    }
+    let Some(blocks) = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY)) else {
+        return Ok(true);
+    };
+    let (node_end, predicate) = match edge {
+        Edge::Forward { subject, predicate } => (subject, predicate),
+        Edge::Reverse { object, predicate } => (object, predicate),
+    };
+    let Some(node_end) = node_end else {
+        return Err(TransactError::Parse(
+            "delete-clause @annotation requires the enclosing predicate to have a parent @id \
+             (the subject of the reified edge)"
+                .to_string(),
+        ));
+    };
+    reject_deferred_object_wrappers(map)?;
+
+    // `@language` without `@value` reaches the classifier, which refuses it.
+    let literal = map.contains_key("@value") || map.contains_key("@language");
+    let (subject, object) = match edge {
+        Edge::Forward { .. } => {
+            let object = if literal {
+                classify_reified_object(map)?
+            } else if let Some(term @ Value::Object(_)) = map.get("@id") {
+                ReifiedObjectShape::TripleTerm(term.clone())
+            } else {
+                ReifiedObjectShape::Iri(value_id(map, walk.clause, lowering)?)
+            };
+            (node_end.to_string(), object)
+        }
+        Edge::Reverse { .. } => {
+            if literal {
+                return Err(TransactError::Parse(format!(
+                    "a reverse property's value is a node, the subject of the edge; \
+                     '{predicate}' has a literal value"
+                )));
+            }
+            let subject = value_id(map, walk.clause, lowering)?;
+            (subject, ReifiedObjectShape::Iri(node_end.to_string()))
+        }
+    };
+    let blocks = match blocks {
+        Value::Array(blocks) => blocks,
+        block => vec![block],
+    };
+    let edge = (subject.as_str(), predicate, &object);
+    match walk.clause {
+        Clause::Assert => {
+            for block in blocks {
+                if let Some(node) = annotation_node(edge, block, lowering)? {
+                    included.push(node);
+                }
+            }
+            Ok(true)
+        }
+        Clause::Retract => {
+            for block in blocks {
+                included.push(retraction(edge, block, walk.graph, lowering)?);
+            }
+            Ok(false)
+        }
+    }
+}
+
+/// The `@id` of a value that is an annotated edge's node end. An assertion
+/// mints one for a node without it; a retraction must name it.
+fn value_id(
+    map: &mut Map<String, Value>,
+    clause: Clause,
+    lowering: &mut Lowering,
+) -> Result<String> {
+    if clause == Clause::Retract && !map.contains_key("@id") {
+        return Err(TransactError::Parse(
+            "delete-clause @annotation requires the parent object node to carry an explicit \
+             @id (the object of the reified edge)"
+                .to_string(),
+        ));
+    }
+    node_id(map, lowering)
+}
+
+/// An annotated edge: subject, predicate and object.
+type AnnotatedEdge<'a> = (&'a str, &'a str, &'a ReifiedObjectShape);
+
+/// The `f:reifies*` slots naming `edge`, in expanded form.
+fn edge_slots((subject, predicate, object): AnnotatedEdge<'_>) -> Map<String, Value> {
+    let mut slots = Map::new();
+    slots.insert(
+        reifies_iris::SUBJECT.to_string(),
+        json!([{ "@id": subject }]),
+    );
+    slots.insert(
+        reifies_iris::PREDICATE.to_string(),
+        json!([{ "@id": predicate }]),
+    );
+    let (object, lang) = emit_reifies_object_payload(object);
+    slots.insert(reifies_iris::OBJECT.to_string(), json!([object]));
+    // `fold_slots_into_links` takes the term's language from this slot.
+    if let Some(lang) = lang {
+        slots.insert(reifies_iris::LANG.to_string(), json!([{ "@value": lang }]));
+    }
+    slots
+}
+
+/// The node for one annotation of `edge`: its `@id` (the reifier, minted
+/// when the annotation has none), the edge's slots, and the annotation's
+/// properties. `None` for an empty annotation in RDF mode.
+fn annotation_node(
+    edge: AnnotatedEdge<'_>,
+    block: Value,
+    lowering: &mut Lowering,
+) -> Result<Option<Value>> {
+    let mut node = annotation_body(block)?;
+    if node.is_empty() && !lowering.lpg_mode {
+        return Ok(None);
+    }
+    refuse_annotations_in_body(&node)?;
+    let id = match node.get("@id") {
+        Some(Value::String(id)) => id.clone(),
+        Some(_) => {
+            return Err(TransactError::Parse(
+                "an annotation's @id must name a node".to_string(),
+            ))
+        }
+        None => lowering.mint_blank(),
+    };
+    node.insert("@id".to_string(), json!(id));
+    node.extend(edge_slots(edge));
+    Ok(Some(Value::Object(node)))
+}
+
+/// The retract template for one annotation of `edge` in a `delete`: by the
+/// annotation's `@id`, or, without one, by a variable that a `where` pattern
+/// binds to each annotation of the edge whose properties match the body's.
+fn retraction(
+    edge: AnnotatedEdge<'_>,
+    block: Value,
+    graph: Option<&str>,
+    lowering: &mut Lowering,
+) -> Result<Value> {
+    let mut body = annotation_body(block)?;
+    let id = match body.remove("@id") {
+        Some(Value::String(id)) => {
+            // A client's blank-node label is minted fresh at insert time and
+            // names no stored node; a stable `_:fdb-…` id from a query does.
+            if id.starts_with("_:") && crate::namespace::stable_blank_node_sid(&id).is_none() {
+                return Err(TransactError::UnsupportedFeature(
+                    "delete by anonymous annotation @id is not supported — client blank-node \
+                     labels are minted fresh at insert time and not user-addressable. Use the \
+                     stable `_:fdb-...` id returned by a query, a selector form (no @id, body \
+                     properties only), or attach an explicit @id at insert."
+                        .to_string(),
+                ));
+            }
+            id
+        }
+        Some(_) => {
+            return Err(TransactError::Parse(
+                "an annotation's @id must name a node".to_string(),
+            ))
+        }
+        None => {
+            refuse_annotations_in_body(&body)?;
+            let var = lowering.mint_var();
+            let pattern = selector_pattern(&var, &body, edge, graph);
+            lowering.where_patterns.push(pattern);
+            var
+        }
+    };
+    let mut template = edge_slots(edge);
+    template.insert("@id".to_string(), json!(id));
+    Ok(Value::Object(template))
+}
+
+/// The `where` node a retraction by selector binds `var` with: the body's
+/// properties, and the query-side `@reifies` naming the edge, in the edge's
+/// graph.
+fn selector_pattern(
+    var: &str,
+    body: &Map<String, Value>,
+    (subject, predicate, object): AnnotatedEdge<'_>,
+    graph: Option<&str>,
+) -> Value {
+    let mut node: Map<String, Value> = body
+        .iter()
+        .map(|(k, v)| (k.clone(), where_value(v)))
+        .collect();
+    node.insert("@id".to_string(), json!(var));
+    let (object, _) = emit_reifies_object_payload(object);
+    node.insert(
+        REIFIES_KEY.to_string(),
+        json!({ "@id": subject, predicate: object }),
+    );
+    if let Some(graph) = graph {
+        node.insert("@graph".to_string(), json!(graph));
+    }
+    Value::Object(node)
+}
+
+/// An expanded value as a `where` reads it: a property's one value bare (the
+/// `where` takes no array of values), and a plain literal as its scalar,
+/// which the `where` reads as the document wrote it (a `?var` included).
+fn where_value(value: &Value) -> Value {
+    match value {
+        Value::Array(items) if items.len() == 1 => where_value(&items[0]),
+        Value::Array(items) => Value::Array(items.iter().map(where_value).collect()),
+        Value::Object(map) => {
+            if let (1, Some(scalar)) = (map.len(), map.get("@value")) {
+                if !scalar.is_object() && !scalar.is_array() {
+                    return scalar.clone();
+                }
+            }
+            if map.contains_key("@value") || map.contains_key("@list") {
+                return value.clone();
+            }
+            Value::Object(
+                map.iter()
+                    .map(|(k, v)| {
+                        (
+                            k.clone(),
+                            if k == "@id" {
+                                v.clone()
+                            } else {
+                                where_value(v)
+                            },
+                        )
+                    })
+                    .collect(),
+            )
+        }
+        other => other.clone(),
+    }
+}
+
+/// An `@annotation` value, which describes a node.
+fn annotation_body(block: Value) -> Result<Map<String, Value>> {
+    match block {
+        Value::Object(map) if !map.contains_key("@value") => Ok(map),
+        _ => Err(TransactError::Parse(
+            "@annotation value must be a JSON object describing the annotation subject".to_string(),
+        )),
+    }
+}
+
+/// Refuse an annotation keyword in an annotation's body: annotation of an
+/// annotation, and a triple term nested in one, are deferred (v1).
+fn refuse_annotations_in_body(body: &Map<String, Value>) -> Result<()> {
+    find_annotation_keyword(body).map_or(Ok(()), |k| {
+        Err(TransactError::UnsupportedFeature(if k == REIFIES_KEY {
+            "@reifies nested inside an @annotation body is the deferred nested-triple-term \
+             shape (v1)"
+                .to_string()
+        } else {
+            format!(
+                "{k} nested inside an @annotation body is the deferred \
+                 annotation-of-annotation shape (v1)"
+            )
+        }))
+    })
+}
+
+/// Refuse an annotation keyword anywhere in `value`, which is `place` (a
+/// list, a triple term): no statement in it can be annotated in v1.
+fn refuse_annotations_within(value: &Value, place: &str) -> Result<()> {
+    match value {
+        Value::Object(map) => refuse_annotations_within_map(map, place),
+        Value::Array(items) => items
+            .iter()
+            .try_for_each(|item| refuse_annotations_within(item, place)),
+        _ => Ok(()),
+    }
+}
+
+fn refuse_annotations_within_map(map: &Map<String, Value>, place: &str) -> Result<()> {
+    find_annotation_keyword(map).map_or(Ok(()), |k| {
+        Err(TransactError::UnsupportedFeature(format!(
+            "{k} inside {place} is deferred (v1): edge annotations name statements of a node"
+        )))
+    })
+}
+
+/// The first annotation keyword (`@annotation`, `@edge`, `@reifies`) in the
+/// expanded `map` or the nodes it holds. A literal's `@value` is not read.
+fn find_annotation_keyword(map: &Map<String, Value>) -> Option<&'static str> {
+    for (k, v) in map {
+        if let Some(keyword) = [ANNOTATION_KEY, EDGE_KEY, REIFIES_KEY]
+            .into_iter()
+            .find(|keyword| k == keyword)
+        {
+            return Some(keyword);
+        }
+        if k == "@value" {
+            continue;
+        }
+        let found = match v {
+            Value::Object(inner) => find_annotation_keyword(inner),
+            Value::Array(items) => items.iter().find_map(|item| match item {
+                Value::Object(inner) => find_annotation_keyword(inner),
+                _ => None,
+            }),
+            _ => None,
+        };
+        if found.is_some() {
+            return found;
+        }
+    }
+    None
+}
+
+/// Add `nodes` to `map`'s `@included`, keeping any nodes already there.
+fn include_nodes(map: &mut Map<String, Value>, nodes: Vec<Value>) {
+    match map.get_mut("@included") {
         Some(Value::Array(existing)) => existing.extend(nodes),
         Some(single) => {
             let node = std::mem::take(single);
             *single = Value::Array(std::iter::once(node).chain(nodes).collect());
         }
         None => {
-            map.insert(key, Value::Array(nodes));
+            map.insert("@included".to_string(), Value::Array(nodes));
         }
     }
 }
 
-/// Lower an update clause's value. A `["graph", <name>, <pattern>]` item
-/// scopes its pattern to that graph, exactly as the parser scopes it.
-fn lower_clause_value(value: &mut Value, walk: &WalkCtx<'_>, ctx: &mut LowerCtx) -> Result<()> {
-    let Value::Array(items) = value else {
-        return lower_value_with_subject(value, None, walk, ctx);
-    };
-    for item in items.iter_mut() {
-        match graph_sugar_mut(item) {
-            Some((_, pattern)) => lower_value_with_subject(pattern, None, walk, ctx)?,
-            None => lower_value_with_subject(item, None, walk, ctx)?,
+/// Lower a `@reifies` value on the node `reifier`: the node is a reifier,
+/// and each triple named becomes its `rdf:reifies` link without being
+/// asserted (RDF 1.2). The first triple's slots ride on the node, each other
+/// one's on a node with the same `@id` included in it, so in its scope.
+fn lower_reifies_block(map: &mut Map<String, Value>, reifier: &str, reifies: Value) -> Result<()> {
+    let blocks = match reifies {
+        Value::Array(blocks) if !blocks.is_empty() => blocks,
+        Value::Array(_) => {
+            return Err(TransactError::Parse(
+                "@reifies must describe at least one triple".to_string(),
+            ))
         }
+        block => vec![block],
+    };
+    let mut included = Vec::new();
+    for (i, block) in blocks.iter().enumerate() {
+        let slots = reifies_slots(block)?;
+        if i == 0 {
+            map.extend(slots);
+        } else {
+            let mut node = slots;
+            node.insert("@id".to_string(), json!(reifier));
+            included.push(Value::Object(node));
+        }
+    }
+    if !included.is_empty() {
+        include_nodes(map, included);
     }
     Ok(())
 }
 
-/// The name (when it is a graph selector) and pattern of a
-/// `["graph", <name>, <pattern>]` update-template item.
-fn graph_sugar_mut(item: &mut Value) -> Option<(Option<String>, &mut Value)> {
-    let Value::Array(arr) = item else {
-        return None;
+/// The `f:reifies*` slots naming the one triple an expanded `@reifies` value
+/// describes: `{"@id": s, p: [o]}`.
+fn reifies_slots(block: &Value) -> Result<Map<String, Value>> {
+    let Value::Object(block) = block else {
+        return Err(TransactError::Parse(
+            "@reifies value must be a JSON object describing a triple".to_string(),
+        ));
     };
-    if arr.len() != 3 || arr[0].as_str() != Some("graph") {
-        return None;
+    if let Some(k) = find_annotation_keyword(block) {
+        return Err(TransactError::UnsupportedFeature(format!(
+            "{k} inside @reifies is the deferred nested-triple-term shape"
+        )));
     }
-    let name = match classify_graph_value(&arr[1]) {
-        GraphValue::Selector(raw) => Some(raw.to_string()),
-        _ => None,
+    let Some(Value::String(subject)) = block.get("@id") else {
+        return Err(TransactError::Parse(
+            "@reifies must include an @id naming the triple's subject".to_string(),
+        ));
     };
-    Some((name, &mut arr[2]))
-}
-
-/// The key of `map`'s `@graph` entry: the keyword, a context alias of it, or
-/// the legacy bare `graph` key. At the document root a bare `graph` key is
-/// the transaction's routing key, stripped before parsing, not a selector.
-fn graph_entry_key(map: &Map<String, Value>, ctx: &ParsedContext, root: bool) -> Option<String> {
-    if map.contains_key("@graph") {
-        return Some("@graph".to_string());
-    }
-    map.keys()
-        .find(|k| is_graph_key(k, ctx) && !(root && k.as_str() == "graph"))
-        .cloned()
-}
-
-/// Read an already-present subject id from a node-map, honoring the
-/// JSON-LD `@id` alias declared in the active context. Returns `None`
-/// when neither key is present; in that case the caller decides whether
-/// minting is required (see lazy-mint logic above).
-fn read_existing_subject_id(map: &Map<String, Value>, walk: &WalkCtx<'_>) -> Option<String> {
-    if let Some(Value::String(s)) = map.get("@id") {
-        return Some(s.clone());
-    }
-    let id_alias = walk.json_ld.id_key.as_str();
-    if id_alias != "@id" {
-        if let Some(Value::String(s)) = map.get(id_alias) {
-            return Some(s.clone());
+    let pairs: Vec<(&String, &Value)> = block.iter().filter(|(k, _)| !k.starts_with('@')).collect();
+    let [(predicate, objects)] = pairs.as_slice() else {
+        return Err(TransactError::Parse(format!(
+            "@reifies must describe exactly one triple (got {} predicates); \
+             use an array to reify several",
+            pairs.len()
+        )));
+    };
+    let object = match objects {
+        Value::Array(items) if items.len() == 1 => &items[0],
+        Value::Array(_) => {
+            return Err(TransactError::Parse(
+                "@reifies must describe exactly one triple; use an array of @reifies \
+                 blocks to reify several"
+                    .to_string(),
+            ))
         }
-    }
-    None
-}
-
-/// True iff `value`'s structural subtree contains an `@annotation`,
-/// `@edge`, or `@reifies` key. Used to gate the lazy `@id` mint so
-/// we only stamp an id on parent nodes that actually need to anchor
-/// a `f:reifiesSubject` pointer.
-///
-/// Stops at value/list/variable wrappers — those are NOT node-maps
-/// and the deferred-shape rejection inside
-/// `intercept_annotations_for_predicate` handles any annotation key
-/// they might carry.
-fn value_subtree_carries_annotation(value: &Value) -> bool {
-    match value {
-        Value::Object(map) => {
-            if map.contains_key(ANNOTATION_KEY)
-                || map.contains_key(EDGE_KEY)
-                || map.contains_key(REIFIES_KEY)
-                || map.contains_key(TTL_KEY)
-                || map.contains_key(EXPIRES_AT_KEY)
-            {
-                return true;
-            }
-            // Stop at value/list/variable wrappers — they can't host
-            // an annotation in v1, and recursing further would
-            // false-positive on inner keys that happen to match.
-            if is_jsonld_value_object(map) {
-                return false;
-            }
-            map.values().any(value_subtree_carries_annotation)
+        object => object,
+    };
+    let shape = match object {
+        Value::Object(object)
+            if object.contains_key("@value") || object.contains_key("@language") =>
+        {
+            classify_reified_object(object)?
         }
-        Value::Array(items) => items.iter().any(value_subtree_carries_annotation),
-        _ => false,
-    }
-}
-
-/// Which end of the annotated edges the walked node is.
-#[derive(Clone, Copy)]
-enum Direction<'a> {
-    /// The node is the subject; each value is an edge's object.
-    Forward { subject: &'a str },
-    /// A reverse property: each value is an edge's subject, and the node is
-    /// the object.
-    Reverse { object: &'a str },
-}
-
-/// Lower the `@annotation` blocks on `value` (one value, or an array of
-/// them), the objects (or, for a reverse property, the subjects) of the
-/// node's `predicate` edges: each becomes an annotation node, pushed to
-/// `included` for the node to include.
-fn intercept_annotations_for_edges(
-    direction: Direction<'_>,
-    predicate: &str,
-    value: &mut Value,
-    walk: &WalkCtx<'_>,
-    ctx: &mut LowerCtx,
-    included: &mut Vec<Value>,
-) -> Result<()> {
-    match value {
-        Value::Array(items) => {
-            for item in items {
-                intercept_annotations_for_edges(direction, predicate, item, walk, ctx, included)?;
-            }
-            Ok(())
-        }
-        Value::Object(map) => {
-            if map.contains_key(ANNOTATION_KEY) && map.contains_key(EDGE_KEY) {
+        Value::Object(object) if object.len() == 1 => match object.get("@id") {
+            Some(Value::String(id)) => ReifiedObjectShape::Iri(id.clone()),
+            Some(term @ Value::Object(_)) => ReifiedObjectShape::TripleTerm(term.clone()),
+            _ => {
                 return Err(TransactError::Parse(
-                    "edge annotation: cannot specify both @annotation and @edge on the same object"
-                        .to_string(),
-                ));
+                    "@reifies object must be an @id reference or a value".to_string(),
+                ))
             }
-            fold_ttl_shorthand(map)?;
-            let ann_block = map.remove(ANNOTATION_KEY).or_else(|| map.remove(EDGE_KEY));
-            let Some(ann_block) = ann_block else {
-                return Ok(());
-            };
-
-            // Wrapper rejection runs in both branches.
-            reject_deferred_object_wrappers(map)?;
-
-            // Route maps carrying either `@value` or `@language`
-            // through the classifier — both are JSON-LD value-object
-            // signals. The classifier rejects `@language` without a
-            // sibling `@value`, so the Ref branch only receives
-            // object-position node-maps that are unambiguously
-            // identifier references.
-            //
-            // For the Ref branch, we route through `ensure_subject_id`
-            // so context-aliased `@id` keys (e.g. `"id"` under a
-            // custom JSON-LD context) and blank-node minting both
-            // work — building `ReifiedObjectShape::Iri` directly from
-            // the returned id.
-            let is_value_object_shape = map.contains_key("@value") || map.contains_key("@language");
-            if reifies_iris::ALL.contains(&predicate) || predicate == fluree_vocab::rdf::REIFIES {
-                return Err(TransactError::UnsupportedFeature(format!(
-                    "'{predicate}' is a system-controlled predicate; use @annotation instead"
-                )));
-            }
-            let synth = match direction {
-                Direction::Forward { subject } => {
-                    let shape = if is_value_object_shape {
-                        // Reject @context-coerced literals before classifying
-                        // so the synthesized f:reifies* bundle's EdgeKey
-                        // cannot silently diverge from the base flake's.
-                        reject_context_coercion_on_annotated_literal(map, predicate, walk.json_ld)?;
-                        classify_reified_object(map)?
-                    } else if let Some(shape) = triple_term_shape(map, walk.json_ld.id_key.as_str())
-                    {
-                        shape
-                    } else {
-                        ReifiedObjectShape::Iri(ensure_subject_id(map, walk, ctx))
-                    };
-                    build_annotation_node(subject, predicate, &shape, ann_block, walk.json_ld, ctx)?
-                }
-                // The value is the edge's subject, and must be a node.
-                Direction::Reverse { object } => {
-                    if is_value_object_shape {
-                        return Err(TransactError::Parse(format!(
-                            "a reverse property's value is a node, the subject of the edge; \
-                             '{predicate}' has a literal value"
-                        )));
-                    }
-                    let subject = ensure_subject_id(map, walk, ctx);
-                    let shape = ReifiedObjectShape::Iri(object.to_string());
-                    build_annotation_node(
-                        &subject,
-                        predicate,
-                        &shape,
-                        ann_block,
-                        walk.json_ld,
-                        ctx,
-                    )?
-                }
-            };
-            if let Some(node) = synth {
-                included.push(node);
-            }
-            // None = empty body in RDF mode = no-op (no attachment row
-            // written, base edge stays a plain triple).
-            Ok(())
+        },
+        _ => {
+            return Err(TransactError::Parse(
+                "@reifies object must be an @id reference or a value".to_string(),
+            ))
         }
-        _ => Ok(()),
-    }
+    };
+    Ok(edge_slots((subject, predicate, &shape)))
 }
 
 /// Replace each annotation's lowered `f:reifies*` slot templates with its
@@ -2458,11 +1406,18 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Run the full pipeline (scan + two-pass lowering) on `doc` and
-    /// return the rewritten document plus any minted blank-node count.
+    /// Lower `doc` as a transaction's data: its lowered expansion.
     fn lower(mut doc: Value) -> Result<Value> {
         lower_edge_annotations(&mut doc)?;
         Ok(doc)
+    }
+
+    /// The one value of `node`'s expanded `key`.
+    fn one<'a>(node: &'a Value, key: &str) -> &'a Value {
+        match node.get(key).and_then(Value::as_array).map(Vec::as_slice) {
+            Some([value]) => value,
+            _ => panic!("one value of {key} in {node:#}"),
+        }
     }
 
     /// The annotation nodes the lowering included in `node` (the edge's
@@ -2677,7 +1632,7 @@ mod tests {
             let result = lower(doc).unwrap_or_else(|e| panic!("{ctx}: {e}"));
             let sibling = &included(&result)[0];
             assert_eq!(
-                sibling.get(reifies_iris::OBJECT).unwrap(),
+                one(sibling, reifies_iris::OBJECT),
                 &json!({"@value": "2024-01-01"}),
                 "{ctx}"
             );
@@ -2686,7 +1641,7 @@ mod tests {
     }
 
     #[test]
-    fn accepts_term_coerced_datatype_when_value_object_is_explicit() {
+    fn an_annotated_literal_keeps_its_own_datatype() {
         let doc = json!({
             "@context": {
                 "ex": "http://example.org/",
@@ -2700,102 +1655,40 @@ mod tests {
                 "@annotation": { "ex:source": "hr" }
             }
         });
-        let result = lower(doc).expect("explicit @type must lower cleanly");
+        let result = lower(doc).unwrap();
         let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "2024-01-01", "@type": "xsd:date"})
+            one(sibling, reifies_iris::OBJECT),
+            &json!({"@value": "2024-01-01", "@type": "http://www.w3.org/2001/XMLSchema#date"})
         );
     }
 
-    /// A `@json` term makes the whole value one JSON literal, so an
-    /// annotated value object under it must name its own `@type`.
+    /// A `@json` term makes its whole value one JSON literal, as JSON-LD
+    /// expands it: an `@annotation` written in that value is part of the
+    /// document, not an annotation.
     #[test]
-    fn rejects_json_term_coercion_on_annotated_literal() {
+    fn a_json_term_holds_its_whole_value_as_one_literal() {
         let doc = json!({
             "@context": {
                 "ex": "http://example.org/",
                 "doc": { "@id": "ex:doc", "@type": "@json" }
             },
             "@id": "ex:alice",
-            "doc": {
-                "@value": "x",
-                "@annotation": { "ex:source": "hr" }
-            }
+            "doc": {"@value": "x", "@annotation": { "ex:source": "hr" }}
         });
-        let msg = lower(doc).unwrap_err().to_string();
-        assert!(
-            msg.contains("@context term coercion (@type='@json')"),
-            "got: {msg}"
-        );
-        assert!(msg.contains("Add @type"));
-    }
-
-    #[test]
-    fn rejects_node_local_context_term_coercion_on_annotated_literal() {
-        // Envelope @context holds prefixes; the inner @graph node
-        // introduces its own @context defining `doc` with `@type: @json`.
-        // The lowering walker must merge the inner context into the
-        // parent's so the coercion guard fires. (Two separate `@context`
-        // keys on the same JSON object would collapse via JSON parsing, so
-        // the envelope form is the only way to express true per-node
-        // context merging in input JSON.)
-        let doc = json!({
-            "@context": { "ex": "http://example.org/" },
-            "@graph": [{
-                "@context": {
-                    "doc": { "@id": "ex:doc", "@type": "@json" }
-                },
-                "@id": "ex:alice",
-                "doc": {
-                    "@value": "x",
-                    "@annotation": { "ex:source": "hr" }
-                }
-            }]
-        });
-        let msg = lower(doc).unwrap_err().to_string();
-        assert!(
-            msg.contains("@context term coercion (@type='@json')"),
-            "got: {msg}"
+        let result = lower(doc).unwrap();
+        assert!(result.get("@included").is_none(), "{result:#}");
+        assert_eq!(
+            one(&result, "http://example.org/doc"),
+            &json!({
+                "@value": {"@value": "x", "@annotation": {"ex:source": "hr"}},
+                "@type": "@json"
+            })
         );
     }
 
     #[test]
-    fn rejects_node_local_context_term_coercion_on_delete_clause() {
-        // Symmetric coverage on the delete pre-pass: a per-node
-        // `@context` inside a delete-clause node must merge into the
-        // effective context before the coercion guard runs.
-        let mut doc = json!({
-            "@context": { "ex": "http://example.org/" },
-            "delete": [{
-                "@context": {
-                    "doc": { "@id": "ex:doc", "@type": "@json" }
-                },
-                "@id": "ex:alice",
-                "doc": {
-                    "@value": "x",
-                    "@annotation": { "@id": "ex:ann-stale" }
-                }
-            }]
-        });
-        let ctx = top_level_context(&doc).unwrap();
-        let msg = lower_delete_annotation_blocks(&mut doc, &ctx)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            msg.contains("@context term coercion (@type='@json')"),
-            "got: {msg}"
-        );
-    }
-
-    #[test]
-    fn node_local_context_provides_id_alias_for_subject_resolution() {
-        // Regression: alias lookups inside the insert walker used to
-        // read the *parent* walker's id_key, so a node-local
-        // `"id": "@id"` alias would be invisible. The subject's id
-        // would fall through to blank-node minting and the
-        // synthesized f:reifiesSubject would point at the minted
-        // blank rather than the user's IRI.
+    fn a_node_local_id_alias_names_the_subject() {
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
             "@graph": [{
@@ -2807,21 +1700,15 @@ mod tests {
                 }
             }]
         });
-        let result = lower(doc).expect("node-local id alias must lower cleanly");
-        // The annotation node is included in the edge's subject, the
-        // envelope's one node.
-        let node = &result.get("@graph").and_then(|g| g.as_array()).unwrap()[0];
-        let sibling = &included(node)[0];
-        // f:reifiesSubject must point at the user's IRI, not a minted
-        // blank — confirming the alias was resolved from the merged
-        // (node-local) context.
+        let result = lower(doc).unwrap();
+        let sibling = &included(&result[0])[0];
         assert_eq!(
-            sibling.get(reifies_iris::SUBJECT).unwrap(),
-            &json!({"@id": "ex:alice"})
+            one(sibling, reifies_iris::SUBJECT),
+            &json!({"@id": "http://example.org/alice"})
         );
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@id": "ex:acme"})
+            one(sibling, reifies_iris::OBJECT),
+            &json!({"@id": "http://example.org/acme"})
         );
     }
 
@@ -2844,16 +1731,15 @@ mod tests {
         let result = lower(doc).expect("a value object under an @id term is a literal");
         let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
+            one(sibling, reifies_iris::OBJECT),
             &json!({"@value": "ex:bob"})
         );
     }
 
     #[test]
     fn intercept_rejects_language_without_value_on_object() {
-        // End-to-end regression for the routing fix: an object
-        // carrying `@language` without `@value` must NOT slip into the
-        // Ref branch via `ensure_subject_id` minting a blank.
+        // An object carrying `@language` without `@value` must not be read
+        // as a reference with a minted id.
         let doc = json!({
             "@id": "ex:alice",
             "ex:label": {
@@ -2995,10 +1881,10 @@ mod tests {
         }
     }
 
-    // ---- Existing lowering tests ----------------------------------------
+    // ---- Lowering ----------------------------------------------------------
 
     #[test]
-    fn lowers_inline_annotation_to_sibling_with_reifies_predicates() {
+    fn lowers_inline_annotation_to_an_included_node_naming_the_edge() {
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
             "@id": "ex:alice",
@@ -3008,33 +1894,71 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        // The annotation node is included in the edge's subject.
         assert_eq!(included(&result).len(), 1, "one annotation node");
-
-        // Original node: no @annotation key remains.
-        let original = &result;
-        let nested = original.get("ex:worksFor").unwrap();
-        assert!(
-            !nested.as_object().unwrap().contains_key("@annotation"),
-            "@annotation must be removed from the original payload"
+        assert_eq!(
+            one(&result, "http://example.org/worksFor"),
+            &json!({"@id": "http://example.org/acme"}),
+            "the edge stays, without its annotation"
         );
-
-        // Sibling: has f:reifiesSubject/Predicate/Object pointing at the edge.
         let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::SUBJECT).unwrap(),
-            &json!({"@id": "ex:alice"})
+            one(sibling, reifies_iris::SUBJECT),
+            &json!({"@id": "http://example.org/alice"})
         );
         assert_eq!(
-            sibling.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"ex:worksFor": {"@id": PREDICATE_HELPER}})
+            one(sibling, reifies_iris::PREDICATE),
+            &json!({"@id": "http://example.org/worksFor"})
         );
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@id": "ex:acme"})
+            one(sibling, reifies_iris::OBJECT),
+            &json!({"@id": "http://example.org/acme"})
         );
-        // Body fact preserved.
-        assert_eq!(sibling.get("ex:role").unwrap(), &json!("Engineer"));
+        assert_eq!(
+            one(sibling, "http://example.org/role"),
+            &json!({"@value": "Engineer"})
+        );
+    }
+
+    /// The edge's predicate is the key its value is under, as the expander
+    /// resolved it: by the subject's type-scoped context, which does not
+    /// reach the nodes the subject holds (the annotation among them), and by
+    /// a property-scoped context.
+    #[test]
+    fn the_predicate_is_the_key_as_its_context_resolves_it() {
+        let annotated = json!({"@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}});
+        for (doc, path) in [
+            (
+                json!({
+                    "@context": {
+                        "@vocab": "http://outer.example/",
+                        "Emp": {"@id": "http://example.org/Emp", "@context": {"p": "http://inner.example/p"}}
+                    },
+                    "@id": "http://example.org/s",
+                    "@type": "Emp",
+                    "p": annotated.clone()
+                }),
+                vec![],
+            ),
+            (
+                json!({
+                    "@context": {
+                        "@vocab": "http://outer.example/",
+                        "child": {"@id": "http://example.org/child", "@context": {"p": "http://inner.example/p"}}
+                    },
+                    "@id": "http://example.org/parent",
+                    "child": {"@id": "http://example.org/s", "p": annotated.clone()}
+                }),
+                vec!["http://example.org/child"],
+            ),
+        ] {
+            let result = lower(doc.clone()).unwrap();
+            let subject = path.iter().fold(&result, |node, key| one(node, key));
+            assert_eq!(
+                one(&included(subject)[0], reifies_iris::PREDICATE),
+                &json!({"@id": "http://inner.example/p"}),
+                "{doc}"
+            );
+        }
     }
 
     #[test]
@@ -3069,20 +1993,25 @@ mod tests {
         });
         let result = lower(doc).unwrap();
         let sibling = &included(&result)[0];
-        assert_eq!(
-            sibling.get("@id").unwrap(),
-            &json!("ex:employment-1"),
-            "explicit @id on the annotation must be preserved"
-        );
+        assert_eq!(sibling.get("@id").unwrap(), &json!("ex:employment-1"));
+    }
+
+    #[test]
+    fn each_annotation_in_an_array_is_its_own_reifier() {
+        let doc = json!({
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": [{"@id": "ex:a1"}, {"@id": "ex:a2"}]
+            }
+        });
+        let result = lower(doc).unwrap();
+        let ids: Vec<&Value> = included(&result).iter().map(|n| &n["@id"]).collect();
+        assert_eq!(ids, [&json!("ex:a1"), &json!("ex:a2")]);
     }
 
     #[test]
     fn annotation_resolves_context_aliased_id_on_ref_object() {
-        // Regression: prior to using ensure_subject_id's return value
-        // directly in the Ref branch, an object whose @id was aliased
-        // under a JSON-LD context (e.g. "id" instead of "@id") errored
-        // with "must carry @id or @value" because the classifier only
-        // checked literal "@id".
         let doc = json!({
             "@context": { "id": "@id", "ex": "http://example.org/" },
             "id": "ex:alice",
@@ -3091,13 +2020,11 @@ mod tests {
                 "@annotation": { "ex:role": "Engineer" }
             }
         });
-        let result = lower(doc).expect("aliased @id on annotated ref must lower cleanly");
+        let result = lower(doc).unwrap();
         assert_eq!(included(&result).len(), 1, "one annotation node");
-        let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
-            &json!({ "@id": "ex:acme" }),
-            "f:reifiesObject must carry the resolved IRI from the aliased id key"
+            one(&included(&result)[0], reifies_iris::OBJECT),
+            &json!({ "@id": "http://example.org/acme" })
         );
     }
 
@@ -3111,7 +2038,6 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        // Same shape as the @annotation case.
         assert_eq!(included(&result).len(), 1);
     }
 
@@ -3126,28 +2052,17 @@ mod tests {
             }
         });
         let result = lower(doc).unwrap();
-        assert_eq!(included(&result).len(), 1, "one annotation node");
-
-        // Original payload retains the literal value object minus
-        // @annotation.
-        let original = &result;
-        let nested = original.get("ex:joinedAt").unwrap().as_object().unwrap();
-        assert_eq!(nested.get("@value"), Some(&json!("2024-01-01")));
-        assert_eq!(nested.get("@type"), Some(&json!("xsd:date")));
-        assert!(!nested.contains_key("@annotation"));
-
-        // Sibling carries f:reifiesObject as the canonicalized value-
-        // object — not an @id reference. f:reifiesLang must be absent
-        // (no @language).
+        assert_eq!(
+            one(&result, "ex:joinedAt"),
+            &json!({"@value": "2024-01-01", "@type": "xsd:date"}),
+            "the literal stays, without its annotation"
+        );
         let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
+            one(sibling, reifies_iris::OBJECT),
             &json!({"@value": "2024-01-01", "@type": "xsd:date"})
         );
-        assert!(
-            sibling.get(reifies_iris::LANG).is_none(),
-            "no @language → no f:reifiesLang"
-        );
+        assert!(sibling.get(reifies_iris::LANG).is_none());
     }
 
     #[test]
@@ -3163,12 +2078,11 @@ mod tests {
         let result = lower(doc).unwrap();
         let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
+            one(sibling, reifies_iris::OBJECT),
             &json!({"@value": "chat", "@language": "fr"})
         );
-        // f:reifiesLang explicit — required for the folded link to name
-        // the same `lang` the base flake carries via flake.m.lang.
-        assert_eq!(sibling.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+        // The folded link takes its language from this slot.
+        assert_eq!(one(sibling, reifies_iris::LANG), &json!({"@value": "fr"}));
     }
 
     #[test]
@@ -3183,85 +2097,83 @@ mod tests {
         let result = lower(doc).unwrap();
         let sibling = &included(&result)[0];
         assert_eq!(
-            sibling.get(reifies_iris::OBJECT).unwrap(),
+            one(sibling, reifies_iris::OBJECT),
             &json!({"@value": "Alice"})
         );
         assert!(sibling.get(reifies_iris::LANG).is_none());
     }
 
-    // ---- Delete-pre-pass: literal-object support ------------------------
-
-    /// Run the delete-clause pre-pass on `doc` (assumes it has a
-    /// `delete` clause) and return the rewritten doc.
-    fn lower_delete(mut doc: Value) -> Result<Value> {
-        let ctx = top_level_context(&doc)?;
-        lower_delete_annotation_blocks(&mut doc, &ctx)?;
-        Ok(doc)
+    #[test]
+    fn ttl_shorthand_becomes_an_instruction_in_the_annotation() {
+        let doc = json!({
+            "@id": "ex:alice",
+            "ex:status": {"@value": "on", "@ttl": 60}
+        });
+        let result = lower(doc).unwrap();
+        assert_eq!(one(&result, "ex:status"), &json!({"@value": "on"}));
+        assert_eq!(
+            one(&included(&result)[0], fluree_vocab::retention_iris::TTL),
+            &json!({"@value": 60})
+        );
     }
 
-    fn templates(doc: &Value) -> &Vec<Value> {
-        match doc.get("delete").unwrap() {
-            Value::Array(a) => a,
-            _ => panic!("expected delete array"),
-        }
+    // ---- Retractions (an update's delete) ------------------------------------
+
+    /// Lower `delete` as an update's delete clause; returns the lowered
+    /// clause and the update's `where`.
+    fn lower_delete(delete: Value) -> Result<(Value, Vec<Value>)> {
+        let mut doc = json!({"delete": delete});
+        lower_edge_annotations(&mut doc)?;
+        let wheres = match doc.get("where") {
+            Some(Value::Array(items)) => items.clone(),
+            _ => Vec::new(),
+        };
+        Ok((doc["delete"].clone(), wheres))
     }
 
-    fn wheres(doc: &Value) -> &Vec<Value> {
-        match doc.get("where").unwrap() {
-            Value::Array(a) => a,
-            _ => panic!("expected where array"),
-        }
+    /// The retract templates the lowering included in `node`.
+    fn retractions(node: &Value) -> &Vec<Value> {
+        included(node)
     }
 
     #[test]
     fn delete_by_id_on_plain_string_literal_object_emits_value_object_template() {
-        let doc = json!({
-            "delete": {
-                "@id": "ex:alice",
-                "ex:name": {
-                    "@value": "Alice",
-                    "@annotation": { "@id": "ex:ann-1" }
-                }
+        let (delete, wheres) = lower_delete(json!({
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "@id": "ex:ann-1" }
             }
-        });
-        let lowered = lower_delete(doc).unwrap();
-        let templates = templates(&lowered);
+        }))
+        .unwrap();
+        let templates = retractions(&delete);
         assert_eq!(templates.len(), 1);
         let t = &templates[0];
         assert_eq!(t.get("@id").unwrap(), &json!("ex:ann-1"));
-        assert_eq!(
-            t.get(reifies_iris::SUBJECT).unwrap(),
-            &json!({"@id": "ex:alice"})
-        );
-        assert_eq!(
-            t.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"ex:name": {"@id": PREDICATE_HELPER}})
-        );
-        assert_eq!(
-            t.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "Alice"})
-        );
+        assert_eq!(one(t, reifies_iris::SUBJECT), &json!({"@id": "ex:alice"}));
+        assert_eq!(one(t, reifies_iris::PREDICATE), &json!({"@id": "ex:name"}));
+        assert_eq!(one(t, reifies_iris::OBJECT), &json!({"@value": "Alice"}));
         assert!(t.get(reifies_iris::LANG).is_none());
+        // A retraction by annotation does not retract the edge.
+        assert!(delete.get("ex:name").is_none(), "{delete:#}");
         // No WHERE for by-id delete.
-        assert!(lowered.get("where").is_none());
+        assert!(wheres.is_empty());
     }
 
     #[test]
     fn delete_by_id_on_typed_literal_object() {
-        let doc = json!({
-            "delete": {
-                "@id": "ex:alice",
-                "ex:joinedAt": {
-                    "@value": "2024-01-01",
-                    "@type": "xsd:date",
-                    "@annotation": { "@id": "ex:ann-2" }
-                }
+        let (delete, _) = lower_delete(json!({
+            "@id": "ex:alice",
+            "ex:joinedAt": {
+                "@value": "2024-01-01",
+                "@type": "xsd:date",
+                "@annotation": { "@id": "ex:ann-2" }
             }
-        });
-        let lowered = lower_delete(doc).unwrap();
-        let t = &templates(&lowered)[0];
+        }))
+        .unwrap();
+        let t = &retractions(&delete)[0];
         assert_eq!(
-            t.get(reifies_iris::OBJECT).unwrap(),
+            one(t, reifies_iris::OBJECT),
             &json!({"@value": "2024-01-01", "@type": "xsd:date"})
         );
         assert!(t.get(reifies_iris::LANG).is_none());
@@ -3269,117 +2181,110 @@ mod tests {
 
     #[test]
     fn delete_by_id_on_lang_tagged_literal_object_emits_reifies_lang() {
-        let doc = json!({
-            "delete": {
-                "@id": "ex:alice",
-                "ex:label": {
-                    "@value": "chat",
-                    "@language": "fr",
-                    "@annotation": { "@id": "ex:ann-3" }
-                }
+        let (delete, _) = lower_delete(json!({
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "@id": "ex:ann-3" }
             }
-        });
-        let lowered = lower_delete(doc).unwrap();
-        let t = &templates(&lowered)[0];
+        }))
+        .unwrap();
+        let t = &retractions(&delete)[0];
         assert_eq!(
-            t.get(reifies_iris::OBJECT).unwrap(),
+            one(t, reifies_iris::OBJECT),
             &json!({"@value": "chat", "@language": "fr"})
         );
-        // Explicit f:reifiesLang on the delete template — without it,
-        // the retract's decoded EdgeKey would have lang=None while the
-        // original assertion's EdgeKey has lang=Some("fr"), and the
-        // retract flake would not cancel the assertion.
-        assert_eq!(t.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+        // Without the language, the retraction would name another edge.
+        assert_eq!(one(t, reifies_iris::LANG), &json!({"@value": "fr"}));
     }
 
     #[test]
     fn delete_by_selector_on_plain_string_literal_object() {
-        let doc = json!({
-            "delete": {
-                "@id": "ex:alice",
-                "ex:name": {
-                    "@value": "Alice",
-                    "@annotation": { "ex:source": "hr" }
-                }
+        let (delete, wheres) = lower_delete(json!({
+            "@id": "ex:alice",
+            "ex:name": {
+                "@value": "Alice",
+                "@annotation": { "ex:source": "hr" }
             }
-        });
-        let lowered = lower_delete(doc).unwrap();
-        let wn = &wheres(&lowered)[0];
+        }))
+        .unwrap();
+        let wn = &wheres[0];
         assert_eq!(
             wn.get(REIFIES_KEY).unwrap(),
             &json!({"@id": "ex:alice", "ex:name": {"@value": "Alice"}})
         );
-        let t = &templates(&lowered)[0];
-        assert_eq!(
-            t.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "Alice"})
-        );
-        // Selector body property must appear on the WHERE node.
+        let t = &retractions(&delete)[0];
+        assert_eq!(t["@id"], wn["@id"], "the template is bound by the where");
+        assert_eq!(one(t, reifies_iris::OBJECT), &json!({"@value": "Alice"}));
+        // The selector's body is the where node's: a plain literal as written.
         assert_eq!(wn.get("ex:source").unwrap(), &json!("hr"));
     }
 
     #[test]
     fn delete_by_selector_on_lang_tagged_literal_keeps_lang_in_where_and_template() {
-        let doc = json!({
-            "delete": {
-                "@id": "ex:alice",
-                "ex:label": {
-                    "@value": "chat",
-                    "@language": "fr",
-                    "@annotation": { "ex:source": "lexicon" }
-                }
+        let (delete, wheres) = lower_delete(json!({
+            "@id": "ex:alice",
+            "ex:label": {
+                "@value": "chat",
+                "@language": "fr",
+                "@annotation": { "ex:source": "lexicon" }
             }
-        });
-        let lowered = lower_delete(doc).unwrap();
-        let wn = &wheres(&lowered)[0];
+        }))
+        .unwrap();
         // The WHERE selector's `@reifies` keeps the language tag, so the
         // same lexical string in another language does not bind.
         assert_eq!(
-            wn.get(REIFIES_KEY).unwrap(),
+            wheres[0].get(REIFIES_KEY).unwrap(),
             &json!({"@id": "ex:alice", "ex:label": {"@value": "chat", "@language": "fr"}})
         );
-        let t = &templates(&lowered)[0];
-        assert_eq!(t.get(reifies_iris::LANG).unwrap(), &json!("fr"));
+        let t = &retractions(&delete)[0];
+        assert_eq!(one(t, reifies_iris::LANG), &json!({"@value": "fr"}));
     }
 
-    /// Find the appended retract template — the first delete-clause
-    /// item that carries an `f:reifiesSubject` key. Used by tests
-    /// where the original delete node carries a non-`@id` keyword
-    /// (e.g. `@graph`) and therefore survives the stripping pass.
-    fn find_retract_template(doc: &Value) -> &Value {
-        templates(doc)
-            .iter()
-            .find(|v| {
-                v.as_object()
-                    .map(|m| m.contains_key(reifies_iris::SUBJECT))
-                    .unwrap_or(false)
-            })
-            .expect("a retract template must be appended")
+    /// A retraction is included in the node it is written from, so it is in
+    /// that node's graph; a selector's `where` names the graph.
+    #[test]
+    fn a_retraction_in_a_named_graph_is_in_its_edges_graph() {
+        let (delete, wheres) = lower_delete(json!([{
+            "@graph": "ex:hr-graph",
+            "@id": "ex:alice",
+            "ex:name": {"@value": "Alice", "@annotation": { "@id": "ex:ann-g" }}
+        }, {
+            "@graph": "ex:hr-graph",
+            "@id": "ex:bob",
+            "ex:name": {"@value": "Bob", "@annotation": { "ex:source": "hr" }}
+        }]))
+        .unwrap();
+        for node in delete.as_array().unwrap() {
+            assert_eq!(node["@graph"], "ex:hr-graph");
+            let t = &retractions(node)[0];
+            // The parser anchors it (`f:reifiesGraph`) from that scope.
+            assert!(t.get(reifies_iris::GRAPH).is_none(), "{t:?}");
+            assert!(t.get("@graph").is_none(), "{t:?}");
+        }
+        assert_eq!(wheres.len(), 1);
+        assert_eq!(wheres[0]["@graph"], "ex:hr-graph");
     }
 
     #[test]
-    fn delete_by_id_on_literal_in_named_graph_keeps_graph_selector() {
-        let doc = json!({
-            "delete": {
-                "@graph": "ex:hr-graph",
-                "@id": "ex:alice",
-                "ex:name": {
-                    "@value": "Alice",
-                    "@annotation": { "@id": "ex:ann-g" }
-                }
-            }
-        });
-        let lowered = lower_delete(doc).unwrap();
-        let t = find_retract_template(&lowered);
-        // The template is scoped to the edge's graph; the parser anchors it
-        // (`f:reifiesGraph`) from that scope, so the lowering does not.
-        assert!(t.get(reifies_iris::GRAPH).is_none(), "{t:?}");
-        assert_eq!(t.get("@graph").unwrap(), &json!("ex:hr-graph"));
-        assert_eq!(
-            t.get(reifies_iris::OBJECT).unwrap(),
-            &json!({"@value": "Alice"})
-        );
+    fn a_retraction_needs_both_ends_of_its_edge() {
+        let err = lower_delete(json!({
+            "ex:name": {"@value": "Alice", "@annotation": {"@id": "ex:ann"}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("parent @id"), "{err}");
+        let err = lower_delete(json!({
+            "@id": "ex:alice",
+            "ex:knows": {"ex:name": "Bob", "@annotation": {"@id": "ex:ann"}}
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("explicit @id"), "{err}");
     }
+
+    // ---- Refusals ------------------------------------------------------------
 
     #[test]
     fn rejects_both_annotation_and_edge() {
@@ -3409,14 +2314,19 @@ mod tests {
                 }
             }
         });
-        let err = lower(doc).unwrap_err();
-        // The deeper @annotation hit the body-keys check or the
-        // recursion's own check.
-        let msg = err.to_string();
+        let msg = lower(doc).unwrap_err().to_string();
         assert!(
-            msg.contains("annotation") && msg.contains("deferred"),
-            "expected deferred annotation-of-annotation message, got: {msg}"
+            msg.contains("annotation-of-annotation") && msg.contains("deferred"),
+            "{msg}"
         );
+    }
+
+    #[test]
+    fn rejects_an_annotation_on_a_node_no_property_holds() {
+        let msg = lower(json!({"@id": "ex:a", "@annotation": {"ex:c": 1}}))
+            .unwrap_err()
+            .to_string();
+        assert!(msg.contains("unasserted-reifier"), "{msg}");
     }
 
     #[test]
@@ -3427,33 +2337,6 @@ mod tests {
         });
         let err = lower(doc).unwrap_err();
         assert!(err.to_string().contains("system-controlled"));
-    }
-
-    /// A predicate slot resolves where its edge's key does: expanded with the
-    /// lowered document, a property-scoped term names its own IRI there.
-    #[test]
-    fn predicate_slot_resolves_with_the_scoped_context_of_its_edge() {
-        let mut doc = json!({
-            "@context": {
-                "@vocab": "http://outer.example/",
-                "child": {"@id": "http://example.org/child", "@context": {"p": "http://inner.example/p"}}
-            },
-            "@id": "http://example.org/parent",
-            "child": {"@id": "http://example.org/s", "p": {
-                "@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}}}
-        });
-        lower_edge_annotations(&mut doc).unwrap();
-        let mut expanded = fluree_graph_json_ld::expand(&doc).unwrap();
-        resolve_predicate_slots(&mut expanded);
-        let text = expanded.to_string();
-        assert!(
-            text.contains(&format!(
-                r#""{}":[{{"@id":"http://inner.example/p"}}]"#,
-                reifies_iris::PREDICATE
-            )),
-            "{expanded:#}"
-        );
-        assert!(!text.contains(PREDICATE_HELPER), "{expanded:#}");
     }
 
     /// W9: the lowering's anonymous annotation nodes are `_:fluree_ann_N`; a
@@ -3486,19 +2369,32 @@ mod tests {
             ]
         });
         let lowered = lower(doc).expect("lower");
-        assert_eq!(lowered["ex:role"], "Engineer");
-        assert_eq!(lowered[reifies_iris::SUBJECT], json!({"@id": "ex:alice"}));
-        assert_eq!(lowered[reifies_iris::OBJECT], json!({"@id": "ex:acme"}));
+        assert_eq!(one(&lowered, "ex:role"), &json!({"@value": "Engineer"}));
+        assert_eq!(
+            one(&lowered, reifies_iris::SUBJECT),
+            &json!({"@id": "ex:alice"})
+        );
+        assert_eq!(
+            one(&lowered, reifies_iris::PREDICATE),
+            &json!({"@id": "ex:worksFor"})
+        );
+        assert_eq!(
+            one(&lowered, reifies_iris::OBJECT),
+            &json!({"@id": "ex:acme"})
+        );
         // The second triple rides on a node with the reifier's `@id`,
         // included in it, so written in its scope.
-        let included = lowered["@included"].as_array().expect("the second triple");
+        let included = included(&lowered);
         assert_eq!(included.len(), 1, "{lowered:#}");
         assert_eq!(included[0]["@id"], "ex:employment-1");
         assert_eq!(
-            included[0][reifies_iris::PREDICATE],
-            json!({"ex:age": {"@id": PREDICATE_HELPER}})
+            one(&included[0], reifies_iris::PREDICATE),
+            &json!({"@id": "ex:age"})
         );
-        assert_eq!(included[0][reifies_iris::OBJECT], json!({"@value": 42}));
+        assert_eq!(
+            one(&included[0], reifies_iris::OBJECT),
+            &json!({"@value": 42})
+        );
         assert!(
             lowered.get("ex:worksFor").is_none()
                 && included.iter().all(|n| n.get("ex:worksFor").is_none()),
@@ -3508,17 +2404,12 @@ mod tests {
 
     #[test]
     fn rejects_compact_reifies_iri_via_context() {
-        // Compact form via `@context` must be rejected with the same
-        // firewall message as the full IRI form. Without context-aware
-        // resolution this would slip through and produce user-authored
-        // system facts.
         let doc = json!({
             "@context": { "f": "https://ns.flur.ee/db#" },
             "@id": "ex:alice",
             "f:reifiesSubject": { "@id": "ex:bob" }
         });
-        let err = lower(doc).unwrap_err();
-        let msg = err.to_string();
+        let msg = lower(doc).unwrap_err().to_string();
         assert!(
             msg.contains("system-controlled") && msg.contains("reifiesSubject"),
             "expected reserved-predicate firewall error, got: {msg}"
@@ -3526,30 +2417,8 @@ mod tests {
     }
 
     #[test]
-    fn typed_literal_value_object_passes_through_untouched() {
-        // Regression: previously the lowering walker minted an @id for
-        // `{"@value": "...", "@type": "..."}` and treated `@value` as a
-        // predicate. Verify a typed-literal value-object is preserved
-        // exactly, with no @id minted and no annotation siblings.
-        let doc = json!({
-            "@context": { "ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#" },
-            "@id": "ex:alice",
-            "ex:joinedAt": { "@value": "2024-01-01", "@type": "xsd:date" }
-        });
-        let original = doc.clone();
-        let result = lower(doc).unwrap();
-        assert_eq!(
-            result, original,
-            "value object must not be lowered as a node"
-        );
-    }
-
-    #[test]
     fn rejects_annotation_nested_inside_list_item() {
-        // List-occurrence annotations are deferred (v1). A `@list`
-        // wrapper containing an `@annotation` inside one of its items
-        // must error rather than silently slip past the early-return
-        // for value-class objects.
+        // List-occurrence annotations are deferred (v1).
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
             "@id": "ex:alice",
@@ -3560,8 +2429,7 @@ mod tests {
                 ]
             }
         });
-        let err = lower(doc).unwrap_err();
-        let msg = err.to_string();
+        let msg = lower(doc).unwrap_err().to_string();
         assert!(
             msg.contains("annotation") && msg.contains("deferred"),
             "list-nested @annotation must be rejected with a deferred message: {msg}"
@@ -3586,8 +2454,6 @@ mod tests {
 
     #[test]
     fn rejects_annotation_nested_inside_variable_wrapper() {
-        // @variable should be a leaf reference — embedding a deferred
-        // shape inside it must error.
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
             "@id": "ex:alice",
@@ -3600,36 +2466,47 @@ mod tests {
         assert!(err.to_string().contains("annotation"));
     }
 
-    #[test]
-    fn list_object_passes_through_untouched() {
-        let doc = json!({
-            "@context": { "ex": "http://example.org/" },
-            "@id": "ex:alice",
-            "ex:nicknames": { "@list": ["A", "B", "C"] }
-        });
-        let original = doc.clone();
-        let result = lower(doc).unwrap();
-        assert_eq!(result, original);
+    // ---- What the lowering leaves alone ------------------------------------
+
+    /// The expansion of `doc` as the lowering reads it.
+    fn expanded(doc: &Value) -> Value {
+        expand_with_root_context(doc, &top_level_context(doc).unwrap(), false).unwrap()
     }
 
     #[test]
-    fn variable_object_passes_through_untouched() {
-        let doc = json!({
-            "@context": { "ex": "http://example.org/" },
-            "@id": "ex:alice",
-            "ex:status": { "@variable": "?status" }
-        });
-        let original = doc.clone();
-        let result = lower(doc).unwrap();
-        assert_eq!(result, original);
+    fn a_document_without_annotations_is_its_expansion() {
+        for doc in [
+            json!({
+                "@context": { "ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#" },
+                "@id": "ex:alice",
+                "ex:joinedAt": { "@value": "2024-01-01", "@type": "xsd:date" }
+            }),
+            json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:nicknames": { "@list": ["A", "B", "C"] }
+            }),
+            json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:status": { "@variable": "?status" }
+            }),
+            json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:alice",
+                "ex:name": "Alice"
+            }),
+        ] {
+            assert_eq!(lower(doc.clone()).unwrap(), expanded(&doc), "{doc}");
+        }
     }
 
     #[test]
-    fn annotation_in_named_graph_emits_reifies_graph() {
-        // When the parent node is in a named graph (per-node @graph
-        // selector), the annotation node is included in the parent, so the
-        // parser writes it in the parent's (the edge's) graph. It carries
-        // no graph of its own.
+    fn annotation_in_named_graph_is_included_in_its_edges_subject() {
+        // The annotation node is included in the edge's subject, so the
+        // parser writes it in the subject's (the edge's) graph. It carries no
+        // graph of its own, and the parser anchors it (`f:reifiesGraph`) from
+        // that scope.
         let doc = json!({
             "@context": { "ex": "http://example.org/" },
             "@id": "ex:alice",
@@ -3643,45 +2520,6 @@ mod tests {
         assert_eq!(result.get("@graph"), Some(&json!("ex:hr-graph")));
         let sibling = &included(&result)[0];
         assert!(sibling.get("@graph").is_none(), "{sibling}");
-        // The anchor comes from the parser's scope (`GraphScope::emit`), the
-        // one place that writes it.
         assert!(sibling.get(reifies_iris::GRAPH).is_none(), "{sibling}");
-    }
-
-    #[test]
-    fn annotation_in_default_graph_omits_reifies_graph() {
-        // Default-graph edges encode "default" as the *absence* of
-        // `f:reifiesGraph`.
-        let doc = json!({
-            "@id": "ex:alice",
-            "ex:worksFor": {
-                "@id": "ex:acme",
-                "@annotation": { "ex:role": "Engineer" }
-            }
-        });
-        let result = lower(doc).unwrap();
-        let sibling = &included(&result)[0];
-        assert!(
-            sibling.get(reifies_iris::GRAPH).is_none(),
-            "f:reifiesGraph must be absent for default-graph edges"
-        );
-        assert!(
-            sibling.get("@graph").is_none(),
-            "an annotation node never pins a graph of its own"
-        );
-    }
-
-    #[test]
-    fn no_annotation_doc_passes_through_unchanged() {
-        let doc = json!({
-            "@context": { "ex": "http://example.org/" },
-            "@id": "ex:alice",
-            "ex:name": "Alice"
-        });
-        let original = doc.clone();
-        let result = lower(doc).unwrap();
-        // Lowering only mints a blank node @id when needed; this doc
-        // has explicit @id everywhere, so it should be untouched.
-        assert_eq!(result, original);
     }
 }
