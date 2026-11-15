@@ -1302,7 +1302,7 @@ fn build_annotation_delete(
     );
     template.insert(
         reifies_iris::PREDICATE.to_string(),
-        json!({"@id": predicate}),
+        predicate_slot(predicate, ctx),
     );
     template.insert(reifies_iris::OBJECT.to_string(), object_payload);
     if let Some(lang) = lang_payload {
@@ -1474,7 +1474,7 @@ fn build_annotation_node(
     ann_map.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
     ann_map.insert(
         reifies_iris::PREDICATE.to_string(),
-        json!({"@id": predicate}),
+        predicate_slot(predicate, json_ld),
     );
 
     // f:reifiesObject and (optional) f:reifiesLang. For a literal
@@ -1518,7 +1518,7 @@ fn lower_reifies_block(
     };
     let mut included = Vec::new();
     for (i, block) in blocks.into_iter().enumerate() {
-        let slots = reifies_slots(block)?;
+        let slots = reifies_slots(block, json_ld)?;
         if i == 0 {
             map.extend(slots);
         } else {
@@ -1533,9 +1533,16 @@ fn lower_reifies_block(
     Ok(())
 }
 
+/// The slot value naming the edge's predicate, a key as written: resolved as
+/// the parser resolves the key (a term or compact IRI, else against
+/// `@vocab`), not as an `@id`, which falls back to `@base`.
+fn predicate_slot(predicate: &str, json_ld: &ParsedContext) -> Value {
+    json!({"@id": fluree_graph_json_ld::expand_iri_with_vocab(predicate, json_ld, true)})
+}
+
 /// The `f:reifies*` slots naming the one triple a `@reifies` block
 /// describes: `{"@id": s, p: o}`.
-fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
+fn reifies_slots(block: Value, json_ld: &ParsedContext) -> Result<Map<String, Value>> {
     let Value::Object(block) = block else {
         return Err(TransactError::Parse(
             "@reifies value must be a JSON object describing a triple".to_string(),
@@ -1599,7 +1606,7 @@ fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
     slots.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
     slots.insert(
         reifies_iris::PREDICATE.to_string(),
-        json!({"@id": predicate}),
+        predicate_slot(predicate, json_ld),
     );
     let (object, lang) = emit_reifies_object_payload(&shape);
     slots.insert(reifies_iris::OBJECT.to_string(), object);
@@ -2976,7 +2983,7 @@ mod tests {
         );
         assert_eq!(
             sibling.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"@id": "ex:worksFor"})
+            &json!({"@id": "http://example.org/worksFor"})
         );
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),

@@ -5146,4 +5146,83 @@ mod tests {
             parse_doc(&doc, TxnType::Insert).unwrap_or_else(|e| panic!("{doc}: {e}"));
         }
     }
+
+    /// An annotation's link names the predicate the edge is written under: a
+    /// bare key resolves against `@vocab` (or a lone `@base`, which a
+    /// transaction reads as the `@vocab`) for the link as for the edge.
+    #[test]
+    fn an_annotation_links_the_predicate_its_edge_is_written_under() {
+        let alice = "http://example.org/alice";
+        let acme = json!({"@id": "http://example.org/acme", "@annotation": {"http://example.org/role": "E"}});
+        let link_p = |txn: &Txn, deletes: bool| {
+            let templates = if deletes {
+                &txn.delete_templates
+            } else {
+                &txn.insert_templates
+            };
+            templates
+                .iter()
+                .find_map(|t| match &t.object {
+                    TemplateTerm::TripleTerm(term) => match &term.p {
+                        TemplateTerm::Sid(p) => Some(p.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("a link")
+        };
+        for (ctx, iri) in [
+            (
+                json!({"@vocab": "http://v.example/"}),
+                "http://v.example/worksFor",
+            ),
+            (
+                json!({"@base": "http://example.org/doc"}),
+                "http://example.org/doc/worksFor",
+            ),
+        ] {
+            let mut ns = test_registry();
+            let expected = ns.sid_for_iri(iri);
+
+            let insert = json!({"@context": ctx, "@id": alice, "worksFor": acme});
+            let txn = parse_transaction(
+                &insert,
+                TxnType::Insert,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            assert_eq!(link_p(&txn, false), expected, "{insert}");
+            assert!(
+                txn.insert_templates
+                    .iter()
+                    .any(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == expected)),
+                "{insert}"
+            );
+
+            let reifies = json!({"@context": ctx, "@id": "http://example.org/r",
+                                 "@reifies": {"@id": alice, "worksFor": {"@id": "http://example.org/acme"}}});
+            let txn = parse_transaction(
+                &reifies,
+                TxnType::Insert,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            assert_eq!(link_p(&txn, false), expected, "{reifies}");
+
+            let delete = json!({"@context": ctx, "delete": {"@id": alice, "worksFor": acme}});
+            let txn = parse_transaction(
+                &delete,
+                TxnType::Update,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            assert_eq!(link_p(&txn, true), expected, "{delete}");
+        }
+    }
 }
