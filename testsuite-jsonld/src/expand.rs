@@ -27,9 +27,11 @@ pub fn initial_context(test: &TestCase) -> Result<ParsedContext> {
 /// the readers that call it unwrap its result themselves, so this applies
 /// the steps `JsonLdProcessor.expand()` adds (JSON-LD 1.1 API §9.1, 8.1-8.3).
 pub fn expanded_input(test: &TestCase) -> Result<Value> {
-    let input = read_json(&test.input)?;
-    let context = initial_context(test)?;
-    let output = match expand_with_context(&input, &context)? {
+    expand_document(&read_json(&test.input)?, &initial_context(test)?)
+}
+
+fn expand_document(input: &Value, context: &ParsedContext) -> Result<Value> {
+    let output = match expand_with_context(input, context)? {
         Value::Object(mut map) if map.len() == 1 && map.contains_key("@graph") => {
             map.remove("@graph").expect("checked")
         }
@@ -66,6 +68,37 @@ pub fn run(test: &TestCase) -> Result<()> {
                     serde_json::to_string(&output)?
                 )
             }
+        }
+    }
+}
+
+/// A JSON-LD transaction parses the document's `@context`, then expands the
+/// document, which still holds it, against the result, so the context
+/// applies twice. Passes when that agrees with applying it once: both refuse
+/// the input, or both give equivalent output.
+pub fn run_as_transaction(test: &TestCase) -> Result<()> {
+    let input = read_json(&test.input)?;
+    let initial = initial_context(test)?;
+    let once = expand_document(&input, &initial);
+    let twice = match input.get("@context") {
+        Some(local) => parse_context_with_base(&initial, local)
+            .map_err(Into::into)
+            .and_then(|context| expand_document(&input, &context)),
+        None => expand_document(&input, &initial),
+    };
+    match (once, twice) {
+        (Err(_), Err(_)) => Ok(()),
+        (Ok(a), Ok(b)) if equivalent(&a, &b, false) => Ok(()),
+        (once, twice) => {
+            let show = |r: Result<Value>| match r {
+                Ok(v) => v.to_string(),
+                Err(e) => format!("error: {e:#}"),
+            };
+            bail!(
+                "applying the context twice changes the result\n  once:  {}\n  twice: {}",
+                show(once),
+                show(twice)
+            )
         }
     }
 }

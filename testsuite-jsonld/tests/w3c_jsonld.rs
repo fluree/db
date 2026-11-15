@@ -16,3 +16,12 @@ fn jsonld_expand() -> Result<()> {
 fn jsonld_to_rdf() -> Result<()> {
     check_suite("toRdf-manifest.jsonld", to_rdf::run, registers::TO_RDF)
 }
+
+#[test]
+fn jsonld_expand_as_transaction() -> Result<()> {
+    check_suite(
+        "expand-manifest.jsonld",
+        expand::run_as_transaction,
+        registers::EXPAND_AS_TRANSACTION,
+    )
+}

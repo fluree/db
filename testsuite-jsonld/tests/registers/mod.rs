@@ -566,3 +566,7 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#twf05", // Triples including invalid language tags are rejected
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#twf07", // Triples including invalid graph name IRIs are rejected
 ];
+
+// Expand tests whose result changes when the document's `@context` applies
+// twice, as a transaction applies it (`expand::run_as_transaction`).
+pub const EXPAND_AS_TRANSACTION: &[&str] = &[];

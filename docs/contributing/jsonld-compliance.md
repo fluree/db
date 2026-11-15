@@ -2,10 +2,15 @@
 
 The `testsuite-jsonld/` crate runs the W3C [json-ld-api test
 suite](https://github.com/w3c/json-ld-api/tree/main/tests): its expand and
-toRdf manifests, as the test fns `jsonld_expand` and `jsonld_to_rdf`. It tests
-`fluree-graph-json-ld`, the expander every JSON-LD reader shares
-(transactions, bulk import, `rdf::parse`, inline SHACL shapes), and the
-adapter that turns expanded JSON-LD into RDF statements.
+toRdf manifests, as the test fns `jsonld_expand` and `jsonld_to_rdf`. Both
+test `fluree-graph-json-ld`:
+
+- **expand** tests the expander, which every JSON-LD reader shares
+  (transactions, bulk import, `rdf::parse`, inline SHACL shapes).
+- **toRdf** tests the adapter that turns expanded JSON-LD into RDF statements.
+  Bulk import, `rdf::parse` and inline shapes use it. A JSON-LD transaction
+  builds its statements with its own parser, so a toRdf pass says nothing
+  about what an insert writes.
 
 The crate is **excluded from the workspace**, so run cargo from inside
 `testsuite-jsonld/`. The suite is a git submodule; on a fresh clone run:
@@ -18,8 +23,8 @@ git submodule update --init testsuite-jsonld/json-ld-api
 
 | Command | Purpose |
 |---------|---------|
-| `cargo test` | Both suites, as CI runs them |
-| `cargo test jsonld_expand` | One suite |
+| `cargo test` | Every suite, as CI runs them |
+| `cargo test jsonld_to_rdf` | One suite |
 | `JSONLD_TEST=tc014 cargo test -- --nocapture` | Only the tests whose IRI contains `tc014`, each outcome printed in full |
 
 ## How a test runs
@@ -31,6 +36,13 @@ git submodule update --init testsuite-jsonld/json-ld-api
   Expansion Algorithm; the harness applies the three steps
   `JsonLdProcessor.expand()` adds (§9.1, 8.1–8.3), which Fluree's readers apply
   themselves.
+- **Expand, context applied twice:** a transaction parses the document's
+  `@context`, then expands the document, which still holds it, against the
+  result. `jsonld_expand_as_transaction` expands each expand input that way
+  and the usual way, and fails where the two differ: refused by one and not the
+  other, or giving different output. Its register, `EXPAND_AS_TRANSACTION`, is
+  empty. A context that resolves differently when applied over itself, such
+  as a relative IRI resolved against the value in effect, fails here.
 - **toRdf:** the expanded input goes through the JSON-LD adapter, and the
   statements are compared with `expect` (N-Quads) by RDF dataset isomorphism.
   The graph IR holds a `@list` as indexed values of its property; the harness
