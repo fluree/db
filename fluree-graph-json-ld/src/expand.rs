@@ -711,7 +711,7 @@ fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
 
 /// Get context from node map
 fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
-    node_map.get("@context").or_else(|| node_map.get("context"))
+    node_map.get("@context")
 }
 
 /// Maximum expansion depth for nested JSON-LD values. Expansion recurses
@@ -888,7 +888,7 @@ fn expand_node_entries(
     let strict = keys.strict;
     for (k, v) in map {
         // Skip context and type keys
-        if k == "@context" || k == "context" {
+        if k == "@context" {
             continue;
         }
         if k == keys.type_key || Some(k.as_str()) == keys.type_id {
@@ -1308,6 +1308,41 @@ mod tests {
         assert_eq!(nicks.len(), 3);
         // @set should be flattened (no @set wrapper)
         assert!(nicks[0].get("@value").is_some());
+    }
+
+    /// Only `@context` is a context. A `context` key is a property like any
+    /// other, a plain name with no `@vocab`; it used to be read as the node's
+    /// context, which dropped it and could rewrite every other key.
+    #[test]
+    fn a_context_key_is_data() {
+        let doc = json!({
+            "@id": "http://example.org/n1",
+            "context": "meeting notes",
+            "title": "Q3 plan"
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/n1",
+                "context": [{"@value": "meeting notes"}],
+                "title": [{"@value": "Q3 plan"}]
+            })
+        );
+
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:n1",
+            "ex:title": "Q3 plan",
+            "context": {"topic": "budget"}
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/n1",
+                "http://example.org/title": [{"@value": "Q3 plan"}],
+                "context": [{"topic": [{"@value": "budget"}]}]
+            })
+        );
     }
 
     #[test]

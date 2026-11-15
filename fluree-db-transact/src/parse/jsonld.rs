@@ -5013,4 +5013,28 @@ mod tests {
         let txn = parse_doc(&doc, TxnType::Insert).expect("an ordinary key");
         assert_eq!(txn.insert_templates.len(), 1);
     }
+
+    /// Only `@context` is a context. A `context` key is data, so a prefix it
+    /// defines resolves nothing.
+    #[test]
+    fn a_context_key_is_not_a_context() {
+        let doc = json!({
+            "context": {"ex": "http://example.org/"},
+            "@id": "http://example.org/alice",
+            "ex:knows": {"@id": "http://example.org/bob"}
+        });
+        let err = parse_doc(&doc, TxnType::Insert).expect_err("`ex` is undefined");
+        assert!(err.to_string().contains("'ex:knows'"), "{err}");
+
+        let doc = json!({"@id": "http://example.org/n1", "context": "meeting notes"});
+        let txn = parse_doc(&doc, TxnType::Insert).expect("a plain property");
+        assert!(
+            matches!(
+                txn.insert_templates.as_slice(),
+                [t] if matches!(&t.predicate, TemplateTerm::Sid(p) if &*p.name == "context")
+            ),
+            "{:?}",
+            txn.insert_templates
+        );
+    }
 }

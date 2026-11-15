@@ -448,6 +448,12 @@ Three kinds of document that were refused are accepted, and one that was accepte
 
 To make the stored values match, see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
 
+#### A JSON-LD `context` key is data (breaking)
+
+Only `@context` sets a JSON-LD node's context. Earlier releases also read a `context` key as one, in a transaction, a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes, so a property named `context` was dropped, and a string value rewrote the node's other keys (`{"context": "notes", "title": "x"}` wrote the property `notes/title`). The key is now a property like any other: a plain name, with no `@vocab`.
+
+A document that set its context with `context` no longer gets the prefixes and terms it defined, and a transaction refuses a compact IRI whose prefix only that key defined. Rename the key to `@context`. A query's top-level `context` is unchanged.
+
 #### Python RDF terms compare as RDF terms (breaking)
 
 In the Python binding, `fluree.IRI`, `fluree.BlankNode` and `fluree.LangString` are still `str` subclasses, and print, slice and pass as their text. They no longer equal a plain string with that text: `row.s == "http://example.org/alice"` is now `False`, and so is a `dict` or `set` lookup by the plain string. An `IRI` equals only an `IRI`, a `BlankNode` only a `BlankNode`, and a `LangString` only a `LangString` with the same language and direction. Compare with `fluree.IRI("http://example.org/alice")`, or with `str(row.s)` for the text alone.
