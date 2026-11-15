@@ -1583,7 +1583,7 @@ mod inner {
             || jsonld.contains("@expiresAt");
         if needs_lowering {
             let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
-            crate::parse::edge_annotations::check_then_lower(&mut doc, &top_ctx, false)?;
+            crate::parse::edge_annotations::check_then_lower(&mut doc, &top_ctx, false, false)?;
         }
         let refuse_reserved = |expanded: &serde_json::Value| {
             if needs_lowering {

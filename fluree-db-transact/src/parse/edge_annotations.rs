@@ -478,19 +478,22 @@ pub(crate) fn refuse_reserved_predicate(iri: &str) -> Result<()> {
 }
 
 /// [`refuse_reserved_iris`] over the data a document holds before any
-/// lowering: the document itself, or an update's `insert`, `delete` and
-/// `upsert` clauses, each expanded against `root`, which holds the document's
-/// own `@context`.
-pub(crate) fn refuse_reserved_iris_in_document(doc: &Value, root: &ParsedContext) -> Result<()> {
-    if let Value::Object(map) = doc {
-        if is_transaction_wrapper(map) {
-            for clause in ["insert", "delete", "upsert"] {
-                if let Some(value) = map.get(clause) {
-                    refuse_reserved_iris(&expand_with_context_policy(value, root, false)?)?;
-                }
+/// lowering, expanded against `root`, which holds the document's own
+/// `@context`: an update's `insert`, `delete` and `upsert` clauses when
+/// `clauses` is set (the caller knows the transaction is an update), and
+/// otherwise the whole document, whose keys are all data.
+pub(crate) fn refuse_reserved_iris_in_document(
+    doc: &Value,
+    root: &ParsedContext,
+    clauses: bool,
+) -> Result<()> {
+    if clauses {
+        for clause in ["insert", "delete", "upsert"] {
+            if let Some(value) = doc.get(clause) {
+                refuse_reserved_iris(&expand_with_context_policy(value, root, false)?)?;
             }
-            return Ok(());
         }
+        return Ok(());
     }
     refuse_reserved_iris(&expand_with_root_context(doc, root, false)?)
 }
@@ -507,7 +510,8 @@ pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
     let top_ctx = top_level_context(doc)?;
     // Test / external callers that don't carry transaction options
     // default to RDF mode (empty `@annotation: {}` is a no-op).
-    check_then_lower(doc, &top_ctx, false)
+    let clauses = doc.as_object().is_some_and(is_transaction_wrapper);
+    check_then_lower(doc, &top_ctx, false, clauses)
 }
 
 /// [`refuse_reserved_iris_in_document`] on `doc` as written, then the
@@ -517,8 +521,9 @@ pub(crate) fn check_then_lower(
     doc: &mut Value,
     top_ctx: &ParsedContext,
     lpg_mode: bool,
+    clauses: bool,
 ) -> Result<()> {
-    if let Err(refused) = refuse_reserved_iris_in_document(doc, top_ctx) {
+    if let Err(refused) = refuse_reserved_iris_in_document(doc, top_ctx, clauses) {
         lower_edge_annotations_after_firewall(doc, top_ctx, lpg_mode)?;
         return Err(refused);
     }

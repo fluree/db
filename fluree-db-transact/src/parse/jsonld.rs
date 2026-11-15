@@ -200,8 +200,13 @@ fn parse_rooted(
         )?;
         // After the lowering, which refuses some documents for a reason of
         // its own; the check reads the document as written.
-        let data = strip_opts_for_expansion(json, &root)?;
-        super::edge_annotations::refuse_reserved_iris_in_document(&data, &root)?;
+        let update = matches!(txn_type, TxnType::Update);
+        let data = if update {
+            std::borrow::Cow::Borrowed(json)
+        } else {
+            strip_opts_for_expansion(json, &root)?
+        };
+        super::edge_annotations::refuse_reserved_iris_in_document(&data, &root, update)?;
         std::borrow::Cow::Owned(lowered)
     } else {
         std::borrow::Cow::Borrowed(json)
@@ -5224,5 +5229,36 @@ mod tests {
             .unwrap();
             assert_eq!(link_p(&txn, true), expected, "{delete}");
         }
+    }
+
+    /// An insert's keys are data, whatever they are named: one keyed
+    /// `insert`, `delete` and `upsert` is a node, not an update's clauses,
+    /// and the checks read it as one. An update keeps its own reading: a
+    /// context term named like a dataset key is not refused there.
+    #[test]
+    fn checks_read_the_transaction_as_its_type_says() {
+        let term = |name: &str| format!("{}{name}", fluree_vocab::fluree::DB);
+        let annotated = json!({"@id": "http://example.org/s", "http://example.org/p": {
+            "@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}}});
+        let insert = json!({
+            "@context": {
+                "insert": term(fluree_vocab::db::REIFIES_SUBJECT),
+                "delete": term(fluree_vocab::db::REIFIES_PREDICATE),
+                "upsert": term(fluree_vocab::db::REIFIES_OBJECT)
+            },
+            "insert": annotated,
+            "delete": {"@id": "http://example.org/q"},
+            "upsert": {"@id": "http://example.org/o"}
+        });
+        let err =
+            parse_doc(&insert, TxnType::Insert).expect_err("keys that name reserved predicates");
+        assert!(err.to_string().contains(fluree_vocab::fluree::DB), "{err}");
+
+        let update = json!({
+            "@context": {"from": "http://example.org/from"},
+            "from": "http://example.org/g",
+            "insert": annotated
+        });
+        parse_doc(&update, TxnType::Update).expect("an annotated update with a dataset key");
     }
 }
