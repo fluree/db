@@ -1093,14 +1093,11 @@ where
                 .await?;
             tracing::debug!(%cid, bytes = bytes.len(), "referenced blob stored");
         }
-        {
-            let span = tracing::debug_span!("commit_write_commit_blob");
-            let _g = span.enter();
-            content_store
-                .put_with_id(&commit_cid, &commit_bytes)
-                .await?;
-            tracing::info!(commit_bytes = commit_bytes.len(), "commit blob stored");
-        }
+        content_store
+            .put_with_id(&commit_cid, &commit_bytes)
+            .instrument(tracing::debug_span!("commit_write_commit_blob"))
+            .await?;
+        tracing::info!(commit_bytes = commit_bytes.len(), "commit blob stored");
         let blob_us = phase.elapsed().as_micros() as u64;
         let publish_started = fluree_db_core::clock::Instant::now();
 

@@ -4192,6 +4192,12 @@ impl crate::Fluree {
     /// at a TriG document's first block. Only then is the document read as
     /// TriG, which keeps the second parse off plain Turtle entirely.
     #[allow(clippy::too_many_arguments)]
+    #[tracing::instrument(
+        level = "debug",
+        name = "stage_turtle_insert",
+        skip_all,
+        fields(ledger_t = ledger.t(), new_t = ledger.t() + 1, turtle_bytes = turtle.len())
+    )]
     pub(crate) async fn stage_turtle_insert_with_opts(
         &self,
         ledger: LedgerState,
@@ -4214,14 +4220,6 @@ impl crate::Fluree {
             )
             .into());
         }
-
-        let span = tracing::debug_span!(
-            "stage_turtle_insert",
-            ledger_t = ledger.t(),
-            new_t = ledger.t() + 1,
-            turtle_bytes = turtle.len()
-        );
-        let _guard = span.enter();
 
         let mut ns_registry = NamespaceRegistry::from_db(&ledger.snapshot);
         let new_t = ledger.t() + 1;
