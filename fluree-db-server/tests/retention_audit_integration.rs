@@ -187,6 +187,90 @@ async fn removal_makes_raw_commits_audit_data() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
+/// A server that asks no token of its readers still keeps audit data for an
+/// auditor, and reads the audit grant of a token it would otherwise ignore:
+/// the status route as the raw commit routes do.
+#[tokio::test]
+async fn a_server_without_data_auth_reads_an_audit_token() {
+    let tmp = tempfile::tempdir().unwrap();
+    let key = SigningKey::from_bytes(&[12u8; 32]);
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        data_auth_trusted_issuers: vec![fluree_db_credential::did_from_pubkey(
+            &key.verifying_key().to_bytes(),
+        )],
+        ..Default::default()
+    };
+    assert_eq!(
+        cfg.data_auth_mode,
+        fluree_db_server::config::DataAuthMode::None
+    );
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = std::sync::Arc::new(AppState::new(cfg, telemetry).await.unwrap());
+    let app = build_router(state);
+    let ledger = "open:main";
+    let reader = token(&key, ledger, false);
+    let auditor = token(&key, ledger, true);
+    let stranger = token(&SigningKey::from_bytes(&[13u8; 32]), ledger, true);
+
+    let (status, _) = call(
+        &app,
+        "POST",
+        "/v1/fluree/create",
+        None,
+        Some(json!({"ledger": ledger})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let (status, _) = call(
+        &app,
+        "POST",
+        &format!("/v1/fluree/insert/{ledger}"),
+        None,
+        Some(json!({"@context": {"ex": "http://example.org/"},
+                    "insert": {"@id": "ex:alice", "ex:email": "a@x"}})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, receipt) = call(
+        &app,
+        "POST",
+        &format!("/v1/fluree/remove/{ledger}"),
+        None,
+        Some(json!({"matching": [{"subject": "http://example.org/alice",
+                                  "predicate": "http://example.org/email"}]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{receipt}");
+
+    let retention = format!("/v1/fluree/retention/{ledger}");
+    let journal = |body: &JsonValue| body["registration"]["journal"]["removals"].clone();
+    let (status, audited) = call(&app, "GET", &retention, Some(&auditor), None).await;
+    assert_eq!(status, StatusCode::OK, "{audited}");
+    assert!(
+        journal(&audited).as_array().is_some_and(|r| !r.is_empty()),
+        "{audited}"
+    );
+    for (who, bearer) in [
+        ("no token", None),
+        ("a reader", Some(&reader)),
+        ("an untrusted issuer", Some(&stranger)),
+    ] {
+        let (status, body) = call(&app, "GET", &retention, bearer.map(String::as_str), None).await;
+        assert_eq!(status, StatusCode::OK, "{who}: {body}");
+        assert!(journal(&body).is_null(), "{who}: {body}");
+        assert_eq!(body["removals"], audited["removals"], "{who}: {body}");
+    }
+
+    let show = format!("/v1/fluree/show/{ledger}?commit=t:1");
+    let (status, body) = call(&app, "GET", &show, None, None).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let (status, body) = call(&app, "GET", &show, Some(&auditor), None).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
 #[tokio::test]
 async fn erasure_needs_a_prover_and_file_storage() {
     let tmp = tempfile::tempdir().unwrap();

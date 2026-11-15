@@ -323,6 +323,8 @@ and [Iceberg → Access policy](../graph-sources/iceberg.md#where-policies-live-
 }
 ```
 
+The message names the removed property only when the read's own pattern named it. A read of a subject's every property, or of everything, is told `a removed occurrence this read could reach on mydb:main falls in the requested range`.
+
 **How to Fix:**
 - Read as of the current head, or narrow the query to predicates and subjects the removal does not cover
 - For a search index, retry once it has synced
