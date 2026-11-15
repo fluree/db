@@ -164,7 +164,6 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter26", // Colliding keywords
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter27", // Invalid @id value
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter28", // Invalid type value
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter29", // Invalid value object value
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter30", // Invalid language-tagged string
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter31", // Invalid @index value
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter34", // Invalid reverse property value (in @reverse)
@@ -179,7 +178,6 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter48", // Invalid term as relative IRI
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter49", // A relative IRI cannot be used as a prefix
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter50", // Invalid reverse id
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter51", // Invalid value object value using a value alias
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter52", // Definition for the empty term
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter53", // Invalid prefix value
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter54", // Invalid value object, multiple values for @type.
@@ -444,7 +442,6 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter26", // Colliding keywords
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter27", // Invalid @id value
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter28", // Invalid type value
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter29", // Invalid value object value
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter30", // Invalid language-tagged string
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter31", // Invalid @index value
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter35", // Invalid language map value
@@ -456,7 +453,6 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter48", // Invalid term as relative IRI
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter49", // A relative IRI cannot be used as a prefix
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter50", // Invalid reverse id
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter51", // Invalid value object value using a value alias
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter52", // Definition for the empty term
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter53", // Invalid prefix value
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#ter54", // Invalid value object, multiple values for @type.
