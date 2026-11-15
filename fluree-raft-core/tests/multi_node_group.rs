@@ -22,7 +22,7 @@ use cluster::{eventually, form_cluster, leader, start_node, Node};
 
 type CounterNode = Node<Counter>;
 use counter::{Counter, CounterCommand};
-use fluree_raft_core::forward::{LeaderView, ProposeError};
+use fluree_raft_core::forward::{propose_via_leader, LeaderView, ProposeError};
 use fluree_raft_core::group::GroupId;
 use fluree_raft_core::node::NodeId;
 use fluree_raft_core::runtime::{
@@ -42,6 +42,9 @@ enum ProposeFault {
     ServerError,
     Bare503,
     InvalidJson,
+    /// A leader too old to report the log id.
+    NoLogId,
+    MalformedLogId,
 }
 
 /// Forward to the real leader, then damage only the first proposal's
@@ -115,6 +118,10 @@ async fn relay_fault_case(fault: ProposeFault) {
                     .send()
                     .await
                     .unwrap();
+                let mut log_id = response
+                    .headers()
+                    .get("x-fluree-raft-log-id")
+                    .map(|value| value.to_str().unwrap().to_string());
                 let mut status = response.status();
                 let mut bytes = response.bytes().await.unwrap();
                 if rejected {
@@ -138,11 +145,16 @@ async fn relay_fault_case(fault: ProposeFault) {
                             bytes = "upstream unavailable".into();
                         }
                         ProposeFault::InvalidJson => bytes = "{".into(),
+                        ProposeFault::NoLogId => log_id = None,
+                        ProposeFault::MalformedLogId => log_id = Some("7".into()),
                         _ => {}
                     }
                 }
+                let log_id = log_id
+                    .map(|value| format!("X-Fluree-Raft-Log-Id: {value}\r\n"))
+                    .unwrap_or_default();
                 let headers = format!(
-                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n{log_id}\r\n",
                     status,
                     bytes.len()
                 );
@@ -166,7 +178,7 @@ async fn relay_fault_case(fault: ProposeFault) {
 
     let result = tokio::time::timeout(
         Duration::from_secs(10),
-        fluree_raft_core::forward::propose_via_leader(&nodes[1].group.raft, CounterCommand::Add(1)),
+        propose_via_leader(&nodes[1].group.raft, CounterCommand::Add(1)),
     )
     .await
     .expect("relay must finish");
@@ -180,15 +192,24 @@ async fn relay_fault_case(fault: ProposeFault) {
     );
     assert_eq!(state.value, 1, "one logical proposal must increment once");
     assert_eq!(state.applies, 1);
-    if matches!(fault, ProposeFault::NotLeader) {
-        assert!(result.is_ok());
-        assert_eq!(proposals.load(Ordering::SeqCst), 2);
-    } else {
-        assert!(
-            matches!(result, Err(ProposeError::Unknown(_))),
-            "lost response must report an ambiguous outcome"
-        );
-        assert_eq!(proposals.load(Ordering::SeqCst), 1);
+    match fault {
+        ProposeFault::NotLeader => {
+            let proposed = result.expect("the retry reaches the leader");
+            assert!(proposed.log_id.is_some(), "the leader reports the log id");
+            assert_eq!(proposals.load(Ordering::SeqCst), 2);
+        }
+        ProposeFault::NoLogId => {
+            let proposed = result.expect("a response without the log id still decodes");
+            assert_eq!(proposed.log_id, None);
+            assert_eq!(proposals.load(Ordering::SeqCst), 1);
+        }
+        _ => {
+            assert!(
+                matches!(result, Err(ProposeError::Unknown(_))),
+                "lost response must report an ambiguous outcome"
+            );
+            assert_eq!(proposals.load(Ordering::SeqCst), 1);
+        }
     }
 }
 
@@ -220,6 +241,16 @@ async fn relay_does_not_retry_bare_503_after_apply() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn relay_reports_unknown_after_invalid_success_json() {
     relay_fault_case(ProposeFault::InvalidJson).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_through_a_leader_without_the_log_id_returns_the_response() {
+    relay_fault_case(ProposeFault::NoLogId).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_reports_unknown_after_a_malformed_log_id() {
+    relay_fault_case(ProposeFault::MalformedLogId).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -446,7 +477,9 @@ async fn a_task_that_ignores_cancellation_is_aborted_after_the_grace_period() {
 /// relays the command to the leader's `/propose` endpoint, the apply
 /// replicates, and the follower gets the application response back —
 /// the contract that lets a load balancer spread writes across a
-/// group's nodes instead of pinning them to whoever leads.
+/// group's nodes instead of pinning them to whoever leads. It also gets
+/// the entry the command committed as, which it can wait to apply
+/// before reading its own write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_propose_relays_to_the_leader_and_applies() {
     let group_id = GroupId::new("counter").expect("valid group id");
@@ -457,7 +490,8 @@ async fn a_follower_propose_relays_to_the_leader_and_applies() {
     ];
     form_cluster(&nodes).await;
 
-    let leader_id = leader(&nodes).await.id;
+    let leader = leader(&nodes).await;
+    let leader_id = leader.id;
     let follower = nodes
         .iter()
         .find(|n| n.id != leader_id)
@@ -475,15 +509,31 @@ async fn a_follower_propose_relays_to_the_leader_and_applies() {
         "a follower's direct client_write must refuse"
     );
 
-    // The relayed propose lands.
-    fluree_raft_core::forward::propose_via_leader(&follower.group.raft, CounterCommand::Add(41))
+    // The relayed propose lands, as the entry after one the leader
+    // proposed itself.
+    let on_leader = propose_via_leader(&leader.group.raft, CounterCommand::Add(1))
         .await
-        .expect("relayed propose applies");
+        .expect("the leader proposes")
+        .log_id
+        .expect("the leader reports the log id");
+    let relayed = propose_via_leader(&follower.group.raft, CounterCommand::Add(41))
+        .await
+        .expect("relayed propose applies")
+        .log_id
+        .expect("the relay reports the log id");
+    assert_eq!(relayed.index, on_leader.index + 1);
+
+    follower
+        .group
+        .wait_applied(relayed.index, Duration::from_secs(10))
+        .await
+        .expect("the follower applies its relayed write");
+    assert_eq!(follower.group.state.read().await.value, 42);
 
     for node in &nodes {
         let id = node.id;
-        eventually(&format!("node {id} to converge on 41"), || async {
-            node.group.state.read().await.value == 41
+        eventually(&format!("node {id} to converge on 42"), || async {
+            node.group.state.read().await.value == 42
         })
         .await;
     }
