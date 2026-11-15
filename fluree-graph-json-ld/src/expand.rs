@@ -395,7 +395,7 @@ fn parse_node_value(
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, nodes, path, strict);
+                return parse_value_object(map, context, nodes, path, strict);
             }
 
             // Check for @container: @language
@@ -512,7 +512,6 @@ fn expand_nested_node(
 /// Parse a @value object
 fn parse_value_object(
     map: &Map<String, JsonValue>,
-    entry: Option<&ContextEntry>,
     context: &ParsedContext,
     nodes: &ParsedContext,
     path: &Path<'_>,
@@ -535,27 +534,21 @@ fn parse_value_object(
         .or_else(|| map.get("language"))
         .and_then(|l| l.as_str());
 
-    // The object's own `@type` and `@language` exclude each other. Its own
-    // language overrides the datatype its term would give, and a datatype
-    // excludes the default language. A term's `@id` or `@vocab` coercion
-    // never applies here: JSON-LD 1.1 coerces only a string value to an IRI
-    // (Value Expansion), and a value object is a literal. Only an explicit
-    // `"@type": "@id"` on the object makes it a reference.
-    let type_iri = match explicit_type {
-        Some(_) if explicit_language.is_some() => return Err(JsonLdError::LanguageWithType),
-        Some(t) => Some(t),
-        None if explicit_language.is_some() => None,
-        None => entry.as_ref().and_then(|e| match &e.type_ {
-            Some(TypeValue::Iri(t)) => Some(t.clone()),
-            _ => None,
-        }),
+    // A value object is taken as written: JSON-LD 1.1 gives a term's `@type`
+    // and `@language`, and the default language, only to a bare value (Value
+    // Expansion). Only an explicit `"@type": "@id"` makes it a reference.
+    let (type_iri, lang) = match (explicit_type, explicit_language) {
+        (Some(_), Some(_)) => return Err(JsonLdError::LanguageWithType),
+        (t, l) => (t, l.map(std::string::ToString::to_string)),
     };
-    let lang = match type_iri {
-        Some(_) => None,
-        None => explicit_language
-            .map(std::string::ToString::to_string)
-            .or_else(|| context.language.clone()),
-    };
+    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref()) {
+        return Err(JsonLdError::InvalidKeywordValue {
+            keyword: "@value",
+            reason: "a value object whose @value is an array or a map needs its own \
+                     \"@type\": \"@json\" (or \"@vector\" for an array); a value object \
+                     takes no datatype from its term",
+        });
+    }
     let direction = base_direction(map)?;
 
     // Build result
@@ -596,6 +589,17 @@ fn parse_value_object(
     }
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// Whether a value object typed `type_iri` may hold an array or a map: a JSON
+/// literal, or a vector (an array only, which the vector parser checks).
+fn holds_structured_value(type_iri: Option<&str>) -> bool {
+    matches!(
+        type_iri,
+        Some(
+            "@json" | "@vector" | fluree_vocab::rdf::JSON | fluree_vocab::fluree::EMBEDDING_VECTOR
+        )
+    )
 }
 
 /// A value object's `@direction`, which Fluree joins to its language tag as
@@ -2085,14 +2089,63 @@ mod tests {
         ));
     }
 
-    /// A value object's own language overrides the datatype its term gives.
+    /// A value object is taken as written: its term's `@type` and
+    /// `@language`, and the default language, apply only to bare values.
     #[test]
-    fn value_object_language_overrides_the_term_datatype() {
-        let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": XSD_INTEGER}});
+    fn value_object_is_taken_as_written() {
+        let p = EX.to_owned() + "p";
+        let typed = json!({"@language": "en", "p": {"@id": p, "@type": XSD_INTEGER}});
         assert_eq!(
-            values_of_p(json!({"@context": ctx, "p": {"@value": "cinq", "@language": "fr"}})),
+            values_of_p(json!({"@context": typed, "p": ["5", {"@value": "5"}, {"@value": 6}]})),
+            json!([
+                {"@value": "5", "@type": XSD_INTEGER},
+                {"@value": "5"},
+                {"@value": 6}
+            ])
+        );
+        assert_eq!(
+            values_of_p(json!({"@context": typed, "p": {"@value": "cinq", "@language": "fr"}})),
             json!([{"@value": "cinq", "@language": "fr"}])
         );
+
+        for term in [json!(p), json!({"@id": p, "@language": "de"})] {
+            let ctx = json!({"@language": "en", "p": term});
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": {"@value": "obj"}})),
+                json!([{"@value": "obj"}]),
+                "{ctx}"
+            );
+        }
+    }
+
+    /// An array or map `@value` needs its own `@json` or `@vector` type: a
+    /// value object takes none from its term, and an untyped one has no
+    /// literal to stand for.
+    #[test]
+    fn structured_value_object_needs_its_own_type() {
+        let p = EX.to_owned() + "p";
+        let vector = json!({"f": "https://ns.flur.ee/db#", "p": {"@id": p, "@type": "@vector"}});
+        for value in [
+            json!({"@value": [0.5]}),
+            json!({"@value": {"a": 1}}),
+            json!({"@value": [0.5], "@type": XSD_INTEGER}),
+        ] {
+            let err = crate::expand(&json!({"@context": vector, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs its own \"@type\""), "{value}: {err}");
+        }
+
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": vector, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
     }
 
     #[test]
