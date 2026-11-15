@@ -260,6 +260,11 @@ pub struct ExecutionContext<'a> {
     /// When present, scan operators should use this for per-leaf batch filtering
     /// via `filter_flakes`. This provides full f:query support without deadlocks.
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is: the query's primary
+    /// (a ledger or a graph source) when the caller resolves policy per
+    /// graph, `None` when it does not. A graph-source scan outside a dataset
+    /// reads this context's policy only when it is that source's own.
+    pub policy_source: Option<Arc<str>>,
     /// Optional BM25 index provider for `Pattern::IndexSearch` (legacy, returns raw index)
     pub bm25_provider: Option<&'a dyn Bm25IndexProvider>,
     /// Optional BM25 search provider for `Pattern::IndexSearch` (preferred, returns search results)
@@ -313,6 +318,12 @@ pub struct ExecutionContext<'a> {
     /// present-but-dangling FK differs (templated vs omitted). Read only for the
     /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
     pub trust_fk_refs: bool,
+    /// When true, every graph-source table scan emits a fixed row order, even
+    /// where the planner found no LIMIT or OFFSET in the query (see
+    /// [`crate::r2rml::ScanOrder`]). For a caller that slices the answer itself,
+    /// outside the query: the graph-source browse crawl pages subjects after the
+    /// query returns. Default `false`.
+    pub deterministic_scans: bool,
     /// Most pairs a property path may compute before returning its first
     /// row — one whose endpoints are both free or both constant; past it the
     /// path fails with [`QueryError::ResourceLimit`]. `None` (the default)
@@ -402,6 +413,11 @@ pub struct ExecutionContext<'a> {
     /// by an EXACT `rr:class` match and a subclass-entailed subject would be
     /// silently dropped. Defaults to `false` (no reasoning).
     pub reasoning_active: bool,
+    /// The reasoning materialization's translated overlay ops, shared across
+    /// the queries reading it (see [`crate::reasoning_ops`]). Set with
+    /// `reasoning_active` when the query has derived facts; propagated across
+    /// per-graph derivations, which use it only while reading its overlay.
+    pub reasoning_ops: Option<crate::reasoning_ops::ReasoningOpsHandle>,
     /// The snapshot this context was originally constructed from.
     ///
     /// Equal to `active_snapshot` in the common single-graph case. In per-graph
@@ -514,6 +530,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000, // Default batch size
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -528,6 +545,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -543,6 +561,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -577,6 +596,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -591,6 +611,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -606,6 +627,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -644,6 +666,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -658,6 +681,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -673,6 +697,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -700,6 +725,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -714,6 +740,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -729,6 +756,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -755,6 +783,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -769,6 +798,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -784,6 +814,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -812,6 +843,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -826,6 +858,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -841,6 +874,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
@@ -1019,6 +1053,12 @@ impl<'a> ExecutionContext<'a> {
     /// `QueryExecutionOptions::trust_fk_refs` on the graph-source crawl path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// See [`ExecutionContext::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
         self
     }
 
@@ -1484,15 +1524,47 @@ impl<'a> ExecutionContext<'a> {
     /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
     /// names no graph, or it names a reserved system graph or the default graph
     /// (the ledger's own address, even if a registered graph shares the text).
+    ///
+    /// A graph dropped as of `to_t` names no graph here either, as one that
+    /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
         match self.single_db_graph_position(iri)? {
             fluree_db_core::GraphPosition::Registered { g_id, .. }
-                if g_id >= FIRST_USER_GRAPH_ID =>
+                if g_id >= FIRST_USER_GRAPH_ID
+                    && self
+                        .active_snapshot
+                        .graph_registry
+                        .visible_at(g_id, self.to_t) =>
             {
                 Some(g_id)
             }
             _ => None,
         }
+    }
+
+    /// Refuse a `GRAPH <iri>` naming a user graph that a commit after `to_t`
+    /// dropped: the query asks what the graph held then, which the drop took,
+    /// and reading that as an empty graph would answer something else.
+    pub fn refuse_dropped_graph(&self, iri: &str) -> crate::error::Result<()> {
+        if !self.active_snapshot.graph_registry.has_drops() {
+            return Ok(());
+        }
+        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
+            self.single_db_graph_position(iri)
+        {
+            if let Some(floor) = self
+                .active_snapshot
+                .graph_registry
+                .drop_after(g_id, self.to_t)
+            {
+                return Err(crate::error::QueryError::GraphDropped {
+                    graph: iri.to_string(),
+                    floor,
+                    t: self.to_t,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
@@ -1517,7 +1589,7 @@ impl<'a> ExecutionContext<'a> {
         let registry = &self.active_snapshot.graph_registry;
         let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
         registry
-            .iter_entries()
+            .iter_visible_entries(self.to_t)
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
             .filter_map(|(g, iri)| {
                 target
@@ -1550,6 +1622,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1564,6 +1637,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1579,6 +1653,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
@@ -1616,6 +1691,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1630,6 +1706,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1645,6 +1722,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
@@ -1678,6 +1756,12 @@ impl<'a> ExecutionContext<'a> {
                 .policy_enforcer
                 .clone()
                 .or_else(|| self.policy_enforcer.clone()),
+            // A graph's own enforcer is built for that graph.
+            policy_source: if graph.policy_enforcer.is_some() {
+                Some(Arc::clone(&graph.ledger_id))
+            } else {
+                self.policy_source.clone()
+            },
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1692,6 +1776,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
@@ -1707,6 +1792,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             // A fresh per-graph scope: dataset members are stamped at the
             // member boundary by their owning `DatasetOperator`, and the
@@ -1810,6 +1896,12 @@ impl<'a> ExecutionContext<'a> {
     /// Force eager materialization of binary-scan bindings.
     pub fn with_eager_materialization(mut self) -> Self {
         self.eager_materialization = true;
+        self
+    }
+
+    /// See [`reasoning_ops`](Self::reasoning_ops).
+    pub fn with_reasoning_ops(mut self, ops: crate::reasoning_ops::ReasoningOpsHandle) -> Self {
+        self.reasoning_ops = Some(ops);
         self
     }
 

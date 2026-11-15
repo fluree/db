@@ -24,8 +24,8 @@ impl<'a> HeadGraphNames<'a> {
     /// The graph registered under exactly `iri`.
     pub fn graph_id(&self, iri: &str) -> Option<GraphId> {
         self.registry
-            .graph_id_for_iri(iri)
-            .or_else(|| self.store.and_then(|store| store.graph_id_for_iri(iri)))
+            .assigned_graph_id(iri)
+            .or_else(|| self.store.and_then(|store| store.assigned_graph_id(iri)))
     }
 }
 

@@ -148,7 +148,7 @@ pub(crate) fn materialized_facts(
 ) -> Vec<Flake> {
     let g_id = match &target.graph {
         None => default_g_id,
-        Some(iri) => match snapshot.graph_registry.graph_id_for_iri(iri) {
+        Some(iri) => match snapshot.graph_registry.assigned_graph_id(iri) {
             Some(g_id) => g_id,
             None => return Vec::new(),
         },
@@ -254,7 +254,9 @@ pub(crate) async fn explain_facts(
         for batch in &batches {
             for row in 0..batch.len() {
                 for head in &heads {
-                    let Some(flake) = instantiate(head, batch, row, view.snapshot, view.t) else {
+                    let Some(flake) =
+                        instantiate(&rule.name, head, batch, row, view.snapshot, view.t)?
+                    else {
                         continue;
                     };
                     let Some((_, fact)) = facts.iter_mut().find(|(f, _)| same_fact(f, &flake))
@@ -858,7 +860,7 @@ async fn asserted(
 ) -> Result<bool> {
     let db = match graph {
         None => base,
-        Some(iri) => match base.snapshot.graph_registry.graph_id_for_iri(iri) {
+        Some(iri) => match base.snapshot.graph_registry.assigned_graph_id(iri) {
             Some(g_id) => GraphDbRef::new(base.snapshot, g_id, base.overlay, base.t),
             None => return Ok(false),
         },

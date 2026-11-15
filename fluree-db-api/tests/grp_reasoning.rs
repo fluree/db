@@ -29,6 +29,8 @@ mod it_datalog_rules_sparql;
 mod it_datalog_run_contract;
 #[path = "it_datalog_semi_naive.rs"]
 mod it_datalog_semi_naive;
+#[path = "it_reasoning_batched_probe.rs"]
+mod it_reasoning_batched_probe;
 #[path = "it_reasoning_budget.rs"]
 mod it_reasoning_budget;
 #[path = "it_reasoning_imports.rs"]

@@ -16,6 +16,8 @@ mod it_commit_contention;
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
+#[path = "it_graph_drop.rs"]
+mod it_graph_drop;
 #[path = "it_graph_scoped_writes.rs"]
 mod it_graph_scoped_writes;
 #[path = "it_json_canonicalization.rs"]

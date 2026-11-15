@@ -270,13 +270,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // consistent. With the datatype emitted, the isomorphism resolves.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-05",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-06",
-    // optional cluster (3): all three optional-complex-* use GRAPH ?x/?g and
-    // are gated on PR-G1 (GRAPH-variable semantics). dawg-optional-filter-005's
-    // doubly-nested `OPTIONAL { { ... FILTER } }` scope leak is fixed (PR-W1
-    // Family A).
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-4",
     // type-promotion-03/04/05/21 (double∘decimal, float-float/decimal/short
     // promotion) and the tP-29/30 "-fail" ASKs (double+decimal is double not
     // decimal; float+decimal is float not decimal) — D4 numeric promotion, PR-X2
@@ -485,14 +478,7 @@ pub const SPARQL12_VERSION: &[&str] = &[
     // parser rejects valid input (3)
 ];
 
-// Not path-cardinality defects: pp34/pp35 are graph-cluster tests mis-filed
-// under property-path (`GRAPH <ng-01.ttl> { ?s :p1* ?t }` — constant GRAPH IRI
-// base-expansion vs exact-key registry miss, and `?g` bound as a literal).
-// Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
-// already produces the expected `[a,b,b]` bag once the GRAPH block matches
-// (residual-eval.md §2.2).
-pub const SPARQL11_PROPERTY_PATH: &[&str] =
-    &["http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35"];
+pub const SPARQL11_PROPERTY_PATH: &[&str] = &[];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
 // test environment cannot provide. Revisit with an in-process mock endpoint

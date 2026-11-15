@@ -40,6 +40,7 @@ pub use build::shared_pool;
 
 pub use vocab::dict_io;
 pub use vocab::dict_merge;
+pub use vocab::new_terms::{NewTermReader, NewTermWriter, NewTerms};
 pub use vocab::vocab_file;
 pub use vocab::vocab_merge;
 
@@ -51,16 +52,16 @@ pub use resolve::global_dict::{
     DictAllocator, DictWorkerCache, GlobalDicts, LanguageTagDict, PredicateDict,
     SharedDictAllocator, StringValueDict, SubjectDict,
 };
-pub use resolve::lang_remap::build_lang_remap_from_vocabs;
+pub use resolve::lang_remap::{build_lang_remap_from_vocabs, build_lang_remap_over};
 pub use resolve::resolver::{CommitResolver, ResolverError};
 
 // From runs/
 pub use runs::run_file::{write_run_file, RunFileInfo};
 pub use runs::run_writer::{MultiOrderConfig, MultiOrderRunWriter, RunWriter, RunWriterResult};
 pub use runs::spool::{
-    collect_chunk_run_files, remap_commit_to_runs, remap_spool_to_runs, remap_v1_to_v2,
-    sort_remap_and_write_sorted_commit, spool_to_runs, SortedCommitInfo, SpoolFileInfo,
-    SpoolReader, SpoolWriter, TypesMapConfig,
+    collect_chunk_run_files, relocalize_sorted_commit, remap_commit_to_runs, remap_spool_to_runs,
+    remap_v1_to_v2, sort_remap_and_write_sorted_commit, spool_to_runs, SortedCommitInfo,
+    SpoolFileInfo, SpoolReader, SpoolWriter, TypesMapConfig,
 };
 pub use runs::streaming_reader::StreamingRunReader;
 
@@ -73,7 +74,7 @@ pub use build::incremental_leaf::{
     update_leaf, LeafUpdateInput, LeafUpdateOutput, LeafletOrigin, NewLeafBlob,
 };
 pub use build::incremental_resolve::{IncrementalNovelty, IncrementalResolveConfig};
-pub use build::incremental_root::IncrementalRootBuilder;
+pub use build::incremental_root::{replaced_dict_cids, IncrementalRootBuilder};
 pub use build::index_build::{
     build_all_indexes, build_index, BuildAllConfig, GraphIndexResult, IndexBuildConfig,
     IndexBuildError, IndexBuildResult,

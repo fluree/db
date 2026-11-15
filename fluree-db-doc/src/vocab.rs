@@ -85,6 +85,12 @@ pub const EXTRACTION_MODEL: &str = "doc:extractionModel";
 /// Hash of everything that shaped extraction, so an unchanged document is
 /// re-extracted only when the ontology, gazetteer or model changed.
 pub const EXTRACTION_FINGERPRINT: &str = "doc:extractionFingerprint";
+/// A predicate a reader wrote that this pipeline does not own: what a
+/// re-ingest retracts from the nodes that reader minted, and nothing else.
+pub const READER_PREDICATE: &str = "doc:readerPredicate";
+/// The named graph an HTTP reader's reading of the document is committed
+/// in, which a re-ingest clears before it commits the new reading.
+pub const READING_GRAPH: &str = "doc:readingGraph";
 pub const MENTION_COUNT: &str = "doc:mentionCount";
 pub const ENTITY_COUNT: &str = "doc:entityCount";
 pub const RELATION_COUNT: &str = "doc:relationCount";

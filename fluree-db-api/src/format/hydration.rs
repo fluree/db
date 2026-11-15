@@ -885,6 +885,7 @@ impl<'a> DatasetCtx<'a> {
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(view.db.snapshot, arena_reader.is_some());
         HydrationFormatter {
             db: view.db,
             compactor: &view.compactor,
@@ -893,6 +894,7 @@ impl<'a> DatasetCtx<'a> {
             policy: view.policy.as_ref(),
             tracker: self.tracker,
             arena_reader,
+            arena_dropped_graphs,
             novelty,
             dataset: Some(self),
             active_idx: idx,
@@ -1131,6 +1133,10 @@ struct HydrationFormatter<'a> {
             dyn fluree_db_core::storage::ContentStore,
         >,
     >,
+    /// The graphs a drop took after the index, as edges name them: the
+    /// arena predates those drops, so an edge of theirs is read from novelty
+    /// alone. Empty without an arena reader or a drop since the index.
+    arena_dropped_graphs: Vec<Option<Sid>>,
     /// Cached downcast of `db.overlay` to the concrete
     /// `fluree_db_novelty::Novelty` type. Computed once on `new()`
     /// and reused across every annotation-hydration call site —
@@ -1161,6 +1167,16 @@ struct HydrationFormatter<'a> {
     /// head a list stored as its triples; read when the crawl first meets a
     /// blank-node value ([`Self::holds_cells`]).
     holds_cells: std::sync::OnceLock<bool>,
+}
+
+/// [`HydrationFormatter::arena_dropped_graphs`] for `snapshot`, when an
+/// arena reader is in use.
+fn arena_dropped_graphs(snapshot: &LedgerSnapshot, has_arena: bool) -> Vec<Option<Sid>> {
+    if has_arena {
+        snapshot.edge_graphs_dropped_since_index()
+    } else {
+        Vec::new()
+    }
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -1196,6 +1212,7 @@ impl<'a> HydrationFormatter<'a> {
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(db.snapshot, arena_reader.is_some());
         Self {
             db,
             compactor,
@@ -1204,6 +1221,7 @@ impl<'a> HydrationFormatter<'a> {
             policy,
             tracker,
             arena_reader,
+            arena_dropped_graphs,
             novelty,
             dataset: None,
             active_idx: 0,
@@ -1357,8 +1375,13 @@ impl<'a> HydrationFormatter<'a> {
                 _ => Arc::new(self.fetch_subject_properties(sid, predicate_filter).await?),
             };
 
-            // Group flakes by predicate
-            let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
+            // Group flakes by predicate, in predicate order. The order the
+            // predicates are formatted in decides which path reaches a shared
+            // node first, and so what its cached rendering holds (the cycle
+            // cut at `visited` depends on the path): a std map, seeded at
+            // random per instance, rendered the same subject differently from
+            // run to run.
+            let mut by_pred: BTreeMap<Sid, Vec<&Flake>> = BTreeMap::new();
             for flake in flakes.iter() {
                 by_pred.entry(flake.p.clone()).or_default().push(flake);
             }
@@ -1453,8 +1476,10 @@ impl<'a> HydrationFormatter<'a> {
                 }
             }
 
-            // Format reverse properties
-            for (rev_pred, rev_nested_opt) in level.reverse() {
+            // Format reverse properties, in predicate order (as `by_pred`).
+            let mut reverse: Vec<_> = level.reverse().iter().collect();
+            reverse.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (rev_pred, rev_nested_opt) in reverse {
                 let rev_flakes = self.fetch_reverse_properties(sid, rev_pred).await?;
                 if !rev_flakes.is_empty() {
                     let values = self
@@ -2164,6 +2189,16 @@ impl<'a> HydrationFormatter<'a> {
             let Some(novelty) = self.novelty else {
                 return Ok(None);
             };
+            if self.arena_dropped_graphs.contains(&edge_key.g) {
+                // The arena predates the drop of this edge's graph, which
+                // took all it holds of the edge.
+                let live: Vec<Sid> = novelty
+                    .attachments
+                    .current_annotations_for_at(edge_key, self.db.t)
+                    .collect();
+                tracing::Span::current().record("live_count", live.len());
+                return Ok(Some(live));
+            }
             let novelty_events = novelty.attachments.collect_forward_events(edge_key);
             let live = reader
                 .current_annotations_merged(edge_key, &novelty_events, self.db.t)

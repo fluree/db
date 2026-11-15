@@ -2000,6 +2000,65 @@ async fn sync_with_nested_projection_rebuilds_when_the_referenced_subject_change
     );
 }
 
+/// Reasoning infers from properties the patterns never name: asserting
+/// `ex:Memo rdfs:subClassOf ex:Doc` makes every memo a document. No tracked
+/// property changes, so the sync must rebuild.
+#[tokio::test]
+async fn sync_with_reasoning_rebuilds_when_the_schema_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/reasoning:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    });
+    let tx1 = json!({
+        "@context": ctx,
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" },
+            { "@id":"ex:memo1", "@type":"ex:Memo", "ex:title":"quokka" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": ctx,
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:title"] },
+        "reasoning": "rdfs"
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("reasoning", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    let tx2 = json!({
+        "@context": ctx,
+        "@graph": [ { "@id":"ex:Memo", "rdfs:subClassOf": { "@id":"ex:Doc" } } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "reasoning cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("quokka").is_some(),
+        "the memo, now a document, never reached the index"
+    );
+}
+
 /// A variable predicate observes every property, so the tracked set cannot be
 /// total. Here the changed property happens to be tracked anyway, which is why
 /// the index ends up correct on either path — the routing is the assertion.

@@ -750,7 +750,7 @@ pub fn graph_id_in(ledger: &LedgerState, g: &Option<Sid>) -> Option<GraphId> {
         Some(g_sid) => ledger
             .snapshot
             .decode_sid(g_sid)
-            .and_then(|iri| ledger.snapshot.graph_registry.graph_id_for_iri(&iri)),
+            .and_then(|iri| ledger.snapshot.graph_registry.assigned_graph_id(&iri)),
     }
 }
 

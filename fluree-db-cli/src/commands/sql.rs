@@ -10,11 +10,9 @@ use fluree_db_api::server_defaults::FlureeDir;
 pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir, direct: bool) -> CliResult<()> {
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
-        let result = run_sql_map_remote(&client, &args).await.map_err(|e| {
-            CliError::Remote(format!(
-                "failed to map SQL graph source on '{remote_name}': {e}"
-            ))
-        });
+        let result = run_sql_map_remote(&client, &args)
+            .await
+            .map_err(|e| e.context(format!("failed to map SQL graph source on '{remote_name}'")));
         crate::context::persist_refreshed_tokens(&client, remote_name, dirs).await;
         return result;
     }
@@ -23,7 +21,7 @@ pub async fn run_sql_map(args: SqlMapArgs, dirs: &FlureeDir, direct: bool) -> Cl
         if let Some(client) = crate::context::try_server_route_client(dirs) {
             return run_sql_map_remote(&client, &args)
                 .await
-                .map_err(|e| CliError::Remote(format!("failed to map SQL graph source: {e}")));
+                .map_err(|e| e.context("failed to map SQL graph source"));
         }
     }
 
@@ -197,6 +195,7 @@ async fn run_sql_map_remote(
     );
     super::iceberg::print_model_warnings(&super::iceberg::model_warnings_of(&result));
     print_mapping_warnings(&string_list_of(&result, "mapping_warnings"));
+    super::iceberg::report_diagnostics(&result);
     Ok(())
 }
 
@@ -232,20 +231,22 @@ async fn run_sql_check_local(name: &str, dirs: &FlureeDir) -> CliResult<()> {
     };
     let result = fluree.check_sql_graph_source(&id).await?;
     println!("Checked SQL graph source '{}'", result.graph_source_id);
-    if result.duplicate_subject_tables.is_empty() {
+    if result.allow_duplicate_subjects {
+        println!(
+            "  Subject keys: not probed (registered with --allow-duplicate-subjects: \
+             queries answer with set semantics)"
+        );
+    } else if result.duplicate_subject_tables.is_empty() {
         println!("  Subject keys: unique in every probed table");
     } else {
         println!(
-            "  Subject keys: NOT unique in {} ({})",
+            "  Subject keys: NOT unique in {} (the pushdown lane refuses statements over \
+             these tables)",
             result.duplicate_subject_tables.join(", "),
-            if result.allow_duplicate_subjects {
-                "accepted: registered with --allow-duplicate-subjects"
-            } else {
-                "the pushdown lane refuses statements over these tables"
-            }
         );
     }
     print_mapping_warnings(&result.mapping_warnings);
+    super::iceberg::print_diagnostics(&result.diagnostics);
     Ok(())
 }
 
@@ -311,6 +312,7 @@ async fn run_sql_map_local(args: SqlMapArgs, dirs: &FlureeDir) -> CliResult<()> 
     );
     super::iceberg::print_model_warnings(&result.model_warnings);
     print_mapping_warnings(&result.mapping_warnings);
+    super::iceberg::print_diagnostics(&result.diagnostics);
     Ok(())
 }
 

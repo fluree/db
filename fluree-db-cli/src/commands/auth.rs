@@ -25,14 +25,28 @@ use fluree_db_nameservice::RemoteName;
 use fluree_db_nameservice_sync::{OidcLoginFlow, RemoteAuthType, RemoteEndpoint, SyncConfigStore};
 use std::io::{self, Read};
 
-pub async fn run(action: AuthAction, dirs: &FlureeDir) -> CliResult<()> {
-    let store = TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
+/// `dirs` is `None` only for `auth status` outside any project, which then
+/// reports the machine's fluree.ai sign-in alone.
+pub async fn run(action: AuthAction, dirs: Option<&FlureeDir>) -> CliResult<()> {
+    let store = dirs.map(|d| TomlSyncConfigStore::new(d.config_dir().to_path_buf()));
+    if let AuthAction::Status { remote } = &action {
+        return run_status(store.as_ref(), remote.as_deref()).await;
+    }
+    if let AuthAction::Token {
+        account: true,
+        refresh,
+        ..
+    } = &action
+    {
+        return run_account_token(*refresh).await;
+    }
+    let store = store.ok_or(CliError::NoFlureeDir)?;
 
     match action {
-        AuthAction::Status { remote } => run_status(&store, remote.as_deref()).await,
+        AuthAction::Status { .. } => unreachable!("handled above"),
         AuthAction::Login { remote, token } => run_login(&store, remote.as_deref(), token).await,
         AuthAction::Logout { remote } => run_logout(&store, remote.as_deref()).await,
-        AuthAction::Token { remote } => run_token(&store, remote.as_deref()).await,
+        AuthAction::Token { remote, .. } => run_token(&store, remote.as_deref()).await,
     }
 }
 
@@ -65,8 +79,90 @@ async fn resolve_remote_name(
 // Status
 // =============================================================================
 
-async fn run_status(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliResult<()> {
-    let name = resolve_remote_name(store, remote).await?;
+/// With `--remote`, that remote only (as before `fluree login` existed).
+/// Without it: the fluree.ai sign-in when there is one, then the only
+/// remote if exactly one is configured.
+async fn run_status(store: Option<&TomlSyncConfigStore>, remote: Option<&str>) -> CliResult<()> {
+    if remote.is_some() {
+        let store = store.ok_or(CliError::NoFlureeDir)?;
+        let name = resolve_remote_name(store, remote).await?;
+        return run_remote_status(store, &name).await;
+    }
+
+    let signed_in = print_account_status()?;
+    match store {
+        Some(store) => match resolve_remote_name(store, None).await {
+            Ok(name) => {
+                if signed_in {
+                    println!();
+                }
+                run_remote_status(store, &name).await
+            }
+            // Signed in with no remote configured: the account is the status.
+            Err(CliError::Config(_)) if signed_in => Ok(()),
+            // Several remotes: say how to see one rather than hiding them.
+            Err(CliError::Usage(_)) if signed_in => {
+                println!();
+                println!(
+                    "  {} several remotes are configured; `fluree auth status --remote <name>` shows one",
+                    "hint:".cyan().bold()
+                );
+                Ok(())
+            }
+            Err(e) if signed_in => {
+                println!();
+                eprintln!("  {} remotes: {e}", "warn:".yellow().bold());
+                Ok(())
+            }
+            Err(e) => Err(e),
+        },
+        None if signed_in => Ok(()),
+        None => {
+            println!("Not signed in to a fluree.ai account, and no project here.");
+            println!("  {} fluree login", "hint:".cyan().bold());
+            Ok(())
+        }
+    }
+}
+
+/// Print the machine's fluree.ai sign-in, if any. Local only: reads
+/// `account.toml` and the token's claims, never calls the server. An
+/// unreadable file is reported, not an error, so the project's remotes
+/// still show.
+fn print_account_status() -> CliResult<bool> {
+    let stored = match crate::account::load() {
+        Ok(Some(stored)) => stored,
+        Ok(None) => return Ok(false),
+        Err(e) => {
+            println!("{}", "Account:".bold());
+            println!("  {} {e}", "warn:".yellow().bold());
+            return Ok(true);
+        }
+    };
+    let tier = stored.account.as_ref().and_then(|a| a.tier.clone());
+    println!("{}", "Account:".bold());
+    println!("  Signed in to {}", super::login::describe(&stored).green());
+    if let Some(tier) = tier {
+        println!("  Tier: {tier}");
+    }
+    match decode_token_summary(&stored.access_token) {
+        Ok(summary) if summary.expired => {
+            println!("  Access token: expired (refreshed on next use)");
+        }
+        Ok(TokenSummary {
+            expiry: Some(exp), ..
+        }) => println!("  Access token: valid until {exp}"),
+        _ => {}
+    }
+    println!(
+        "  Credentials: {}",
+        crate::account::account_path()?.display()
+    );
+    Ok(true)
+}
+
+async fn run_remote_status(store: &TomlSyncConfigStore, name: &str) -> CliResult<()> {
+    let name = name.to_string();
     let remote_name = RemoteName::new(&name);
     let config = store
         .get_remote(&remote_name)
@@ -318,7 +414,7 @@ async fn try_discover_and_login(
 
 /// OIDC endpoints discovered from the provider's openid-configuration.
 /// The CLI auto-selects the appropriate flow based on which endpoints exist.
-enum OidcFlow {
+pub(crate) enum OidcFlow {
     /// Provider supports Device Authorization Grant (RFC 8628)
     DeviceCode {
         device_authorization_endpoint: String,
@@ -369,6 +465,7 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
 
     let http = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::USER_AGENT)
         .build()
         .map_err(|e| CliError::Remote(format!("failed to build HTTP client: {e}")))?;
 
@@ -389,6 +486,8 @@ async fn run_oidc_login(config: &mut fluree_db_nameservice_sync::RemoteConfig) -
                 &token_endpoint,
                 &client_id,
                 &scopes,
+                None,
+                true,
             )
             .await?
         }
@@ -476,7 +575,10 @@ fn warn_on_scope_downgrade(requested: &str, granted: Option<&str>) {
 /// Fetch OIDC discovery document and determine which flow to use.
 ///
 /// Prefers device flow if available; falls back to authorization code.
-async fn discover_oidc_endpoints(http: &reqwest::Client, issuer: &str) -> CliResult<OidcFlow> {
+pub(crate) async fn discover_oidc_endpoints(
+    http: &reqwest::Client,
+    issuer: &str,
+) -> CliResult<OidcFlow> {
     let url = format!(
         "{}/.well-known/openid-configuration",
         issuer.trim_end_matches('/')
@@ -537,15 +639,21 @@ async fn discover_oidc_endpoints(http: &reqwest::Client, issuer: &str) -> CliRes
 // =============================================================================
 
 /// Run the Device Authorization Grant flow.
-async fn run_device_code_flow(
+///
+/// `device_name` (this machine's host name) is sent only to servers that
+/// show it on their approval page; RFC 8628 servers ignore unknown fields.
+pub(crate) async fn run_device_code_flow(
     http: &reqwest::Client,
     device_auth_endpoint: &str,
     token_endpoint: &str,
     client_id: &str,
     scopes: &str,
+    device_name: Option<&str>,
+    open_browser: bool,
 ) -> CliResult<IdpTokenResponse> {
     eprintln!("Requesting device authorization...");
-    let device_resp = request_device_code(http, device_auth_endpoint, client_id, scopes).await?;
+    let device_resp =
+        request_device_code(http, device_auth_endpoint, client_id, scopes, device_name).await?;
 
     eprintln!();
     eprintln!("  {} Open this URL and enter the code below:", ">>".bold());
@@ -560,7 +668,7 @@ async fn run_device_code_flow(
         .verification_uri_complete
         .as_deref()
         .unwrap_or(&device_resp.verification_uri);
-    if open::that(open_url).is_ok() {
+    if open_browser && open::that(open_url).is_ok() {
         eprintln!("  (browser opened automatically)");
     }
 
@@ -590,10 +698,15 @@ async fn request_device_code(
     device_auth_endpoint: &str,
     client_id: &str,
     scopes: &str,
+    device_name: Option<&str>,
 ) -> CliResult<DeviceAuthResponse> {
+    let mut form = vec![("client_id", client_id), ("scope", scopes)];
+    if let Some(name) = device_name {
+        form.push(("device_name", name));
+    }
     let resp = http
         .post(device_auth_endpoint)
-        .form(&[("client_id", client_id), ("scope", scopes)])
+        .form(&form)
         .send()
         .await
         .map_err(|e| CliError::Remote(format!("device authorization request failed: {e}")))?;
@@ -648,8 +761,8 @@ async fn request_device_code(
 }
 
 /// IdP token response (from either device code polling or auth code exchange).
-struct IdpTokenResponse {
-    access_token: String,
+pub(crate) struct IdpTokenResponse {
+    pub(crate) access_token: String,
     /// Present when the IdP returns an id_token (e.g., Cognito auth code flow).
     /// Preferred for exchange because its `aud` claim matches the client_id.
     id_token: Option<String>,
@@ -721,7 +834,7 @@ async fn poll_for_token(
             }
             "expired_token" => {
                 return Err(CliError::Remote(
-                    "device code expired. Run `fluree auth login` to try again.".into(),
+                    "the device code expired before the sign-in was approved; run the same login command again".into(),
                 ));
             }
             "access_denied" => {
@@ -1049,9 +1162,12 @@ fn generate_random_state() -> String {
 }
 
 /// Fluree token exchange response.
-struct ExchangeResponse {
-    access_token: String,
-    refresh_token: Option<String>,
+pub(crate) struct ExchangeResponse {
+    pub(crate) access_token: String,
+    pub(crate) refresh_token: Option<String>,
+    /// The whole response, for servers that return more than the tokens
+    /// (fluree.ai: `account`, `deployment_id`).
+    pub(crate) body: serde_json::Value,
 }
 
 /// Exchange an IdP token for a Fluree-scoped Bearer token.
@@ -1059,7 +1175,7 @@ struct ExchangeResponse {
 /// `subject_token_type` should be `urn:ietf:params:oauth:token-type:id_token`
 /// when sending an id_token, or `urn:ietf:params:oauth:token-type:access_token`
 /// when sending an access_token.
-async fn exchange_token(
+pub(crate) async fn exchange_token(
     http: &reqwest::Client,
     exchange_url: &str,
     subject_token: &str,
@@ -1110,6 +1226,7 @@ async fn exchange_token(
     Ok(ExchangeResponse {
         access_token,
         refresh_token,
+        body,
     })
 }
 
@@ -1151,6 +1268,21 @@ async fn run_logout(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliRes
 /// hatch (`FLUREE_TOKEN=$(fluree auth token)` in .env workflows). Exactly
 /// the token goes to stdout; diagnostics (expiry warning) go to stderr.
 /// The refresh token is never printed.
+/// `fluree auth token --account [--refresh]`: the sign-in's access token,
+/// alone on stdout.
+async fn run_account_token(force: bool) -> CliResult<()> {
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .user_agent(crate::USER_AGENT)
+        .build()
+        .map_err(|e| CliError::Remote(format!("failed to build HTTP client: {e}")))?;
+    let session = crate::account::session(&http, force)
+        .await?
+        .ok_or_else(|| CliError::NotFound("not signed in; run `fluree login`".into()))?;
+    println!("{}", session.access_token);
+    Ok(())
+}
+
 async fn run_token(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliResult<()> {
     let name = resolve_remote_name(store, remote).await?;
     let remote_name = RemoteName::new(&name);
@@ -1183,17 +1315,17 @@ async fn run_token(store: &TomlSyncConfigStore, remote: Option<&str>) -> CliResu
 // Token summary decoding (no verification)
 // =============================================================================
 
-struct TokenSummary {
-    expiry: Option<String>,
+pub(crate) struct TokenSummary {
+    pub(crate) expiry: Option<String>,
     /// True when the `exp` claim is present and in the past.
-    expired: bool,
+    pub(crate) expired: bool,
     identity: Option<String>,
     issuer: Option<String>,
     subject: Option<String>,
 }
 
 /// Decode a JWT/JWS payload without verification to extract summary info.
-fn decode_token_summary(token: &str) -> Result<TokenSummary, ()> {
+pub(crate) fn decode_token_summary(token: &str) -> Result<TokenSummary, ()> {
     use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 
     let parts: Vec<&str> = token.split('.').collect();

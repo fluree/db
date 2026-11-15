@@ -510,7 +510,7 @@ impl super::Parser<'_> {
             }
             TokenKind::Anon => {
                 self.stream.advance();
-                return Some(BlankNode::anon(span));
+                return Some(self.anon_blank_node(span));
             }
             TokenKind::LBracket => {
                 // [ ... ] blank node syntax
@@ -520,7 +520,7 @@ impl super::Parser<'_> {
                 // Empty `[]` is just an anonymous blank node.
                 if self.stream.match_token(&TokenKind::RBracket) {
                     let span = start.union(self.stream.previous_span());
-                    return Some(BlankNode::anon(span));
+                    return Some(self.anon_blank_node(span));
                 }
 
                 // Non-empty `[ propertyListNotEmpty ]` (SPARQL 1.1 grammar rule
@@ -532,6 +532,15 @@ impl super::Parser<'_> {
         }
 
         None
+    }
+
+    /// An anonymous `[]`, under a fresh reserved label. A `;` or `,` list
+    /// copies its subject into each triple, and the shared label keeps those
+    /// copies one node.
+    fn anon_blank_node(&mut self, span: SourceSpan) -> BlankNode {
+        let label = reserved_blank_label("anon", self.bnode_counter);
+        self.bnode_counter += 1;
+        BlankNode::labeled(&label, span)
     }
 
     /// Parse the body of a non-empty blank-node property list `[ … ]` (the

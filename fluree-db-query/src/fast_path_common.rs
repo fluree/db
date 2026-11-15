@@ -449,10 +449,16 @@ pub(crate) fn driver_subject_boundaries(
 /// (`DictOverlay::assign_numbig_handle`), a novelty value reuses a base arena
 /// handle only when the predicate's base arena is non-empty (already reported
 /// here), and novelty *list* rows need a row-level check in the overlay lane.
+///
+/// `replay_to` is the read's `t` when it is below the index's. The flags and
+/// the type constant describe a leaflet's live rows; history newer than the
+/// read can hold list rows or arena handles, so a leaflet the read replays is
+/// unsafe.
 pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    replay_to: Option<i64>,
 ) -> Result<bool> {
     use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
@@ -461,10 +467,11 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
             .map_err(|e| QueryError::from_io("leaf open", e))?;
         let dir = handle.dir();
         for (idx, entry) in dir.entries.iter().enumerate() {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
+            let replays = entry.replays_history(replay_to);
+            if (entry.row_count == 0 && !replays) || entry.p_const != Some(p_id) {
                 continue;
             }
-            if entry.flags & HAS_O_I != 0 {
+            if replays || entry.flags & HAS_O_I != 0 {
                 return Ok(true);
             }
             match entry.o_type_const {
@@ -2105,6 +2112,38 @@ pub(crate) fn predicate_walk_bounds(pred: &Sid) -> (fluree_db_core::Flake, flure
     (first, rhs)
 }
 
+/// Upper bound on the overlay flakes of `pred_sid` in `g_id` (the extent
+/// [`collect_resolved_overlay_ops`] walks for PSOT), when the overlay can
+/// count without walking.
+pub(crate) fn predicate_overlay_extent(
+    ctx: &ExecutionContext<'_>,
+    g_id: GraphId,
+    pred_sid: &Sid,
+) -> Option<usize> {
+    predicate_overlay_extent_in(ctx, g_id, RunSortOrder::Psot, pred_sid)
+}
+
+/// [`predicate_overlay_extent`] in a predicate-leading `order`; `None` for
+/// any other order.
+fn predicate_overlay_extent_in(
+    ctx: &ExecutionContext<'_>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> Option<usize> {
+    if !matches!(order, RunSortOrder::Psot | RunSortOrder::Post) {
+        return None;
+    }
+    let (first, rhs) = predicate_walk_bounds(pred_sid);
+    ctx.overlay().overlay_range_flake_count(
+        g_id,
+        crate::binary_scan::sort_order_to_index_type(order),
+        Some(&first),
+        Some(&rhs),
+        false,
+    )
+}
+
 /// Collect the novelty-overlay ops for a single predicate, translated into the
 /// binary-index `OverlayOp` representation and sorted/resolved for `order`.
 ///
@@ -2283,6 +2322,82 @@ pub fn cached_overlay_ops(
     order: RunSortOrder,
     pred_sid: &Sid,
 ) -> Result<Option<SharedOverlayOps>> {
+    debug_assert!(
+        !matches!(order, RunSortOrder::Opst),
+        "OPST keys hold the object lane's ops (`cached_object_probe_ops`)"
+    );
+    cached_ops_entry(ctx, store, g_id, order, pred_sid, || {
+        Ok(
+            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
+                .map(SharedOverlayOps::from),
+        )
+    })
+}
+
+/// Whether the bound-object lane can probe objects of `o_type`: refs and
+/// string terms, whose `(o_type, o_key)` is their whole identity. Other
+/// literals match across datatypes and are left to the per-row scan.
+pub(crate) fn object_probe_covers(o_type: u16) -> bool {
+    use fluree_db_core::o_type::DecodeKind;
+    matches!(
+        OType::from_u16(o_type).decode_kind(),
+        DecodeKind::IriRef | DecodeKind::StringDict
+    )
+}
+
+/// The predicate's ops on the objects the bound-object lane probes
+/// ([`object_probe_covers`]), sorted by `(o_type, o_key, s_id, o_i)`, the order
+/// it reconciles in. Derived from the PSOT ops once and cached beside them
+/// under the OPST key: no scan reads OPST ops, while the POST key holds a POST
+/// scan's own.
+pub(crate) fn cached_object_probe_ops(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    pred_sid: &Sid,
+) -> Result<Option<SharedOverlayOps>> {
+    let g_id = ctx.binary_g_id;
+    cached_ops_entry(ctx, store, g_id, RunSortOrder::Opst, pred_sid, || {
+        let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? else {
+            return Ok(None);
+        };
+        let mut subset: Vec<_> = ops
+            .iter()
+            .filter(|o| object_probe_covers(o.o_type))
+            .copied()
+            .collect();
+        subset.sort_unstable_by_key(|o| (o.o_type, o.o_key, o.s_id, o.o_i));
+        Ok(Some(subset.into()))
+    })
+}
+
+/// Whether the ops for `(g_id, order, pred_sid)` are already translated,
+/// in this execution or, under reasoning, on the materialization.
+pub(crate) fn overlay_ops_cached(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+) -> bool {
+    let in_execution = ctx.overlay_ops_cache.inner.get().is_some_and(|bound| {
+        bound.binding == OverlayOpsBinding::of(ctx, store)
+            && bound
+                .map
+                .lock()
+                .expect("overlay ops cache poisoned")
+                .contains_key(&(g_id, order, pred_sid.clone()))
+    });
+    in_execution || crate::reasoning_ops::cached(ctx, store, g_id, order, pred_sid)
+}
+
+fn cached_ops_entry(
+    ctx: &ExecutionContext<'_>,
+    store: &Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    order: RunSortOrder,
+    pred_sid: &Sid,
+    compute: impl FnOnce() -> Result<Option<SharedOverlayOps>>,
+) -> Result<Option<SharedOverlayOps>> {
     let binding = OverlayOpsBinding::of(ctx, store);
     let bound = ctx.overlay_ops_cache.inner.get_or_init(|| BoundOpsMap {
         binding,
@@ -2296,10 +2411,7 @@ pub fn cached_overlay_ops(
              the deriving constructor must start a fresh cache"
         );
         tracing::debug!("overlay-ops cache binding mismatch; computing uncached");
-        return Ok(
-            collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
-                .map(SharedOverlayOps::from),
-        );
+        return compute();
     }
     let key = (g_id, order, pred_sid.clone());
     if let Some(entry) = bound
@@ -2313,8 +2425,15 @@ pub fn cached_overlay_ops(
     // A concurrent miss on the same key duplicates the walk (acceptable —
     // last write wins with an identical value) but never holds the lock
     // across the walk.
-    let computed = collect_resolved_overlay_ops(ctx, store, g_id, order, pred_sid)?
-        .map(SharedOverlayOps::from);
+    let computed = crate::reasoning_ops::get_or_translate(
+        ctx,
+        store,
+        g_id,
+        order,
+        pred_sid,
+        || predicate_overlay_extent_in(ctx, g_id, order, pred_sid),
+        compute,
+    )?;
     bound
         .map
         .lock()
@@ -2452,27 +2571,20 @@ impl ProbeOps {
     }
 }
 
-/// One overlay op of the object-probe subset: an `IRI_REF`-valued fact of
-/// the probed predicate, keyed for object-major reconciliation.
-#[derive(Clone, Copy)]
-struct ObjectProbeOp {
-    o_key: u64,
-    s_id: u64,
-    o_i: u32,
-    /// true = assert, false = retract.
-    op: bool,
-}
-
-/// Per-flush reconciler for the OPST bound-object probe lane.
+/// Per-flush reconciler for one object type of the bound-object probe lane.
 ///
-/// The lane scans only `IRI_REF` rows of one predicate, keyed by object id,
-/// so this owns the matching subset of the predicate's resolved ops re-sorted
-/// by `(o_key, s_id, o_i)` — object-major windows with a well-defined
-/// binary-search order regardless of the source vec's sort order (the cached
-/// PSOT ops serve directly; no second overlay walk in OPST order). Same case
-/// analysis and per-flush scope as [`ProbeOps`].
+/// The lane scans one predicate's rows for a set of objects, each an exact
+/// `(o_type, o_key)`, so it reconciles against [`cached_object_probe_ops`]:
+/// the predicate's resolved ops on such objects in `(o_type, o_key, s_id, o_i)`
+/// order, object-major windows shared across flushes and (for eager callers)
+/// queries. A probe walks one type at a time and an op of another type cannot
+/// touch its rows, so the reconciler holds that type's run of the ops alone.
+/// Same case analysis and per-flush scope as [`ProbeOps`].
 pub struct ObjectProbeOps {
-    ops: Vec<ObjectProbeOp>,
+    ops: SharedOverlayOps,
+    /// Where the probed type's ops start in `ops`; `consumed` has one flag
+    /// for each of them.
+    start: usize,
     consumed: Vec<bool>,
     /// Base rows suppressed by novelty retracts (diagnostics).
     pub dropped_rows: u64,
@@ -2481,45 +2593,49 @@ pub struct ObjectProbeOps {
 }
 
 impl ObjectProbeOps {
-    /// Filter `ops` (one predicate's resolved ops, any sort order) to the
-    /// `IRI_REF` subset and index it object-major. Returns `None` when no op
-    /// can affect the lane — callers then run their unmodified scan.
-    pub fn new(ops: &[fluree_db_binary_index::read::types::OverlayOp]) -> Option<Self> {
-        let iri_ref = OType::IRI_REF.as_u16();
-        let mut subset: Vec<ObjectProbeOp> = ops
-            .iter()
-            .filter(|o| o.o_type == iri_ref)
-            .map(|o| ObjectProbeOp {
-                o_key: o.o_key,
-                s_id: o.s_id,
-                o_i: o.o_i,
-                op: o.op,
-            })
-            .collect();
-        if subset.is_empty() {
+    /// `ops` must come from [`cached_object_probe_ops`]. Returns `None` when
+    /// none is on an object of `o_type`: no op can affect the probe, so
+    /// callers run their unmodified scan.
+    pub fn for_type(ops: &SharedOverlayOps, o_type: u16) -> Option<Self> {
+        debug_assert!(
+            ops.windows(2).all(|w| {
+                (w[0].o_type, w[0].o_key, w[0].s_id, w[0].o_i)
+                    < (w[1].o_type, w[1].o_key, w[1].s_id, w[1].o_i)
+            }),
+            "ObjectProbeOps requires object-major sorted, resolved ops"
+        );
+        let start = ops.partition_point(|o| o.o_type < o_type);
+        let len = ops[start..].partition_point(|o| o.o_type == o_type);
+        if len == 0 {
             return None;
         }
-        subset.sort_unstable_by_key(|o| (o.o_key, o.s_id, o.o_i));
-        let consumed = vec![false; subset.len()];
         Some(Self {
-            ops: subset,
-            consumed,
+            ops: Arc::clone(ops),
+            start,
+            consumed: vec![false; len],
             dropped_rows: 0,
             injected_rows: 0,
         })
     }
 
-    /// Index range of ops for `o_key`. Empty for objects with no novelty —
-    /// the common case, which keeps the per-row fate check free for them.
+    /// The probed type's ops, in `(o_key, s_id, o_i)` order.
+    fn typed(&self) -> &[fluree_db_binary_index::read::types::OverlayOp] {
+        &self.ops[self.start..self.start + self.consumed.len()]
+    }
+
+    /// Index range, within the probed type's ops, of those for the object
+    /// `o_key`. Empty for objects with no novelty — the common case, which
+    /// keeps the per-row fate check free for them.
     pub fn object_window(&self, o_key: u64) -> std::ops::Range<usize> {
-        let start = self.ops.partition_point(|o| o.o_key < o_key);
-        let end = start + self.ops[start..].partition_point(|o| o.o_key == o_key);
+        let typed = self.typed();
+        let start = typed.partition_point(|o| o.o_key < o_key);
+        let end = start + typed[start..].partition_point(|o| o.o_key == o_key);
         start..end
     }
 
     /// Reconcile one base row of `window`'s object against the ops, marking a
     /// matching op consumed. `window` must come from
-    /// [`Self::object_window`] for the row's object key.
+    /// [`Self::object_window`] for the row's object.
     pub fn base_row_fate(
         &mut self,
         window: &std::ops::Range<usize>,
@@ -2529,14 +2645,15 @@ impl ObjectProbeOps {
         if window.is_empty() {
             return RowFate::Keep;
         }
-        let win = &self.ops[window.clone()];
+        let win = &self.typed()[window.clone()];
         let probe = (s_id, o_i);
         let pos = win.partition_point(|o| (o.s_id, o.o_i) < probe);
         if pos < win.len() {
             let op = &win[pos];
             if (op.s_id, op.o_i) == probe {
+                let assert = op.op;
                 self.consumed[window.start + pos] = true;
-                if op.op {
+                if assert {
                     return RowFate::Keep;
                 }
                 self.dropped_rows += 1;
@@ -2546,20 +2663,20 @@ impl ObjectProbeOps {
         RowFate::Keep
     }
 
-    /// Hand every not-yet-consumed assert for `o_key` to `f` (as the
-    /// asserting subject id) — novelty-only facts of probed objects become
-    /// new matches. Call once per probed object after the base scan.
+    /// Hand every not-yet-consumed assert for the object `o_key` to `f` (as
+    /// the asserting subject id) — novelty-only facts of probed objects
+    /// become new matches. Call once per probed object after the base scan.
     pub fn drain_asserts_for_object(
         &mut self,
         o_key: u64,
         mut f: impl FnMut(u64) -> Result<()>,
     ) -> Result<()> {
-        let window = self.object_window(o_key);
-        for i in window {
-            if !self.consumed[i] && self.ops[i].op {
+        for i in self.object_window(o_key) {
+            let op = self.ops[self.start + i];
+            if !self.consumed[i] && op.op {
                 self.consumed[i] = true;
                 self.injected_rows += 1;
-                f(self.ops[i].s_id)?;
+                f(op.s_id)?;
             }
         }
         Ok(())
@@ -2692,6 +2809,23 @@ pub(crate) fn policy_lane_for_predicates(
     verdict
 }
 
+/// An eager (reasoning) caller with an overlay to merge.
+pub(crate) fn eager_with_overlay(ctx: &ExecutionContext<'_>) -> bool {
+    ctx.eager_materialization && !ctx.overlay_free_single_graph()
+}
+
+/// What a probe lane emits, which decides whether an eager caller with an
+/// overlay may take it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LaneOutput {
+    /// Encoded bindings. Eager callers are owed decoded ones (a datalog rule
+    /// head rejects an encoded binding), so admission declines them.
+    Encoded,
+    /// Decoded bindings under eager materialization, as the per-row scan
+    /// emits, or no bindings at all.
+    DecodesForEager,
+}
+
 /// Admission shared by every probe lane and by the join's early routing
 /// decision: `Some(plan)` settles the lane without consulting the overlay,
 /// `None` means plan against it.
@@ -2705,6 +2839,7 @@ pub(crate) fn policy_lane_for_predicates(
 pub(crate) fn probe_lane_admission(
     ctx: &ExecutionContext<'_>,
     pred_sids: &[&Sid],
+    output: LaneOutput,
 ) -> Option<ProbeLanePlan> {
     if ctx.is_history_range() {
         return Some(ProbeLanePlan::Decline);
@@ -2722,10 +2857,9 @@ pub(crate) fn probe_lane_admission(
     if ctx.overlay_free_single_graph() {
         return Some(ProbeLanePlan::Clean);
     }
-    // Eager-materialization callers (reasoning queries with Sid-space derived
-    // overlays, federated queries) need the per-row path: probes emit
-    // encoded bindings and merge only V3-translated novelty.
-    if ctx.eager_materialization {
+    // An eager caller's resolved ops carry the derived facts, so a lane that
+    // decodes what it emits can merge them.
+    if ctx.eager_materialization && output == LaneOutput::Encoded {
         return Some(ProbeLanePlan::Decline);
     }
     if !matches!(ctx.active_graphs(), crate::dataset::ActiveGraphs::Single) {
@@ -2734,14 +2868,30 @@ pub(crate) fn probe_lane_admission(
     None
 }
 
+/// An eager caller declines a predicate the index lacks before translating
+/// its ops, which could only decide between declining and an empty lane: a
+/// derived-only extent is translated in full for nothing, and the fallback is
+/// correct either way.
+fn eager_declines_unindexed(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    pred_sid: &Sid,
+) -> bool {
+    eager_with_overlay(ctx) && store.sid_to_p_id(pred_sid).is_none()
+}
+
 /// Plan a single-predicate PSOT subject probe under the active overlay.
 pub fn subject_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
+    output: LaneOutput,
 ) -> Result<ProbeLanePlan> {
-    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid], output) {
         return Ok(plan);
+    }
+    if eager_declines_unindexed(ctx, store, pred_sid) {
+        return Ok(ProbeLanePlan::Decline);
     }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
@@ -2765,18 +2915,21 @@ pub fn subject_probe_lane_plan(
     Ok(ProbeLanePlan::Merge(ops))
 }
 
-/// Plan an OPST bound-object probe under the active overlay.
+/// Plan a bound-object probe under the active overlay.
 ///
-/// Reuses the predicate's cached PSOT ops (the object lane filters and
-/// re-sorts its `IRI_REF` subset itself), but gates on the OPST branch the
-/// scan actually reads.
+/// Gates on the predicate's PSOT ops and the POST branch the probe reads, and
+/// merges the ops on probeable objects ([`cached_object_probe_ops`]).
 pub fn object_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sid: &Sid,
+    output: LaneOutput,
 ) -> Result<ProbeLanePlan> {
-    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid]) {
+    if let Some(plan) = probe_lane_admission(ctx, &[pred_sid], output) {
         return Ok(plan);
+    }
+    if eager_declines_unindexed(ctx, store, pred_sid) {
+        return Ok(ProbeLanePlan::Decline);
     }
     let Some(ops) = cached_overlay_ops(ctx, store, ctx.binary_g_id, RunSortOrder::Psot, pred_sid)?
     else {
@@ -2791,13 +2944,16 @@ pub fn object_probe_lane_plan(
         return Ok(ProbeLanePlan::Decline);
     }
     if store
-        .branch_for_order(ctx.binary_g_id, RunSortOrder::Opst)
+        .branch_for_order(ctx.binary_g_id, RunSortOrder::Post)
         .is_none()
     {
-        tracing::debug!("object probe: OPST branch absent with novelty present; declining");
+        tracing::debug!("object probe: POST branch absent with novelty present; declining");
         return Ok(ProbeLanePlan::Decline);
     }
-    Ok(ProbeLanePlan::Merge(ops))
+    let Some(object_ops) = cached_object_probe_ops(ctx, store, pred_sid)? else {
+        return Ok(ProbeLanePlan::Decline);
+    };
+    Ok(ProbeLanePlan::Merge(object_ops))
 }
 
 /// Plan a multi-predicate SPOT star probe under the active overlay.
@@ -2810,9 +2966,16 @@ pub fn star_probe_lane_plan(
     ctx: &ExecutionContext<'_>,
     store: &Arc<BinaryIndexStore>,
     pred_sids: &[&Sid],
+    output: LaneOutput,
 ) -> Result<ProbeLanePlan> {
-    if let Some(plan) = probe_lane_admission(ctx, pred_sids) {
+    if let Some(plan) = probe_lane_admission(ctx, pred_sids, output) {
         return Ok(plan);
+    }
+    if pred_sids
+        .iter()
+        .any(|pred_sid| eager_declines_unindexed(ctx, store, pred_sid))
+    {
+        return Ok(ProbeLanePlan::Decline);
     }
     let mut merged: Vec<fluree_db_binary_index::read::types::OverlayOp> = Vec::new();
     for pred_sid in pred_sids {
@@ -4505,7 +4668,7 @@ mod tests {
     #[test]
     fn branch_or_none_refuses_a_merge_over_a_graph_with_no_branch() {
         let store = BinaryIndexStore::empty(std::env::temp_dir());
-        for order in [RunSortOrder::Psot, RunSortOrder::Opst, RunSortOrder::Spot] {
+        for order in [RunSortOrder::Psot, RunSortOrder::Post, RunSortOrder::Spot] {
             assert!(
                 matches!(branch_or_none(&store, 3, order, false), Ok(None)),
                 "{order:?}: no merge, no branch: nothing to read"
@@ -4543,5 +4706,150 @@ mod tests {
             Err(QueryError::Internal("merge check failed".into()))
         });
         assert!(refused.is_err(), "a failed merge check fails the lookup");
+    }
+
+    /// Eager callers with an overlay are owed decoded bindings, so only a
+    /// lane that decodes them is admitted; on an overlay-free graph every
+    /// lane is `Clean`.
+    #[test]
+    fn probe_lane_admission_admits_eager_only_for_decoding_lanes() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
+        use fluree_db_novelty::Novelty;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let pred = Sid::new(100, "p");
+        let mut novelty = Novelty::new(0);
+        let flake = Flake {
+            g: None,
+            s: Sid::new(100, "s"),
+            p: pred.clone(),
+            o: FlakeValue::Ref(Sid::new(100, "o")),
+            dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+            t: 1,
+            op: true,
+            m: None,
+        };
+        novelty
+            .apply_commit(vec![flake], 1, &Default::default())
+            .unwrap();
+        let admit =
+            |ctx: &ExecutionContext<'_>, output| probe_lane_admission(ctx, &[&pred], output);
+
+        let plain = ExecutionContext::with_overlay(&snapshot, &vars, &novelty);
+        assert!(admit(&plain, LaneOutput::Encoded).is_none());
+
+        let eager =
+            ExecutionContext::with_overlay(&snapshot, &vars, &novelty).with_eager_materialization();
+        assert!(matches!(
+            admit(&eager, LaneOutput::Encoded),
+            Some(ProbeLanePlan::Decline)
+        ));
+        assert!(admit(&eager, LaneOutput::DecodesForEager).is_none());
+
+        let clean = ExecutionContext::new(&snapshot, &vars).with_eager_materialization();
+        for output in [LaneOutput::Encoded, LaneOutput::DecodesForEager] {
+            assert!(matches!(admit(&clean, output), Some(ProbeLanePlan::Clean)));
+        }
+    }
+
+    /// Translated ops outlive an execution only on a reasoning
+    /// materialization, for the contexts reading its overlay, and only
+    /// within its reasoning memory budget.
+    #[test]
+    fn only_a_materialization_keeps_ops_across_queries() {
+        use crate::reasoning_ops::ReasoningOpsHandle;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{Flake, FlakeValue, LedgerSnapshot};
+        use fluree_db_novelty::Novelty;
+        use fluree_db_reasoner::DerivedFactsOverlay;
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let pred = Sid::new(100, "p");
+        let novelty_with = |object: &str| {
+            let mut novelty = Novelty::new(0);
+            let flake = Flake {
+                g: None,
+                s: Sid::new(100, "s"),
+                p: pred.clone(),
+                o: FlakeValue::Ref(Sid::new(100, object)),
+                dt: Sid::new(fluree_vocab::namespaces::JSON_LD, "id"),
+                t: 1,
+                op: true,
+                m: None,
+            };
+            novelty
+                .apply_commit(vec![flake], 1, &Default::default())
+                .unwrap();
+            novelty
+        };
+        let overlay = novelty_with("o");
+        let other_overlay = novelty_with("o2");
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        fn ctx<'a>(
+            snapshot: &'a LedgerSnapshot,
+            vars: &'a VarRegistry,
+            store: &Arc<BinaryIndexStore>,
+            overlay: &'a Novelty,
+            ops: Option<&ReasoningOpsHandle>,
+        ) -> ExecutionContext<'a> {
+            let ctx = ExecutionContext::with_time_and_overlay(snapshot, vars, 1, None, overlay)
+                .with_binary_store(Arc::clone(store), 0)
+                .with_eager_materialization()
+                .with_reasoning_active(true);
+            match ops {
+                Some(ops) => ctx.with_reasoning_ops(ops.clone()),
+                None => ctx,
+            }
+        }
+        let ctx = |overlay, ops| ctx(&snapshot, &vars, &store, overlay, ops);
+        let kept_by_a_later_query = |first: ExecutionContext<'_>, later: ExecutionContext<'_>| {
+            let ops = cached_overlay_ops(&first, &store, 0, RunSortOrder::Psot, &pred).unwrap();
+            // An empty store can't translate the fact; a failed translation
+            // is kept like any other, and an empty one never is.
+            assert!(ops.is_none_or(|ops| !ops.is_empty()), "never empty");
+            overlay_ops_cached(&later, &store, 0, RunSortOrder::Psot, &pred)
+        };
+        let attach = |limit| {
+            ReasoningOpsHandle::attach(
+                &DerivedFactsOverlay::empty(),
+                limit,
+                fluree_db_core::OverlayProvider::content_version(&overlay),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            !kept_by_a_later_query(ctx(&overlay, None), ctx(&overlay, None)),
+            "a reasoning query without a materialization keeps nothing"
+        );
+        let ops = attach(usize::MAX);
+        assert!(
+            kept_by_a_later_query(ctx(&overlay, Some(&ops)), ctx(&overlay, Some(&ops))),
+            "queries reading one materialization share its translations"
+        );
+        let fresh = attach(usize::MAX);
+        assert!(
+            !kept_by_a_later_query(
+                ctx(&other_overlay, Some(&fresh)),
+                ctx(&other_overlay, Some(&fresh))
+            ),
+            "a context reading another overlay leaves the materialization alone"
+        );
+        let tight = attach(1);
+        let tight_ctx = ctx(&overlay, Some(&tight));
+        cached_overlay_ops(&tight_ctx, &store, 0, RunSortOrder::Psot, &pred).unwrap();
+        assert!(
+            !overlay_ops_cached(
+                &ctx(&overlay, Some(&tight)),
+                &store,
+                0,
+                RunSortOrder::Psot,
+                &pred
+            ),
+            "a translation past the reasoning memory budget isn't kept"
+        );
     }
 }

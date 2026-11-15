@@ -233,7 +233,7 @@ async fn a_legacy_urn_default_graph_does_not_shadow_the_default_graph() {
         let g1 = ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(G1)
+            .assigned_graph_id(G1)
             .expect("G1 is registered");
         assert_eq!(g1, FIRST_USER_GRAPH_ID);
         let (txn_meta, config) = (txn_meta_graph_iri(&ledger_id), config_graph_iri(&ledger_id));

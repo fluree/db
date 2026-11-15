@@ -368,6 +368,14 @@ impl FormatterConfig {
         self
     }
 
+    /// Whether this format may answer with a prefix of the rows, which the
+    /// client continues with an OFFSET query: AgentJson under a byte budget
+    /// (`hasMore`, `resume`). The rows must then be read in one order on every
+    /// execution, as under a LIMIT, so the pages partition the answer.
+    pub fn pages_rows(&self) -> bool {
+        self.format == OutputFormat::AgentJson && self.max_bytes.is_some()
+    }
+
     /// Set AgentJson context (SPARQL text, FROM count, ISO timestamp)
     pub fn with_agent_json_context(mut self, context: AgentJsonContext) -> Self {
         self.agent_json_context = Some(context);

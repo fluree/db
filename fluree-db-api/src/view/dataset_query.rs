@@ -853,6 +853,12 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
             bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,
@@ -869,6 +875,7 @@ impl Fluree {
             include_system_facts: executable.query.include_system_facts,
             cypher_vocab: executable.query.cypher_vocab.clone(),
             trust_fk_refs: options.trust_fk_refs,
+            deterministic_scans: options.deterministic_scans,
             ..Default::default()
         };
         #[cfg(feature = "vector")]
@@ -1034,6 +1041,12 @@ impl Fluree {
             cancellation: options.cancellation.clone(),
             dataset: Some(&runtime_dataset),
             policy_enforcer: primary.policy_enforcer().cloned(),
+            policy_source: Some(
+                primary
+                    .graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| std::sync::Arc::clone(&primary.ledger_id)),
+            ),
             r2rml: Some((r2rml.provider, r2rml.table_provider)),
             bm25_provider: Some(&index_provider),
             binary_g_id: primary.graph_id,
@@ -1050,6 +1063,7 @@ impl Fluree {
             include_system_facts: executable.query.include_system_facts,
             cypher_vocab: executable.query.cypher_vocab.clone(),
             trust_fk_refs: options.trust_fk_refs,
+            deterministic_scans: options.deterministic_scans,
             ..Default::default()
         };
         #[cfg(feature = "vector")]

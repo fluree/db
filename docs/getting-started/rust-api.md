@@ -169,6 +169,46 @@ async fn main() -> Result<()> {
 removes it only on full success (unless `.cleanup(false)` is set). On failure, it keeps the
 session directory and logs its path for debugging.
 
+#### Into a new named graph of an existing ledger
+
+`import_into_graph` runs the same pipeline into a named graph the ledger does not have yet, and
+takes the same tuning options:
+
+```rust
+let result = fluree
+    .import_into_graph("mydb:main", "http://example.org/graph/products")
+    .import("./products")
+    .threads(8)
+    .execute()
+    .await?;
+
+let graph = result.graph.expect("a graph import names its graph");
+println!(
+    "<{}> is g_id {}, commits t={}..{}",
+    graph.iri, graph.g_id, graph.base_t + 1, result.t
+);
+```
+
+- Every statement lands in the named graph, and the import's commits follow the ledger's head,
+  so a full reindex from the commits rebuilds the same ledger.
+- An IRI or string the ledger already holds keeps its id, so the graph joins with the rest of
+  the ledger. The new graph's index is built in bulk and spliced into the ledger's existing
+  index; nothing else is rebuilt.
+- A ledger with commits after its index is indexed first. Writes through the same `Fluree`'s
+  cached ledger wait until the import publishes; reads go on against the head it started from.
+  A writer that does not share that cache (another process, another `Fluree`, or one built
+  without ledger caching) is not held: if it commits first, the import fails with nothing
+  published.
+- `ImportError::PublishedWithoutIndex { t, .. }` is the one failure after which the import is in
+  the ledger: its commits are published through `t` and its index is not. Queries read the graph
+  from those commits until an index covers them, which `Fluree::reindex` builds. A future
+  dropped while the import publishes can leave the ledger the same way.
+- The source holds default-graph data (Turtle, N-Triples, JSON-LD, JSONL/NDJSON). An existing
+  graph, `urn:default`, the system graphs, TriG / N-Quads, and JSON-LD that names graphs of its
+  own are refused with `ImportError::Refused` (or `ImportError::Invalid`), with nothing written.
+- `result.has_annotations` reports a graph with statement annotations: the ledger's annotation
+  index is then set aside, and annotation queries read by scan until `Fluree::reindex`.
+
 ### With S3 Storage
 
 Requires `fluree-db-api` feature `aws` and standard AWS credential/region configuration.

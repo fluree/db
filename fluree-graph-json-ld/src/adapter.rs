@@ -619,15 +619,24 @@ fn process_literal<S: GraphSink>(
     obj: &serde_json::Map<String, Value>,
     sink: &mut S,
 ) -> Result<ProcessedValue> {
-    // Check for @type (datatype)
-    let datatype = if let Some(type_val) = obj.get("@type") {
-        if let Some(type_iri) = type_val.as_str() {
-            Datatype::from_iri(type_iri)
-        } else {
-            Datatype::xsd_string()
-        }
-    } else {
-        Datatype::xsd_string()
+    // The datatype: `@type` when given; otherwise, for a native value,
+    // `xsd:boolean` for a boolean, `xsd:integer` for a number that fits an
+    // i64, `xsd:double` for any other number, and `xsd:string` for a
+    // string. So `1.0`, `1e3` and an integer past `i64::MAX` are doubles,
+    // as the value stored for them is, and as a bare number in a list is;
+    // JSON-LD's own RDF conversion would call the first two integers.
+    // (A native number used to be
+    // labelled `xsd:string` here while keeping its numeric value, which a
+    // sink that writes the datatype out, like the graph collector, then
+    // printed as a string: `"0"` for `{"@value": 0}`.)
+    let datatype = match obj.get("@type").and_then(Value::as_str) {
+        Some(type_iri) => Datatype::from_iri(type_iri),
+        None => match val {
+            Value::Bool(_) => Datatype::xsd_boolean(),
+            Value::Number(n) if n.as_i64().is_some() => Datatype::xsd_integer(),
+            Value::Number(_) => Datatype::xsd_double(),
+            _ => Datatype::xsd_string(),
+        },
     };
 
     // Check for @language
@@ -638,6 +647,17 @@ fn process_literal<S: GraphSink>(
 
     // Handle the actual value
     match val {
+        // A string `@value` holds an already serialized JSON document, and
+        // takes the string path below.
+        Value::Object(_) | Value::Array(_) | Value::Number(_) | Value::Bool(_)
+            if datatype.is_json() =>
+        {
+            let json_str = crate::normalize::normalize(val);
+            Ok(ProcessedValue::Single(sink.term_literal_value(
+                LiteralValue::Json(Arc::from(json_str.as_str())),
+                Datatype::rdf_json(),
+            )))
+        }
         Value::String(s) => {
             if language.is_some() {
                 // Language-tagged string
@@ -695,15 +715,8 @@ fn process_literal<S: GraphSink>(
         Value::Bool(b) => Ok(ProcessedValue::Single(
             sink.term_literal_value(LiteralValue::Boolean(*b), datatype),
         )),
-        // Handle @json typed values
         Value::Object(_) | Value::Array(_) => {
-            if datatype.is_json() {
-                let json_str = crate::normalize::normalize(val);
-                Ok(ProcessedValue::Single(sink.term_literal_value(
-                    LiteralValue::Json(Arc::from(json_str.as_str())),
-                    Datatype::rdf_json(),
-                )))
-            } else if matches!(val, Value::Array(_))
+            if matches!(val, Value::Array(_))
                 && datatype.as_iri() == fluree_vocab::fluree::EMBEDDING_VECTOR
             {
                 // Vector arrays come through here once JSON-LD expansion produces
@@ -761,6 +774,30 @@ mod tests {
         );
     }
 
+    /// A JSON literal whose `@value` is a number or a boolean is a JSON
+    /// document, as an object or array one is, not an `xsd` value.
+    #[test]
+    fn json_literal_of_a_scalar_is_a_json_document() {
+        for (value, document) in [(json!(5), "5"), (json!(true), "true")] {
+            let expanded = json!([{
+                "@id": "http://example.org/s",
+                "http://example.org/p": [{"@value": value, "@type": "@json"}]
+            }]);
+            let mut sink = GraphCollectorSink::new();
+            to_graph_events(&expanded, &mut sink).unwrap();
+            let triple = sink.graph().iter().next().unwrap().clone();
+            assert!(
+                matches!(
+                    &triple.o,
+                    Term::Literal { value: LiteralValue::Json(json), datatype, .. }
+                        if json.as_ref() == document && datatype.is_json()
+                ),
+                "{:?}",
+                triple.o
+            );
+        }
+    }
+
     #[test]
     fn test_typed_literal() {
         let expanded = json!([{
@@ -785,6 +822,40 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    /// A native value with no `@type` takes the datatype JSON-LD's RDF
+    /// conversion gives it, not `xsd:string`: what expansion makes of a
+    /// bare `0`, `1.5` or `true`.
+    #[test]
+    fn native_values_without_a_type_keep_their_rdf_datatype() {
+        let expanded = json!([{
+            "@id": "http://example.org/row",
+            "http://example.org/int": [{ "@value": 0 }],
+            "http://example.org/double": [{ "@value": 1.5 }],
+            "http://example.org/bool": [{ "@value": true }],
+            "http://example.org/string": [{ "@value": "0" }],
+            "http://example.org/declared": [{ "@value": 7, "@type": "http://www.w3.org/2001/XMLSchema#long" }]
+        }]);
+        let mut sink = GraphCollectorSink::new();
+        to_graph_events(&expanded, &mut sink).unwrap();
+        let datatype_of = |p: &str| {
+            sink.graph()
+                .iter()
+                .find(|t| t.predicate().as_iri() == Some(p))
+                .and_then(|t| {
+                    t.object()
+                        .as_literal()
+                        .map(|(_, dt, _)| dt.as_iri().to_string())
+                })
+                .unwrap()
+        };
+        let xsd = |local: &str| format!("http://www.w3.org/2001/XMLSchema#{local}");
+        assert_eq!(datatype_of("http://example.org/int"), xsd("integer"));
+        assert_eq!(datatype_of("http://example.org/double"), xsd("double"));
+        assert_eq!(datatype_of("http://example.org/bool"), xsd("boolean"));
+        assert_eq!(datatype_of("http://example.org/string"), xsd("string"));
+        assert_eq!(datatype_of("http://example.org/declared"), xsd("long"));
     }
 
     #[test]

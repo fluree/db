@@ -3161,7 +3161,7 @@ impl ScopeRegistry {
     /// The graph `iri` names in the ledger, if the ledger registers it.
     pub(crate) fn graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
         match self {
-            Self::Ledger(names) => names.graph_id_for_iri(iri),
+            Self::Ledger(names) => names.assigned_graph_id(iri),
             Self::Empty => None,
             #[cfg(test)]
             Self::Fixed(ids) => ids.get(iri).copied(),

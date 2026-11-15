@@ -272,6 +272,37 @@ impl Expression {
         }
     }
 
+    /// Whether evaluating this expression reads the dataset rather than its row
+    /// alone: through an embedded pattern, a node's property, or a function that
+    /// looks facts up ([`Function::reads_dataset`]). Such an expression answers
+    /// for the graph it is evaluated in, so it cannot move into a scope that
+    /// switches the active graph or source.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => false,
+            Expression::Call { func, args } => {
+                func.reads_dataset() || args.iter().any(Self::reads_dataset)
+            }
+            Expression::Map(entries) => entries.iter().any(|(_, v)| v.reads_dataset()),
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.reads_dataset()
+                    || filter.as_deref().is_some_and(Self::reads_dataset)
+                    || map.as_deref().is_some_and(Self::reads_dataset)
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => init.reads_dataset() || list.reads_dataset() || body.reads_dataset(),
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => list.reads_dataset() || predicate.reads_dataset(),
+            Expression::Member { .. }
+            | Expression::Exists { .. }
+            | Expression::PatternComprehension { .. } => true,
+        }
+    }
+
     /// Visit every pattern list embedded in this expression — EXISTS / NOT
     /// EXISTS sub-patterns (`FILTER(EXISTS { … } && …)`, `BIND(EXISTS { … }
     /// AS ?x)`) and pattern comprehensions — recursing through
@@ -939,7 +970,12 @@ impl From<&crate::parse::ast::UnresolvedFilterValue> for FlakeValue {
 }
 
 /// Built-in functions
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Hash` agrees with `Eq` over the whole value, fields included: a
+/// `Lang { strict }` or `Datatype { strict }` computes a different answer in
+/// each mode, so anything keyed by a function (the encoded bool-predicate
+/// cache) must see the mode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Function {
     // =========================================================================
     // Comparison operators
@@ -1235,6 +1271,135 @@ pub enum Function {
     // Custom/unknown function
     // =========================================================================
     Custom(String),
+}
+
+impl Function {
+    /// Whether this function looks facts up in the active graph, where every
+    /// other function computes from its arguments alone. An unknown function
+    /// is taken to.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Function::Fulltext
+            | Function::Labels
+            | Function::Keys
+            | Function::Properties
+            | Function::RelType
+            | Function::StartNode
+            | Function::EndNode
+            | Function::Custom(_) => true,
+            Function::Eq
+            | Function::Ne
+            | Function::Lt
+            | Function::Le
+            | Function::Gt
+            | Function::Ge
+            | Function::Add
+            | Function::Sub
+            | Function::Mul
+            | Function::Div
+            | Function::Mod
+            | Function::Negate
+            | Function::And
+            | Function::Or
+            | Function::Not
+            | Function::Xor
+            | Function::In
+            | Function::NotIn
+            | Function::Strlen
+            | Function::Substr
+            | Function::Ucase
+            | Function::Lcase
+            | Function::Contains
+            | Function::StrStarts
+            | Function::StrEnds
+            | Function::Regex
+            | Function::Concat
+            | Function::StrBefore
+            | Function::StrAfter
+            | Function::Replace
+            | Function::Str
+            | Function::StrDt
+            | Function::StrLang
+            | Function::EncodeForUri
+            | Function::ReplaceAll
+            | Function::Split
+            | Function::Trim
+            | Function::LTrim
+            | Function::RTrim
+            | Function::Left
+            | Function::Right
+            | Function::Abs
+            | Function::Round
+            | Function::Ceil
+            | Function::Floor
+            | Function::Rand
+            | Function::Sqrt
+            | Function::Sign
+            | Function::Ln
+            | Function::Pow
+            | Function::Iri
+            | Function::Bnode
+            | Function::Now
+            | Function::Today
+            | Function::Year
+            | Function::Month
+            | Function::Day
+            | Function::Hours
+            | Function::Minutes
+            | Function::Seconds
+            | Function::Tz
+            | Function::Timezone
+            | Function::IsIri
+            | Function::IsBlank
+            | Function::IsLiteral
+            | Function::IsNumeric
+            | Function::Lang { .. }
+            | Function::Datatype { .. }
+            | Function::LangMatches
+            | Function::SameTerm
+            | Function::T
+            | Function::Op
+            | Function::Md5
+            | Function::Sha1
+            | Function::Sha256
+            | Function::Sha384
+            | Function::Sha512
+            | Function::Uuid
+            | Function::StrUuid
+            | Function::DotProduct
+            | Function::CosineSimilarity
+            | Function::EuclideanDistance
+            | Function::GeofDistance
+            | Function::Bound
+            | Function::If
+            | Function::Coalesce
+            | Function::XsdBoolean
+            | Function::XsdInteger
+            | Function::XsdFloat
+            | Function::XsdDouble
+            | Function::XsdDecimal
+            | Function::XsdString
+            | Function::XsdDateTime
+            | Function::XsdDate
+            | Function::XsdTime
+            | Function::CypherToFloat
+            | Function::PathLength
+            | Function::Size
+            | Function::Head
+            | Function::Last
+            | Function::Tail
+            | Function::Reverse
+            | Function::MakeList
+            | Function::Nodes
+            | Function::Range
+            | Function::PathPairs
+            | Function::ListIndex
+            | Function::Relationships
+            | Function::MakeRel
+            | Function::MakePath
+            | Function::MakePathHops => false,
+        }
+    }
 }
 
 #[cfg(test)]

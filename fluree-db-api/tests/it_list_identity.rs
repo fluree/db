@@ -192,7 +192,7 @@ async fn add_merges_a_second_list_copy_replaces() {
         ledger
             .snapshot
             .graph_registry
-            .graph_id_for_iri(&format!("{EX}{name}"))
+            .assigned_graph_id(&format!("{EX}{name}"))
             .expect("graph")
     };
     let in_graph = |ledger: &LedgerState, name: &str| {

@@ -110,11 +110,12 @@ fn request_graph(request: &Request, ledger: &str) -> Result<GraphSel> {
     let graph = graph_target(graph, default_graph, true)?;
     if let GraphSel::Graph(iri) = &graph {
         use fluree_db_core::graph_registry::{
-            config_graph_iri, txn_meta_graph_iri, validate_absolute_graph_iri,
+            names_config_graph, txn_meta_graph_iri, validate_absolute_graph_iri,
         };
         validate_absolute_graph_iri(iri).map_err(ServerError::bad_request)?;
         let ledger_id = crate::error::scope_id(ledger)?;
-        if *iri == txn_meta_graph_iri(&ledger_id) || *iri == config_graph_iri(&ledger_id) {
+        // Any ledger's config graph IRI names this ledger's config graph.
+        if *iri == txn_meta_graph_iri(&ledger_id) || names_config_graph(iri) {
             return Err(ServerError::bad_request(format!(
                 "<{iri}> is a system graph; the Graph Store Protocol reads and writes user graphs"
             )));

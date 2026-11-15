@@ -13,7 +13,7 @@ document against your ontology: the `[doc.reader]` that `fluree doc ingest`
 can read with. `check` mirrors the ontology input policy such a reader applies.
 `fluree doc ingest`'s language-model extractor (`[doc.llm]`) reads more of an
 ontology than an HTTP reader does (domains and ranges, `schema:domainIncludes`,
-every parent class), so the "not read" counts and the advice about domains,
+every parent class), so the "not shown" counts and the advice about domains,
 ranges and parents describe an HTTP reader only.
 
 They read files only: no `.fluree/` directory, no ledger, and nothing is sent
@@ -45,7 +45,7 @@ For the records an ontology's names link to, see [`fluree catalog`](catalog.md).
 
 ## What an HTTP reader reads
 
-Of each class and property, an HTTP reader sees:
+Of each class and property, an HTTP reader shows its model:
 
 - its `rdfs:label`;
 - its `rdfs:comment`;
@@ -53,9 +53,13 @@ Of each class and property, an HTTP reader sees:
 - the SHACL node shapes that target a class (their supported constraints);
 - the IRI's local name (the namespace is hidden).
 
-It does not see `rdfs:domain` or `rdfs:range` (unless a shape on the class
-restates them), a second parent, `skos:altLabel`, `owl:equivalentClass`, OWL
-restrictions, or other axioms.
+The model is not shown `rdfs:domain` or `rdfs:range` (unless a shape on the
+class restates them), a second parent, `skos:altLabel`, `owl:equivalentClass`,
+OWL restrictions, or other axioms. Domains and ranges still shape the answer
+after the model has read: a property with a datatype range takes a literal of
+that type (a value the text doesn't give in that form is kept as a claim that
+is not accepted, so its triple isn't asserted), and a domain or class range
+keeps an entity a node.
 
 Input it has no place for is adapted rather than refused (input policy
 `ontology-adapter-v1`):
@@ -71,6 +75,48 @@ Input it has no place for is adapted rather than refused (input policy
 Catalog records are read by their SKOS text: `skos:prefLabel`, `altLabel` and
 `hiddenLabel` as names, and the first 300 characters of `skos:definition`. A
 record needs a SKOS label and an IRI.
+
+A request is refused if it carries `xt:example` (example phrases are no longer
+read: say what they show in the description) or extraction results such as
+`xt:entity`, `xt:score`, `xt:accepted` or `rdf:reifies`, which are not
+evidence. `xt:` is `https://ns.flur.ee/extract#`.
+
+### Event classes
+
+A class the reader should find events of (a commitment, a meeting, a
+departure: something that happens, with a time and participants) is declared
+an event class, `a rdfs:Class, xt:EventClass`. Without `xt:EventClass` it is
+read as an ordinary class, and the reader finds no events of it.
+
+An event class's kinds (a commitment to call back, or to send a quote) are read
+in one of two ways:
+
+- **A kind class and kind records.** A class labelled "<the event class's
+  label> kind", exactly one property labelled "kind", and a catalog record for
+  each kind, typed with the kind class. The reader reads each record as a kind
+  of the event.
+- **Event subclasses.** A subclass of an event class that is an event class
+  too is read as a kind of its parent, under both labels ("meeting, board
+  meeting"), in place of itself.
+
+```turtle
+@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix skos: <http://www.w3.org/2004/02/skos/core#> .
+@prefix xt: <https://ns.flur.ee/extract#> .
+@prefix ex: <https://example.com/> .
+ex:Commitment a rdfs:Class, xt:EventClass ;
+  rdfs:label "commitment" ;
+  rdfs:comment "Something a person says they will do, to or for someone." .
+ex:CommitmentKind a rdfs:Class ; rdfs:label "commitment kind" .
+ex:kind a rdf:Property ; rdfs:label "kind" .
+# in the catalog
+ex:Callback a ex:CommitmentKind ; skos:prefLabel "callback" .
+ex:SendQuote a ex:CommitmentKind ; skos:prefLabel "send a quote" .
+```
+
+Domains, ranges and SHACL shapes never make a class an event class or a
+kind: a meeting's organizer is a participant, not a kind of meeting.
 
 A request carries at most 2,000,000 bytes, 48,000 characters of text in up to
 16 windows, and 200,000 serialized tokens per window. The ontology and the
@@ -102,17 +148,18 @@ Applies the input policy locally and reports, in four parts:
 
 - **Will fail**: what a request carrying this ontology and catalog would be
   refused for (no class, a term that can't be labelled, a catalog record
-  without a SKOS label or an IRI, a window over its token limit, a file over
-  the byte limit).
+  without a SKOS label or an IRI, `xt:example` or an extraction result, a
+  window over its token limit, a file over the byte limit).
 - **Read another way**: what the policy adapted, counted by kind.
-- **Not read**: the ontology's triples the reader never sees,
+- **Not shown to the model**: the ontology's triples the model never sees,
   counted by predicate (`rdfs:domain`, `owl:equivalentClass`, `rdfs:subClassOf
   (a second parent)`, `(not a shown term)` for triples about something that is
   neither a class nor a property, ...).
 - **Advice**: what improves a reading: descriptions where there are none,
   labels written in words rather than as column names (`employer`, not
   `employer_id`), IRIs minted from their labels, a smaller vocabulary, what
-  each property connects said in its description.
+  each property connects said in its description, and event classes whose
+  kinds the reader can't find (see [Event classes](#event-classes)).
 
 It also estimates the serialized tokens the ontology and catalog cost per
 window. The reader's tokenizer isn't part of the CLI, so this is an
@@ -145,7 +192,7 @@ Read another way by the reader
   rdfs:label from skos:prefLabel          2  e.g. ex:Bank, ex:Custodian
   rdfs:label from the IRI                 1  e.g. ex:Asset
 
-Not read by the reader
+Not shown to the model
   owl:onProperty                          1
   owl:someValuesFrom                      1
   rdf:type owl:Restriction                1
@@ -176,6 +223,8 @@ Nothing here would make a request fail.
   "classes": 5,
   "properties": 1,
   "records": 0,
+  "event_classes": 0,
+  "event_kinds": 0,
   "by_graph": false,
   "will_fail": [{"code": "no-label", "message": "...", "count": 1, "examples": ["https://..."]}],
   "adapted": {"rdfs:label from skos:prefLabel": 2},
@@ -191,14 +240,21 @@ Nothing here would make a request fail.
 counts under (`X-Fluree-Ontology-Adapted`, `X-Fluree-Ontology-Not-Shown`), so
 the two compare line for line. `slice` appears only with `--seed`.
 `estimate.document_chars` is the room left for text in one window, at most
-48,000.
+48,000. `event_classes` counts the classes declared `xt:EventClass` that are
+read as event classes (an event subclass of one is read as one of its kinds,
+not counted here), and `event_kinds` the kinds the reader will read of them.
 
 Finding codes: `no-ontology`, `no-class`, `no-label`, `owl-machinery`, `catalog-blank-node`,
-`catalog-no-label`, `window-full` and `too-many-bytes` fail a request;
+`catalog-no-label`, `example-refused`, `extraction-annotations`,
+`window-full` and `too-many-bytes` fail a request;
 `no-description`, `label-not-words`, `local-name-not-words`,
 `opaque-local-name`, `large-vocabulary`, `domain-range-not-shown`,
 `one-parent-shown`, `catalog-class-not-in-ontology`,
-`catalog-long-definition` and `little-room-for-text` are advice.
+`catalog-long-definition`, `little-room-for-text` and the event findings
+`event-class-not-marked` (a class with a kind class that isn't an event class),
+`event-class-undeclared` (`xt:EventClass` without `rdfs:Class` or `owl:Class`),
+`event-subtype-not-marked`, `event-kind-ambiguous`, `event-kind-property` and
+`event-kind-no-records` are advice.
 
 ## fluree ontology from
 
@@ -452,7 +508,14 @@ reads made explicit:
 - OWL axioms written as nodes of their own (`[] a owl:AllDisjointClasses`) and
   declarations of annotation properties and datatypes dropped, since a reader
   would read them as catalog records and refuse the request; the summary counts
-  them.
+  them;
+- `xt:example` and extraction results (`xt:score`, `rdf:reifies`, ...)
+  dropped, since a reader refuses them; the summary counts them. A result
+  record goes whole: a blank node that carries a result, or an IRI with
+  nothing but its types once its results go (left behind, either would be
+  refused as a catalog record). A subject with a label or description of its
+  own keeps it, without its results, and the summary counts those too, so
+  you can check they are records.
 
 Domains, ranges and other axioms are kept: an HTTP reader doesn't see
 them, but a reading can still be checked against them. Catalog records in the

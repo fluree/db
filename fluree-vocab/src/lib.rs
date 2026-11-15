@@ -1593,6 +1593,13 @@ pub mod fluree {
     /// Fluree DB system namespace IRI (canonical base for all Fluree system vocabulary)
     pub const DB: &str = "https://ns.flur.ee/db#";
 
+    /// `f:key` — on an R2RML logical table (`rr:logicalTable`), an `rdf:List`
+    /// of column names no two of the table's rows agree on (rows with a NULL
+    /// in any of them aside). Repeatable: one list per alternative key, a
+    /// composite key being one list of several columns. Trusted, not checked
+    /// against the data.
+    pub const KEY: &str = "https://ns.flur.ee/db#key";
+
     /// Constraint component reported when a `sh:path` could not be compiled
     /// (Fluree extension; W3C SHACL has no component for this condition)
     pub const UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT: &str =
@@ -2285,6 +2292,10 @@ pub mod config_iris {
 
     /// `f:shapesSource` — GraphRef pointing to SHACL shapes graph
     pub const SHAPES_SOURCE: &str = "https://ns.flur.ee/db#shapesSource";
+
+    /// `f:additionalDataSource` — GraphRef (repeatable) to a graph read with
+    /// each validated graph when SHACL checks its nodes
+    pub const ADDITIONAL_DATA_SOURCE: &str = "https://ns.flur.ee/db#additionalDataSource";
 
     /// `f:validationMode` — IRI: f:ValidationReject or f:ValidationWarn
     pub const VALIDATION_MODE: &str = "https://ns.flur.ee/db#validationMode";

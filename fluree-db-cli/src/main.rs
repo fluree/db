@@ -1,4 +1,4 @@
-// Opt-in global allocator (see the `mimalloc` feature). In the binary only, so
+// Global allocator (the default `mimalloc` feature). In the binary only, so
 // embedders of the cli library keep their own allocator.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]

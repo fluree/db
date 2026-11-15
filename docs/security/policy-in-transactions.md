@@ -165,7 +165,7 @@ Verb policies get **exact** semantics on two axes where bare `f:modify` keeps it
 }
 ```
 
-With `default-allow: false`, the holder can insert new `ex:Lead` subjects (any of their properties — typing the new subject as `ex:Lead` in the same transaction is what brings it under the grant) and nothing else: no other class can be minted, existing Leads can't be edited or removed. Pair with a SHACL shape (`sh:closed`, required properties) to constrain *what a valid Lead looks like* — the shape is identity-invariant; the policy is who may create.
+With `default-allow: false`, the holder can insert new `ex:Lead` subjects (any of their properties — typing the new subject as `ex:Lead` in the same transaction is what brings it under the grant) and nothing else: no other class can be minted, existing Leads can't be edited or removed. Pair with a SHACL shape (`sh:closed`, required properties) to constrain *what a valid Lead looks like* — the shape is identity-invariant; the policy is who may create. Because of that, SHACL reads the written graph, the shapes graph and any [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graph in full, whatever the writer's policy allows, so a violation can show a writer a value their policy hides. List only graphs every writer may see, or accept that.
 
 ### Lifecycle edge cases
 

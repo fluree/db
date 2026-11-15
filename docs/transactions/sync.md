@@ -188,6 +188,5 @@ A huge *graph* is bounded by `FLUREE_MAX_GRAPH_SCAN_FLAKES` (default
 transaction fails with a resource-limit error naming the knob, instead of
 exhausting memory — an identical resync of a large graph is the worst case,
 since it materializes everything and commits nothing. A dry run trips the
-cap the same way the real run would, and `CLEAR`/`DROP`/`COPY`/`MOVE` share
-it. The follow-up that streams the diff instead of materializing the graph
+cap the same way the real run would, and `CLEAR`/`COPY`/`MOVE` share it. The follow-up that streams the diff instead of materializing the graph
 is [#1691](https://github.com/fluree/db/issues/1691).

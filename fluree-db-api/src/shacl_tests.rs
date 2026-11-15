@@ -4625,6 +4625,81 @@ async fn validate_report_unknown_graph_is_not_found() {
     assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
 }
 
+/// A config that cannot be read fails validation, as it fails a transaction,
+/// rather than validating without it. Here the config lists a catalog graph
+/// whose tag puts `ex:item` over `sh:maxCount 1`; read as "no config", the
+/// catalog would drop out and the report would conform.
+#[tokio::test]
+async fn validate_report_fails_when_the_config_cannot_be_read() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "shacl/validate-config-unreadable:main";
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    let trig = format!(
+        r#"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:  <http://example.org/ns/> .
+
+        GRAPH <http://example.org/ns/org-a> {{ ex:item ex:tag "a" . }}
+        GRAPH <http://example.org/ns/catalog> {{ ex:item ex:tag "b" . }}
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:additionalDataSource <urn:config:catalog> .
+            <urn:config:catalog> rdf:type f:GraphRef ; f:graphSource <urn:config:catalog-graph> .
+            <urn:config:catalog-graph> f:graphSelector <http://example.org/ns/catalog> .
+        }}
+    "#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+    let options = crate::validate::ValidateOptions {
+        graph: Some("http://example.org/ns/org-a".to_string()),
+        shapes: crate::validate::ShapesSource::InlineTurtle(
+            r"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://example.org/ns/> .
+            ex:TagShape a sh:NodeShape ;
+                sh:targetNode ex:item ;
+                sh:property [ sh:path ex:tag ; sh:maxCount 1 ] .
+        "
+            .to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let report = crate::validate::validate_view(&view, ledger_id, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.violation_count(),
+        1,
+        "the catalog's tag counts: {:?}",
+        report.results
+    );
+
+    let _fault = crate::config_resolver::config_read_fault::arm();
+    let err = crate::validate::validate_view(&view, ledger_id, &options)
+        .await
+        .expect_err("validate_view without its config");
+    assert!(matches!(err, ApiError::ConfigUnavailable(_)), "{err:?}");
+    assert_eq!(
+        err.status_code(),
+        500,
+        "a storage failure, not a request error"
+    );
+    let err = fluree
+        .validate_ledger(ledger_id, &options)
+        .await
+        .expect_err("validate_ledger without its config");
+    assert!(matches!(err, ApiError::ConfigUnavailable(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn validate_report_inline_shapes_carry_class_value_set() {
     // An ad-hoc shapes doc may ship both a sh:class constraint AND the

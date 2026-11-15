@@ -88,11 +88,11 @@ fluree graph drop http://example.org/graphs/scratch --ledger mydb:feature-x
 fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
 ```
 
-Unlike `fluree drop`, `fluree graph drop` is **transactional and history-
-preserving**: it produces a normal commit at `t = current + 1` whose
-flakes retract every triple currently asserted in the graph, leaves the
-graph IRI registered (so subsequent inserts land in the same graph slot),
-and lets queries `as-of` an earlier `t` still see the dropped data.
+Unlike `fluree drop`, `fluree graph drop` is a **commit**: SPARQL `DROP
+GRAPH` at `t = current + 1`. Nothing the graph held is queryable afterwards,
+at the head or as of an earlier `t`, but the commits keep it, so a branch
+created before the drop still has it. A later write to the same IRI starts
+the graph afresh.
 
 The graph IRI must be an absolute IRI (e.g. `urn:...`, `http://...`).
 The default graph and the system graphs (`urn:fluree:{ledger_id}#txn-meta`

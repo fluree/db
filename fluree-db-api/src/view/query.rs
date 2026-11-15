@@ -183,7 +183,18 @@ fn guard_graph_source_patterns_for(
     parsed: &fluree_db_query::ir::Query,
     syntax: QuerySyntax,
 ) -> Result<()> {
-    let unsupported = fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    let mut unsupported =
+        fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    // HAVING, ORDER BY and the binds after a trailing VALUES run outside
+    // every graph scope, wrapped or not.
+    unsupported.extend(fluree_db_query::r2rml::unsupported_query_modifiers(
+        parsed.grouping.as_ref(),
+        &parsed.order_binds,
+        parsed
+            .post_values
+            .as_ref()
+            .map_or(&[], |pv| pv.then.as_slice()),
+    ));
     if !unsupported.is_empty() {
         return Err(ApiError::Query(
             fluree_db_query::r2rml::unsupported_subscope_error(gs_ids, &unsupported),
@@ -1493,6 +1504,9 @@ impl Fluree {
                     "SPARQL FROM/FROM NAMED <{iri}> names no graph in ledger '{target}'; \
                      check the IRI against the ledger's registered graphs"
                 )),
+                other @ TargetError::OtherLedgersSystemGraph { .. } => {
+                    ApiError::invalid_query(format!("SPARQL FROM/FROM NAMED: {other}"))
+                }
             })?;
         Self::select_graph_id(db.clone(), graph.g_id)
     }

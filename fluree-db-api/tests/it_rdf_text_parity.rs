@@ -82,7 +82,7 @@ fn render(ledger: &LedgerState, f: &Flake) -> String {
 async fn facts(ledger: &LedgerState, graph: Option<&str>) -> Vec<String> {
     let g_id = match graph {
         None => 0,
-        Some(iri) => match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+        Some(iri) => match ledger.snapshot.graph_registry.assigned_graph_id(iri) {
             Some(g) => g,
             None => return Vec::new(),
         },
@@ -1279,7 +1279,7 @@ async fn a_refused_urn_default_block_leaves_the_ledger_as_it_was() {
     assert!(
         now.snapshot
             .graph_registry
-            .graph_id_for_iri("urn:default")
+            .assigned_graph_id("urn:default")
             .is_none(),
         "no graph is registered as urn:default"
     );

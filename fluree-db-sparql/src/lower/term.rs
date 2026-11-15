@@ -5,7 +5,7 @@
 //! registration.
 
 use crate::ast::term::{
-    BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, SubjectTerm,
+    Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, SubjectTerm,
     Term as SparqlTerm, Var,
 };
 
@@ -76,20 +76,18 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         match term {
             SubjectTerm::Var(v) => Ok(self.lower_var_ref(v)),
             SubjectTerm::Iri(iri) => self.lower_iri_ref(iri),
-            SubjectTerm::BlankNode(bn) => match &bn.value {
-                BlankNodeValue::Labeled(label) => {
-                    // Stable Fluree blank-node ids (`_:fdb-...`) denote the
-                    // stored node, so they lower to a constant like an IRI;
-                    // other labels are non-distinguished variables per spec.
-                    if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
-                        let full_iri = format!("_:{label}");
-                        return Ok(self.encoder.encode_ref(&full_iri));
-                    }
-                    let var_id = self.vars.get_or_insert(&format!("_:{label}"));
-                    Ok(Ref::Var(var_id))
+            SubjectTerm::BlankNode(bn) => {
+                // Stable Fluree blank-node ids (`_:fdb-...`) denote the
+                // stored node, so they lower to a constant like an IRI;
+                // other labels are non-distinguished variables per spec.
+                let label = &bn.label;
+                if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+                    let full_iri = format!("_:{label}");
+                    return Ok(self.encoder.encode_ref(&full_iri));
                 }
-                BlankNodeValue::Anon => Ok(Ref::Var(self.fresh_blank_node_var())),
-            },
+                let var_id = self.vars.get_or_insert(&format!("_:{label}"));
+                Ok(Ref::Var(var_id))
+            }
             SubjectTerm::QuotedTriple(_qt) => {
                 // This path is reached when a quoted triple appears in a
                 // context without a reified-triple desugaring hook.
@@ -133,19 +131,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::Var(v) => Ok(self.lower_var(v)),
             SparqlTerm::Iri(iri) => self.lower_iri(iri),
             SparqlTerm::Literal(lit) => self.lower_literal(lit),
-            SparqlTerm::BlankNode(bn) => match &bn.value {
-                BlankNodeValue::Labeled(label) => {
-                    // Stable Fluree blank-node ids lower to a constant
-                    // (see lower_subject).
-                    if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
-                        let full_iri = format!("_:{label}");
-                        return Ok(self.encoder.encode_term(&full_iri));
-                    }
-                    let var_id = self.vars.get_or_insert(&format!("_:{label}"));
-                    Ok(Term::Var(var_id))
+            SparqlTerm::BlankNode(bn) => {
+                // Stable Fluree blank-node ids lower to a constant
+                // (see lower_subject).
+                let label = &bn.label;
+                if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+                    let full_iri = format!("_:{label}");
+                    return Ok(self.encoder.encode_term(&full_iri));
                 }
-                BlankNodeValue::Anon => Ok(Term::Var(self.fresh_blank_node_var())),
-            },
+                let var_id = self.vars.get_or_insert(&format!("_:{label}"));
+                Ok(Term::Var(var_id))
+            }
             SparqlTerm::QuotedTriple(qt) => {
                 // Reified-triple objects are desugared by
                 // `lower_object_desugared` before this is reached on

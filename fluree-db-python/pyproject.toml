@@ -42,8 +42,15 @@ module-name = "fluree._fluree"
 # workspace build (the CLI release's among them) skips it. abi3-py310: one wheel
 # per platform for every CPython >= 3.10. Set here, not as a crate feature, so
 # workspace `--all-features` builds do not demand a 3.10+ interpreter; plain
-# cargo builds use whichever Python is installed.
-features = ["extension", "pyo3/extension-module", "pyo3/abi3-py310"]
+# cargo builds use whichever Python is installed. `mimalloc`: the extension's
+# global allocator.
+features = ["extension", "mimalloc", "pyo3/extension-module", "pyo3/abi3-py310"]
+
+# Oldest macOS the Apple silicon wheel runs on, as in .cargo/config.toml.
+# maturin tags the wheel with it and passes it to cargo; without it, it would
+# set rustc's default, 11.0, over cargo's [env] table.
+[tool.maturin.target."aarch64-apple-darwin"]
+macos-deployment-target = "14.0"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

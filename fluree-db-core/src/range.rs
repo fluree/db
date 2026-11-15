@@ -253,6 +253,18 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
         self.0.overlay_flake_count(g_id)
     }
 
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        self.0
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+    }
+
     fn overlay_segments(&self, g_id: GraphId) -> Vec<crate::overlay::OverlaySegmentMeta> {
         self.0.overlay_segments(g_id)
     }

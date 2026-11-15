@@ -389,6 +389,34 @@ query that computes a materialization pays for it; queries answered from the
 cached result do not, and a run that was cancelled or ran out of fuel caches
 nothing.
 
+### Memory a cached result holds
+
+A materialization is cached (see below), and while cached it holds its
+derived facts. Joins over derived facts add to that. The first reasoning
+query whose join reads a derived predicate through a batched lane translates
+that predicate's facts into the index's internal ids, about 40 bytes per
+fact, and the result keeps the translation for every later query reading it.
+A predicate can be translated twice: once in subject order, and, for joins
+that probe by object, its reference-valued facts again in object order. The
+translations are made only when a query needs them and are dropped with the
+result.
+
+The memory limit above covers both: a result's derived facts and its
+translations together stay within it. Both sizes are estimates. A translation
+that would take a result past the limit is not made. The join runs per row
+instead, with the same answer, only slower, and the server logs one WARN for
+that result. The warning names the phase, the estimated sizes, the limit and
+the derived-fact count.
+
+To provision for reasoning, plan for each cached result to hold up to its
+memory limit. Up to 16 results are cached at once, one for each distinct
+combination of database state, reasoning modes, rules and budget. If the
+warning appears:
+
+- if the host has memory to spare, raise the memory limit;
+- if it doesn't, run fewer distinct reasoning workloads at once;
+- or narrow the rules or queries, so less is derived or translated.
+
 ## Performance considerations
 
 | Mode | Overhead | Caching |

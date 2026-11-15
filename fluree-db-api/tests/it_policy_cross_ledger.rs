@@ -153,6 +153,85 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
     );
 }
 
+/// A selector naming a config graph IRI, the model ledger's own or another
+/// ledger's, is refused: any ledger's config graph IRI names M's config
+/// graph, which is never a cross-ledger governance target.
+#[tokio::test]
+async fn a_config_graph_selector_is_refused_in_any_ledgers_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-e2e/config-selector-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let model_config = config_graph_iri(model_id);
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <{model_config}> {{
+                ex:denyUsers rdf:type f:AccessPolicy ;
+                             f:action f:view ;
+                             f:onClass ex:User ;
+                             f:allow false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed a policy in M's config graph");
+
+    for (n, selector) in [model_config.clone(), config_graph_iri("nowhere:main")]
+        .iter()
+        .enumerate()
+    {
+        let data_id = format!("test/cross-ledger-e2e/config-selector-data-{n}:main");
+        let data = genesis_ledger(&fluree, &data_id);
+        let data_config = config_graph_iri(&data_id);
+        fluree
+            .stage_owned(data)
+            .upsert_turtle(&format!(
+                r"
+                @prefix f:   <https://ns.flur.ee/db#> .
+                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+                GRAPH <{data_config}> {{
+                    <urn:cfg:main> rdf:type f:LedgerConfig ;
+                                   f:policyDefaults <urn:cfg:policy> .
+                    <urn:cfg:policy> f:defaultAllow true ;
+                                     f:policyClass f:AccessPolicy ;
+                                     f:policySource <urn:cfg:policy-ref> .
+                    <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                         f:graphSource <urn:cfg:policy-src> .
+                    <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                         f:graphSelector <{selector}> .
+                }}
+            "
+            ))
+            .execute()
+            .await
+            .expect("seed D's cross-ledger config");
+
+        let Err(err) = fluree
+            .db_with_policy(&data_id, &GovernanceOptions::default())
+            .await
+        else {
+            panic!("{selector}: a config graph selector must be refused");
+        };
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::CrossLedger(
+                    fluree_db_api::cross_ledger::CrossLedgerError::ReservedGraphSelected { .. }
+                )
+            ),
+            "{selector}: {err:?}"
+        );
+    }
+}
+
 // =============================================================================
 // Class-filter contract — exact-IRI resolution at the wire→Sid boundary.
 //

@@ -417,7 +417,9 @@ JSON object:
 
 - Each commit's `t` is the prior commit's `t + 1`. The first commit's `t` is the ledger's current `t + 1`.
 - Each commit's first parent is the prior commit. The first commit's first parent is the ledger's current head. A match on a later parent is not enough. The first-parent line is the history the server replays.
-- A commit with no flakes is rejected unless it is a merge commit. A merge records the merge even when its conflict strategy resolved every flake away.
+- A commit with no flakes is rejected unless it is a merge commit or drops graphs. A merge records the merge even when its conflict strategy resolved every flake away; a drop is the change of a commit that only drops.
+- A commit that drops graphs applies its drops before its flakes, as it did where it was written. Only an identity without a restricting policy may push one.
+- A drop must name the default graph or a user graph registered by that commit or earlier. Unknown graphs, system graphs, and graphs first registered by a later commit in the batch are rejected. Incremental pull checks the same rule.
 - Every parent of every commit is either in the push or already stored. For a branch, that includes history from before the fork, which is stored under its source branch.
 
 **Response Body (200 OK):**
@@ -453,6 +455,7 @@ When `enabled` is `false` (external indexer mode), the caller should use `needed
 **Error Responses:**
 
 - `400 Bad Request`: the body carries `merged_commits`
+- `403 Forbidden`: policy refuses a commit, including one that drops graphs pushed by an identity with a restricting policy
 - `409 Conflict`: head changed / diverged / first commit `t` did not match next-t
 - `422 Unprocessable Entity`: invalid commit bytes, a parent that is neither in the push nor stored, or retraction invariant violation
 - `422 Unprocessable Entity` with `err:db/DatatypeLimitExceeded`: the commits would bring the ledger past its [datatype limit](../concepts/datatypes.md#datatype-limit)
@@ -473,7 +476,7 @@ The fields of `POST /push/*ledger`, plus:
 
 - `merged_commits`: array of base64-encoded commit v2 blobs, parents before children. These are the commits that merges in `commits` brought in from other branches. The server stores them and does not replay them. Each merge commit already carries their combined changes. Their `t` values come from other branches, so they are not contiguous with `commits`. Their txn blobs go in `blobs` like any other.
 
-The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit. A push that carries any other commit is refused with `422`.
+The chain rules of `POST /push/*ledger` apply to `commits`. The parent rule also covers `merged_commits`. Every merged commit must be reachable from a merge in `commits`, directly or through another merged commit, and none may drop graphs, which a merge cannot bring in. A push that carries any other commit is refused with `422`.
 
 A sender leaves out the commits the receiver's head already reaches, so merging the same branch twice sends only what that branch gained in between. The parent rule still holds, because a commit the receiver has means the receiver has everything behind it.
 
@@ -893,12 +896,27 @@ POST /import-upload
   "source_kind": "source",       // default "flpack"
   "filename": "dump.cypher",     // extension drives format detection
   "edge_properties": "plain",    // CSV/Cypher only; default "annotated"
-  "base_iri": "https://kb.example/" } // CSV/Cypher only; format default if omitted
+  "base_iri": "https://kb.example/", // CSV/Cypher only; format default if omitted
+  "skolem_namespace": "urn:kb" } // blank-node salt; needs "source-upload-skolem"
 ```
+
+The file is imported under its own name, so its blank nodes get the ids a direct import of that file would mint. Servers that honor `"skolem_namespace"` (the salt `--skolem-namespace` sets, in place of the ledger id) advertise `"source-upload-skolem"` in `import.modes`.
 
 Upload / complete / status are unchanged; on `succeeded`, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`. One upload = one source file (upload a directory as one concatenated/merged file, or pack it). Not offered on Raft-replicated servers (the pipeline publishes nameservice heads outside the replicated log) — mint returns 400 and discovery omits the mode.
 
 This is the transport behind `fluree create <ledger> --remote <name> --from data.ttl|dump.cypher|…` — the CLI checks the capability and errors with a `.flpack` fallback hint when the server doesn't offer it.
+
+A source upload can also fill a **new named graph of an existing ledger**, as [`fluree graph import`](../cli/graph.md#fluree-graph-import) does. Servers that support it add `"source-upload-graph"` to `import.modes`; mint with `"graph"` naming the new graph and `"ledger"` the existing ledger:
+
+```jsonc
+POST /import-upload
+{ "ledger": "kb:main", "size": 123456789,
+  "source_kind": "source",
+  "filename": "products.ttl",
+  "graph": "http://example.org/graph/products" }
+```
+
+Mint refuses `"graph"` on a `.flpack` upload, the default graph and the ledger's system graphs (`400`), and a ledger that does not exist (`404`). On `succeeded`, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`; the import's commits are `base_t + 1` through `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh.
 
 ## Storage Proxy Endpoints
 
@@ -1828,7 +1846,7 @@ POST /validate/{ledger...}
 }
 ```
 
-- `graph` — IRI of the named data graph to validate (default: the default graph).
+- `graph` — IRI of the named data graph to validate (default: the default graph). It is read with the [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graphs the ledger config lists for it, whichever shapes are used.
 - `shapes` — ad-hoc shapes: a JSON-LD object/array, or a **string containing Turtle**. Ad-hoc shapes **replace** the ledger's attached shapes ("does this data conform to *these* rules?").
 - `shapesGraph` — IRI of a named graph in this ledger holding the shapes (mutually exclusive with `shapes`).
 - `includeAttached` — union ad-hoc shapes with the attached shapes instead of replacing them.
@@ -1871,6 +1889,7 @@ POST /validate/{ledger...}
 - `400 Bad Request` — malformed body, conflicting `shapes`/`shapesGraph`, unparseable shapes document
 - `401 Unauthorized` — authentication required and missing
 - `404 Not Found` — ledger or named graph not found (or not authorized)
+- `500 Internal Server Error` — the ledger config could not be read (`err:storage/ReadFailure`); validation does not run without it
 
 **Examples:**
 
@@ -2399,10 +2418,9 @@ curl -X POST http://localhost:8090/v1/fluree/drop-branch \
 
 ### POST /drop-graph
 
-Drop a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted under that graph IRI. The drop
-runs as a normal commit at `t = current_t + 1` — history at earlier `t`
-values is preserved. Admin-protected.
+Drop a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`. The drop is one commit at `t = current_t + 1` that
+retracts nothing. Admin-protected.
 
 **URL:**
 ```
@@ -2429,7 +2447,7 @@ POST /drop-graph
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -2439,24 +2457,25 @@ POST /drop-graph
 |-------|------|-------------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted |
 | `graph_iri` | string | Graph IRI that was dropped (echoed) |
-| `retracted` | integer | Number of flakes retracted by the drop commit; `0` for a no-op |
-| `committed` | boolean | `true` when a new commit was produced; `false` for a no-op drop on an empty graph |
-| `t` | integer | Current commit `t` for the branch after the drop |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | boolean | `true`: the drop commits |
+| `t` | integer | Commit `t` of the drop |
 
 **Behavior:**
 
-- **Transactional and history-preserving.** A query `as-of` an earlier `t` still sees the graph populated.
+- **Takes the history.** Nothing the graph held is queryable afterwards, at the head or as of an earlier `t`: a query naming the graph as of a `t` before the drop gets a 404. The commits keep the facts, so a branch created at a `t` before the drop reads them.
+- **The graph no longer exists.** `/info` leaves it out of `named-graphs`, and writing to the same IRI starts it afresh.
+- **Any size.** The drop reads none of the graph's facts, so its cost does not depend on the graph's size; `FLUREE_MAX_GRAPH_SCAN_FLAKES` does not apply.
 - **Per-branch.** Only affects the targeted branch — sibling branches that share the same graph IRI are not touched.
 - **Refuses system graphs.** The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped (400 Bad Request).
-- **Refuses unknown graphs.** Returns 404 when `graph` is not registered in the ledger's graph registry — the call never auto-registers a new graph slot.
-- **Idempotent.** A second call on an already-empty graph returns `committed: false`, `retracted: 0` without producing a commit.
+- **Refuses missing graphs.** Returns 404 when `graph` does not exist in the ledger, a dropped graph included — the call never registers a graph.
 
 **Status codes:**
 
-- `200 OK` - Drop succeeded (commit produced or no-op)
+- `200 OK` - Drop succeeded
 - `400 Bad Request` - Malformed IRI, empty IRI, or system-graph IRI
 - `401`/`403` - Admin token required and absent/invalid
-- `404 Not Found` - Ledger or graph IRI not found
+- `404 Not Found` - Ledger or graph not found
 - `500 Internal Server Error` - Server error
 
 **Examples:**
@@ -2818,6 +2837,27 @@ Returns comprehensive ledger metadata including namespace codes, property stats,
   "classes": [ ... ]
 }
 ```
+
+For a graph source (Iceberg, Delta, SQL), a class or property `count` is the exact number a native ledger loaded with the mapping's triples would report, or `null` where table metadata cannot prove it. A `null` count carries `count-upper-bound` when a bound is provable, and a `null` entry of `ref-classes` carries its bound under `ref-classes-upper-bound`:
+
+```json
+"classes": {
+  "ex:Customer": {
+    "count": null,
+    "count-upper-bound": 9000000,
+    "properties": {
+      "ex:placedBy": {
+        "count": null,
+        "count-upper-bound": 6000000,
+        "ref-classes": { "ex:Customer": null },
+        "ref-classes-upper-bound": { "ex:Customer": 6000000 }
+      }
+    }
+  }
+}
+```
+
+Earlier releases put the tables' row counts in `count`. A client that displays a count reads `count`, falls back to `count-upper-bound` ("at most N"), and shows a count with neither as unknown, never as 0. Most counts of a map with no declared key are `null`; see [Iceberg → `info`](../graph-sources/iceberg.md) for when a count is exact.
 
 When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
 
@@ -3209,6 +3249,8 @@ In `direct`, `glue` and `s3tables` modes the server reads with its own AWS ident
 
 `connection_tested` reports whether every table the mapping names loaded at registration, the way a query loads it: through the catalog in `rest`, `glue` and `s3tables` modes, or by resolving its current metadata at the location in `direct` mode. It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail the request; the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
 
+`diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map whose subjects neither an `f:key` nor the table's identifier fields prove unique, so its queries remove repeated solutions as they read: `{"severity": "advisory", "code": "keylessMap", "table": "sales.orders", "message": "TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, … If order_id identifies a row, declare `f:key ( \"order_id\" )` on its logical table, or make it the table's identifier field."}`. It is informational: the source is registered and answers correctly, but more slowly than a keyed map (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). It is reported only when every table loaded (`connection_check` `verified`).
+
 `connection_check` says what the check found; `connection_tested` is `true` exactly when its `outcome` is `verified`:
 
 | `outcome` | Meaning | Other fields |
@@ -3514,7 +3556,7 @@ The catalog and storage fields may instead be given structured, as the stored co
 }
 ```
 
-`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate.
+`table_versions` holds the current Delta version of each mapped table that opened with every column its maps reference. A table that could not be read, or that lacks a mapped column, appears in `table_warnings` instead; the source is registered regardless. `model_warnings` lists policies of the model a virtual source cannot evaluate. `diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map no `f:key` proves subject-unique (a Delta table reports no key of its own), naming the map and the `f:key` that would prove it; queries over such a map remove repeated solutions as they read (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)).
 
 See also the CLI equivalent: [fluree delta map](../cli/delta.md#fluree-delta-map).
 
@@ -3570,7 +3612,7 @@ So that one body can be sent to each route in turn, each Delta route ignores the
 }
 ```
 
-An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns.
+An override's `table` is spelled as in `tables`. `options` are those of `iceberg/r2rml/generate`. `turtle` is the mapping; `structured` is the same mapping as data; each entry of `diagnostics` has a `severity` (`error`, `warning`, `advisory`), a `code`, and the `table`, `column` and `message` it concerns. A generated mapping declares no `f:key`, and a Delta table reports no key of its own, so `generate` and `validate` give a `keylessMap` advisory for each triples map no declared key proves subject-unique: its queries remove repeated solutions as they read. Add the `f:key` the advisory names where the subject's columns identify a row (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). `iceberg/r2rml/generate` does the same, counting the tables' identifier fields as keys.
 
 **Validate** answers `200` whether or not the mapping is sound: `compiled_ok` is false for a mapping that does not compile or defines no `rr:TriplesMap`, and `diagnostics` lists what was found (`tableNotFound`, `columnNotFound`, `casingMismatch`, `joinTypeMismatch`, `noSafeSubjectKey`, `nestedColumnSkipped`).
 
@@ -3621,7 +3663,7 @@ POST {api_base_url}/sql/map
 | `session` | object | Session properties sent as `X-Trino-Session` |
 | `model` | string | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must be an existing native ledger. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy). |
 | `default_allow` | bool | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny). |
-| `allow_duplicate_subjects` | bool | Accept subject keys the registration probe finds non-unique; without it the pushdown lane refuses statements over the flagged tables. See [Subject keys must be unique](../graph-sources/sql.md#subject-keys-must-be-unique). |
+| `allow_duplicate_subjects` | bool | Skip the duplicate-subject probe: no table is refused, and queries answer with set semantics wherever no key declared in the mapping proves a map's subjects unique. Without it, the pushdown lane refuses statements over tables the probe finds repeated. See [Repeated rows and subject keys](../graph-sources/sql.md#repeated-rows-and-subject-keys). |
 
 **Response:**
 
@@ -3639,7 +3681,7 @@ POST {api_base_url}/sql/map
 }
 ```
 
-`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration. `mapping_warnings` (omitted when empty) lists the findings of the subject-key uniqueness probe.
+`connection_tested` reports whether `SELECT 1` succeeded against the endpoint; a failure does not block registration. `mapping_warnings` (omitted when empty) lists the findings of the subject-key uniqueness probe. `diagnostics` (omitted when empty) holds a `keylessMap` advisory for each triples map that neither the key the probe verified nor an `f:key` proves subject-unique, so its statements carry `DISTINCT` or decline to the per-scan lane (see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Nothing is reported when the endpoint was unreachable.
 
 **Status Codes:**
 - `201 Created` — graph source created

@@ -19,7 +19,8 @@
 //! 2. One `rdf:type` triple per `rr:class`.
 //! 3. For each `rr:predicateObjectMap`: the predicate IRI, then either a direct
 //!    object (column / template / constant — a NULL object column yields no
-//!    triple) or, for a `RefObjectMap`, the FK edge to the parent subject.
+//!    triple) or, for a `RefObjectMap`, one FK edge per parent subject its key
+//!    matches.
 //!
 //! # RefObjectMap (foreign-key) edges — lookup-free, dims-first
 //!
@@ -27,9 +28,10 @@
 //! without any per-row parent re-scan. Parent triples maps are processed before
 //! their children ([`dependency_order`]); while a parent is scanned, its join
 //! key → subject term is recorded in a [`ParentIndexSet`]. When a child row
-//! carries a foreign key, the edge is emitted only if that key is present in the
-//! parent index — a **dangling** or NULL FK produces no triple, which is R2RML
-//! inner-join semantics (and matches what the virtual query path serves).
+//! carries a foreign key, one edge is emitted per distinct parent subject the key
+//! matches (R2RML §11: one triple per joined parent row, and a graph is a set) —
+//! a **dangling** or NULL FK produces no triple, which is R2RML inner-join
+//! semantics (and matches what the virtual query path serves).
 //!
 //! Cyclic and self-referential parents (which cannot be indexed lazily in a
 //! single pass) are fully pre-indexed before the emit pass.
@@ -71,7 +73,8 @@ pub struct MaterializeStats {
     pub type_triples: u64,
     /// Direct data triples (column / template / constant objects).
     pub data_triples: u64,
-    /// Foreign-key edge triples emitted (matched parent).
+    /// Foreign-key edge triples emitted: one per distinct parent subject a
+    /// referencing row's key matches.
     pub ref_triples: u64,
     /// Foreign keys present but with no matching parent (dropped — dangling).
     pub ref_dangling: u64,
@@ -81,12 +84,10 @@ pub struct MaterializeStats {
     pub per_tm: HashMap<String, u64>,
     /// FK-edge count per `(child TriplesMap IRI, predicate IRI)` — parity key.
     pub ref_edges: HashMap<(String, String), u64>,
-    /// Ambiguous parent join keys per PARENT TriplesMap IRI: keys that resolved to
-    /// more than one distinct parent subject (a fan-out the builder cannot yet emit;
-    /// [`parent_key_insert_keep_min`] deterministically keeps one). Counted as
-    /// DISTINCT ambiguous keys, not raw collisions, so the figure is reproducible
-    /// (a raw collision tally is scan-order dependent). Drives the materialize
-    /// decline gate and is recorded in the twin's stamp when the override builds.
+    /// Per PARENT TriplesMap IRI, the parent join keys whose rows mint more than
+    /// one distinct subject ([`ParentIndexSet::dup_parent_keys`]): the keys a
+    /// referencing row fans out on, emitting one edge per subject. Distinct keys,
+    /// so the figure does not depend on scan order. Informational.
     pub dup_parent_keys: HashMap<String, u64>,
 }
 
@@ -208,19 +209,15 @@ pub fn canonical_join(rom: &RefObjectMap) -> R2rmlResult<(Vec<String>, Vec<Strin
     Ok((parent_cols, child_cols))
 }
 
-/// A parent's join-key tuple → its materialized subject term, for one canonical
-/// parent-column set.
-type KeyToSubject = HashMap<Vec<String>, RdfTerm>;
+/// A parent's join-key tuple → the distinct subjects its rows mint, for one
+/// canonical parent-column set.
+type KeyToSubjects = HashMap<Vec<String>, ParentSubjects>;
 
 /// A comparable ordering key for a parent SUBJECT term. Parent subjects are IRIs
 /// (occasionally blank nodes); the inner string gives a total lexicographic order.
 ///
-/// Exported (id=3717339907) so the VIRTUAL query path's fused keep-min uses the SAME
-/// comparator this crate's `parent_key_insert_keep_min` uses — otherwise the fused
-/// semi-join could pick a different parent row than the generic chained inner join on a
-/// duplicate intermediate key. Reused directly at the RdfTerm keep-min sites; the P2a
-/// IRI-string site compares the pure-IRI subjects it already extracted, which for
-/// `RdfTerm::Iri` is exactly this function's inner-string ordering.
+/// Exported so the VIRTUAL query path's fused aggregate orders parent subjects the
+/// way [`ParentSubjects`] does.
 pub fn subject_sort_key(term: &RdfTerm) -> &str {
     match term {
         RdfTerm::Iri(s) | RdfTerm::BlankNode(s) => s,
@@ -228,53 +225,158 @@ pub fn subject_sort_key(term: &RdfTerm) -> &str {
     }
 }
 
-/// Insert a parent join-key → subject mapping with a DETERMINISTIC keep-min
-/// tie-break, shared by the materialize index builder ([`ParentIndexSet::index_batch`])
-/// and the virtual query path (`build_parent_lookup`). On a collision — the key is
-/// already present with a DIFFERENT subject — the lexicographically smaller subject
-/// IRI wins, so which parent survives is independent of scan / IO-completion order.
-/// This makes the pick REPRODUCIBLE (the materialize stamp's mapping-hash contract
-/// rests on it) instead of a race between data files. An exact-duplicate row (same
-/// key, same subject) is not a collision. Returns `true` iff this insert observed a
-/// DISTINCT-subject collision — free duplicate-key detection (`HashMap` already
-/// tells us the key was occupied).
-pub fn parent_key_insert_keep_min(
-    map: &mut HashMap<Vec<String>, RdfTerm>,
+/// The total order [`ParentSubjects`] keeps: by [`subject_sort_key`], then by kind,
+/// so two terms compare equal only when they are the same term.
+fn subject_order(a: &RdfTerm, b: &RdfTerm) -> std::cmp::Ordering {
+    let kind = |t: &RdfTerm| match t {
+        RdfTerm::Iri(_) => 0u8,
+        RdfTerm::BlankNode(_) => 1,
+        RdfTerm::Literal { .. } => 2,
+    };
+    subject_sort_key(a)
+        .cmp(subject_sort_key(b))
+        .then_with(|| kind(a).cmp(&kind(b)))
+}
+
+/// The distinct subjects the parent rows of one join key mint, in
+/// [`subject_sort_key`] order. A referencing object map joins a child row to each
+/// of them: R2RML §11 makes one triple per joined parent row, and an RDF graph is a
+/// set, so rows minting the same subject (the versions of a history table, say)
+/// give one triple.
+///
+/// Never empty. One subject, the usual case, is held inline, so a unique parent
+/// key costs what a single subject did.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ParentSubjects(Subjects);
+
+#[derive(Debug, Clone, PartialEq)]
+enum Subjects {
+    One(RdfTerm),
+    /// Two or more, sorted and distinct.
+    Many(Vec<RdfTerm>),
+}
+
+impl ParentSubjects {
+    /// The subjects of a key whose first row mints `subject`.
+    pub fn new(subject: RdfTerm) -> Self {
+        Self(Subjects::One(subject))
+    }
+
+    /// Add a subject another row of the key mints. Returns whether it was new.
+    pub fn insert(&mut self, subject: RdfTerm) -> bool {
+        match &mut self.0 {
+            Subjects::One(first) => {
+                let order = subject_order(&subject, first);
+                if order.is_eq() {
+                    return false;
+                }
+                let first = std::mem::replace(first, RdfTerm::Iri(String::new()));
+                self.0 = Subjects::Many(if order.is_lt() {
+                    vec![subject, first]
+                } else {
+                    vec![first, subject]
+                });
+                true
+            }
+            Subjects::Many(all) => match all.binary_search_by(|t| subject_order(t, &subject)) {
+                Ok(_) => false,
+                Err(at) => {
+                    // Grow by half rather than doubling: a key's list is
+                    // resident for the whole join, and its last growth would
+                    // otherwise leave up to as many free slots as used ones.
+                    if all.len() == all.capacity() {
+                        all.reserve_exact(all.len() / 2 + 1);
+                    }
+                    all.insert(at, subject);
+                    true
+                }
+            },
+        }
+    }
+
+    /// The subjects, sorted.
+    pub fn as_slice(&self) -> &[RdfTerm] {
+        match &self.0 {
+            Subjects::One(subject) => std::slice::from_ref(subject),
+            Subjects::Many(all) => all,
+        }
+    }
+
+    /// How many distinct subjects the key's rows mint (at least one).
+    pub fn len(&self) -> usize {
+        self.as_slice().len()
+    }
+
+    /// Always `false`: a key is recorded only with the subject of one of its rows.
+    pub fn is_empty(&self) -> bool {
+        false
+    }
+
+    /// The bytes held on the heap for the subjects: each term's text, plus the
+    /// spilled list's slots (its capacity, not its length) when there are
+    /// several.
+    pub fn heap_bytes(&self) -> usize {
+        let text: usize = self.as_slice().iter().map(rdf_term_bytes).sum();
+        match &self.0 {
+            Subjects::One(_) => text,
+            Subjects::Many(all) => text + all.capacity() * std::mem::size_of::<RdfTerm>(),
+        }
+    }
+
+    /// Release the spilled list's spare capacity, once no more subjects will
+    /// be added (growth leaves up to half as many free slots as used ones).
+    pub fn shrink_to_fit(&mut self) {
+        if let Subjects::Many(all) = &mut self.0 {
+            all.shrink_to_fit();
+        }
+    }
+}
+
+/// What recording one parent row's join key and subject found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParentKeyInsert {
+    /// The key's first subject.
+    NewKey,
+    /// The key already had this subject (another row minting it).
+    SameSubject,
+    /// The key already had other subjects: a referencing row fans out to each.
+    AnotherSubject,
+}
+
+/// Record that a parent row with join `key` mints `subject`. The one insert both
+/// the materialize index builder ([`ParentIndexSet::index_batch`]) and the virtual
+/// query path's parent lookup use, so the twin and the query join a child row to
+/// the same parents. The result is independent of the order rows arrive in.
+pub fn parent_key_insert(
+    map: &mut HashMap<Vec<String>, ParentSubjects>,
     key: Vec<String>,
     subject: RdfTerm,
-) -> bool {
+) -> ParentKeyInsert {
     use std::collections::hash_map::Entry;
     match map.entry(key) {
         Entry::Vacant(e) => {
-            e.insert(subject);
-            false
+            e.insert(ParentSubjects::new(subject));
+            ParentKeyInsert::NewKey
         }
         Entry::Occupied(mut e) => {
-            let replace = {
-                let current = subject_sort_key(e.get());
-                let incoming = subject_sort_key(&subject);
-                if incoming == current {
-                    return false; // benign exact-duplicate parent row
-                }
-                incoming < current
-            };
-            if replace {
-                e.insert(subject);
+            if e.get_mut().insert(subject) {
+                ParentKeyInsert::AnotherSubject
+            } else {
+                ParentKeyInsert::SameSubject
             }
-            true
         }
     }
 }
 
 /// All of one parent TriplesMap's indexes, keyed by canonical parent-column list
 /// (a parent may be joined on more than one column set).
-type ParentColIndex = HashMap<Vec<String>, KeyToSubject>;
+type ParentColIndex = HashMap<Vec<String>, KeyToSubjects>;
 
 /// Parent-subject indexes for every TriplesMap referenced as a foreign-key
 /// target. Built by scanning parent tables once; consulted by child rows.
 ///
 /// Layout: `parent TM IRI → (canonical parent columns → (key tuple → parent
-/// subject term))`. A parent may be referenced via more than one column set, so
+/// subjects))`. A parent may be referenced via more than one column set, so
 /// the middle level is keyed by the canonical column list.
 #[derive(Debug, Default)]
 pub struct ParentIndexSet {
@@ -282,12 +384,6 @@ pub struct ParentIndexSet {
     needed: HashMap<String, HashSet<Vec<String>>>,
     /// The built indexes.
     index: HashMap<String, ParentColIndex>,
-    /// Parent join keys that resolved to MORE THAN ONE distinct subject, per parent
-    /// TM IRI. A key is recorded iff some row minted a differing subject for it
-    /// ([`parent_key_insert_keep_min`] returned `true`) — set membership, so the
-    /// tally is independent of insertion order. The winner is picked deterministically
-    /// (keep-min); this records WHICH keys were ambiguous, for the decline gate + stamp.
-    ambiguous_keys: HashMap<String, HashSet<Vec<String>>>,
 }
 
 impl ParentIndexSet {
@@ -315,11 +411,7 @@ impl ParentIndexSet {
             }
         }
         let index = needed.keys().map(|p| (p.clone(), HashMap::new())).collect();
-        Ok(Self {
-            needed,
-            index,
-            ambiguous_keys: HashMap::new(),
-        })
+        Ok(Self { needed, index })
     }
 
     /// Whether `tm_iri` is referenced as a foreign-key parent (and therefore
@@ -336,40 +428,50 @@ impl ParentIndexSet {
         Self {
             needed: self.needed.clone(),
             index: HashMap::new(),
-            ambiguous_keys: HashMap::new(),
         }
     }
 
     /// Fold another index set's built indexes into this one (union per parent, per
-    /// canonical column set, per key). Pre-indexed parent tables have disjoint
-    /// parent IRIs, but the merge is a full union so it stays correct regardless.
+    /// canonical column set, per key, per subject). Pre-indexed parent tables have
+    /// disjoint parent IRIs, but the merge is a full union so it stays correct
+    /// regardless.
     pub fn merge_from(&mut self, other: Self) {
         for (parent, col_index) in other.index {
             let entry = self.index.entry(parent).or_default();
-            for (cols, key_to_subject) in col_index {
-                entry.entry(cols).or_default().extend(key_to_subject);
+            for (cols, key_to_subjects) in col_index {
+                let mine = entry.entry(cols).or_default();
+                if mine.is_empty() {
+                    *mine = key_to_subjects;
+                    continue;
+                }
+                for (key, subjects) in key_to_subjects {
+                    for subject in subjects.as_slice() {
+                        parent_key_insert(mine, key.clone(), subject.clone());
+                    }
+                }
             }
-        }
-        // Union the ambiguous-key sets (a parent is indexed in exactly one wave-local
-        // set, so these are normally disjoint; the union stays correct regardless and
-        // keeps the tally order-independent).
-        for (parent, keys) in other.ambiguous_keys {
-            self.ambiguous_keys.entry(parent).or_default().extend(keys);
         }
     }
 
-    /// Distinct ambiguous parent join keys per parent TM IRI (keys that mapped to
-    /// more than one subject). Empty when every parent key is unambiguous. Feeds the
-    /// materialize decline gate, [`MaterializeStats::dup_parent_keys`], and the stamp.
+    /// Per parent TM IRI, the parent join keys whose rows mint more than one
+    /// distinct subject: the keys a referencing row fans out on, emitting one edge
+    /// per subject. Empty when every parent key is unique. Informational
+    /// ([`MaterializeStats::dup_parent_keys`]); nothing declines on it.
     pub fn dup_parent_keys(&self) -> HashMap<String, u64> {
-        self.ambiguous_keys
+        self.index
             .iter()
-            .map(|(tm, keys)| (tm.clone(), keys.len() as u64))
+            .filter_map(|(tm, col_index)| {
+                let keys = col_index
+                    .values()
+                    .flat_map(HashMap::values)
+                    .filter(|subjects| subjects.len() > 1)
+                    .count() as u64;
+                (keys > 0).then(|| (tm.clone(), keys))
+            })
             .collect()
     }
 
-    /// The canonical parent-column set(s) a parent TM is indexed on — used to name
-    /// the offending join column(s) in the duplicate-parent-key decline error.
+    /// The canonical parent-column set(s) a parent TM is indexed on.
     pub fn needed_columns(&self, tm_iri: &str) -> Option<&HashSet<Vec<String>>> {
         self.needed.get(tm_iri)
     }
@@ -386,12 +488,12 @@ impl ParentIndexSet {
         const ENTRY_OVERHEAD: usize = 64;
         let mut total = 0usize;
         for col_index in self.index.values() {
-            for (cols, key_to_subject) in col_index {
+            for (cols, key_to_subjects) in col_index {
                 total += cols.iter().map(String::len).sum::<usize>();
-                for (key, subject) in key_to_subject {
+                for (key, subjects) in key_to_subjects {
                     total += ENTRY_OVERHEAD;
                     total += key.iter().map(String::len).sum::<usize>();
-                    total += rdf_term_bytes(subject);
+                    total += subjects.heap_bytes();
                 }
             }
         }
@@ -406,58 +508,39 @@ impl ParentIndexSet {
             Some(sets) => sets.iter().cloned().collect(),
             None => return Ok(()),
         };
-        // Collision resolution is deterministic keep-min (order-independent winner);
-        // ambiguous keys are recorded free (the map already reports occupancy). Buffer
-        // them locally so `self.ambiguous_keys` isn't borrowed while `entry` holds
-        // `self.index`.
-        let mut ambiguous_this_batch: Vec<Vec<String>> = Vec::new();
-        {
-            let entry = self.index.entry(tm.iri.clone()).or_default();
-            // MAJOR-4 (#1529 review): create each canonical col-set's map ONCE (one
-            // column-name Vec clone per set), then probe it by borrow in the row loop
-            // — the old `entry.entry(cols.clone())` cloned that Vec on EVERY row.
-            // id=3717339921: this leaves a PRESENT-but-EMPTY inner map when a col-set
-            // yields no key, where the old per-row code left the entry ABSENT. Safe by
-            // construction: no consumer distinguishes the two — `resolve` chains
-            // `.get(cols)?.get(key)` (an empty map returns `None` on `.get(key)`, same as
-            // an absent col-set short-circuiting the `?`), `merge_from` `.extend`s (a
-            // no-op on empty), and `estimated_bytes` counts 0 for an empty map.
+        let entry = self.index.entry(tm.iri.clone()).or_default();
+        // MAJOR-4 (#1529 review): create each canonical col-set's map ONCE (one
+        // column-name Vec clone per set), then probe it by borrow in the row loop
+        // — the old `entry.entry(cols.clone())` cloned that Vec on EVERY row.
+        // id=3717339921: this leaves a PRESENT-but-EMPTY inner map when a col-set
+        // yields no key, where the old per-row code left the entry ABSENT. Safe by
+        // construction: no consumer distinguishes the two — `lookup` chains
+        // `.get(cols)?.get(key)` (an empty map returns `None` on `.get(key)`, same as
+        // an absent col-set short-circuiting the `?`), `merge_from` adopts or folds
+        // (a no-op on empty), and `estimated_bytes` counts 0 for an empty map.
+        for cols in &col_sets {
+            entry.entry(cols.clone()).or_default();
+        }
+        for row in 0..batch.num_rows {
+            let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
+                Some(s) => s,
+                None => continue,
+            };
             for cols in &col_sets {
-                entry.entry(cols.clone()).or_default();
-            }
-            for row in 0..batch.num_rows {
-                let subject = match materialize_subject_from_batch(&tm.subject_map, batch, row)? {
-                    Some(s) => s,
-                    None => continue,
-                };
-                for cols in &col_sets {
-                    if let Some(key) = get_join_key_from_batch(cols, batch, row) {
-                        let map = entry
-                            .get_mut(cols.as_slice())
-                            .expect("col-set map pre-created above");
-                        // Pass the key by value (no per-row clone). On the RARE
-                        // distinct-subject collision, re-read it from the batch for
-                        // the ambiguity record — so the key Vec is only rebuilt on a
-                        // genuine duplicate, not on every row.
-                        if parent_key_insert_keep_min(map, key, subject.clone()) {
-                            if let Some(dup) = get_join_key_from_batch(cols, batch, row) {
-                                ambiguous_this_batch.push(dup);
-                            }
-                        }
-                    }
+                if let Some(key) = get_join_key_from_batch(cols, batch, row) {
+                    let map = entry
+                        .get_mut(cols.as_slice())
+                        .expect("col-set map pre-created above");
+                    parent_key_insert(map, key, subject.clone());
                 }
             }
-        }
-        if !ambiguous_this_batch.is_empty() {
-            let set = self.ambiguous_keys.entry(tm.iri.clone()).or_default();
-            set.extend(ambiguous_this_batch);
         }
         Ok(())
     }
 
-    /// Look up a parent subject term by parent IRI, canonical parent columns,
-    /// and the child's join-key values.
-    fn lookup(&self, parent_iri: &str, cols: &[String], key: &[String]) -> Option<&RdfTerm> {
+    /// The parent subjects of the child's join-key values, by parent IRI and
+    /// canonical parent columns.
+    fn lookup(&self, parent_iri: &str, cols: &[String], key: &[String]) -> Option<&ParentSubjects> {
         self.index.get(parent_iri)?.get(cols)?.get(key)
     }
 
@@ -609,15 +692,20 @@ pub fn emit_row_terms(
                     Some(k) => k,
                     None => continue, // null FK → no triple
                 };
+                // One edge per distinct parent subject the key matches.
                 match parents.lookup(&rom.parent_triples_map, parent_cols, &child_key) {
-                    Some(parent_subject) => {
-                        observer.observe(subject, &predicate, parent_subject)?;
-                        stats.ref_triples += 1;
+                    Some(parent_subjects) => {
+                        let parent_subjects = parent_subjects.as_slice();
+                        for parent_subject in parent_subjects {
+                            observer.observe(subject, &predicate, parent_subject)?;
+                        }
+                        let edges = parent_subjects.len() as u64;
+                        stats.ref_triples += edges;
                         *stats
                             .ref_edges
                             .entry((tm.iri.clone(), predicate.to_string()))
-                            .or_default() += 1;
-                        tm_triples += 1;
+                            .or_default() += edges;
+                        tm_triples += edges;
                     }
                     None => stats.ref_dangling += 1, // dangling/absent parent → no triple
                 }
@@ -959,33 +1047,76 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn parent_key_keep_min_is_order_independent() {
-        // The SAME colliding key fed in BOTH orders must pick the SAME winner (the
-        // lexicographically smaller subject IRI) and flag the collision — this is what
-        // makes the baked twin reproducible regardless of scan / IO-completion order.
+    fn a_parent_key_holds_its_distinct_subjects_in_order_whatever_the_row_order() {
+        // Every order the rows of one key can arrive in gives the same sorted,
+        // distinct subjects; the result names a key's first, a repeated, and a
+        // further subject.
         let key = vec!["k1".to_string()];
-        let a = RdfTerm::iri("http://ex/parent/A");
-        let b = RdfTerm::iri("http://ex/parent/B");
-
-        let mut m1: HashMap<Vec<String>, RdfTerm> = HashMap::new();
-        assert!(!parent_key_insert_keep_min(&mut m1, key.clone(), a.clone()));
-        assert!(parent_key_insert_keep_min(&mut m1, key.clone(), b.clone()));
-        assert_eq!(m1.get(&key), Some(&a), "A < B, so A wins");
-
-        let mut m2: HashMap<Vec<String>, RdfTerm> = HashMap::new();
-        assert!(!parent_key_insert_keep_min(&mut m2, key.clone(), b.clone()));
-        assert!(parent_key_insert_keep_min(&mut m2, key.clone(), a.clone()));
+        let terms = [
+            RdfTerm::iri("http://ex/parent/B"),
+            RdfTerm::iri("http://ex/parent/A"),
+            RdfTerm::iri("http://ex/parent/C"),
+            RdfTerm::iri("http://ex/parent/A"),
+        ];
+        let want: Vec<RdfTerm> = ["A", "B", "C"]
+            .iter()
+            .map(|s| RdfTerm::iri(format!("http://ex/parent/{s}")))
+            .collect();
+        let orders: [[usize; 4]; 4] = [[0, 1, 2, 3], [3, 2, 1, 0], [1, 3, 0, 2], [2, 0, 3, 1]];
+        for order in orders {
+            let mut m: HashMap<Vec<String>, ParentSubjects> = HashMap::new();
+            let mut seen: Vec<&RdfTerm> = Vec::new();
+            for i in order {
+                let got = parent_key_insert(&mut m, key.clone(), terms[i].clone());
+                let expected = if seen.is_empty() {
+                    ParentKeyInsert::NewKey
+                } else if seen.contains(&&terms[i]) {
+                    ParentKeyInsert::SameSubject
+                } else {
+                    ParentKeyInsert::AnotherSubject
+                };
+                assert_eq!(got, expected, "order {order:?}, row {i}");
+                seen.push(&terms[i]);
+            }
+            assert_eq!(m[&key].as_slice(), want.as_slice(), "order {order:?}");
+        }
+        // One subject stays inline: a unique key costs what one term does.
         assert_eq!(
-            m2.get(&key),
-            Some(&a),
-            "reversed feed order must pick the same winner"
+            std::mem::size_of::<ParentSubjects>(),
+            std::mem::size_of::<RdfTerm>()
         );
+    }
 
-        // An exact-duplicate row (same key, same subject) is not a collision.
-        let mut m3: HashMap<Vec<String>, RdfTerm> = HashMap::new();
-        assert!(!parent_key_insert_keep_min(&mut m3, key.clone(), a.clone()));
-        assert!(!parent_key_insert_keep_min(&mut m3, key.clone(), a.clone()));
-        assert_eq!(m3.get(&key), Some(&a));
+    #[test]
+    fn a_blank_node_and_an_iri_with_one_label_are_two_subjects() {
+        let mut subjects = ParentSubjects::new(RdfTerm::iri("x"));
+        assert!(subjects.insert(RdfTerm::blank_node("x")));
+        assert!(!subjects.insert(RdfTerm::iri("x")));
+        assert_eq!(subjects.len(), 2);
+    }
+
+    #[test]
+    fn a_spilled_subject_list_counts_its_capacity_until_shrunk() {
+        let slot = std::mem::size_of::<RdfTerm>();
+        let mut subjects = ParentSubjects::new(RdfTerm::iri("s0"));
+        assert_eq!(subjects.heap_bytes(), 2, "one inline term: its text only");
+        for i in 1..9 {
+            subjects.insert(RdfTerm::iri(format!("s{i}")));
+        }
+        for i in 9..14 {
+            subjects.insert(RdfTerm::iri(format!("s{i}")));
+        }
+        let text = 14 * 3 - 10;
+        // Grown one insert at a time, the list holds more slots than
+        // subjects, and the heap estimate counts every slot.
+        assert!(
+            subjects.heap_bytes() > text + 14 * slot,
+            "{}",
+            subjects.heap_bytes()
+        );
+        subjects.shrink_to_fit();
+        assert_eq!(subjects.heap_bytes(), text + 14 * slot);
+        assert_eq!(subjects.len(), 14);
     }
 
     fn field(name: &str, ty: FieldType, nullable: bool, id: i32) -> FieldInfo {
@@ -1225,6 +1356,113 @@ mod tests {
                 .is_none(),
             "an unindexed key must not resolve"
         );
+    }
+
+    /// `dw.stores` (store_id, region) under `store/{store_id}`, and an order whose
+    /// `region` references it: region EU is on stores 2 (twice, one subject) and 1,
+    /// one batch each, US on store 3; the order's region is EU.
+    fn fan_out_mapping_and_batches() -> (CompiledR2rmlMapping, HashMap<String, Vec<ColumnBatch>>) {
+        let mut store = TriplesMap::new("<#Store>", "dw.stores");
+        store.subject_map = SubjectMap::template("http://ex.org/store/{store_id}");
+        let mut order = TriplesMap::new("<#Order>", "dw.orders");
+        order.subject_map = SubjectMap::template("http://ex.org/order/{o_key}");
+        order.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/servedBy"),
+            object_map: ObjectMap::RefObjectMap(RefObjectMap::new("<#Store>", "region", "region")),
+        }];
+        let stores = |rows: &[(i64, &str)]| {
+            let schema = Arc::new(BatchSchema::new(vec![
+                field("store_id", FieldType::Int64, false, 1),
+                field("region", FieldType::String, true, 2),
+            ]));
+            ColumnBatch::new(
+                schema,
+                vec![
+                    Column::Int64(rows.iter().map(|r| Some(r.0)).collect()),
+                    Column::String(rows.iter().map(|r| s(r.1)).collect()),
+                ],
+            )
+            .unwrap()
+        };
+        let order_schema = Arc::new(BatchSchema::new(vec![
+            field("o_key", FieldType::Int64, false, 1),
+            field("region", FieldType::String, true, 2),
+        ]));
+        let orders = ColumnBatch::new(
+            order_schema,
+            vec![Column::Int64(vec![Some(7)]), Column::String(vec![s("EU")])],
+        )
+        .unwrap();
+        let mut batches = HashMap::new();
+        // Batches are keyed by TriplesMap IRI.
+        batches.insert(
+            "<#Store>".to_string(),
+            vec![
+                stores(&[(2, "EU"), (3, "US"), (2, "EU")]),
+                stores(&[(1, "EU")]),
+            ],
+        );
+        batches.insert("<#Order>".to_string(), vec![orders]);
+        (CompiledR2rmlMapping::new(vec![store, order]), batches)
+    }
+
+    #[test]
+    fn a_key_matching_several_parent_subjects_emits_an_edge_to_each() {
+        let (mapping, batches) = fan_out_mapping_and_batches();
+        let want = vec![
+            "<http://ex.org/order/7> <http://ex.org/servedBy> <http://ex.org/store/1> ."
+                .to_string(),
+            "<http://ex.org/order/7> <http://ex.org/servedBy> <http://ex.org/store/2> ."
+                .to_string(),
+        ];
+        for waves in [false, true] {
+            let mut obs = NTriplesCollector::default();
+            let stats = if waves {
+                enumerate_by_waves(&mapping, &batches, &mut obs).unwrap()
+            } else {
+                enumerate_from_batches(&mapping, &batches, &mut obs).unwrap()
+            };
+            let mut lines = obs.lines.clone();
+            lines.sort();
+            assert_eq!(lines, want, "one edge per distinct store (waves: {waves})");
+            assert_eq!(stats.ref_triples, 2);
+            assert_eq!(
+                stats.ref_edges[&("<#Order>".to_string(), "http://ex.org/servedBy".to_string())],
+                2
+            );
+        }
+
+        // Indexed in two partials (one batch each, each holding one EU store) and
+        // merged, region EU holds both stores, as indexed whole.
+        let base = ParentIndexSet::new(&mapping).unwrap();
+        let store = &mapping.triples_maps["<#Store>"];
+        let mut whole = base.split_empty();
+        let mut merged = base.split_empty();
+        for batch in &batches["<#Store>"] {
+            whole.index_batch(store, batch).unwrap();
+            let mut part = base.split_empty();
+            part.index_batch(store, batch).unwrap();
+            merged.merge_from(part);
+        }
+        let cols = vec!["region".to_string()];
+        let eu = vec!["EU".to_string()];
+        let stores: Vec<RdfTerm> = [1, 2]
+            .iter()
+            .map(|id| RdfTerm::iri(format!("http://ex.org/store/{id}")))
+            .collect();
+        for (label, index) in [("whole", &whole), ("merged", &merged)] {
+            assert_eq!(
+                index
+                    .lookup("<#Store>", &cols, &eu)
+                    .map(ParentSubjects::as_slice),
+                Some(stores.as_slice()),
+                "{label}"
+            );
+            assert_eq!(
+                index.dup_parent_keys(),
+                HashMap::from([("<#Store>".to_string(), 1)])
+            );
+        }
     }
 
     #[test]

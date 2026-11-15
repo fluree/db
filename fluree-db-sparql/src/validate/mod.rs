@@ -36,8 +36,7 @@ use crate::ast::pattern::{GraphPattern, TriplePattern};
 use crate::ast::query::{
     AskQuery, ConstructQuery, DescribeQuery, QueryBody, SelectQuery, SparqlAst,
 };
-use crate::ast::term::BlankNodeValue;
-use crate::ast::term::{PredicateTerm, SubjectTerm, Term};
+use crate::ast::term::{BlankNode, PredicateTerm, SubjectTerm, Term};
 use crate::ast::update::{
     DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
     UpdateOperation,
@@ -434,45 +433,38 @@ impl<'a> Validator<'a> {
     /// constants addressing the existing stored node.
     fn validate_no_blank_nodes_in_delete_triple(&mut self, triple: &TriplePattern, context: &str) {
         if let SubjectTerm::BlankNode(bn) = &triple.subject {
-            self.reject_blank_node_in_delete(&bn.value, bn.span, context);
+            self.reject_blank_node_in_delete(bn, context);
         }
         if let Term::BlankNode(bn) = &triple.object {
-            self.reject_blank_node_in_delete(&bn.value, bn.span, context);
+            self.reject_blank_node_in_delete(bn, context);
         }
     }
 
-    fn reject_blank_node_in_delete(
-        &mut self,
-        value: &BlankNodeValue,
-        span: SourceSpan,
-        context: &str,
-    ) {
-        let label = match value {
-            BlankNodeValue::Labeled(l) => {
-                if l.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
-                    // Fluree stable id: denotes the stored node, not a fresh one.
-                    return;
-                }
-                format!("_:{l}")
-            }
-            BlankNodeValue::Anon => "[]".to_string(),
+    fn reject_blank_node_in_delete(&mut self, bn: &BlankNode, context: &str) {
+        let span = bn.span;
+        if bn.label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+            // Fluree stable id: denotes the stored node, not a fresh one.
+            return;
+        }
+        // A label the parser reserved (`[]`, `[ … ]`, `( … )`) is not one the
+        // user wrote, so the message names only the span.
+        let message = if bn.label.starts_with('-') {
+            format!("Blank node is not allowed in {context}")
+        } else {
+            format!("Blank node _:{} is not allowed in {context}", bn.label)
         };
         self.diagnostics.push(
-            Diagnostic::error(
-                DiagCode::BlankNodeInDelete,
-                format!("Blank node {label} is not allowed in {context}"),
-                span,
-            )
-            .with_label(Label::new(span, "blank node not allowed here"))
-            .with_help(
-                "SPARQL 1.1 Update forbids blank nodes in DELETE operations: a blank node \
+            Diagnostic::error(DiagCode::BlankNodeInDelete, message, span)
+                .with_label(Label::new(span, "blank node not allowed here"))
+                .with_help(
+                    "SPARQL 1.1 Update forbids blank nodes in DELETE operations: a blank node \
                  denotes a fresh node and can never match existing data. Use a variable \
                  bound by a WHERE clause, or a concrete IRI.",
-            )
-            .with_note(
-                "Fluree stable blank-node ids (_:fdb-...) are allowed here: they address \
+                )
+                .with_note(
+                    "Fluree stable blank-node ids (_:fdb-...) are allowed here: they address \
                  the existing stored node.",
-            ),
+                ),
         );
     }
 
