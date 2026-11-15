@@ -506,6 +506,13 @@ fn parse_value_object(
             _ => None,
         }),
     };
+    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref()) {
+        return Err(JsonLdError::InvalidKeywordValue {
+            keyword: "@value",
+            reason: "a value object whose @value is an array or a map needs \"@type\": \
+                     \"@json\" (or \"@vector\" for an array)",
+        });
+    }
     let lang = match type_iri {
         Some(_) => None,
         None => explicit_language
@@ -536,6 +543,17 @@ fn parse_value_object(
     }
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// Whether a value object typed `type_iri` may hold an array or a map: a JSON
+/// literal, or a vector (an array only, which the vector parser checks).
+fn holds_structured_value(type_iri: Option<&str>) -> bool {
+    matches!(
+        type_iri,
+        Some(
+            "@json" | "@vector" | fluree_vocab::rdf::JSON | fluree_vocab::fluree::EMBEDDING_VECTOR
+        )
+    )
 }
 
 /// Parse @type values and return expanded types with potentially updated context
@@ -1944,5 +1962,45 @@ mod tests {
                 json!([{"@value": document, "@type": "@json"}])
             );
         }
+    }
+
+    /// An array or map `@value` needs a `@json` or `@vector` type, its own or
+    /// its term's: without one it has no literal to stand for.
+    #[test]
+    fn structured_value_object_needs_a_json_or_vector_type() {
+        let p = EX.to_owned() + "p";
+        for (term, value) in [
+            (json!(p), json!({"@value": [0.5]})),
+            (json!(p), json!({"@value": {"a": 1}})),
+            (json!(p), json!({"@value": [0.5], "@type": XSD_INTEGER})),
+            (
+                json!({"@id": p, "@type": XSD_INTEGER}),
+                json!({"@value": [0.5]}),
+            ),
+        ] {
+            let ctx = json!({"p": term});
+            let err = crate::expand(&json!({"@context": ctx, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs \"@type\""), "{ctx} {value}: {err}");
+        }
+
+        let ctx = json!({"f": "https://ns.flur.ee/db#", "p": p});
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": ctx, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
+
+        let vector = json!({"p": {"@id": p, "@type": "@vector"}});
+        assert_eq!(
+            values_of_p(json!({"@context": vector, "p": {"@value": [0.5]}}))[0]["@value"],
+            json!([0.5])
+        );
     }
 }

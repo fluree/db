@@ -466,6 +466,10 @@ No stored format changes. These kinds of earlier data behave differently after t
 
 `@annotation` on a value of a reverse property (inside `@reverse`, or under a reverse-defined term) now annotates the edge in the direction it is stored.
 
+#### A JSON-LD array or map `@value` needs a `@json` or `@vector` type
+
+A value object whose `@value` is an array or a map is refused unless it, or the term it sits under, types it `@json` or `@vector`: `{"@value": [0.5, 0.25]}` under an untyped term has no literal to stand for. A transaction refused it already, with a message that named no fix, and a bulk import and inline shapes dropped the value without an error. Each now refuses it with a message that names the `@type` to add.
+
 #### Graph-source requests are checked strictly (breaking)
 
 Every Iceberg route, `sql/map` and every Delta route now reads its connection, auth and storage identity through one codec, and refuses with `400` (`err:api/InvalidGraphSourceConfig`, the message naming the field, never its value) requests an earlier release accepted:
