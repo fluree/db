@@ -580,6 +580,11 @@ impl Lowering {
         self.where_patterns
     }
 
+    /// The `where` patterns written so far.
+    pub(crate) fn where_patterns(&self) -> &[Value] {
+        &self.where_patterns
+    }
+
     fn mint_blank(&mut self) -> String {
         let id = format!("{ANN_BLANK_PREFIX}{}", self.next_blank);
         self.next_blank += 1;

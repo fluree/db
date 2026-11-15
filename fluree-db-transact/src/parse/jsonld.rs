@@ -36,7 +36,7 @@ use fluree_vocab::{
 };
 use serde_json::Value;
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Parse a JSON-LD transaction into the Transaction IR
@@ -535,10 +535,13 @@ fn parse_update(
         })
         .unwrap_or_default();
 
-    let has_where = obj.get("where").is_some();
-    let has_values = obj.get("values").is_some();
-    let reads_object_vars = opts.object_var_parsing.unwrap_or(true);
-    let mut object_var_parsing = (has_where || has_values) && reads_object_vars;
+    // A `?` string in a template's value position is a variable when the
+    // `where` or `values` mentions its name, and otherwise the string itself.
+    let object_var_parsing = opts.object_var_parsing.unwrap_or(true);
+    let mut mentioned = HashSet::new();
+    for binder in [obj.get("where"), obj.get("values")].into_iter().flatten() {
+        collect_var_mentions(binder, &mut mentioned);
+    }
 
     // The template clauses and VALUES share one blank-node issuer; they are
     // parsed a second time only when a user `_:bN` label collided with an
@@ -550,19 +553,15 @@ fn parse_update(
             context,
             strict,
             pass,
-            object_var_parsing,
+            ValueVars {
+                enabled: object_var_parsing,
+                mentioned: Some(&mentioned),
+            },
             &from_named_aliases,
             ns_registry,
             ledger_id,
             &mut blanks,
         )?;
-        // A retraction by selector binds its annotations in a `where`: the
-        // update is one with a `where`, and reads its object variables so.
-        if !object_var_parsing && reads_object_vars && !clauses.where_patterns.is_empty() {
-            object_var_parsing = true;
-            blanks = BlankIssuer::default();
-            continue;
-        }
         if !blanks.needs_reparse()? {
             break clauses;
         }
@@ -618,6 +617,7 @@ fn parse_update(
         } else {
             (Vec::new(), false)
         };
+    refuse_unbound_template_vars(&clauses, [where_val.as_deref(), obj.get("values")])?;
 
     let mut txn = Txn::update()
         .with_wheres(where_patterns)
@@ -634,6 +634,81 @@ fn parse_update(
         txn = txn.with_values(values);
     }
     Ok(txn)
+}
+
+/// Refuse a variable in an update's templates that its `where` and `values`
+/// (`binders`) never mention. A value is such a variable only when they
+/// mention it ([`ValueVars`]), so what is left is a node, a property, a type
+/// or a graph: an IRI, which cannot start with `?`, that nothing can bind,
+/// whose statements would silently never be written. A mention anywhere
+/// counts, a filter or bind expression's included, so a variable the `where`
+/// may bind is never refused; one it leaves unbound in a solution drops its
+/// statements there, as in SPARQL.
+fn refuse_unbound_template_vars(
+    clauses: &UpdateClauses,
+    binders: [Option<&Value>; 2],
+) -> Result<()> {
+    let mut mentioned = HashSet::new();
+    for value in binders.into_iter().flatten() {
+        collect_var_mentions(value, &mut mentioned);
+    }
+    for (clause, templates) in [("delete", &clauses.delete), ("insert", &clauses.insert)] {
+        for template in templates {
+            let mut unbound: Option<&str> = None;
+            let mut check = |v: fluree_db_query::VarId| {
+                let name = clauses.vars.name(v);
+                if unbound.is_none() && !mentioned.contains(name) {
+                    unbound = Some(name);
+                }
+            };
+            for term in [&template.subject, &template.predicate, &template.object] {
+                term.for_each_leaf(&mut |leaf| {
+                    if let TemplateTerm::Var(v) = leaf {
+                        check(*v);
+                    }
+                });
+            }
+            if let TemplateGraph::Var(v) = &template.graph {
+                check(*v);
+            }
+            if let Some(name) = unbound {
+                return Err(TransactError::Parse(format!(
+                    "{name} in the update's {clause} is not in its where or values, so nothing \
+                     binds it; an IRI cannot start with \"?\""
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every `?name` token in `value`'s strings and keys, and each whole string
+/// that starts with `?`.
+fn collect_var_mentions(value: &Value, out: &mut std::collections::HashSet<String>) {
+    fn mentions(text: &str, out: &mut std::collections::HashSet<String>) {
+        if text.starts_with('?') {
+            out.insert(text.to_string());
+        }
+        let delimiter = |c: char| c.is_whitespace() || "()[]{},;\"'".contains(c);
+        for token in text.split(delimiter).filter(|t| t.starts_with('?')) {
+            out.insert(token.to_string());
+        }
+    }
+    match value {
+        Value::String(text) => mentions(text, out),
+        Value::Array(items) => {
+            for item in items {
+                collect_var_mentions(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                mentions(key, out);
+                collect_var_mentions(item, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// An update's `where` with `patterns` (a retraction's, by selector) after
@@ -689,7 +764,7 @@ fn parse_update_clauses(
     context: &ParsedContext,
     strict: bool,
     pass: ExpandedPass,
-    object_var_parsing: bool,
+    value_vars: ValueVars<'_>,
     from_named_aliases: &HashMap<String, String>,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
@@ -747,7 +822,7 @@ fn parse_update_clauses(
             context,
             &mut vars,
             ns_registry,
-            object_var_parsing,
+            value_vars.enabled,
             strict,
             &mut write_graphs,
             from_named_aliases,
@@ -755,6 +830,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
+        ctx.value_vars = value_vars;
         ctx.lowering = lowering.as_mut().map(|l| (Clause::Retract, l));
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
@@ -787,6 +863,26 @@ fn parse_update_clauses(
         Vec::new()
     };
 
+    // The delete's retractions by selector bind in `where` patterns of their
+    // own, which the insert may read too.
+    let with_retractions = lowering
+        .as_ref()
+        .filter(|l| !l.where_patterns().is_empty())
+        .map(|l| {
+            let mut mentioned = value_vars.mentioned.cloned().unwrap_or_default();
+            for pattern in l.where_patterns() {
+                collect_var_mentions(pattern, &mut mentioned);
+            }
+            mentioned
+        });
+    let insert_vars = match &with_retractions {
+        Some(mentioned) => ValueVars {
+            mentioned: Some(mentioned),
+            ..value_vars
+        },
+        None => value_vars,
+    };
+
     // Parse INSERT clause
     let insert = if let Some(insert_val) = obj.get("insert") {
         validate_type_fields(insert_val)?;
@@ -794,7 +890,7 @@ fn parse_update_clauses(
             context,
             &mut vars,
             ns_registry,
-            object_var_parsing,
+            insert_vars.enabled,
             strict,
             &mut write_graphs,
             from_named_aliases,
@@ -802,6 +898,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
+        ctx.value_vars = insert_vars;
         ctx.lowering = lowering.as_mut().map(|l| (Clause::Assert, l));
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
@@ -1201,11 +1298,32 @@ fn check_and_lower(
     }
 }
 
+/// Which `?` strings in a template's value positions are variables.
+#[derive(Clone, Copy, Debug)]
+struct ValueVars<'a> {
+    /// Off for data (an insert, an upsert) and under
+    /// `opts.objectVarParsing: false`: every value is the string written.
+    enabled: bool,
+    /// In an update, the names its `where` and `values` mention
+    /// ([`collect_var_mentions`]): only one of them is a variable, so a value
+    /// that merely starts with `?` is the string. `None` reads every `?`
+    /// name as a variable.
+    mentioned: Option<&'a HashSet<String>>,
+}
+
+impl ValueVars<'_> {
+    fn is_var(self, value: &str) -> bool {
+        self.enabled
+            && value.starts_with('?')
+            && self.mentioned.is_none_or(|names| names.contains(value))
+    }
+}
+
 struct TemplateParseCtx<'a> {
     context: &'a ParsedContext,
     vars: &'a mut VarRegistry,
     ns_registry: &'a mut NamespaceRegistry,
-    object_var_parsing: bool,
+    value_vars: ValueVars<'a>,
     strict_compact_iri: bool,
     write_graphs: &'a mut WriteGraphs,
     from_named_aliases: &'a HashMap<String, String>,
@@ -1241,7 +1359,10 @@ impl<'a> TemplateParseCtx<'a> {
             context,
             vars,
             ns_registry,
-            object_var_parsing,
+            value_vars: ValueVars {
+                enabled: object_var_parsing,
+                mentioned: None,
+            },
             strict_compact_iri,
             write_graphs,
             from_named_aliases,
@@ -2238,7 +2359,7 @@ fn parse_expanded_value_with_ctx(
                     ctx.context,
                     ctx.vars,
                     ctx.ns_registry,
-                    ctx.object_var_parsing,
+                    ctx.value_vars,
                     ctx.strict_compact_iri,
                 );
             }
@@ -2293,7 +2414,7 @@ fn parse_expanded_value_with_ctx(
         // String values are literals — only `{"@id": "..."}` or a context-declared
         // `@type: "@id"` (which expansion rewrites to `{"@id": ...}`) produces an IRI reference.
         Value::String(s) => {
-            if s.starts_with('?') && ctx.object_var_parsing {
+            if ctx.value_vars.is_var(s) {
                 let var_id = ctx.vars.get_or_insert(s);
                 Ok(ParsedValue::new(TemplateTerm::Var(var_id)))
             } else {
@@ -2405,7 +2526,7 @@ fn parse_literal_value_with_meta(
     context: &ParsedContext,
     vars: &mut VarRegistry,
     ns_registry: &mut NamespaceRegistry,
-    object_var_parsing: bool,
+    value_vars: ValueVars<'_>,
     strict: bool,
 ) -> Result<ParsedValue> {
     // Check for @type first - always route through typed coercion when present
@@ -2417,12 +2538,12 @@ fn parse_literal_value_with_meta(
             if type_iri == "@json" || expanded_type == rdf::JSON {
                 // A template variable, written bare or as the JSON string a
                 // `@json`-typed term serializes it to.
-                if let (true, Value::String(s)) = (object_var_parsing, val) {
+                if let Value::String(s) = val {
                     let name = s
                         .strip_prefix('"')
                         .and_then(|rest| rest.strip_suffix('"'))
                         .unwrap_or(s);
-                    if name.starts_with('?') && !name.contains(['"', '\\']) {
+                    if value_vars.is_var(name) && !name.contains(['"', '\\']) {
                         let var_id = vars.get_or_insert(name);
                         return Ok(ParsedValue::new(TemplateTerm::Var(var_id)));
                     }
@@ -2464,7 +2585,7 @@ fn parse_literal_value_with_meta(
     match val {
         Value::String(s) => {
             // Check if it's a variable - allow in @value for transaction WHERE patterns
-            if s.starts_with('?') && object_var_parsing {
+            if value_vars.is_var(s) {
                 let var_id = vars.get_or_insert(s);
                 return Ok(ParsedValue::new(TemplateTerm::Var(var_id)));
             }
@@ -5438,6 +5559,85 @@ mod tests {
                     "{doc}"
                 );
             }
+        }
+    }
+    /// In an update's templates a value that starts with `?` is a variable
+    /// only when the `where` or `values` mentions it, in any form (a bind
+    /// expression, the `where` a retraction by selector adds); otherwise it
+    /// is the string. A node, property, type or graph is an IRI, which cannot
+    /// start with `?`, so one nothing mentions is refused.
+    #[test]
+    fn an_update_reads_a_value_as_a_variable_only_where_something_binds_it() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let where_ = json!({"@id": "?s", "ex:p": "?o"});
+        let parse = |doc: &Value| {
+            let mut ns = test_registry();
+            parse_transaction(
+                doc,
+                TxnType::Update,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .map(|txn| (txn, ns))
+            .map_err(|e| e.to_string())
+        };
+        // The object the insert writes under `ex:q`.
+        let written = |doc: Value| {
+            let (txn, mut ns) = parse(&doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let q = ns.sid_for_iri("http://example.org/q");
+            let object = txn
+                .insert_templates
+                .iter()
+                .find(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == q))
+                .map(|t| t.object.clone())
+                .unwrap_or_else(|| panic!("ex:q in {doc}"));
+            (doc, object)
+        };
+        for doc in [
+            json!({"@context": ctx, "where": where_, "insert": {"@id": "ex:c", "ex:q": "?hello"}}),
+            json!({"@context": ctx, "where": where_, "insert": {"@id": "ex:c", "ex:q": {"@value": "?hello"}}}),
+            json!({"@context": ctx, "insert": {"@id": "ex:c", "ex:q": "?hello"}}),
+        ] {
+            let (doc, object) = written(doc);
+            assert!(
+                matches!(&object, TemplateTerm::Value(FlakeValue::String(v)) if v == "?hello"),
+                "{doc}: {object:?}"
+            );
+        }
+        for doc in [
+            json!({"@context": ctx, "where": where_, "insert": {"@id": "?s", "ex:q": "?o"}}),
+            json!({"@context": ctx, "where": [where_, ["bind", "?label", "(str ?o)"]],
+                   "insert": {"@id": "?s", "ex:q": "?label"}}),
+            json!({"@context": ctx, "values": ["?v", ["a", "b"]],
+                   "insert": {"@id": "ex:c", "ex:q": "?v"}}),
+            json!({"@context": ctx,
+                   "delete": {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:role": "?r"}}},
+                   "insert": {"@id": "ex:alice", "ex:q": "?r"}}),
+        ] {
+            let (doc, object) = written(doc);
+            assert!(matches!(object, TemplateTerm::Var(_)), "{doc}: {object:?}");
+        }
+        parse(&json!({"@context": ctx, "where": [["graph", "?g", where_]],
+                      "insert": [["graph", "?g", {"@id": "?s", "ex:q": "?o"}]]}))
+        .unwrap();
+
+        for (doc, refusal) in [
+            (
+                json!({"@context": ctx, "where": where_, "delete": {"@id": "?x", "ex:p": "v"}}),
+                "?x in the update's delete",
+            ),
+            (
+                json!({"@context": ctx, "insert": {"@id": "?s", "ex:p": "v"}}),
+                "?s in the update's insert",
+            ),
+            (
+                json!({"@context": ctx, "where": where_, "insert": {"@id": "ex:c", "ex:r": {"@id": "?other"}}}),
+                "?other in the update's insert",
+            ),
+        ] {
+            let err = parse(&doc).map(|_| ()).expect_err(&doc.to_string());
+            assert!(err.contains(refusal), "{doc}: {err}");
         }
     }
 }

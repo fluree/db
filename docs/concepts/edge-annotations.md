@@ -363,7 +363,7 @@ Updating metadata is normal RDF update against the annotation subject. Once you'
     "@id": "ex:alice",
     "ex:worksFor": {
       "@id": "ex:acme",
-      "@annotation": { "@id": "?edge", "ex:role": "Engineer" }
+      "@annotation": { "@id": "?edge", "ex:role": "Engineer", "ex:confidence": "?old" }
     }
   },
   "delete": { "@id": "?edge", "ex:confidence": "?old" },
