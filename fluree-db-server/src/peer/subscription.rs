@@ -1,9 +1,11 @@
-//! SSE subscription task for peer mode
+//! SSE subscription task for peer mode, in either storage access mode
 //!
 //! Drives the shared head-stream pump
 //! ([`fluree_db_nameservice_sync::run_head_stream`]) over the transaction
 //! server's `/fluree/events` endpoint and applies its events to the peer
-//! state and the library-level ledger cache. The pump owns the loop shape
+//! state and the library-level ledger cache. A peer writes nothing: on
+//! shared storage the nameservice is the transaction server's own, and the
+//! peer only reads it. The pump owns the loop shape
 //! (connect, parse, dispatch, reconnect with the configured backoff,
 //! 401/403 fatal); this module owns what the events *mean* for a peer.
 
@@ -14,7 +16,7 @@ use crate::config::ServerConfig;
 use crate::peer::state::PeerState;
 
 use async_trait::async_trait;
-use fluree_db_api::{Fluree, LedgerManager, NotifyResult, NsNotify};
+use fluree_db_api::{Fluree, NotifyResult};
 use fluree_db_nameservice::NsRecord;
 use fluree_db_nameservice_sync::{
     run_head_stream, HeadSink, HeadStreamConfig, RemoteEvent, ReqwestSseSource, TokioSleeper,
@@ -128,24 +130,14 @@ impl PeerEventSink {
         }
     }
 
-    /// Keep hot: if this ledger is already cached locally, apply the
-    /// nameservice update to the library-level cache (reload if stale).
+    /// Bring a ledger this peer has cached up to the record, in place. A
+    /// ledger it has not cached is left to load on its first query.
     async fn refresh_cached_ledger(&self, record: &NsRecord) {
         let Some(mgr) = self.fluree.ledger_manager() else {
             return;
         };
-        self.notify_mgr(mgr, record.clone()).await;
-    }
-
-    async fn notify_mgr(&self, mgr: &Arc<LedgerManager>, ns_record: NsRecord) {
-        let ledger_id = ns_record.ledger_id.clone();
-        match mgr
-            .notify(NsNotify {
-                ledger_id: ledger_id.clone(),
-                record: Some(ns_record),
-            })
-            .await
-        {
+        let ledger_id = record.ledger_id.clone();
+        match mgr.follow(record.clone()).await {
             Ok(NotifyResult::NotLoaded) => {
                 // Not cached - do not cold-load on events (avoids subscribe-all stampede).
             }
@@ -191,6 +183,9 @@ impl HeadSink for PeerEventSink {
                 self.preload_configured_ledgers().await;
             }
             RemoteEvent::LedgerUpdated(record) => {
+                // The cached ledger first: a query that sees the new
+                // watermark over a cached ledger behind it reloads it whole.
+                self.refresh_cached_ledger(&record).await;
                 let changed = self
                     .peer_state
                     .update_ledger(
@@ -209,7 +204,6 @@ impl HeadSink for PeerEventSink {
                         "Remote ledger watermark updated"
                     );
                 }
-                self.refresh_cached_ledger(&record).await;
             }
             RemoteEvent::GraphSourceUpdated(record) => {
                 let changed = self
@@ -280,5 +274,132 @@ impl PeerSubscriptionError {
             PeerSubscriptionError::TokenLoad(_) => true,
             _ => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{FlureeBuilder, LedgerId};
+    use serde_json::json;
+
+    /// A transaction server's root and a shared-storage peer reading it.
+    struct SharedRoot {
+        _dir: tempfile::TempDir,
+        writer: Fluree,
+        peer: Arc<Fluree>,
+        sink: PeerEventSink,
+    }
+
+    impl SharedRoot {
+        async fn new() -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_string_lossy().to_string();
+            let writer = FlureeBuilder::file(path.clone())
+                .without_indexing()
+                .build()
+                .unwrap();
+            let peer = Arc::new(
+                FlureeBuilder::file(path)
+                    .read_only()
+                    .build_client()
+                    .await
+                    .unwrap(),
+            );
+            let sink = PeerEventSink {
+                config: ServerConfig::default(),
+                peer_state: Arc::new(PeerState::new()),
+                fluree: Arc::clone(&peer),
+            };
+            Self {
+                _dir: dir,
+                writer,
+                peer,
+                sink,
+            }
+        }
+
+        async fn commit(&self, n: usize) -> NsRecord {
+            let ledger = match self.writer.ledger("peer:main").await {
+                Ok(ledger) => ledger,
+                Err(_) => self.writer.create_ledger("peer:main").await.unwrap(),
+            };
+            self.writer
+                .insert(
+                    ledger,
+                    &json!({"@context": {"ex": "http://example.org/"},
+                            "@id": format!("ex:s{n}"), "ex:p": n}),
+                )
+                .await
+                .unwrap();
+            self.record().await
+        }
+
+        async fn record(&self) -> NsRecord {
+            self.writer
+                .nameservice()
+                .lookup("peer:main")
+                .await
+                .unwrap()
+                .unwrap()
+        }
+
+        async fn cached_t(&self) -> Option<i64> {
+            self.peer
+                .ledger_manager()
+                .unwrap()
+                .current_t(&LedgerId::parse("peer:main").unwrap())
+                .await
+        }
+    }
+
+    /// The peer has already read past the record: it keeps its cached
+    /// ledger, and the transaction server's record is not moved back.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_the_peer_has_passed_changes_nothing() {
+        let root = SharedRoot::new().await;
+        let behind = root.commit(1).await;
+        let head = root.commit(2).await;
+        root.peer.ledger_cached("peer:main").await.unwrap();
+
+        root.sink.on_event(RemoteEvent::LedgerUpdated(behind)).await;
+
+        assert_eq!(root.cached_t().await, Some(head.commit_t), "still cached");
+        let after = root.record().await;
+        assert_eq!(
+            (after.commit_head_id, after.commit_t),
+            (head.commit_head_id, head.commit_t)
+        );
+    }
+
+    /// A new commit is applied to the cached ledger in place: it is not
+    /// evicted, so no query waits on a cold load.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_commit_is_applied_to_the_cached_ledger() {
+        let root = SharedRoot::new().await;
+        root.commit(1).await;
+        root.peer.ledger_cached("peer:main").await.unwrap();
+        let next = root.commit(2).await;
+
+        root.sink
+            .on_event(RemoteEvent::LedgerUpdated(next.clone()))
+            .await;
+
+        assert_eq!(root.cached_t().await, Some(next.commit_t));
+        let watermark = root
+            .sink
+            .peer_state
+            .get_remote_ledger(&next.ledger_id)
+            .await
+            .unwrap();
+        assert_eq!(watermark.commit_t, next.commit_t);
+    }
+
+    /// A shared-storage peer opens the root as a reader.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_peer_cannot_write_the_nameservice() {
+        let root = SharedRoot::new().await;
+        assert!(root.peer.nameservice_mode().is_read_only());
+        assert!(root.peer.nameservice_mode().publisher().is_none());
     }
 }

@@ -1608,6 +1608,9 @@ pub struct FlureeBuilder {
     /// [`with_indexing_thresholds`]: FlureeBuilder::with_indexing_thresholds
     /// [`with_indexer_config`]: FlureeBuilder::with_indexer_config
     indexer_config_user_set: bool,
+    /// Open the storage as a reader of a root another process writes.
+    /// See [`FlureeBuilder::read_only`].
+    read_only: bool,
     /// Remote Fluree connection registry for SERVICE federation.
     remote_connections: remote_service::RemoteConnectionRegistry,
     /// Externally-supplied event bus. When set, `Fluree` uses this
@@ -1871,6 +1874,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_lock: false,
             indexer_config_user_set: false,
+            read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -1896,6 +1900,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_lock: false,
             indexer_config_user_set: false,
+            read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -1977,6 +1982,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_lock: false,
             indexer_config_user_set: false,
+            read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -2210,6 +2216,7 @@ impl FlureeBuilder {
             #[cfg(feature = "native")]
             storage_lock: false,
             indexer_config_user_set: false,
+            read_only: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
@@ -2395,6 +2402,18 @@ impl FlureeBuilder {
             storage = storage.with_wal_owner(owner.clone());
         }
         storage
+    }
+
+    /// Open the storage as a reader of a root another process writes, as a
+    /// shared-storage query peer reads its transaction server's.
+    ///
+    /// [`build_client`](Self::build_client) then gives the backend's own
+    /// nameservice read-only and runs no background indexer. A file root is
+    /// opened without its WAL and without the startup sweep of staging
+    /// files: both belong to the writer.
+    pub fn read_only(mut self) -> Self {
+        self.read_only = true;
+        self
     }
 
     pub fn without_indexing(mut self) -> Self {
@@ -3576,17 +3595,20 @@ impl FlureeBuilder {
 
             let root_lock = self.lock_storage_root(path.as_ref())?;
             let mut file_storage = self.file_storage(path.as_ref());
+            let reader =
+                self.read_only || matches!(&nameservice, Some(NameServiceMode::ReadOnly(_)));
             // A query peer must recover the preceding writer's tail without
             // retaining its WAL lock. Any incidental storage writes remain
             // durable through per-write flushing and cannot reacquire the WAL.
-            if matches!(&nameservice, Some(NameServiceMode::ReadOnly(_)))
-                && file_storage.durability() == fluree_db_core::Durability::Wal
-            {
+            if reader && file_storage.durability() == fluree_db_core::Durability::Wal {
                 file_storage = file_storage.with_durability(fluree_db_core::Durability::Sync);
             }
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
-            file_storage.sweep_orphaned_staging();
+            // The staging files are the writer's to clean up.
+            if !self.read_only {
+                file_storage.sweep_orphaned_staging();
+            }
             let root_lock = Self::recover_holding(&file_storage, root_lock).await?;
             let ns_storage = file_storage.clone();
             let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
@@ -3602,6 +3624,10 @@ impl FlureeBuilder {
 
             let (ns_mode, indexing_mode) = match nameservice {
                 Some(ns) => (ns, tx::IndexingMode::Disabled),
+                None if self.read_only => (
+                    NameServiceMode::ReadOnly(Arc::new(FileNameService::with_storage(ns_storage))),
+                    tx::IndexingMode::Disabled,
+                ),
                 None => {
                     let ns = FileNameService::with_storage(ns_storage);
                     let notifying =
@@ -3676,6 +3702,10 @@ impl FlureeBuilder {
 
         let (ns_mode, indexing_mode) = match nameservice {
             Some(ns) => (ns, tx::IndexingMode::Disabled),
+            None if self.read_only => {
+                let ns: Arc<dyn NameServiceLookup> = aws_handle.nameservice_arc().clone();
+                (NameServiceMode::ReadOnly(ns), tx::IndexingMode::Disabled)
+            }
             None => {
                 let ns_arc: Arc<dyn NameServicePublisher> = aws_handle.nameservice_arc().clone();
                 let ns_rw: Arc<dyn fluree_db_nameservice::ReadWriteNameService> =
