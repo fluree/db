@@ -85,10 +85,6 @@ pub const EXPAND: &[&str] = &[
     // A key in keyword form that is no keyword (`"@ignoreMe"`) is kept on the node,
     // where the algorithm drops it, and a transaction refuses it. Documented:
     // compatibility.md (JSON-LD 1.1).
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0119", // Ignore some terms with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0120", // Ignore some values of @id with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0121", // Ignore some values of @reverse with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0122", // Ignore some IRIs when that start with @ when expanding.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr34", // Ignores a non-keyword term starting with '@'
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr35", // Ignores a non-keyword term starting with '@' (with @vocab)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr36", // Ignores a term mapping to a value in the form of a keyword.
@@ -216,8 +212,9 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr32", // Protected @type cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr42", // Fail if protected flag not retained during redefinition
     // IRI expansion: a relative `@type`, or a reference that is only a query, is not
-    // resolved against the base; a relative, compact or term `@vocab`; terms that
-    // begin with `@` or `:`; some valid term definitions are refused. #2395
+    // resolved against the base; a relative, compact or term `@vocab`; terms and IRIs
+    // that begin with `:`, or with `@` but are not in keyword form (`@`, `@foo.bar`);
+    // some valid term definitions are refused. #2395
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0048", // Terms are ignored in @id
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0056", // Use terms with @type: @vocab but not with @type: @id
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0060", // Overwrite document base with @base and reset it again
@@ -230,6 +227,10 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0114", // Expansion allows multiple properties expanding to @type
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0117", // A term starting with a colon can expand to a different IRI
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0118", // Expanding a value staring with a colon does not treat that value as an IRI
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0119", // Ignore some terms with @, allow others. (also `@ignoreMe`, kept)
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0120", // Ignore some values of @id with @, allow others. (also `@ignoreMe`, kept)
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0121", // Ignore some values of @reverse with @, allow others.
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0124", // compact IRI as @vocab
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0125", // term as @vocab
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc021", // type-scoped value mix
@@ -363,10 +364,6 @@ pub const TO_RDF: &[&str] = &[
     // A key in keyword form that is no keyword (`"@ignoreMe"`) is kept on the node,
     // where the algorithm drops it, and a transaction refuses it. Documented:
     // compatibility.md (JSON-LD 1.1).
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te119", // Ignore some terms with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te120", // Ignore some values of @id with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te121", // Ignore some values of @reverse with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te122", // Ignore some IRIs when that start with @ when expanding.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr34", // Ignores a non-keyword term starting with '@'
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr35", // Ignores a non-keyword term starting with '@' (with @vocab)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr36", // Ignores a term mapping to a value in the form of a keyword.
@@ -487,8 +484,9 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr32", // Protected @type cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr42", // Fail if protected flag not retained during redefinition
     // IRI expansion: a relative `@type`, or a reference that is only a query, is not
-    // resolved against the base; a relative, compact or term `@vocab`; terms that
-    // begin with `@` or `:`; some valid term definitions are refused. #2395
+    // resolved against the base; a relative, compact or term `@vocab`; terms and IRIs
+    // that begin with `:`, or with `@` but are not in keyword form (`@`, `@foo.bar`);
+    // some valid term definitions are refused. #2395
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc021", // type-scoped value mix
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc022", // type-scoped property-scoped contexts including @type:@vocab
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc023", // composed type-scoped property-scoped contexts including @type:@vocab
@@ -505,6 +503,10 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te114", // Expansion allows multiple properties expanding to @type
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te117", // A term starting with a colon can expand to a different IRI
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te118", // Expanding a value staring with a colon does not treat that value as an IRI
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te119", // Ignore some terms with @, allow others. (also `@ignoreMe`, refused)
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te120", // Ignore some values of @id with @, allow others. (also `@ignoreMe`, refused)
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te121", // Ignore some values of @reverse with @, allow others.
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te124", // compact IRI as @vocab
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te125", // term as @vocab
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr29", // Does not expand a Compact IRI using a non-prefix term.
