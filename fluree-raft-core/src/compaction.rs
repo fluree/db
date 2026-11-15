@@ -10,7 +10,7 @@
 //! it is still on disk.
 
 use crate::node::{ClusterNode, NodeId};
-use crate::runtime::RaftGroup;
+use crate::runtime::{applied, RaftGroup};
 use crate::state_machine::AppStateMachine;
 use crate::storage::{RaftLogStore, RaftSnapshotStore, RaftStorage, StorageError};
 use async_trait::async_trait;
@@ -70,11 +70,13 @@ impl<A: AppStateMachine> RaftGroup<A> {
     /// those entries produced in a fresh snapshot. Returns the index
     /// compacted through; `None` when the log held no entries.
     ///
-    /// `covering` names the write whose effect has to leave the disk,
-    /// such as a delete's `client_write(..).log_id.index`. Compaction
-    /// waits until this node has applied it, so the index compacted
-    /// through is at or past it; without it, a node that has not yet
-    /// applied the delete compacts short of it and keeps the value.
+    /// `covering` names the write whose effect has to leave the disk:
+    /// the index of the delete's
+    /// [`Proposed::log_id`](crate::forward::Proposed::log_id), from
+    /// whichever node proposed it. Compaction waits until this node has
+    /// applied it, so the index compacted through is at or past it;
+    /// without it, a node that has not yet applied the delete compacts
+    /// short of it and keeps the value.
     ///
     /// Succeeds only once storage confirms no entry at or below the
     /// returned index remains. Entries appended meanwhile are kept. On
@@ -177,10 +179,6 @@ impl<A: AppStateMachine> RaftGroup<A> {
             .map(|_| ())
             .map_err(|e| wait_error(e, what))
     }
-}
-
-fn applied(index: u64) -> impl Fn(&RaftMetrics<NodeId, ClusterNode>) -> bool + Send {
-    move |m| m.last_applied.as_ref().is_some_and(|id| id.index >= index)
 }
 
 fn wait_error(e: WaitError, what: &'static str) -> CompactionError {

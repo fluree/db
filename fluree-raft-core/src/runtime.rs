@@ -13,12 +13,13 @@ use crate::config::FlureeRaftConfig;
 use crate::group::GroupId;
 use crate::log_adapter::LogAdapter;
 use crate::network::{self, HttpClientConfig, RaftHttpClient, RaftTransportConfig};
-use crate::node::NodeId;
+use crate::node::{ClusterNode, NodeId};
 use crate::state_machine::{
     AppStateMachine, ReadOnlyState, StateMachineAdapter, StateMachineObserver,
 };
 use crate::storage::RaftStorage;
-use openraft::{Config as RaftConfig, Raft};
+use openraft::metrics::WaitError;
+use openraft::{Config as RaftConfig, Raft, RaftMetrics};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -354,6 +355,22 @@ impl<A: AppStateMachine> RaftGroup<A> {
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().current_leader == Some(self.node_id)
     }
+
+    /// Wait until this node has applied the entry at `index`, so a read
+    /// of [`Self::state`] here sees that write. `index` comes from
+    /// [`Proposed::log_id`](crate::forward::Proposed::log_id), on any
+    /// node.
+    pub async fn wait_applied(&self, index: u64, timeout: Duration) -> Result<(), WaitError> {
+        self.raft
+            .wait(Some(timeout))
+            .metrics(applied(index), "the entry to apply")
+            .await
+            .map(|_| ())
+    }
+}
+
+pub(crate) fn applied(index: u64) -> impl Fn(&RaftMetrics<NodeId, ClusterNode>) -> bool + Send {
+    move |m| m.last_applied.as_ref().is_some_and(|id| id.index >= index)
 }
 
 // ============================================================================

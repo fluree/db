@@ -27,6 +27,7 @@ use async_trait::async_trait;
 use cluster::{eventually, form_cluster, leader, start_node, start_node_in, Node};
 use fluree_raft_core::admin::{AdminError, NodeAddrs};
 use fluree_raft_core::compaction::CompactionError;
+use fluree_raft_core::forward::propose_via_leader;
 use fluree_raft_core::group::GroupId;
 use fluree_raft_core::kv::sweep::{run_sweep, sweep_once, SweepConfig, SweepTarget};
 use fluree_raft_core::kv::{Expect, KvCommand, KvResponse};
@@ -828,8 +829,10 @@ async fn storage_on_the_defaults_refuses_before_any_step() {
 }
 
 /// Compaction is per node, and each node waits to apply the delete it
-/// is given. On the leader the purge waits out replication; afterwards
-/// no node's files hold the value and the group still replicates.
+/// is given. The delete goes through a follower, which gets the delete's
+/// index back from the relay and can wait to read its own delete. On the
+/// leader the purge waits out replication; afterwards no node's files
+/// hold the value and the group still replicates.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn every_node_compacts_and_the_group_keeps_replicating() {
     let group_id = GroupId::new("compaction").expect("valid group id");
@@ -846,7 +849,21 @@ async fn every_node_compacts_and_the_group_keeps_replicating() {
         fence(propose(leader, put_config(&format!("key-{i}"), &[i])).await);
     }
     fence(propose(leader, put_config("credential", SECRET)).await);
-    let deleted = delete(&leader.group, "credential").await;
+    let follower = nodes
+        .iter()
+        .find(|n| n.id != leader.id)
+        .expect("a follower");
+    let relayed = propose_via_leader(&follower.group.raft, delete_config("credential"))
+        .await
+        .expect("relayed delete");
+    assert_eq!(relayed.response.kv(), KvResponse::Deleted { removed: true });
+    let deleted = relayed.log_id.expect("the relay reports the log id").index;
+    follower
+        .group
+        .wait_applied(deleted, COMPACTION_TIMEOUT)
+        .await
+        .expect("the follower applies its delete");
+    assert_eq!(read_config(&follower.group, "credential").await, None);
 
     for node in &nodes {
         let through = node

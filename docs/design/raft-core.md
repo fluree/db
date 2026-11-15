@@ -117,7 +117,9 @@ can stay readable under `log/` for months.
 
 `RaftGroup::compact_log` is for an application that needs such a value gone, for
 example before the storage directory is copied. Given `covering`, the index of
-the write whose effect must go (a delete's `client_write(..).log_id.index`), it:
+the write whose effect must go (the delete's `Proposed::log_id` from
+`forward::propose_via_leader`, which reports it on whichever node proposed the
+delete), it:
 
 1. waits until this node has applied `covering`;
 2. seals the tail segment, so later appends start a new one, and takes its last
