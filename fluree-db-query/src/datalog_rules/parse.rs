@@ -127,7 +127,8 @@ pub(super) fn parse_jsonld_rule(
         .or_else(|| obj.get("context"))
         .cloned()
         .unwrap_or(JsonValue::Null);
-    let context = parse_context(&fluree_graph_json_ld::with_base_as_vocab(&context_val))
+    fluree_graph_json_ld::note_lone_base(&context_val);
+    let context = parse_context(&context_val)
         .map_err(|e| invalid(&label, format!("invalid @context: {e}")))?;
     let policy = resolve_parse_policy(None, obj);
     let path_aliases = extract_path_aliases(&context_val, &context, policy)

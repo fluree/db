@@ -510,7 +510,8 @@ impl DepsWalker {
             root: None,
         };
         if let Some(raw) = raw_ctx {
-            match parse_context(&fluree_graph_json_ld::with_base_as_vocab(raw)) {
+            fluree_graph_json_ld::note_lone_base(raw);
+            match parse_context(raw) {
                 Ok(ctx) => walker.ctx = ctx,
                 Err(e) => walker.flag(format!("the `@context` could not be parsed: {e}")),
             }
@@ -2597,14 +2598,16 @@ mod tests {
         assert!(!a.deps.contains("headline"));
         assert!(!a.deps.contains("body"));
 
-        // @base stands in for @vocab, as `parse_query` arranges.
+        // A lone @base names no property, as `parse_query` reads it: `title`
+        // is a plain name.
         let a = analyze(serde_json::json!({
             "@context": {"@base": "http://example.org/"},
             "where": [{"@id": "?x", "title": "?t"}],
             "select": {"?x": ["@id", "title"]}
         }));
         assert!(a.is_complete(), "{}", reason(&a));
-        assert!(a.deps.contains("http://example.org/title"));
+        assert!(a.deps.contains("title"));
+        assert!(!a.deps.contains("http://example.org/title"));
 
         // Array-form contexts resolve too.
         let a = analyze(serde_json::json!({

@@ -128,7 +128,7 @@ fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
     let top_ctx = json
         .as_object()
         .and_then(|m| m.get("@context").or_else(|| m.get("context")))
-        .map(|v| fluree_graph_json_ld::parse_context(&fluree_graph_json_ld::with_base_as_vocab(v)))
+        .map(fluree_graph_json_ld::parse_context)
         .transpose()
         .map_err(|e| ParseError::InvalidWhere(format!("failed to parse @context: {e}")))?
         .unwrap_or_else(fluree_graph_json_ld::ParsedContext::new);
@@ -157,22 +157,19 @@ fn scan_query_for_reifies_iris(
         JsonValue::Object(map) => {
             // Honor per-node `@context` overrides for compact-IRI
             // resolution.
-            let merged: Option<fluree_graph_json_ld::ParsedContext> =
-                if let Some(local) = map.get("@context").or_else(|| map.get("context")) {
-                    Some(
-                        fluree_graph_json_ld::parse_context_with_base(
-                            context,
-                            &fluree_graph_json_ld::with_base_as_vocab(local),
-                        )
-                        .map_err(|e| {
-                            ParseError::InvalidWhere(format!(
-                                "failed to parse nested @context during firewall scan: {e}"
-                            ))
-                        })?,
-                    )
-                } else {
-                    None
-                };
+            let merged: Option<fluree_graph_json_ld::ParsedContext> = if let Some(local) =
+                map.get("@context").or_else(|| map.get("context"))
+            {
+                Some(
+                    fluree_graph_json_ld::parse_context_with_base(context, local).map_err(|e| {
+                        ParseError::InvalidWhere(format!(
+                            "failed to parse nested @context during firewall scan: {e}"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
             scan_query_entries(map, merged.as_ref().unwrap_or(context))?;
         }
         JsonValue::Array(items) => {
@@ -256,7 +253,8 @@ pub(crate) fn parse_query_ast_internal(
         .or_else(|| obj.get("context"))
         .unwrap_or(&JsonValue::Null);
 
-    let context = parse_context(&fluree_graph_json_ld::with_base_as_vocab(context_val))?;
+    fluree_graph_json_ld::note_lone_base(context_val);
+    let context = parse_context(context_val)?;
 
     // Resolve parse policy BEFORE extracting path aliases so that any
     // compact IRIs inside @path expressions honor `opts.strictCompactIri`.

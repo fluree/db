@@ -90,19 +90,25 @@ pub fn parse_context(context: &JsonValue) -> Result<ParsedContext> {
     ParsedContext::parse(None, context)
 }
 
-/// A context object with Fluree's `@base` fallback applied, as JSON-LD
-/// transactions and queries read their contexts: with an `@base` and no
-/// `@vocab`, the base is the vocabulary too.
-pub fn with_base_as_vocab(context: &JsonValue) -> JsonValue {
-    let JsonValue::Object(map) = context else {
-        return context.clone();
-    };
-    let Some(base) = map.get("@base").filter(|_| !map.contains_key("@vocab")) else {
-        return context.clone();
-    };
-    let mut out = map.clone();
-    out.insert("@vocab".to_string(), base.clone());
-    JsonValue::Object(out)
+/// Log, once per process, that a context object sets `@base` and no
+/// `@vocab`. Such a `@base` resolves references only, as JSON-LD defines;
+/// before 5.0 a Fluree transaction, query, datalog rule or BM25 index
+/// definition also read it as the `@vocab`, so a document written for that
+/// now names its properties and types differently.
+pub fn note_lone_base(context: &JsonValue) {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    let lone = context.as_object().is_some_and(|map| {
+        map.get("@base").is_some_and(JsonValue::is_string) && !map.contains_key("@vocab")
+    });
+    if lone {
+        NOTED.call_once(|| {
+            tracing::warn!(
+                "a JSON-LD @context sets @base and no @vocab: since 5.0 @base resolves \
+                 references only, so the context's keys and types no longer join the base; \
+                 set @vocab to the same IRI to keep them there"
+            );
+        });
+    }
 }
 
 /// Parse a context with a base context.

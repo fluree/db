@@ -88,7 +88,6 @@ Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and ev
 
 Deviations from the JSON-LD 1.1 expansion algorithm:
 - **Plain names, by design.** A key the context maps to no IRI is stored as written, as a plain name, where the algorithm drops it. A `@type` resolves as the algorithm resolves it: against `@vocab`, and otherwise against the base, as an `@id` does; with neither, it is a plain name too. So with no `@vocab` and no `@base`, `{"@type": "Person", "name": "Ann"}` writes the class `Person` and the property `name`. Fluree keeps plain names because Cypher reads and writes the same ones (as a Cypher import does by default), so a JSON-LD write and a Cypher query meet on one ledger. A term defined only in a property-scoped context, used outside it, is a plain name the same way. A misspelled key is stored under its misspelling; a SHACL shape with `sh:closed` refuses properties a class does not declare.
-- A transaction or a query reads a top-level `@base` with no `@vocab` as the `@vocab` too, so its keys and types join the base: under `"@base": "http://example.org/ns/"`, `name` is `http://example.org/ns/name`. A bulk import and [`rdf::parse`](rdf-documents.md) read `@base` as the algorithm does.
 - A string starting with `?` is a variable, not a relative IRI reference, as a key, an `@id` or a `@type` (see [Relative IRIs](../concepts/iri-and-context.md#relative-iris)).
 - Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
 - A node with several types applies their scoped contexts in the order written rather than in lexicographic order. `@propagate` is honored on a type's scoped context only.
@@ -391,7 +390,7 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
-#### JSON-LD resolves `@base` by RFC 3986, and a type's scoped context stops at nested nodes (breaking)
+#### JSON-LD reads `@base` as JSON-LD 1.1 does, and a type's scoped context stops at nested nodes (breaking)
 
 A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, as one in Turtle already did; it used to be joined to `@base` as a string. A base ending in `/` resolves as before. Otherwise the result differs:
 
@@ -401,7 +400,15 @@ A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, a
 
 A relative `@base` or `@vocab` resolves against the base already in effect. A relative `@base` with no base to resolve against is refused; it used to be joined as written.
 
-**Check any context whose `@base` does not end in `/`.** With no `@vocab`, Fluree's JSON-LD transactions and queries use `@base` as the vocabulary too, so `{"@base": "http://example.org/ns#"}` put ids, types and properties in one namespace. Types and properties still land there; ids no longer do. `{"@id": "alice", "@type": "Person"}` now writes `http://example.org/alice` typed `http://example.org/ns#Person`. Data already written stays as it is, so on a ledger written before the upgrade the same document adds a second subject beside the stored `http://example.org/ns#alice`, and a `where`, delete or upsert that names `"alice"` no longer reaches the stored one. Nothing reports an error. Write the id as `#alice`, or define a prefix and write `ns:alice`.
+**`@base` no longer names properties and types.** Earlier releases read a top-level `@base` with no `@vocab` as the `@vocab` too, in a transaction, a query, a datalog rule and a BM25 index definition, so `{"@base": "http://example.org/ns#"}` put ids, types and properties in one namespace. `@base` now resolves references only, as JSON-LD 1.1 defines, everywhere JSON-LD is read:
+
+- A key the context maps to no IRI is a plain name: `name` is `name`, where it was `http://example.org/ns#name`.
+- A `@type` (and a value object's datatype) that no term, prefix or `@vocab` maps resolves against the base, as an `@id` does: `Person` under `http://example.org/ns#` is `http://example.org/Person`. Write `#Person` for `http://example.org/ns#Person`. A bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes used to store such a type as written.
+- `{"@id": "alice", "@type": "Person"}` writes `http://example.org/alice` typed `http://example.org/Person`.
+
+To keep properties and types in the base's namespace, set `@vocab` to the same IRI: `{"@base": "http://example.org/ns#", "@vocab": "http://example.org/ns#"}`. A stored datalog rule or BM25 index definition reads its context the new way too, so give a lone `@base` there its `@vocab` as well.
+
+**Check any context with a lone `@base`.** Data already written stays as it is, so on a ledger written before the upgrade the same document writes its ids, properties and types beside the stored ones, and a `where`, delete or upsert with that context no longer reaches them. Nothing reports an error; the server logs a warning, once, the first time a context sets `@base` with no `@vocab`.
 
 Query results change the same way. An `@id` under a base ending in `#` is written `#alice`, where it was `alice`. Under any other base, an id whose remainder starts with `/`, has a `:` in its first segment or holds a `.` or `..` segment is written as the full IRI, since the shortened form would resolve to something else.
 
@@ -448,10 +455,6 @@ Three kinds of document that were refused are accepted, and one that was accepte
 - A `where` pattern written with the same value object no longer finds a value stored under a typed term: `{"@value": "5"}` looks for the string. A `where` string with no language matches a stored string in any language, so it still finds `"obj"@en`.
 
 To make the stored values match, see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
-
-#### A JSON-LD `@type` resolves against `@base` (breaking)
-
-In a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes, a `@type` that no term, prefix or `@vocab` maps now resolves against the base, as an `@id` does, and so does a value object's datatype. It used to be stored as written: under `"@base": "http://example.org/doc"`, `"@type": "#Person"` was the class `#Person` and is now `http://example.org/doc#Person`, the IRI `"@id": "#Person"` names. With no base, a `@type` is still a plain name. A transaction and a query are unchanged: they read a lone `@base` as the `@vocab`.
 
 #### A JSON-LD `context` key is data (breaking)
 

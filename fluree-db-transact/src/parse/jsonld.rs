@@ -1462,11 +1462,14 @@ fn parse_update_templates_with_ctx(
     Ok(out)
 }
 
-/// The document's top-level `@context` as the parser reads it: a lone
-/// `@base` is the `@vocab` too.
+/// The document's top-level `@context`, as every stage of the parser reads
+/// it.
 fn top_context(json: &Value) -> fluree_graph_json_ld::Result<ParsedContext> {
     match json.get("@context") {
-        Some(ctx_val) => parse_context(&fluree_graph_json_ld::with_base_as_vocab(ctx_val)),
+        Some(ctx_val) => {
+            fluree_graph_json_ld::note_lone_base(ctx_val);
+            parse_context(ctx_val)
+        }
         None => Ok(ParsedContext::new()),
     }
 }
@@ -5068,10 +5071,10 @@ mod tests {
         }
     }
 
-    /// The parser's checks resolve a key as the parser does, under a lone
-    /// `@base` as under `@vocab`.
+    /// A lone `@base` resolves references only, for the parser's checks and
+    /// the parser alike: a key under it is a plain name, whatever the base.
     #[test]
-    fn checks_read_a_lone_base_as_the_parser_does() {
+    fn a_lone_base_leaves_keys_plain_names() {
         let f = fluree_vocab::fluree::DB;
         let p = fluree_vocab::db::REIFIES_SUBJECT;
         let edge = |key: &str| json!({"@id": "http://example.org/alice", key: {"@id": "http://example.org/bob"}});
@@ -5093,17 +5096,34 @@ mod tests {
             ),
         ];
         for (txn_type, doc) in cases {
-            let msg = match parse_doc(&doc, txn_type) {
-                Ok(_) => panic!("{doc}: accepted"),
-                Err(e) => e.to_string(),
-            };
-            assert!(msg.contains(p), "{doc}: {msg}");
+            let mut ns = test_registry();
+            let txn = parse_transaction(&doc, txn_type, TxnOpts::default(), &mut ns, TEST_LEDGER)
+                .unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let plain = ns.sid_for_iri(p);
+            assert!(
+                txn.insert_templates
+                    .iter()
+                    .all(|t| matches!(&t.predicate, TemplateTerm::Sid(s) if *s == plain)),
+                "{doc}: {:?}",
+                txn.insert_templates
+            );
         }
 
-        // A lone `@base` still names ordinary properties.
         let doc = based("http://example.org/", "knows");
-        let txn = parse_doc(&doc, TxnType::Insert).expect("an ordinary key");
-        assert_eq!(txn.insert_templates.len(), 1);
+        let mut ns = test_registry();
+        let txn = parse_transaction(
+            &doc,
+            TxnType::Insert,
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap();
+        let plain = ns.sid_for_iri("knows");
+        assert!(matches!(
+            txn.insert_templates.as_slice(),
+            [t] if matches!(&t.predicate, TemplateTerm::Sid(s) if *s == plain)
+        ));
     }
 
     /// Only `@context` is a context. A `context` key is data, so a prefix it
@@ -5190,8 +5210,8 @@ mod tests {
     }
 
     /// An annotation's link names the predicate the edge is written under: a
-    /// bare key resolves against `@vocab` (or a lone `@base`, which a
-    /// transaction reads as the `@vocab`) for the link as for the edge.
+    /// bare key resolves against `@vocab` for the link as for the edge, and
+    /// under a lone `@base` is a plain name in both.
     #[test]
     fn an_annotation_links_the_predicate_its_edge_is_written_under() {
         let alice = "http://example.org/alice";
@@ -5218,10 +5238,7 @@ mod tests {
                 json!({"@vocab": "http://v.example/"}),
                 "http://v.example/worksFor",
             ),
-            (
-                json!({"@base": "http://example.org/doc"}),
-                "http://example.org/doc/worksFor",
-            ),
+            (json!({"@base": "http://example.org/doc"}), "worksFor"),
         ] {
             let mut ns = test_registry();
             let expected = ns.sid_for_iri(iri);
