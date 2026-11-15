@@ -783,7 +783,7 @@ fn parse_type_property(
 
     match value {
         JsonValue::String(s) => {
-            let object = parse_object_value(s, ctx, object_var_parsing)?;
+            let object = parse_type_value(s, ctx, object_var_parsing)?;
             query.add_pattern(UnresolvedTriplePattern::new(
                 subject.clone(),
                 predicate,
@@ -796,7 +796,7 @@ fn parse_type_property(
                 let s = item.as_str().ok_or_else(|| {
                     ParseError::InvalidWhere("@type array items must be strings".to_string())
                 })?;
-                let object = parse_object_value(s, ctx, object_var_parsing)?;
+                let object = parse_type_value(s, ctx, object_var_parsing)?;
                 query.add_pattern(UnresolvedTriplePattern::new(
                     subject.clone(),
                     predicate.clone(),
@@ -1692,7 +1692,7 @@ fn parse_value_object(
                 (Some(Arc::from("@id")), None)
             } else {
                 // @type is a constant IRI: the literal matches that datatype only
-                let (expanded, _) = ctx.expand_vocab(dt)?;
+                let expanded = ctx.expand_type(dt)?;
                 (Some(Arc::from(expanded.as_str())), None)
             }
         } else {
@@ -1918,6 +1918,23 @@ fn parse_nested_node_map(
 }
 
 /// Parse an object value (string that might be a variable or IRI)
+/// A `@type` value: a variable, or the class IRI resolved as the expander
+/// resolves a `@type` on write.
+fn parse_type_value(
+    s: &str,
+    ctx: &JsonLdParseCtx,
+    object_var_parsing: bool,
+) -> Result<UnresolvedTerm> {
+    if is_variable(s) {
+        return Ok(if object_var_parsing {
+            UnresolvedTerm::var(s)
+        } else {
+            UnresolvedTerm::string(s)
+        });
+    }
+    Ok(UnresolvedTerm::iri(ctx.expand_type(s)?))
+}
+
 fn parse_object_value(
     s: &str,
     ctx: &JsonLdParseCtx,

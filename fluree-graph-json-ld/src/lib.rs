@@ -311,6 +311,15 @@ pub fn expand_with_root_context(
     expand::root_impl(doc, root, strict)
 }
 
+/// A `@type` value's IRI, resolved as JSON-LD resolves one: a term or compact
+/// IRI, else relative to `@vocab`, else to `@base` as an `@id` is. The rule the
+/// expander applies to a node's `@type` and a value object's datatype, for a
+/// reader that resolves types itself. Strict or permissive as
+/// [`expand_with_context_policy`].
+pub fn expand_type_iri(value: &str, context: &ParsedContext, strict: bool) -> Result<String> {
+    expand::vocab_or_base(value, context, strict).map(|(iri, _)| iri)
+}
+
 /// Compact an IRI using a context.
 ///
 /// # Arguments

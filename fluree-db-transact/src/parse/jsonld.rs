@@ -5261,4 +5261,57 @@ mod tests {
         });
         parse_doc(&update, TxnType::Update).expect("an annotated update with a dataset key");
     }
+
+    /// An update reads a `@type` in `where` as it writes one in `insert`:
+    /// against `@vocab`, else against `@base`. With no `@vocab` (here set to
+    /// `null`, or a context array, which the lone-`@base` rule does not
+    /// read), both resolve against the base.
+    #[test]
+    fn where_and_insert_resolve_a_type_alike() {
+        use fluree_db_query::parse::{UnresolvedPattern, UnresolvedTerm};
+        for ctx in [
+            json!({"@base": "http://example.org/doc", "@vocab": null}),
+            json!([{"@base": "http://example.org/doc"}]),
+        ] {
+            let doc = json!({
+                "@context": ctx,
+                "where": {"@id": "?s", "@type": "#Person"},
+                "insert": {"@id": "?s", "@type": "#Person"}
+            });
+            let mut ns = test_registry();
+            let txn = parse_transaction(
+                &doc,
+                TxnType::Update,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            let read = txn
+                .where_patterns
+                .iter()
+                .find_map(|p| match p {
+                    UnresolvedPattern::Triple(t) => match &t.o {
+                        UnresolvedTerm::Iri(iri) => Some(iri.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("a type pattern");
+            let written = txn
+                .insert_templates
+                .iter()
+                .find_map(|t| match &t.object {
+                    TemplateTerm::Sid(s) => Some(format!(
+                        "{}{}",
+                        ns.get_prefix(s.namespace_code).unwrap_or(""),
+                        s.name
+                    )),
+                    _ => None,
+                })
+                .expect("a type");
+            assert_eq!(read, "http://example.org/doc#Person", "{doc}");
+            assert_eq!(written, read, "{doc}");
+        }
+    }
 }

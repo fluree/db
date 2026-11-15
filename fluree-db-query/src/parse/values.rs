@@ -242,10 +242,7 @@ fn parse_typed_literal(
 
     let dt_iri = match map.get("@type").and_then(|v| v.as_str()) {
         Some("@id") => Some(Arc::from("@id")),
-        Some(t) => {
-            let (expanded, _) = ctx.expand_vocab(t)?;
-            Some(Arc::from(expanded))
-        }
+        Some(t) => Some(Arc::from(ctx.expand_type(t)?)),
         None => None,
     };
 

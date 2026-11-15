@@ -180,7 +180,7 @@ fn details_dispatch(
 
 /// `s` resolved as JSON-LD resolves a `@type` value: a term or compact IRI,
 /// else relative to `@vocab`, else to `@base`, as an `@id` is.
-fn vocab_or_base(
+pub(crate) fn vocab_or_base(
     s: &str,
     ctx: &ParsedContext,
     strict: bool,
