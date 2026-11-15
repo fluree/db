@@ -162,7 +162,21 @@ fn parse_rooted(
     // resolves against it, and the expander does not apply it again.
     let root = top_context(json)
         .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?;
-    super::edge_annotations::run_user_authored_reifies_firewall(json, &root)?;
+
+    // Reserved predicates are refused in what the user wrote, by the IRIs
+    // the parser resolves. An annotated document is checked as written,
+    // since the lowering adds statements of its own; any other is checked on
+    // the expansion the parser makes anyway. An update's `where` and
+    // `values` get the check a query's clauses get.
+    let annotated = super::edge_annotations::document_has_annotation_keys(json);
+    if matches!(txn_type, TxnType::Update) {
+        for clause in ["where", "values"] {
+            if let Some(value) = json.get(clause) {
+                fluree_db_query::parse::reject_reserved_iris_in_clause(value, &root)
+                    .map_err(|e| TransactError::UnsupportedFeature(e.to_string()))?;
+            }
+        }
+    }
 
     // Two-pass lowering for UPDATE transactions:
     //
@@ -174,7 +188,7 @@ fn parse_rooted(
     // 2. The standard assertion-shaped lowering rewrites the rest. Both
     //    passes synthesize `f:reifies*` IRIs internally, which is why the
     //    firewall ran first on the un-rewritten input.
-    let lowered = if super::edge_annotations::document_has_annotation_keys(json) {
+    let lowered = if annotated {
         let mut lowered = json.clone();
         if matches!(txn_type, TxnType::Update) {
             super::edge_annotations::lower_delete_annotation_blocks(&mut lowered, &root)?;
@@ -184,23 +198,27 @@ fn parse_rooted(
             &root,
             lpg_mode,
         )?;
+        // After the lowering, which refuses some documents for a reason of
+        // its own; the check reads the document as written.
+        let data = strip_opts_for_expansion(json, &root)?;
+        super::edge_annotations::refuse_reserved_iris_in_document(&data, &root)?;
         std::borrow::Cow::Owned(lowered)
     } else {
         std::borrow::Cow::Borrowed(json)
     };
 
-    let annotated = matches!(lowered, std::borrow::Cow::Owned(_));
     let mut txn = match txn_type {
         TxnType::Insert | TxnType::Upsert => parse_data(
             &lowered,
             &root,
+            !annotated,
             txn_type,
             opts,
             ns_registry,
             ledger_id,
             request_graph,
         )?,
-        TxnType::Update => parse_update(&lowered, &root, opts, ns_registry, ledger_id)?,
+        TxnType::Update => parse_update(&lowered, &root, !annotated, opts, ns_registry, ledger_id)?,
     };
     if annotated {
         refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
@@ -419,9 +437,11 @@ fn names_a_node(expanded: &Value) -> bool {
 ///
 /// The root scope is the default graph, or the request's graph for a graph
 /// insert / sync (`request_graph`), which the payload may not leave.
+#[allow(clippy::too_many_arguments)]
 fn parse_data(
     json: &Value,
     context: &ParsedContext,
+    refuse_reserved: bool,
     txn_type: TxnType,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
@@ -436,6 +456,9 @@ fn parse_data(
     // Strip top-level `opts` so it is not expanded as data (single-object form)
     let json_for_expand = strip_opts_for_expansion(json, context)?;
     let expanded = expand_with_root_context(&json_for_expand, context, strict)?;
+    if refuse_reserved {
+        super::edge_annotations::refuse_reserved_iris(&expanded)?;
+    }
 
     let no_aliases = HashMap::new();
     let mut blanks = BlankIssuer::default();
@@ -505,6 +528,7 @@ fn parse_data(
 fn parse_update(
     json: &Value,
     context: &ParsedContext,
+    refuse_reserved: bool,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
@@ -560,6 +584,7 @@ fn parse_update(
             obj,
             context,
             strict,
+            refuse_reserved,
             object_var_parsing,
             &from_named_aliases,
             ns_registry,
@@ -670,6 +695,7 @@ fn parse_update_clauses(
     obj: &serde_json::Map<String, Value>,
     context: &ParsedContext,
     strict: bool,
+    refuse_reserved: bool,
     object_var_parsing: bool,
     from_named_aliases: &HashMap<String, String>,
     ns_registry: &mut NamespaceRegistry,
@@ -735,6 +761,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
+        ctx.refuse_reserved = refuse_reserved;
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -781,6 +808,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
+        ctx.refuse_reserved = refuse_reserved;
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
             // As with delete: `"insert": []` is a no-op, an empty node is not.
@@ -1147,6 +1175,8 @@ struct TemplateParseCtx<'a> {
     fixed_root: Option<GraphScope>,
     /// The document's anonymous-node labels.
     blanks: &'a mut BlankIssuer,
+    /// Refuse reserved predicates in what this clause expands to.
+    refuse_reserved: bool,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -1175,16 +1205,17 @@ impl<'a> TemplateParseCtx<'a> {
             role,
             fixed_root: None,
             blanks,
+            refuse_reserved: false,
         }
     }
 
     /// Expand a JSON-LD document, respecting strict policy.
     fn expand_document(&self, json: &Value) -> std::result::Result<Value, TransactError> {
-        Ok(expand_with_context_policy(
-            json,
-            self.context,
-            self.strict_compact_iri,
-        )?)
+        let expanded = expand_with_context_policy(json, self.context, self.strict_compact_iri)?;
+        if self.refuse_reserved {
+            super::edge_annotations::refuse_reserved_iris(&expanded)?;
+        }
+        Ok(expanded)
     }
 
     /// Resolve a graph name written in this document, by
@@ -2874,6 +2905,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2899,6 +2931,7 @@ mod tests {
         let err = parse_update(
             &cypher_envelope,
             &top_context(&cypher_envelope).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2917,6 +2950,7 @@ mod tests {
         let err = parse_update(
             &where_only,
             &top_context(&where_only).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2935,6 +2969,7 @@ mod tests {
         let txn = parse_update(
             &explicit_empty_delete,
             &top_context(&explicit_empty_delete).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2963,6 +2998,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2994,6 +3030,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3025,6 +3062,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
+            true,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -5048,5 +5086,64 @@ mod tests {
             "{:?}",
             txn.insert_templates
         );
+    }
+
+    /// The parser's checks read the IRIs the expander resolves, scoped
+    /// contexts included, in every clause a transaction writes or reads.
+    #[test]
+    fn checks_read_terms_from_scoped_contexts() {
+        let p = format!(
+            "{}{}",
+            fluree_vocab::fluree::DB,
+            fluree_vocab::db::REIFIES_SUBJECT
+        );
+        let ex = "http://example.org/";
+        let scoped = |iri: &str| json!({"x": {"@id": iri}});
+        let property_scoped = |iri: &str| {
+            json!({"@context": {"ex": ex, "q": {"@id": "ex:q", "@context": scoped(iri)}},
+                   "@id": "ex:a", "q": {"@id": "ex:b", "x": {"@id": "ex:c"}}})
+        };
+        let type_scoped = |iri: &str| {
+            json!({"@context": {"ex": ex, "T": {"@id": "ex:T", "@context": scoped(iri)}},
+                   "@id": "ex:a", "@type": "T", "x": {"@id": "ex:c"}})
+        };
+        let cases = [
+            (TxnType::Insert, property_scoped(&p)),
+            (TxnType::Upsert, type_scoped(&p)),
+            (
+                TxnType::Insert,
+                json!({"@context": {"ex": ex, "x": {"@id": p}}, "@id": "ex:a",
+                       "ex:age": {"@value": 5, "@edge": {"x": {"@id": "ex:c"}}}}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"ex": ex, "T": {"@id": "ex:T", "@context": scoped(&p)}},
+                       "insert": {"@id": "ex:a", "@type": "T", "x": {"@id": "ex:c"}}}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"ex": ex, "x": {"@id": p}},
+                       "where": {"@id": "?s", "x": "?o"},
+                       "delete": {"@id": "?s", "ex:p": "?o"}}),
+            ),
+        ];
+        for (txn_type, doc) in cases {
+            let msg = match parse_doc(&doc, txn_type) {
+                Ok(_) => panic!("{doc}: accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains(fluree_vocab::db::REIFIES_SUBJECT),
+                "{doc}: {msg}"
+            );
+        }
+
+        // A scoped term naming an ordinary IRI is written.
+        for doc in [
+            property_scoped("http://example.org/x"),
+            type_scoped("http://example.org/x"),
+        ] {
+            parse_doc(&doc, TxnType::Insert).unwrap_or_else(|e| panic!("{doc}: {e}"));
+        }
     }
 }

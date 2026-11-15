@@ -591,13 +591,16 @@ fn parse_value_object(
 
     // `{"@value": …, "@annotation": {…}}`: the annotation describes a
     // reifier of the triple this value completes, and expands as a node does.
-    if let Some(annotation) = map.get("@annotation") {
-        let expanded =
-            match expand_node_internal(annotation, nodes, &path.key("@annotation"), strict)? {
+    // `@edge` is a transaction's alias for it, kept under its own name as it
+    // is on a node reference.
+    for key in ["@annotation", "@edge"] {
+        if let Some(annotation) = map.get(key) {
+            let expanded = match expand_node_internal(annotation, nodes, &path.key(key), strict)? {
                 JsonValue::Array(nodes) => nodes,
                 node => vec![node],
             };
-        obj.insert("@annotation".to_string(), JsonValue::Array(expanded));
+            obj.insert(key.to_string(), JsonValue::Array(expanded));
+        }
     }
 
     Ok(vec![JsonValue::Object(obj)])
