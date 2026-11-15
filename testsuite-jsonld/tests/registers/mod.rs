@@ -91,18 +91,17 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr37", // Ignores a term mapping to a value in the form of a keyword (with @vocab).
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr38", // Ignores a term mapping to a value in the form of a keyword (@reverse).
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr39", // Ignores a term mapping to a value in the form of a keyword (@reverse with @vocab).
-    // A key or `@type` value the context maps to no IRI is stored as written, as a
-    // plain name (`Person`), where the algorithm drops the key and resolves the type
-    // against the base. A choice: Cypher reads and writes the same plain names.
-    // Documented: compatibility.md (JSON-LD 1.1).
+    // A key the context maps to no IRI is stored as written, as a plain name
+    // (`name`), where the algorithm drops it. A choice: Cypher reads and writes the
+    // same plain names. Documented: compatibility.md (JSON-LD 1.1).
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0003", // drop null and unmapped properties
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0029", // Relative IRIs (also a `?` variable)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0059", // Reset @vocab by setting it to null
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0062", // Various relative IRIs with with @base
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0065", // Drop unmapped keys in reverse map
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0132", // @base does not expand property keys
     // A string starting with `?` is a variable, not a relative IRI reference
     // (`?y`, `?query=works`). Documented: compatibility.md (JSON-LD 1.1); docs/concepts/iri-and-context.md.
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0029", // Relative IRIs
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0062", // Various relative IRIs with with @base
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0092", // Various relative IRIs as properties with with @vocab: ''
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0110", // Various relative IRIs as properties with with relative @vocab
     // A node with several types applies their scoped contexts in the order
@@ -209,8 +208,7 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr31", // Protected keyword aliases cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr32", // Protected @type cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr42", // Fail if protected flag not retained during redefinition
-    // IRI expansion: a relative `@type`, or a reference that is only a query, is not
-    // resolved against the base; a relative, compact or term `@vocab`; terms and IRIs
+    // IRI expansion: a relative, compact or term `@vocab`; terms and IRIs
     // that begin with `:`, or with `@` but are not in keyword form (`@`, `@foo.bar`);
     // some valid term definitions are refused. #2395
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0048", // Terms are ignored in @id
@@ -368,17 +366,16 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr37", // Ignores a term mapping to a value in the form of a keyword (with @vocab).
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr38", // Ignores a term mapping to a value in the form of a keyword (@reverse).
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr39", // Ignores a term mapping to a value in the form of a keyword (@reverse with @vocab).
-    // A key or `@type` value the context maps to no IRI is stored as written, as a
-    // plain name (`Person`), where the algorithm drops the key and resolves the type
-    // against the base. A choice: Cypher reads and writes the same plain names.
-    // Documented: compatibility.md (JSON-LD 1.1).
+    // A key the context maps to no IRI is stored as written, as a plain name
+    // (`name`), where the algorithm drops it. A choice: Cypher reads and writes the
+    // same plain names. Documented: compatibility.md (JSON-LD 1.1).
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te003", // drop null and unmapped properties
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te029", // Relative IRIs (also a `?` variable)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te059", // Reset @vocab by setting it to null
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te062", // Various relative IRIs with with @base
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te065", // Keys that are not mapped to an IRI in a reverse-map are dropped
     // A string starting with `?` is a variable, not a relative IRI reference
     // (`?y`, `?query=works`). Documented: compatibility.md (JSON-LD 1.1); docs/concepts/iri-and-context.md.
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te029", // Relative IRIs
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te062", // Various relative IRIs with with @base
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#t0120", // IRI Resolution (0)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#t0121", // IRI Resolution (1)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#t0122", // IRI Resolution (2)
@@ -479,8 +476,7 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr31", // Protected keyword aliases cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr32", // Protected @type cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr42", // Fail if protected flag not retained during redefinition
-    // IRI expansion: a relative `@type`, or a reference that is only a query, is not
-    // resolved against the base; a relative, compact or term `@vocab`; terms and IRIs
+    // IRI expansion: a relative, compact or term `@vocab`; terms and IRIs
     // that begin with `:`, or with `@` but are not in keyword form (`@`, `@foo.bar`);
     // some valid term definitions are refused. #2395
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc021", // type-scoped value mix

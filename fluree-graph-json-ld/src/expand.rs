@@ -178,21 +178,33 @@ fn details_dispatch(
     }
 }
 
-/// A string a `"@type": "@vocab"` term coerces: a term or compact IRI, else
-/// relative to `@vocab`, else to `@base`. `None` for a term defined as
-/// `null`, which names no IRI.
-fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+/// `s` resolved as JSON-LD resolves a `@type` value: a term or compact IRI,
+/// else relative to `@vocab`, else to `@base`, as an `@id` is.
+fn vocab_or_base(
+    s: &str,
+    ctx: &ParsedContext,
+    strict: bool,
+) -> Result<(String, Option<ContextEntry>)> {
     match details(s, ctx, true) {
-        (_, Some(entry)) if entry.null_mapping => Ok(None),
-        (expanded, Some(_)) => Ok(Some(expanded)),
-        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
+        // No term, prefix or `@vocab` matched, so only `@base` can.
+        (expanded, None) => match match_default(s, ctx, false) {
+            Some((iri, entry)) => Ok((iri, Some(entry))),
+            None => {
+                if strict {
+                    guard_unresolved(&expanded)?;
+                }
+                Ok((expanded, None))
+            }
+        },
+        found => Ok(found),
     }
 }
 
-/// A `@type` value's IRI; `None` for a term defined as `null`.
-fn type_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
-    let (expanded, entry) = details_dispatch(s, ctx, true, strict)?;
-    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(expanded))
+/// A `@type` value's IRI, or a string a `"@type": "@vocab"` term coerces;
+/// `None` for a term defined as `null`, which names no IRI.
+fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let (iri, entry) = vocab_or_base(s, ctx, strict)?;
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(iri))
 }
 
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
@@ -525,7 +537,7 @@ fn parse_value_object(
         .or_else(|| map.get("type"))
         .and_then(|t| t.as_str())
     {
-        Some(t) => Some(iri_dispatch(t, context, true, strict)?),
+        Some(t) => Some(vocab_or_base(t, context, strict)?.0),
         None => None,
     };
 
@@ -633,12 +645,12 @@ fn parse_type<'c>(
 
     if let Some(type_val) = type_val {
         let types: Vec<String> = match type_val {
-            JsonValue::String(s) => type_iri(s, context, strict)?.into_iter().collect(),
+            JsonValue::String(s) => vocab_value_iri(s, context, strict)?.into_iter().collect(),
             JsonValue::Array(arr) => {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     if let Some(s) = v.as_str() {
-                        result.extend(type_iri(s, context, strict)?);
+                        result.extend(vocab_value_iri(s, context, strict)?);
                     }
                 }
                 result
@@ -1308,6 +1320,42 @@ mod tests {
         assert_eq!(nicks.len(), 3);
         // @set should be flattened (no @set wrapper)
         assert!(nicks[0].get("@value").is_some());
+    }
+
+    /// A `@type` resolves as JSON-LD resolves one: against `@vocab`, else
+    /// against `@base` as an `@id` does, else it stays a plain name. A value
+    /// object's datatype resolves the same way.
+    #[test]
+    fn a_type_resolves_against_the_base_without_a_vocab() {
+        let doc = json!({
+            "@context": {"@base": "http://example.org/doc"},
+            "@id": "#alice",
+            "@type": ["#Person", "Agent"],
+            "http://example.org/p": {"@value": "x", "@type": "#dt"}
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/doc#alice",
+                "@type": ["http://example.org/doc#Person", "http://example.org/Agent"],
+                "http://example.org/p": [{"@value": "x", "@type": "http://example.org/doc#dt"}]
+            })
+        );
+
+        let vocab = json!({
+            "@context": {"@base": "http://example.org/doc", "@vocab": "http://v.example/"},
+            "@type": "Person"
+        });
+        assert_eq!(
+            node(&vocab, &ParsedContext::new()).unwrap()["@type"],
+            json!(["http://v.example/Person"])
+        );
+
+        let plain = json!({"@type": "Person", "name": "Ann"});
+        assert_eq!(
+            node(&plain, &ParsedContext::new()).unwrap(),
+            json!({"@type": ["Person"], "name": [{"@value": "Ann"}]})
+        );
     }
 
     /// Only `@context` is a context. A `context` key is a property like any

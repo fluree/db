@@ -193,13 +193,15 @@ is a variable in Fluree, not a relative IRI.
 
 ### Plain names
 
-A key or `@type` value that the context maps to no IRI (no term, no prefix,
-no `@vocab`) is stored as written, as a plain name: `{"@type": "Person",
-"name": "Ann"}` writes the class `Person` and the property `name`. This is a
-choice. Cypher reads and writes the same plain names, so a JSON-LD write and a
-Cypher query agree with no context at all. JSON-LD 1.1 would drop such a key
-(see [the JSON-LD deviations](../reference/compatibility.md#json-ld-11)). Set
-`@vocab` to put names under a namespace. A misspelled key is stored under its
+A key that the context maps to no IRI (no term, no prefix, no `@vocab`) is
+stored as written, as a plain name: `{"@type": "Person", "name": "Ann"}`
+writes the class `Person` and the property `name`. This is a choice. Cypher
+reads and writes the same plain names, so a JSON-LD write and a Cypher query
+agree with no context at all. JSON-LD 1.1 would drop such a key (see [the
+JSON-LD deviations](../reference/compatibility.md#json-ld-11)). A `@type`
+resolves against `@vocab`, and otherwise against `@base` as an `@id` does, so
+it is a plain name only when there is neither. Set `@vocab` to put names under
+a namespace. A misspelled key is stored under its
 misspelling; a SHACL shape with `sh:closed` refuses properties a class does not
 declare.
 
