@@ -983,3 +983,194 @@ async fn cross_graph_root_unions_split_subject_altlabels() {
         "root subject should union skos:altLabel across the default-graph union: {value:#}"
     );
 }
+
+// =============================================================================
+// Tracked (`opts.meta`) multi-ledger queries must hydrate exactly as untracked
+// ones do. The tracked dataset path built its result with no composite overlay
+// and formatted against the primary view alone, so a nested subject whose
+// flakes live in another ledger came back as a bare `@id`. Flat selects were
+// unaffected. Every case runs both lanes so they cannot drift apart again.
+// =============================================================================
+
+/// Run `q` through `query_from()` both untracked (`execute_formatted`) and
+/// tracked (`execute_tracked`), returning `(untracked, tracked)` results.
+async fn run_untracked_and_tracked(
+    fluree: &MemoryFluree,
+    q: &serde_json::Value,
+) -> (serde_json::Value, serde_json::Value) {
+    let untracked = fluree
+        .query_from()
+        .jsonld(q)
+        .execute_formatted()
+        .await
+        .expect("untracked query");
+
+    let mut tracked_q = q.clone();
+    tracked_q["opts"] = json!({"meta": true});
+    let tracked = fluree
+        .query_from()
+        .jsonld(&tracked_q)
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("tracked query failed: {e:?}"))
+        .result;
+
+    (untracked, tracked)
+}
+
+/// An order in `test/orders` whose `lines` (an `@list`) are line-item
+/// nodes, each referencing `unit` / `product` subjects that live only in
+/// `test/products`.
+async fn seed_list_refs_into_foreign_ledger(fluree: &MemoryFluree) {
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/orders:main"),
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                },
+                "@graph": [
+                    {"@id": "ex:order1", "@type": "ex:Order",
+                     "ex:lines": {"@list": [
+                        {"@id": "ex:line1",
+                         "ex:product": {"@id": "ex:widget"},
+                         "ex:unit": {"@id": "ex:kg"}},
+                        {"@id": "ex:line2",
+                         "ex:product": {"@id": "ex:gadget"},
+                         "ex:unit": {"@id": "ex:kg"}}
+                     ]}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert orders");
+
+    fluree
+        .insert(
+            genesis_ledger(fluree, "test/products:main"),
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+                },
+                "@graph": [
+                    {"@id": "ex:kg", "rdfs:label": "kilogram", "ex:isMetric": true},
+                    {"@id": "ex:widget", "rdfs:label": "Widget"},
+                    {"@id": "ex:gadget", "rdfs:label": "Gadget"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert products");
+}
+
+#[tokio::test]
+async fn tracked_cross_ledger_nested_list_projection_hydrates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_list_refs_into_foreign_ledger(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+        },
+        "from": ["test/orders:main", "test/products:main"],
+        "select": {"?order": ["@id", {"ex:lines": ["@id",
+            {"ex:product": ["@id", "rdfs:label"]},
+            {"ex:unit": ["@id", "rdfs:label", "ex:isMetric"]}
+        ]}]},
+        "where": {"@id": "?order", "@type": "ex:Order"}
+    });
+
+    let (untracked, tracked) = run_untracked_and_tracked(&fluree, &q).await;
+
+    for (lane, value) in [("untracked", &untracked), ("tracked", &tracked)] {
+        let order = value.as_array().and_then(|a| a.first()).expect("one order");
+        let lines = order
+            .get("ex:lines")
+            .and_then(|v| v.as_array())
+            .unwrap_or_else(|| panic!("{lane}: lines missing: {value:#}"));
+        assert_eq!(lines.len(), 2, "{lane}: {value:#}");
+        let line1 = &lines[0];
+        assert_eq!(
+            line1["ex:unit"],
+            json!({"@id": "ex:kg", "rdfs:label": "kilogram", "ex:isMetric": true}),
+            "{lane}: cross-ledger unit not hydrated: {value:#}"
+        );
+        assert_eq!(
+            line1["ex:product"],
+            json!({"@id": "ex:widget", "rdfs:label": "Widget"}),
+            "{lane}: cross-ledger product not hydrated: {value:#}"
+        );
+    }
+    assert_eq!(untracked, tracked, "tracked and untracked lanes diverge");
+}
+
+#[tokio::test]
+async fn tracked_cross_ledger_wildcard_depth_hydrates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_list_refs_into_foreign_ledger(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+        },
+        "from": ["test/orders:main", "test/products:main"],
+        "select": {"?order": ["*"]},
+        "depth": 2,
+        "where": {"@id": "?order", "@type": "ex:Order"}
+    });
+
+    let (untracked, tracked) = run_untracked_and_tracked(&fluree, &q).await;
+
+    for (lane, value) in [("untracked", &untracked), ("tracked", &tracked)] {
+        let order = value.as_array().and_then(|a| a.first()).expect("one order");
+        let line1 = order
+            .get("ex:lines")
+            .and_then(|v| v.as_array())
+            .and_then(|a| a.first())
+            .unwrap_or_else(|| panic!("{lane}: lines missing: {value:#}"));
+        assert_eq!(
+            line1["ex:unit"].get("rdfs:label").and_then(|v| v.as_str()),
+            Some("kilogram"),
+            "{lane}: cross-ledger unit not hydrated at depth 2: {value:#}"
+        );
+    }
+    assert_eq!(untracked, tracked, "tracked and untracked lanes diverge");
+}
+
+/// The plain nested-ref shape (no `@list`), reusing the divergent-namespace
+/// seed so the tracked lane also exercises the per-predicate Sid rebind.
+#[tokio::test]
+async fn tracked_cross_ledger_nested_ref_hydrates() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    seed_divergent_predicate_ref_ledgers(&fluree).await;
+
+    let q = json!({
+        "@context": {
+            "schema": "http://schema.org/",
+            "cat": "http://catalog.example/",
+            "p": "http://people.example/",
+            "id": "@id", "type": "@type",
+        },
+        "from": ["test/catalog:main", "test/people:main"],
+        "select": { "?item": ["@id",
+            { "schema:author": ["@id", "schema:name", "p:fullName"] }
+        ]},
+        "where": { "@id": "?item", "type": "schema:Product" }
+    });
+
+    let (untracked, tracked) = run_untracked_and_tracked(&fluree, &q).await;
+
+    for (lane, value) in [("untracked", &untracked), ("tracked", &tracked)] {
+        let author = &value[0]["schema:author"];
+        assert_eq!(
+            author.get("p:fullName").and_then(|v| v.as_str()),
+            Some("Augusta Ada King"),
+            "{lane}: cross-ledger author not hydrated: {value:#}"
+        );
+    }
+    assert_eq!(untracked, tracked, "tracked and untracked lanes diverge");
+}

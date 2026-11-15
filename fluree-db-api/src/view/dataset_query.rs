@@ -459,7 +459,7 @@ impl Fluree {
             parsed,
             batches,
             dataset.result_t(),
-            None,
+            dataset.composite_overlay(),
             primary.binary_graph(),
         );
 
@@ -470,11 +470,19 @@ impl Fluree {
             format_config = crate::format::FormatterConfig::jsonld();
         }
 
-        // Format with tracking
-        let result_json = query_result
-            .format_async_for_view_tracked(primary, &format_config, &tracker)
-            .await
-            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        // Format with tracking. Dataset-aware, like the untracked path: each
+        // hydrated subject is expanded in its home ledger's view, under that
+        // view's policy. Formatting against the primary alone returned
+        // cross-ledger nested subjects as bare `@id`.
+        let result_json = crate::format::format_results_async_dataset(
+            &query_result,
+            &query_result.context,
+            dataset,
+            &format_config,
+            Some(&tracker),
+        )
+        .await
+        .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         Ok(crate::query::TrackedQueryResponse::success(
             result_json,
@@ -572,7 +580,7 @@ impl Fluree {
             parsed,
             batches,
             dataset.result_t(),
-            None,
+            dataset.composite_overlay(),
             primary.binary_graph(),
         );
 
@@ -582,10 +590,15 @@ impl Fluree {
             format_config = crate::format::FormatterConfig::jsonld();
         }
 
-        let result_json = query_result
-            .format_async_for_view_tracked(primary, &format_config, &tracker)
-            .await
-            .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
+        let result_json = crate::format::format_results_async_dataset(
+            &query_result,
+            &query_result.context,
+            dataset,
+            &format_config,
+            Some(&tracker),
+        )
+        .await
+        .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, tracker.tally()))?;
 
         Ok(crate::query::TrackedQueryResponse::success(
             result_json,
