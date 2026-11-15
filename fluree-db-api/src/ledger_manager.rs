@@ -325,6 +325,11 @@ struct LedgerHandleInner {
     /// path, so the publish listener can tell its own commits from others'
     /// without touching the state lock.
     committed_t: std::sync::atomic::AtomicI64,
+    /// Bumped each time a reload swaps in a state it loaded from the
+    /// nameservice, which may be another line than the one it replaces (a
+    /// rebase). An index install planned before the swap is not made after
+    /// it; commits on the line leave it alone.
+    line: AtomicU64,
     write_paths: WritePathCounters,
     /// Test hook: the next optimistic stage on this handle parks here after
     /// staging and before taking the lock (see
@@ -478,6 +483,7 @@ impl LedgerHandle {
                 config_cache: RwLock::new(ConfigCacheEntry::default()),
                 recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
                 committed_t: std::sync::atomic::AtomicI64::new(0),
+                line: AtomicU64::new(0),
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
                 exclusion_gate: parking_lot::Mutex::new(None),
@@ -829,16 +835,22 @@ impl LedgerHandle {
         cs: Arc<dyn ContentStore>,
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+        planned_on: Line,
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let span = tracing::debug_span!(
             "index_install",
             ledger_id = %self.id(),
             index_t = tracing::field::Empty,
         );
-        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache)
+        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache, planned_on)
             .instrument(span)
             .await
+    }
+
+    /// The line the cached state is on, for an index install planned now.
+    pub fn line(&self) -> Line {
+        Line(self.inner.line.load(Ordering::Acquire))
     }
 
     async fn apply_index_v2_inner(
@@ -847,7 +859,8 @@ impl LedgerHandle {
         cs: Arc<dyn ContentStore>,
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+        planned_on: Line,
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
@@ -921,6 +934,13 @@ impl LedgerHandle {
         let wait_us = wait_started.elapsed().as_micros() as u64;
         let install_started = Instant::now();
         let ledger_id = self.id().to_string();
+        if self.line() != planned_on {
+            tracing::debug!(
+                ledger = %ledger_id,
+                "a reload replaced the state the index was planned for; not installed"
+            );
+            return Ok(false);
+        }
         let install = async move {
             let mut state = state_guard;
             let novelty_flakes_before = state.novelty.len();
@@ -993,9 +1013,14 @@ impl LedgerHandle {
             .instrument(tracing::debug_span!("index_install_lock"))
             .await?;
 
-        Ok(())
+        Ok(true)
     }
 }
+
+/// A ledger handle's line, as [`LedgerHandle::line`] reads it: an index
+/// install planned on one line is not made on another.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Line(u64);
 
 // ============================================================================
 // Freshness Types
@@ -1513,9 +1538,6 @@ pub struct LedgerManager {
     /// A `std::sync` lock: both sides are sub-microsecond map
     /// operations with no `.await` inside the critical section.
     head_watermarks: std::sync::RwLock<HashMap<LedgerId, i64>>,
-    /// One [`Self::follow`] at a time per ledger: a record that installs an
-    /// index must not land on a line a later record has replaced.
-    follow_locks: std::sync::Mutex<HashMap<LedgerId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl LedgerManager {
@@ -1538,7 +1560,6 @@ impl LedgerManager {
             shutdown: AtomicBool::new(false),
             load_generation: AtomicU64::new(0),
             head_watermarks: std::sync::RwLock::new(HashMap::new()),
-            follow_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2210,6 +2231,7 @@ impl LedgerManager {
                             {
                                 let mut bs_guard = handle.inner.binary_store.write().await;
                                 write_guard.replace(new_state);
+                                handle.inner.line.fetch_add(1, Ordering::AcqRel);
                                 *bs_guard = new_binary_store;
                                 // Out-of-band swap: any resolved-config entry may
                                 // have been cached against a state this swap just
@@ -2668,6 +2690,7 @@ impl LedgerManager {
         };
 
         // Get local state metrics for planning
+        let planned_on = handle.line();
         let (local_t, local_index_t, local_index_id) = handle.state_metrics().await;
 
         // Plan the update action
@@ -2710,15 +2733,20 @@ impl LedgerManager {
                     "notify: applying index update (incremental)"
                 );
                 let cs = cs_for_record().await?;
-                handle
+                let installed = handle
                     .apply_index_v2(
                         &index_head_id,
                         cs,
                         &self.config.cache_dir,
                         self.config.leaflet_cache.clone(),
+                        planned_on,
                     )
                     .await?;
-                Ok(NotifyResult::IndexUpdated)
+                Ok(if installed {
+                    NotifyResult::IndexUpdated
+                } else {
+                    NotifyResult::Current
+                })
             }
 
             UpdatePlan::CommitCatchUp {
@@ -2882,6 +2910,7 @@ impl LedgerManager {
                             Arc::clone(&cs),
                             &self.config.cache_dir,
                             self.config.leaflet_cache.clone(),
+                            planned_on,
                         )
                         .await?;
                 }
@@ -2909,8 +2938,7 @@ impl LedgerManager {
     /// state until the reload lands.
     ///
     /// A record for a ledger that is still loading is followed once the load
-    /// lands, since the load may have read the nameservice before it. Records
-    /// for one ledger are followed one at a time.
+    /// lands, since the load may have read the nameservice before it.
     pub async fn follow(&self, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
         let cached = match self.entries.read().await.get(&ledger_id) {
@@ -2930,14 +2958,6 @@ impl LedgerManager {
 
     async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
-        let lock = Arc::clone(
-            self.follow_locks
-                .lock()
-                .expect("follow lock map never poisoned: no panics inside critical section")
-                .entry(ledger_id.clone())
-                .or_default(),
-        );
-        let _following = lock.lock().await;
         if CachedHead::of(handle).await.advanced_or_named_by(&record) {
             return self.notify_with(record).await;
         }

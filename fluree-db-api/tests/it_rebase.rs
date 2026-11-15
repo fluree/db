@@ -1620,10 +1620,10 @@ mod paused_lookup {
 }
 
 /// An index update for the branch's old line, still installing when a
-/// rebase arrives, lands before the rebase is followed rather than after:
-/// the peer ends on the new line, not on the old line's index.
-#[tokio::test(flavor = "multi_thread")]
-async fn a_peer_follows_a_rebase_after_an_index_update_in_flight() {
+/// rebase is followed, does not land after it: the peer ends on the new
+/// line, not on the old line's index. The update comes from `follow` itself
+/// or from another path that brings the cache up to date, `refresh`.
+async fn a_rebase_outlasts_an_index_install_in_flight(via_refresh: bool) {
     use std::sync::Arc;
 
     let dir = tempfile::tempdir().unwrap();
@@ -1661,7 +1661,13 @@ async fn a_peer_follows_a_rebase_after_an_index_update_in_flight() {
         .store(true, std::sync::atomic::Ordering::SeqCst);
     let index_update = {
         let peer = peer.clone();
-        tokio::spawn(async move { follow(&peer, indexed).await })
+        tokio::spawn(async move {
+            if via_refresh {
+                peer.refresh("rb:dev", Default::default()).await.unwrap();
+            } else {
+                follow(&peer, indexed).await;
+            }
+        })
     };
     lookup.entered.notified().await;
 
@@ -1670,23 +1676,27 @@ async fn a_peer_follows_a_rebase_after_an_index_update_in_flight() {
         .await
         .unwrap();
     let rebased = dev_record(&writer).await;
-    let mut rebase = {
-        let peer = peer.clone();
-        tokio::spawn(async move { follow(&peer, rebased).await })
-    };
-    // Unserialized, the rebase is followed in full meanwhile.
-    let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut rebase).await;
+    assert_eq!(
+        follow(&peer, rebased).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
     lookup.release.notify_one();
     index_update.await.unwrap();
-    match early {
-        Ok(followed) => drop(followed.unwrap()),
-        Err(_) => drop(rebase.await.unwrap()),
-    }
 
     assert_eq!(
         query_cached_names(&peer, "rb:dev").await,
         ["alice", "alice-main", "dave"]
     );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebase_outlasts_an_index_install_follow_started() {
+    a_rebase_outlasts_an_index_install_in_flight(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebase_outlasts_an_index_install_refresh_started() {
+    a_rebase_outlasts_an_index_install_in_flight(true).await;
 }
 
 /// A rebase published while a peer loads the branch, after the load read the

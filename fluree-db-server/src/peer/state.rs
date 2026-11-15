@@ -5,6 +5,7 @@
 
 use fluree_db_api::LedgerId;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use tokio::sync::RwLock;
 
@@ -41,6 +42,10 @@ pub struct PeerState {
     graph_sources: RwLock<HashMap<LedgerId, RemoteGraphSourceWatermark>>,
     /// Whether SSE connection is active
     connected: RwLock<bool>,
+    /// Bumped, under the `ledgers` lock, each time the watermarks are
+    /// cleared for a new connection: a record from an earlier connection
+    /// sets no watermark after it.
+    epoch: AtomicU64,
 }
 
 impl PeerState {
@@ -49,7 +54,13 @@ impl PeerState {
             ledgers: RwLock::new(HashMap::new()),
             graph_sources: RwLock::new(HashMap::new()),
             connected: RwLock::new(false),
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// The current connection's epoch, for [`Self::update_ledger_in`].
+    pub fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
     }
 
     /// Check if a ledger needs refresh based on local vs remote watermarks.
@@ -124,7 +135,32 @@ impl PeerState {
         commit_head_id: Option<String>,
         index_head_id: Option<String>,
     ) -> bool {
+        self.update_ledger_in(
+            self.epoch(),
+            ledger_id,
+            commit_t,
+            index_t,
+            commit_head_id,
+            index_head_id,
+        )
+        .await
+    }
+
+    /// [`Self::update_ledger`] for a record received in connection `epoch`:
+    /// nothing is set once the watermarks were cleared for a later one.
+    pub async fn update_ledger_in(
+        &self,
+        epoch: u64,
+        ledger_id: &LedgerId,
+        commit_t: i64,
+        index_t: i64,
+        commit_head_id: Option<String>,
+        index_head_id: Option<String>,
+    ) -> bool {
         let mut ledgers = self.ledgers.write().await;
+        if self.epoch() != epoch {
+            return false;
+        }
 
         let changed = ledgers.get(ledger_id).is_none_or(|existing| {
             existing.commit_t != commit_t
@@ -193,7 +229,10 @@ impl PeerState {
 
     /// Clear all state (on reconnect, before new snapshot)
     pub async fn clear(&self) {
-        self.ledgers.write().await.clear();
+        let mut ledgers = self.ledgers.write().await;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        ledgers.clear();
+        drop(ledgers);
         self.graph_sources.write().await.clear();
     }
 

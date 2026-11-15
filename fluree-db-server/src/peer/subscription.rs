@@ -113,15 +113,25 @@ struct PeerEventSink {
     updates: Arc<LedgerUpdates>,
 }
 
-/// The ledger records waiting to be applied. A ledger's records are applied
-/// one at a time, by a worker of its own, so one waiting on slow storage
-/// holds up no other ledger's. A record that arrives while its ledger's
-/// worker is busy replaces any still waiting: the latest supersedes them.
+/// The ledger updates waiting to be applied. A ledger's updates are applied
+/// one at a time, in stream order, by a worker of its own, so one waiting on
+/// slow storage holds up no other ledger's. An update that arrives while its
+/// ledger's worker is busy replaces any still waiting: the latest supersedes
+/// them.
 struct LedgerUpdates {
-    /// A ledger with an entry has a worker; the entry is the record it
+    /// A ledger with an entry has a worker; the entry is the update it
     /// applies next.
-    waiting: std::sync::Mutex<HashMap<LedgerId, Option<NsRecord>>>,
+    waiting: std::sync::Mutex<HashMap<LedgerId, Option<LedgerUpdate>>>,
     permits: tokio::sync::Semaphore,
+}
+
+enum LedgerUpdate {
+    /// A record received in connection `epoch` (see [`PeerState::epoch`]).
+    Record {
+        epoch: u64,
+        record: Box<NsRecord>,
+    },
+    Retracted,
 }
 
 impl PeerEventSink {
@@ -158,18 +168,17 @@ impl PeerEventSink {
         }
     }
 
-    /// Queue `record` for its ledger's worker, starting one if it has none.
-    fn queue(&self, record: NsRecord) {
-        let ledger_id = record.ledger_id.clone();
+    /// Queue `update` for `ledger_id`'s worker, starting one if it has none.
+    fn queue(&self, ledger_id: LedgerId, update: LedgerUpdate) {
         let start = {
             let mut waiting = self.updates.waiting.lock().expect("never poisoned");
             match waiting.get_mut(&ledger_id) {
                 Some(next) => {
-                    *next = Some(record);
+                    *next = Some(update);
                     false
                 }
                 None => {
-                    waiting.insert(ledger_id.clone(), Some(record));
+                    waiting.insert(ledger_id.clone(), Some(update));
                     true
                 }
             }
@@ -183,22 +192,9 @@ impl PeerEventSink {
             ));
         }
     }
-
-    /// Drop a record still waiting for `ledger_id`.
-    fn discard(&self, ledger_id: &LedgerId) {
-        if let Some(next) = self
-            .updates
-            .waiting
-            .lock()
-            .expect("never poisoned")
-            .get_mut(ledger_id)
-        {
-            *next = None;
-        }
-    }
 }
 
-/// A ledger's worker: applies its waiting records until none is left.
+/// A ledger's worker: applies its waiting updates until none is left.
 async fn apply_ledger_updates(
     updates: Arc<LedgerUpdates>,
     fluree: Arc<Fluree>,
@@ -206,10 +202,10 @@ async fn apply_ledger_updates(
     ledger_id: LedgerId,
 ) {
     loop {
-        let record = {
+        let update = {
             let mut waiting = updates.waiting.lock().expect("never poisoned");
             match waiting.get_mut(&ledger_id).and_then(Option::take) {
-                Some(record) => record,
+                Some(update) => update,
                 None => {
                     waiting.remove(&ledger_id);
                     return;
@@ -217,11 +213,22 @@ async fn apply_ledger_updates(
             }
         };
         let _permit = updates.permits.acquire().await.expect("never closed");
+        let (epoch, record) = match update {
+            LedgerUpdate::Record { epoch, record } => (epoch, record),
+            LedgerUpdate::Retracted => {
+                peer_state.remove_ledger(&ledger_id).await;
+                tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
+                // Evict any cached state for the ledger (no-op if not cached).
+                fluree.disconnect_ledger(&ledger_id).await;
+                continue;
+            }
+        };
         // The cached ledger first: a query that sees the new watermark over a
         // cached ledger behind it reloads it whole.
         refresh_cached_ledger(&fluree, &record).await;
         let changed = peer_state
-            .update_ledger(
+            .update_ledger_in(
+                epoch,
                 &record.ledger_id,
                 record.commit_t,
                 record.index_t,
@@ -287,7 +294,16 @@ impl HeadSink for PeerEventSink {
                 // number of ledgers.
                 self.preload_configured_ledgers().await;
             }
-            RemoteEvent::LedgerUpdated(record) => self.queue(record),
+            RemoteEvent::LedgerUpdated(record) => {
+                let epoch = self.peer_state.epoch();
+                self.queue(
+                    record.ledger_id.clone(),
+                    LedgerUpdate::Record {
+                        epoch,
+                        record: Box::new(record),
+                    },
+                );
+            }
             RemoteEvent::GraphSourceUpdated(record) => {
                 let changed = self
                     .peer_state
@@ -306,13 +322,9 @@ impl HeadSink for PeerEventSink {
                     );
                 }
             }
+            // Applied after any update to the ledger already in flight.
             RemoteEvent::LedgerRetracted { ledger_id } => {
-                self.discard(&ledger_id);
-                self.peer_state.remove_ledger(&ledger_id).await;
-                tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
-
-                // Evict any cached state for the ledger (no-op if not cached).
-                self.fluree.disconnect_ledger(&ledger_id).await;
+                self.queue(ledger_id, LedgerUpdate::Retracted);
             }
             RemoteEvent::GraphSourceRetracted { graph_source_id } => {
                 self.peer_state.remove_graph_source(&graph_source_id).await;
@@ -670,7 +682,11 @@ mod tests {
                 .lock()
                 .unwrap()
                 .get(&LedgerId::parse("a:main").unwrap())
-                .map(|next| next.as_ref().map(|r| r.commit_t))
+                .map(|next| match next {
+                    Some(LedgerUpdate::Record { record, .. }) => Some(record.commit_t),
+                    Some(LedgerUpdate::Retracted) => Some(-1),
+                    None => None,
+                })
         }
 
         /// Start a load of `a:main` that waits until released.
@@ -753,5 +769,55 @@ mod tests {
         load.await.unwrap();
         settled(&root.sink).await;
         assert_eq!(root.cached_t("a:main").await, Some(third.commit_t));
+    }
+
+    async fn watermark_t(sink: &PeerEventSink, ledger_id: &str) -> Option<i64> {
+        sink.peer_state
+            .get_remote_ledger(&LedgerId::parse(ledger_id).unwrap())
+            .await
+            .map(|w| w.commit_t)
+    }
+
+    /// A retraction is applied after the ledger's update in flight, so that
+    /// update cannot set the watermark again once the retraction removed it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retraction_follows_the_update_in_flight() {
+        let root = TwoLedgers::new().await;
+        let load = root.stall_a().await;
+        let record = root.commit("a:main", 1).await;
+        root.sink.on_event(RemoteEvent::LedgerUpdated(record)).await;
+        for _ in 0..200 {
+            if root.waiting_for_a() == Some(None) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        root.sink
+            .on_event(RemoteEvent::LedgerRetracted {
+                ledger_id: LedgerId::parse("a:main").unwrap(),
+            })
+            .await;
+
+        root.slow.release.notify_one();
+        load.await.unwrap();
+        settled(&root.sink).await;
+        assert_eq!(watermark_t(&root.sink, "a:main").await, None);
+        assert_eq!(root.cached_t("a:main").await, None, "evicted");
+    }
+
+    /// A record from before a reconnect, applied after it, sets no
+    /// watermark: the new connection's records do.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_record_from_before_a_reconnect_sets_no_watermark() {
+        let root = TwoLedgers::new().await;
+        let load = root.stall_a().await;
+        let record = root.commit("a:main", 1).await;
+        root.sink.on_event(RemoteEvent::LedgerUpdated(record)).await;
+        root.sink.on_event(RemoteEvent::Connected).await;
+
+        root.slow.release.notify_one();
+        load.await.unwrap();
+        settled(&root.sink).await;
+        assert_eq!(watermark_t(&root.sink, "a:main").await, None);
     }
 }
