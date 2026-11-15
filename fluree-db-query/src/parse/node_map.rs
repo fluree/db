@@ -909,12 +909,16 @@ fn parse_property(
         }
     }
 
-    // Determine if this property is typed as @id or @vocab (reference)
-    let mut is_ref_type = term_type.is_some_and(|t| matches!(t, TypeValue::Id | TypeValue::Vocab));
-
-    // rdf:type always expects an IRI object, even if not annotated in @context.
+    // A string value is a reference when the term is typed `@id` or
+    // `@vocab`, resolved as a write resolves it. rdf:type always expects a
+    // class, read as a `@type` is.
+    let mut string_value = match term_type {
+        Some(TypeValue::Id) => StringValue::Id,
+        Some(TypeValue::Vocab) => StringValue::Vocab,
+        _ => StringValue::Literal,
+    };
     if matches!(predicate, UnresolvedTerm::Iri(ref iri) if iri.as_ref() == RDF_TYPE) {
-        is_ref_type = true;
+        string_value = StringValue::Vocab;
     }
 
     // Get datatype IRI from context if present
@@ -1146,7 +1150,7 @@ fn parse_property(
     }
 
     // Parse the object value (non-nested case)
-    let object = parse_json_value(value, is_ref_type, ctx.ctx, ctx.object_var_parsing)?;
+    let object = parse_json_value(value, string_value, ctx.ctx, ctx.object_var_parsing)?;
 
     // Create and add the pattern
     let pattern = build_triple_pattern(subject, predicate, object, is_reverse, dt_iri.as_deref());
@@ -1947,16 +1951,28 @@ fn parse_object_value(
             Ok(UnresolvedTerm::string(s))
         }
     } else {
-        // Expand as IRI
-        let (expanded, _) = ctx.expand_vocab(s)?;
+        // A reference, resolved as an `@id`.
+        let (expanded, _) = ctx.expand_id(s)?;
         Ok(UnresolvedTerm::iri(expanded))
     }
+}
+
+/// How a property's string value is read.
+#[derive(Clone, Copy)]
+enum StringValue {
+    Literal,
+    /// A reference under a term typed `@id`: resolved as an `@id`, against
+    /// `@base`.
+    Id,
+    /// A reference under a term typed `@vocab`, or a class: resolved as a
+    /// `@type`, against `@vocab` and otherwise `@base`.
+    Vocab,
 }
 
 /// Parse a JSON value to an UnresolvedTerm
 fn parse_json_value(
     value: &JsonValue,
-    is_ref_type: bool,
+    string_value: StringValue,
     ctx: &JsonLdParseCtx,
     object_var_parsing: bool,
 ) -> Result<UnresolvedTerm> {
@@ -1968,13 +1984,12 @@ fn parse_json_value(
                 } else {
                     Ok(UnresolvedTerm::string(s))
                 }
-            } else if is_ref_type {
-                // This is a reference - expand as IRI
-                let (expanded, _) = ctx.expand_vocab(s)?;
-                Ok(UnresolvedTerm::iri(expanded))
             } else {
-                // Plain string literal
-                Ok(UnresolvedTerm::string(s))
+                match string_value {
+                    StringValue::Literal => Ok(UnresolvedTerm::string(s)),
+                    StringValue::Id => Ok(UnresolvedTerm::iri(ctx.expand_id(s)?.0)),
+                    StringValue::Vocab => Ok(UnresolvedTerm::iri(ctx.expand_type(s)?)),
+                }
             }
         }
         JsonValue::Number(n) => {
@@ -2037,7 +2052,7 @@ fn parse_path_alias_usage(
                 UnresolvedTerm::var(s)
             } else {
                 // Treat as IRI reference (property paths traverse refs)
-                let (expanded, _) = ctx.expand_vocab(s)?;
+                let (expanded, _) = ctx.expand_id(s)?;
                 UnresolvedTerm::iri(expanded)
             }
         }
@@ -2056,7 +2071,7 @@ fn parse_path_alias_usage(
             if is_variable(id_str) {
                 UnresolvedTerm::var(id_str)
             } else {
-                let (expanded, _) = ctx.expand_vocab(id_str)?;
+                let (expanded, _) = ctx.expand_id(id_str)?;
                 UnresolvedTerm::iri(expanded)
             }
         }

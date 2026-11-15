@@ -1266,8 +1266,8 @@ fn parse_hydration_object(
     let root = if is_variable(root_str) {
         UnresolvedRoot::Var(Arc::from(root_str.as_str()))
     } else {
-        // IRI constant root - expand via @context
-        let (expanded, _) = ctx.expand_vocab(root_str)?;
+        // A subject IRI, resolved as an `@id`.
+        let (expanded, _) = ctx.expand_id(root_str)?;
         UnresolvedRoot::Iri(expanded)
     };
 
@@ -2990,6 +2990,59 @@ mod tests {
         assert!(
             matches!(&pattern.s, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/resource#alice")
         );
+    }
+
+    /// A query resolves each position as a write does: a node's id, a
+    /// graph-select root, a `values` `@id`, a value object typed `@id` and a
+    /// string under a term typed `@id` against `@base`; a class and a string
+    /// under a term typed `@vocab` against `@vocab`.
+    #[test]
+    fn query_positions_resolve_as_a_write_does() {
+        let context = json!({
+            "@base": "http://b.example/",
+            "@vocab": "http://v.example/",
+            "knows": {"@type": "@id"},
+            "kind": {"@type": "@vocab"}
+        });
+        let debug = |query: JsonValue| format!("{:?}", parse_query_ast(&query, None).unwrap().0);
+        let cases = [
+            (
+                json!({"@context": context, "select": {"alice": ["*"]}}),
+                "http://b.example/alice",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"],
+                       "values": ["?s", [{"@id": "alice"}]], "where": {"@id": "?s", "p": "?o"}}),
+                "http://b.example/alice",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"],
+                       "where": {"@id": "?s", "p": {"@value": "bob", "@type": "@id"}}}),
+                "http://b.example/bob",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"], "where": {"@id": "?s", "knows": "bob"}}),
+                "http://b.example/bob",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"], "where": {"@id": "?s", "kind": "Thing"}}),
+                "http://v.example/Thing",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"], "where": {"@id": "?s", "@type": "Person"}}),
+                "http://v.example/Person",
+            ),
+        ];
+        for (query, iri) in cases {
+            let ast = debug(query.clone());
+            assert!(ast.contains(iri), "{query}: expected {iri} in {ast}");
+            let wrong = if iri.starts_with("http://b.") {
+                iri.replace("http://b.", "http://v.")
+            } else {
+                iri.replace("http://v.", "http://b.")
+            };
+            assert!(!ast.contains(&wrong), "{query}: {wrong} in {ast}");
+        }
     }
 
     #[test]
