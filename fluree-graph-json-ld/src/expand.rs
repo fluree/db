@@ -1982,7 +1982,7 @@ mod tests {
             let err = crate::expand(&json!({"@context": ctx, "p": value}))
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("needs \"@type\""), "{ctx} {value}: {err}");
+            assert!(err.contains(r#""@type": "@json""#), "{ctx} {value}: {err}");
         }
 
         let ctx = json!({"f": "https://ns.flur.ee/db#", "p": p});

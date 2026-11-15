@@ -143,7 +143,7 @@ async fn an_untyped_structured_value_object_is_refused() {
             .expect_err("an untyped structured @value");
         assert_eq!(err.status_code(), 400, "{value}: {err}");
         assert!(
-            err.to_string().contains("needs \"@type\""),
+            err.to_string().contains(r#""@type": "@json""#),
             "{value}: {err}"
         );
 
@@ -163,7 +163,7 @@ async fn an_untyped_structured_value_object_is_refused() {
             .await
             .expect_err("a bulk import of an untyped structured @value");
         assert!(
-            err.to_string().contains("needs \"@type\""),
+            err.to_string().contains(r#""@type": "@json""#),
             "{value}: {err}"
         );
     }
