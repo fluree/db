@@ -158,8 +158,10 @@ fn parse_rooted(
     // clone, and only when an `@annotation` / `@edge` / `@reifies` block is
     // actually present: a large non-annotated transaction then skips the
     // clone and both rewrite walks entirely.
-    let top_ctx = super::edge_annotations::top_level_context(json)?;
-    super::edge_annotations::run_user_authored_reifies_firewall(json, &top_ctx)?;
+    // The same top-level context the parser resolves keys against.
+    let parser_ctx = top_context(json)
+        .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?;
+    super::edge_annotations::run_user_authored_reifies_firewall(json, &parser_ctx)?;
 
     // Two-pass lowering for UPDATE transactions:
     //
@@ -172,6 +174,7 @@ fn parse_rooted(
     //    passes synthesize `f:reifies*` IRIs internally, which is why the
     //    firewall ran first on the un-rewritten input.
     let lowered = if super::edge_annotations::document_has_annotation_keys(json) {
+        let top_ctx = super::edge_annotations::top_level_context(json)?;
         let mut lowered = json.clone();
         if matches!(txn_type, TxnType::Update) {
             super::edge_annotations::lower_delete_annotation_blocks(&mut lowered)?;
@@ -1389,10 +1392,15 @@ fn parse_update_templates_with_ctx(
 
 /// Extract and parse the @context from a JSON-LD document
 fn extract_context(json: &Value) -> Result<ParsedContext> {
-    if let Some(ctx_val) = json.get("@context") {
-        Ok(parse_context(&normalize_context_value(ctx_val))?)
-    } else {
-        Ok(ParsedContext::new())
+    Ok(top_context(json)?)
+}
+
+/// The document's top-level `@context` as the parser reads it: a lone
+/// `@base` is the `@vocab` too.
+fn top_context(json: &Value) -> fluree_graph_json_ld::Result<ParsedContext> {
+    match json.get("@context") {
+        Some(ctx_val) => parse_context(&normalize_context_value(ctx_val)),
+        None => Ok(ParsedContext::new()),
     }
 }
 
@@ -4966,5 +4974,43 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The parser's checks resolve a key as the parser does, under a lone
+    /// `@base` as under `@vocab`.
+    #[test]
+    fn checks_read_a_lone_base_as_the_parser_does() {
+        let f = fluree_vocab::fluree::DB;
+        let p = fluree_vocab::db::REIFIES_SUBJECT;
+        let edge = |key: &str| json!({"@id": "http://example.org/alice", key: {"@id": "http://example.org/bob"}});
+        let based = |base: &str, key: &str| {
+            let mut doc = edge(key);
+            doc["@context"] = json!({"@base": base});
+            doc
+        };
+        let cases = [
+            (TxnType::Insert, based(f, p)),
+            (TxnType::Upsert, based(f, p)),
+            (
+                TxnType::Insert,
+                json!({"@context": {"@base": f}, "@graph": [edge(p)]}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"@base": f}, "insert": edge(p)}),
+            ),
+        ];
+        for (txn_type, doc) in cases {
+            let msg = match parse_doc(&doc, txn_type) {
+                Ok(_) => panic!("{doc}: accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(msg.contains(p), "{doc}: {msg}");
+        }
+
+        // A lone `@base` still names ordinary properties.
+        let doc = based("http://example.org/", "knows");
+        let txn = parse_doc(&doc, TxnType::Insert).expect("an ordinary key");
+        assert_eq!(txn.insert_templates.len(), 1);
     }
 }
