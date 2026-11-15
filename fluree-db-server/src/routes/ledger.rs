@@ -719,7 +719,9 @@ pub async fn info(
             Err(e) => return Err(e),
         };
 
-        let t = ledger_state.snapshot.t;
+        // The commit head's `t`, novelty included: clients compare it with
+        // their own head.
+        let t = ledger_state.t();
 
         // Build comprehensive ledger info
         //

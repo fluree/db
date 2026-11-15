@@ -4081,7 +4081,8 @@ async fn test_proxy_peer_negotiates_every_query_format() {
 
 /// A proxy peer reports a ledger's full metadata, the transaction server's
 /// own: stats, commit and heads. It used to answer with the nameservice
-/// record alone.
+/// record alone. The top-level `t` is the head's, with or without an index
+/// at it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_proxy_peer_reports_full_ledger_info() {
     use fluree_db_api::ReindexOptions;
@@ -4100,32 +4101,41 @@ async fn test_proxy_peer_reports_full_ledger_info() {
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
     let client = reqwest::Client::new();
-    let create = client
-        .post(format!("{server_url}/v1/fluree/create"))
-        .header("content-type", "application/json")
-        .body(r#"{"ledger": "info:main"}"#)
-        .send()
-        .await
-        .expect("create ledger");
-    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
-    for turtle in [
-        "@prefix ex: <http://example.org/> . ex:a a ex:Person ; ex:name \"A\" .",
-        "@prefix ex: <http://example.org/> . ex:b a ex:Person ; ex:name \"B\" .",
-    ] {
-        let insert = client
-            .post(format!("{server_url}/v1/fluree/upsert/info:main"))
-            .header("content-type", "text/turtle")
-            .body(turtle)
+    let commit = |ledger: &'static str, name: &'static str| {
+        let client = client.clone();
+        let server_url = server_url.clone();
+        async move {
+            let insert = client
+                .post(format!("{server_url}/v1/fluree/upsert/{ledger}"))
+                .header("content-type", "text/turtle")
+                .body(format!(
+                    "@prefix ex: <http://example.org/> . ex:{name} a ex:Person ; ex:name \"{name}\" ."
+                ))
+                .send()
+                .await
+                .expect("insert");
+            assert_eq!(insert.status(), reqwest::StatusCode::OK);
+        }
+    };
+    for ledger in ["info:main", "fresh:main"] {
+        let create = client
+            .post(format!("{server_url}/v1/fluree/create"))
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"ledger": "{ledger}"}}"#))
             .send()
             .await
-            .expect("insert");
-        assert_eq!(insert.status(), reqwest::StatusCode::OK);
+            .expect("create ledger");
+        assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+        commit(ledger, "a").await;
+        commit(ledger, "b").await;
     }
+    // `info:main`'s index trails its head; `fresh:main` has none.
     state
         .fluree
         .reindex("info:main", ReindexOptions::default())
         .await
         .expect("reindex");
+    commit("info:main", "c").await;
 
     let signing_key = SigningKey::from_bytes(&[0u8; 32]);
     let token = create_storage_proxy_token_no_identity(&signing_key, true);
@@ -4134,12 +4144,12 @@ async fn test_proxy_peer_reports_full_ledger_info() {
         .expect("peer state");
     let peer_app = build_router(peer);
 
-    let info = |app: axum::Router| async move {
+    let info = |app: axum::Router, ledger: &'static str| async move {
         let resp = app
             .oneshot(
                 Request::builder()
                     .method("GET")
-                    .uri("/v1/fluree/info/info:main")
+                    .uri(format!("/v1/fluree/info/{ledger}"))
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -4147,13 +4157,22 @@ async fn test_proxy_peer_reports_full_ledger_info() {
             .unwrap();
         json_body(resp).await
     };
-    let (tx_status, tx_info) = info(tx_app).await;
-    assert_eq!(tx_status, StatusCode::OK, "{tx_info}");
-    let (peer_status, peer_info) = info(peer_app).await;
-    assert_eq!(peer_status, StatusCode::OK, "{peer_info}");
-    assert!(peer_info.get("commitId").is_some(), "{peer_info}");
-    assert!(peer_info.get("stats").is_some(), "{peer_info}");
-    assert_eq!(peer_info, tx_info);
+    // `t` is the head's, which a client compares with its own head.
+    for (ledger, head_t) in [("info:main", 3), ("fresh:main", 2)] {
+        let (tx_status, mut tx_info) = info(tx_app.clone(), ledger).await;
+        assert_eq!(tx_status, StatusCode::OK, "{tx_info}");
+        let (peer_status, mut peer_info) = info(peer_app.clone(), ledger).await;
+        assert_eq!(peer_status, StatusCode::OK, "{peer_info}");
+        assert!(peer_info.get("commitId").is_some(), "{peer_info}");
+        assert!(peer_info.get("stats").is_some(), "{peer_info}");
+        assert_eq!(peer_info["t"], head_t, "{ledger}: {peer_info}");
+        // The transaction server's `nameservice` block is the record its
+        // cached ledger last loaded or indexed from, which its own commits
+        // do not refresh; the peer's, loaded now, is the current one.
+        tx_info.as_object_mut().unwrap().remove("nameservice");
+        peer_info.as_object_mut().unwrap().remove("nameservice");
+        assert_eq!(peer_info, tx_info, "{ledger}");
+    }
 
     server_handle.abort();
 }
