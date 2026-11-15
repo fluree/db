@@ -2584,20 +2584,22 @@ impl CachedHead {
             t: state.t(),
             head: state.head_commit_id.clone(),
             index_t: state.index_t(),
-            index: state
-                .ns_record
-                .as_ref()
-                .and_then(|r| r.index_head_id.clone()),
+            index: state.head_index_id.clone().or_else(|| {
+                state
+                    .ns_record
+                    .as_ref()
+                    .and_then(|r| r.index_head_id.clone())
+            }),
         }
     }
 
-    /// Whether `record` moves the cached head forward, or names it with an
-    /// index no lower than the cached one.
-    fn advanced_or_named_by(&self, record: &NsRecord) -> bool {
+    /// Whether `record` moves the cached head forward, or names the cached
+    /// head and index both.
+    fn advanced_or_held_by(&self, record: &NsRecord) -> bool {
         record.commit_t > self.t
             || (record.commit_t == self.t
                 && record.commit_head_id == self.head
-                && !self.index_lowered_by(record))
+                && record.index_head_id == self.index)
     }
 
     /// Whether the nameservice's `current` record has replaced the cached
@@ -2952,13 +2954,15 @@ impl LedgerManager {
     /// does. The stream is authoritative, but it can trail the cached state:
     /// a load reads the nameservice, which may already be ahead of it.
     ///
-    /// A record that moves the cached head forward, or names it, is applied
-    /// as [`Self::notify`] applies it. Any other record, a head below or
-    /// beside the cached one or a lower index under it, is either one the
-    /// cache has passed or a reset, such as a rebase that moves a branch's
-    /// head back or lowers its index. The nameservice's current record tells
-    /// which: a reset reloads the ledger, which goes on serving the cached
-    /// state until the reload lands.
+    /// A record that moves the cached head forward, or names the cached head
+    /// and index, is applied as [`Self::notify`] applies it. Any other record
+    /// is judged by the nameservice's current record: a head below or beside
+    /// the cached one, or another index under it. Such a record is one the
+    /// cache has passed, an index the nameservice may no longer hold (one a
+    /// rebase reset, or a reset read half-written), or a reset itself, such
+    /// as a rebase that moves a branch's head back or lowers its index. A
+    /// reset reloads the ledger, which goes on serving the cached state until
+    /// the reload lands; otherwise the current record is applied.
     ///
     /// A record for a ledger that is still loading is followed once the load
     /// lands, since the load may have read the nameservice before it.
@@ -2982,7 +2986,7 @@ impl LedgerManager {
     async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
         let planned_on = handle.line();
-        if CachedHead::of(handle).await.advanced_or_named_by(&record) {
+        if CachedHead::of(handle).await.advanced_or_held_by(&record) {
             return self.notify_with(record, planned_on).await;
         }
         let Some(current) = self.current_record(&ledger_id).await? else {

@@ -1508,6 +1508,45 @@ async fn a_peer_follows_a_reset_that_lowers_the_index_of_its_head() {
     );
 }
 
+/// A record naming the peer's head with an index the nameservice no longer
+/// holds (one sent before a reset, or a reset read half-written) does not
+/// install that index.
+#[tokio::test]
+async fn a_peer_does_not_install_an_index_a_reset_took_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    diverged(&writer).await;
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let indexed = dev_record(&writer).await;
+    assert!(indexed.index_head_id.is_some());
+    writer
+        .branch_admin()
+        .unwrap()
+        .reset_head(
+            "rb:dev",
+            fluree_db_nameservice::NsRecordSnapshot {
+                commit_head_id: indexed.commit_head_id.clone(),
+                commit_t: indexed.commit_t,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let peer = peer_fluree(&dir).await;
+    let cached_index_t = || async {
+        let handle = peer.ledger_cached("rb:dev").await.unwrap();
+        handle.index_t().await
+    };
+    assert_eq!(cached_index_t().await, 0);
+    assert_eq!(
+        follow(&peer, indexed).await,
+        fluree_db_api::NotifyResult::Current
+    );
+    assert_eq!(cached_index_t().await, 0, "no index installed");
+}
+
 /// A peer draining a backlog sees records far behind its cache, from its own
 /// line: each changes nothing, however far behind it is.
 #[tokio::test]
