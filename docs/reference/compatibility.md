@@ -427,8 +427,9 @@ A value object (`{"@value": ...}`) takes only the `@type` or `@language` it name
 
 This applies to every JSON-LD reader: a transaction, a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes. A JSON-LD `where` reads a constant value object the same way, so a pattern written like the insert matches what it stored. A variable written as a value object (`{"@value": "?v", "@t": "?t"}`) keeps its term's datatype, as `"?v"` does, so it matches only values of that datatype: under a term typed `xsd:integer` it does not return the string that `{"@value": "5"}` writes.
 
-Two documents that were refused are accepted, and one that was accepted is refused:
+Three kinds of document that were refused are accepted, and one that was accepted is refused:
 
+- A value object whose `@value` does not read as its term's datatype is stored as written: `{"@value": "abc"}` under a term typed `xsd:integer` is the string `"abc"`. It was refused, so the typed term no longer checks a value object. A value object's own `@type` is still checked (`{"@value": "abc", "@type": "xsd:integer"}` is refused), and so is a bare value under the term. To hold a property to one datatype however a document writes it, use a SHACL shape with `sh:datatype` (see the [SHACL cookbook](../guides/cookbook-shacl.md)).
 - An annotated value object (`@annotation`) under a typed term or a default language annotates the value as written. It was refused unless it named its own `@type` or `@language`.
 - `{"@value": [...]}` under a term typed `@vector` needs its own `"@type": "@vector"`, and is refused without it. A bare array under the term is unchanged. Every JSON-LD reader refuses an array or map `@value` without a `@json` or `@vector` type: a bulk import and `rdf::parse` used to drop it without an error.
 
