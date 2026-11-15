@@ -649,7 +649,7 @@ mod tests {
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let result = relay_propose::<RelayTestConfig>(&url, &command, Duration::from_secs(2)).await;
         server.abort();
-        assert_eq!(result.unwrap(), "applied");
+        assert_eq!(result.unwrap().response, "applied");
     }
 
     #[tokio::test]
@@ -1096,13 +1096,28 @@ pub enum ProposeError {
     Apply(String),
 }
 
+/// A command [`propose_via_leader`] committed, and where.
+#[derive(Debug, Clone)]
+pub struct Proposed<R> {
+    /// The entry the command committed as. Its `index` is what
+    /// [`RaftGroup::wait_applied`](crate::runtime::RaftGroup::wait_applied)
+    /// waits on before a node reads the write back, and what
+    /// [`RaftGroup::compact_log`](crate::runtime::RaftGroup::compact_log)
+    /// takes as `covering`. `None` only when the relay reached a leader
+    /// too old to report it.
+    pub log_id: Option<openraft::LogId<NodeId>>,
+    pub response: R,
+}
+
 /// Propose `cmd` to this group from ANY node: a plain `client_write` when
 /// this node leads, an HTTP relay of the JSON-encoded command to the
 /// leader's network router (`{raft_addr}/propose`) when it does not. At most
 /// one retry, with a fresh leader lookup, when the previous attempt cannot
 /// commit: connection establishment failed or the peer explicitly rejected
 /// the command as not leader. Ambiguous outcomes are returned as
-/// [`ProposeError::Unknown`] without replaying the command.
+/// [`ProposeError::Unknown`] without replaying the command. A success
+/// carries the entry the command committed as, from whichever node
+/// proposed it.
 ///
 /// A rejection requires a 503 with the JSON body `{"error":"not_leader"}`.
 /// A bare 503 (including an older peer's text response) is conservatively
@@ -1116,7 +1131,10 @@ pub enum ProposeError {
 /// The relay dials a membership-supplied URL, so it uses a no-redirect
 /// client and [`is_valid_leader_url`] — the same SSRF posture as the
 /// request-forwarding middleware above.
-pub async fn propose_via_leader<C>(raft: &Raft<C>, cmd: C::D) -> Result<C::R, ProposeError>
+pub async fn propose_via_leader<C>(
+    raft: &Raft<C>,
+    cmd: C::D,
+) -> Result<Proposed<C::R>, ProposeError>
 where
     C: crate::config::FlureeRaftConfig,
     C::D: Clone + serde::Serialize,
@@ -1124,7 +1142,12 @@ where
     let mut last_relay_error: Option<ProposeError> = None;
     for _attempt in 0..2 {
         match raft.client_write(cmd.clone()).await {
-            Ok(resp) => return Ok(resp.data),
+            Ok(resp) => {
+                return Ok(Proposed {
+                    log_id: Some(resp.log_id),
+                    response: resp.data,
+                })
+            }
             Err(openraft::error::RaftError::APIError(
                 openraft::error::ClientWriteError::ForwardToLeader(fwd),
             )) => {
@@ -1132,7 +1155,7 @@ where
                     return Err(ProposeError::NoLeader);
                 };
                 match relay_propose::<C>(&node.raft_addr, &cmd, Duration::from_secs(30)).await {
-                    Ok(data) => return Ok(data),
+                    Ok(proposed) => return Ok(proposed),
                     Err(e @ ProposeError::Relay(_)) => {
                         // The previous attempt cannot commit. Re-resolve
                         // leadership before the one permitted retry.
@@ -1157,7 +1180,7 @@ async fn relay_propose<C>(
     leader_raft_addr: &str,
     cmd: &C::D,
     timeout: Duration,
-) -> Result<C::R, ProposeError>
+) -> Result<Proposed<C::R>, ProposeError>
 where
     C: crate::config::FlureeRaftConfig,
     C::D: serde::Serialize,
@@ -1194,6 +1217,10 @@ where
             }
         })?;
     let status = resp.status();
+    let log_id = resp
+        .headers()
+        .get(crate::network::PROPOSE_LOG_ID_HEADER)
+        .cloned();
     let bytes = resp
         .bytes()
         .await
@@ -1216,6 +1243,11 @@ where
             String::from_utf8_lossy(&bytes)
         )));
     }
-    serde_json::from_slice(&bytes)
-        .map_err(|e| ProposeError::Unknown(format!("response decode error: {e}")))
+    let response = serde_json::from_slice(&bytes)
+        .map_err(|e| ProposeError::Unknown(format!("response decode error: {e}")))?;
+    let log_id = log_id
+        .map(|value| serde_json::from_slice(value.as_bytes()))
+        .transpose()
+        .map_err(|e| ProposeError::Unknown(format!("log id decode error: {e}")))?;
+    Ok(Proposed { log_id, response })
 }
