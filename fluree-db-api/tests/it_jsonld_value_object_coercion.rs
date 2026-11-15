@@ -182,3 +182,38 @@ async fn value_object_takes_neither_the_default_language_nor_its_terms_datatype(
         assert_eq!(rows, json!(["ex:s"]), "{property}: {value}");
     }
 }
+
+/// A value object takes no datatype from a `@vector` term, so an array
+/// `@value` under it needs its own `@type`. Every JSON-LD reader refuses one
+/// without it: the adapter readers used to drop the value with no error.
+#[tokio::test]
+async fn an_array_value_object_with_no_type_is_refused() {
+    let doc = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "v": {"@id": "ex:v", "@type": "@vector"}
+        },
+        "@id": "ex:s",
+        "v": {"@value": [0.5, 0.25]}
+    });
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("tx/value-object-array-no-type:main")
+        .await
+        .expect("genesis");
+    let err = fluree
+        .insert(ledger, &doc)
+        .await
+        .expect_err("an untyped array @value");
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(err.to_string().contains("needs its own"), "{err}");
+
+    let err = fluree_db_api::rdf::parse(
+        &doc.to_string(),
+        fluree_db_api::rdf::RdfFormat::JsonLd,
+        None,
+    )
+    .expect_err("rdf::parse of an untyped array @value");
+    assert!(err.to_string().contains("needs its own"), "{err}");
+}

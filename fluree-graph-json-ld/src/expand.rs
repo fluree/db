@@ -541,6 +541,14 @@ fn parse_value_object(
         (Some(_), Some(_)) => return Err(JsonLdError::LanguageWithType),
         (t, l) => (t, l.map(std::string::ToString::to_string)),
     };
+    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref()) {
+        return Err(JsonLdError::InvalidKeywordValue {
+            keyword: "@value",
+            reason: "a value object whose @value is an array or a map needs its own \
+                     \"@type\": \"@json\" (or \"@vector\" for an array); a value object \
+                     takes no datatype from its term",
+        });
+    }
     let direction = base_direction(map)?;
 
     // Build result
@@ -581,6 +589,17 @@ fn parse_value_object(
     }
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// Whether a value object typed `type_iri` may hold an array or a map: a JSON
+/// literal, or a vector (an array only, which the vector parser checks).
+fn holds_structured_value(type_iri: Option<&str>) -> bool {
+    matches!(
+        type_iri,
+        Some(
+            "@json" | "@vector" | fluree_vocab::rdf::JSON | fluree_vocab::fluree::EMBEDDING_VECTOR
+        )
+    )
 }
 
 /// A value object's `@direction`, which Fluree joins to its language tag as
@@ -2097,12 +2116,36 @@ mod tests {
                 "{ctx}"
             );
         }
+    }
 
-        let vector = json!({"p": {"@id": p, "@type": "@vector"}});
-        assert_eq!(
-            values_of_p(json!({"@context": vector, "p": {"@value": [0.5]}})),
-            json!([{"@value": [0.5]}])
-        );
+    /// An array or map `@value` needs its own `@json` or `@vector` type: a
+    /// value object takes none from its term, and an untyped one has no
+    /// literal to stand for.
+    #[test]
+    fn structured_value_object_needs_its_own_type() {
+        let p = EX.to_owned() + "p";
+        let vector = json!({"f": "https://ns.flur.ee/db#", "p": {"@id": p, "@type": "@vector"}});
+        for value in [
+            json!({"@value": [0.5]}),
+            json!({"@value": {"a": 1}}),
+            json!({"@value": [0.5], "@type": XSD_INTEGER}),
+        ] {
+            let err = crate::expand(&json!({"@context": vector, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs its own \"@type\""), "{value}: {err}");
+        }
+
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": vector, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
     }
 
     #[test]

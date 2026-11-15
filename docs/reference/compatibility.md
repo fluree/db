@@ -430,7 +430,7 @@ This applies to every JSON-LD reader: a transaction, a bulk import, [`rdf::parse
 Two documents that were refused are accepted, and one that was accepted is refused:
 
 - An annotated value object (`@annotation`) under a typed term or a default language annotates the value as written. It was refused unless it named its own `@type` or `@language`.
-- `{"@value": [...]}` under a term typed `@vector` needs its own `"@type": "@vector"`, and is refused without it. A bare array under the term is unchanged.
+- `{"@value": [...]}` under a term typed `@vector` needs its own `"@type": "@vector"`, and is refused without it. A bare array under the term is unchanged. Every JSON-LD reader refuses an array or map `@value` without a `@json` or `@vector` type: a bulk import and `rdf::parse` used to drop it without an error.
 
 **Check documents that write value objects under a default `@language` or a typed term.** To keep the values they wrote, give each value object the language or datatype it used to take (`{"@value": "obj", "@language": "en"}`), or write the value bare. Data already written stays as it is, so on a ledger that holds `"obj"@en` from `{"@value": "obj"}`:
 
