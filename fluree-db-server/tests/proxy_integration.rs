@@ -3950,3 +3950,131 @@ async fn test_proxy_peer_forwards_a_write() {
     assert_eq!(ledger.t(), 1);
     server_handle.abort();
 }
+
+/// A proxy peer answers in every format the transaction server does, for
+/// SPARQL and JSON-LD alike, with the same bytes. It used to refuse every
+/// format but JSON with 406.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_negotiates_every_query_format() {
+    use fluree_db_api::ReindexOptions;
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let tx_app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let served = tx_app.clone();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, served).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "formats:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let insert = client
+        .post(format!("{server_url}/v1/fluree/upsert/formats:main"))
+        .header("content-type", "text/turtle")
+        .body(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:name \"A\" ; ex:age 1 .\n\
+             ex:b ex:name \"B\" ; ex:age 2 .\n",
+        )
+        .send()
+        .await
+        .expect("insert");
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+    state
+        .fluree
+        .reindex("formats:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+
+    let send = |app: axum::Router,
+                content_type: &'static str,
+                accept: &'static str,
+                body: String| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/query/formats:main")
+                    .header("content-type", content_type)
+                    .header("accept", accept)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    };
+
+    let select = "PREFIX ex: <http://example.org/> \
+                  SELECT ?s ?n WHERE { ?s ex:name ?n } ORDER BY ?n"
+        .to_string();
+    let describe = "PREFIX ex: <http://example.org/> DESCRIBE ex:a".to_string();
+    let construct = "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT { ?s ex:name ?n } WHERE { ?s ex:name ?n }"
+        .to_string();
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?n", "?age"],
+        "where": {"@id": "?s", "ex:name": "?n", "ex:age": "?age"},
+        "orderBy": "?n"
+    })
+    .to_string();
+
+    let cases = [
+        (
+            "application/sparql-query",
+            "application/sparql-results+xml",
+            select.clone(),
+        ),
+        ("application/sparql-query", "text/csv", select.clone()),
+        (
+            "application/sparql-query",
+            "text/tab-separated-values",
+            select.clone(),
+        ),
+        (
+            "application/sparql-query",
+            "application/sparql-results+json",
+            select,
+        ),
+        ("application/sparql-query", "text/turtle", describe.clone()),
+        ("application/sparql-query", "application/rdf+xml", describe),
+        (
+            "application/sparql-query",
+            "application/n-triples",
+            construct,
+        ),
+        ("application/json", "text/csv", jsonld.clone()),
+        ("application/json", "text/tab-separated-values", jsonld),
+    ];
+    for (content_type, accept, body) in cases {
+        let (tx_status, tx_body) = send(tx_app.clone(), content_type, accept, body.clone()).await;
+        assert_eq!(tx_status, StatusCode::OK, "{accept}: {tx_body}");
+        let (peer_status, peer_body) = send(peer_app.clone(), content_type, accept, body).await;
+        assert_eq!(peer_status, StatusCode::OK, "{accept}: {peer_body}");
+        assert_eq!(peer_body, tx_body, "{content_type} as {accept}");
+    }
+
+    server_handle.abort();
+}
