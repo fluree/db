@@ -2409,8 +2409,9 @@ impl FlureeBuilder {
     ///
     /// [`build_client`](Self::build_client) then gives the backend's own
     /// nameservice read-only and runs no background indexer. A file root is
-    /// opened without its WAL and without the startup sweep of staging
-    /// files: both belong to the writer.
+    /// opened without its WAL: the client never applies a log the writer
+    /// left, at startup or on a missing file, and does not sweep its staging
+    /// files. Those are the writer's to recover and clean up.
     pub fn read_only(mut self) -> Self {
         self.read_only = true;
         self
@@ -3597,19 +3598,23 @@ impl FlureeBuilder {
             let mut file_storage = self.file_storage(path.as_ref());
             let reader =
                 self.read_only || matches!(&nameservice, Some(NameServiceMode::ReadOnly(_)));
-            // A query peer must recover the preceding writer's tail without
-            // retaining its WAL lock. Any incidental storage writes remain
-            // durable through per-write flushing and cannot reacquire the WAL.
+            // A client given a read-only nameservice recovers the preceding
+            // writer's tail without retaining its WAL lock. Any incidental
+            // storage writes remain durable through per-write flushing and
+            // cannot reacquire the WAL.
             if reader && file_storage.durability() == fluree_db_core::Durability::Wal {
                 file_storage = file_storage.with_durability(fluree_db_core::Durability::Sync);
             }
             // Client build is startup: take the explicit sweep of
-            // crash-orphaned staging files here, where startup is known.
-            // The staging files are the writer's to clean up.
-            if !self.read_only {
+            // crash-orphaned staging files here, where startup is known, and
+            // recover the WAL. Both are the writer's on a root it is read from.
+            let root_lock = if self.read_only {
+                file_storage = file_storage.without_wal_replay();
+                root_lock
+            } else {
                 file_storage.sweep_orphaned_staging();
-            }
-            let root_lock = Self::recover_holding(&file_storage, root_lock).await?;
+                Self::recover_holding(&file_storage, root_lock).await?
+            };
             let ns_storage = file_storage.clone();
             let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
 

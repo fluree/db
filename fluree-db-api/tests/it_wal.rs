@@ -500,3 +500,38 @@ async fn review_read_only_client_recovers_without_retaining_writer_lock() {
     );
     drop(reader);
 }
+
+/// A `read_only` client reads a root another process writes: it applies none
+/// of the writer's log, which stays for the writer to recover.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_client_leaves_the_writers_log_to_the_writer() {
+    use fluree_db_core::{StorageRead, StorageWrite};
+
+    let dir = tempfile::tempdir().unwrap();
+    let previous = probe(dir.path());
+    previous.hold_wal_segments_for_test().unwrap();
+    previous
+        .write_bytes("fluree:file://payload", b"recover me")
+        .await
+        .unwrap();
+    previous.sync().await.unwrap();
+    previous.simulate_crash_for_test();
+    std::fs::remove_file(dir.path().join("payload")).unwrap();
+
+    let reader = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .read_only()
+        .build_client()
+        .await
+        .unwrap();
+    assert!(
+        !dir.path().join("payload").exists(),
+        "the reader applied the writer's log"
+    );
+    drop(reader);
+
+    let writer = probe(dir.path());
+    assert_eq!(
+        writer.read_bytes("fluree:file://payload").await.unwrap(),
+        b"recover me"
+    );
+}

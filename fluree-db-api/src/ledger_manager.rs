@@ -2531,6 +2531,55 @@ pub struct NsNotify {
     pub record: Option<NsRecord>,
 }
 
+/// The head a cached ledger holds, as [`LedgerManager::follow`] compares
+/// records with it.
+struct CachedHead {
+    t: i64,
+    head: Option<ContentId>,
+    index_t: i64,
+    index: Option<ContentId>,
+}
+
+impl CachedHead {
+    async fn of(handle: &LedgerHandle) -> Self {
+        let state = handle.inner.state.read().await;
+        Self {
+            t: state.t(),
+            head: state.head_commit_id.clone(),
+            index_t: state.index_t(),
+            index: state
+                .ns_record
+                .as_ref()
+                .and_then(|r| r.index_head_id.clone()),
+        }
+    }
+
+    /// Whether `record` moves the cached head forward, or names it with an
+    /// index no lower than the cached one.
+    fn advanced_or_named_by(&self, record: &NsRecord) -> bool {
+        record.commit_t > self.t
+            || (record.commit_t == self.t
+                && record.commit_head_id == self.head
+                && !self.index_lowered_by(record))
+    }
+
+    /// Whether the nameservice's `current` record has replaced the cached
+    /// line: a head at or below the cached `t` other than the cached head,
+    /// or a lower or absent index under the cached head. The nameservice
+    /// only moves a branch back on a reset.
+    fn replaced_by(&self, current: &NsRecord) -> bool {
+        if current.commit_head_id == self.head {
+            self.index_lowered_by(current)
+        } else {
+            current.commit_t <= self.t
+        }
+    }
+
+    fn index_lowered_by(&self, record: &NsRecord) -> bool {
+        self.index.is_some() && (record.index_head_id.is_none() || record.index_t < self.index_t)
+    }
+}
+
 /// Which reloaded state [`LedgerManager::reload_installing`] installs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Install {
@@ -2844,114 +2893,87 @@ impl LedgerManager {
     }
 
     /// Apply a record from the writer's own event stream, as a query peer
-    /// does. The record is authoritative, but it can trail the cached state:
-    /// a load reads the nameservice, which may already be ahead of the
-    /// stream.
+    /// does. The stream is authoritative, but it can trail the cached state:
+    /// a load reads the nameservice, which may already be ahead of it.
     ///
-    /// A record that replaces the cached line reloads the ledger, which goes
-    /// on serving the cached state until the reload lands: a head at the
-    /// cached `t` other than the cached head, a head below it that is not on
-    /// the cached line, or a lower or absent index under the cached head. A
-    /// rebase can do each. Any other record is applied as [`Self::notify`]
-    /// applies it, so one the cached state has already passed changes nothing.
-    pub async fn follow(&self, record: NsRecord) -> Result<NotifyResult> {
+    /// A record that moves the cached head forward, or names it, is applied
+    /// as [`Self::notify`] applies it. Any other record, a head below or
+    /// beside the cached one or a lower index under it, is either one the
+    /// cache has passed or a reset, such as a rebase that moves a branch's
+    /// head back or lowers its index. The nameservice's current record tells
+    /// which: a reset reloads the ledger, which goes on serving the cached
+    /// state until the reload lands.
+    ///
+    /// A record for a ledger that is still loading is followed once the load
+    /// lands, since the load may have read the nameservice before it.
+    pub async fn follow(self: &Arc<Self>, record: NsRecord) -> Result<NotifyResult> {
         let ledger_id = record.ledger_id.clone();
-        let Some(handle) = self.cached_handle(&ledger_id).await else {
-            return Ok(NotifyResult::NotLoaded);
+        let cached = match self.entries.read().await.get(&ledger_id) {
+            Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
+                Some(handle.clone())
+            }
+            Some(LoadState::Loading { .. }) => None,
+            Some(LoadState::Failed { .. }) | None => return Ok(NotifyResult::NotLoaded),
         };
-        if self.replaces_cached_line(&handle, &record).await {
-            tracing::info!(
-                alias = %ledger_id,
-                commit_t = record.commit_t,
-                index_t = record.index_t,
-                "record replaces the cached line; reloading"
-            );
-            // A reload already in flight may have installed nothing.
-            self.reload_installing(&ledger_id, Install::Always).await?;
-            if self.replaces_cached_line(&handle, &record).await {
+        if let Some(handle) = cached {
+            return self.follow_cached(&handle, record).await;
+        }
+        let manager = Arc::clone(self);
+        crate::wasm_compat::spawn_detached(async move {
+            // Joins the load in flight.
+            let Ok(handle) = manager.get_or_load(&ledger_id).await else {
+                return;
+            };
+            if let Err(e) = manager.follow_cached(&handle, record).await {
+                tracing::warn!(
+                    alias = %ledger_id,
+                    error = %e,
+                    "failed to follow a record sent while the ledger loaded"
+                );
+            }
+        });
+        Ok(NotifyResult::NotLoaded)
+    }
+
+    async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
+        let ledger_id = record.ledger_id.clone();
+        if CachedHead::of(handle).await.advanced_or_named_by(&record) {
+            return self.notify_with(record).await;
+        }
+        let Some(current) = self.current_record(&ledger_id).await? else {
+            return Ok(NotifyResult::Current);
+        };
+        if !CachedHead::of(handle).await.replaced_by(&current) {
+            // A record the cache has passed.
+            return self.notify_with(current).await;
+        }
+        tracing::info!(
+            alias = %ledger_id,
+            commit_t = current.commit_t,
+            index_t = current.index_t,
+            "the nameservice replaced the cached line; reloading"
+        );
+        self.reload_installing(&ledger_id, Install::Always).await?;
+        // A reload already in flight installs only a state not behind the
+        // cached one, so it may have installed nothing.
+        if let Some(current) = self.current_record(&ledger_id).await? {
+            if CachedHead::of(handle).await.replaced_by(&current) {
                 self.reload_installing(&ledger_id, Install::Always).await?;
             }
-            return Ok(NotifyResult::Reloaded);
         }
+        Ok(NotifyResult::Reloaded)
+    }
+
+    async fn notify_with(&self, record: NsRecord) -> Result<NotifyResult> {
         self.notify(NsNotify {
-            ledger_id,
+            ledger_id: record.ledger_id.clone(),
             record: Some(record),
         })
         .await
     }
 
-    async fn replaces_cached_line(&self, handle: &LedgerHandle, record: &NsRecord) -> bool {
-        let (local_t, local_head, local_index_t, local_index) = {
-            let state = handle.inner.state.read().await;
-            (
-                state.t(),
-                state.head_commit_id.clone(),
-                state.index_t(),
-                state
-                    .ns_record
-                    .as_ref()
-                    .and_then(|r| r.index_head_id.clone()),
-            )
-        };
-        let Some(local_head) = local_head else {
-            return false;
-        };
-        let Some(record_head) = record.commit_head_id.as_ref() else {
-            return true;
-        };
-        if record.commit_t > local_t {
-            // Catch-up checks that the new commits extend the cached head.
-            return false;
-        }
-        if record.commit_t == local_t {
-            return *record_head != local_head
-                || (local_index.is_some()
-                    && (record.index_head_id.is_none() || record.index_t < local_index_t));
-        }
-        if local_t - record.commit_t > MAX_INCREMENTAL_COMMITS {
-            return true;
-        }
-        match self.cached_line_commit_at(&local_head, record).await {
-            Ok(on_line) => on_line.as_ref() != Some(record_head),
-            Err(e) => {
-                tracing::debug!(
-                    alias = %record.ledger_id,
-                    error = %e,
-                    "cannot walk the cached line; reloading"
-                );
-                true
-            }
-        }
-    }
-
-    /// The commit at `record.commit_t` on the first-parent line of `head`.
-    async fn cached_line_commit_at(
-        &self,
-        head: &ContentId,
-        record: &NsRecord,
-    ) -> Result<Option<ContentId>> {
-        let cs = fluree_db_nameservice::branched_content_store_for_record(
-            &self.backend,
-            self.nameservice_mode.reader(),
-            record,
-        )
-        .await?;
-        let stream = trace_first_parent_commits_by_id(cs, head.clone(), record.commit_t);
-        futures::pin_mut!(stream);
-        let mut oldest = None;
-        while let Some(commit) = futures::StreamExt::next(&mut stream).await {
-            oldest = Some(commit?);
-        }
-        Ok(oldest.and_then(|c| c.parent_ids().next().cloned()))
-    }
-
-    async fn cached_handle(&self, ledger_id: &LedgerId) -> Option<LedgerHandle> {
-        match self.entries.read().await.get(ledger_id) {
-            Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
-                Some(handle.clone())
-            }
-            _ => None,
-        }
+    async fn current_record(&self, ledger_id: &LedgerId) -> Result<Option<NsRecord>> {
+        Ok(self.nameservice_mode.reader().lookup(ledger_id).await?)
     }
 
     /// Returns the cached ledger's current `t`, or `None` if not cached.
