@@ -546,7 +546,6 @@ Each flake is a tuple: `[subject, predicate, object, datatype, operation]`. Oper
 - `400 Bad Request`: Missing or invalid `commit` parameter
 - `401 Unauthorized`: Bearer token required but missing
 - `404 Not Found`: Ledger or commit not found; a `commit` that names no commit is typed `err:db/CommitNotFound`
-- `501 Not Implemented`: Proxy storage mode (no local index available)
 
 **Peer mode:** Forwards to the transactor.
 
@@ -2822,7 +2821,7 @@ GET /info/{ledger-id}
 **Path Parameters:**
 - `ledger-id`: Ledger ID (e.g., "mydb" or "mydb:main")
 
-**Response (non-proxy mode):**
+**Response:**
 
 Returns comprehensive ledger metadata including namespace codes, property stats, and class counts. Always includes:
 
@@ -2861,25 +2860,12 @@ Earlier releases put the tables' row counts in `count`. A client that displays a
 
 When the ledger's config is in a state that does not do what it appears to (shapes no config enables, a setting group whose fields sit in another graph, and so on), the response also carries `configDiagnostics`: a list of `{"code", "message", "subjects"}` entries, `subjects` being the config nodes concerned by IRI. It is omitted when there is nothing to report. The codes are listed under [`fluree info`](../cli/info.md).
 
-**Response (proxy storage mode):**
-
-Returns simplified nameservice-only metadata:
-
-```json
-{
-  "ledger_id": "mydb:main",
-  "t": 42,
-  "commit_head_id": "bafybeig...commitCid",
-  "index_head_id": "bafybeig...indexCid"
-}
-```
-
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `ledger_id` | string | Yes | Canonical ledger ID |
 | `t` | integer | **Yes** | Current transaction time. Used by push/pull for head comparison. |
-| `commitId` | string | No | Head commit CID (non-proxy mode) |
-| `commit_head_id` | string | No | Head commit CID (proxy mode) |
+| `commitId` | string | No | Head commit CID |
+| `indexId` | string | No | Head index root CID |
 
 > **Important:** The `t` field is required by the CLI for push/pull/clone operations — clone and pull read it as a remote-head preflight before requesting a pack. See [Implementing Server Support For Fluree CLI](../cli/server-integration.md#minimum-endpoints-by-cli-feature) for the per-command endpoint contract.
 

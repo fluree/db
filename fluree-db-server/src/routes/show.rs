@@ -138,14 +138,6 @@ async fn show_local(
             }
         };
 
-        // Proxy storage mode cannot decode commits (no local index).
-        if state.config.is_proxy_storage_mode() {
-            set_span_error_code(&span, "error:NotImplemented");
-            return Err(ServerError::NotImplemented(
-                "Commit show is not available in proxy storage mode".to_string(),
-            ));
-        }
-
         let fluree = &state.fluree;
 
         // Parse commit ref: "t:N" → by transaction number, otherwise by prefix/CID

@@ -4078,3 +4078,82 @@ async fn test_proxy_peer_negotiates_every_query_format() {
 
     server_handle.abort();
 }
+
+/// A proxy peer reports a ledger's full metadata, the transaction server's
+/// own: stats, commit and heads. It used to answer with the nameservice
+/// record alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_reports_full_ledger_info() {
+    use fluree_db_api::ReindexOptions;
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let tx_app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let served = tx_app.clone();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, served).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "info:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    for turtle in [
+        "@prefix ex: <http://example.org/> . ex:a a ex:Person ; ex:name \"A\" .",
+        "@prefix ex: <http://example.org/> . ex:b a ex:Person ; ex:name \"B\" .",
+    ] {
+        let insert = client
+            .post(format!("{server_url}/v1/fluree/upsert/info:main"))
+            .header("content-type", "text/turtle")
+            .body(turtle)
+            .send()
+            .await
+            .expect("insert");
+        assert_eq!(insert.status(), reqwest::StatusCode::OK);
+    }
+    state
+        .fluree
+        .reindex("info:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+
+    let info = |app: axum::Router| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/v1/fluree/info/info:main")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    };
+    let (tx_status, tx_info) = info(tx_app).await;
+    assert_eq!(tx_status, StatusCode::OK, "{tx_info}");
+    let (peer_status, peer_info) = info(peer_app).await;
+    assert_eq!(peer_status, StatusCode::OK, "{peer_info}");
+    assert!(peer_info.get("commitId").is_some(), "{peer_info}");
+    assert!(peer_info.get("stats").is_some(), "{peer_info}");
+    assert_eq!(peer_info, tx_info);
+
+    server_handle.abort();
+}
