@@ -425,7 +425,7 @@ A value object (`{"@value": ...}`) takes only the `@type` or `@language` it name
 - Under a term typed `xsd:integer`, `{"@value": "5"}` is the string `"5"`. It was the integer `5`. A number takes its datatype from its value: `{"@value": 5}` under a term typed `xsd:decimal` is the integer `5`.
 - A bare value is unchanged: `"plain"` takes the default language, and `"5"` under the term is the integer.
 
-This applies to every JSON-LD reader: a transaction, a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes. A JSON-LD `where` reads a constant value object the same way, so a pattern written like the insert matches what it stored. A variable written as a value object (`{"@value": "?v", "@t": "?t"}`) keeps its term's datatype, as `"?v"` does.
+This applies to every JSON-LD reader: a transaction, a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes. A JSON-LD `where` reads a constant value object the same way, so a pattern written like the insert matches what it stored. A variable written as a value object (`{"@value": "?v", "@t": "?t"}`) keeps its term's datatype, as `"?v"` does, so it matches only values of that datatype: under a term typed `xsd:integer` it does not return the string that `{"@value": "5"}` writes.
 
 Two documents that were refused are accepted, and one that was accepted is refused:
 
