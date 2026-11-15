@@ -1307,7 +1307,7 @@ fn build_annotation_delete(
     );
     template.insert(
         reifies_iris::PREDICATE.to_string(),
-        predicate_slot(predicate, ctx),
+        predicate_slot(predicate),
     );
     template.insert(reifies_iris::OBJECT.to_string(), object_payload);
     if let Some(lang) = lang_payload {
@@ -1479,7 +1479,7 @@ fn build_annotation_node(
     ann_map.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
     ann_map.insert(
         reifies_iris::PREDICATE.to_string(),
-        predicate_slot(predicate, json_ld),
+        predicate_slot(predicate),
     );
 
     // f:reifiesObject and (optional) f:reifiesLang. For a literal
@@ -1523,7 +1523,7 @@ fn lower_reifies_block(
     };
     let mut included = Vec::new();
     for (i, block) in blocks.into_iter().enumerate() {
-        let slots = reifies_slots(block, json_ld)?;
+        let slots = reifies_slots(block)?;
         if i == 0 {
             map.extend(slots);
         } else {
@@ -1538,16 +1538,55 @@ fn lower_reifies_block(
     Ok(())
 }
 
-/// The slot value naming the edge's predicate, a key as written: resolved as
-/// the parser resolves the key (a term or compact IRI, else against
-/// `@vocab`), not as an `@id`, which falls back to `@base`.
-fn predicate_slot(predicate: &str, json_ld: &ParsedContext) -> Value {
-    json!({"@id": fluree_graph_json_ld::expand_iri_with_vocab(predicate, json_ld, true)})
+/// The label of the node a predicate slot holds until it is resolved: in the
+/// reserved prefix, so a document cannot write it.
+const PREDICATE_HELPER: &str = "_:fluree_ann_predicate";
+
+/// The slot value naming the edge's predicate, a key as written. It is
+/// written as a key, on a helper node in the slot, so the expander resolves
+/// it by the rules and the contexts (scoped ones included) that a key there
+/// gets, rather than as an `@id`, which falls back to `@base`.
+/// [`resolve_predicate_slots`] replaces the helper with the IRI.
+fn predicate_slot(predicate: &str) -> Value {
+    json!({ predicate: {"@id": PREDICATE_HELPER} })
+}
+
+/// Replace each predicate slot's helper node (see [`predicate_slot`]) with a
+/// reference to the IRI its one key expanded to. Runs on the expansion of a
+/// lowered document, before its statements are built.
+pub(crate) fn resolve_predicate_slots(expanded: &mut Value) {
+    match expanded {
+        Value::Object(map) => {
+            if let Some(Value::Array(values)) = map.get_mut(reifies_iris::PREDICATE) {
+                for value in values.iter_mut() {
+                    let iri = value.as_object().and_then(|helper| {
+                        let mut keys = helper.keys().filter(|k| !k.starts_with('@'));
+                        match (keys.next(), keys.next()) {
+                            (Some(iri), None) if !helper.contains_key("@id") => Some(iri.clone()),
+                            _ => None,
+                        }
+                    });
+                    if let Some(iri) = iri {
+                        *value = json!({"@id": iri});
+                    }
+                }
+            }
+            for value in map.values_mut() {
+                resolve_predicate_slots(value);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                resolve_predicate_slots(item);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// The `f:reifies*` slots naming the one triple a `@reifies` block
 /// describes: `{"@id": s, p: o}`.
-fn reifies_slots(block: Value, json_ld: &ParsedContext) -> Result<Map<String, Value>> {
+fn reifies_slots(block: Value) -> Result<Map<String, Value>> {
     let Value::Object(block) = block else {
         return Err(TransactError::Parse(
             "@reifies value must be a JSON object describing a triple".to_string(),
@@ -1611,7 +1650,7 @@ fn reifies_slots(block: Value, json_ld: &ParsedContext) -> Result<Map<String, Va
     slots.insert(reifies_iris::SUBJECT.to_string(), json!({"@id": subject}));
     slots.insert(
         reifies_iris::PREDICATE.to_string(),
-        predicate_slot(predicate, json_ld),
+        predicate_slot(predicate),
     );
     let (object, lang) = emit_reifies_object_payload(&shape);
     slots.insert(reifies_iris::OBJECT.to_string(), object);
@@ -2988,7 +3027,7 @@ mod tests {
         );
         assert_eq!(
             sibling.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"@id": "http://example.org/worksFor"})
+            &json!({"ex:worksFor": {"@id": PREDICATE_HELPER}})
         );
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
@@ -3196,7 +3235,7 @@ mod tests {
         );
         assert_eq!(
             t.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"@id": "ex:name"})
+            &json!({"ex:name": {"@id": PREDICATE_HELPER}})
         );
         assert_eq!(
             t.get(reifies_iris::OBJECT).unwrap(),
@@ -3390,6 +3429,33 @@ mod tests {
         assert!(err.to_string().contains("system-controlled"));
     }
 
+    /// A predicate slot resolves where its edge's key does: expanded with the
+    /// lowered document, a property-scoped term names its own IRI there.
+    #[test]
+    fn predicate_slot_resolves_with_the_scoped_context_of_its_edge() {
+        let mut doc = json!({
+            "@context": {
+                "@vocab": "http://outer.example/",
+                "child": {"@id": "http://example.org/child", "@context": {"p": "http://inner.example/p"}}
+            },
+            "@id": "http://example.org/parent",
+            "child": {"@id": "http://example.org/s", "p": {
+                "@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}}}
+        });
+        lower_edge_annotations(&mut doc).unwrap();
+        let mut expanded = fluree_graph_json_ld::expand(&doc).unwrap();
+        resolve_predicate_slots(&mut expanded);
+        let text = expanded.to_string();
+        assert!(
+            text.contains(&format!(
+                r#""{}":[{{"@id":"http://inner.example/p"}}]"#,
+                reifies_iris::PREDICATE
+            )),
+            "{expanded:#}"
+        );
+        assert!(!text.contains(PREDICATE_HELPER), "{expanded:#}");
+    }
+
     /// W9: the lowering's anonymous annotation nodes are `_:fluree_ann_N`; a
     /// user node labelled that way would merge with one of them.
     #[test]
@@ -3430,7 +3496,7 @@ mod tests {
         assert_eq!(included[0]["@id"], "ex:employment-1");
         assert_eq!(
             included[0][reifies_iris::PREDICATE],
-            json!({"@id": "ex:age"})
+            json!({"ex:age": {"@id": PREDICATE_HELPER}})
         );
         assert_eq!(included[0][reifies_iris::OBJECT], json!({"@value": 42}));
         assert!(

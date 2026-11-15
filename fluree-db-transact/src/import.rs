@@ -1585,8 +1585,11 @@ mod inner {
             let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
             crate::parse::edge_annotations::check_then_lower(&mut doc, &top_ctx, false, false)?;
         }
-        let refuse_reserved = |expanded: &serde_json::Value| {
+        // What each expansion goes through: the lowering's predicate slots
+        // resolved, or, for a document the lowering did not touch, the check.
+        let after_expansion = |expanded: &mut serde_json::Value| {
             if needs_lowering {
+                crate::parse::edge_annotations::resolve_predicate_slots(expanded);
                 Ok(())
             } else {
                 crate::parse::edge_annotations::refuse_reserved_iris(expanded)
@@ -1604,8 +1607,8 @@ mod inner {
         let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
         match &shared {
             None => {
-                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
-                refuse_reserved(&expanded)?;
+                let mut expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                after_expansion(&mut expanded)?;
                 write_jsonld_document(
                     &expanded,
                     &mut sink,
@@ -1624,8 +1627,8 @@ mod inner {
                 // chunk. Any other line expands, and resolves its graph
                 // names, as the document it is.
                 let lines = ndjson_lines(&doc)?;
-                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
-                refuse_reserved(&expanded)?;
+                let mut expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                after_expansion(&mut expanded)?;
                 let serde_json::Value::Array(expanded) = expanded else {
                     return Err(not_an_ndjson_chunk());
                 };
@@ -1638,8 +1641,9 @@ mod inner {
                         plain.push(expanded);
                         continue;
                     }
-                    let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
+                    let mut expanded = fluree_graph_json_ld::expand_with_context(line, shared)
                         .map_err(expand_error)?;
+                    after_expansion(&mut expanded)?;
                     write_jsonld_document(
                         &expanded,
                         &mut sink,

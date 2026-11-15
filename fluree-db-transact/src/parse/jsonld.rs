@@ -216,14 +216,21 @@ fn parse_rooted(
         TxnType::Insert | TxnType::Upsert => parse_data(
             &lowered,
             &root,
-            !annotated,
+            ExpandedPass::for_document(annotated),
             txn_type,
             opts,
             ns_registry,
             ledger_id,
             request_graph,
         )?,
-        TxnType::Update => parse_update(&lowered, &root, !annotated, opts, ns_registry, ledger_id)?,
+        TxnType::Update => parse_update(
+            &lowered,
+            &root,
+            ExpandedPass::for_document(annotated),
+            opts,
+            ns_registry,
+            ledger_id,
+        )?,
     };
     if annotated {
         refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
@@ -446,7 +453,7 @@ fn names_a_node(expanded: &Value) -> bool {
 fn parse_data(
     json: &Value,
     context: &ParsedContext,
-    refuse_reserved: bool,
+    pass: ExpandedPass,
     txn_type: TxnType,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
@@ -460,10 +467,8 @@ fn parse_data(
 
     // Strip top-level `opts` so it is not expanded as data (single-object form)
     let json_for_expand = strip_opts_for_expansion(json, context)?;
-    let expanded = expand_with_root_context(&json_for_expand, context, strict)?;
-    if refuse_reserved {
-        super::edge_annotations::refuse_reserved_iris(&expanded)?;
-    }
+    let mut expanded = expand_with_root_context(&json_for_expand, context, strict)?;
+    pass.apply(&mut expanded)?;
 
     let no_aliases = HashMap::new();
     let mut blanks = BlankIssuer::default();
@@ -533,7 +538,7 @@ fn parse_data(
 fn parse_update(
     json: &Value,
     context: &ParsedContext,
-    refuse_reserved: bool,
+    pass: ExpandedPass,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
@@ -589,7 +594,7 @@ fn parse_update(
             obj,
             context,
             strict,
-            refuse_reserved,
+            pass,
             object_var_parsing,
             &from_named_aliases,
             ns_registry,
@@ -700,7 +705,7 @@ fn parse_update_clauses(
     obj: &serde_json::Map<String, Value>,
     context: &ParsedContext,
     strict: bool,
-    refuse_reserved: bool,
+    pass: ExpandedPass,
     object_var_parsing: bool,
     from_named_aliases: &HashMap<String, String>,
     ns_registry: &mut NamespaceRegistry,
@@ -766,7 +771,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
-        ctx.refuse_reserved = refuse_reserved;
+        ctx.pass = pass;
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -813,7 +818,7 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
-        ctx.refuse_reserved = refuse_reserved;
+        ctx.pass = pass;
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
             // As with delete: `"insert": []` is a no-op, an empty node is not.
@@ -1163,6 +1168,39 @@ pub(crate) enum GraphRole {
     UpdateDefault,
 }
 
+/// What a document's expansion goes through before its statements are built.
+#[derive(Clone, Copy, Debug, Default)]
+enum ExpandedPass {
+    #[default]
+    None,
+    /// The document as written: refuse reserved predicates in it.
+    RefuseReserved,
+    /// The annotation lowering's output, already checked as written:
+    /// resolve the predicate slots the lowering wrote.
+    ResolvePredicateSlots,
+}
+
+impl ExpandedPass {
+    fn for_document(annotated: bool) -> Self {
+        if annotated {
+            Self::ResolvePredicateSlots
+        } else {
+            Self::RefuseReserved
+        }
+    }
+
+    fn apply(self, expanded: &mut Value) -> Result<()> {
+        match self {
+            Self::None => Ok(()),
+            Self::RefuseReserved => super::edge_annotations::refuse_reserved_iris(expanded),
+            Self::ResolvePredicateSlots => {
+                super::edge_annotations::resolve_predicate_slots(expanded);
+                Ok(())
+            }
+        }
+    }
+}
+
 struct TemplateParseCtx<'a> {
     context: &'a ParsedContext,
     vars: &'a mut VarRegistry,
@@ -1180,8 +1218,9 @@ struct TemplateParseCtx<'a> {
     fixed_root: Option<GraphScope>,
     /// The document's anonymous-node labels.
     blanks: &'a mut BlankIssuer,
-    /// Refuse reserved predicates in what this clause expands to.
-    refuse_reserved: bool,
+    /// What this clause's expansion goes through before its templates are
+    /// built.
+    pass: ExpandedPass,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -1210,16 +1249,14 @@ impl<'a> TemplateParseCtx<'a> {
             role,
             fixed_root: None,
             blanks,
-            refuse_reserved: false,
+            pass: ExpandedPass::None,
         }
     }
 
     /// Expand a JSON-LD document, respecting strict policy.
     fn expand_document(&self, json: &Value) -> std::result::Result<Value, TransactError> {
-        let expanded = expand_with_context_policy(json, self.context, self.strict_compact_iri)?;
-        if self.refuse_reserved {
-            super::edge_annotations::refuse_reserved_iris(&expanded)?;
-        }
+        let mut expanded = expand_with_context_policy(json, self.context, self.strict_compact_iri)?;
+        self.pass.apply(&mut expanded)?;
         Ok(expanded)
     }
 
@@ -2910,7 +2947,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2936,7 +2973,7 @@ mod tests {
         let err = parse_update(
             &cypher_envelope,
             &top_context(&cypher_envelope).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2955,7 +2992,7 @@ mod tests {
         let err = parse_update(
             &where_only,
             &top_context(&where_only).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2974,7 +3011,7 @@ mod tests {
         let txn = parse_update(
             &explicit_empty_delete,
             &top_context(&explicit_empty_delete).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3003,7 +3040,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3035,7 +3072,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -3067,7 +3104,7 @@ mod tests {
         let txn = parse_update(
             &json,
             &top_context(&json).unwrap(),
-            true,
+            ExpandedPass::RefuseReserved,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -5313,5 +5350,48 @@ mod tests {
             assert_eq!(read, "http://example.org/doc#Person", "{doc}");
             assert_eq!(written, read, "{doc}");
         }
+    }
+
+    /// A key defined in a property-scoped context names the edge's predicate
+    /// in its annotation's link as it does in the edge: the slot is resolved
+    /// where the parser resolves the key, not against the document's top
+    /// context.
+    #[test]
+    fn an_annotation_links_a_scoped_term_as_its_edge_names_it() {
+        let doc = json!({
+            "@context": {
+                "@vocab": "http://outer.example/",
+                "child": {"@id": "http://example.org/child", "@context": {"p": "http://inner.example/p"}}
+            },
+            "@id": "http://example.org/parent",
+            "child": {"@id": "http://example.org/s", "p": {
+                "@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}}}
+        });
+        let mut ns = test_registry();
+        let txn = parse_transaction(
+            &doc,
+            TxnType::Insert,
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap();
+        let expected = ns.sid_for_iri("http://inner.example/p");
+        let link = txn
+            .insert_templates
+            .iter()
+            .find_map(|t| match &t.object {
+                TemplateTerm::TripleTerm(term) => match &term.p {
+                    TemplateTerm::Sid(p) => Some(p.clone()),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .expect("a link");
+        assert_eq!(link, expected);
+        assert!(txn
+            .insert_templates
+            .iter()
+            .any(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == expected)));
     }
 }
