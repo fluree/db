@@ -957,15 +957,7 @@ fn parse_property(
             }
             let parsed = parse_value_object(obj, ctx.ctx, ctx.object_var_parsing)?;
             let object = parsed.term;
-
-            // Determine the datatype constraint for the triple pattern.
-            // parsed.dtc (from explicit @type or @language) takes precedence
-            // over the context-level dt_iri.
-            let pattern_dtc = parsed.dtc.or_else(|| {
-                dt_iri
-                    .as_deref()
-                    .map(|iri| UnresolvedDatatypeConstraint::Explicit(Arc::from(iri)))
-            });
+            let pattern_dtc = value_object_dtc(parsed.dtc, &object, dt_iri.as_deref());
 
             // Build the triple pattern
             let pattern = if is_reverse {
@@ -1349,8 +1341,8 @@ fn parse_edge_annotation(
 ///
 /// Mirrors [`parse_edge_annotation`] but threads the literal through
 /// `parse_value_object` so the base edge carries an
-/// `UnresolvedDatatypeConstraint` derived from `@type` (explicit or
-/// context-coerced) or `@language`. Without that constraint,
+/// `UnresolvedDatatypeConstraint` derived from the value object's own
+/// `@type` or `@language`. Without that constraint,
 /// same-lexical literals of different datatypes (or languages) would
 /// cross-match annotations through the `f:reifiesObject` lookup.
 ///
@@ -1446,12 +1438,7 @@ fn parse_literal_edge_annotation(
     }
 
     let object = parsed.term;
-
-    // dtc precedence: the value object's parsed `@type`/`@language`
-    // wins; the predicate's context-level dt_iri is the fallback.
-    let pattern_dtc = parsed
-        .dtc
-        .or_else(|| dt_iri.map(|iri| UnresolvedDatatypeConstraint::Explicit(Arc::from(iri))));
+    let pattern_dtc = value_object_dtc(parsed.dtc, &object, dt_iri);
 
     let mut edge = UnresolvedTriplePattern::new(subject.clone(), predicate, object);
     edge.dtc = pattern_dtc;
@@ -1653,6 +1640,22 @@ struct ParsedValueObject {
     /// binding or a boolean constant filter (`true` = assert,
     /// `false` = retract).
     op_var: Option<OpAnnotation>,
+}
+
+/// A value object's datatype constraint. A constant `@value` is taken as
+/// written, as a transaction writes it: JSON-LD gives a term's `@type` only
+/// to a bare value. A variable stands where a bare value would, so it keeps
+/// the term's datatype, as `"?v"` does.
+fn value_object_dtc(
+    explicit: Option<UnresolvedDatatypeConstraint>,
+    object: &UnresolvedTerm,
+    term_dt: Option<&str>,
+) -> Option<UnresolvedDatatypeConstraint> {
+    explicit.or_else(|| {
+        term_dt
+            .filter(|_| object.is_var())
+            .map(|iri| UnresolvedDatatypeConstraint::Explicit(Arc::from(iri)))
+    })
 }
 
 /// `@op` annotation parsed from a value object.
