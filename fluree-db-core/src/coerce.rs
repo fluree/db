@@ -971,6 +971,22 @@ mod tests {
         ));
     }
 
+    /// A number of 16 or more significant digits reads as the nearest double,
+    /// not its neighbour, and as a decimal keeps the digits written
+    /// (serde_json's default parser read this one as `…224`).
+    #[test]
+    fn a_full_precision_number_reads_as_the_nearest_double() {
+        let json: serde_json::Value = serde_json::from_str("0.9452706955539223").unwrap();
+        let Ok(FlakeValue::Double(d)) = coerce_json_value(&json, xsd::DOUBLE) else {
+            panic!("expected a double");
+        };
+        assert_eq!(d.to_bits(), 0.945_270_695_553_922_3_f64.to_bits());
+        let Ok(FlakeValue::Decimal(dec)) = coerce_json_value(&json, xsd::DECIMAL) else {
+            panic!("expected a decimal");
+        };
+        assert_eq!(dec.to_string(), "0.9452706955539223");
+    }
+
     #[test]
     fn test_coerce_json_number_to_integer() {
         let json = serde_json::json!(42);
