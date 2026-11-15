@@ -209,6 +209,82 @@ fn default_literal_datatype(value: &FlakeValue) -> Option<Sid> {
     Some(Sid::new(XSD, name))
 }
 
+/// A JSON-LD condition as the executor parses it: an object whose `ask`, the
+/// preferred spelling, is its `where`, selecting `?$this` with limit 1.
+fn jsonld_condition(source: &str) -> PolicyResult<serde_json::Value> {
+    let mut query_json: serde_json::Value = serde_json::from_str(source).map_err(|e| {
+        fluree_db_policy::PolicyError::QueryExecution {
+            message: format!("Invalid policy query JSON: {e}"),
+        }
+    })?;
+    let obj = query_json.as_object_mut().ok_or_else(|| {
+        fluree_db_policy::PolicyError::QueryExecution {
+            message: "Policy query must be a JSON object".to_string(),
+        }
+    })?;
+    // The `ask` value IS a where-pattern, so it normalizes onto the same
+    // existence check as the legacy `{"where": ...}` form. Both keys together
+    // is ambiguous and fails closed (deny).
+    if let Some(ask) = obj.remove("ask") {
+        if obj.contains_key("where") {
+            return Err(fluree_db_policy::PolicyError::QueryExecution {
+                message: "Policy query cannot carry both 'ask' and 'where'".to_string(),
+            });
+        }
+        obj.insert("where".to_string(), ask);
+    }
+    obj.insert(
+        "select".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::String("?$this".to_string())]),
+    );
+    obj.insert("limit".to_string(), serde_json::Value::from(1));
+    Ok(query_json)
+}
+
+/// Calls `visit` on each pattern `query` evaluates, as
+/// [`crate::ir::walk::for_each_pattern`] does, without the bindings an
+/// evaluation seeds: `?$this`, `?$identity` and the rest stay variables.
+/// Returns `false` when the patterns cannot be told: a Cypher condition, one
+/// that does not parse, or SPARQL in a process without SPARQL support.
+pub fn for_each_condition_pattern(
+    query: &PolicyQuery,
+    snapshot: &LedgerSnapshot,
+    visit: &mut dyn FnMut(&Pattern),
+) -> bool {
+    let mut vars = VarRegistry::new();
+    match query.language {
+        PolicyQueryLanguage::JsonLd => {
+            let Ok(json) = jsonld_condition(&query.source) else {
+                return false;
+            };
+            // A condition with no pattern reads nothing.
+            if json.get("where").is_none() {
+                return true;
+            }
+            match crate::parse::parse_query(&json, snapshot, &mut vars, None) {
+                Ok(parsed) => {
+                    crate::ir::walk::for_each_pattern(&parsed, visit);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        PolicyQueryLanguage::Sparql => {
+            let Some(support) = crate::lang_support::sparql_support() else {
+                return false;
+            };
+            match (support.lower_policy_query)(&query.source, snapshot, &mut vars) {
+                Ok(patterns) => {
+                    crate::ir::walk::for_each_pattern_in(&patterns, visit);
+                    true
+                }
+                Err(_) => false,
+            }
+        }
+        _ => false,
+    }
+}
+
 impl QueryPolicyExecutor<'_> {
     /// Async implementation of policy query evaluation
     async fn evaluate_async(
@@ -311,37 +387,10 @@ impl QueryPolicyExecutor<'_> {
         // - select forced to ["?$this"]
         // - limit forced to 1
         // - VALUES injected into WHERE for special variables (?$this, ?$identity, etc.)
-        let mut query_json: serde_json::Value = serde_json::from_str(source).map_err(|e| {
-            fluree_db_policy::PolicyError::QueryExecution {
-                message: format!("Invalid policy query JSON: {e}"),
-            }
-        })?;
-
-        let obj = query_json.as_object_mut().ok_or_else(|| {
-            fluree_db_policy::PolicyError::QueryExecution {
-                message: "Policy query must be a JSON object".to_string(),
-            }
-        })?;
-
-        // Accept the query language's `ask` form as the preferred spelling
-        // of a condition — its value IS a where-pattern, so it normalizes
-        // onto the same existence-check path as the legacy `{"where": ...}`
-        // form. Both keys together is ambiguous and fails closed (deny).
-        if let Some(ask) = obj.remove("ask") {
-            if obj.contains_key("where") {
-                return Err(fluree_db_policy::PolicyError::QueryExecution {
-                    message: "Policy query cannot carry both 'ask' and 'where'".to_string(),
-                });
-            }
-            obj.insert("where".to_string(), ask);
-        }
-
-        // Force select + limit for policy queries
-        obj.insert(
-            "select".to_string(),
-            serde_json::Value::Array(vec![serde_json::Value::String("?$this".to_string())]),
-        );
-        obj.insert("limit".to_string(), serde_json::Value::from(1));
+        let mut query_json = jsonld_condition(source)?;
+        let obj = query_json
+            .as_object_mut()
+            .expect("jsonld_condition returns an object");
 
         // Build VALUES clause JSON for the ref-valued special variables
         // (?$this, ?$identity, custom policy values). Inject VALUES into
@@ -646,5 +695,45 @@ mod tests {
         // A regular ref seeds itself.
         let real = FlakeValue::Ref(Sid::new(XSD, "someSubject"));
         assert!(matches!(binding_for_value(&real), Binding::Sid { .. }));
+    }
+
+    /// A condition's patterns are told for JSON-LD, `ask` included, and an
+    /// empty condition reads nothing; one that cannot be read says so.
+    #[test]
+    fn a_conditions_patterns_are_told_or_refused() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let walk = |source: &str, language| {
+            let query = PolicyQuery {
+                source: source.to_string(),
+                language,
+                state: ConditionState::Pre,
+            };
+            let mut triples = 0;
+            let told = for_each_condition_pattern(&query, &snapshot, &mut |p| {
+                triples += usize::from(matches!(p, Pattern::Triple(_)));
+            });
+            told.then_some(triples)
+        };
+        let ex = r#""http://example.org/p": "?o""#;
+        assert_eq!(
+            walk(
+                &format!(r#"{{"where": {{"@id": "?$this", {ex}}}}}"#),
+                PolicyQueryLanguage::JsonLd
+            ),
+            Some(1)
+        );
+        assert_eq!(
+            walk(
+                &format!(r#"{{"ask": {{"@id": "?$this", {ex}}}}}"#),
+                PolicyQueryLanguage::JsonLd
+            ),
+            Some(1)
+        );
+        assert_eq!(walk("{}", PolicyQueryLanguage::JsonLd), Some(0));
+        assert_eq!(walk("not json", PolicyQueryLanguage::JsonLd), None);
+        assert_eq!(
+            walk("MATCH (n) RETURN n", PolicyQueryLanguage::Cypher),
+            None
+        );
     }
 }

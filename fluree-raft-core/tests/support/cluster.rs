@@ -43,6 +43,17 @@ pub async fn start_node<A: AppStateMachine>(
     tune: impl FnOnce(&mut RaftGroupConfig),
 ) -> Node<A> {
     let dir = tempfile::tempdir().expect("tempdir");
+    start_node_in(id, group_id, dir, tune).await
+}
+
+/// [`start_node`] with storage under `dir`, for a test that reads the
+/// node's files.
+pub async fn start_node_in<A: AppStateMachine>(
+    id: NodeId,
+    group_id: &GroupId,
+    dir: tempfile::TempDir,
+    tune: impl FnOnce(&mut RaftGroupConfig),
+) -> Node<A> {
     let mut config = RaftGroupConfig::new(group_id.clone(), id, dir.path());
     tune(&mut config);
     let config = config;
