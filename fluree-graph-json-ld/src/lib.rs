@@ -90,6 +90,21 @@ pub fn parse_context(context: &JsonValue) -> Result<ParsedContext> {
     ParsedContext::parse(None, context)
 }
 
+/// A context object with Fluree's `@base` fallback applied, as JSON-LD
+/// transactions and queries read their contexts: with an `@base` and no
+/// `@vocab`, the base is the vocabulary too.
+pub fn with_base_as_vocab(context: &JsonValue) -> JsonValue {
+    let JsonValue::Object(map) = context else {
+        return context.clone();
+    };
+    let Some(base) = map.get("@base").filter(|_| !map.contains_key("@vocab")) else {
+        return context.clone();
+    };
+    let mut out = map.clone();
+    out.insert("@vocab".to_string(), base.clone());
+    JsonValue::Object(out)
+}
+
 /// Parse a context with a base context.
 ///
 /// # Arguments
@@ -282,6 +297,18 @@ pub fn expand_with_context_policy(
     strict: bool,
 ) -> Result<JsonValue> {
     expand::node_impl(node_map, context, strict)
+}
+
+/// Expand a document whose top-level `@context` the caller has already parsed
+/// into `root`, so that `@context` is not applied a second time. Contexts
+/// nested in the document apply as usual. Strict or permissive as
+/// [`expand_with_context_policy`].
+pub fn expand_with_root_context(
+    doc: &JsonValue,
+    root: &ParsedContext,
+    strict: bool,
+) -> Result<JsonValue> {
+    expand::root_impl(doc, root, strict)
 }
 
 /// Compact an IRI using a context.

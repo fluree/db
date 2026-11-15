@@ -128,18 +128,21 @@ fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
     let top_ctx = json
         .as_object()
         .and_then(|m| m.get("@context").or_else(|| m.get("context")))
-        .map(|v| fluree_graph_json_ld::parse_context(&normalize_context_value(v)))
+        .map(|v| fluree_graph_json_ld::parse_context(&fluree_graph_json_ld::with_base_as_vocab(v)))
         .transpose()
         .map_err(|e| ParseError::InvalidWhere(format!("failed to parse @context: {e}")))?
         .unwrap_or_else(fluree_graph_json_ld::ParsedContext::new);
-    scan_query_for_reifies_iris(json, &top_ctx)
+    // `top_ctx` already holds the query's own `@context`.
+    match json {
+        JsonValue::Object(map) => scan_query_entries(map, &top_ctx),
+        _ => scan_query_for_reifies_iris(json, &top_ctx),
+    }
 }
 
 fn scan_query_for_reifies_iris(
     value: &JsonValue,
     context: &fluree_graph_json_ld::ParsedContext,
 ) -> Result<()> {
-    use fluree_vocab::reifies_iris;
     match value {
         JsonValue::Object(map) => {
             // Honor per-node `@context` overrides for compact-IRI
@@ -149,7 +152,7 @@ fn scan_query_for_reifies_iris(
                     Some(
                         fluree_graph_json_ld::parse_context_with_base(
                             context,
-                            &normalize_context_value(local),
+                            &fluree_graph_json_ld::with_base_as_vocab(local),
                         )
                         .map_err(|e| {
                             ParseError::InvalidWhere(format!(
@@ -160,25 +163,7 @@ fn scan_query_for_reifies_iris(
                 } else {
                     None
                 };
-            let effective = merged.as_ref().unwrap_or(context);
-
-            for (k, v) in map {
-                if k == "@context" || k == "context" {
-                    continue;
-                }
-                let expanded_key = if k.starts_with('@') {
-                    k.clone()
-                } else {
-                    fluree_graph_json_ld::expand_iri(k, effective)
-                };
-                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
-                    return Err(ParseError::InvalidWhere(format!(
-                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
-                         use @annotation or @reifies in queries instead"
-                    )));
-                }
-                scan_query_for_reifies_iris(v, effective)?;
-            }
+            scan_query_entries(map, merged.as_ref().unwrap_or(context))?;
         }
         JsonValue::Array(items) => {
             for item in items {
@@ -196,7 +181,10 @@ fn scan_query_for_reifies_iris(
             // to one of the seven reserved IRIs, so this cannot reject
             // real input.
             let expanded = fluree_graph_json_ld::expand_iri(s, context);
-            if reifies_iris::ALL.iter().any(|iri| *iri == expanded) {
+            if fluree_vocab::reifies_iris::ALL
+                .iter()
+                .any(|iri| *iri == expanded)
+            {
                 return Err(ParseError::InvalidWhere(format!(
                     "value '{s}' resolves to a system-controlled predicate '{expanded}'; \
                      use @annotation or @reifies in queries instead"
@@ -204,6 +192,33 @@ fn scan_query_for_reifies_iris(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The firewall over one object's entries, resolved against `effective`,
+/// which already holds the object's own `@context`.
+fn scan_query_entries(
+    map: &serde_json::Map<String, JsonValue>,
+    effective: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    use fluree_vocab::reifies_iris;
+    for (k, v) in map {
+        if k == "@context" || k == "context" {
+            continue;
+        }
+        let expanded_key = if k.starts_with('@') {
+            k.clone()
+        } else {
+            fluree_graph_json_ld::expand_iri(k, effective)
+        };
+        if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+            return Err(ParseError::InvalidWhere(format!(
+                "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                 use @annotation or @reifies in queries instead"
+            )));
+        }
+        scan_query_for_reifies_iris(v, effective)?;
     }
     Ok(())
 }
@@ -231,7 +246,7 @@ pub(crate) fn parse_query_ast_internal(
         .or_else(|| obj.get("context"))
         .unwrap_or(&JsonValue::Null);
 
-    let context = parse_context(&normalize_context_value(context_val))?;
+    let context = parse_context(&fluree_graph_json_ld::with_base_as_vocab(context_val))?;
 
     // Resolve parse policy BEFORE extracting path aliases so that any
     // compact IRIs inside @path expressions honor `opts.strictCompactIri`.
@@ -482,19 +497,6 @@ fn parse_query_body(
     }
 
     Ok((query, select_mode))
-}
-
-pub(crate) fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
-    if let JsonValue::Object(map) = context_val {
-        if let Some(base) = map.get("@base") {
-            if !map.contains_key("@vocab") {
-                let mut out = map.clone();
-                out.insert("@vocab".to_string(), base.clone());
-                return JsonValue::Object(out);
-            }
-        }
-    }
-    context_val.clone()
 }
 
 /// Extract `@path` term definitions from the raw context JSON.

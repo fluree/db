@@ -831,46 +831,53 @@ fn expand_node_internal(
         }
 
         JsonValue::Object(map) => {
-            // Parse local context if present
-            let local_context = get_context(map);
-            let merged_context = if let Some(lc) = local_context {
-                Cow::Owned(ParsedContext::parse(Some(context), lc)?)
-            } else {
-                Cow::Borrowed(context)
+            let merged_context = match get_context(map) {
+                Some(lc) => Cow::Owned(ParsedContext::parse(Some(context), lc)?),
+                None => Cow::Borrowed(context),
             };
-
-            // Parse @type and get updated context
-            let (types, context_with_types, propagates) = parse_type(map, &merged_context, strict)?;
-
-            // Build result
-            let mut result = Map::new();
-
-            // Add @type if present
-            if !types.is_empty() {
-                result.insert("@type".to_string(), json!(types));
-            }
-
-            // Process other keys
-            let type_key = merged_context.type_key.clone();
-            let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
-            let keys = NodeKeys {
-                context: &context_with_types,
-                nodes: if propagates {
-                    &context_with_types
-                } else {
-                    &merged_context
-                },
-                type_key: &type_key,
-                type_id: type_id.as_deref(),
-                strict,
-            };
-            expand_node_entries(map, &keys, path, false, &mut result)?;
-
-            Ok(JsonValue::Object(result))
+            expand_object(map, &merged_context, path, strict)
         }
 
         _ => Ok(node_map.clone()),
     }
+}
+
+/// Expand node object `map` against `merged_context`, which already holds the
+/// node's own `@context`.
+fn expand_object(
+    map: &Map<String, JsonValue>,
+    merged_context: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<JsonValue> {
+    // Parse @type and get updated context
+    let (types, context_with_types, propagates) = parse_type(map, merged_context, strict)?;
+
+    // Build result
+    let mut result = Map::new();
+
+    // Add @type if present
+    if !types.is_empty() {
+        result.insert("@type".to_string(), json!(types));
+    }
+
+    // Process other keys
+    let type_key = merged_context.type_key.clone();
+    let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
+    let keys = NodeKeys {
+        context: &context_with_types,
+        nodes: if propagates {
+            &context_with_types
+        } else {
+            merged_context
+        },
+        type_key: &type_key,
+        type_id: type_id.as_deref(),
+        strict,
+    };
+    expand_node_entries(map, &keys, path, false, &mut result)?;
+
+    Ok(JsonValue::Object(result))
 }
 
 /// What a node object's entries expand against.
@@ -1130,6 +1137,20 @@ pub(crate) fn node_impl(
     }
 }
 
+/// Expand a document whose root context the caller has already parsed:
+/// `root` holds the root object's own `@context`, which is not applied again.
+/// An array has no root object, so each item applies its own `@context`.
+pub(crate) fn root_impl(doc: &JsonValue, root: &ParsedContext, strict: bool) -> Result<JsonValue> {
+    let JsonValue::Object(map) = doc else {
+        return node_impl(doc, root, strict);
+    };
+    if let Some(key) = crate::graph_shape::envelope_graph_key(map)? {
+        return expand_node_internal(&map[key], root, &Path::ROOT.key(key), strict);
+    }
+    guard_depth(&Path::ROOT)?;
+    expand_object(map, root, &Path::ROOT, strict)
+}
+
 /// Expand the contents of an envelope's `@graph` under the envelope's own
 /// `@context`.
 fn expand_envelope(
@@ -1320,6 +1341,32 @@ mod tests {
         assert_eq!(nicks.len(), 3);
         // @set should be flattened (no @set wrapper)
         assert!(nicks[0].get("@value").is_some());
+    }
+
+    /// A document whose root context the caller already parsed is expanded
+    /// against it without applying its `@context` again: a relative `@base`
+    /// applied twice would resolve against itself.
+    #[test]
+    fn a_parsed_root_context_is_not_applied_again() {
+        let initial = ParsedContext {
+            base: Some("http://example.org/a/".to_string()),
+            ..ParsedContext::new()
+        };
+        let doc = json!({"@context": {"@base": "b/"}, "@id": "x", "http://example.org/p": 1});
+        let root = ParsedContext::parse(Some(&initial), &doc["@context"]).unwrap();
+        let once =
+            json!({"@id": "http://example.org/a/b/x", "http://example.org/p": [{"@value": 1}]});
+        assert_eq!(
+            crate::expand_with_root_context(&doc, &root, false).unwrap(),
+            once
+        );
+        assert_eq!(node(&doc, &initial).unwrap(), once);
+
+        let envelope = json!({"@context": {"@base": "b/"}, "@graph": [{"@id": "x", "http://example.org/p": 1}]});
+        assert_eq!(
+            crate::expand_with_root_context(&envelope, &root, false).unwrap(),
+            json!([once])
+        );
     }
 
     /// A `@type` resolves as JSON-LD resolves one: against `@vocab`, else

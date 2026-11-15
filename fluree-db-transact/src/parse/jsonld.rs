@@ -26,8 +26,8 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, iri_named_graph, is_keyword_form, node_graph,
-    parse_context, GraphValue, NodeGraph, ParsedContext,
+    classify_graph_value, expand_with_context_policy, expand_with_root_context, iri_named_graph,
+    is_keyword_form, node_graph, parse_context, GraphValue, NodeGraph, ParsedContext,
 };
 use fluree_vocab::{
     rdf::{self, TYPE},
@@ -158,10 +158,11 @@ fn parse_rooted(
     // clone, and only when an `@annotation` / `@edge` / `@reifies` block is
     // actually present: a large non-annotated transaction then skips the
     // clone and both rewrite walks entirely.
-    // The same top-level context the parser resolves keys against.
-    let parser_ctx = top_context(json)
+    // The document's top-level context, read once: every stage below
+    // resolves against it, and the expander does not apply it again.
+    let root = top_context(json)
         .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?;
-    super::edge_annotations::run_user_authored_reifies_firewall(json, &parser_ctx)?;
+    super::edge_annotations::run_user_authored_reifies_firewall(json, &root)?;
 
     // Two-pass lowering for UPDATE transactions:
     //
@@ -174,14 +175,13 @@ fn parse_rooted(
     //    passes synthesize `f:reifies*` IRIs internally, which is why the
     //    firewall ran first on the un-rewritten input.
     let lowered = if super::edge_annotations::document_has_annotation_keys(json) {
-        let top_ctx = super::edge_annotations::top_level_context(json)?;
         let mut lowered = json.clone();
         if matches!(txn_type, TxnType::Update) {
-            super::edge_annotations::lower_delete_annotation_blocks(&mut lowered)?;
+            super::edge_annotations::lower_delete_annotation_blocks(&mut lowered, &root)?;
         }
         super::edge_annotations::lower_edge_annotations_after_firewall(
             &mut lowered,
-            &top_ctx,
+            &root,
             lpg_mode,
         )?;
         std::borrow::Cow::Owned(lowered)
@@ -193,13 +193,14 @@ fn parse_rooted(
     let mut txn = match txn_type {
         TxnType::Insert | TxnType::Upsert => parse_data(
             &lowered,
+            &root,
             txn_type,
             opts,
             ns_registry,
             ledger_id,
             request_graph,
         )?,
-        TxnType::Update => parse_update(&lowered, opts, ns_registry, ledger_id)?,
+        TxnType::Update => parse_update(&lowered, &root, opts, ns_registry, ledger_id)?,
     };
     if annotated {
         refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
@@ -420,21 +421,21 @@ fn names_a_node(expanded: &Value) -> bool {
 /// insert / sync (`request_graph`), which the payload may not leave.
 fn parse_data(
     json: &Value,
+    context: &ParsedContext,
     txn_type: TxnType,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
     request_graph: Option<&GraphSel>,
 ) -> Result<Txn> {
-    let context = extract_context(json)?;
     let strict = strict_compact_iri(&opts, json);
 
     // Extract transaction metadata (only from envelope-form documents with @graph)
-    let txn_meta = extract_txn_meta(json, &context, ns_registry, strict)?;
+    let txn_meta = extract_txn_meta(json, context, ns_registry, strict)?;
 
     // Strip top-level `opts` so it is not expanded as data (single-object form)
-    let json_for_expand = strip_opts_for_expansion(json, &context)?;
-    let expanded = expand_with_context_policy(&json_for_expand, &context, strict)?;
+    let json_for_expand = strip_opts_for_expansion(json, context)?;
+    let expanded = expand_with_root_context(&json_for_expand, context, strict)?;
 
     let no_aliases = HashMap::new();
     let mut blanks = BlankIssuer::default();
@@ -446,7 +447,7 @@ fn parse_data(
             None => GraphScope::default_graph(),
         };
         let mut ctx = TemplateParseCtx::new(
-            &context,
+            context,
             &mut vars,
             ns_registry,
             false,
@@ -503,6 +504,7 @@ fn parse_data(
 /// the ledger's database for IRI encoding.
 fn parse_update(
     json: &Value,
+    context: &ParsedContext,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
@@ -521,13 +523,10 @@ fn parse_update(
         ));
     }
 
-    // Parse context from the outer document
-    let context = extract_context(json)?;
-
     let strict = strict_compact_iri(&opts, json);
 
     // Extract transaction metadata (only from envelope-form documents with @graph)
-    let txn_meta = extract_txn_meta(json, &context, ns_registry, strict)?;
+    let txn_meta = extract_txn_meta(json, context, ns_registry, strict)?;
 
     // Optional WHERE dataset scoping using query-style dataset keys.
     // - `from.graph` (or `"from": "<graph IRI>"`, or `"from": ["<g1>", "<g2>"]`) scopes WHERE
@@ -535,7 +534,7 @@ fn parse_update(
     // - `fromNamed` (or legacy `from-named`) restricts visible named graphs for WHERE (USING NAMED equivalent)
     let where_named_graphs = parse_update_where_named_graphs(
         obj.get("fromNamed").or_else(|| obj.get("from-named")),
-        &context,
+        context,
     )?;
     refuse_from_named_name_collisions(where_named_graphs.as_deref().unwrap_or_default())?;
     let from_named_aliases: HashMap<String, String> = where_named_graphs
@@ -559,7 +558,7 @@ fn parse_update(
     let clauses = loop {
         let clauses = parse_update_clauses(
             obj,
-            &context,
+            context,
             strict,
             object_var_parsing,
             &from_named_aliases,
@@ -573,7 +572,7 @@ fn parse_update(
     };
 
     let where_default_graph_iris =
-        parse_update_where_default_graph_iris(obj.get("from"), &context, &from_named_aliases)?
+        parse_update_where_default_graph_iris(obj.get("from"), context, &from_named_aliases)?
             .unwrap_or_else(|| clauses.template_root_iri.iter().cloned().collect());
     // A where node's `"@graph": "default"` names the ledger's default graph,
     // as a template's does. When the WHERE reads another default graph, the
@@ -1390,16 +1389,11 @@ fn parse_update_templates_with_ctx(
     Ok(out)
 }
 
-/// Extract and parse the @context from a JSON-LD document
-fn extract_context(json: &Value) -> Result<ParsedContext> {
-    Ok(top_context(json)?)
-}
-
 /// The document's top-level `@context` as the parser reads it: a lone
 /// `@base` is the `@vocab` too.
 fn top_context(json: &Value) -> fluree_graph_json_ld::Result<ParsedContext> {
     match json.get("@context") {
-        Some(ctx_val) => parse_context(&normalize_context_value(ctx_val)),
+        Some(ctx_val) => parse_context(&fluree_graph_json_ld::with_base_as_vocab(ctx_val)),
         None => Ok(ParsedContext::new()),
     }
 }
@@ -1509,19 +1503,6 @@ fn expand_datatype_iri_with_policy(
 
 fn expand_builtin_xsd_datatype(local: &str) -> Option<&'static str> {
     fluree_vocab::datatype::KnownDatatype::from_xsd_local(local).map(|dt| dt.canonical_form())
-}
-
-fn normalize_context_value(context_val: &Value) -> Value {
-    if let Value::Object(map) = context_val {
-        if let Some(base) = map.get("@base") {
-            if !map.contains_key("@vocab") {
-                let mut out = map.clone();
-                out.insert("@vocab".to_string(), base.clone());
-                return Value::Object(out);
-            }
-        }
-    }
-    context_val.clone()
 }
 
 /// Validate that any `@type` fields are strings (IRI) or arrays of strings.
@@ -2890,7 +2871,14 @@ mod tests {
             "insert": { "@id": "?s", "ex:name": "New Name" }
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
 
         assert_eq!(txn.txn_type, TxnType::Update);
         assert_eq!(txn.where_patterns.len(), 1);
@@ -2910,6 +2898,7 @@ mod tests {
         });
         let err = parse_update(
             &cypher_envelope,
+            &top_context(&cypher_envelope).unwrap(),
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2927,6 +2916,7 @@ mod tests {
         });
         let err = parse_update(
             &where_only,
+            &top_context(&where_only).unwrap(),
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2944,6 +2934,7 @@ mod tests {
         });
         let txn = parse_update(
             &explicit_empty_delete,
+            &top_context(&explicit_empty_delete).unwrap(),
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2969,7 +2960,14 @@ mod tests {
             ]
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
         let named = txn
             .update_where_named_graphs
             .as_ref()
@@ -2993,7 +2991,14 @@ mod tests {
             ]
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
         let named = txn
             .update_where_named_graphs
             .as_ref()
@@ -3017,7 +3022,14 @@ mod tests {
             ]
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
         assert!(
             txn.write_graphs.contains("http://example.org/g2"),
             "expected write_graphs to contain resolved graph IRI for alias g2"

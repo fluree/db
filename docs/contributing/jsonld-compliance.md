@@ -36,13 +36,12 @@ git submodule update --init testsuite-jsonld/json-ld-api
   Expansion Algorithm; the harness applies the three steps
   `JsonLdProcessor.expand()` adds (§9.1, 8.1–8.3), which Fluree's readers apply
   themselves.
-- **Expand, context applied twice:** a transaction parses the document's
-  `@context`, then expands the document, which still holds it, against the
-  result. `jsonld_expand_as_transaction` expands each expand input that way
-  and the usual way, and fails where the two differ: refused by one and not the
-  other, or giving different output. Its register, `EXPAND_AS_TRANSACTION`, is
-  empty. A context that resolves differently when applied over itself, such
-  as a relative IRI resolved against the value in effect, fails here.
+- **Expand, as a transaction expands:** a transaction parses the document's
+  `@context` once and expands the document against that result, without
+  applying it again (`expand_with_root_context`). `jsonld_expand_as_transaction`
+  expands each expand input that way and the usual way, and fails where the
+  two differ: refused by one and not the other, or giving different output.
+  Its register, `EXPAND_AS_TRANSACTION`, is empty.
 - **toRdf:** the expanded input goes through the JSON-LD adapter, and the
   statements are compared with `expect` (N-Quads) by RDF dataset isomorphism.
   The graph IR holds a `@list` as indexed values of its property; the harness

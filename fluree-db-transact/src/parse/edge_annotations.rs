@@ -457,56 +457,61 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
             } else {
                 None
             };
-            let effective = merged.as_ref().unwrap_or(context);
-
-            // A `@json` literal's payload never becomes triples — it is
-            // serialized whole into a single `rdf:JSON` flake value — so
-            // no key inside it can carry a system predicate into the
-            // store, and the firewall has nothing to guard there. See
-            // [`opaque_subtree`].
-            let opaque = opaque_subtree(map, Some(effective));
-
-            for (k, v) in map {
-                // `@context` is structural, not a predicate.
-                if k == "@context" {
-                    continue;
-                }
-                if opaque && k == "@value" {
-                    continue;
-                }
-                // The lowering labels anonymous annotation nodes with a
-                // reserved prefix; a user node with such a label would merge
-                // with one of them.
-                if k == "@id" || *k == effective.id_key {
-                    if let Some(label) = v.as_str().filter(|s| s.starts_with(ANN_BLANK_PREFIX)) {
-                        return Err(TransactError::Parse(format!(
-                            "blank-node label {label:?} uses the prefix {ANN_BLANK_PREFIX:?}, \
-                             which is reserved for edge-annotation nodes; choose another label"
-                        )));
-                    }
-                }
-                let expanded_key = if k.starts_with('@') {
-                    k.clone()
-                } else {
-                    expand_iri(k, effective)
-                };
-                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key)
-                    || expanded_key == fluree_vocab::rdf::REIFIES
-                {
-                    return Err(TransactError::UnsupportedFeature(format!(
-                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
-                         use @annotation or @reifies instead"
-                    )));
-                }
-                scan_user_authored_reifies_iris(v, effective)?;
-            }
+            scan_node_keys(map, merged.as_ref().unwrap_or(context))
         }
         Value::Array(items) => {
             for item in items {
                 scan_user_authored_reifies_iris(item, context)?;
             }
+            Ok(())
         }
-        _ => {}
+        _ => Ok(()),
+    }
+}
+
+/// The firewall over one node object's entries, resolved against `effective`,
+/// which already holds the node's own `@context`.
+fn scan_node_keys(map: &Map<String, Value>, effective: &ParsedContext) -> Result<()> {
+    // A `@json` literal's payload never becomes triples — it is
+    // serialized whole into a single `rdf:JSON` flake value — so
+    // no key inside it can carry a system predicate into the
+    // store, and the firewall has nothing to guard there. See
+    // [`opaque_subtree`].
+    let opaque = opaque_subtree(map, Some(effective));
+
+    for (k, v) in map {
+        // `@context` is structural, not a predicate.
+        if k == "@context" {
+            continue;
+        }
+        if opaque && k == "@value" {
+            continue;
+        }
+        // The lowering labels anonymous annotation nodes with a
+        // reserved prefix; a user node with such a label would merge
+        // with one of them.
+        if k == "@id" || *k == effective.id_key {
+            if let Some(label) = v.as_str().filter(|s| s.starts_with(ANN_BLANK_PREFIX)) {
+                return Err(TransactError::Parse(format!(
+                    "blank-node label {label:?} uses the prefix {ANN_BLANK_PREFIX:?}, \
+                     which is reserved for edge-annotation nodes; choose another label"
+                )));
+            }
+        }
+        let expanded_key = if k.starts_with('@') {
+            k.clone()
+        } else {
+            expand_iri(k, effective)
+        };
+        if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key)
+            || expanded_key == fluree_vocab::rdf::REIFIES
+        {
+            return Err(TransactError::UnsupportedFeature(format!(
+                "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                 use @annotation or @reifies instead"
+            )));
+        }
+        scan_user_authored_reifies_iris(v, effective)?;
     }
     Ok(())
 }
@@ -521,7 +526,7 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
 /// The document keeps its shape.
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
     let top_ctx = top_level_context(doc)?;
-    scan_user_authored_reifies_iris(doc, &top_ctx)?;
+    run_user_authored_reifies_firewall(doc, &top_ctx)?;
     // Test / external callers that don't carry transaction options
     // default to RDF mode (empty `@annotation: {}` is a no-op).
     lower_edge_annotations_after_firewall(doc, &top_ctx, false)
@@ -568,8 +573,14 @@ pub fn top_level_context(doc: &Value) -> Result<ParsedContext> {
 /// document, before any lowering pass runs. Exposed for the
 /// transactor's two-pass dispatch (delete-clause pre-pass + standard
 /// lowering) so the firewall fires once on the user's input.
+///
+/// `top_ctx` already holds the root object's own `@context`, which is not
+/// applied again.
 pub fn run_user_authored_reifies_firewall(doc: &Value, top_ctx: &ParsedContext) -> Result<()> {
-    scan_user_authored_reifies_iris(doc, top_ctx)
+    match doc {
+        Value::Object(map) => scan_node_keys(map, top_ctx),
+        _ => scan_user_authored_reifies_iris(doc, top_ctx),
+    }
 }
 
 /// Cheap read-only check for whether `doc` contains any `@annotation` /
@@ -657,11 +668,7 @@ pub fn document_has_annotation_keys(doc: &Value) -> bool {
 /// SPARQL UPDATE machinery then runs the WHERE, instantiates the
 /// template per binding, and the resulting bundle retracts trigger
 /// the LPG body cleanup pass at stage time.
-pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
-    // Read the @context BEFORE we borrow the doc mutably for the
-    // delete-clause walk — both views are needed and serde_json's
-    // immutable / mutable accessors don't compose otherwise.
-    let top_ctx = top_level_context(doc)?;
+pub fn lower_delete_annotation_blocks(doc: &mut Value, top_ctx: &ParsedContext) -> Result<()> {
     let Some(obj) = doc.as_object_mut() else {
         return Ok(());
     };
@@ -705,13 +712,13 @@ pub fn lower_delete_annotation_blocks(doc: &mut Value) -> Result<()> {
             for item in items.iter_mut() {
                 match graph_sugar_mut(item) {
                     Some((name, pattern)) => {
-                        walk_delete_for_annotations(pattern, &top_ctx, name.as_deref(), &mut sink)?;
+                        walk_delete_for_annotations(pattern, top_ctx, name.as_deref(), &mut sink)?;
                     }
-                    None => walk_delete_for_annotations(item, &top_ctx, None, &mut sink)?,
+                    None => walk_delete_for_annotations(item, top_ctx, None, &mut sink)?,
                 }
             }
         }
-        other => walk_delete_for_annotations(other, &top_ctx, None, &mut sink)?,
+        other => walk_delete_for_annotations(other, top_ctx, None, &mut sink)?,
     }
 
     // Splice the new templates into the delete clause. Convert
@@ -1835,8 +1842,10 @@ fn lower_object_with_subject(
     // `reject_context_coercion_on_annotated_literal`, allowing the
     // base flake's `EdgeKey` to diverge from the synthesized
     // `f:reifies*` bundle. Mirrors the firewall scanner's context
-    // merge logic.
-    let local_merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
+    // merge logic. The root's own `@context` is already in `walk.json_ld`.
+    let local_merged: Option<ParsedContext> = if walk.root {
+        None
+    } else if let Some(local_ctx) = map.get("@context") {
         Some(
             fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(
                 |e| {
@@ -2739,7 +2748,8 @@ mod tests {
                 }
             }]
         });
-        let msg = lower_delete_annotation_blocks(&mut doc)
+        let ctx = top_level_context(&doc).unwrap();
+        let msg = lower_delete_annotation_blocks(&mut doc, &ctx)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3154,7 +3164,8 @@ mod tests {
     /// Run the delete-clause pre-pass on `doc` (assumes it has a
     /// `delete` clause) and return the rewritten doc.
     fn lower_delete(mut doc: Value) -> Result<Value> {
-        lower_delete_annotation_blocks(&mut doc)?;
+        let ctx = top_level_context(&doc)?;
+        lower_delete_annotation_blocks(&mut doc, &ctx)?;
         Ok(doc)
     }
 

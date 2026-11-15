@@ -2,7 +2,9 @@
 //! comparison (tests/README.md).
 
 use anyhow::{bail, Result};
-use fluree_graph_json_ld::{expand_with_context, parse_context_with_base, ParsedContext};
+use fluree_graph_json_ld::{
+    expand_with_context, expand_with_root_context, parse_context_with_base, ParsedContext,
+};
 use serde_json::Value;
 
 use crate::manifest::{Kind, TestCase};
@@ -27,11 +29,14 @@ pub fn initial_context(test: &TestCase) -> Result<ParsedContext> {
 /// the readers that call it unwrap its result themselves, so this applies
 /// the steps `JsonLdProcessor.expand()` adds (JSON-LD 1.1 API §9.1, 8.1-8.3).
 pub fn expanded_input(test: &TestCase) -> Result<Value> {
-    expand_document(&read_json(&test.input)?, &initial_context(test)?)
+    unwrapped(expand_with_context(
+        &read_json(&test.input)?,
+        &initial_context(test)?,
+    )?)
 }
 
-fn expand_document(input: &Value, context: &ParsedContext) -> Result<Value> {
-    let output = match expand_with_context(input, context)? {
+fn unwrapped(output: Value) -> Result<Value> {
+    let output = match output {
         Value::Object(mut map) if map.len() == 1 && map.contains_key("@graph") => {
             map.remove("@graph").expect("checked")
         }
@@ -72,32 +77,37 @@ pub fn run(test: &TestCase) -> Result<()> {
     }
 }
 
-/// A JSON-LD transaction parses the document's `@context`, then expands the
-/// document, which still holds it, against the result, so the context
-/// applies twice. Passes when that agrees with applying it once: both refuse
-/// the input, or both give equivalent output.
+/// A JSON-LD transaction parses the document's `@context` once, then expands
+/// the document against that result without applying it again
+/// (`expand_with_root_context`). Passes when that agrees with expanding the
+/// document as the algorithm does: both refuse the input, or both give
+/// equivalent output.
 pub fn run_as_transaction(test: &TestCase) -> Result<()> {
     let input = read_json(&test.input)?;
     let initial = initial_context(test)?;
-    let once = expand_document(&input, &initial);
-    let twice = match input.get("@context") {
-        Some(local) => parse_context_with_base(&initial, local)
-            .map_err(Into::into)
-            .and_then(|context| expand_document(&input, &context)),
-        None => expand_document(&input, &initial),
+    let plain = expand_with_context(&input, &initial)
+        .map_err(Into::into)
+        .and_then(unwrapped);
+    let root = match input.get("@context") {
+        Some(local) => parse_context_with_base(&initial, local),
+        None => Ok(initial.clone()),
     };
-    match (once, twice) {
+    let rooted = root
+        .and_then(|root| expand_with_root_context(&input, &root, false))
+        .map_err(Into::into)
+        .and_then(unwrapped);
+    match (plain, rooted) {
         (Err(_), Err(_)) => Ok(()),
         (Ok(a), Ok(b)) if equivalent(&a, &b, false) => Ok(()),
-        (once, twice) => {
+        (plain, rooted) => {
             let show = |r: Result<Value>| match r {
                 Ok(v) => v.to_string(),
                 Err(e) => format!("error: {e:#}"),
             };
             bail!(
-                "applying the context twice changes the result\n  once:  {}\n  twice: {}",
-                show(once),
-                show(twice)
+                "expanding against the parsed root context changes the result\n  plain:  {}\n  rooted: {}",
+                show(plain),
+                show(rooted)
             )
         }
     }

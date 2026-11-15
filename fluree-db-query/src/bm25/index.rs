@@ -510,7 +510,7 @@ impl DepsWalker {
             root: None,
         };
         if let Some(raw) = raw_ctx {
-            match parse_context(&crate::parse::normalize_context_value(raw)) {
+            match parse_context(&fluree_graph_json_ld::with_base_as_vocab(raw)) {
                 Ok(ctx) => walker.ctx = ctx,
                 Err(e) => walker.flag(format!("the `@context` could not be parsed: {e}")),
             }
