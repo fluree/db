@@ -64,7 +64,7 @@ extension.
 
 ### JSON-LD 1.1
 
-**Status:** Compliant, with the deviations listed below
+**Status:** Compliant, with the deviations listed below; the other gaps the W3C suite reports are tracked in #2395
 
 Fluree supports JSON-LD 1.1:
 - @context for namespace mappings
