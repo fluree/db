@@ -72,38 +72,47 @@ async fn an_explicit_vocab_is_taken_as_written() {
     }
 }
 
-/// Cypher joins a default context's `@vocab` to a name as written, so a
-/// Cypher read finds what a JSON-LD write under the same `@vocab` stored.
+/// Cypher names IRIs by a default context's vocabulary as JSON-LD resolves
+/// it, so it reads what a JSON-LD write under that context stored.
 #[tokio::test]
-async fn cypher_and_jsonld_agree_on_the_vocab() {
+async fn cypher_reads_the_vocab_a_jsonld_write_used() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "tx/vocab-as-written-cypher:main").await;
-    let ledger = fluree
-        .insert(
-            ledger0,
-            &json!({
-                "@context": {"@vocab": "urn:ex:"},
-                "@id": "urn:ex:ann",
-                "@type": "Person",
-                "name": "Ann"
-            }),
-        )
-        .await
-        .expect("insert")
-        .ledger;
-    let db = graphdb_from_ledger(&ledger).with_default_context(Some(json!({"@vocab": "urn:ex:"})));
-    let cj = fluree
-        .query_cypher(&db, "MATCH (n:Person) RETURN n.name AS name")
-        .await
-        .expect("cypher query")
-        .to_cypher_json_async(db.as_graph_db_ref())
-        .await
-        .expect("cypher json");
-    assert_eq!(
-        cj["results"][0]["data"][0]["row"][0],
-        json!("Ann"),
-        "cypher result: {cj}"
-    );
+    let contexts = [
+        json!({"@vocab": "urn:ex:"}),
+        // A relative @vocab resolves against the base.
+        json!({"@base": "http://example.org/doc/", "@vocab": ""}),
+        // A compact-IRI @vocab expands against the context before it.
+        json!([{"ex": "http://example.org/"}, {"@vocab": "ex:v/"}]),
+    ];
+    for (i, context) in contexts.into_iter().enumerate() {
+        let ledger0 = genesis_ledger(&fluree, &format!("tx/vocab-cypher-{i}:main")).await;
+        let ledger = fluree
+            .insert(
+                ledger0,
+                &json!({
+                    "@context": context,
+                    "@id": "http://example.org/ann",
+                    "@type": "Person",
+                    "name": "Ann"
+                }),
+            )
+            .await
+            .expect("insert")
+            .ledger;
+        let db = graphdb_from_ledger(&ledger).with_default_context(Some(context.clone()));
+        let cj = fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n.name AS name")
+            .await
+            .expect("cypher query")
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        assert_eq!(
+            cj["results"][0]["data"][0]["row"][0],
+            json!("Ann"),
+            "cypher under {context}: {cj}"
+        );
+    }
 }
 
 #[tokio::test]

@@ -481,3 +481,37 @@ async fn nested_field_arguments_page_each_subject_s_values() {
     .await;
     assert_eq!(data["person"]["knows"], json!([{ "id": "ex:dave" }]));
 }
+
+/// GraphQL names IRIs by a default context's vocabulary as JSON-LD resolves
+/// it, so a schema derived under a relative or compact-IRI `@vocab` uses the
+/// names a JSON-LD write under that context wrote.
+#[tokio::test]
+async fn names_follow_the_vocab_a_jsonld_write_used() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let contexts = [
+        json!({"@base": "http://example.org/doc/", "@vocab": ""}),
+        json!([{ "ex": EX }, {"@vocab": "ex:v/"}]),
+    ];
+    for (i, context) in contexts.into_iter().enumerate() {
+        let ledger = genesis_ledger(&fluree, &format!("gql-vocab-{i}")).await;
+        let ledger = fluree
+            .insert(
+                ledger,
+                &json!({
+                    "@context": context,
+                    "@id": "http://example.org/ann",
+                    "@type": "Person",
+                    "name": "Ann"
+                }),
+            )
+            .await
+            .expect("insert")
+            .ledger;
+        let db = GraphDb::from_ledger_state(&ledger).with_default_context(Some(context.clone()));
+        assert_eq!(
+            run(&fluree, &db, "{ persons { name } }").await,
+            json!({"persons": [{"name": ["Ann"]}]}),
+            "under {context}"
+        );
+    }
+}

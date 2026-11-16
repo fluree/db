@@ -420,7 +420,7 @@ A term under an explicit `@vocab` is the vocabulary joined to the term, as JSON-
 
 A `@vocab` written as a compact IRI or a term now expands: after `{"ex": "http://example.org/"}`, `"@vocab": "ex:ns/"` is `http://example.org/ns/`, where it was the IRI `ex:ns/`. A relative `@vocab` joins the vocabulary already in effect (`"./rel#"` after `http://example.org/v/` is `http://example.org/v/./rel#`), and with none it resolves against `@base` as before.
 
-A JSON-LD query reads its context the same way and compacts results with it, so `urn:ex:name` comes back as `name` under `"@vocab": "urn:ex:"`. Cypher already joined a ledger default context's `@vocab` as written, so under such a `@vocab` it read other IRIs than a JSON-LD write stored; the two now agree.
+A JSON-LD query reads its context the same way and compacts results with it, so `urn:ex:name` comes back as `name` under `"@vocab": "urn:ex:"`. Cypher and GraphQL read a ledger default context's `@vocab` as JSON-LD resolves it too. Cypher already joined an absolute `@vocab` as written, so under one like `urn:ex:` it read other IRIs than a JSON-LD write stored; and both read a relative or compact-IRI `@vocab` as its text, so under `{"@base": "http://example.org/doc/", "@vocab": ""}` neither found what a JSON-LD write stored. Each now names what a JSON-LD write under the same context stores.
 
 A string `@context`, Fluree's fallback for a remote context, keeps the `/`: `"@context": "https://schema.org"` is the vocabulary `https://schema.org/`.
 
