@@ -199,14 +199,16 @@ fn reverse_context(
         }
     }
 
-    if include_vocab {
-        if let Some(ref vocab) = context.vocab {
-            flipped.insert(vocab.clone(), ":vocab".to_string());
-        }
-    }
+    // An equal vocabulary replaces the base: a property shortened by the
+    // base's rule (`#name`) reads back as a reference, not as a term.
     if include_base {
         if let Some(ref base) = context.base {
             flipped.insert(base.clone(), ":base".to_string());
+        }
+    }
+    if include_vocab {
+        if let Some(ref vocab) = context.vocab {
+            flipped.insert(vocab.clone(), ":vocab".to_string());
         }
     }
 
@@ -312,6 +314,20 @@ mod tests {
         assert_eq!(compact("urn:ex:name", &ctx), "name");
         // A prefix still needs to end in `/` or `#`.
         assert_eq!(compact("urn:p:x", &ctx), "urn:p:x");
+    }
+
+    #[test]
+    fn an_equal_base_leaves_properties_to_the_vocab() {
+        for ns in ["http://example.org/ns#", "urn:ex:"] {
+            let ctx = ParsedContext::parse(None, &json!({"@base": ns, "@vocab": ns})).unwrap();
+            let name = format!("{ns}name");
+            assert_eq!(compact(&name, &ctx), "name", "under {ns}");
+            assert_eq!(crate::expand::iri("name", &ctx, true), name);
+        }
+        // An id still compacts by the base.
+        let ns = "http://example.org/ns#";
+        let ctx = ParsedContext::parse(None, &json!({"@base": ns, "@vocab": ns})).unwrap();
+        assert_eq!(compact_id("http://example.org/ns#alice", &ctx), "#alice");
     }
 
     #[test]

@@ -127,3 +127,43 @@ async fn a_string_context_keeps_its_slash() {
         vec![json!(["http://example.org/terms/name", "Ann"])]
     );
 }
+
+/// A `@vocab` equal to the `@base` names the properties and types in a
+/// result, and the `@base` the ids, so each reads back under the context.
+#[tokio::test]
+async fn an_equal_base_and_vocab_read_back() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = json!({"@base": "http://example.org/ns#", "@vocab": "http://example.org/ns#"});
+    let ledger0 = genesis_ledger(&fluree, "tx/vocab-equal-base:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": context, "@id": "#alice", "@type": "Person", "name": "Ann"}),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let query = json!({
+        "@context": context,
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "name": "Ann"}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("jsonld query");
+    assert_eq!(
+        rows,
+        json!([{"@id": "#alice", "@type": "Person", "name": "Ann"}])
+    );
+    let read_back = json!({
+        "@context": context,
+        "select": "?n",
+        "where": {"@id": "#alice", "@type": "Person", "name": "?n"}
+    });
+    assert_eq!(
+        support::query_jsonld_formatted(&fluree, &ledger, &read_back)
+            .await
+            .expect("read back"),
+        json!(["Ann"])
+    );
+}
