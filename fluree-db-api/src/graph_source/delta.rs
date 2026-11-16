@@ -240,6 +240,10 @@ pub struct DeltaCreateResult {
     /// registering process may lack the credentials the query process has.
     pub table_warnings: Vec<String>,
     pub model_warnings: Vec<String>,
+    /// Advisories about the mapping as the source's queries will read it: a
+    /// `keylessMap` for each map no `f:key` proves subject-unique, which
+    /// queries deduplicate (a Delta table reports no key of its own).
+    pub diagnostics: Vec<fluree_db_r2rml::emit::Diagnostic>,
 }
 
 impl crate::Fluree {
@@ -348,6 +352,22 @@ impl crate::Fluree {
             )
             .await?;
 
+        // A Delta table reports no key, so this reads no table: a map's keys
+        // are what the mapping declares, whether its table loaded or not.
+        let diagnostics = match &registered.compiled {
+            Some(compiled) => {
+                super::r2rml::registered_keyless_maps(
+                    &super::r2rml::FlureeR2rmlProvider::new(self),
+                    &graph_source_id,
+                    compiled,
+                    super::iceberg_validate::QueryTables::Alias,
+                    super::iceberg_validate::KeyRemedy::Declare,
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
+
         info!(graph_source_id = %graph_source_id, mapping_address = %registered.address, "Created Delta graph source");
         Ok(DeltaCreateResult {
             graph_source_id,
@@ -358,6 +378,7 @@ impl crate::Fluree {
             table_versions,
             table_warnings,
             model_warnings,
+            diagnostics,
         })
     }
 

@@ -1038,28 +1038,31 @@ fn registration_refuses_a_malformed_google_identity_before_storing_it() {
 
 #[test]
 fn registration_runs_the_engines_own_validation_in_every_mode() {
-    // A Direct location must name its table when no mapping does; only the
-    // stored config's validation knew that, and REST/Direct registration
-    // never ran it.
-    let e = IcebergCreateConfig::new_direct("gs", "s3://bucket/t")
+    // Which schemes a Direct location may use is the stored config's rule
+    // alone, and REST/Direct registration never ran it.
+    let e = IcebergCreateConfig::new_direct("gs", "https://bucket/t")
         .validate()
         .unwrap_err();
-    assert!(e.to_string().contains("table identifier"), "{e}");
+    assert!(e.to_string().contains("table_location must be"), "{e}");
+    // A location one level under its bucket names a table (`bucket.t`).
+    IcebergCreateConfig::new_direct("gs", "s3://bucket/t")
+        .validate()
+        .unwrap();
 }
 
 #[test]
 fn registration_refuses_what_every_query_would() {
     // A query validates the stored config before it reads anything, and a
-    // Direct location must name a table (`ns/table`) even when a mapping names
-    // them; registration used to accept one that no query could use.
+    // Direct location's scheme is checked there even when a mapping names
+    // the tables; registration used to accept one that no query could use.
     let e = crate::R2rmlCreateConfig::new_direct(
         "gs",
-        "s3://bucket/dw",
+        "https://bucket/dw",
         "@prefix rr: <http://www.w3.org/ns/r2rml#> .",
     )
     .validate()
     .unwrap_err();
-    assert!(e.to_string().contains("table identifier"), "{e}");
+    assert!(e.to_string().contains("table_location must be"), "{e}");
 }
 
 #[test]

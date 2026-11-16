@@ -1053,6 +1053,13 @@ impl BranchLifecycle for DynamoDbNameService {
             .await
             .map_err(|e| NameServiceError::storage(format!("DynamoDB reset_head failed: {e}")))?;
 
+        // As a publish does: the commit index lists the head, so a build over
+        // it keeps its fast path.
+        if let Some(ref cid) = snapshot.commit_head_id {
+            self.put_commit_index_item(&pk, snapshot.commit_t, cid)
+                .await;
+        }
+
         Ok(())
     }
 

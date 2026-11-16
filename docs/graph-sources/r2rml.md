@@ -148,6 +148,114 @@ Map relationships:
 
 Maps foreign key `customer_id` to RDF object property linking to customer resource.
 
+The join links a child row to every parent row whose `rr:parent` columns equal its `rr:child` columns, and the graph holds one triple per distinct parent subject. So when the parent's join columns are not unique, a child row links to each distinct subject the matching rows mint: rows that mint the same subject (several versions of one customer, say) give one triple, and rows minting different subjects give one triple each. A null in a join column joins nothing.
+
+### Declaring a Table's Keys (`f:key`)
+
+An R2RML graph source answers over the set of triples its mapping defines, so
+two rows that mint the same triple yield it once, as a native ledger loaded
+with those triples would. A table is a bag of rows: a history table holds
+several versions of one customer, and a fact table can hold an exact
+duplicate row. Unless Fluree can prove that no two rows of a map mint the
+same subject, queries over the map remove repeated solutions as they read.
+A key proves it, and a query over a map whose subject is proven unique reads
+its rows straight through.
+
+Declare a key with `f:key` (`https://ns.flur.ee/db#key`) on the logical
+table: a list of the columns no two rows agree on.
+
+```turtle
+@prefix f: <https://ns.flur.ee/db#> .
+
+<#CurrentCustomers>
+  a rr:TriplesMap ;
+  rr:logicalTable [
+    rr:tableName "sales.customers_current" ;
+    f:key ( "customer_id" )
+  ] ;
+  rr:subjectMap [
+    rr:template "http://example.org/customer/{customer_id}" ;
+    rr:class ex:Customer
+  ] .
+```
+
+- A composite key is one list: `f:key ( "customer_id" "valid_from" )`.
+  Repeat `f:key` for each alternative key: `f:key ( "customer_id" ), ( "email" )`.
+- It means: no two rows with no NULL in the key columns agree on all of them.
+  Fluree trusts it and does not check the data. A key the data breaks makes
+  queries return the repeated solutions it promised were not there.
+- It describes the logical table's rows, so it applies to every triples map
+  that reads the same `rr:tableName`. On an `rr:sqlQuery` it describes the
+  query's rows only, so a key that holds only for the rows a filter keeps
+  (`customer_id` among `WHERE is_current = 1` rows of a history table) is
+  declared there:
+
+  ```turtle
+  rr:logicalTable [
+    rr:sqlQuery "SELECT * FROM sales.customers_history WHERE is_current = 1" ;
+    f:key ( "customer_id" )
+  ] ;
+  ```
+
+  A key on an Iceberg `rr:sqlQuery` can name only columns its select list
+  selects (any column, for `SELECT *`); one that names another column is
+  refused when the source is mapped. The table's identifier fields hold for
+  any subset of its rows, so they also count as a key of a query over the
+  table, when the query selects their columns.
+
+A key makes a map's subjects unique only when the subject is built from it:
+
+- an `rr:column` subject over a column that is a key by itself, or
+- an `rr:template` subject whose placeholders include every column of a key,
+  and that keeps their values apart. Each value is percent-encoded into the
+  IRI (see [the percent-encoding contract](#bound-subject-key-pushdown)), and
+  letters, digits, `- . _ ~ ! $ & ' ( ) * + , ; = : @` and `%` itself can
+  appear in an encoded value. So the text between two adjacent placeholders
+  must hold a character outside that set, such as `/`, `#`, `?` or a space:
+  `.../{customer_id}/{region}` qualifies, while `.../{customer_id}-{region}`
+  and `.../{customer_id}{region}` do not (`("1-2", "3")` and `("1", "2-3")`
+  mint one IRI).
+
+A history table's natural key, `( "customer_id" "valid_from" )`, does not make
+a subject minted from `customer_id` alone unique, and queries over it still
+remove repeated solutions. Two things are deduplicated whatever the keys say:
+a triple one row can mint twice (two predicate-object maps for one predicate,
+or an `rr:class` beside an `rdf:type` map naming the same class), and a
+subject two triples maps can both mint (a current table and a history table
+minting customers from the same template).
+
+An Iceberg table's identifier fields (`identifier-field-ids` in its schema)
+count as a key without being declared, for tables of format version 1 to 3;
+format version 4 replaces them with table constraints, and Fluree does not
+read those yet. Delta sources report no key, so declare one there. A SQL
+source's keys come from its registration probe (see
+[SQL → Repeated rows and subject keys](sql.md#repeated-rows-and-subject-keys))
+or a declaration.
+
+**Keys are trusted, not verified.** Fluree does not check a key against the
+data, whichever way it was learned: an `f:key`, an Iceberg table's
+identifier fields, or a SQL source's registration probe. Iceberg does not
+enforce identifier fields either; an append can write a row that repeats
+one. Over a table that breaks its key, queries return the repeated
+solutions the key ruled out, as bag answers, and a count read from table
+metadata (a fused `COUNT`, `/info`'s per-class counts) is presented as exact
+when it is not. A check of each Iceberg snapshot's keys against its data is
+planned; until then, declare a key only where the table's writer keeps it.
+
+`f:key` is checked when the mapping loads. Refused with
+`Failed to compile R2RML mapping: …`: an `f:key` that is not a list, an empty
+list, a list item that is not a plain string, a column named twice in one
+key, an `f:key` anywhere but on a logical table, and any other term in the
+`f:` namespace on a logical table (so a misspelled `f:keys` cannot leave the
+table silently keyless). Over an Iceberg source, a query is refused with HTTP
+`400` `err:db/InvalidQuery` when a declared key names a column the queried
+snapshot does not have (casing included), or a column whose values cannot
+identify a row: floating-point (NaN is unequal to itself, so a column declared
+unique can hold two NaNs that mint one subject), nested, or of a type values
+are not read from. `POST /iceberg/r2rml/validate` reports the same columns
+before you save the mapping (see
+[Iceberg → Schema Mismatch](iceberg.md#schema-mismatch)).
+
 ### Complex Queries
 
 A [SQL source](sql.md#rrsqlquery) hands an `rr:sqlQuery` logical table to its engine, so a joined or aggregated view like the one below works there. An Iceberg source has no engine; it accepts only a row filter over one table (`SELECT * FROM t WHERE <column> <op> <literal> [AND ...]`), evaluated exactly. See [Iceberg → Row filters](iceberg.md#row-filters-rrsqlquery).
@@ -432,10 +540,85 @@ A mapping that does not parse or compile is refused when the source is mapped, w
 - `Failed to parse R2RML Turtle: …`: the Turtle itself is malformed.
 - `Failed to compile R2RML mapping: …`: the Turtle parsed, but is not a mapping Fluree can load. The reason names the problem, for example `Missing required property: rr:tableName in logical table`, `Invalid value for …: …`, or `Unsupported feature: …` (see [Limitations](#limitations)).
 - `R2RML mapping must be in Turtle format. JSON-LD is not yet supported.`
+- `Failed to compile R2RML mapping: Invalid value for f:key: …`: a declared key
+  is malformed or misplaced; see [Declaring a Table's Keys](#declaring-a-tables-keys-fkey).
+- At query time, `Graph source '…': Invalid value for f:key: on the logical table "…", a key names column "…", …`
+  (HTTP `400`): a declared key names a column the table does not have, or one
+  that cannot identify a row. Fix the key, or remove it.
 
 Table and column names are not checked when the source is mapped. A table or column the mapping names but the catalog does not have shows up at query time, as described in [Iceberg → Schema Mismatch](iceberg.md#schema-mismatch), which also covers `POST /iceberg/r2rml/validate`, the read-only check of a mapping's tables, columns, join key types and subject keys against the live catalog.
 
 ### Slow Queries
+
+#### A map with no key (most likely after an upgrade)
+
+**Symptom.** After upgrading to a version that answers over the set of
+triples a mapping defines, queries over a graph source got slower or heavier:
+
+- a `COUNT`, `SUM`, `AVG` or `GROUP BY` reads the table where it used to
+  answer from table metadata or fold rows directly;
+- a same-subject star (`?s ex:name ?n ; ex:city ?c`) runs as one scan per
+  predicate joined on the subject, where it used to read each row once;
+- an `ORDER BY … LIMIT` reads every data file where it used to stop early;
+- the query's memory use grows with the number of distinct solutions it has
+  seen, and a query that ran close to the
+  [query memory budget](../api/errors.md#507-insufficient-storage) now fails
+  with `MemoryBudgetExceeded` (HTTP `507`).
+
+**Cause.** No key proves the map's subjects unique, so its queries remove
+repeated solutions as they read (see
+[Declaring a Table's Keys](#declaring-a-tables-keys-fkey)). That is what
+makes their answers right where rows repeat: before, each row that repeated
+a triple returned it again. A mapping written or generated without `f:key`,
+over an Iceberg table whose writer set no identifier fields, has no key, so
+most maps take this path after the upgrade, including maps over tables whose
+rows never repeat.
+
+**Which maps.** Mapping a source reports each such map: the response to
+`POST /iceberg/map`, `POST /delta/map` and `POST /sql/map` (and to
+`fluree iceberg map`, `fluree delta map`, `fluree sql map` and
+`fluree sql check`) carries an advisory per map, and so do the dry runs
+(`POST /iceberg/r2rml/validate`, `fluree delta validate`) and the mapping
+generators:
+
+```text
+advisory: sales.customers: TriplesMap <http://example.org/mapping#Customer>: no key of its logical table 'sales.customers' lies within its subject's columns (customer_id), and it has no known key, so queries over it remove repeated solutions as they run. … If customer_id identifies a row, declare `f:key ( "customer_id" )` on its logical table, or make it the table's identifier field.
+```
+
+In JSON the advisory is `{"severity": "advisory", "code": "keylessMap", "table": …, "message": …}`.
+It is informational: the source is registered and answers correctly.
+
+**Which lane a query took.** Each R2RML scan stamps the routing decision
+`r2rml_scan_proven_distinct` on the `fluree::fastpath` tracing target:
+`proceed` when every map it reads is proven unique (no deduplication),
+`fallback:gate_declined` when it deduplicates, and `fallback:kill_switch`
+when fast paths are disabled (`FLUREE_DISABLE_QUERY_FAST_PATHS`, which
+deduplicates everything). A fused aggregate that deduplicates stamps
+`fused_r2rml_aggregate_dedupe`. To see them, run the server with
+`RUST_LOG=info,fluree::fastpath=debug`, or the CLI with
+`RUST_LOG=fluree::fastpath=debug fluree --verbose query …`:
+
+```text
+DEBUG fluree::fastpath: fast-path outcome site="r2rml_scan_proven_distinct" outcome="fallback:gate_declined"
+```
+
+With `fluree_db_query=debug` as well, each deduplication set reports its
+size and memory when it is released (`R2RML scan: deduplication set
+released`, with `solutions`, `charged_bytes` and `peak_bytes`).
+
+**Fix.** If the columns the subject is built from identify a row, say so:
+declare `f:key ( "customer_id" )` on the map's logical table, or, on an
+Iceberg table of format version 1 to 3, make those columns its identifier
+fields. The map then reads its rows straight through again, as fast as
+before. On a history table whose key holds only for the current rows,
+declare it on an `rr:sqlQuery` that selects them. A SQL source's
+registration probe records a key it verified (`fluree sql check` re-runs
+it). Declare only a key the table's writer keeps: Fluree trusts it and does
+not check the data. If the rows do repeat the map's triples, the
+deduplication is what makes the answer right; narrow the query, or raise
+the query memory budget.
+
+#### Other causes
 
 **Causes:**
 - Large result sets (many Parquet files scanned)

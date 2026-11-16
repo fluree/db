@@ -51,6 +51,7 @@ const MAPPING: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+    @prefix f: <https://ns.flur.ee/db#> .
 
     <http://example.org/mapping#Customer> a rr:TriplesMap ;
         rr:logicalTable [ {customer_logical_table} ] ;
@@ -66,7 +67,8 @@ const MAPPING: &str = r#"
                         rr:class ex:HighScorer ] .
 
     <http://example.org/mapping#HistoryRow> a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "silver.customers_history" ] ;
+        rr:logicalTable [ rr:tableName "silver.customers_history" ;
+                          f:key ( "customer_id" "valid_from" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/history/{customer_id}/{valid_from}" ;
                         rr:class ex:HistoryRow ] .
 
@@ -80,6 +82,9 @@ const MAPPING: &str = r#"
 
 const CURRENT: &str = r#"rr:sqlQuery "SELECT * FROM silver.customers_history WHERE is_current = 1 AND is_deleted = FALSE""#;
 const WHOLE_TABLE: &str = r#"rr:tableName "silver.customers_history""#;
+/// The current rows, with the key they hold: the whole table repeats
+/// `customer_id` across versions, its current, non-deleted rows do not.
+const CURRENT_KEYED: &str = r#"rr:sqlQuery "SELECT * FROM silver.customers_history WHERE is_current = 1 AND is_deleted = FALSE" ; f:key ( "customer_id" )"#;
 
 fn mapping(customer_logical_table: &str) -> String {
     MAPPING.replace("{customer_logical_table}", customer_logical_table)
@@ -388,10 +393,13 @@ async fn filtered_map_answers_match_the_native_oracle() {
     }
     set_fast_paths_disabled(false);
 
-    // The manifest COUNT shortcut: fires for the unfiltered map over the same
-    // table (8 rows) and declines for the filtered one, whose count is 3.
-    let count = |class: &str| {
-        format!("PREFIX ex: <http://example.org/> SELECT (COUNT(?s) AS ?n) FROM <{FILTERED}> WHERE {{ ?s a ex:{class} }}")
+    // The manifest COUNT shortcut counts rows, so it is tried only for a map
+    // whose rows are its subjects (a key): it fires for the keyed, unfiltered
+    // map over the same table (8 rows) and declines for the filtered map with
+    // a key, whose count is 3. The filtered map without a key never reaches it.
+    create_source(&fluree, "filtered-keyed", &mapping(CURRENT_KEYED)).await;
+    let count = |from: &str, class: &str| {
+        format!("PREFIX ex: <http://example.org/> SELECT (COUNT(?s) AS ?n) FROM <{from}> WHERE {{ ?s a ex:{class} }}")
     };
     let fired = |store: &span_capture::SpanStore, before: usize| -> Vec<String> {
         store.find_spans("r2rml.count_manifest")[before..]
@@ -399,42 +407,51 @@ async fn filtered_map_answers_match_the_native_oracle() {
             .filter_map(|s| s.fields.get("fired").cloned())
             .collect()
     };
-    for (class, n, expect_fired) in [("HistoryRow", "8", "true"), ("Customer", "3", "false")] {
+    for (from, class, n, expect_fired) in [
+        (FILTERED, "HistoryRow", "8", &["true"][..]),
+        ("filtered-keyed:main", "Customer", "3", &["false"][..]),
+        (FILTERED, "Customer", "3", &[][..]),
+    ] {
         let before = store.find_spans("r2rml.count_manifest").len();
         let result = fluree
             .query_from()
-            .sparql(&count(class))
+            .sparql(&count(from, class))
             .execute_formatted()
             .await
             .unwrap_or_else(|e| panic!("count {class}: {e}"));
         assert_eq!(
             term(&result["results"]["bindings"][0]["n"]),
             n,
-            "count {class}: {result}"
+            "count {class} over {from}: {result}"
         );
         let outcomes = fired(&store, before);
         assert_eq!(
-            outcomes,
-            [expect_fired],
-            "manifest COUNT for {class}: {outcomes:?}"
+            outcomes, expect_fired,
+            "manifest COUNT for {class} over {from}: {outcomes:?}"
         );
     }
 
-    // The scan-side top-k ran for the top balance and stopped early: the file
-    // holding the current rows' best balance is read first, and the other file
-    // cannot beat it. Its answer (customer/4, 100.00) is above; unfiltered, a
-    // non-current row's 500.00 would win.
-    let before = store.find_events("scan-side top-k prune").len();
-    let top = sparql_rows(&fluree, FILTERED, &cases()[4]).await;
-    assert_eq!(top, ["customer/4"]);
-    let prunes = &store.find_events("scan-side top-k prune")[before..];
-    assert!(
-        prunes
-            .iter()
-            .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
-        "the top-k must read one file and prune the other: {:?}",
-        prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
-    );
+    // Over the keyed map the scan-side top-k ran for the top balance and
+    // stopped early: the file holding the current rows' best balance is read
+    // first, and the other file cannot beat it. Its answer (customer/4,
+    // 100.00) is above; unfiltered, a non-current row's 500.00 would win.
+    // With no key, two current rows could mint one customer's balance, which
+    // the scan emits once, so the rows it has seen are not k triples: it
+    // declines the top-k and reads both files, to the same answer.
+    for (from, keyed) in [("filtered-keyed:main", true), (FILTERED, false)] {
+        let before = store.find_events("scan-side top-k prune").len();
+        let top = sparql_rows(&fluree, from, &cases()[4]).await;
+        assert_eq!(top, ["customer/4"], "{from}");
+        let prunes = &store.find_events("scan-side top-k prune")[before..];
+        assert_eq!(
+            prunes
+                .iter()
+                .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
+            keyed,
+            "{from}: the top-k must read one file and prune the other only when keyed: {:?}",
+            prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
+        );
+    }
 }
 
 /// The `{"?s": ["*"]}` browse crawl renders a reference from the child's own
@@ -813,6 +830,219 @@ async fn validation_registration_and_reads_refuse_a_row_filter_alike() {
             .expect_err(sql);
         assert!(err.to_string().contains(reason), "{sql}\n{err}");
     }
+}
+
+/// Routing stamps for one query: the sites that proceeded, every site that
+/// recorded an outcome, and the table scans it opened.
+struct Routing {
+    proceeded: Vec<String>,
+    stamped: Vec<String>,
+    scans: usize,
+}
+
+async fn routed_rows(
+    fluree: &Fluree,
+    store: &span_capture::SpanStore,
+    from: &str,
+    case: &Case,
+    jsonld: bool,
+) -> (Vec<String>, Routing) {
+    let before = store.find_events("fast-path outcome").len();
+    let scans_before = store.find_spans("r2rml.scan_table").len();
+    let rows = if jsonld {
+        jsonld_rows(fluree, from, case).await
+    } else {
+        sparql_rows(fluree, from, case).await
+    };
+    let events = &store.find_events("fast-path outcome")[before..];
+    let routing = Routing {
+        proceeded: proceeded(store, before),
+        stamped: events
+            .iter()
+            .filter_map(|e| e.fields.get("site").cloned())
+            .collect(),
+        scans: store.find_spans("r2rml.scan_table").len() - scans_before,
+    };
+    (rows, routing)
+}
+
+/// A key declared on the filtered logical table (`f:key` next to its
+/// `rr:sqlQuery`) holds for the rows the filter keeps, though the whole table
+/// repeats it: the lanes that skip deduplication serve the map, and answers
+/// equal the native oracle. The same map without the key answers the same
+/// rows through the deduplicating lanes. Each stamp is checked on both maps,
+/// so neither assertion passes because a site never ran.
+#[tokio::test(flavor = "current_thread")]
+async fn a_key_on_a_filtered_logical_table_serves_the_keyed_lanes() {
+    const PROVEN: &str = "r2rml_scan_proven_distinct";
+    const FUSED: &str = "fused_r2rml_aggregate";
+    const FOLD_DEDUPE: &str = "fused_r2rml_aggregate_dedupe";
+    let _serial = SERIAL.lock().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    create_source(&fluree, "keyed", &mapping(CURRENT_KEYED)).await;
+    create_source(&fluree, "keyless", &mapping(CURRENT)).await;
+    create_oracle(&fluree).await;
+    let (store, _tracing) = span_capture::init_test_tracing();
+
+    // (case, sites that proceed with the key and do not without it, sites
+    // that proceed without the key and do not with it, sites that proceed on
+    // both, the keyed run's table scans)
+    type Expect = (
+        Case,
+        &'static [&'static str],
+        &'static [&'static str],
+        &'static [&'static str],
+        Option<usize>,
+    );
+    let expectations: Vec<Expect> = vec![
+        (
+            Case {
+                name: "keyed-names",
+                vars: &["c", "name"],
+                sparql: "SELECT ?c ?name {FROM} WHERE { ?c a ex:Customer ; ex:name ?name }",
+                jsonld: json!({"select": ["?c", "?name"],
+                               "where": {"@id": "?c", "@type": "ex:Customer", "ex:name": "?name"}}),
+                expected: &["customer/1|alice", "customer/2|bob", "customer/4|dave"],
+                must_fire: None,
+            },
+            &[PROVEN],
+            &[],
+            &[],
+            Some(1),
+        ),
+        (
+            Case {
+                name: "keyed-star",
+                vars: &["c", "name", "tier"],
+                sparql: "SELECT ?c ?name ?tier {FROM} WHERE { ?c ex:name ?name ; ex:tier ?tier }",
+                jsonld: json!({"select": ["?c", "?name", "?tier"],
+                               "where": {"@id": "?c", "ex:name": "?name", "ex:tier": "?tier"}}),
+                expected: &["customer/1|alice|gold", "customer/2|bob|silver"],
+                must_fire: None,
+            },
+            &[PROVEN],
+            &[],
+            &[],
+            Some(1),
+        ),
+        (
+            Case {
+                name: "keyed-count-class",
+                vars: &["n"],
+                sparql: "SELECT (COUNT(?c) AS ?n) {FROM} WHERE { ?c a ex:Customer }",
+                jsonld: json!({"select": ["(count ?c)"],
+                               "where": {"@id": "?c", "@type": "ex:Customer"}}),
+                expected: &["3"],
+                must_fire: None,
+            },
+            &[],
+            &[FOLD_DEDUPE],
+            &[FUSED],
+            None,
+        ),
+        (
+            Case {
+                name: "keyed-count-predicate",
+                vars: &["n"],
+                sparql: "SELECT (COUNT(?t) AS ?n) {FROM} WHERE { ?c ex:tier ?t }",
+                jsonld: json!({"select": ["(count ?t)"],
+                               "where": {"@id": "?c", "ex:tier": "?t"}}),
+                expected: &["2"],
+                must_fire: None,
+            },
+            &[],
+            &[FOLD_DEDUPE],
+            &[FUSED],
+            None,
+        ),
+    ];
+
+    let mut failures = Vec::new();
+    for (case, keyed_only, keyless_only, both, keyed_scans) in &expectations {
+        let expected: Vec<String> = case.expected.iter().map(ToString::to_string).collect();
+        for jsonld in [false, true] {
+            let surface = if jsonld { "JSON-LD" } else { "SPARQL" };
+            let (oracle, _) = routed_rows(&fluree, &store, ORACLE, case, jsonld).await;
+            for (from, keyed) in [("keyed:main", true), ("keyless:main", false)] {
+                for fast in [true, false] {
+                    set_fast_paths_disabled(!fast);
+                    let (rows, routing) = routed_rows(&fluree, &store, from, case, jsonld).await;
+                    set_fast_paths_disabled(false);
+                    let at = format!("{} {surface} {from} fast={fast}", case.name);
+                    if rows != oracle || (!jsonld && rows != expected) {
+                        failures.push(format!("{at}: {rows:?}, oracle {oracle:?}"));
+                    }
+                    if !fast {
+                        continue;
+                    }
+                    let (fire, hold): (Vec<&str>, Vec<&str>) = if keyed {
+                        (
+                            keyed_only.iter().chain(*both).copied().collect(),
+                            keyless_only.to_vec(),
+                        )
+                    } else {
+                        (
+                            keyless_only.iter().chain(*both).copied().collect(),
+                            keyed_only.to_vec(),
+                        )
+                    };
+                    for site in fire {
+                        if !routing.proceeded.iter().any(|s| s == site) {
+                            failures.push(format!(
+                                "{at}: `{site}` must proceed (stamped {:?})",
+                                routing.stamped
+                            ));
+                        }
+                    }
+                    for site in hold {
+                        if routing.proceeded.iter().any(|s| s == site) {
+                            failures.push(format!("{at}: `{site}` must not proceed"));
+                        }
+                    }
+                    if let (true, Some(n)) = (keyed, keyed_scans) {
+                        if routing.scans != *n {
+                            failures
+                                .push(format!("{at}: {} table scans, expected {n}", routing.scans));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+
+    // A key does not make a filtered map trackable: the tracking materializer
+    // still cannot retract a subject whose row leaves the filter.
+    fluree.create_ledger("target:main").await.expect("target");
+    let err = fluree
+        .materialize_r2rml_graph_source("keyed:main", "target:main", false)
+        .await
+        .expect_err("a keyed filtered map cannot be tracked either");
+    assert!(err.to_string().contains("fluree materialize"), "{err}");
+}
+
+/// A key over a column the query does not select is no key of the logical
+/// table: registration refuses it, naming the column, before any query runs.
+#[tokio::test]
+async fn a_key_the_query_does_not_select_is_refused_at_registration() {
+    let _serial = SERIAL.lock().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    set_local_roots();
+    let location = format!("file://{}/silver", fixtures_dir());
+    let logical = r#"rr:sqlQuery "SELECT name, tier, balance FROM silver.customers_history WHERE is_current = 1" ; f:key ( "customer_id" )"#;
+    let err = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("unselected", &location, mapping(logical))
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect_err("a key the query does not select");
+    let message = err.to_string();
+    assert!(
+        message.contains("\"customer_id\", which the query does not select")
+            && message.contains("mapping#Customer"),
+        "{message}"
+    );
 }
 
 /// A table with no snapshot has no rows to filter, but a row filter its

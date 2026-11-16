@@ -3713,7 +3713,10 @@ fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Resul
         let sid = normalize_pred_sid(ec.store, pred)?;
         if let Some(p_id) = ec.store.sid_to_p_id(&sid) {
             if crate::fast_path_common::predicate_unsafe_for_cross_predicate_o_key_join(
-                ec.store, ec.g_id, p_id,
+                ec.store,
+                ec.g_id,
+                p_id,
+                (ec.ctx.to_t < ec.store.max_t()).then_some(ec.ctx.to_t),
             )? {
                 return Ok(None);
             }
