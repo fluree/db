@@ -2179,7 +2179,8 @@ pub fn build_where_operators_with_needed(
 /// A BIND is considered safe to include in the block if **all** variables referenced
 /// by its expression are already bound by preceding patterns (original order). BINDs
 /// with unbound inputs cannot be deferred - they must fail at their original position.
-/// A leading constant-IRI BIND that seeds the block is left out (`bind_seeds_block`).
+/// A constant-IRI BIND ahead of the block's first triple that seeds the block ends
+/// it (`bind_seeds_block`).
 ///
 /// `VALUES` is always safe to include because it is an inner-join constraint/seed.
 pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoinBlock {
@@ -2214,7 +2215,13 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
                 i += 1;
             }
             Pattern::Bind { var, expr } => {
-                if i == start && bind_seeds_block(*var, expr, &patterns[i + 1..]) {
+                // What precedes it then runs ahead of the block too, so only
+                // FILTERs, VALUES and constant-IRI BINDs may: an earlier literal
+                // BIND has to stay a term check rather than become a probe.
+                if triples.is_empty()
+                    && binds.iter().all(|b| b.expr.is_constant_iri())
+                    && bind_seeds_block(*var, expr, &patterns[i + 1..])
+                {
                     break;
                 }
                 if let Some(bind) = BindPattern::when_eligible(*var, expr, &bound_vars) {
@@ -2250,7 +2257,7 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
     }
 }
 
-/// Does `BIND(<iri> AS ?var)`, at the head of a block, have to run before it?
+/// Does `BIND(<iri> AS ?var)`, ahead of a block's triples, have to run before them?
 ///
 /// `reorder_patterns` places a variable-free BIND first and costs every later
 /// pattern with `?var` bound. Held in the block, the BIND is only applied after
@@ -2261,12 +2268,7 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
 /// IRIs only. A literal probe matches by value across numeric subtypes, unlike
 /// the term comparison the held-back BIND makes.
 fn bind_seeds_block(var: VarId, expr: &Expression, rest: &[Pattern]) -> bool {
-    let constant_iri = matches!(
-        expr,
-        Expression::Call { func: Function::Iri, args }
-            if matches!(args.as_slice(), [Expression::Const(fluree_db_core::FlakeValue::String(_))])
-    );
-    constant_iri
+    expr.is_constant_iri()
         && rest
             .iter()
             .take_while(|p| {
