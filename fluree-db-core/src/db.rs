@@ -12,7 +12,7 @@ use crate::index_schema::IndexSchema;
 use crate::index_stats::IndexStats;
 use crate::ledger_id::{IntoLedgerId, LedgerId};
 use crate::namespaces::default_namespace_codes;
-use crate::ns_encoding::{encode_registered, NsSplitMode};
+use crate::ns_encoding::{encode_registered, table_full, NsSplitMode};
 use crate::range_provider::RangeProvider;
 use crate::schema_hierarchy::SchemaHierarchy;
 use crate::sid::Sid;
@@ -360,11 +360,11 @@ impl LedgerSnapshot {
 
     /// Encode an IRI to a SID using this db's namespace codes.
     ///
-    /// If no registered namespace prefix matches the IRI, falls back to the
-    /// EMPTY namespace (code 0), storing the full IRI as the local name.
-    /// This matches the transaction layer's behavior for bare-string
-    /// identifiers and ensures queries return empty results (rather than
-    /// erroring) for truly unknown IRIs.
+    /// An IRI whose canonical prefix has no code is stored whole under
+    /// `OVERFLOW` once the namespace table is full, and encodes that way here.
+    /// While the table has room no stored IRI has such a prefix, so it falls
+    /// back to the EMPTY namespace (code 0) with the full IRI as the local
+    /// name: queries for it return empty results rather than erroring.
     ///
     /// Use [`encode_iri_strict`](Self::encode_iri_strict) when unknown IRIs
     /// should produce an error (e.g., validating datatype IRIs in BIND
@@ -373,13 +373,15 @@ impl LedgerSnapshot {
         Some(self.encode_iri_inner(iri))
     }
 
-    /// Encode an IRI to a SID, returning `None` if no registered namespace
-    /// prefix matches.
+    /// Encode an IRI to a SID, returning `None` for an IRI this ledger cannot
+    /// hold: one whose prefix has no code while the namespace table has room.
     ///
     /// Unlike [`encode_iri`](Self::encode_iri), this does NOT fall back to
     /// the EMPTY namespace for unknown IRIs. Use this when the caller needs
     /// to distinguish between known and unknown namespaces (e.g., validating
     /// user-supplied IRIs in BIND expressions or policy identity resolution).
+    /// Once the table is full, every IRI has a known encoding: its prefix's
+    /// code, or `OVERFLOW`.
     ///
     /// Note: bare strings with no scheme (e.g., `"just-a-string"`) canonically
     /// split to the EMPTY prefix `""` and are intentionally rejected here, even
@@ -394,15 +396,16 @@ impl LedgerSnapshot {
         }
     }
 
-    /// Shared IRI → SID encoding using canonical splitting and exact-prefix lookup.
-    ///
-    /// Uses `canonical_split(iri, mode)` + exact-prefix lookup. If the
-    /// canonical prefix is not registered, falls back to `Sid(EMPTY, iri)`.
-    /// No longest-prefix-match — canonical encoding prohibits `starts_with` matching.
+    /// Shared IRI → SID encoding using canonical splitting and exact-prefix
+    /// lookup, per [`encode_registered`]. No longest-prefix-match — canonical
+    /// encoding prohibits `starts_with` matching.
     fn encode_iri_inner(&self, iri: &str) -> Sid {
-        encode_registered(iri, self.ns_split_mode, |prefix| {
-            self.namespace_reverse.get(prefix).copied()
-        })
+        encode_registered(
+            iri,
+            self.ns_split_mode,
+            |prefix| self.namespace_reverse.get(prefix).copied(),
+            || table_full(&self.namespace_codes),
+        )
     }
 
     /// Build a reverse lookup from graph Sid → GraphId.
