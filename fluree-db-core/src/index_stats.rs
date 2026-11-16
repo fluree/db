@@ -6,6 +6,7 @@
 
 use crate::ids::GraphId;
 use crate::sid::Sid;
+use std::collections::HashMap;
 
 // === Per-Property Statistics ===
 
@@ -207,6 +208,41 @@ impl IndexStats {
                     / (total_flakes as u128)) as u64;
                 g.size = part;
                 assigned = assigned.saturating_add(part);
+            }
+        }
+    }
+
+    /// Key each predicate `keys` names by the Sid it maps to, in the property
+    /// table and in every class's property usages, ledger-wide and per graph.
+    pub fn rekey_predicates(&mut self, keys: &HashMap<Sid, Sid>) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Some(properties) = self.properties.as_mut() {
+            for property in properties.iter_mut() {
+                if let Some(to) = keys.get(&Sid::new(property.sid.0, &property.sid.1)) {
+                    property.sid = (to.namespace_code, to.name.to_string());
+                }
+            }
+            properties.sort_by(|a, b| a.sid.cmp(&b.sid));
+        }
+        let graph_classes = self
+            .graphs
+            .iter_mut()
+            .flatten()
+            .flat_map(|g| g.classes.iter_mut().flatten());
+        for class in self.classes.iter_mut().flatten().chain(graph_classes) {
+            let mut rekeyed = false;
+            for usage in &mut class.properties {
+                if let Some(to) = keys.get(&usage.property_sid) {
+                    usage.property_sid = to.clone();
+                    rekeyed = true;
+                }
+            }
+            if rekeyed {
+                class
+                    .properties
+                    .sort_by(|a, b| a.property_sid.cmp(&b.property_sid));
             }
         }
     }
