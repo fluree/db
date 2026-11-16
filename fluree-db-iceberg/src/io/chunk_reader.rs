@@ -398,6 +398,18 @@ pub struct RangeRead<S: SendIcebergStorage + 'static> {
     runtime: Handle,
 }
 
+impl<S: SendIcebergStorage + 'static> std::fmt::Debug for RangeRead<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let buffered = (self.head.get_ref().len() as u64).saturating_sub(self.head.position());
+        f.debug_struct("RangeRead")
+            .field("path", &self.path)
+            .field("buffered", &buffered)
+            .field("next", &self.next)
+            .field("limit", &self.limit)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<S: SendIcebergStorage + 'static> Read for RangeRead<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let n = self.head.read(buf)?;
@@ -825,8 +837,7 @@ mod tests {
         let err = tokio::task::spawn_blocking(move || {
             reader_over(&storage)
                 .get_read(MIB + 1)
-                .err()
-                .expect("an offset past the end is an error")
+                .expect_err("an offset past the end is an error")
         })
         .await
         .unwrap();
