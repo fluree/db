@@ -897,6 +897,7 @@ mod tests {
         use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
         use parquet::arrow::ArrowWriter;
         use parquet::file::properties::WriterProperties;
+        use parquet::file::reader::{FileReader, SerializedFileReader};
         use std::collections::HashMap;
 
         const ROWS: i64 = 1_200_000;
@@ -917,6 +918,9 @@ mod tests {
         let props = WriterProperties::builder()
             .set_dictionary_enabled(false)
             .set_data_page_size_limit(64 * 1024)
+            // One row group, so two column chunks; parquet's default would
+            // split these rows at 1,048,576.
+            .set_max_row_group_row_count(Some(ROWS as usize))
             .build();
         let mut buf = Vec::new();
         let mut writer = ArrowWriter::try_new(&mut buf, schema, Some(props)).unwrap();
@@ -925,6 +929,11 @@ mod tests {
         let file = Bytes::from(buf);
         let file_size = file.len() as u64;
         assert!(file_size > 2 * GET_READ_WINDOW, "file is {file_size} bytes");
+        let row_groups = SerializedFileReader::new(file.clone())
+            .unwrap()
+            .metadata()
+            .num_row_groups();
+        assert_eq!(row_groups, 1);
 
         let storage = CountingStorage::over(file.clone());
         let check = Arc::clone(&storage);
@@ -974,7 +983,7 @@ mod tests {
             check.bytes_fetched(),
             check.fetches().len()
         );
-        // The footer, then a window per ~7 MiB of the two column chunks.
+        // The footer, then a window per ~7 MiB of each column chunk.
         assert_eq!(check.fetches().len(), 5, "fetches: {:?}", check.fetches());
     }
 }
