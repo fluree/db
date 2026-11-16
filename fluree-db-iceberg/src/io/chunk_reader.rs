@@ -44,8 +44,8 @@
 //! to spare, or that runs to the end of the file; otherwise it fetches a fresh
 //! [`GET_READ_WINDOW`] from `start`. So a column chunk read page by page costs
 //! about one fetch per window, not one per page. The reader it returns reads
-//! up to [`GET_READ_WINDOW`] from `start`, as the old 8 MiB cursor did,
-//! fetching past a cached window's end only if read that far.
+//! up to [`GET_READ_WINDOW`] from `start`, fetching past a cached window's end
+//! only if read that far.
 
 use std::io::{Cursor, Read};
 use std::ops::Range;
@@ -347,9 +347,7 @@ impl<S: SendIcebergStorage + 'static> ChunkReader for RangeBackedChunkReader<S> 
     /// Parquet's page reader calls this once per page, to read the page's
     /// header; the body then comes through `get_bytes`. Serving it from a
     /// window already fetched keeps a page-by-page read of a column chunk at
-    /// about one fetch per window. Requiring a cached window to hold a whole
-    /// `GET_READ_WINDOW` past the offset instead meant a fresh 8 MiB fetch for
-    /// nearly every page: 8 MiB moved per 1 MiB page.
+    /// about one fetch per window.
     fn get_read(&self, start: u64) -> std::result::Result<Self::T, parquet::errors::ParquetError> {
         if start > self.file_size {
             return Err(ParquetError::EOF(format!(
@@ -383,11 +381,10 @@ impl<S: SendIcebergStorage + 'static> ChunkReader for RangeBackedChunkReader<S> 
 
 /// The reader [`RangeBackedChunkReader::get_read`] returns: the bytes from its
 /// offset that a cached or fresh window holds, then, only if read past them,
-/// the rest of [`GET_READ_WINDOW`] from that offset, fetched uncached. That is
-/// the old 8 MiB cursor's reach: a page header longer than a served window's
-/// remainder still reads whole, while a corrupt header that declares a longer
-/// field than that runs into the end of the reader, as it did before, instead
-/// of pulling the rest of the file through it.
+/// the rest of [`GET_READ_WINDOW`] from that offset, fetched uncached. So a
+/// page header longer than a served window's remainder still reads whole,
+/// while a corrupt header that declares a longer field than that runs into the
+/// end of the reader instead of pulling the rest of the file through it.
 pub struct RangeRead<S: SendIcebergStorage + 'static> {
     /// The bytes not yet read from the current window.
     head: Cursor<Bytes>,
@@ -642,10 +639,8 @@ mod tests {
     }
 
     /// Parquet's page reader reads a column chunk page by page: `get_read` at
-    /// each page for its header, then `get_bytes` for the body. A header used
-    /// to fetch a fresh 8 MiB window unless a cached one held 8 MiB past it, so
-    /// these 16 MiB of 64 KiB pages took 64 fetches and about 520 MiB. A window
-    /// already fetched now serves the pages it covers.
+    /// each page for its header, then `get_bytes` for the body. A window
+    /// already fetched serves the headers of the pages it covers.
     #[tokio::test(flavor = "multi_thread")]
     async fn page_by_page_read_fetches_each_window_once() {
         const PAGE: u64 = 64 * 1024;
@@ -762,13 +757,13 @@ mod tests {
         assert_eq!(check.fetches().len(), 1, "fetches: {:?}", check.fetches());
     }
 
-    /// The reader `get_read` returns reaches `GET_READ_WINDOW` from its offset,
-    /// as the old 8 MiB cursor did, and no further. Served from a cached window
-    /// with less than that left, a read past the window's end fetches the rest
-    /// of the reach in one uncached range (a page header longer than what the
-    /// window has left still reads whole); a read past the reach ends there, so
-    /// a corrupt header that declares a longer field can't pull the rest of the
-    /// file through the reader.
+    /// The reader `get_read` returns reaches `GET_READ_WINDOW` from its offset
+    /// and no further. Served from a cached window with less than that left, a
+    /// read past the window's end fetches the rest of the reach in one uncached
+    /// range (a page header longer than what the window has left still reads
+    /// whole); a read past the reach ends there, so a corrupt header that
+    /// declares a longer field can't pull the rest of the file through the
+    /// reader.
     #[tokio::test(flavor = "multi_thread")]
     async fn get_read_reads_up_to_its_reach_and_no_further() {
         let storage = CountingStorage::patterned(32 * MIB);
@@ -844,8 +839,7 @@ mod tests {
     /// (Iceberg writes 1 MiB pages by default, and real pages vary) costs one
     /// extra fetch at that window's edge: the body is fetched on its own, and
     /// the next header, with less than `GET_READ_MIN_TAIL` left in that body's
-    /// range, starts a fresh window. Ten 1.75 MiB pages take four fetches,
-    /// against ten 8 MiB fetches before.
+    /// range, starts a fresh window. Ten 1.75 MiB pages take four fetches.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_page_longer_than_its_windows_remainder_costs_one_extra_fetch() {
         const PAGE: u64 = 1792 * 1024;
@@ -885,8 +879,7 @@ mod tests {
 
     /// End to end through the Arrow decoder: a file of small pages decodes to
     /// the same rows through the range-backed reader as from memory, in five
-    /// fetches and little more than the file's bytes. Before page headers were
-    /// served from cached windows, this 19 MB file took 43 fetches and 363 MB.
+    /// fetches and little more than the file's bytes.
     #[tokio::test(flavor = "multi_thread")]
     async fn small_page_parquet_decodes_with_about_one_pass_over_the_file() {
         use arrow::array::{ArrayRef, Int64Array, RecordBatch};
