@@ -203,7 +203,6 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr19", // Mix of protected and unprotected terms.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr20", // Fail with mix of protected and unprotected terms with type+null+ctx.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr21", // Fail with mix of protected and unprotected terms with type+null.
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr22", // Check legal overriding of type-scoped protected term from nested node.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr28", // Fails if trying to redefine a protected null term.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr30", // Keywords may be protected.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr31", // Protected keyword aliases cannot be overridden.
@@ -225,7 +224,7 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0119", // Ignore some terms with @, allow others. (also `@ignoreMe`, kept)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0120", // Ignore some values of @id with @, allow others. (also `@ignoreMe`, kept)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0121", // Ignore some values of @reverse with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`)
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`, refused)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc023", // composed type-scoped property-scoped contexts including @type:@vocab
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc024", // type-scoped + property-scoped + values evaluates against previous context
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr29", // Does not expand a Compact IRI using a non-prefix term.
@@ -242,21 +241,14 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0045", // Top-level value objects
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0046", // Free-floating nodes
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0047", // Free-floating values in sets and free-floating lists
-    // Context and keyword features: a scoped context's term with no `@id` does not
-    // take `@vocab`; a type-scoped `null` context or `@base` is ignored; keyword
-    // aliases in term definitions; `@none` in language maps; `@type: @none`; `@reverse`
-    // and `@nest` edge cases; a nested graph object with no `@id`. #2395
+    // Context and keyword features: a type-scoped `null` context or `@base` is
+    // ignored; keyword aliases in term definitions; `@none` in language maps;
+    // `@type: @none`; `@reverse` and `@nest` edge cases; a nested graph object with
+    // no `@id`. #2395
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0043", // Using reverse properties inside a @reverse-container
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0051", // Expansion of keyword aliases in term definitions
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc002", // overriding a term
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc003", // property and value with different terms mapping to the same expanded property
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc004", // deep @context affects nested nodes
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc007", // overriding a term
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc012", // deep property-term scoped @context in @type-scoped @context affects nested nodes
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc014", // type-scoped context nullification
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc015", // type-scoped base
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc019", // type-scoped context with multiple property scoped terms
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc026", // @propagate: true on type-scoped context
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc037", // property-scoped contexts which are alias of @nest
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc038", // Bibframe example (poor-mans inferrence)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tin06", // json.api example
@@ -467,7 +459,6 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr19", // Mix of protected and unprotected terms.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr20", // Fail with mix of protected and unprotected terms with type+null+ctx.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr21", // Fail with mix of protected and unprotected terms with type+null.
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr22", // Check legal overriding of type-scoped protected term from nested node.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr28", // Fails if trying to redefine a protected null term.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr30", // Keywords may be protected.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr31", // Protected keyword aliases cannot be overridden.
@@ -491,7 +482,7 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te119", // Ignore some terms with @, allow others. (also `@ignoreMe`, refused)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te120", // Ignore some values of @id with @, allow others. (also `@ignoreMe`, refused)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te121", // Ignore some values of @reverse with @, allow others.
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`)
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`, refused)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr29", // Does not expand a Compact IRI using a non-prefix term.
     // A `@json` term drops a null value, where the algorithm keeps the JSON literal
     // `null`. #2357
@@ -504,19 +495,12 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te045", // Top-level value objects are removed
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te046", // Free-floating nodes are removed
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te047", // Remove free-floating set values and lists
-    // Context and keyword features: a scoped context's term with no `@id` does not
-    // take `@vocab`; a type-scoped `null` context or `@base` is ignored; keyword
-    // aliases in term definitions; `@none` in language maps; `@type: @none`; `@reverse`
-    // and `@nest` edge cases; a nested graph object with no `@id`. #2395
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc002", // overriding a term
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc003", // property and value with different terms mapping to the same expanded property
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc004", // deep @context affects nested nodes
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc007", // overriding a term
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc012", // deep property-term scoped @context in @type-scoped @context affects nested nodes
+    // Context and keyword features: a type-scoped `null` context or `@base` is
+    // ignored; keyword aliases in term definitions; `@none` in language maps;
+    // `@type: @none`; `@reverse` and `@nest` edge cases; a nested graph object with
+    // no `@id`. #2395
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc014", // type-scoped context nullification
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc015", // type-scoped base
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc019", // type-scoped context with multiple property scoped terms
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc026", // @propagate: true on type-scoped context
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc037", // property-scoped contexts which are alias of @nest
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc038", // Bibframe example (poor-mans inferrence)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te020", // do not remove @graph if not at top-level
