@@ -104,6 +104,8 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0062", // Various relative IRIs with with @base
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0092", // Various relative IRIs as properties with with @vocab: ''
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0110", // Various relative IRIs as properties with with relative @vocab
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0111", // Various relative IRIs as properties with with relative @vocab itself relative to an existing vocabulary base
+    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0112", // Various relative IRIs as properties with with relative @vocab relative to another relative vocabulary base
     // A node with several types applies their scoped contexts in the order
     // written, and `@propagate` is honored on a type's scoped context only.
     // Documented: compatibility.md (JSON-LD 1.1); #2080.
@@ -128,7 +130,6 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tdi06", // simple language mapwith overriding null direction
     // There is no JSON-LD 1.0 processing mode (`processingMode: json-ld-1.0`): a
     // document is processed as JSON-LD 1.1. Documented: compatibility.md (JSON-LD 1.1).
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0075", // @vocab as blank node identifier
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc029", // @propagate is invalid in 1.0
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tep02", // processingMode json-ld-1.0 conflicts with @version: 1.1
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#ter42", // Keywords may not be redefined in 1.0
@@ -208,9 +209,9 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr31", // Protected keyword aliases cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr32", // Protected @type cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr42", // Fail if protected flag not retained during redefinition
-    // IRI expansion: a relative, compact or term `@vocab`; terms and IRIs
-    // that begin with `:`, or with `@` but are not in keyword form (`@`, `@foo.bar`);
-    // some valid term definitions are refused. #2395
+    // IRI expansion: terms and IRIs that begin with `:`, or with `@` but are not
+    // in keyword form (`@`, `@foo.bar`); some valid term definitions are refused.
+    // #2395
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0048", // Terms are ignored in @id
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0056", // Use terms with @type: @vocab but not with @type: @id
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0060", // Overwrite document base with @base and reset it again
@@ -218,8 +219,6 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0070", // Compact IRI as term defined using equivalent compact IRI
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0072", // Redefine term using @vocab, not itself
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0109", // IRI expansion of fragments including ':'
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0111", // Various relative IRIs as properties with with relative @vocab itself relative to an existing vocabulary base
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0112", // Various relative IRIs as properties with with relative @vocab relative to another relative vocabulary base
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0114", // Expansion allows multiple properties expanding to @type
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0117", // A term starting with a colon can expand to a different IRI
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0118", // Expanding a value staring with a colon does not treat that value as an IRI
@@ -227,10 +226,6 @@ pub const EXPAND: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0120", // Ignore some values of @id with @, allow others. (also `@ignoreMe`, kept)
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0121", // Ignore some values of @reverse with @, allow others.
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`)
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0124", // compact IRI as @vocab
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#t0125", // term as @vocab
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc021", // type-scoped value mix
-    "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc022", // type-scoped property-scoped contexts including @type:@vocab
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc023", // composed type-scoped property-scoped contexts including @type:@vocab
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tc024", // type-scoped + property-scoped + values evaluates against previous context
     "https://w3c.github.io/json-ld-api/tests/expand-manifest#tpr29", // Does not expand a Compact IRI using a non-prefix term.
@@ -385,6 +380,8 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#t0126", // IRI Resolution (6)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te092", // Various relative IRIs as properties with with @vocab: ''
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te110", // Various relative IRIs as properties with with relative @vocab
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te111", // Various relative IRIs as properties with with relative @vocab itself relative to an existing vocabulary base (also keeps the invalid IRI `…/rel2##fragment-works`, #2395)
+    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te112", // Various relative IRIs as properties with with relative @vocab relative to another relative vocabulary base (also keeps the invalid IRI `…/rel2##fragment-works`, #2395)
     // A node with several types applies their scoped contexts in the order
     // written, and `@propagate` is honored on a type's scoped context only.
     // Documented: compatibility.md (JSON-LD 1.1); #2080.
@@ -476,11 +473,9 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr31", // Protected keyword aliases cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr32", // Protected @type cannot be overridden.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr42", // Fail if protected flag not retained during redefinition
-    // IRI expansion: a relative, compact or term `@vocab`; terms and IRIs
-    // that begin with `:`, or with `@` but are not in keyword form (`@`, `@foo.bar`);
-    // some valid term definitions are refused. #2395
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc021", // type-scoped value mix
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc022", // type-scoped property-scoped contexts including @type:@vocab
+    // IRI expansion: terms and IRIs that begin with `:`, or with `@` but are not
+    // in keyword form (`@`, `@foo.bar`); some valid term definitions are refused.
+    // #2395
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc023", // composed type-scoped property-scoped contexts including @type:@vocab
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tc024", // type-scoped + property-scoped + values evaluates against previous context
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te048", // Terms are ignored in @id
@@ -490,8 +485,6 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te070", // Redefine compact IRI with itself
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te072", // Redefine term using @vocab, not itself
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te109", // IRI expansion of fragments including ':'
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te111", // Various relative IRIs as properties with with relative @vocab itself relative to an existing vocabulary base
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te112", // Various relative IRIs as properties with with relative @vocab relative to another relative vocabulary base
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te114", // Expansion allows multiple properties expanding to @type
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te117", // A term starting with a colon can expand to a different IRI
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te118", // Expanding a value staring with a colon does not treat that value as an IRI
@@ -499,8 +492,6 @@ pub const TO_RDF: &[&str] = &[
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te120", // Ignore some values of @id with @, allow others. (also `@ignoreMe`, refused)
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te121", // Ignore some values of @reverse with @, allow others.
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te122", // Ignore some IRIs when that start with @ when expanding. (also `@ignoreMe` as an `@id`)
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te124", // compact IRI as @vocab
-    "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#te125", // term as @vocab
     "https://w3c.github.io/json-ld-api/tests/toRdf-manifest#tpr29", // Does not expand a Compact IRI using a non-prefix term.
     // A `@json` term drops a null value, where the algorithm keeps the JSON literal
     // `null`. #2357

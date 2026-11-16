@@ -349,17 +349,15 @@ fn schema_cache() -> &'static SchemaCache {
 /// `@vocab` that shorten IRIs to the names this ledger's users already write.
 fn namer_for(db: &GraphDb) -> Namer {
     let mut prefixes = Vec::new();
-    let mut vocab = None;
     if let Some(obj) = db.default_context.as_ref().and_then(JsonValue::as_object) {
         for (key, value) in obj {
             let Some(iri) = value.as_str() else { continue };
-            if key == "@vocab" {
-                vocab = Some(iri.to_string());
-            } else if !key.starts_with('@') {
+            if !key.starts_with('@') {
                 prefixes.push((key.clone(), iri.to_string()));
             }
         }
     }
+    let vocab = crate::query::helpers::default_context_vocab(db.default_context.as_ref());
     Namer::new(prefixes, vocab)
 }
 
