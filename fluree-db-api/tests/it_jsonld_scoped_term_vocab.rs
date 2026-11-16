@@ -83,7 +83,7 @@ async fn a_keyword_form_node_reference_is_refused() {
             .expect_err(&doc.to_string())
             .to_string();
         assert!(
-            err.contains("\"@ignoreMe\" is not supported as a node reference"),
+            err.contains("\"@ignoreMe\" has the form of a JSON-LD keyword, so it names no node"),
             "{doc}: {err}"
         );
     }
