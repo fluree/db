@@ -490,6 +490,18 @@ Fulltext scoring works naturally with standard graph patterns. Filter by type, c
 
 Placing the category filter before the `fulltext()` bind reduces the number of documents scored, improving query performance.
 
+`fulltext()` scores against the graph its own group reads. To score values held in a named graph, write the `fulltext()` filter or bind inside that `GRAPH` block, not after it:
+
+```sparql
+SELECT ?title ?score WHERE {
+  GRAPH <http://example.org/catalog> {
+    ?doc ex:title ?title .
+    BIND(fulltext(?title, "zapato") AS ?score)
+    FILTER(?score > 0)
+  }
+}
+```
+
 ## How Scoring Works
 
 The `fulltext()` function uses **BM25** (Best Match 25), the standard information retrieval scoring algorithm used by search engines.
@@ -513,6 +525,10 @@ score(q,d) = SUM( IDF(t) * TF_norm(t) )  for each query term t
 - **Term frequency saturation** -- Diminishing returns for repeated terms, controlled by parameter *k1* (default 1.2). The 5th occurrence of "database" in a document contributes less than the 1st.
 
 - **Corpus-wide average document length** (`avgdl`) -- Anchors the length normalization across the entire collection.
+
+### Scoring under a policy
+
+The corpus statistics (*N*, *df*, *avgdl*) cover every document of the property, including documents a [policy](../security/policy-in-queries.md) hides from the identity running the query. Hidden documents are never returned as hits, and a visible document scores the same for a policy-scoped reader as for an unrestricted request. Because the statistics include hidden documents, though, a reader can tell from their scores when hidden documents containing a term are added or removed. The BM25 graph source behaves the same way: it scores against the whole index, then drops hits the identity cannot see.
 
 ### Text analysis pipeline
 

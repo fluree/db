@@ -59,6 +59,12 @@ pub enum DiagCode {
     CasingMismatch,
     /// An emitted child-fact→hub join on the hub's PK — bounded, but a perf advisory.
     FactHubJoinAdvisory,
+    /// No key the source knows for a map's logical table proves the map's
+    /// subjects unique (`TriplesMap::subject_unique_under`), so queries over
+    /// it remove repeated solutions as they run. Correct, but slower and
+    /// charged to the query's memory budget; the message names the map and
+    /// the remedy (declare `f:key`, or a key the source reports).
+    KeylessMap,
 }
 
 /// A single structured diagnostic.

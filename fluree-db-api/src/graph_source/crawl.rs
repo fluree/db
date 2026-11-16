@@ -2336,6 +2336,7 @@ mod e2e {
             tables: vec!["customers".to_string(), "accounts".to_string()],
             snapshot_id: Some(1),
             mor_approximate_tables: Vec::new(),
+            table_columns: HashMap::new(),
             model: None,
             default_allow: None,
         };

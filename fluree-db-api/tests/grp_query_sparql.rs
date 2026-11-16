@@ -10,6 +10,9 @@ mod it_query_join_count;
 #[path = "it_limit_stops_work.rs"]
 mod it_limit_stops_work;
 
+#[path = "it_graph_scope_streams.rs"]
+mod it_graph_scope_streams;
+
 #[path = "it_novelty_subject_iri_formats.rs"]
 mod it_novelty_subject_iri_formats;
 

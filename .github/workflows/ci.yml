@@ -261,9 +261,11 @@ jobs:
       # the rows the per-scan lane returns and the rows the fake pinned. The
       # bridge is already built here, so run one over each database (an empty
       # SQLite file, and the two services) and replay every lane case through
-      # all three. The tests seed their own tables and skip loudly when a URL
-      # is unset; `live_bridge_backends_are_configured_in_ci` fails if any of
-      # the three is missing, so a skipped backend cannot read as a pass.
+      # all three, and the set-semantics cases (tables repeating triples)
+      # against a native ledger. The tests seed their own tables and skip
+      # loudly when a URL is unset; `live_bridge_backends_are_configured_in_ci`
+      # fails if any of the three is missing, so a skipped backend cannot read
+      # as a pass.
       - name: Start a bridge over each database
         run: |
           bridge=fluree-sql-bridge/target/debug/fluree-sql-bridge
@@ -288,7 +290,7 @@ jobs:
           FLUREE_SQL_BRIDGE_URL: http://127.0.0.1:18080
           FLUREE_SQL_BRIDGE_POSTGRES_URL: http://127.0.0.1:18081
           FLUREE_SQL_BRIDGE_MYSQL_URL: http://127.0.0.1:18082
-        run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane --test it_sql_graph_source live_bridge
+        run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane --test it_sql_graph_source --test it_sql_set_semantics live_bridge
 
   # Keeps the wasm32-unknown-unknown build honest: the whole engine stack must
   # keep compiling for the browser target (fluree-db-api pulls every wasm-path

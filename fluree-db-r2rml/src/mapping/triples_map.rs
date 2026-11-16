@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{PredicateObjectMap, TermType};
+use super::{PredicateObjectMap, TableKeys, TermType};
 
 /// A compiled R2RML TriplesMap
 ///
@@ -38,6 +38,13 @@ pub struct TriplesMap {
     pub subject_map: SubjectMap,
     /// Zero or more predicate-object maps
     pub predicate_object_maps: Vec<PredicateObjectMap>,
+    /// The keys the mapping declares on this map's logical table (`f:key`).
+    ///
+    /// Skipped when empty, so a mapping that declares none serializes, and
+    /// hashes for its materialized twin, exactly as it did before keys could be
+    /// declared.
+    #[serde(default, skip_serializing_if = "TableKeys::is_empty")]
+    pub declared_keys: TableKeys,
 }
 
 impl TriplesMap {
@@ -48,12 +55,26 @@ impl TriplesMap {
             logical_table: LogicalTable::TableName(table_name.into()),
             subject_map: SubjectMap::default(),
             predicate_object_maps: Vec::new(),
+            declared_keys: TableKeys::none(),
         }
     }
 
-    /// Set the subject map template
+    /// Declare a key of the logical table: columns no two rows agree on.
+    pub fn with_declared_key<S: Into<String>>(
+        mut self,
+        columns: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.declared_keys = std::mem::take(&mut self.declared_keys)
+            .union([columns.into_iter().map(Into::into).collect::<Vec<String>>()]);
+        self
+    }
+
+    /// Set the subject map template, and the columns it reads
+    /// ([`SubjectMap::template_columns`]), as the loader does.
     pub fn with_subject_template(mut self, template: impl Into<String>) -> Self {
-        self.subject_map.template = Some(template.into());
+        let template = template.into();
+        self.subject_map.template_columns = extract_template_columns(&template);
+        self.subject_map.template = Some(template);
         self
     }
 
@@ -659,6 +680,12 @@ mod tests {
             Some("http://example.org/{namespace}/{id}".to_string())
         );
         assert_eq!(sm.template_columns, vec!["namespace", "id"]);
+    }
+
+    #[test]
+    fn the_builder_records_a_subject_templates_columns() {
+        let tm = TriplesMap::new("#T", "t").with_subject_template("http://ex/t/{a}/{b}");
+        assert_eq!(tm.subject_map.template_columns, vec!["a", "b"]);
     }
 
     #[test]

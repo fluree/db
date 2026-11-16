@@ -16,13 +16,16 @@ mod span_capture;
 
 use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
 
+/// The key lets the fold count rows as solutions: without one, every
+/// aggregate over the map declines, since two rows could mint one triple.
 const PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
+    @prefix f: <https://ns.flur.ee/db#> .
 
     <http://example.org/mapping#PeopleMapping>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:logicalTable [ rr:tableName "silver.people" ; f:key ( "id" ) ] ;
         rr:subjectMap [
             rr:template "http://example.org/person/{id}" ;
             rr:class ex:Person

@@ -39,14 +39,16 @@ fn version_name_rows(result: &serde_json::Value) -> Vec<Vec<String>> {
 /// `silver.versions`: the first file holds alice (1) and erin (5); the second
 /// the top names, hank (2), gina (3), ivan (6, no city) and zed (no `id`, so
 /// no subject). `ex:person` references `silver.people` (ids 1 to 5), so
-/// ivan's dangles.
+/// ivan's dangles. Both logical tables declare `id` their key: a map whose
+/// rows can repeat a triple declines the top-k, and these tests pin the
+/// heap's feed, so their maps are ones whose rows are their solutions.
 const VERSIONS_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
     @prefix ex: <http://example.org/> .
 
     <http://example.org/mapping#Version>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "silver.versions" ] ;
+        rr:logicalTable [ rr:tableName "silver.versions" ; <https://ns.flur.ee/db#key> ( "id" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/version/{id}" ; rr:class ex:Version ] ;
         rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
         rr:predicateObjectMap [ rr:predicate ex:city ; rr:objectMap [ rr:column "city" ] ] ;
@@ -60,7 +62,7 @@ const VERSIONS_R2RML: &str = r#"
 
     <http://example.org/mapping#Person>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:logicalTable [ rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/person/{id}" ] .
 "#;
 
