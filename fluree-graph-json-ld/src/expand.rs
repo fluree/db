@@ -2539,6 +2539,38 @@ mod tests {
         }
     }
 
+    /// A scoped term's `@reverse` and `@type` datatype take the vocabulary in
+    /// effect too, and a relative `@id` joins it to that `@id`, not to the
+    /// term.
+    #[test]
+    fn a_scoped_terms_other_iris_take_the_vocabulary() {
+        let expanded = crate::expand(&json!({
+            "@context": {"@vocab": "http://example/", "foo": {"@context": {
+                "bar": {"@type": "myType"},
+                "up": {"@reverse": "rel"},
+                "qux": {"@id": "baz"}
+            }}},
+            "foo": {"@id": "http://example/n", "bar": "x", "up": {"@id": "http://example/o"}, "qux": "y"}
+        }))
+        .unwrap();
+        let node = &expanded["http://example/foo"][0];
+        assert_eq!(
+            node["http://example/bar"],
+            json!([{"@value": "x", "@type": "http://example/myType"}]),
+            "{node}"
+        );
+        assert_eq!(
+            node["@reverse"]["http://example/rel"],
+            json!([{"@id": "http://example/o"}]),
+            "{node}"
+        );
+        assert_eq!(
+            node["http://example/baz"],
+            json!([{"@value": "y"}]),
+            "{node}"
+        );
+    }
+
     /// A scoped `"@vocab": null` clears the vocabulary where it applies, so
     /// its terms with no `@id`, and the keys it covers, are plain names.
     #[test]

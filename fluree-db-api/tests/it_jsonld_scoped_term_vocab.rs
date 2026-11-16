@@ -270,3 +270,68 @@ async fn a_keyword_form_iri_an_earlier_release_wrote_moves() {
         ]))
     );
 }
+
+/// An earlier release wrote a scoped term's `@type` datatype as the plain
+/// name; one update retypes the values, so the same document then writes the
+/// value already stored.
+#[tokio::test]
+async fn a_plain_datatype_an_earlier_release_wrote_retypes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "tx/scoped-datatype-retype:main";
+    let ledger0 = genesis_ledger(&fluree, id).await;
+    let doc = json!({
+        "@context": {
+            "@vocab": "http://example.org/",
+            "foo": {"@context": {"bar": {"@id": "http://example.org/bar", "@type": "myType"}}}
+        },
+        "@id": "http://example.org/s",
+        "foo": {"@id": "http://example.org/n", "bar": "x"}
+    });
+    // `doc` as an earlier release stored it: the datatype a plain name.
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@id": "http://example.org/s",
+                "http://example.org/foo": {
+                    "@id": "http://example.org/n",
+                    "http://example.org/bar": {"@value": "x", "@type": "myType"}
+                }
+            }),
+        )
+        .await
+        .expect("insert");
+
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(
+            "DELETE { ?s ?p ?o } INSERT { ?s ?p ?n } WHERE { ?s ?p ?o \
+             FILTER(isLiteral(?o) && STR(DATATYPE(?o)) = \"myType\") \
+             BIND(STRDT(STR(?o), <http://example.org/myType>) AS ?n) }",
+        )
+        .commit()
+        .await
+        .expect("retype");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let ledger = fluree
+        .insert(ledger, &doc)
+        .await
+        .expect("insert again")
+        .ledger;
+
+    let out = support::query_sparql(
+        &fluree,
+        &ledger,
+        "SELECT (STR(?o) AS ?v) (STR(DATATYPE(?o)) AS ?dt) \
+         WHERE { <http://example.org/n> <http://example.org/bar> ?o }",
+    )
+    .await
+    .expect("sparql query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&out),
+        vec![json!(["x", "http://example.org/myType"])]
+    );
+}
