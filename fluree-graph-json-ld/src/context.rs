@@ -302,24 +302,27 @@ impl ParsedContext {
 /// `active` is the context before this one's term definitions.
 fn compute_vocab(active: &ParsedContext, value: &JsonValue) -> Result<Option<String>> {
     match value {
-        JsonValue::String(s) => {
-            let expanded = crate::expand::iri(s, active, true);
-            let relative = !iri::is_absolute(&expanded) && !expanded.starts_with("_:");
-            let vocab = match active.base.as_deref() {
-                Some(base) if relative => Some(resolve_iri(base, &expanded)),
-                _ if expanded.is_empty() => None,
-                _ => Some(expanded),
-            };
-            if vocab.as_deref().is_some_and(has_no_path) {
-                note_pathless_vocab();
-            }
-            Ok(vocab)
-        }
+        JsonValue::String(s) => Ok(resolve_vocab(active, s)),
         JsonValue::Null => Ok(None),
         _ => Err(JsonLdError::InvalidContext {
             message: format!("@vocab must be a string, got: {value:?}"),
         }),
     }
+}
+
+/// The vocabulary a `@vocab` string `s` sets, under `active`.
+pub(crate) fn resolve_vocab(active: &ParsedContext, s: &str) -> Option<String> {
+    let expanded = crate::expand::iri(s, active, true);
+    let relative = !iri::is_absolute(&expanded) && !expanded.starts_with("_:");
+    let vocab = match active.base.as_deref() {
+        Some(base) if relative => Some(resolve_iri(base, &expanded)),
+        _ if expanded.is_empty() => None,
+        _ => Some(expanded),
+    };
+    if vocab.as_deref().is_some_and(has_no_path) {
+        note_pathless_vocab();
+    }
+    vocab
 }
 
 /// An IRI with an authority and nothing after it, such as

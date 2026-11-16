@@ -722,22 +722,32 @@ fn parse_type<'c>(
 /// so a term IRI it writes as a compact IRI over a prefix it does not define
 /// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there, and
 /// one with no `:` (a relative `@id`, or none, so the term itself) has not
-/// met an outer `@vocab`. Both are expanded here, against the active context
-/// the scoped context applies to, before the scoped terms take effect, as a
-/// term of that context would be: left as they are, a key would expand to the
-/// compact string, or to a plain name under a context that declares a
+/// met an outer `@vocab`. Its own `@vocab`, if relative, has not either, nor
+/// have the terms it named. All are expanded here, against the active context
+/// the scoped context applies to, before the scoped terms take effect, as at
+/// the top level: left as they are, a key would expand to the compact string,
+/// to a relative IRI, or to a plain name under a context that declares a
 /// vocabulary.
 fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
-    let vocab = scoped.vocab.as_deref().or(active.vocab.as_deref());
+    // The scoped `@vocab` as written, and as it reads here.
+    let own_vocab = scoped
+        .vocab
+        .as_deref()
+        .map(|written| (written, crate::context::resolve_vocab(active, written)));
     let resolve = |iri: &str| -> Option<String> {
         match iri::parse_prefix(iri) {
             Some((prefix, suffix)) => {
                 let prefix_iri = active.get(&prefix)?.id.as_deref()?;
                 (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
             }
-            None if !iri.starts_with('@') && !iri::any_iri(iri) => {
-                vocab.map(|vocab| format!("{vocab}{iri}"))
-            }
+            None if !iri.starts_with('@') && !iri::any_iri(iri) => match &own_vocab {
+                // Parsing joined the term to the scoped `@vocab` as written.
+                Some((written, vocab)) => {
+                    let term = iri.strip_prefix(written)?;
+                    vocab.as_ref().map(|vocab| format!("{vocab}{term}"))
+                }
+                None => active.vocab.as_ref().map(|vocab| format!("{vocab}{iri}")),
+            },
             None => None,
         }
     };
@@ -761,8 +771,8 @@ fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
         })
         .collect();
     active.terms.extend(resolved);
-    if scoped.vocab.is_some() {
-        active.vocab = scoped.vocab.clone();
+    if let Some((_, vocab)) = own_vocab {
+        active.vocab = vocab;
     }
 }
 
@@ -2487,6 +2497,39 @@ mod tests {
             typed["http://example/baz"],
             json!([{"@id": "http://example/buzz"}])
         );
+    }
+
+    /// A scoped context's own `@vocab`, relative or a compact IRI, expands
+    /// against the context where it applies, as at the top level, and so do
+    /// the scoped terms it names and the keys it covers.
+    #[test]
+    fn a_scoped_vocab_expands_where_it_applies() {
+        for (vocab, expected) in [
+            ("rel/", "http://example/rel/"),
+            ("ex:ns/", "http://example/ns/"),
+        ] {
+            let expanded = crate::expand(&json!({
+                "@context": {
+                    "@vocab": "http://example/",
+                    "ex": "http://example/",
+                    "foo": {"@context": {"@vocab": vocab, "bar": {"@type": "@id"}}}
+                },
+                "foo": {"bar": "http://o/1", "baz": "v"}
+            }))
+            .unwrap();
+            let node = &expanded["http://example/foo"][0];
+            assert_eq!(node.as_object().map(Map::len), Some(2), "{vocab}: {node}");
+            assert_eq!(
+                node[format!("{expected}bar")],
+                json!([{"@id": "http://o/1"}]),
+                "{vocab}: {node}"
+            );
+            assert_eq!(
+                node[format!("{expected}baz")],
+                json!([{"@value": "v"}]),
+                "{vocab}: {node}"
+            );
+        }
     }
 
     /// A string in keyword form names no node, so where one would become an
