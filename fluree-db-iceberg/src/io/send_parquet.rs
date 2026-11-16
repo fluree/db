@@ -333,11 +333,11 @@ impl<S: SendIcebergStorage + 'static> SendIcebergStorage for LocalFileStorage<S>
 ///
 /// A large file decodes on blocking threads (see
 /// [`SendParquetReader::decode_large_file`]), and dropping or aborting the
-/// future that awaits them doesn't stop them. They went on fetching and
-/// decoding the rest of the file for a scan that no longer wanted it: a scan
-/// whose consumer had its rows (a LIMIT), a cancelled query, or the sibling
-/// slices of a row-group-parallel decode one of which failed. Each read checks
-/// first, so such a decode ends at its next fetch, with an error no one reads.
+/// future that awaits them doesn't stop them. That future is dropped when the
+/// file is no longer wanted: the scan's consumer has its rows (a LIMIT), the
+/// query is cancelled, or a sibling slice of a row-group-parallel decode
+/// failed. Each read checks first, so the decode ends at its next fetch, with
+/// an error no one reads.
 #[derive(Debug)]
 struct AbandonableStorage<S: SendIcebergStorage> {
     inner: Arc<S>,
@@ -2591,8 +2591,7 @@ mod tests {
     }
 
     /// A large file decodes on a blocking thread, which aborting the read does
-    /// not stop. It used to go on fetching and decoding the rest of the file
-    /// after its scan was gone; now its next fetch is refused.
+    /// not stop; its next fetch after the abort is refused.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_large_file_read_stops_fetching() {
         use std::sync::atomic::Ordering::SeqCst;
@@ -2681,8 +2680,7 @@ mod tests {
     }
 
     /// A row-group-parallel decode returns at the first slice that fails, and
-    /// the slices after it, on blocking threads of their own, used to go on
-    /// reading their row groups. Now the decode's return stops them at their
+    /// the slices after it, on blocking threads of their own, stop at their
     /// next fetch.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_failing_slice_stops_the_slices_after_it() {
