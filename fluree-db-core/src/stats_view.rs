@@ -12,7 +12,8 @@ use crate::value_id::ValueTypeTag;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Resolves a query-side IRI to the `Sid` that `IndexStats` is keyed by.
+/// Resolves an IRI to the `Sid` that `IndexStats` is keyed by: the indexer
+/// keys the stats with it and the planner reads them with it.
 ///
 /// Must stay equivalent to [`LedgerSnapshot::encode_iri`], including its
 /// EMPTY-namespace fallback for bare names.
@@ -30,6 +31,29 @@ impl StatsIriEncoder {
             reverse: snapshot.shared_namespace_reverse(),
             split_mode: snapshot.ns_split_mode(),
         }
+    }
+
+    /// Build an encoder from a namespace table (code -> prefix) and the
+    /// ledger's split mode.
+    pub fn from_namespace_codes<'a>(
+        codes: impl IntoIterator<Item = (&'a u16, &'a String)>,
+        split_mode: NsSplitMode,
+    ) -> Self {
+        Self {
+            reverse: Arc::new(
+                codes
+                    .into_iter()
+                    .map(|(&code, prefix)| (prefix.clone(), code))
+                    .collect(),
+            ),
+            split_mode,
+        }
+    }
+
+    /// [`Self::encode`] as the `(namespace code, name)` pair a root stores.
+    pub fn encode_parts(&self, iri: &str) -> (u16, String) {
+        let sid = self.encode(iri);
+        (sid.namespace_code, sid.name.to_string())
     }
 
     /// Encode an IRI to the SID the stats tables are keyed by.
