@@ -141,26 +141,61 @@ fn detect_container_memory_bytes() -> Option<usize> {
 }
 use std::sync::{Arc, Mutex};
 
-/// Key for the per-query constant→`s_id` memo.
+/// Key for the per-query constant→`s_id` memo ([`ConstSidMemo`]).
 ///
 /// A FILTER like `<iri> != ?var` (or `sid != ?var`) resolves the constant side
 /// to an internal subject id via a dictionary reverse-lookup. That result is
 /// invariant across rows, so it is memoized once per query rather than redone
 /// per row (a dominant cost on selective-filter workloads such as BSBM Explore).
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum ConstSidKey {
-    /// A constant full IRI.
-    Iri(Box<str>),
+///
+/// Every key is the constant itself, never where its expression lives. A
+/// correlated UNION, MINUS or OPTIONAL builds an operator tree per input row,
+/// each with its own copy of the FILTER expression, and drops it before the
+/// next; an address-based key could then read back a constant freed with an
+/// earlier tree (#2385). Borrowed, so a lookup allocates nothing.
+#[derive(Clone, Copy, Debug)]
+pub enum ConstSidKey<'a> {
+    /// An `IRI("…")` operand (how SPARQL and JSON-LD lower an IRI constant),
+    /// by the string it names, read off the expression before evaluating it.
+    /// Kept apart from [`Self::Iri`]: its value is whatever the operand
+    /// evaluates to (a SID when the snapshot knows the namespace), not always a
+    /// lookup by full IRI.
+    IriLiteral(&'a str),
+    /// A constant full IRI, as evaluated.
+    Iri(&'a str),
     /// A constant SID: namespace code + name.
-    Sid(u16, Box<str>),
-    /// Identity (address) of a variable-free operand expression, so its s_id can
-    /// be resolved once and reused without re-evaluating/re-encoding it per row.
-    ///
-    /// Safe as a key only because this memo lives exactly as long as the query
-    /// (and the expression tree it points into): the pointer is stable across
-    /// rows and the memo is dropped before any expression could be freed, so a
-    /// stale/reused address can never be observed.
-    ExprPtr(usize),
+    Sid(u16, &'a str),
+}
+
+/// The per-query constant→`s_id` memo; see [`ConstSidKey`].
+#[derive(Debug, Default)]
+pub struct ConstSidMemo {
+    iri_literals: FxHashMap<Box<str>, Option<u64>>,
+    iris: FxHashMap<Box<str>, Option<u64>>,
+    sids: FxHashMap<u16, FxHashMap<Box<str>, Option<u64>>>,
+}
+
+impl ConstSidMemo {
+    /// The memoized `s_id` for `key`: `Some(None)` when the constant was
+    /// resolved and isn't an indexed subject, `None` when it isn't memoized.
+    pub fn get(&self, key: ConstSidKey<'_>) -> Option<Option<u64>> {
+        match key {
+            ConstSidKey::IriLiteral(iri) => self.iri_literals.get(iri),
+            ConstSidKey::Iri(iri) => self.iris.get(iri),
+            ConstSidKey::Sid(ns, name) => self.sids.get(&ns).and_then(|names| names.get(name)),
+        }
+        .copied()
+    }
+
+    pub fn insert(&mut self, key: ConstSidKey<'_>, s_id: Option<u64>) {
+        match key {
+            ConstSidKey::IriLiteral(iri) => self.iri_literals.insert(iri.into(), s_id),
+            ConstSidKey::Iri(iri) => self.iris.insert(iri.into(), s_id),
+            ConstSidKey::Sid(ns, name) => {
+                self.sids.entry(ns).or_default().insert(name.into(), s_id)
+            }
+        };
+    }
 }
 
 /// Per-query memo for constant subject-id resolution (see [`ConstSidKey`]).
@@ -168,7 +203,7 @@ pub enum ConstSidKey {
 /// Owned by the [`ExecutionContext`], which holds exactly one store/snapshot, so
 /// the memo is correctly scoped — no cross-ledger aliasing. `Arc<Mutex<…>>` so
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
-pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
+pub type ConstSidCache = Arc<Mutex<ConstSidMemo>>;
 
 /// Per-query memo: binding-level `lang_id` → resolved language tag. Shared
 /// across per-graph context derivations like [`ConstSidCache`], so a
