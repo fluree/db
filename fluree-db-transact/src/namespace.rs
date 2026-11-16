@@ -64,11 +64,12 @@ pub struct NamespaceRegistry {
 }
 
 impl NamespaceRegistry {
-    /// Create a new registry with default namespaces
+    /// A registry for a new ledger: the predefined namespaces, splitting IRIs
+    /// under [`NsSplitMode::FOR_NEW_LEDGERS`].
     pub fn new() -> Self {
         Self {
             codes: NamespaceCodes::new(),
-            split_mode: NsSplitMode::default(),
+            split_mode: NsSplitMode::FOR_NEW_LEDGERS,
         }
     }
 
@@ -815,15 +816,24 @@ mod tests {
         let snapshot = LedgerSnapshot::genesis("test:main");
         let mut registry = NamespaceRegistry::from_db(&snapshot);
 
-        // Default split mode
-        assert_eq!(registry.split_mode(), NsSplitMode::MostGranular);
+        assert_eq!(registry.split_mode(), NsSplitMode::FOR_NEW_LEDGERS);
 
         let iri = "http://some-unseen-host/blah/123/456";
         let sid = registry.sid_for_iri(iri);
 
-        // MostGranular: split at last '/' → prefix="http://some-unseen-host/blah/123/"
+        // Split at last '/' → prefix="http://some-unseen-host/blah/123/"
         assert!(registry.has_prefix("http://some-unseen-host/blah/123/"));
         assert_eq!(sid.name.as_ref(), "456");
+    }
+
+    #[test]
+    fn a_new_ledger_gives_an_iri_ending_in_a_slash_no_namespace_of_its_own() {
+        let mut registry = NamespaceRegistry::new();
+        let offer = registry.sid_for_iri("http://example.com/vendor7/Offer12");
+        let page = registry.sid_for_iri("http://example.com/vendor7/Offer12/");
+        assert_eq!(page.namespace_code, offer.namespace_code);
+        assert_eq!(page.name.as_ref(), "Offer12/");
+        assert!(!registry.has_prefix("http://example.com/vendor7/Offer12/"));
     }
 
     #[test]

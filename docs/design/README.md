@@ -50,7 +50,7 @@ Geospatial indexing internals: inline GeoPoint encoding (packed 60-bit lat/lng f
 
 ### [Namespace allocation and fallback modes](namespace-allocation.md)
 
-How Fluree assigns `ns_code` values for IRIs (prefix trie matching, fallback split modes), including bulk-import preflight mitigation and how the “host-only” fallback persists for future transactions.
+How Fluree assigns `ns_code` values for IRIs (canonical split modes, the `NamedLocal` default for new ledgers), including bulk-import preflight mitigation and how the “host-only” fallback persists for future transactions.
 
 ### [Ontology imports (`f:schemaSource` + `owl:imports`)](ontology-imports.md)
 
