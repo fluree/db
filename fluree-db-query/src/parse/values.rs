@@ -214,7 +214,7 @@ fn parse_triple_term(
         return Err(invalid("its object must be a constant"));
     }
     Ok(UnresolvedValue::TripleTerm {
-        subject: Arc::from(ctx.expand_vocab(subject)?.0),
+        subject: Arc::from(ctx.expand_id(subject)?.0),
         predicate: Arc::from(ctx.expand_vocab(predicate)?.0),
         object: Box::new(object),
     })
@@ -225,7 +225,7 @@ fn parse_iri_binding(id_val: &JsonValue, ctx: &JsonLdParseCtx) -> Result<Unresol
     let id_str = id_val
         .as_str()
         .ok_or_else(|| ParseError::InvalidWhere("@id in values must be a string".to_string()))?;
-    let (expanded, _) = ctx.expand_vocab(id_str)?;
+    let (expanded, _) = ctx.expand_id(id_str)?;
     Ok(UnresolvedValue::Iri(Arc::from(expanded)))
 }
 
@@ -242,10 +242,7 @@ fn parse_typed_literal(
 
     let dt_iri = match map.get("@type").and_then(|v| v.as_str()) {
         Some("@id") => Some(Arc::from("@id")),
-        Some(t) => {
-            let (expanded, _) = ctx.expand_vocab(t)?;
-            Some(Arc::from(expanded))
-        }
+        Some(t) => Some(Arc::from(ctx.expand_type(t)?)),
         None => None,
     };
 
@@ -267,7 +264,7 @@ fn parse_iri_from_value(value_val: &JsonValue, ctx: &JsonLdParseCtx) -> Result<U
     let s = value_val.as_str().ok_or_else(|| {
         ParseError::InvalidWhere("@value must be a string when @type is @id".to_string())
     })?;
-    let (expanded, _) = ctx.expand_vocab(s)?;
+    let (expanded, _) = ctx.expand_id(s)?;
     Ok(UnresolvedValue::Iri(Arc::from(expanded)))
 }
 

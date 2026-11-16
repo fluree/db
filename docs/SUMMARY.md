@@ -314,5 +314,6 @@
   - [Adding a benchmark](contributing/benches.md)
   - [W3C SPARQL compliance suite](contributing/sparql-compliance.md)
   - [W3C SHACL compliance suite](contributing/shacl-compliance.md)
+  - [W3C JSON-LD compliance suite](contributing/jsonld-compliance.md)
   - [Adding tracing spans](contributing/tracing-guide.md)
   - [Releasing](contributing/releasing.md)

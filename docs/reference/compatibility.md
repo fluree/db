@@ -64,7 +64,7 @@ extension.
 
 ### JSON-LD 1.1
 
-**Status:** Compliant, with the deviations listed below
+**Status:** Compliant, with the deviations listed below; the other gaps the W3C suite reports are tracked in #2395
 
 Fluree supports JSON-LD 1.1:
 - @context for namespace mappings
@@ -87,12 +87,18 @@ Fluree supports JSON-LD 1.1:
 Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
 
 Deviations from the JSON-LD 1.1 expansion algorithm:
+- **Plain names, by design.** A key the context maps to no IRI is stored as written, as a plain name, where the algorithm drops it. A `@type` resolves as the algorithm resolves it: against `@vocab`, and otherwise against the base, as an `@id` does; with neither, it is a plain name too. So with no `@vocab` and no `@base`, `{"@type": "Person", "name": "Ann"}` writes the class `Person` and the property `name`. Fluree keeps plain names because Cypher reads and writes the same ones (as a Cypher import does by default), so a JSON-LD write and a Cypher query meet on one ledger. A term defined only in a property-scoped context, used outside it, is a plain name the same way. A misspelled key is stored under its misspelling; a SHACL shape with `sh:closed` refuses properties a class does not declare.
+- A string starting with `?` is a variable, not a relative IRI reference, as a key, an `@id` or a `@type` (see [Relative IRIs](../concepts/iri-and-context.md#relative-iris)).
 - Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
 - A node with several types applies their scoped contexts in the order written rather than in lexicographic order. `@propagate` is honored on a type's scoped context only.
-- A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
 - A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
 - `@container` values `@id`, `@type` and `@graph` are refused. A property-valued `@index` is refused where an index map uses it.
 - A string `@value` on a value object typed `@json` is read as a serialized JSON document: `{"@value": "{\"a\": 1}", "@type": "@json"}` is the object, not a string. A string under a term typed `@json` is the JSON string itself.
+- A top-level object with an `@graph`, other properties and no `@id` is a transaction envelope: the other properties are the commit's metadata (see [Commit metadata](../transactions/overview.md#commit-metadata)). JSON-LD reads it as a node whose `@graph` is a graph named by a blank node.
+- There is no JSON-LD 1.0 processing mode: every document is read as JSON-LD 1.1.
+- The `rdfDirection` option of JSON-LD's conversion to RDF is not offered: a `@direction` is kept in the language tag (see base-direction tags above).
+
+The W3C json-ld-api expand and toRdf suites run in CI. `testsuite-jsonld/tests/registers/mod.rs` lists each test Fluree fails, with its cause: one of the deviations above, or an open issue (see [the JSON-LD compliance suite](../contributing/jsonld-compliance.md)).
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
@@ -384,7 +390,7 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
-#### JSON-LD resolves `@base` by RFC 3986, and a type's scoped context stops at nested nodes (breaking)
+#### JSON-LD reads `@base` as JSON-LD 1.1 does, and a type's scoped context stops at nested nodes (breaking)
 
 A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, as one in Turtle already did; it used to be joined to `@base` as a string. A base ending in `/` resolves as before. Otherwise the result differs:
 
@@ -394,7 +400,15 @@ A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, a
 
 A relative `@base` or `@vocab` resolves against the base already in effect. A relative `@base` with no base to resolve against is refused; it used to be joined as written.
 
-**Check any context whose `@base` does not end in `/`.** With no `@vocab`, Fluree's JSON-LD transactions and queries use `@base` as the vocabulary too, so `{"@base": "http://example.org/ns#"}` put ids, types and properties in one namespace. Types and properties still land there; ids no longer do. `{"@id": "alice", "@type": "Person"}` now writes `http://example.org/alice` typed `http://example.org/ns#Person`. Data already written stays as it is, so on a ledger written before the upgrade the same document adds a second subject beside the stored `http://example.org/ns#alice`, and a `where`, delete or upsert that names `"alice"` no longer reaches the stored one. Nothing reports an error. Write the id as `#alice`, or define a prefix and write `ns:alice`.
+**`@base` no longer names properties and types.** Earlier releases read a top-level `@base` with no `@vocab` as the `@vocab` too, in a transaction, a query, a datalog rule and a BM25 index definition, so `{"@base": "http://example.org/ns#"}` put ids, types and properties in one namespace. `@base` now resolves references only, as JSON-LD 1.1 defines, everywhere JSON-LD is read:
+
+- A key the context maps to no IRI is a plain name: `name` is `name`, where it was `http://example.org/ns#name`.
+- A `@type` (and a value object's datatype) that no term, prefix or `@vocab` maps resolves against the base, as an `@id` does: `Person` under `http://example.org/ns#` is `http://example.org/Person`. Write `#Person` for `http://example.org/ns#Person`. A bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes used to store such a type as written.
+- `{"@id": "alice", "@type": "Person"}` writes `http://example.org/alice` typed `http://example.org/Person`.
+
+To keep properties and types in the base's namespace, set `@vocab` to the same IRI: `{"@base": "http://example.org/ns#", "@vocab": "http://example.org/ns#"}`. A stored datalog rule or BM25 index definition reads its context the new way too, so give a lone `@base` there its `@vocab` as well.
+
+**Check any context with a lone `@base`.** Data already written stays as it is, so on a ledger written before the upgrade the same document writes its ids, properties and types beside the stored ones, and a `where`, delete or upsert with that context no longer reaches them. Nothing reports an error; the server logs a warning, once, the first time a context sets `@base` with no `@vocab`.
 
 Query results change the same way. An `@id` under a base ending in `#` is written `#alice`, where it was `alice`. Under any other base, an id whose remainder starts with `/`, has a `:` in its first segment or holds a `.` or `..` segment is written as the full IRI, since the shortened form would resolve to something else.
 
@@ -441,6 +455,12 @@ Three kinds of document that were refused are accepted, and one that was accepte
 - A `where` pattern written with the same value object no longer finds a value stored under a typed term: `{"@value": "5"}` looks for the string. A `where` string with no language matches a stored string in any language, so it still finds `"obj"@en`.
 
 To make the stored values match, see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
+
+#### A JSON-LD `context` key is data (breaking)
+
+Only `@context` sets a JSON-LD node's context. Earlier releases also read a `context` key as one, in a transaction, a bulk import, [`rdf::parse`](rdf-documents.md) and inline shapes, so a property named `context` was dropped, and a string value rewrote the node's other keys (`{"context": "notes", "title": "x"}` wrote the property `notes/title`). The key is now a property like any other: a plain name, with no `@vocab`.
+
+A document that set its context with `context` no longer gets the prefixes and terms it defined, and a transaction refuses a compact IRI whose prefix only that key defined. Rename the key to `@context`. A query's top-level `context` is unchanged.
 
 #### Python RDF terms compare as RDF terms (breaking)
 
@@ -498,7 +518,7 @@ Since 4.2.4, a node object nested under a node with an `@graph` selector is writ
 
 A term defined in a scoped (property- or type-scoped) `@context` whose `@id` is a compact IRI over a prefix only the outer context defines (`"a": {"@id": "ex:a", "@context": {"b": {"@id": "ex:b"}}}`) now expands to the full IRI. It used to stay compact, so the key was written as the string `ex:b`, an IRI with the scheme `ex`. Data already written that way stays as it is.
 
-Related JSON-LD changes: graph names must be absolute IRIs (a relative one is resolved against `@base` and refused without one, and a graph name no longer expands through `@vocab`); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates, and in a CONSTRUCT template, the `"construct": true` shorthand included, it names the graph the node's triples are written to (it was read as a property named `@graph`, and the triples went to the default graph); `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import reads all of this as a transaction does (see below).
+Related JSON-LD changes: graph names must be absolute IRIs (a relative one is resolved against `@base` and refused without one, and a graph name no longer expands through `@vocab`); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates, and in a CONSTRUCT template, the `"construct": true` shorthand included, it names the graph the node's triples are written to (it was read as a property named `@graph`, and the triples went to the default graph); `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); in an update's `delete` and `insert`, a value that starts with `?` is a variable only when the `where` or `values` mentions it, and otherwise the string (it was a variable nothing bound, so the triple was silently not written), and a node, property, type or graph variable they never mention is refused; and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import reads all of this as a transaction does (see below).
 
 #### Bulk JSON-LD import writes graph-scoped data, and refuses what it cannot place
 

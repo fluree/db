@@ -39,6 +39,14 @@ a different pattern) retracts nothing, and cannot cancel an INSERT of the same
 triple: `DELETE { x } INSERT { x } WHERE {}` inserts `x` when it is absent.
 See [Retraction Semantics](retractions.md#retraction-semantics).
 
+In DELETE and INSERT, a value that starts with `?` is a variable when WHERE or
+`values` mentions it, and otherwise the string itself: `"ex:note": "?hello"`
+writes the string `?hello` unless WHERE binds `?hello`. A node, property, type
+or graph that starts with `?` is a variable that WHERE or `values` must
+mention, since an IRI cannot start with `?`; one they never mention is refused
+rather than silently writing nothing. In an insert or upsert, which has no
+WHERE, every value is the string written.
+
 ## WHERE clause capabilities
 
 The update transaction `where` clause uses the **same pattern grammar as JSON-LD queries**, so you can use rich patterns like OPTIONAL, UNION, FILTER, VALUES, and subqueries.
@@ -778,7 +786,7 @@ Good:
 }
 ```
 
-Bad (deletes all ages):
+Bad (`?age` is not in WHERE, so it is the string `"?age"`, which matches nothing):
 ```json
 {
   "where": [{ "@id": "ex:alice", "schema:age": "?oldAge" }],

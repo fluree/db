@@ -191,6 +191,7 @@ fn extract_one_entry(
     entries: &mut Vec<TxnMetaEntry>,
 ) -> Result<()> {
     let (expanded_iri, _) = details_with_policy(key, context, strict)?;
+    super::edge_annotations::refuse_reserved_predicate(&expanded_iri)?;
 
     let sid = ns_registry.sid_for_iri(&expanded_iri);
     let predicate_ns = sid.namespace_code;

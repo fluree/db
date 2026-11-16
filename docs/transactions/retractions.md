@@ -499,6 +499,7 @@ Good:
 Over:
 ```json
 {
+  "where": [{ "@id": "ex:alice", "?pred": "?val" }],
   "delete": [{ "@id": "ex:alice", "?pred": "?val" }]
 }
 ```
@@ -530,10 +531,13 @@ Good:
 }
 ```
 
-Dangerous:
+Dangerous (every property of every entity with an age):
 ```json
 {
-  "where": [{ "@id": "?entity", "schema:age": "?age" }],
+  "where": [
+    { "@id": "?entity", "schema:age": "?age" },
+    { "@id": "?entity", "?pred": "?val" }
+  ],
   "delete": [{ "@id": "?entity", "?pred": "?val" }]
 }
 ```

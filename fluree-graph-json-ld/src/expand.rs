@@ -178,21 +178,33 @@ fn details_dispatch(
     }
 }
 
-/// A string a `"@type": "@vocab"` term coerces: a term or compact IRI, else
-/// relative to `@vocab`, else to `@base`. `None` for a term defined as
-/// `null`, which names no IRI.
-fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+/// `s` resolved as JSON-LD resolves a `@type` value: a term or compact IRI,
+/// else relative to `@vocab`, else to `@base`, as an `@id` is.
+pub(crate) fn vocab_or_base(
+    s: &str,
+    ctx: &ParsedContext,
+    strict: bool,
+) -> Result<(String, Option<ContextEntry>)> {
     match details(s, ctx, true) {
-        (_, Some(entry)) if entry.null_mapping => Ok(None),
-        (expanded, Some(_)) => Ok(Some(expanded)),
-        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
+        // No term, prefix or `@vocab` matched, so only `@base` can.
+        (expanded, None) => match match_default(s, ctx, false) {
+            Some((iri, entry)) => Ok((iri, Some(entry))),
+            None => {
+                if strict {
+                    guard_unresolved(&expanded)?;
+                }
+                Ok((expanded, None))
+            }
+        },
+        found => Ok(found),
     }
 }
 
-/// A `@type` value's IRI; `None` for a term defined as `null`.
-fn type_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
-    let (expanded, entry) = details_dispatch(s, ctx, true, strict)?;
-    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(expanded))
+/// A `@type` value's IRI, or a string a `"@type": "@vocab"` term coerces;
+/// `None` for a term defined as `null`, which names no IRI.
+fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let (iri, entry) = vocab_or_base(s, ctx, strict)?;
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(iri))
 }
 
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
@@ -525,7 +537,7 @@ fn parse_value_object(
         .or_else(|| map.get("type"))
         .and_then(|t| t.as_str())
     {
-        Some(t) => Some(iri_dispatch(t, context, true, strict)?),
+        Some(t) => Some(vocab_or_base(t, context, strict)?.0),
         None => None,
     };
 
@@ -579,16 +591,32 @@ fn parse_value_object(
 
     // `{"@value": …, "@annotation": {…}}`: the annotation describes a
     // reifier of the triple this value completes, and expands as a node does.
-    if let Some(annotation) = map.get("@annotation") {
-        let expanded =
-            match expand_node_internal(annotation, nodes, &path.key("@annotation"), strict)? {
+    // `@edge` is a transaction's alias for it, kept under its own name as it
+    // is on a node reference.
+    for key in ["@annotation", "@edge"] {
+        if let Some(annotation) = map.get(key) {
+            let expanded = match expand_node_internal(annotation, nodes, &path.key(key), strict)? {
                 JsonValue::Array(nodes) => nodes,
                 node => vec![node],
             };
-        obj.insert("@annotation".to_string(), JsonValue::Array(expanded));
+            obj.insert(key.to_string(), JsonValue::Array(expanded));
+        }
     }
+    keep_lifetime_shorthand(map, &mut obj);
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// `@ttl` / `@expiresAt`: a transaction's shorthand for the lifetime of the
+/// value they are on, kept as written for the transaction to read.
+const LIFETIME_KEYS: [&str; 2] = ["@ttl", "@expiresAt"];
+
+fn keep_lifetime_shorthand(map: &Map<String, JsonValue>, result: &mut Map<String, JsonValue>) {
+    for key in LIFETIME_KEYS {
+        if let Some(value) = map.get(key) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
 }
 
 /// Whether a value object typed `type_iri` may hold an array or a map: a JSON
@@ -633,12 +661,12 @@ fn parse_type<'c>(
 
     if let Some(type_val) = type_val {
         let types: Vec<String> = match type_val {
-            JsonValue::String(s) => type_iri(s, context, strict)?.into_iter().collect(),
+            JsonValue::String(s) => vocab_value_iri(s, context, strict)?.into_iter().collect(),
             JsonValue::Array(arr) => {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     if let Some(s) = v.as_str() {
-                        result.extend(type_iri(s, context, strict)?);
+                        result.extend(vocab_value_iri(s, context, strict)?);
                     }
                 }
                 result
@@ -711,7 +739,7 @@ fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
 
 /// Get context from node map
 fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
-    node_map.get("@context").or_else(|| node_map.get("context"))
+    node_map.get("@context")
 }
 
 /// Maximum expansion depth for nested JSON-LD values. Expansion recurses
@@ -819,46 +847,53 @@ fn expand_node_internal(
         }
 
         JsonValue::Object(map) => {
-            // Parse local context if present
-            let local_context = get_context(map);
-            let merged_context = if let Some(lc) = local_context {
-                Cow::Owned(ParsedContext::parse(Some(context), lc)?)
-            } else {
-                Cow::Borrowed(context)
+            let merged_context = match get_context(map) {
+                Some(lc) => Cow::Owned(ParsedContext::parse(Some(context), lc)?),
+                None => Cow::Borrowed(context),
             };
-
-            // Parse @type and get updated context
-            let (types, context_with_types, propagates) = parse_type(map, &merged_context, strict)?;
-
-            // Build result
-            let mut result = Map::new();
-
-            // Add @type if present
-            if !types.is_empty() {
-                result.insert("@type".to_string(), json!(types));
-            }
-
-            // Process other keys
-            let type_key = merged_context.type_key.clone();
-            let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
-            let keys = NodeKeys {
-                context: &context_with_types,
-                nodes: if propagates {
-                    &context_with_types
-                } else {
-                    &merged_context
-                },
-                type_key: &type_key,
-                type_id: type_id.as_deref(),
-                strict,
-            };
-            expand_node_entries(map, &keys, path, false, &mut result)?;
-
-            Ok(JsonValue::Object(result))
+            expand_object(map, &merged_context, path, strict)
         }
 
         _ => Ok(node_map.clone()),
     }
+}
+
+/// Expand node object `map` against `merged_context`, which already holds the
+/// node's own `@context`.
+fn expand_object(
+    map: &Map<String, JsonValue>,
+    merged_context: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<JsonValue> {
+    // Parse @type and get updated context
+    let (types, context_with_types, propagates) = parse_type(map, merged_context, strict)?;
+
+    // Build result
+    let mut result = Map::new();
+
+    // Add @type if present
+    if !types.is_empty() {
+        result.insert("@type".to_string(), json!(types));
+    }
+
+    // Process other keys
+    let type_key = merged_context.type_key.clone();
+    let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
+    let keys = NodeKeys {
+        context: &context_with_types,
+        nodes: if propagates {
+            &context_with_types
+        } else {
+            merged_context
+        },
+        type_key: &type_key,
+        type_id: type_id.as_deref(),
+        strict,
+    };
+    expand_node_entries(map, &keys, path, false, &mut result)?;
+
+    Ok(JsonValue::Object(result))
 }
 
 /// What a node object's entries expand against.
@@ -888,10 +923,14 @@ fn expand_node_entries(
     let strict = keys.strict;
     for (k, v) in map {
         // Skip context and type keys
-        if k == "@context" || k == "context" {
+        if k == "@context" {
             continue;
         }
         if k == keys.type_key || Some(k.as_str()) == keys.type_id {
+            continue;
+        }
+        if LIFETIME_KEYS.contains(&k.as_str()) {
+            result.insert(k.clone(), v.clone());
             continue;
         }
 
@@ -1118,6 +1157,20 @@ pub(crate) fn node_impl(
     }
 }
 
+/// Expand a document whose root context the caller has already parsed:
+/// `root` holds the root object's own `@context`, which is not applied again.
+/// An array has no root object, so each item applies its own `@context`.
+pub(crate) fn root_impl(doc: &JsonValue, root: &ParsedContext, strict: bool) -> Result<JsonValue> {
+    let JsonValue::Object(map) = doc else {
+        return node_impl(doc, root, strict);
+    };
+    if let Some(key) = crate::graph_shape::envelope_graph_key(map)? {
+        return expand_node_internal(&map[key], root, &Path::ROOT.key(key), strict);
+    }
+    guard_depth(&Path::ROOT)?;
+    expand_object(map, root, &Path::ROOT, strict)
+}
+
 /// Expand the contents of an envelope's `@graph` under the envelope's own
 /// `@context`.
 fn expand_envelope(
@@ -1308,6 +1361,103 @@ mod tests {
         assert_eq!(nicks.len(), 3);
         // @set should be flattened (no @set wrapper)
         assert!(nicks[0].get("@value").is_some());
+    }
+
+    /// A document whose root context the caller already parsed is expanded
+    /// against it without applying its `@context` again: a relative `@base`
+    /// applied twice would resolve against itself.
+    #[test]
+    fn a_parsed_root_context_is_not_applied_again() {
+        let initial = ParsedContext {
+            base: Some("http://example.org/a/".to_string()),
+            ..ParsedContext::new()
+        };
+        let doc = json!({"@context": {"@base": "b/"}, "@id": "x", "http://example.org/p": 1});
+        let root = ParsedContext::parse(Some(&initial), &doc["@context"]).unwrap();
+        let once =
+            json!({"@id": "http://example.org/a/b/x", "http://example.org/p": [{"@value": 1}]});
+        assert_eq!(
+            crate::expand_with_root_context(&doc, &root, false).unwrap(),
+            once
+        );
+        assert_eq!(node(&doc, &initial).unwrap(), once);
+
+        let envelope = json!({"@context": {"@base": "b/"}, "@graph": [{"@id": "x", "http://example.org/p": 1}]});
+        assert_eq!(
+            crate::expand_with_root_context(&envelope, &root, false).unwrap(),
+            json!([once])
+        );
+    }
+
+    /// A `@type` resolves as JSON-LD resolves one: against `@vocab`, else
+    /// against `@base` as an `@id` does, else it stays a plain name. A value
+    /// object's datatype resolves the same way.
+    #[test]
+    fn a_type_resolves_against_the_base_without_a_vocab() {
+        let doc = json!({
+            "@context": {"@base": "http://example.org/doc"},
+            "@id": "#alice",
+            "@type": ["#Person", "Agent"],
+            "http://example.org/p": {"@value": "x", "@type": "#dt"}
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/doc#alice",
+                "@type": ["http://example.org/doc#Person", "http://example.org/Agent"],
+                "http://example.org/p": [{"@value": "x", "@type": "http://example.org/doc#dt"}]
+            })
+        );
+
+        let vocab = json!({
+            "@context": {"@base": "http://example.org/doc", "@vocab": "http://v.example/"},
+            "@type": "Person"
+        });
+        assert_eq!(
+            node(&vocab, &ParsedContext::new()).unwrap()["@type"],
+            json!(["http://v.example/Person"])
+        );
+
+        let plain = json!({"@type": "Person", "name": "Ann"});
+        assert_eq!(
+            node(&plain, &ParsedContext::new()).unwrap(),
+            json!({"@type": ["Person"], "name": [{"@value": "Ann"}]})
+        );
+    }
+
+    /// Only `@context` is a context. A `context` key is a property like any
+    /// other, a plain name with no `@vocab`; it used to be read as the node's
+    /// context, which dropped it and could rewrite every other key.
+    #[test]
+    fn a_context_key_is_data() {
+        let doc = json!({
+            "@id": "http://example.org/n1",
+            "context": "meeting notes",
+            "title": "Q3 plan"
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/n1",
+                "context": [{"@value": "meeting notes"}],
+                "title": [{"@value": "Q3 plan"}]
+            })
+        );
+
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:n1",
+            "ex:title": "Q3 plan",
+            "context": {"topic": "budget"}
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/n1",
+                "http://example.org/title": [{"@value": "Q3 plan"}],
+                "context": [{"topic": [{"@value": "budget"}]}]
+            })
+        );
     }
 
     #[test]

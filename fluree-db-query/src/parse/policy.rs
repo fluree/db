@@ -150,6 +150,12 @@ impl JsonLdParseCtx {
         details_with_policy(s, &self.context, self.policy.strict_compact_iri)
     }
 
+    /// Expand a `@type` value or a datatype: against `@vocab`, else against
+    /// `@base`, as the expander resolves one on write.
+    pub fn expand_type(&self, s: &str) -> fluree_graph_json_ld::Result<String> {
+        fluree_graph_json_ld::expand_type_iri(s, &self.context, self.policy.strict_compact_iri)
+    }
+
     /// Expand a compact IRI to its full form (uses `@vocab`, returns only the IRI).
     pub fn expand_iri(&self, s: &str) -> fluree_graph_json_ld::Result<String> {
         expand_iri_with_policy(s, &self.context, self.policy.strict_compact_iri)
