@@ -105,8 +105,8 @@ fn compact_with(
                 }
             }
             if prefix_name == ":vocab" {
-                if allow_vocab_strip {
-                    return suffix.to_string();
+                if let Some(term) = vocab_term(suffix).filter(|_| allow_vocab_strip) {
+                    return term;
                 }
                 continue;
             }
@@ -135,6 +135,13 @@ fn base_reference(base: &str, suffix: &str) -> Option<String> {
     reads_back.then(|| suffix.to_string())
 }
 
+/// The term that expands against the vocabulary back to the vocabulary
+/// followed by `suffix`, and `None` for a suffix holding a `:`, which reads
+/// as a compact or absolute IRI.
+fn vocab_term(suffix: &str) -> Option<String> {
+    (!suffix.contains(':')).then(|| suffix.to_string())
+}
+
 /// Like `compact_with` but records which terms were used.
 fn compact_with_tracking(
     exact: &HashMap<String, String>,
@@ -157,7 +164,7 @@ fn compact_with_tracking(
             let suffix = &iri[prefix_iri.len()..];
             let shortened = match prefix_name.as_str() {
                 ":base" => base_reference(prefix_iri, suffix),
-                ":vocab" => allow_vocab_strip.then(|| suffix.to_string()),
+                ":vocab" => vocab_term(suffix).filter(|_| allow_vocab_strip),
                 _ => None,
             };
             if prefix_name == ":vocab" || prefix_name == ":base" {
@@ -314,6 +321,15 @@ mod tests {
         assert_eq!(compact("urn:ex:name", &ctx), "name");
         // A prefix still needs to end in `/` or `#`.
         assert_eq!(compact("urn:p:x", &ctx), "urn:p:x");
+    }
+
+    #[test]
+    fn a_vocab_name_holding_a_colon_stays_whole() {
+        let ctx = ParsedContext::parse(None, &json!({"@vocab": "urn:ex:"})).unwrap();
+        assert_eq!(compact("urn:ex:a:b", &ctx), "urn:ex:a:b");
+        let f = compact_fn(&ctx, None);
+        assert_eq!(f("urn:ex:a:b"), "urn:ex:a:b");
+        assert_eq!(f("urn:ex:a"), "a");
     }
 
     #[test]

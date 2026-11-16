@@ -167,3 +167,29 @@ async fn an_equal_base_and_vocab_read_back() {
         json!(["Ann"])
     );
 }
+
+/// A name holding a `:` would read back as a compact or absolute IRI, so a
+/// result keeps it whole rather than shortening it by the vocabulary.
+#[tokio::test]
+async fn a_vocab_name_holding_a_colon_reads_back() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = json!({"@vocab": "urn:ex:"});
+    let ledger0 = genesis_ledger(&fluree, "tx/vocab-colon-name:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": context, "@id": "urn:ex:s", "urn:ex:a:b": "x"}),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let query = json!({
+        "@context": context,
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "urn:ex:a:b": "x"}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &query)
+        .await
+        .expect("jsonld query");
+    assert_eq!(rows, json!([{"@id": "urn:ex:s", "urn:ex:a:b": "x"}]));
+}
