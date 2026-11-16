@@ -189,6 +189,39 @@ jobs:
         timeout-minutes: 45
         run: cargo test
 
+  testsuite-jsonld:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Fetch the json-ld-api suite
+        run: git submodule update --init --depth 1 testsuite-jsonld/json-ld-api
+
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: "testsuite-jsonld -> target"
+
+      - name: Format
+        working-directory: testsuite-jsonld
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        working-directory: testsuite-jsonld
+        run: cargo clippy --all-targets -- -D warnings
+
+      # The W3C JSON-LD expand and toRdf suites, against the same register
+      # contract as testsuite-sparql: a failure must be registered, and a
+      # registered test that passes fails the run. See
+      # docs/contributing/jsonld-compliance.md.
+      - name: Run W3C JSON-LD test suites
+        working-directory: testsuite-jsonld
+        run: cargo test
+
   sql-bridge:
     # fluree-sql-bridge is a standalone workspace (it links sqlx + three
     # database drivers, none of which belong in the fluree binary), so the

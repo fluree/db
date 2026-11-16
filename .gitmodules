@@ -4,3 +4,6 @@
 [submodule "testsuite-shacl/data-shapes"]
 	path = testsuite-shacl/data-shapes
 	url = https://github.com/w3c/data-shapes
+[submodule "testsuite-jsonld/json-ld-api"]
+	path = testsuite-jsonld/json-ld-api
+	url = https://github.com/w3c/json-ld-api.git

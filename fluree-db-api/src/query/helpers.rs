@@ -412,6 +412,14 @@ fn cypher_full_scan_enabled() -> bool {
     })
 }
 
+/// A default context's vocabulary as a JSON-LD read resolves it: a relative
+/// or compact-IRI `@vocab` expanded, not the key's text.
+pub(crate) fn default_context_vocab(default_context: Option<&JsonValue>) -> Option<String> {
+    fluree_graph_json_ld::parse_context(default_context?)
+        .ok()?
+        .vocab
+}
+
 /// Extract `@vocab` and bare-identifier → IRI overrides from a
 /// JSON-LD `@context` object.
 ///
@@ -421,12 +429,9 @@ fn cypher_full_scan_enabled() -> bool {
 pub(crate) fn extract_cypher_iri_mapping(
     default_context: Option<&JsonValue>,
 ) -> (Option<String>, std::collections::HashMap<String, String>) {
-    let mut vocab = None;
+    let vocab = default_context_vocab(default_context);
     let mut overrides = std::collections::HashMap::new();
     if let Some(obj) = default_context.and_then(|v| v.as_object()) {
-        if let Some(v) = obj.get("@vocab").and_then(|v| v.as_str()) {
-            vocab = Some(v.to_string());
-        }
         for (k, v) in obj {
             if k.starts_with('@') {
                 continue;

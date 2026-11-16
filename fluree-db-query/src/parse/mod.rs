@@ -128,57 +128,49 @@ fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
     let top_ctx = json
         .as_object()
         .and_then(|m| m.get("@context").or_else(|| m.get("context")))
-        .map(|v| fluree_graph_json_ld::parse_context(&normalize_context_value(v)))
+        .map(fluree_graph_json_ld::parse_context)
         .transpose()
         .map_err(|e| ParseError::InvalidWhere(format!("failed to parse @context: {e}")))?
         .unwrap_or_else(fluree_graph_json_ld::ParsedContext::new);
-    scan_query_for_reifies_iris(json, &top_ctx)
+    // `top_ctx` already holds the query's own `@context`.
+    match json {
+        JsonValue::Object(map) => scan_query_entries(map, &top_ctx),
+        _ => scan_query_for_reifies_iris(json, &top_ctx),
+    }
+}
+
+/// The query side's check for reserved predicates over one clause (an
+/// update's `where` or `values`), resolved against `context`, which holds the
+/// document's own `@context`: the check a query's clauses get.
+pub fn reject_reserved_iris_in_clause(
+    value: &JsonValue,
+    context: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    scan_query_for_reifies_iris(value, context)
 }
 
 fn scan_query_for_reifies_iris(
     value: &JsonValue,
     context: &fluree_graph_json_ld::ParsedContext,
 ) -> Result<()> {
-    use fluree_vocab::reifies_iris;
     match value {
         JsonValue::Object(map) => {
             // Honor per-node `@context` overrides for compact-IRI
             // resolution.
-            let merged: Option<fluree_graph_json_ld::ParsedContext> =
-                if let Some(local) = map.get("@context").or_else(|| map.get("context")) {
-                    Some(
-                        fluree_graph_json_ld::parse_context_with_base(
-                            context,
-                            &normalize_context_value(local),
-                        )
-                        .map_err(|e| {
-                            ParseError::InvalidWhere(format!(
-                                "failed to parse nested @context during firewall scan: {e}"
-                            ))
-                        })?,
-                    )
-                } else {
-                    None
-                };
-            let effective = merged.as_ref().unwrap_or(context);
-
-            for (k, v) in map {
-                if k == "@context" || k == "context" {
-                    continue;
-                }
-                let expanded_key = if k.starts_with('@') {
-                    k.clone()
-                } else {
-                    fluree_graph_json_ld::expand_iri(k, effective)
-                };
-                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
-                    return Err(ParseError::InvalidWhere(format!(
-                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
-                         use @annotation or @reifies in queries instead"
-                    )));
-                }
-                scan_query_for_reifies_iris(v, effective)?;
-            }
+            let merged: Option<fluree_graph_json_ld::ParsedContext> = if let Some(local) =
+                map.get("@context").or_else(|| map.get("context"))
+            {
+                Some(
+                    fluree_graph_json_ld::parse_context_with_base(context, local).map_err(|e| {
+                        ParseError::InvalidWhere(format!(
+                            "failed to parse nested @context during firewall scan: {e}"
+                        ))
+                    })?,
+                )
+            } else {
+                None
+            };
+            scan_query_entries(map, merged.as_ref().unwrap_or(context))?;
         }
         JsonValue::Array(items) => {
             for item in items {
@@ -196,7 +188,10 @@ fn scan_query_for_reifies_iris(
             // to one of the seven reserved IRIs, so this cannot reject
             // real input.
             let expanded = fluree_graph_json_ld::expand_iri(s, context);
-            if reifies_iris::ALL.iter().any(|iri| *iri == expanded) {
+            if fluree_vocab::reifies_iris::ALL
+                .iter()
+                .any(|iri| *iri == expanded)
+            {
                 return Err(ParseError::InvalidWhere(format!(
                     "value '{s}' resolves to a system-controlled predicate '{expanded}'; \
                      use @annotation or @reifies in queries instead"
@@ -204,6 +199,33 @@ fn scan_query_for_reifies_iris(
             }
         }
         _ => {}
+    }
+    Ok(())
+}
+
+/// The firewall over one object's entries, resolved against `effective`,
+/// which already holds the object's own `@context`.
+fn scan_query_entries(
+    map: &serde_json::Map<String, JsonValue>,
+    effective: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    use fluree_vocab::reifies_iris;
+    for (k, v) in map {
+        if k == "@context" || k == "context" {
+            continue;
+        }
+        let expanded_key = if k.starts_with('@') {
+            k.clone()
+        } else {
+            fluree_graph_json_ld::expand_iri(k, effective)
+        };
+        if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
+            return Err(ParseError::InvalidWhere(format!(
+                "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
+                 use @annotation or @reifies in queries instead"
+            )));
+        }
+        scan_query_for_reifies_iris(v, effective)?;
     }
     Ok(())
 }
@@ -231,7 +253,8 @@ pub(crate) fn parse_query_ast_internal(
         .or_else(|| obj.get("context"))
         .unwrap_or(&JsonValue::Null);
 
-    let context = parse_context(&normalize_context_value(context_val))?;
+    fluree_graph_json_ld::note_lone_base(context_val);
+    let context = parse_context(context_val)?;
 
     // Resolve parse policy BEFORE extracting path aliases so that any
     // compact IRIs inside @path expressions honor `opts.strictCompactIri`.
@@ -482,19 +505,6 @@ fn parse_query_body(
     }
 
     Ok((query, select_mode))
-}
-
-pub(crate) fn normalize_context_value(context_val: &JsonValue) -> JsonValue {
-    if let JsonValue::Object(map) = context_val {
-        if let Some(base) = map.get("@base") {
-            if !map.contains_key("@vocab") {
-                let mut out = map.clone();
-                out.insert("@vocab".to_string(), base.clone());
-                return JsonValue::Object(out);
-            }
-        }
-    }
-    context_val.clone()
 }
 
 /// Extract `@path` term definitions from the raw context JSON.
@@ -1254,8 +1264,8 @@ fn parse_hydration_object(
     let root = if is_variable(root_str) {
         UnresolvedRoot::Var(Arc::from(root_str.as_str()))
     } else {
-        // IRI constant root - expand via @context
-        let (expanded, _) = ctx.expand_vocab(root_str)?;
+        // A subject IRI, resolved as an `@id`.
+        let (expanded, _) = ctx.expand_id(root_str)?;
         UnresolvedRoot::Iri(expanded)
     };
 
@@ -2108,6 +2118,35 @@ mod tests {
         );
     }
 
+    /// A constant value object is taken as written, as a transaction writes
+    /// it: its term's `@type` does not reach it. A variable `@value` keeps the
+    /// term's datatype, as a bare variable does.
+    #[test]
+    fn value_object_takes_no_datatype_from_its_term_in_where() {
+        let dtc_of = |value: JsonValue| {
+            let json = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "age": {"@id": "ex:age", "@type": "http://www.w3.org/2001/XMLSchema#integer"}
+                },
+                "select": ["?s"],
+                "where": {"@id": "?s", "age": value}
+            });
+            let (ast, _) = parse_query_ast(&json, None).unwrap();
+            triple(&ast.patterns[0])
+                .dtc
+                .as_ref()
+                .map(|dtc| dtc.datatype_iri().to_string())
+        };
+        let integer = Some("http://www.w3.org/2001/XMLSchema#integer".to_string());
+
+        assert_eq!(dtc_of(json!({"@value": "5"})), None);
+        assert_eq!(dtc_of(json!({"@value": 5})), None);
+        assert_eq!(dtc_of(json!("5")), integer);
+        assert_eq!(dtc_of(json!({"@value": "?age"})), integer);
+        assert_eq!(dtc_of(json!("?age")), integer);
+    }
+
     /// A value object's `@direction` joins its language tag, as a
     /// transaction stores it.
     #[test]
@@ -2949,6 +2988,59 @@ mod tests {
         assert!(
             matches!(&pattern.s, UnresolvedTerm::Iri(iri) if iri.as_ref() == "http://example.org/resource#alice")
         );
+    }
+
+    /// A query resolves each position as a write does: a node's id, a
+    /// graph-select root, a `values` `@id`, a value object typed `@id` and a
+    /// string under a term typed `@id` against `@base`; a class and a string
+    /// under a term typed `@vocab` against `@vocab`.
+    #[test]
+    fn query_positions_resolve_as_a_write_does() {
+        let context = json!({
+            "@base": "http://b.example/",
+            "@vocab": "http://v.example/",
+            "knows": {"@type": "@id"},
+            "kind": {"@type": "@vocab"}
+        });
+        let debug = |query: JsonValue| format!("{:?}", parse_query_ast(&query, None).unwrap().0);
+        let cases = [
+            (
+                json!({"@context": context, "select": {"alice": ["*"]}}),
+                "http://b.example/alice",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"],
+                       "values": ["?s", [{"@id": "alice"}]], "where": {"@id": "?s", "p": "?o"}}),
+                "http://b.example/alice",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"],
+                       "where": {"@id": "?s", "p": {"@value": "bob", "@type": "@id"}}}),
+                "http://b.example/bob",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"], "where": {"@id": "?s", "knows": "bob"}}),
+                "http://b.example/bob",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"], "where": {"@id": "?s", "kind": "Thing"}}),
+                "http://v.example/Thing",
+            ),
+            (
+                json!({"@context": context, "select": ["?s"], "where": {"@id": "?s", "@type": "Person"}}),
+                "http://v.example/Person",
+            ),
+        ];
+        for (query, iri) in cases {
+            let ast = debug(query.clone());
+            assert!(ast.contains(iri), "{query}: expected {iri} in {ast}");
+            let wrong = if iri.starts_with("http://b.") {
+                iri.replace("http://b.", "http://v.")
+            } else {
+                iri.replace("http://v.", "http://b.")
+            };
+            assert!(!ast.contains(&wrong), "{query}: {wrong} in {ast}");
+        }
     }
 
     #[test]

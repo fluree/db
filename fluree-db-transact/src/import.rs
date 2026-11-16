@@ -1564,34 +1564,37 @@ mod inner {
             }
         };
 
-        // Edge annotations: rewrite `@annotation` / `@edge` into the seven-fact
-        // `f:reifies*` encoding before expansion, exactly as the transact path
-        // does — otherwise the JSON-LD expander silently drops them and a bulk
-        // import loses every edge property. RDF mode (lpg_mode=false): a
-        // non-empty `@annotation` lowers to a reifier bundle; the CSV/LPG
-        // loader never emits an empty `@annotation: {}`.
+        // Every expansion below is the file as written: reserved predicates
+        // are refused in it, by the IRIs the expander resolves, and then its
+        // edge annotations (`@annotation` / `@edge` / `@reifies`, `@ttl` /
+        // `@expiresAt`) are lowered into the `f:reifies*` slots the sink turns
+        // into links, exactly as the transact path does — otherwise a bulk
+        // import loses every edge property. RDF mode: a non-empty
+        // `@annotation` lowers to a reifier; the CSV/LPG loader never emits
+        // an empty `@annotation: {}`. One lowering serves the chunk, so the
+        // nodes it mints are distinct across its lines.
         //
         // The lowering is gated on a cheap presence check so the common
-        // (non-annotated) bulk import pays nothing. The firewall gate is
-        // *broader* on purpose: it must also fire on the fully-expanded
-        // `…#reifies*` IRI form, which contains none of the `@`-keywords
-        // above. Gating it on the same check would let a bulk import inject
-        // system facts directly, bypassing the guard the transact path
-        // always enforces. The bare `reifies` token covers both forms.
+        // (non-annotated) bulk import pays nothing for it.
         let needs_lowering = jsonld.contains("@annotation")
             || jsonld.contains("@edge")
             || jsonld.contains("@reifies")
             || jsonld.contains("@ttl")
             || jsonld.contains("@expiresAt");
-        if needs_lowering || jsonld.contains("reifies") {
-            let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
-            crate::parse::edge_annotations::run_user_authored_reifies_firewall(&doc, &top_ctx)?;
-            if needs_lowering {
-                crate::parse::edge_annotations::lower_edge_annotations_after_firewall(
-                    &mut doc, &top_ctx, false,
-                )?;
+        let mut lowering =
+            needs_lowering.then(|| crate::parse::edge_annotations::Lowering::new(false, 0));
+        let mut after_expansion = |expanded: &mut serde_json::Value| -> Result<()> {
+            crate::parse::edge_annotations::refuse_reserved_iris(expanded)?;
+            match lowering.as_mut() {
+                Some(lowering) => crate::parse::edge_annotations::lower_expanded(
+                    expanded,
+                    crate::parse::edge_annotations::Clause::Assert,
+                    None,
+                    lowering,
+                ),
+                None => Ok(()),
             }
-        }
+        };
 
         // Register @context prefix→IRI mappings in the namespace trie BEFORE
         // expansion. JSON-LD expand() resolves prefixes internally, but the
@@ -1604,7 +1607,8 @@ mod inner {
         let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
         match &shared {
             None => {
-                let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                let mut expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                after_expansion(&mut expanded)?;
                 write_jsonld_document(
                     &expanded,
                     &mut sink,
@@ -1623,9 +1627,9 @@ mod inner {
                 // chunk. Any other line expands, and resolves its graph
                 // names, as the document it is.
                 let lines = ndjson_lines(&doc)?;
-                let serde_json::Value::Array(expanded) =
-                    fluree_graph_json_ld::expand(&doc).map_err(expand_error)?
-                else {
+                let mut expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
+                after_expansion(&mut expanded)?;
+                let serde_json::Value::Array(expanded) = expanded else {
                     return Err(not_an_ndjson_chunk());
                 };
                 if expanded.len() != lines.len() {
@@ -1637,8 +1641,9 @@ mod inner {
                         plain.push(expanded);
                         continue;
                     }
-                    let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
+                    let mut expanded = fluree_graph_json_ld::expand_with_context(line, shared)
                         .map_err(expand_error)?;
+                    after_expansion(&mut expanded)?;
                     write_jsonld_document(
                         &expanded,
                         &mut sink,

@@ -29,4 +29,4 @@ mod enforcer;
 mod executor;
 
 pub use enforcer::{PredicateCoverage, QueryPolicyEnforcer};
-pub use executor::QueryPolicyExecutor;
+pub use executor::{for_each_condition_pattern, QueryPolicyExecutor};

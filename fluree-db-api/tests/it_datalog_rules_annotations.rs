@@ -1581,17 +1581,14 @@ async fn a_json_rule_survives_a_delete_that_also_retracts_a_real_annotation() {
 }
 
 #[tokio::test]
-async fn a_deferred_keyword_beside_a_json_literal_is_still_refused() {
-    // Only the payload is opaque. A sibling of `@value` is ordinary JSON-LD
-    // the parser owns, so a deferred keyword nested in one is still the
-    // deferred shape. This is what pins the decision to put the skip inside
-    // the scanner and delete the `@json` branch at the call site: a call-site
-    // branch that scans siblings one way and the payload another has to
-    // re-state this rule at every site that grows one.
+async fn nothing_beside_a_json_literals_payload_is_written() {
+    // A value object holds its value, datatype, language and annotation; the
+    // expander keeps nothing else of it, so a keyword in another entry is
+    // neither lowered nor written: the node holds the JSON literal alone.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = claims_ledger(&fluree, "rules/json-sibling-refused").await;
+    let ledger = claims_ledger(&fluree, "rules/json-sibling-dropped").await;
 
-    let err = fluree
+    let ledger = fluree
         .insert(
             ledger,
             &json!({
@@ -1605,12 +1602,31 @@ async fn a_deferred_keyword_beside_a_json_literal_is_still_refused() {
             }),
         )
         .await
-        .expect_err("a nested @reifies in a non-@value sibling must stay refused");
-    let message = err.to_string();
-    assert!(
-        message.contains("@reifies"),
-        "the refusal must name the deferred keyword it found: {message}"
-    );
+        .expect("the sibling is not read")
+        .ledger;
+
+    let q = json!({
+        "@context": ex_f_context(),
+        "select": ["?p"],
+        "where": {"@id": "ex:doc", "?p": "?o"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([["f:rule"]]), "ex:doc holds the literal alone");
+    let q = json!({
+        "@context": ex_f_context(),
+        "select": ["?s"],
+        "where": {"@id": "?s", "ex:inner": "?o"}
+    });
+    let rows = support::query_jsonld(&fluree, &ledger, &q)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([]), "nothing of the sibling is written");
 }
 
 #[tokio::test]

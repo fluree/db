@@ -27,6 +27,8 @@ mod it_jsonld_number_by_value;
 mod it_jsonld_scoped_term_vocab;
 #[path = "it_jsonld_value_object_coercion.rs"]
 mod it_jsonld_value_object_coercion;
+#[path = "it_jsonld_vocab_as_written.rs"]
+mod it_jsonld_vocab_as_written;
 #[path = "it_list_cell_edits.rs"]
 mod it_list_cell_edits;
 #[path = "it_list_identity.rs"]
