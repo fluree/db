@@ -8,7 +8,7 @@
 use crate::support;
 use crate::support::{genesis_ledger, normalize_rows};
 use fluree_db_api::FlureeBuilder;
-use serde_json::json;
+use serde_json::{json, Value};
 
 fn context() -> serde_json::Value {
     json!({
@@ -87,4 +87,92 @@ async fn a_keyword_form_node_reference_is_refused() {
             "{doc}: {err}"
         );
     }
+}
+
+/// Every statement, as plain strings.
+async fn all_statements(
+    fluree: &support::MemoryFluree,
+    ledger: &support::MemoryLedger,
+) -> Vec<Value> {
+    let out = support::query_sparql(
+        fluree,
+        ledger,
+        "SELECT (STR(?s) AS ?ss) (STR(?p) AS ?ps) (STR(?o) AS ?os) WHERE { ?s ?p ?o }",
+    )
+    .await
+    .expect("sparql query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    normalize_rows(&out)
+}
+
+/// The values of `foo`'s `bar`, read under `context()`.
+async fn bar_values(fluree: &support::MemoryFluree, ledger: &support::MemoryLedger) -> Value {
+    let query = json!({
+        "@context": context(),
+        "select": "?o",
+        "where": {"@id": "?s", "foo": {"bar": "?o"}}
+    });
+    support::query_jsonld(fluree, ledger, &query)
+        .await
+        .expect("jsonld query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld")
+}
+
+/// An earlier release wrote such a term as a plain name, which a query under
+/// the context never found; an update with no context renames it to the IRI
+/// the term now names.
+#[tokio::test]
+async fn a_plain_name_an_earlier_release_wrote_renames() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "tx/scoped-term-rename:main").await;
+    // The insert above, as an earlier release stored it.
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@id": "http://example.org/s",
+                "http://example.org/foo": {
+                    "@id": "http://example.org/n",
+                    "bar": {"@id": "http://example.org/o"}
+                }
+            }),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    assert_eq!(bar_values(&fluree, &ledger).await, json!([]));
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "where": {"@id": "?n", "bar": "?o"},
+                "delete": {"@id": "?n", "bar": "?o"},
+                "insert": {"@id": "?n", "http://example.org/bar": "?o"}
+            }),
+        )
+        .await
+        .expect("rename")
+        .ledger;
+    assert_eq!(
+        bar_values(&fluree, &ledger).await,
+        json!(["http://example.org/o"])
+    );
+    assert_eq!(
+        all_statements(&fluree, &ledger).await,
+        normalize_rows(&json!([
+            [
+                "http://example.org/n",
+                "http://example.org/bar",
+                "http://example.org/o"
+            ],
+            [
+                "http://example.org/s",
+                "http://example.org/foo",
+                "http://example.org/n"
+            ]
+        ]))
+    );
 }
