@@ -282,22 +282,18 @@ impl StatsView {
         snapshot: &LedgerSnapshot,
     ) -> Self {
         let mut view = StatsView::from_db_stats(stats);
-        let namespace_codes = snapshot.namespaces();
 
-        // Derive IRI-keyed property stats.
-        // If a SID's namespace code is missing, skip it.
+        // Derive IRI-keyed property stats and ref-only flags, skipping a SID
+        // whose namespace code is unknown.
         for (sid, data) in &view.properties {
-            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
-                let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
-                view.properties_by_iri.insert(iri, *data);
+            if let Some(iri) = snapshot.decode_sid(sid) {
+                view.properties_by_iri.insert(Arc::from(iri), *data);
             }
         }
-
-        // Derive IRI-keyed ref-only flags.
         for (sid, ref_only) in &view.property_ref_only {
-            if let Some(prefix) = namespace_codes.get(&sid.namespace_code) {
-                let iri: Arc<str> = Arc::from(format!("{}{}", prefix, sid.name));
-                view.property_ref_only_by_iri.insert(iri, *ref_only);
+            if let Some(iri) = snapshot.decode_sid(sid) {
+                view.property_ref_only_by_iri
+                    .insert(Arc::from(iri), *ref_only);
             }
         }
 

@@ -8,11 +8,14 @@
 //! and `NEW` is only in novelty, and `OLD` also takes a new value in novelty.
 //! A named graph's IRI and a datatype's take the same encoding: before it, a
 //! write into an overflow-IRI graph was refused as naming an unknown graph.
+//! The planner and the schema catalogs find an overflow predicate's and
+//! class's stats under that Sid too.
 
 use crate::support;
 use fluree_db_api::{Batch, Fluree, FlureeBuilder, LedgerState};
 use fluree_vocab::namespaces;
 use serde_json::{json, Value};
+use std::sync::Arc;
 
 const LABEL: &str = "http://example.org/label";
 const LINK: &str = "http://example.org/link";
@@ -25,6 +28,8 @@ const NEW_O: &str = "http://new.example/o";
 const GRAPH: &str = "http://graphs.example/g";
 const CODE: &str = "http://example.org/code";
 const DT: &str = "http://types.example/code";
+const CLASS: &str = "http://old.example/C";
+const CLASS_P: &str = "http://old.example/q";
 
 fn row_count(result: &fluree_db_api::QueryResult) -> usize {
     result.batches.iter().map(Batch::len).sum()
@@ -66,6 +71,7 @@ async fn constant_overflow_iris_match_in_novelty_and_the_index() {
         "@id": OLD, LABEL: "old", OLD_P: 1, LINK: {"@id": OLD_O},
         CODE: {"@value": "x", "@type": DT}
     }));
+    graph.push(json!({"@id": "http://old.example/t", "@type": CLASS, CLASS_P: "v"}));
     fluree
         .insert(ledger, &json!({"@graph": graph}))
         .await
@@ -108,6 +114,71 @@ async fn constant_overflow_iris_match_in_novelty_and_the_index() {
     );
 
     let mut failures = Vec::new();
+
+    // The planner finds an overflow predicate's stats under the Sid a query
+    // gives it: the indexed count, with novelty's counts merged into it.
+    // Missing, it plans the predicate as absent, scanning it first in full.
+    let explained = fluree
+        .explain_sparql(
+            &support::graphdb_from_ledger(&ledger),
+            &format!("SELECT ?s ?n WHERE {{ ?s <{OLD_P}> ?n }}"),
+        )
+        .await
+        .expect("explain");
+    let estimate = &explained["plan"]["logical"][0]["estimate"]["row-count"];
+    if *estimate != json!(1) {
+        failures.push(format!(
+            "indexed estimate for <{OLD_P}>: {estimate}, want 1"
+        ));
+    }
+    let merged = fluree_db_core::StatsView::from_db_stats_with_namespaces(
+        &Arc::new(ledger.current_stats()),
+        &ledger.snapshot,
+    );
+    let count = ledger
+        .snapshot
+        .encode_iri(OLD_P)
+        .and_then(|p| merged.get_property(&p))
+        .map(|p| p.count);
+    if count != Some(2) {
+        failures.push(format!(
+            "merged count for <{OLD_P}>: {count:?}, want Some(2)"
+        ));
+    }
+
+    // Catalogs built from the stats name overflow classes and predicates.
+    let db = support::graphdb_from_ledger(&ledger);
+    for (call, want) in [
+        ("CALL db.labels()", CLASS),
+        ("CALL db.propertyKeys()", OLD_P),
+        ("CALL db.propertyKeys()", CLASS_P),
+    ] {
+        let rows = fluree
+            .query_cypher(&db, call)
+            .await
+            .expect(call)
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        if !rows
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row[0] == want)
+        {
+            failures.push(format!("{call} lacks {want}: {rows}"));
+        }
+    }
+    #[cfg(feature = "graphql")]
+    {
+        match fluree_db_api::graphql::schema_sdl(&db).await {
+            Ok(sdl) if sdl.contains("type C {") && sdl.contains("q: [String!]") => {}
+            other => failures.push(format!(
+                "GraphQL schema lacks type C with field q: {other:?}"
+            )),
+        }
+    }
+
     let sparql = [
         (format!("SELECT ?p ?o WHERE {{ <{NEW}> ?p ?o }}"), 4),
         (

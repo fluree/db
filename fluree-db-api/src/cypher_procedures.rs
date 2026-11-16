@@ -522,8 +522,7 @@ fn display_name(
     vocab: Option<&str>,
     overrides: &HashMap<String, String>,
 ) -> Option<String> {
-    let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
-    let iri = format!("{}{}", prefix, sid.name);
+    let iri = snapshot.decode_sid(sid)?;
     if iri.starts_with("https://ns.flur.ee/") {
         return None;
     }
