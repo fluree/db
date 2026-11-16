@@ -73,6 +73,7 @@ async fn a_keyword_form_node_reference_is_refused() {
     let documents = [
         json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s", "ex:p": {"@id": "@ignoreMe"}}),
         json!({"@context": {"ex": "http://example.org/"}, "@id": "@ignoreMe", "ex:p": 1}),
+        json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s", "@type": "@ignoreMe"}),
     ];
     for (i, doc) in documents.into_iter().enumerate() {
         let ledger0 = genesis_ledger(&fluree, &format!("tx/keyword-reference-{i}:main")).await;

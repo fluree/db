@@ -212,11 +212,18 @@ pub(crate) fn vocab_or_base(
     }
 }
 
-/// A `@type` value's IRI, or a string a `"@type": "@vocab"` term coerces;
-/// `None` for a term defined as `null`, which names no IRI.
+/// A node's `@type` IRI, or a string a `"@type": "@vocab"` term coerces;
+/// `None` for a term defined as `null`, which names no IRI. Either names a
+/// node, so one in keyword form is refused, as in `node_reference`.
 fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
     let (iri, entry) = vocab_or_base(s, ctx, strict)?;
-    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(iri))
+    if entry.is_some_and(|e| e.null_mapping) {
+        return Ok(None);
+    }
+    if crate::is_keyword_form(&iri) {
+        return Err(JsonLdError::KeywordAsNodeReference { value: iri });
+    }
+    Ok(Some(iri))
 }
 
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
@@ -313,13 +320,10 @@ fn parse_node_value(
             }
 
             if type_val == Some(&TypeValue::Vocab) {
-                let Some(iri) = vocab_value_iri(s, context, strict)? else {
-                    return Ok(vec![]);
-                };
-                if crate::is_keyword_form(&iri) {
-                    return Err(JsonLdError::KeywordAsNodeReference { value: iri });
-                }
-                return Ok(vec![json!({"@id": iri})]);
+                return Ok(vocab_value_iri(s, context, strict)?
+                    .map(|iri| json!({"@id": iri}))
+                    .into_iter()
+                    .collect());
             }
 
             let mut obj = Map::new();
@@ -2567,6 +2571,9 @@ mod tests {
             json!({"@context": ctx, "r": "@ignoreMe"}),
             json!({"@context": ctx, "v": "k"}),
             json!({"@context": ctx, "p": {"@value": "@ignoreMe", "@type": "@id"}}),
+            // A node's `@type` names a class, a node too.
+            json!({"@context": ctx, "@type": "@ignoreMe", "p": 1}),
+            json!({"@context": ctx, "@type": ["T", "k"], "p": 1}),
         ] {
             let err = crate::expand(&doc).expect_err(&doc.to_string());
             assert!(
