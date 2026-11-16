@@ -176,3 +176,97 @@ async fn a_plain_name_an_earlier_release_wrote_renames() {
         ]))
     );
 }
+
+/// An earlier release stored a keyword-form `@id` as the IRI. A query that
+/// names it still reads it, a delete that names it is refused, and two
+/// updates that match it by a filter move its statements, and the
+/// references to it, to an IRI.
+#[tokio::test]
+async fn a_keyword_form_iri_an_earlier_release_wrote_moves() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ctx = json!({"ex": "http://example.org/"});
+    let ledger0 = genesis_ledger(&fluree, "tx/keyword-iri-move:main").await;
+    // `{"@id": "@alice", ...}` as an earlier release stored it.
+    let ledger = fluree
+        .update(
+            ledger0,
+            &json!({
+                "@context": ctx,
+                "where": [["bind", "?a", "(iri \"@alice\")"]],
+                "insert": [
+                    {"@id": "?a", "@type": "ex:Person", "ex:name": "Alice"},
+                    {"@id": "ex:bob", "ex:knows": {"@id": "?a"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+
+    let names = support::query_jsonld(
+        &fluree,
+        &ledger,
+        &json!({"@context": ctx, "select": "?n", "where": {"@id": "@alice", "ex:name": "?n"}}),
+    )
+    .await
+    .expect("query")
+    .to_jsonld(&ledger.snapshot)
+    .expect("to_jsonld");
+    assert_eq!(names, json!(["Alice"]));
+    let err = fluree
+        .update(
+            ledger.clone(),
+            &json!({"@context": ctx, "delete": {"@id": "@alice", "ex:name": "Alice"}}),
+        )
+        .await
+        .expect_err("delete naming @alice")
+        .to_string();
+    assert!(err.contains("has the form of a JSON-LD keyword"), "{err}");
+
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "where": [{"@id": "?s", "?p": "?o"}, ["filter", "(= (str ?s) \"@alice\")"]],
+                "delete": {"@id": "?s", "?p": "?o"},
+                "insert": {"@id": "ex:alice", "?p": "?o"}
+            }),
+        )
+        .await
+        .expect("move statements")
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "where": [{"@id": "?x", "?p": "?s"}, ["filter", "(= (str ?s) \"@alice\")"]],
+                "delete": {"@id": "?x", "?p": "?s"},
+                "insert": {"@id": "?x", "?p": {"@id": "ex:alice"}}
+            }),
+        )
+        .await
+        .expect("move references")
+        .ledger;
+    assert_eq!(
+        all_statements(&fluree, &ledger).await,
+        normalize_rows(&json!([
+            [
+                "http://example.org/alice",
+                "http://example.org/name",
+                "Alice"
+            ],
+            [
+                "http://example.org/alice",
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://example.org/Person"
+            ],
+            [
+                "http://example.org/bob",
+                "http://example.org/knows",
+                "http://example.org/alice"
+            ]
+        ]))
+    );
+}
