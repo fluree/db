@@ -50,6 +50,27 @@ use fluree_vocab::{namespaces, rdf_names, xsd_names};
 
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::format::run_record_v2::RunRecordV2;
+
+/// Fast-path site a correlated scan stamps when it has [`ResolvedIds`]:
+/// `proceed` when it takes them, `gate_declined` when they are another
+/// store's.
+pub const CORRELATED_STORE_IDS_SITE: &str = "correlated store ids";
+
+/// Store ids a correlated scan's bound subject and object already have.
+///
+/// A join or OPTIONAL binds a left row's store id into its pattern as the IRI
+/// it decodes to, which the scan would otherwise look up again. These are
+/// ids in the dictionary of the store `store_id` names, all of them
+/// persisted (a novelty id takes the lookup), so a scan of any other store
+/// ignores them. The pattern stays bound, so a path that reads the pattern
+/// instead (range and policy fallbacks, history) is constrained as before.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ResolvedIds {
+    pub(crate) store_id: u64,
+    pub(crate) subject: Option<u64>,
+    pub(crate) object: Option<u64>,
+}
+
 /// Mask indicating which triple components should be emitted as columns.
 ///
 /// Used by plan-time optimizations to prune unused output columns.
@@ -238,6 +259,9 @@ pub struct BinaryScanOperator {
     /// When a bound subject IRI cannot be translated to a persisted `s_id`,
     /// keep a widened base scan correct by checking the resolved subject IRI row-by-row.
     unresolved_bound_subject_iri: Option<Arc<str>>,
+    /// Store ids the bound subject and object already have, from a
+    /// correlated row; see [`ResolvedIds`].
+    resolved: Option<ResolvedIds>,
     /// Temporal mode captured at planner-time. Drives the `op` field on
     /// emitted bindings, the `t` column projection, and the
     /// `RangeOptions::history_mode` pass-through to `range_with_overlay` in
@@ -785,6 +809,7 @@ impl BinaryScanOperator {
             check_p_eq_o,
             range_iter: None,
             unresolved_bound_subject_iri: None,
+            resolved: None,
             mode,
         }
     }
@@ -793,6 +818,31 @@ impl BinaryScanOperator {
     pub fn hiding_list_members(mut self) -> Self {
         self.hide_list_members = true;
         self
+    }
+
+    /// Take the store ids a correlated row already has for the bound subject
+    /// and object (see [`ResolvedIds`]).
+    pub(crate) fn with_resolved_ids(mut self, resolved: Option<ResolvedIds>) -> Self {
+        self.resolved = resolved;
+        self
+    }
+
+    /// The resolved ids, when they are ids of `store`. Stamped whenever the
+    /// scan has some, so a test can see whether it took them.
+    fn resolved_in(&self, store: &BinaryIndexStore) -> Option<ResolvedIds> {
+        let ids = self.resolved?;
+        let same_store = ids.store_id == store.store_id();
+        crate::fast_path_outcome::stamp_fast_path(
+            CORRELATED_STORE_IDS_SITE,
+            if same_store {
+                crate::fast_path_outcome::FastPathOutcome::Proceed
+            } else {
+                crate::fast_path_outcome::FastPathOutcome::Fallback(
+                    crate::fast_path_outcome::FastPathFallback::GateDeclined,
+                )
+            },
+        );
+        same_store.then_some(ids)
     }
 
     /// Helper to get the store ref, panics if not yet set (before open).
@@ -1202,15 +1252,19 @@ impl BinaryScanOperator {
         (s_sid, p_sid, o_val)
     }
 
-    /// Build a `BinaryFilter` from bound pattern terms.
+    /// Build a `BinaryFilter` from bound pattern terms. `known_s_id` is the
+    /// bound subject's id in `store`, when the caller already has it.
     pub(crate) fn build_filter_from_snapshot_sids(
         snapshot: &LedgerSnapshot,
         pattern: &TriplePattern,
         store: &BinaryIndexStore,
         s_sid: &Option<Sid>,
         p_sid: &Option<Sid>,
+        known_s_id: Option<u64>,
     ) -> std::io::Result<BinaryFilter> {
         let s_id = match (&pattern.s, s_sid.as_ref()) {
+            (Ref::Var(_), _) => None,
+            _ if known_s_id.is_some() => known_s_id,
             (Ref::Iri(iri), _) => store.find_subject_id(iri)?,
             (Ref::Sid(query_sid), Some(sid)) => {
                 if let Some(s_id) = sid_iri::sid_to_store_s_id(store, sid)? {
@@ -2158,12 +2212,14 @@ impl Operator for BinaryScanOperator {
             Self::extract_bound_terms_snapshot(ctx.active_snapshot, &self.pattern);
         self.bound_o = o_val;
         self.bound_o_encoded = None;
+        let resolved = self.resolved_in(store_ref);
         let mut filter = Self::build_filter_from_snapshot_sids(
             ctx.active_snapshot,
             &self.pattern,
             store_ref,
             &s_sid,
             &p_sid,
+            resolved.and_then(|ids| ids.subject),
         )
         .map_err(|e| QueryError::Internal(format!("build_filter: {e}")))?;
 
@@ -2290,7 +2346,13 @@ impl Operator for BinaryScanOperator {
                 // (`build_filter_from_snapshot_sids`) and the count path. A raw
                 // `Term::Sid` whose namespace code the store can't decode is thus
                 // not mistaken for absent. `Ok(None)` is a conclusive base miss.
-                match subject_ref_to_s_id(ctx.active_snapshot, store_ref, &Ref::Sid(sid.clone())) {
+                let s_id = match resolved.and_then(|ids| ids.object) {
+                    Some(s_id) => Ok(Some(s_id)),
+                    None => {
+                        subject_ref_to_s_id(ctx.active_snapshot, store_ref, &Ref::Sid(sid.clone()))
+                    }
+                };
+                match s_id {
                     Ok(Some(s_id)) => {
                         filter.o_type = Some(OType::IRI_REF.as_u16());
                         filter.o_key = Some(s_id);
