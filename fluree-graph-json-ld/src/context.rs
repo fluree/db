@@ -305,17 +305,42 @@ fn compute_vocab(active: &ParsedContext, value: &JsonValue) -> Result<Option<Str
         JsonValue::String(s) => {
             let expanded = crate::expand::iri(s, active, true);
             let relative = !iri::is_absolute(&expanded) && !expanded.starts_with("_:");
-            Ok(match active.base.as_deref() {
+            let vocab = match active.base.as_deref() {
                 Some(base) if relative => Some(resolve_iri(base, &expanded)),
                 _ if expanded.is_empty() => None,
                 _ => Some(expanded),
-            })
+            };
+            if vocab.as_deref().is_some_and(has_no_path) {
+                note_pathless_vocab();
+            }
+            Ok(vocab)
         }
         JsonValue::Null => Ok(None),
         _ => Err(JsonLdError::InvalidContext {
             message: format!("@vocab must be a string, got: {value:?}"),
         }),
     }
+}
+
+/// An IRI with an authority and nothing after it, such as
+/// `https://schema.org`: a term joined to it names another host.
+fn has_no_path(iri: &str) -> bool {
+    iri.split_once("://")
+        .is_some_and(|(_, rest)| !rest.is_empty() && !rest.contains(['/', '?', '#']))
+}
+
+/// Log, once per process, a `@vocab` with no path. Before 5.0 a `/` was
+/// added to it, so `"@vocab": "https://schema.org"` named
+/// `https://schema.org/name`; joined as written, it names
+/// `https://schema.orgname`.
+fn note_pathless_vocab() {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    NOTED.call_once(|| {
+        tracing::warn!(
+            "a JSON-LD @vocab is an IRI with no path: since 5.0 a term joins the @vocab as \
+             written, so it names another host; end the @vocab in / to keep the earlier IRIs"
+        );
+    });
 }
 
 /// Parse a context object (map)
@@ -880,6 +905,27 @@ mod tests {
             vocab_of(json!({"@base": "http://example.com/a/b/", "@vocab": "/relative"})).as_deref(),
             Some("http://example.com/relative")
         );
+        // An empty @vocab is the base without its fragment.
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.org/ns#", "@vocab": ""})).as_deref(),
+            Some("http://example.org/ns")
+        );
+    }
+
+    #[test]
+    fn a_vocab_with_no_path_is_noted() {
+        for iri in ["https://schema.org", "http://example.org:8080"] {
+            assert!(has_no_path(iri), "{iri}");
+        }
+        for iri in [
+            "https://schema.org/",
+            "http://example.org/ns",
+            "http://example.org#",
+            "urn:ex:",
+            "file:///x",
+        ] {
+            assert!(!has_no_path(iri), "{iri}");
+        }
     }
 
     #[test]
