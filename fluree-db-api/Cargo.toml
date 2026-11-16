@@ -76,7 +76,7 @@ fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
-# `AbortOnDropHandle` for an Iceberg scan's per-file reads (`graph_source::file_read`).
+# `AbortOnDropHandle` for an Iceberg scan's per-file reads (`r2rml::read_files_in_order`).
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
