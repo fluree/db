@@ -2719,14 +2719,19 @@ mod tests {
         .expect_err("the first slice fails");
         assert!(err.to_string().contains("injected failure"), "{err}");
 
-        // The second slice is held at a fetch, or hasn't reached one yet.
+        // The second slice is held at a fetch, or hasn't reached one yet. Its
+        // abandoned check and this count's increment happen in one poll, so a
+        // fetch that passed the check just before the decode returned can
+        // still count after `held` is read: one more is allowed. A slice that
+        // went on reading its row group would fetch dozens more.
         let held = second_row_group_reads.load(SeqCst);
         gate.add_permits(1 << 20);
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        assert_eq!(
-            second_row_group_reads.load(SeqCst),
-            held,
-            "the second slice fetched more after the decode returned"
+        let after = second_row_group_reads.load(SeqCst);
+        assert!(
+            after <= held + 1,
+            "the second slice fetched {} more after the decode returned",
+            after - held
         );
     }
 }
