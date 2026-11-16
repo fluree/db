@@ -106,6 +106,8 @@ pub struct ScanDatasetBuilder {
     schema: Arc<[VarId]>,
     /// Scan with [`BinaryScanOperator::hiding_list_members`].
     hide_list_members: bool,
+    /// Store ids of the bound subject and object, for a current-state scan.
+    resolved: Option<crate::binary_scan::ResolvedIds>,
 }
 
 impl ScanDatasetBuilder {
@@ -128,7 +130,24 @@ impl ScanDatasetBuilder {
             mode,
             schema,
             hide_list_members: false,
+            resolved: None,
         }
+    }
+
+    /// Scan with [`BinaryScanOperator::hiding_list_members`].
+    pub(crate) fn hiding_list_members(mut self) -> Self {
+        self.hide_list_members = true;
+        self
+    }
+
+    /// Hand a current-state scan the store ids its bound subject and object
+    /// already have (see [`crate::binary_scan::ResolvedIds`]).
+    pub(crate) fn with_resolved_ids(
+        mut self,
+        resolved: Option<crate::binary_scan::ResolvedIds>,
+    ) -> Self {
+        self.resolved = resolved;
+        self
     }
 
     /// Returns the temporal mode this builder will use when constructing scans.
@@ -172,7 +191,8 @@ impl DatasetBuilder for ScanDatasetBuilder {
                     self.inline_ops.clone(),
                     self.emit,
                     self.index_hint,
-                );
+                )
+                .with_resolved_ids(self.resolved);
                 Ok(Box::new(if self.hide_list_members {
                     scan.hiding_list_members()
                 } else {
@@ -411,8 +431,19 @@ impl DatasetOperator {
         index_hint: Option<IndexType>,
         mode: TemporalMode,
     ) -> Self {
-        let builder =
-            ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
+        Self::from_scan(ScanDatasetBuilder::new(
+            pattern,
+            object_bounds,
+            inline_ops,
+            emit,
+            index_hint,
+            mode,
+        ))
+    }
+
+    /// A scan of what `builder` describes, in its temporal mode.
+    pub(crate) fn from_scan(builder: ScanDatasetBuilder) -> Self {
+        let mode = builder.mode;
         let mut op = Self::new(Box::new(builder));
         op.mode = mode;
         op
@@ -428,12 +459,10 @@ impl DatasetOperator {
         index_hint: Option<IndexType>,
         mode: TemporalMode,
     ) -> Self {
-        let mut builder =
-            ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
-        builder.hide_list_members = true;
-        let mut op = Self::new(Box::new(builder));
-        op.mode = mode;
-        op
+        Self::from_scan(
+            ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode)
+                .hiding_list_members(),
+        )
     }
 }
 

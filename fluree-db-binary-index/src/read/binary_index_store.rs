@@ -3189,6 +3189,14 @@ impl BinaryIndexStore {
         Ok(subjects)
     }
 
+    /// Subject IRI → id lookups since load that searched a dictionary leaf.
+    pub fn subject_reverse_leaf_lookups(&self) -> u64 {
+        self.dicts
+            .subject_reverse_tree
+            .as_ref()
+            .map_or(0, |tree| tree.leaf_lookups())
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
@@ -4061,6 +4069,17 @@ impl BinaryGraphView {
     /// The novelty dictionary this view resolves novel ids through.
     pub fn dict_novelty(&self) -> Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>> {
         self.dict_novelty.as_ref()
+    }
+
+    /// Whether `s_id` was assigned by the store's own dictionary, not by
+    /// novelty: at or below its namespace's persisted watermark.
+    pub fn is_persisted_subject_id(&self, s_id: u64) -> bool {
+        use fluree_db_core::subject_id::SubjectId;
+        let Some(dn) = self.dict_novelty.as_ref() else {
+            return true;
+        };
+        let sid64 = SubjectId::from_u64(s_id);
+        sid64.local_id() <= dn.subjects.watermark_for_ns(sid64.ns_code())
     }
 
     // ── Internal watermark helpers ──────────────────────────────────────
