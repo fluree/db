@@ -7,7 +7,7 @@ use crate::annotation_index::AnnotationStats;
 use crate::db::LedgerSnapshot;
 use crate::ids::{GraphId, RuntimePredicateId};
 use crate::index_stats::{ClassStatEntry, IndexStats};
-use crate::ns_encoding::{canonical_split, NsSplitMode};
+use crate::ns_encoding::{encode_registered, table_full, NsSplitMode};
 use crate::sid::Sid;
 use crate::value_id::ValueTypeTag;
 use std::collections::HashMap;
@@ -16,12 +16,13 @@ use std::sync::Arc;
 /// Resolves a query-side IRI to the `Sid` that `IndexStats` is keyed by.
 ///
 /// Must stay equivalent to [`LedgerSnapshot::encode_iri`], including its
-/// EMPTY-namespace fallback for bare names.
+/// fallbacks for an IRI whose prefix has no code.
 #[derive(Debug, Clone)]
 pub struct StatsIriEncoder {
     /// IRI prefix -> namespace code, shared with the snapshot.
     reverse: Arc<HashMap<String, u16>>,
     split_mode: NsSplitMode,
+    table_full: bool,
 }
 
 impl StatsIriEncoder {
@@ -30,16 +31,18 @@ impl StatsIriEncoder {
         Self {
             reverse: snapshot.shared_namespace_reverse(),
             split_mode: snapshot.ns_split_mode(),
+            table_full: table_full(snapshot.namespaces()),
         }
     }
 
     /// Encode an IRI to the SID the stats tables are keyed by.
     pub fn encode(&self, iri: &str) -> Sid {
-        let (prefix, suffix) = canonical_split(iri, self.split_mode);
-        match self.reverse.get(prefix) {
-            Some(&code) => Sid::new(code, suffix),
-            None => Sid::new(fluree_vocab::namespaces::EMPTY, iri),
-        }
+        encode_registered(
+            iri,
+            self.split_mode,
+            |prefix| self.reverse.get(prefix).copied(),
+            || self.table_full,
+        )
     }
 }
 
