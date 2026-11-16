@@ -143,6 +143,10 @@ pub struct ParsedContext {
     pub type_key: String,
     /// Default vocabulary (@vocab)
     pub vocab: Option<String>,
+    /// Whether this context sets `@vocab` to `null`, which `vocab` alone
+    /// cannot tell from no `@vocab`. A scoped context that does clears the
+    /// vocabulary where it applies.
+    pub vocab_null: bool,
     /// Base IRI (@base)
     pub base: Option<String>,
     /// Default language (@language)
@@ -188,6 +192,7 @@ impl ParsedContext {
     pub fn to_json(&self) -> JsonValue {
         if self.terms.is_empty()
             && self.vocab.is_none()
+            && !self.vocab_null
             && self.base.is_none()
             && self.language.is_none()
         {
@@ -198,6 +203,8 @@ impl ParsedContext {
 
         if let Some(ref vocab) = self.vocab {
             ctx.insert("@vocab".to_string(), JsonValue::String(vocab.clone()));
+        } else if self.vocab_null {
+            ctx.insert("@vocab".to_string(), JsonValue::Null);
         }
         if let Some(ref base) = self.base {
             ctx.insert("@base".to_string(), JsonValue::String(base.clone()));
@@ -381,6 +388,7 @@ fn parse_context_map(
             match keyword {
                 "vocab" => {
                     result.vocab = compute_vocab(&result, value)?;
+                    result.vocab_null = value.is_null();
                 }
                 "language" => {
                     result.language = value.as_str().map(std::string::ToString::to_string);

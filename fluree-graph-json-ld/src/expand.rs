@@ -746,6 +746,7 @@ fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
                     let term = iri.strip_prefix(written)?;
                     vocab.as_ref().map(|vocab| format!("{vocab}{term}"))
                 }
+                None if scoped.vocab_null => None,
                 None => active.vocab.as_ref().map(|vocab| format!("{vocab}{iri}")),
             },
             None => None,
@@ -773,6 +774,8 @@ fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
     active.terms.extend(resolved);
     if let Some((_, vocab)) = own_vocab {
         active.vocab = vocab;
+    } else if scoped.vocab_null {
+        active.vocab = None;
     }
 }
 
@@ -2530,6 +2533,27 @@ mod tests {
                 "{vocab}: {node}"
             );
         }
+    }
+
+    /// A scoped `"@vocab": null` clears the vocabulary where it applies, so
+    /// its terms with no `@id`, and the keys it covers, are plain names.
+    #[test]
+    fn a_scoped_null_vocab_clears_the_vocabulary() {
+        let expanded = crate::expand(&json!({
+            "@context": {
+                "@vocab": "http://example/",
+                "foo": {"@context": {"@vocab": null, "bar": {"@type": "@id"}}}
+            },
+            "foo": {"bar": "http://o/1", "baz": "v"}
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({"http://example/foo": [{"bar": [{"@id": "http://o/1"}], "baz": [{"@value": "v"}]}]})
+        );
+        // The parsed context keeps the `null`, so it reads back the same.
+        let scoped = ParsedContext::parse(None, &json!({"@vocab": null})).unwrap();
+        assert_eq!(scoped.to_json(), json!({"@vocab": null}));
     }
 
     /// A string in keyword form names no node, so where one would become an
