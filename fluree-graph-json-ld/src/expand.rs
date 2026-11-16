@@ -212,18 +212,24 @@ pub(crate) fn vocab_or_base(
     }
 }
 
-/// A node's `@type` IRI, or a string a `"@type": "@vocab"` term coerces;
-/// `None` for a term defined as `null`, which names no IRI. Either names a
-/// node, so one in keyword form is refused, as in `node_reference`.
+/// A `@type` value's IRI, or a string a `"@type": "@vocab"` term coerces;
+/// `None` for a term defined as `null`, which names no IRI.
 fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
     let (iri, entry) = vocab_or_base(s, ctx, strict)?;
-    if entry.is_some_and(|e| e.null_mapping) {
-        return Ok(None);
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(iri))
+}
+
+/// [`vocab_value_iri`] for a value that names a node: a class, or a string
+/// a `"@type": "@vocab"` term coerces. One in keyword form names none, so it
+/// is refused, as in `node_reference`.
+fn vocab_node_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let iri = vocab_value_iri(s, ctx, strict)?;
+    match iri {
+        Some(iri) if crate::is_keyword_form(&iri) => {
+            Err(JsonLdError::KeywordAsNodeReference { value: iri })
+        }
+        iri => Ok(iri),
     }
-    if crate::is_keyword_form(&iri) {
-        return Err(JsonLdError::KeywordAsNodeReference { value: iri });
-    }
-    Ok(Some(iri))
 }
 
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
@@ -320,7 +326,7 @@ fn parse_node_value(
             }
 
             if type_val == Some(&TypeValue::Vocab) {
-                return Ok(vocab_value_iri(s, context, strict)?
+                return Ok(vocab_node_iri(s, context, strict)?
                     .map(|iri| json!({"@id": iri}))
                     .into_iter()
                     .collect());
@@ -682,13 +688,20 @@ fn parse_type<'c>(
         .or_else(|| type_id.as_ref().and_then(|id| node_map.get(id)));
 
     if let Some(type_val) = type_val {
+        // A value object where a node goes is refused later, as no node; its
+        // `@type` is a datatype, not a class.
+        let resolve = if node_map.contains_key("@value") {
+            vocab_value_iri
+        } else {
+            vocab_node_iri
+        };
         let types: Vec<String> = match type_val {
-            JsonValue::String(s) => vocab_value_iri(s, context, strict)?.into_iter().collect(),
+            JsonValue::String(s) => resolve(s, context, strict)?.into_iter().collect(),
             JsonValue::Array(arr) => {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     if let Some(s) = v.as_str() {
-                        result.extend(vocab_value_iri(s, context, strict)?);
+                        result.extend(resolve(s, context, strict)?);
                     }
                 }
                 result
