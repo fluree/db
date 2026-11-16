@@ -32,13 +32,15 @@ fluree token create --private-key <KEY> [OPTIONS]
 | `--audience <AUD>` | Audience claim (`aud`) - repeatable for multiple audiences |
 | `--identity <ID>` | Fluree identity claim (`fluree.identity`) - takes precedence over `sub` for policy |
 | `--policy-select` | Allow request policy selection (`"fluree.policy": "request"`); requires `--audience` and an issuer trusted as a policy authority by the server |
-| `--all` | Grant full access to all ledgers (events, storage, read, and write) |
+| `--all` | Grant events, storage, read, and write access to all ledgers. Audit access is separate |
 | `--events-ledger <ALIAS>` | Grant events access to one ledger branch (repeatable) |
 | `--storage-ledger <ALIAS>` | Grant storage access to one ledger branch (repeatable) |
 | `--read-all` | Grant data API read access to all ledgers (`fluree.ledger.read.all=true`) |
 | `--read-ledger <ALIAS>` | Grant data API read access to one ledger branch (repeatable) |
 | `--write-all` | Grant data API write access to all ledgers (`fluree.ledger.write.all=true`) |
 | `--write-ledger <ALIAS>` | Grant data API write access to one ledger branch (repeatable) |
+| `--audit-all` | Grant audit access to all ledgers (`fluree.ledger.audit.all=true`). Adds to read, write, or storage access |
+| `--audit-ledger <ALIAS>` | Grant audit access to one ledger branch (repeatable) |
 | `--graph-source <ALIAS>` | Grant access to specific graph source (repeatable) |
 | `--output <FMT>` | Output format: `token`, `json`, or `curl` (default: `token`) |
 | `--print-claims` | Print decoded claims to stderr |
@@ -217,8 +219,10 @@ Tokens can carry different permission scopes that control access to different se
 | Read (specific) | `fluree.ledger.read.ledgers` | Data API query access to listed ledgers |
 | Write (all) | `fluree.ledger.write.all` | Data API write access to all ledgers |
 | Write (specific) | `fluree.ledger.write.ledgers` | Data API write access to listed ledgers |
+| Audit (all) | `fluree.ledger.audit.all` | Raw commits, and removal and erasure details, of every ledger with a [targeted removal](../transactions/history-retention.md#audit-access) |
+| Audit (specific) | `fluree.ledger.audit.ledgers` | The same, for listed ledgers |
 
-The `--all` flag sets events, storage, read, and write access for all ledgers.
+The `--all` flag sets events, storage, read, and write access for all ledgers. It does not set audit access: no other scope implies it, so ask for it with `--audit-all` or `--audit-ledger`. A token with an audit grant and no read, write, or storage access is refused when it is created, since a server would refuse it.
 
 **Back-compat:** `fluree.storage.*` claims also grant data API read access for the same ledgers.
 

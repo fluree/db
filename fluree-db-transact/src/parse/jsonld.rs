@@ -11,6 +11,7 @@
 //! Only INSERT/DELETE templates are parsed here, which generate flakes rather
 //! than match patterns.
 
+use super::edge_annotations::{lower_expanded, Clause, Lowering};
 use super::txn_meta::extract_txn_meta;
 use crate::error::{Result, TransactError};
 use crate::ir::{
@@ -26,15 +27,16 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_with_context_policy, iri_named_graph, is_keyword_form, node_graph,
-    parse_context, GraphValue, NodeGraph, ParsedContext,
+    classify_graph_value, expand_with_context_policy, expand_with_root_context, iri_named_graph,
+    is_keyword_form, node_graph, parse_context, GraphValue, NodeGraph, ParsedContext,
 };
 use fluree_vocab::{
     rdf::{self, TYPE},
     rdf_names,
 };
 use serde_json::Value;
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 /// Parse a JSON-LD transaction into the Transaction IR
@@ -147,56 +149,38 @@ fn parse_rooted(
     read_body_constraints(json, &mut opts)?;
     refuse_query_only_opts(json)?;
 
-    // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
-    // `f:reifies*` system encoding before JSON-LD expansion, rejecting
-    // user-authored `f:reifies*` IRIs and every deferred shape (literal-
-    // valued annotations, multi-triple reifiers, annotation-of-annotation).
-    //
-    // The firewall always runs on the *original* document (read-only) — it
-    // is the security guard against user-authored system IRIs, so it must
-    // not be gated. Only the mutating lowering passes need the payload
-    // clone, and only when an `@annotation` / `@edge` / `@reifies` block is
-    // actually present: a large non-annotated transaction then skips the
-    // clone and both rewrite walks entirely.
-    let top_ctx = super::edge_annotations::top_level_context(json)?;
-    super::edge_annotations::run_user_authored_reifies_firewall(json, &top_ctx)?;
+    // The document's top-level context, read once: every stage below
+    // resolves against it, and the expander does not apply it again.
+    let root = top_context(json)
+        .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?;
 
-    // Two-pass lowering for UPDATE transactions:
-    //
-    // 1. The delete-clause pre-pass rewrites `@annotation` blocks inside
-    //    `delete:` into explicit `f:reifies*` retract templates so the
-    //    assertion-shaped lowering below doesn't synthesize spurious
-    //    sibling nodes. Insert / Upsert paths skip it — their docs carry no
-    //    `delete` key, so it would be a structural no-op anyway.
-    // 2. The standard assertion-shaped lowering rewrites the rest. Both
-    //    passes synthesize `f:reifies*` IRIs internally, which is why the
-    //    firewall ran first on the un-rewritten input.
-    let lowered = if super::edge_annotations::document_has_annotation_keys(json) {
-        let mut lowered = json.clone();
-        if matches!(txn_type, TxnType::Update) {
-            super::edge_annotations::lower_delete_annotation_blocks(&mut lowered)?;
+    // Each clause is expanded once. Reserved predicates are refused in that
+    // expansion, which is the document as written, by the IRIs the parser
+    // writes; then the annotations in it are lowered, from the same IRIs. An
+    // update's `where` and `values` get the check a query's clauses get.
+    let annotated = super::edge_annotations::document_has_annotation_keys(json);
+    if matches!(txn_type, TxnType::Update) {
+        for clause in ["where", "values"] {
+            if let Some(value) = json.get(clause) {
+                fluree_db_query::parse::reject_reserved_iris_in_clause(value, &root)
+                    .map_err(|e| TransactError::UnsupportedFeature(e.to_string()))?;
+            }
         }
-        super::edge_annotations::lower_edge_annotations_after_firewall(
-            &mut lowered,
-            &top_ctx,
-            lpg_mode,
-        )?;
-        std::borrow::Cow::Owned(lowered)
-    } else {
-        std::borrow::Cow::Borrowed(json)
-    };
+    }
+    let pass = ExpandedPass::for_document(annotated, lpg_mode);
 
-    let annotated = matches!(lowered, std::borrow::Cow::Owned(_));
     let mut txn = match txn_type {
         TxnType::Insert | TxnType::Upsert => parse_data(
-            &lowered,
+            json,
+            &root,
+            pass,
             txn_type,
             opts,
             ns_registry,
             ledger_id,
             request_graph,
         )?,
-        TxnType::Update => parse_update(&lowered, opts, ns_registry, ledger_id)?,
+        TxnType::Update => parse_update(json, &root, pass, opts, ns_registry, ledger_id)?,
     };
     if annotated {
         refuse_annotations_under_a_variable_graph(&txn.insert_templates)?;
@@ -415,23 +399,31 @@ fn names_a_node(expanded: &Value) -> bool {
 ///
 /// The root scope is the default graph, or the request's graph for a graph
 /// insert / sync (`request_graph`), which the payload may not leave.
+#[allow(clippy::too_many_arguments)]
 fn parse_data(
     json: &Value,
+    context: &ParsedContext,
+    pass: ExpandedPass,
     txn_type: TxnType,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
     request_graph: Option<&GraphSel>,
 ) -> Result<Txn> {
-    let context = extract_context(json)?;
     let strict = strict_compact_iri(&opts, json);
 
     // Extract transaction metadata (only from envelope-form documents with @graph)
-    let txn_meta = extract_txn_meta(json, &context, ns_registry, strict)?;
+    let txn_meta = extract_txn_meta(json, context, ns_registry, strict)?;
 
     // Strip top-level `opts` so it is not expanded as data (single-object form)
-    let json_for_expand = strip_opts_for_expansion(json, &context)?;
-    let expanded = expand_with_context_policy(&json_for_expand, &context, strict)?;
+    let json_for_expand = strip_opts_for_expansion(json, context)?;
+    let mut expanded = expand_with_root_context(&json_for_expand, context, strict)?;
+    let mut lowering = pass.lowering(0);
+    check_and_lower(
+        &mut expanded,
+        lowering.as_mut().map(|l| (Clause::Assert, l)),
+        None,
+    )?;
 
     let no_aliases = HashMap::new();
     let mut blanks = BlankIssuer::default();
@@ -443,7 +435,7 @@ fn parse_data(
             None => GraphScope::default_graph(),
         };
         let mut ctx = TemplateParseCtx::new(
-            &context,
+            context,
             &mut vars,
             ns_registry,
             false,
@@ -500,6 +492,8 @@ fn parse_data(
 /// the ledger's database for IRI encoding.
 fn parse_update(
     json: &Value,
+    context: &ParsedContext,
+    pass: ExpandedPass,
     opts: TxnOpts,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
@@ -518,13 +512,10 @@ fn parse_update(
         ));
     }
 
-    // Parse context from the outer document
-    let context = extract_context(json)?;
-
     let strict = strict_compact_iri(&opts, json);
 
     // Extract transaction metadata (only from envelope-form documents with @graph)
-    let txn_meta = extract_txn_meta(json, &context, ns_registry, strict)?;
+    let txn_meta = extract_txn_meta(json, context, ns_registry, strict)?;
 
     // Optional WHERE dataset scoping using query-style dataset keys.
     // - `from.graph` (or `"from": "<graph IRI>"`, or `"from": ["<g1>", "<g2>"]`) scopes WHERE
@@ -532,7 +523,7 @@ fn parse_update(
     // - `fromNamed` (or legacy `from-named`) restricts visible named graphs for WHERE (USING NAMED equivalent)
     let where_named_graphs = parse_update_where_named_graphs(
         obj.get("fromNamed").or_else(|| obj.get("from-named")),
-        &context,
+        context,
     )?;
     refuse_from_named_name_collisions(where_named_graphs.as_deref().unwrap_or_default())?;
     let from_named_aliases: HashMap<String, String> = where_named_graphs
@@ -544,21 +535,28 @@ fn parse_update(
         })
         .unwrap_or_default();
 
-    let has_where = obj.get("where").is_some();
-    let has_values = obj.get("values").is_some();
-    let allow_object_vars = has_where || has_values;
-    let object_var_parsing = allow_object_vars && opts.object_var_parsing.unwrap_or(true);
+    // A `?` string in a template's value position is a variable when the
+    // `where` or `values` mentions its name, and otherwise the string itself.
+    let object_var_parsing = opts.object_var_parsing.unwrap_or(true);
+    let mut mentioned = HashSet::new();
+    for binder in [obj.get("where"), obj.get("values")].into_iter().flatten() {
+        collect_var_mentions(binder, &mut mentioned);
+    }
 
     // The template clauses and VALUES share one blank-node issuer; they are
     // parsed a second time only when a user `_:bN` label collided with an
     // anonymous node's (see `BlankIssuer`).
     let mut blanks = BlankIssuer::default();
-    let clauses = loop {
+    let mut clauses = loop {
         let clauses = parse_update_clauses(
             obj,
-            &context,
+            context,
             strict,
-            object_var_parsing,
+            pass,
+            ValueVars {
+                enabled: object_var_parsing,
+                mentioned: Some(&mentioned),
+            },
             &from_named_aliases,
             ns_registry,
             ledger_id,
@@ -568,9 +566,13 @@ fn parse_update(
             break clauses;
         }
     };
+    let where_val = with_patterns(
+        obj.get("where"),
+        std::mem::take(&mut clauses.where_patterns),
+    );
 
     let where_default_graph_iris =
-        parse_update_where_default_graph_iris(obj.get("from"), &context, &from_named_aliases)?
+        parse_update_where_default_graph_iris(obj.get("from"), context, &from_named_aliases)?
             .unwrap_or_else(|| clauses.template_root_iri.iter().cloned().collect());
     // A where node's `"@graph": "default"` names the ledger's default graph,
     // as a template's does. When the WHERE reads another default graph, the
@@ -581,39 +583,41 @@ fn parse_update(
     // This reuses full pattern support (OPTIONAL, UNION, FILTER, etc.)
     // Variables remain as strings in UnresolvedPattern; they'll be assigned VarIds
     // during lowering in stage.rs using the same VarRegistry as INSERT/DELETE.
-    let (where_patterns, reads_ledger_default_by_name) = if let Some(where_val) = obj.get("where") {
-        let mut query = UnresolvedQuery::new(context.clone());
-        let mut subject_counter: u32 = 0;
-        let mut nested_counter: u32 = 0;
-        let parse_policy = JsonLdParsePolicy {
-            strict_compact_iri: strict,
-        };
-        // Graph names in the WHERE resolve as in the templates: this ledger's
-        // keywords, the same `fromNamed` aliases, and `default` for the
-        // ledger's default graph. A `["graph", …]` name the update's
-        // `fromNamed` spells is that alias, even where it reads as a compact
-        // IRI; any other compact IRI expands.
-        let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
-            .with_graph_names(fluree_db_query::parse::GraphNameEnv {
-                ledger_id: Some(ledger_id.to_string()),
-                aliases: from_named_aliases.clone(),
-                default_by_name,
-            })
-            .with_dataset_names(from_named_aliases.keys().cloned().collect());
-        parse_where_with_counters(
-            where_val,
-            &ctx,
-            &mut query,
-            &mut subject_counter,
-            &mut nested_counter,
-            object_var_parsing,
-        )
-        .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
+    let (where_patterns, reads_ledger_default_by_name) =
+        if let Some(where_val) = where_val.as_deref() {
+            let mut query = UnresolvedQuery::new(context.clone());
+            let mut subject_counter: u32 = 0;
+            let mut nested_counter: u32 = 0;
+            let parse_policy = JsonLdParsePolicy {
+                strict_compact_iri: strict,
+            };
+            // Graph names in the WHERE resolve as in the templates: this ledger's
+            // keywords, the same `fromNamed` aliases, and `default` for the
+            // ledger's default graph. A `["graph", …]` name the update's
+            // `fromNamed` spells is that alias, even where it reads as a compact
+            // IRI; any other compact IRI expands.
+            let ctx = JsonLdParseCtx::new(context.clone(), PathAliasMap::new(), parse_policy)
+                .with_graph_names(fluree_db_query::parse::GraphNameEnv {
+                    ledger_id: Some(ledger_id.to_string()),
+                    aliases: from_named_aliases.clone(),
+                    default_by_name,
+                })
+                .with_dataset_names(from_named_aliases.keys().cloned().collect());
+            parse_where_with_counters(
+                where_val,
+                &ctx,
+                &mut query,
+                &mut subject_counter,
+                &mut nested_counter,
+                object_var_parsing,
+            )
+            .map_err(|e| TransactError::Parse(format!("WHERE clause: {e}")))?;
 
-        (query.patterns, ctx.reads_ledger_default())
-    } else {
-        (Vec::new(), false)
-    };
+            (query.patterns, ctx.reads_ledger_default())
+        } else {
+            (Vec::new(), false)
+        };
+    refuse_unbound_template_vars(&clauses, [where_val.as_deref(), obj.get("values")])?;
 
     let mut txn = Txn::update()
         .with_wheres(where_patterns)
@@ -630,6 +634,95 @@ fn parse_update(
         txn = txn.with_values(values);
     }
     Ok(txn)
+}
+
+/// Refuse a variable in an update's templates that its `where` and `values`
+/// (`binders`) never mention. A value is such a variable only when they
+/// mention it ([`ValueVars`]), so what is left is a node, a property, a type
+/// or a graph: an IRI, which cannot start with `?`, that nothing can bind,
+/// whose statements would silently never be written. A mention anywhere
+/// counts, a filter or bind expression's included, so a variable the `where`
+/// may bind is never refused; one it leaves unbound in a solution drops its
+/// statements there, as in SPARQL.
+fn refuse_unbound_template_vars(
+    clauses: &UpdateClauses,
+    binders: [Option<&Value>; 2],
+) -> Result<()> {
+    let mut mentioned = HashSet::new();
+    for value in binders.into_iter().flatten() {
+        collect_var_mentions(value, &mut mentioned);
+    }
+    for (clause, templates) in [("delete", &clauses.delete), ("insert", &clauses.insert)] {
+        for template in templates {
+            let mut unbound: Option<&str> = None;
+            let mut check = |v: fluree_db_query::VarId| {
+                let name = clauses.vars.name(v);
+                if unbound.is_none() && !mentioned.contains(name) {
+                    unbound = Some(name);
+                }
+            };
+            for term in [&template.subject, &template.predicate, &template.object] {
+                term.for_each_leaf(&mut |leaf| {
+                    if let TemplateTerm::Var(v) = leaf {
+                        check(*v);
+                    }
+                });
+            }
+            if let TemplateGraph::Var(v) = &template.graph {
+                check(*v);
+            }
+            if let Some(name) = unbound {
+                return Err(TransactError::Parse(format!(
+                    "{name} in the update's {clause} is not in its where or values, so nothing \
+                     binds it; an IRI cannot start with \"?\""
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every `?name` token in `value`'s strings and keys, and each whole string
+/// that starts with `?`.
+fn collect_var_mentions(value: &Value, out: &mut std::collections::HashSet<String>) {
+    fn mentions(text: &str, out: &mut std::collections::HashSet<String>) {
+        if text.starts_with('?') {
+            out.insert(text.to_string());
+        }
+        let delimiter = |c: char| c.is_whitespace() || "()[]{},;\"'".contains(c);
+        for token in text.split(delimiter).filter(|t| t.starts_with('?')) {
+            out.insert(token.to_string());
+        }
+    }
+    match value {
+        Value::String(text) => mentions(text, out),
+        Value::Array(items) => {
+            for item in items {
+                collect_var_mentions(item, out);
+            }
+        }
+        Value::Object(map) => {
+            for (key, item) in map {
+                mentions(key, out);
+                collect_var_mentions(item, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// An update's `where` with `patterns` (a retraction's, by selector) after
+/// its own.
+fn with_patterns(where_val: Option<&Value>, patterns: Vec<Value>) -> Option<Cow<'_, Value>> {
+    if patterns.is_empty() {
+        return where_val.map(Cow::Borrowed);
+    }
+    let items = match where_val {
+        None => patterns,
+        Some(Value::Array(items)) => items.iter().cloned().chain(patterns).collect(),
+        Some(other) => std::iter::once(other.clone()).chain(patterns).collect(),
+    };
+    Some(Cow::Owned(Value::Array(items)))
 }
 
 /// Whether an update's WHERE, reading `iris` as its default graph (empty:
@@ -661,6 +754,8 @@ struct UpdateClauses {
     delete: Vec<TripleTemplate>,
     insert: Vec<TripleTemplate>,
     values: Option<InlineValues>,
+    /// The `where` patterns the delete's retractions by selector bind with.
+    where_patterns: Vec<Value>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -668,7 +763,8 @@ fn parse_update_clauses(
     obj: &serde_json::Map<String, Value>,
     context: &ParsedContext,
     strict: bool,
-    object_var_parsing: bool,
+    pass: ExpandedPass,
+    value_vars: ValueVars<'_>,
     from_named_aliases: &HashMap<String, String>,
     ns_registry: &mut NamespaceRegistry,
     ledger_id: &str,
@@ -676,6 +772,7 @@ fn parse_update_clauses(
 ) -> Result<UpdateClauses> {
     let mut vars = VarRegistry::new();
     let mut write_graphs = WriteGraphs::new();
+    let mut lowering = pass.lowering(super::edge_annotations::next_synth_var_index(obj));
 
     // Optional transaction-level default graph (SPARQL `WITH`): the root scope
     // of both template clauses, and the WHERE's default graph unless `from`
@@ -725,7 +822,7 @@ fn parse_update_clauses(
             context,
             &mut vars,
             ns_registry,
-            object_var_parsing,
+            value_vars.enabled,
             strict,
             &mut write_graphs,
             from_named_aliases,
@@ -733,6 +830,8 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
+        ctx.value_vars = value_vars;
+        ctx.lowering = lowering.as_mut().map(|l| (Clause::Retract, l));
         let templates = parse_update_templates_with_ctx(delete_val, &template_root, &mut ctx)?;
         // Blank nodes are not allowed in delete templates (mirrors SPARQL 1.1
         // Update §19.8 note 8 on the JSON-LD surface): a blank node denotes a
@@ -764,6 +863,26 @@ fn parse_update_clauses(
         Vec::new()
     };
 
+    // The delete's retractions by selector bind in `where` patterns of their
+    // own, which the insert may read too.
+    let with_retractions = lowering
+        .as_ref()
+        .filter(|l| !l.where_patterns().is_empty())
+        .map(|l| {
+            let mut mentioned = value_vars.mentioned.cloned().unwrap_or_default();
+            for pattern in l.where_patterns() {
+                collect_var_mentions(pattern, &mut mentioned);
+            }
+            mentioned
+        });
+    let insert_vars = match &with_retractions {
+        Some(mentioned) => ValueVars {
+            mentioned: Some(mentioned),
+            ..value_vars
+        },
+        None => value_vars,
+    };
+
     // Parse INSERT clause
     let insert = if let Some(insert_val) = obj.get("insert") {
         validate_type_fields(insert_val)?;
@@ -771,7 +890,7 @@ fn parse_update_clauses(
             context,
             &mut vars,
             ns_registry,
-            object_var_parsing,
+            insert_vars.enabled,
             strict,
             &mut write_graphs,
             from_named_aliases,
@@ -779,6 +898,8 @@ fn parse_update_clauses(
             GraphRole::UpdateTemplate,
             blanks,
         );
+        ctx.value_vars = insert_vars;
+        ctx.lowering = lowering.as_mut().map(|l| (Clause::Assert, l));
         let templates = parse_update_templates_with_ctx(insert_val, &template_root, &mut ctx)?;
         if templates.is_empty() {
             // As with delete: `"insert": []` is a no-op, an empty node is not.
@@ -815,6 +936,9 @@ fn parse_update_clauses(
         delete,
         insert,
         values,
+        where_patterns: lowering
+            .map(Lowering::into_where_patterns)
+            .unwrap_or_default(),
     })
 }
 
@@ -1128,11 +1252,78 @@ pub(crate) enum GraphRole {
     UpdateDefault,
 }
 
+/// What a clause's expansion goes through before its statements are built:
+/// reserved predicates are refused in what the user wrote, and then, in a
+/// document with annotations, the annotations are lowered.
+#[derive(Clone, Copy, Debug)]
+enum ExpandedPass {
+    Check,
+    /// [`Self::Check`], then the lowering (`lpg_mode`: `opts.lpgEdgeLifecycle`).
+    CheckAndLower {
+        lpg_mode: bool,
+    },
+}
+
+impl ExpandedPass {
+    fn for_document(annotated: bool, lpg_mode: bool) -> Self {
+        if annotated {
+            Self::CheckAndLower { lpg_mode }
+        } else {
+            Self::Check
+        }
+    }
+
+    /// The lowering this pass runs, its retractions' variables numbered from
+    /// `first_var`.
+    fn lowering(self, first_var: u32) -> Option<Lowering> {
+        match self {
+            Self::Check => None,
+            Self::CheckAndLower { lpg_mode } => Some(Lowering::new(lpg_mode, first_var)),
+        }
+    }
+}
+
+/// Refuse reserved predicates in `expanded`, a clause as written, then lower
+/// its annotations as the clause `lowering` names, when there is one. `graph`
+/// is the graph the clause is written in.
+fn check_and_lower(
+    expanded: &mut Value,
+    lowering: Option<(Clause, &mut Lowering)>,
+    graph: Option<&str>,
+) -> Result<()> {
+    super::edge_annotations::refuse_reserved_iris(expanded)?;
+    match lowering {
+        Some((clause, lowering)) => lower_expanded(expanded, clause, graph, lowering),
+        None => Ok(()),
+    }
+}
+
+/// Which `?` strings in a template's value positions are variables.
+#[derive(Clone, Copy, Debug)]
+struct ValueVars<'a> {
+    /// Off for data (an insert, an upsert) and under
+    /// `opts.objectVarParsing: false`: every value is the string written.
+    enabled: bool,
+    /// In an update, the names its `where` and `values` mention
+    /// ([`collect_var_mentions`]): only one of them is a variable, so a value
+    /// that merely starts with `?` is the string. `None` reads every `?`
+    /// name as a variable.
+    mentioned: Option<&'a HashSet<String>>,
+}
+
+impl ValueVars<'_> {
+    fn is_var(self, value: &str) -> bool {
+        self.enabled
+            && value.starts_with('?')
+            && self.mentioned.is_none_or(|names| names.contains(value))
+    }
+}
+
 struct TemplateParseCtx<'a> {
     context: &'a ParsedContext,
     vars: &'a mut VarRegistry,
     ns_registry: &'a mut NamespaceRegistry,
-    object_var_parsing: bool,
+    value_vars: ValueVars<'a>,
     strict_compact_iri: bool,
     write_graphs: &'a mut WriteGraphs,
     from_named_aliases: &'a HashMap<String, String>,
@@ -1145,6 +1336,9 @@ struct TemplateParseCtx<'a> {
     fixed_root: Option<GraphScope>,
     /// The document's anonymous-node labels.
     blanks: &'a mut BlankIssuer,
+    /// The lowering this clause's annotations go through, as the clause
+    /// they are in.
+    lowering: Option<(Clause, &'a mut Lowering)>,
 }
 
 impl<'a> TemplateParseCtx<'a> {
@@ -1165,7 +1359,10 @@ impl<'a> TemplateParseCtx<'a> {
             context,
             vars,
             ns_registry,
-            object_var_parsing,
+            value_vars: ValueVars {
+                enabled: object_var_parsing,
+                mentioned: None,
+            },
             strict_compact_iri,
             write_graphs,
             from_named_aliases,
@@ -1173,16 +1370,18 @@ impl<'a> TemplateParseCtx<'a> {
             role,
             fixed_root: None,
             blanks,
+            lowering: None,
         }
     }
 
-    /// Expand a JSON-LD document, respecting strict policy.
-    fn expand_document(&self, json: &Value) -> std::result::Result<Value, TransactError> {
-        Ok(expand_with_context_policy(
-            json,
-            self.context,
-            self.strict_compact_iri,
-        )?)
+    /// Expand a clause, respecting strict policy, then check it and lower its
+    /// annotations ([`check_and_lower`]). `graph` is the graph it is written
+    /// in.
+    fn expand_document(&mut self, json: &Value, graph: Option<&str>) -> Result<Value> {
+        let mut expanded = expand_with_context_policy(json, self.context, self.strict_compact_iri)?;
+        let lowering = self.lowering.as_mut().map(|(c, l)| (*c, &mut **l));
+        check_and_lower(&mut expanded, lowering, graph)?;
+        Ok(expanded)
     }
 
     /// Resolve a graph name written in this document, by
@@ -1369,32 +1568,33 @@ fn parse_update_templates_with_ctx(
                     ));
                 };
                 let scope = ctx.selector_scope(raw)?;
-                let expanded = ctx.expand_document(pattern)?;
+                let expanded = ctx.expand_document(pattern, Some(raw))?;
                 parse_expanded_nodes(&expanded, &scope, ctx, &mut out)?;
                 continue;
             }
             plain_items.push(item.clone());
         }
         if !plain_items.is_empty() {
-            let expanded = ctx.expand_document(&Value::Array(plain_items))?;
+            let expanded = ctx.expand_document(&Value::Array(plain_items), None)?;
             parse_expanded_nodes(&expanded, root, ctx, &mut out)?;
         }
         return Ok(out);
     }
 
-    let expanded = ctx.expand_document(val)?;
+    let expanded = ctx.expand_document(val, None)?;
     parse_expanded_nodes(&expanded, root, ctx, &mut out)?;
     Ok(out)
 }
 
-/// Extract and parse the @context from a JSON-LD document
-fn extract_context(json: &Value) -> Result<ParsedContext> {
-    if let Some(ctx_val) = json.get("@context") {
-        Ok(parse_context(&fluree_graph_json_ld::with_base_as_vocab(
-            ctx_val,
-        ))?)
-    } else {
-        Ok(ParsedContext::new())
+/// The document's top-level `@context`, as every stage of the parser reads
+/// it.
+fn top_context(json: &Value) -> fluree_graph_json_ld::Result<ParsedContext> {
+    match json.get("@context") {
+        Some(ctx_val) => {
+            fluree_graph_json_ld::note_lone_base(ctx_val);
+            parse_context(ctx_val)
+        }
+        None => Ok(ParsedContext::new()),
     }
 }
 
@@ -2159,7 +2359,7 @@ fn parse_expanded_value_with_ctx(
                     ctx.context,
                     ctx.vars,
                     ctx.ns_registry,
-                    ctx.object_var_parsing,
+                    ctx.value_vars,
                     ctx.strict_compact_iri,
                 );
             }
@@ -2214,7 +2414,7 @@ fn parse_expanded_value_with_ctx(
         // String values are literals — only `{"@id": "..."}` or a context-declared
         // `@type: "@id"` (which expansion rewrites to `{"@id": ...}`) produces an IRI reference.
         Value::String(s) => {
-            if s.starts_with('?') && ctx.object_var_parsing {
+            if ctx.value_vars.is_var(s) {
                 let var_id = ctx.vars.get_or_insert(s);
                 Ok(ParsedValue::new(TemplateTerm::Var(var_id)))
             } else {
@@ -2326,7 +2526,7 @@ fn parse_literal_value_with_meta(
     context: &ParsedContext,
     vars: &mut VarRegistry,
     ns_registry: &mut NamespaceRegistry,
-    object_var_parsing: bool,
+    value_vars: ValueVars<'_>,
     strict: bool,
 ) -> Result<ParsedValue> {
     // Check for @type first - always route through typed coercion when present
@@ -2338,12 +2538,12 @@ fn parse_literal_value_with_meta(
             if type_iri == "@json" || expanded_type == rdf::JSON {
                 // A template variable, written bare or as the JSON string a
                 // `@json`-typed term serializes it to.
-                if let (true, Value::String(s)) = (object_var_parsing, val) {
+                if let Value::String(s) = val {
                     let name = s
                         .strip_prefix('"')
                         .and_then(|rest| rest.strip_suffix('"'))
                         .unwrap_or(s);
-                    if name.starts_with('?') && !name.contains(['"', '\\']) {
+                    if value_vars.is_var(name) && !name.contains(['"', '\\']) {
                         let var_id = vars.get_or_insert(name);
                         return Ok(ParsedValue::new(TemplateTerm::Var(var_id)));
                     }
@@ -2385,7 +2585,7 @@ fn parse_literal_value_with_meta(
     match val {
         Value::String(s) => {
             // Check if it's a variable - allow in @value for transaction WHERE patterns
-            if s.starts_with('?') && object_var_parsing {
+            if value_vars.is_var(s) {
                 let var_id = vars.get_or_insert(s);
                 return Ok(ParsedValue::new(TemplateTerm::Var(var_id)));
             }
@@ -2871,7 +3071,15 @@ mod tests {
             "insert": { "@id": "?s", "ex:name": "New Name" }
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            ExpandedPass::Check,
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
 
         assert_eq!(txn.txn_type, TxnType::Update);
         assert_eq!(txn.where_patterns.len(), 1);
@@ -2891,6 +3099,8 @@ mod tests {
         });
         let err = parse_update(
             &cypher_envelope,
+            &top_context(&cypher_envelope).unwrap(),
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2908,6 +3118,8 @@ mod tests {
         });
         let err = parse_update(
             &where_only,
+            &top_context(&where_only).unwrap(),
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2925,6 +3137,8 @@ mod tests {
         });
         let txn = parse_update(
             &explicit_empty_delete,
+            &top_context(&explicit_empty_delete).unwrap(),
+            ExpandedPass::Check,
             TxnOpts::default(),
             &mut ns_registry,
             TEST_LEDGER,
@@ -2950,7 +3164,15 @@ mod tests {
             ]
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            ExpandedPass::Check,
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
         let named = txn
             .update_where_named_graphs
             .as_ref()
@@ -2974,7 +3196,15 @@ mod tests {
             ]
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            ExpandedPass::Check,
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
         let named = txn
             .update_where_named_graphs
             .as_ref()
@@ -2998,7 +3228,15 @@ mod tests {
             ]
         });
 
-        let txn = parse_update(&json, TxnOpts::default(), &mut ns_registry, TEST_LEDGER).unwrap();
+        let txn = parse_update(
+            &json,
+            &top_context(&json).unwrap(),
+            ExpandedPass::Check,
+            TxnOpts::default(),
+            &mut ns_registry,
+            TEST_LEDGER,
+        )
+        .unwrap();
         assert!(
             txn.write_graphs.contains("http://example.org/g2"),
             "expected write_graphs to contain resolved graph IRI for alias g2"
@@ -4954,6 +5192,452 @@ mod tests {
                     "{what}: the link in {graph} names {s} {p}, not asserted there"
                 );
             }
+        }
+    }
+
+    /// A lone `@base` resolves references only, for the parser's checks and
+    /// the parser alike: a key under it is a plain name, whatever the base.
+    #[test]
+    fn a_lone_base_leaves_keys_plain_names() {
+        let f = fluree_vocab::fluree::DB;
+        let p = fluree_vocab::db::REIFIES_SUBJECT;
+        let edge = |key: &str| json!({"@id": "http://example.org/alice", key: {"@id": "http://example.org/bob"}});
+        let based = |base: &str, key: &str| {
+            let mut doc = edge(key);
+            doc["@context"] = json!({"@base": base});
+            doc
+        };
+        let cases = [
+            (TxnType::Insert, based(f, p)),
+            (TxnType::Upsert, based(f, p)),
+            (
+                TxnType::Insert,
+                json!({"@context": {"@base": f}, "@graph": [edge(p)]}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"@base": f}, "insert": edge(p)}),
+            ),
+        ];
+        for (txn_type, doc) in cases {
+            let mut ns = test_registry();
+            let txn = parse_transaction(&doc, txn_type, TxnOpts::default(), &mut ns, TEST_LEDGER)
+                .unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let plain = ns.sid_for_iri(p);
+            assert!(
+                txn.insert_templates
+                    .iter()
+                    .all(|t| matches!(&t.predicate, TemplateTerm::Sid(s) if *s == plain)),
+                "{doc}: {:?}",
+                txn.insert_templates
+            );
+        }
+
+        let doc = based("http://example.org/", "knows");
+        let mut ns = test_registry();
+        let txn = parse_transaction(
+            &doc,
+            TxnType::Insert,
+            TxnOpts::default(),
+            &mut ns,
+            TEST_LEDGER,
+        )
+        .unwrap();
+        let plain = ns.sid_for_iri("knows");
+        assert!(matches!(
+            txn.insert_templates.as_slice(),
+            [t] if matches!(&t.predicate, TemplateTerm::Sid(s) if *s == plain)
+        ));
+    }
+
+    /// Only `@context` is a context. A `context` key is data, so a prefix it
+    /// defines resolves nothing.
+    #[test]
+    fn a_context_key_is_not_a_context() {
+        let doc = json!({
+            "context": {"ex": "http://example.org/"},
+            "@id": "http://example.org/alice",
+            "ex:knows": {"@id": "http://example.org/bob"}
+        });
+        let err = parse_doc(&doc, TxnType::Insert).expect_err("`ex` is undefined");
+        assert!(err.to_string().contains("'ex:knows'"), "{err}");
+
+        let doc = json!({"@id": "http://example.org/n1", "context": "meeting notes"});
+        let txn = parse_doc(&doc, TxnType::Insert).expect("a plain property");
+        assert!(
+            matches!(
+                txn.insert_templates.as_slice(),
+                [t] if matches!(&t.predicate, TemplateTerm::Sid(p) if &*p.name == "context")
+            ),
+            "{:?}",
+            txn.insert_templates
+        );
+    }
+
+    /// The parser's checks read the IRIs the expander resolves, scoped
+    /// contexts included, in every clause a transaction writes or reads.
+    #[test]
+    fn checks_read_terms_from_scoped_contexts() {
+        let p = format!(
+            "{}{}",
+            fluree_vocab::fluree::DB,
+            fluree_vocab::db::REIFIES_SUBJECT
+        );
+        let ex = "http://example.org/";
+        let scoped = |iri: &str| json!({"x": {"@id": iri}});
+        let property_scoped = |iri: &str| {
+            json!({"@context": {"ex": ex, "q": {"@id": "ex:q", "@context": scoped(iri)}},
+                   "@id": "ex:a", "q": {"@id": "ex:b", "x": {"@id": "ex:c"}}})
+        };
+        let type_scoped = |iri: &str| {
+            json!({"@context": {"ex": ex, "T": {"@id": "ex:T", "@context": scoped(iri)}},
+                   "@id": "ex:a", "@type": "T", "x": {"@id": "ex:c"}})
+        };
+        let cases = [
+            (TxnType::Insert, property_scoped(&p)),
+            (TxnType::Upsert, type_scoped(&p)),
+            (
+                TxnType::Insert,
+                json!({"@context": {"ex": ex, "x": {"@id": p}}, "@id": "ex:a",
+                       "ex:age": {"@value": 5, "@edge": {"x": {"@id": "ex:c"}}}}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"ex": ex, "T": {"@id": "ex:T", "@context": scoped(&p)}},
+                       "insert": {"@id": "ex:a", "@type": "T", "x": {"@id": "ex:c"}}}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"ex": ex, "x": {"@id": p}},
+                       "where": {"@id": "?s", "x": "?o"},
+                       "delete": {"@id": "?s", "ex:p": "?o"}}),
+            ),
+        ];
+        for (txn_type, doc) in cases {
+            let msg = match parse_doc(&doc, txn_type) {
+                Ok(_) => panic!("{doc}: accepted"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains(fluree_vocab::db::REIFIES_SUBJECT),
+                "{doc}: {msg}"
+            );
+        }
+
+        // A scoped term naming an ordinary IRI is written.
+        for doc in [
+            property_scoped("http://example.org/x"),
+            type_scoped("http://example.org/x"),
+        ] {
+            parse_doc(&doc, TxnType::Insert).unwrap_or_else(|e| panic!("{doc}: {e}"));
+        }
+    }
+
+    /// An annotation's link names the predicate the edge is written under: a
+    /// bare key resolves against `@vocab` for the link as for the edge, and
+    /// under a lone `@base` is a plain name in both.
+    #[test]
+    fn an_annotation_links_the_predicate_its_edge_is_written_under() {
+        let alice = "http://example.org/alice";
+        let acme = json!({"@id": "http://example.org/acme", "@annotation": {"http://example.org/role": "E"}});
+        let link_p = |txn: &Txn, deletes: bool| {
+            let templates = if deletes {
+                &txn.delete_templates
+            } else {
+                &txn.insert_templates
+            };
+            templates
+                .iter()
+                .find_map(|t| match &t.object {
+                    TemplateTerm::TripleTerm(term) => match &term.p {
+                        TemplateTerm::Sid(p) => Some(p.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("a link")
+        };
+        for (ctx, iri) in [
+            (
+                json!({"@vocab": "http://v.example/"}),
+                "http://v.example/worksFor",
+            ),
+            (json!({"@base": "http://example.org/doc"}), "worksFor"),
+        ] {
+            let mut ns = test_registry();
+            let expected = ns.sid_for_iri(iri);
+
+            let insert = json!({"@context": ctx, "@id": alice, "worksFor": acme});
+            let txn = parse_transaction(
+                &insert,
+                TxnType::Insert,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            assert_eq!(link_p(&txn, false), expected, "{insert}");
+            assert!(
+                txn.insert_templates
+                    .iter()
+                    .any(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == expected)),
+                "{insert}"
+            );
+
+            let reifies = json!({"@context": ctx, "@id": "http://example.org/r",
+                                 "@reifies": {"@id": alice, "worksFor": {"@id": "http://example.org/acme"}}});
+            let txn = parse_transaction(
+                &reifies,
+                TxnType::Insert,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            assert_eq!(link_p(&txn, false), expected, "{reifies}");
+
+            let delete = json!({"@context": ctx, "delete": {"@id": alice, "worksFor": acme}});
+            let txn = parse_transaction(
+                &delete,
+                TxnType::Update,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            assert_eq!(link_p(&txn, true), expected, "{delete}");
+        }
+    }
+
+    /// An insert's keys are data, whatever they are named: one keyed
+    /// `insert`, `delete` and `upsert` is a node, not an update's clauses,
+    /// and the checks read it as one. An update keeps its own reading: a
+    /// context term named like a dataset key is not refused there.
+    #[test]
+    fn checks_read_the_transaction_as_its_type_says() {
+        let term = |name: &str| format!("{}{name}", fluree_vocab::fluree::DB);
+        let annotated = json!({"@id": "http://example.org/s", "http://example.org/p": {
+            "@id": "http://example.org/o", "@annotation": {"http://example.org/label": "a"}}});
+        let insert = json!({
+            "@context": {
+                "insert": term(fluree_vocab::db::REIFIES_SUBJECT),
+                "delete": term(fluree_vocab::db::REIFIES_PREDICATE),
+                "upsert": term(fluree_vocab::db::REIFIES_OBJECT)
+            },
+            "insert": annotated,
+            "delete": {"@id": "http://example.org/q"},
+            "upsert": {"@id": "http://example.org/o"}
+        });
+        let err =
+            parse_doc(&insert, TxnType::Insert).expect_err("keys that name reserved predicates");
+        assert!(err.to_string().contains(fluree_vocab::fluree::DB), "{err}");
+
+        let update = json!({
+            "@context": {"from": "http://example.org/from"},
+            "from": "http://example.org/g",
+            "insert": annotated
+        });
+        parse_doc(&update, TxnType::Update).expect("an annotated update with a dataset key");
+    }
+
+    /// An update reads a `@type` in `where` as it writes one in `insert`:
+    /// against `@vocab`, else against `@base`. With no `@vocab` (here set to
+    /// `null`, or a context array, which the lone-`@base` rule does not
+    /// read), both resolve against the base.
+    #[test]
+    fn where_and_insert_resolve_a_type_alike() {
+        use fluree_db_query::parse::{UnresolvedPattern, UnresolvedTerm};
+        for ctx in [
+            json!({"@base": "http://example.org/doc", "@vocab": null}),
+            json!([{"@base": "http://example.org/doc"}]),
+        ] {
+            let doc = json!({
+                "@context": ctx,
+                "where": {"@id": "?s", "@type": "#Person"},
+                "insert": {"@id": "?s", "@type": "#Person"}
+            });
+            let mut ns = test_registry();
+            let txn = parse_transaction(
+                &doc,
+                TxnType::Update,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .unwrap();
+            let read = txn
+                .where_patterns
+                .iter()
+                .find_map(|p| match p {
+                    UnresolvedPattern::Triple(t) => match &t.o {
+                        UnresolvedTerm::Iri(iri) => Some(iri.to_string()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .expect("a type pattern");
+            let written = txn
+                .insert_templates
+                .iter()
+                .find_map(|t| match &t.object {
+                    TemplateTerm::Sid(s) => Some(format!(
+                        "{}{}",
+                        ns.get_prefix(s.namespace_code).unwrap_or(""),
+                        s.name
+                    )),
+                    _ => None,
+                })
+                .expect("a type");
+            assert_eq!(read, "http://example.org/doc#Person", "{doc}");
+            assert_eq!(written, read, "{doc}");
+        }
+    }
+
+    /// A key a scoped context defines names the edge's predicate in its
+    /// annotation's link as it does in the edge: the link takes the IRI the
+    /// expander resolved the key to, by a property-scoped context or by the
+    /// subject's type-scoped one (which the nodes the subject holds, the
+    /// annotation among them, do not see), in an insert and in a delete.
+    #[test]
+    fn an_annotation_links_a_scoped_term_as_its_edge_names_it() {
+        let annotated = |ann: Value| json!({"@id": "http://example.org/o", "@annotation": ann});
+        let label = json!({"http://example.org/label": "a"});
+        let property_scoped = json!({
+            "@context": {
+                "@vocab": "http://outer.example/",
+                "child": {"@id": "http://example.org/child", "@context": {"p": "http://inner.example/p"}}
+            },
+            "@id": "http://example.org/parent",
+            "child": {"@id": "http://example.org/s", "p": annotated(label.clone())}
+        });
+        let type_scoped = |ann: Value| {
+            json!({
+                "@id": "http://example.org/s",
+                "@type": "Emp",
+                "p": annotated(ann)
+            })
+        };
+        let context = json!({
+            "@vocab": "http://outer.example/",
+            "Emp": {"@id": "http://example.org/Emp", "@context": {"p": "http://inner.example/p"}}
+        });
+        let mut type_scoped_insert = type_scoped(label);
+        type_scoped_insert["@context"] = context.clone();
+        let type_scoped_delete = json!({
+            "@context": context,
+            "delete": type_scoped(json!({"@id": "http://example.org/ann"}))
+        });
+        for (doc, txn_type) in [
+            (property_scoped, TxnType::Insert),
+            (type_scoped_insert, TxnType::Insert),
+            (type_scoped_delete, TxnType::Update),
+        ] {
+            let mut ns = test_registry();
+            let txn = parse_transaction(&doc, txn_type, TxnOpts::default(), &mut ns, TEST_LEDGER)
+                .unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let expected = ns.sid_for_iri("http://inner.example/p");
+            let templates = match txn_type {
+                TxnType::Update => &txn.delete_templates,
+                _ => &txn.insert_templates,
+            };
+            let link = templates
+                .iter()
+                .find_map(|t| match &t.object {
+                    TemplateTerm::TripleTerm(term) => match &term.p {
+                        TemplateTerm::Sid(p) => Some(p.clone()),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("a link: {doc}"));
+            assert_eq!(link, expected, "{doc}");
+            if txn_type == TxnType::Insert {
+                assert!(
+                    templates
+                        .iter()
+                        .any(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == expected)),
+                    "{doc}"
+                );
+            }
+        }
+    }
+    /// In an update's templates a value that starts with `?` is a variable
+    /// only when the `where` or `values` mentions it, in any form (a bind
+    /// expression, the `where` a retraction by selector adds); otherwise it
+    /// is the string. A node, property, type or graph is an IRI, which cannot
+    /// start with `?`, so one nothing mentions is refused.
+    #[test]
+    fn an_update_reads_a_value_as_a_variable_only_where_something_binds_it() {
+        let ctx = json!({"ex": "http://example.org/"});
+        let where_ = json!({"@id": "?s", "ex:p": "?o"});
+        let parse = |doc: &Value| {
+            let mut ns = test_registry();
+            parse_transaction(
+                doc,
+                TxnType::Update,
+                TxnOpts::default(),
+                &mut ns,
+                TEST_LEDGER,
+            )
+            .map(|txn| (txn, ns))
+            .map_err(|e| e.to_string())
+        };
+        // The object the insert writes under `ex:q`.
+        let written = |doc: Value| {
+            let (txn, mut ns) = parse(&doc).unwrap_or_else(|e| panic!("{doc}: {e}"));
+            let q = ns.sid_for_iri("http://example.org/q");
+            let object = txn
+                .insert_templates
+                .iter()
+                .find(|t| matches!(&t.predicate, TemplateTerm::Sid(p) if *p == q))
+                .map(|t| t.object.clone())
+                .unwrap_or_else(|| panic!("ex:q in {doc}"));
+            (doc, object)
+        };
+        for doc in [
+            json!({"@context": ctx, "where": where_, "insert": {"@id": "ex:c", "ex:q": "?hello"}}),
+            json!({"@context": ctx, "where": where_, "insert": {"@id": "ex:c", "ex:q": {"@value": "?hello"}}}),
+            json!({"@context": ctx, "insert": {"@id": "ex:c", "ex:q": "?hello"}}),
+        ] {
+            let (doc, object) = written(doc);
+            assert!(
+                matches!(&object, TemplateTerm::Value(FlakeValue::String(v)) if v == "?hello"),
+                "{doc}: {object:?}"
+            );
+        }
+        for doc in [
+            json!({"@context": ctx, "where": where_, "insert": {"@id": "?s", "ex:q": "?o"}}),
+            json!({"@context": ctx, "where": [where_, ["bind", "?label", "(str ?o)"]],
+                   "insert": {"@id": "?s", "ex:q": "?label"}}),
+            json!({"@context": ctx, "values": ["?v", ["a", "b"]],
+                   "insert": {"@id": "ex:c", "ex:q": "?v"}}),
+            json!({"@context": ctx,
+                   "delete": {"@id": "ex:alice", "ex:knows": {"@id": "ex:bob", "@annotation": {"ex:role": "?r"}}},
+                   "insert": {"@id": "ex:alice", "ex:q": "?r"}}),
+        ] {
+            let (doc, object) = written(doc);
+            assert!(matches!(object, TemplateTerm::Var(_)), "{doc}: {object:?}");
+        }
+        parse(&json!({"@context": ctx, "where": [["graph", "?g", where_]],
+                      "insert": [["graph", "?g", {"@id": "?s", "ex:q": "?o"}]]}))
+        .unwrap();
+
+        for (doc, refusal) in [
+            (
+                json!({"@context": ctx, "where": where_, "delete": {"@id": "?x", "ex:p": "v"}}),
+                "?x in the update's delete",
+            ),
+            (
+                json!({"@context": ctx, "insert": {"@id": "?s", "ex:p": "v"}}),
+                "?s in the update's insert",
+            ),
+            (
+                json!({"@context": ctx, "where": where_, "insert": {"@id": "ex:c", "ex:r": {"@id": "?other"}}}),
+                "?other in the update's insert",
+            ),
+        ] {
+            let err = parse(&doc).map(|_| ()).expect_err(&doc.to_string());
+            assert!(err.contains(refusal), "{doc}: {err}");
         }
     }
 }

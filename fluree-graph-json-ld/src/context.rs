@@ -883,23 +883,14 @@ mod tests {
     }
 
     #[test]
-    fn a_string_context_and_a_base_standing_in_for_vocab_keep_their_slash() {
+    fn a_string_context_keeps_its_slash() {
         assert_eq!(
             vocab_of(json!("https://schema.org")).as_deref(),
             Some("https://schema.org/")
         );
-        let fallback = |base: &str| vocab_of(crate::with_base_as_vocab(&json!({"@base": base})));
-        assert_eq!(fallback("urn:ex:").as_deref(), Some("urn:ex:/"));
+        // An explicit @vocab beside a base is taken as written.
         assert_eq!(
-            fallback("http://example.org/ns#").as_deref(),
-            Some("http://example.org/ns#")
-        );
-        // An explicit @vocab beside the base wins, as written.
-        assert_eq!(
-            vocab_of(crate::with_base_as_vocab(
-                &json!({"@base": "http://example.org/", "@vocab": "urn:ex:"})
-            ))
-            .as_deref(),
+            vocab_of(json!({"@base": "http://example.org/", "@vocab": "urn:ex:"})).as_deref(),
             Some("urn:ex:")
         );
     }

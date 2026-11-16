@@ -322,7 +322,8 @@ async fn ac2b_update_waterfall() {
         },
         "where": {
             "@id": "?s",
-            "schema:name": "Alice"
+            "schema:name": "Alice",
+            "schema:age": "?any"
         },
         "delete": {
             "@id": "?s",

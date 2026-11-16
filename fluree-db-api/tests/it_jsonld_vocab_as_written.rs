@@ -2,8 +2,8 @@
 //!
 //! JSON-LD 1.1 joins a term to the vocabulary mapping as written. The
 //! expander used to add a `/` to a `@vocab` ending in neither `/` nor `#`, so
-//! `"@vocab": "urn:ex:"` wrote `urn:ex:/name`. Fluree's own fallbacks keep the
-//! `/`: a string `@context`, and a `@base` standing in for a missing `@vocab`.
+//! `"@vocab": "urn:ex:"` wrote `urn:ex:/name`. A string `@context`, Fluree's
+//! fallback for a remote context, keeps the `/`.
 
 use crate::support;
 use crate::support::{genesis_ledger, graphdb_from_ledger, normalize_rows};
@@ -107,32 +107,23 @@ async fn cypher_and_jsonld_agree_on_the_vocab() {
 }
 
 #[tokio::test]
-async fn a_string_context_and_a_base_as_vocab_keep_their_slash() {
+async fn a_string_context_keeps_its_slash() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let cases = [
-        (
-            json!("http://example.org/terms"),
-            "http://example.org/terms/name",
-        ),
-        (
-            json!({"@base": "http://example.org/ns"}),
-            "http://example.org/ns/name",
-        ),
-    ];
-    for (i, (context, predicate)) in cases.into_iter().enumerate() {
-        let ledger0 = genesis_ledger(&fluree, &format!("tx/vocab-fallback-{i}:main")).await;
-        let ledger = fluree
-            .insert(
-                ledger0,
-                &json!({"@context": context, "@id": "http://example.org/s", "name": "Ann"}),
-            )
-            .await
-            .expect("insert")
-            .ledger;
-        assert_eq!(
-            statements(&fluree, &ledger).await,
-            vec![json!([predicate, "Ann"])],
-            "insert under {context}"
-        );
-    }
+    let ledger0 = genesis_ledger(&fluree, "tx/vocab-string-context:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": "http://example.org/terms",
+                "@id": "http://example.org/s",
+                "name": "Ann"
+            }),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    assert_eq!(
+        statements(&fluree, &ledger).await,
+        vec![json!(["http://example.org/terms/name", "Ann"])]
+    );
 }

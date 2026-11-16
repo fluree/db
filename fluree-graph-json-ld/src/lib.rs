@@ -90,27 +90,25 @@ pub fn parse_context(context: &JsonValue) -> Result<ParsedContext> {
     ParsedContext::parse(None, context)
 }
 
-/// A context object with Fluree's `@base` fallback applied, as JSON-LD
-/// transactions and queries read their contexts: with an `@base` and no
-/// `@vocab`, the base is the vocabulary too, with a `/` added to an absolute
-/// base that ends in neither `/` nor `#`. An explicit `@vocab` is taken as
-/// written.
-pub fn with_base_as_vocab(context: &JsonValue) -> JsonValue {
-    let JsonValue::Object(map) = context else {
-        return context.clone();
-    };
-    let Some(base) = map.get("@base").filter(|_| !map.contains_key("@vocab")) else {
-        return context.clone();
-    };
-    let vocab = match base {
-        JsonValue::String(b) if iri::is_absolute(b) => {
-            JsonValue::String(iri::add_trailing_slash(b))
-        }
-        other => other.clone(),
-    };
-    let mut out = map.clone();
-    out.insert("@vocab".to_string(), vocab);
-    JsonValue::Object(out)
+/// Log, once per process, that a context object sets `@base` and no
+/// `@vocab`. Such a `@base` resolves references only, as JSON-LD defines;
+/// before 5.0 a Fluree transaction, query, datalog rule or BM25 index
+/// definition also read it as the `@vocab`, so a document written for that
+/// now names its properties and types differently.
+pub fn note_lone_base(context: &JsonValue) {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    let lone = context.as_object().is_some_and(|map| {
+        map.get("@base").is_some_and(JsonValue::is_string) && !map.contains_key("@vocab")
+    });
+    if lone {
+        NOTED.call_once(|| {
+            tracing::warn!(
+                "a JSON-LD @context sets @base and no @vocab: since 5.0 @base resolves \
+                 references only, so the context's keys and types no longer join the base; \
+                 set @vocab to the same IRI to keep them there"
+            );
+        });
+    }
 }
 
 /// Parse a context with a base context.
@@ -305,6 +303,27 @@ pub fn expand_with_context_policy(
     strict: bool,
 ) -> Result<JsonValue> {
     expand::node_impl(node_map, context, strict)
+}
+
+/// Expand a document whose top-level `@context` the caller has already parsed
+/// into `root`, so that `@context` is not applied a second time. Contexts
+/// nested in the document apply as usual. Strict or permissive as
+/// [`expand_with_context_policy`].
+pub fn expand_with_root_context(
+    doc: &JsonValue,
+    root: &ParsedContext,
+    strict: bool,
+) -> Result<JsonValue> {
+    expand::root_impl(doc, root, strict)
+}
+
+/// A `@type` value's IRI, resolved as JSON-LD resolves one: a term or compact
+/// IRI, else relative to `@vocab`, else to `@base` as an `@id` is. The rule the
+/// expander applies to a node's `@type` and a value object's datatype, for a
+/// reader that resolves types itself. Strict or permissive as
+/// [`expand_with_context_policy`].
+pub fn expand_type_iri(value: &str, context: &ParsedContext, strict: bool) -> Result<String> {
+    expand::vocab_or_base(value, context, strict).map(|(iri, _)| iri)
 }
 
 /// Compact an IRI using a context.

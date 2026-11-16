@@ -22,6 +22,12 @@ pub fn for_each_pattern(query: &Query, visit: &mut dyn FnMut(&Pattern)) {
     }
 }
 
+/// [`for_each_pattern`] over a pattern list alone, such as a lowered policy
+/// condition's.
+pub fn for_each_pattern_in(list: &[Pattern], visit: &mut dyn FnMut(&Pattern)) {
+    patterns(list, visit);
+}
+
 fn patterns(list: &[Pattern], visit: &mut dyn FnMut(&Pattern)) {
     for pattern in list {
         visit(pattern);
