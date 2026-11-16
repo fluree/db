@@ -374,7 +374,7 @@ fn parse_node_value(
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, strict);
+                return parse_value_object(map, entry, context, path, strict);
             }
 
             // Check for @container: @language
@@ -472,6 +472,7 @@ fn parse_value_object(
     map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
     let val = map.get("@value").or_else(|| map.get("value")).unwrap();
@@ -532,6 +533,21 @@ fn parse_value_object(
             obj.insert("@type".to_string(), json!(t));
         } else if let Some(l) = lang {
             obj.insert("@language".to_string(), json!(l));
+        }
+    }
+
+    // `{"@value": …, "@annotation": {…}}`: the annotation describes a
+    // reifier of the triple this value completes, and expands as a node does.
+    // `@edge` is a transaction's alias for it, kept under its own name as it
+    // is on a node reference.
+    for key in ["@annotation", "@edge"] {
+        if let Some(annotation) = map.get(key) {
+            let expanded = match expand_node_internal(annotation, context, &path.key(key), strict)?
+            {
+                JsonValue::Array(nodes) => nodes,
+                node => vec![node],
+            };
+            obj.insert(key.to_string(), JsonValue::Array(expanded));
         }
     }
 
