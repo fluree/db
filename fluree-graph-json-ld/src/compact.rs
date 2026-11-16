@@ -13,35 +13,43 @@ use std::sync::{Arc, Mutex};
 /// `compact_id()` for each IRI — no per-call HashMap rebuilds.
 #[derive(Debug, Clone)]
 pub struct ContextCompactor {
-    /// Full IRI → compact term (exact matches like `"schema:Person"` → `"REPLACE"`)
-    exact_vocab: HashMap<String, String>,
-    /// Namespace IRIs (ending in `/` or `#`) paired with their compact prefix,
-    /// sorted longest-first for greedy matching.
-    prefixes_vocab: Vec<(String, String)>,
+    /// Full IRI → the term defined for exactly that IRI.
+    exact: HashMap<String, String>,
+    /// Namespaces for a property or type, sorted longest-first for greedy
+    /// matching.
+    prefixes_vocab: Vec<(String, Namespace)>,
+    /// The same without `@vocab`, for an `@id`.
+    prefixes_id: Vec<(String, Namespace)>,
+}
 
-    /// Same as above but without @vocab (for @id compaction)
-    exact_id: HashMap<String, String>,
-    prefixes_id: Vec<(String, String)>,
+/// What shortens IRIs that start with a namespace.
+#[derive(Debug, Clone)]
+enum Namespace {
+    /// A prefix term: `term:suffix`.
+    Term(String),
+    /// `@vocab`: the suffix alone, as a term.
+    Vocab,
+    /// `@base`: the suffix as a reference resolving back against the base.
+    Base,
 }
 
 impl ContextCompactor {
     /// Build a compactor from a parsed JSON-LD context.
     ///
-    /// Precomputes two reverse lookup tables (vocab and id variants)
-    /// so that repeated `compact_vocab` / `compact_id` calls are
-    /// pure lookups with no allocation beyond the result string.
+    /// Precomputes the lookup tables so that repeated `compact_vocab` /
+    /// `compact_id` calls are pure lookups with no allocation beyond the
+    /// result string.
     pub fn new(context: &ParsedContext) -> Self {
-        let exact_vocab = reverse_context(context, true, true);
-        let prefixes_vocab = sorted_prefix_iris(&exact_vocab);
-
-        let exact_id = reverse_context(context, false, true);
-        let prefixes_id = sorted_prefix_iris(&exact_id);
-
+        let exact = context
+            .terms
+            .iter()
+            .filter(|(_, entry)| !entry.derived)
+            .filter_map(|(term, entry)| Some((entry.id.clone()?, term.clone())))
+            .collect();
         Self {
-            exact_vocab,
-            prefixes_vocab,
-            exact_id,
-            prefixes_id,
+            exact,
+            prefixes_vocab: namespaces(context, true),
+            prefixes_id: namespaces(context, false),
         }
     }
 
@@ -50,7 +58,7 @@ impl ContextCompactor {
     /// Tries exact match first, then longest-prefix match. @vocab and @base
     /// both participate as implicit prefixes.
     pub fn compact_vocab(&self, iri: &str) -> String {
-        compact_with(&self.exact_vocab, &self.prefixes_vocab, iri, true)
+        compact_with(&self.exact, &self.prefixes_vocab, iri, None)
     }
 
     /// Compact an IRI for an `@id` position.
@@ -58,63 +66,56 @@ impl ContextCompactor {
     /// Per JSON-LD rules, `@vocab` must NOT shorten node identifiers.
     /// Only explicit prefix terms and `@base` may be used.
     pub fn compact_id(&self, iri: &str) -> String {
-        compact_with(&self.exact_id, &self.prefixes_id, iri, false)
+        compact_with(&self.exact, &self.prefixes_id, iri, None)
     }
 
     /// Create a compaction closure suitable for APIs that expect `Fn(&str) -> String`.
     ///
-    /// Optionally tracks which context terms were actually used (for
-    /// producing a minimal output context).
+    /// Optionally tracks which context entries were actually used (for
+    /// producing a minimal output context): a term under its name, and the
+    /// vocabulary and base under `@vocab` and `@base`.
     pub fn vocab_fn(
         &self,
         used: Option<Arc<Mutex<HashMap<String, String>>>>,
     ) -> impl Fn(&str) -> String + '_ {
-        move |iri: &str| {
-            let result = compact_with_tracking(
-                &self.exact_vocab,
-                &self.prefixes_vocab,
-                iri,
-                true,
-                used.as_ref(),
-            );
-            result
-        }
+        move |iri: &str| compact_with(&self.exact, &self.prefixes_vocab, iri, used.as_ref())
     }
 }
 
-/// Core compaction: exact match → longest prefix → return as-is.
+/// Core compaction: exact match → longest prefix → return as-is, recording
+/// in `used` the context entry that shortened the IRI.
 fn compact_with(
     exact: &HashMap<String, String>,
-    prefixes: &[(String, String)],
+    prefixes: &[(String, Namespace)],
     iri: &str,
-    allow_vocab_strip: bool,
+    used: Option<&Arc<Mutex<HashMap<String, String>>>>,
 ) -> String {
-    // 1. Exact match
-    if let Some(prefix) = exact.get(iri) {
-        return prefix.clone();
+    let note = |key: &str, value: &str| {
+        if let Some(mut guard) = used.and_then(|used| used.lock().ok()) {
+            guard.insert(key.to_string(), value.to_string());
+        }
+    };
+
+    if let Some(term) = exact.get(iri) {
+        note(term, iri);
+        return term.clone();
     }
 
-    // 2. Longest-prefix match
-    for (prefix_iri, prefix_name) in prefixes {
-        if iri.starts_with(prefix_iri.as_str()) {
-            let suffix = &iri[prefix_iri.len()..];
-            if prefix_name == ":base" {
-                match base_reference(prefix_iri, suffix) {
-                    Some(reference) => return reference,
-                    None => continue,
-                }
-            }
-            if prefix_name == ":vocab" {
-                if let Some(term) = vocab_term(suffix).filter(|_| allow_vocab_strip) {
-                    return term;
-                }
-                continue;
-            }
-            return format!("{prefix_name}:{suffix}");
+    for (namespace, shortens) in prefixes {
+        let Some(suffix) = iri.strip_prefix(namespace.as_str()) else {
+            continue;
+        };
+        let (compacted, key) = match shortens {
+            Namespace::Term(term) => (Some(format!("{term}:{suffix}")), term.as_str()),
+            Namespace::Vocab => (vocab_term(suffix), "@vocab"),
+            Namespace::Base => (base_reference(namespace, suffix), "@base"),
+        };
+        if let Some(compacted) = compacted {
+            note(key, namespace);
+            return compacted;
         }
     }
 
-    // 3. No match
     iri.to_string()
 }
 
@@ -136,102 +137,35 @@ fn base_reference(base: &str, suffix: &str) -> Option<String> {
 }
 
 /// The term that expands against the vocabulary back to the vocabulary
-/// followed by `suffix`, and `None` for a suffix holding a `:`, which reads
-/// as a compact or absolute IRI.
+/// followed by `suffix`, and `None` for a suffix that is empty or holds a
+/// `:`, which reads as a compact or absolute IRI.
 fn vocab_term(suffix: &str) -> Option<String> {
-    (!suffix.contains(':')).then(|| suffix.to_string())
+    (!suffix.is_empty() && !suffix.contains(':')).then(|| suffix.to_string())
 }
 
-/// Like `compact_with` but records which terms were used.
-fn compact_with_tracking(
-    exact: &HashMap<String, String>,
-    prefixes: &[(String, String)],
-    iri: &str,
-    allow_vocab_strip: bool,
-    used: Option<&Arc<Mutex<HashMap<String, String>>>>,
-) -> String {
-    if let Some(prefix) = exact.get(iri) {
-        if let Some(used) = used {
-            if let Ok(mut guard) = used.lock() {
-                guard.insert(prefix.clone(), iri.to_string());
-            }
-        }
-        return prefix.clone();
-    }
-
-    for (prefix_iri, prefix_name) in prefixes {
-        if iri.starts_with(prefix_iri.as_str()) {
-            let suffix = &iri[prefix_iri.len()..];
-            let shortened = match prefix_name.as_str() {
-                ":base" => base_reference(prefix_iri, suffix),
-                ":vocab" => vocab_term(suffix).filter(|_| allow_vocab_strip),
-                _ => None,
-            };
-            if prefix_name == ":vocab" || prefix_name == ":base" {
-                let Some(shortened) = shortened else {
-                    continue;
-                };
-                if let Some(used) = used {
-                    if let Ok(mut guard) = used.lock() {
-                        guard.insert(prefix_name.clone(), prefix_iri.clone());
-                    }
-                }
-                return shortened;
-            }
-            if let Some(used) = used {
-                if let Ok(mut guard) = used.lock() {
-                    guard.insert(prefix_name.clone(), prefix_iri.clone());
-                }
-            }
-            return format!("{prefix_name}:{suffix}");
-        }
-    }
-
-    iri.to_string()
-}
-
-/// Build the reverse context: full IRI → compact prefix name.
-fn reverse_context(
-    context: &ParsedContext,
-    include_vocab: bool,
-    include_base: bool,
-) -> HashMap<String, String> {
-    let mut flipped = HashMap::new();
-
-    for (prefix, entry) in &context.terms {
-        if let Some(ref id) = entry.id {
-            if !entry.derived {
-                flipped.insert(id.clone(), prefix.clone());
-            }
-        }
-    }
-
-    // An equal vocabulary replaces the base: a property shortened by the
-    // base's rule (`#name`) reads back as a reference, not as a term.
-    if include_base {
-        if let Some(ref base) = context.base {
-            flipped.insert(base.clone(), ":base".to_string());
-        }
-    }
-    if include_vocab {
-        if let Some(ref vocab) = context.vocab {
-            flipped.insert(vocab.clone(), ":vocab".to_string());
-        }
-    }
-
-    flipped
-}
-
-/// Extract namespace IRIs (ending in `/` or `#`) and sort longest-first.
-/// `@vocab` joins as written, so it shortens whatever it ends in.
-fn sorted_prefix_iris(flipped: &HashMap<String, String>) -> Vec<(String, String)> {
-    let mut pairs: Vec<(String, String)> = flipped
+/// The namespaces a context shortens IRIs by, longest first. A prefix term
+/// or the base ends in `/` or `#`; `@vocab` joins as written, so it is one
+/// whatever it ends in. For one IRI the vocabulary wins over the base (a
+/// property shortened by the base's rule, `#name`, reads back as a
+/// reference) and both win over a term.
+fn namespaces(context: &ParsedContext, include_vocab: bool) -> Vec<(String, Namespace)> {
+    let ends_a_namespace = |iri: &str| iri.ends_with('/') || iri.ends_with('#');
+    let mut by_iri: HashMap<String, Namespace> = context
+        .terms
         .iter()
-        .filter(|(iri, name)| iri.ends_with('/') || iri.ends_with('#') || *name == ":vocab")
-        .map(|(iri, prefix)| (iri.clone(), prefix.clone()))
+        .filter(|(_, entry)| !entry.derived)
+        .filter_map(|(term, entry)| Some((entry.id.clone()?, Namespace::Term(term.clone()))))
+        .filter(|(iri, _)| ends_a_namespace(iri))
         .collect();
-    pairs.sort_by_key(|b| std::cmp::Reverse(b.0.len()));
-    pairs
+    if let Some(base) = context.base.as_ref().filter(|b| ends_a_namespace(b)) {
+        by_iri.insert(base.clone(), Namespace::Base);
+    }
+    if let Some(vocab) = context.vocab.as_ref().filter(|_| include_vocab) {
+        by_iri.insert(vocab.clone(), Namespace::Vocab);
+    }
+    let mut namespaces: Vec<_> = by_iri.into_iter().collect();
+    namespaces.sort_by_key(|(iri, _)| std::cmp::Reverse(iri.len()));
+    namespaces
 }
 
 // ---------------------------------------------------------------------------
@@ -247,11 +181,10 @@ pub fn compact_fn(
 ) -> impl Fn(&str) -> String + '_ {
     let compactor = ContextCompactor::new(context);
     move |iri: &str| {
-        compact_with_tracking(
-            &compactor.exact_vocab,
+        compact_with(
+            &compactor.exact,
             &compactor.prefixes_vocab,
             iri,
-            true,
             used.as_ref(),
         )
     }
@@ -344,6 +277,42 @@ mod tests {
         let ns = "http://example.org/ns#";
         let ctx = ParsedContext::parse(None, &json!({"@base": ns, "@vocab": ns})).unwrap();
         assert_eq!(compact_id("http://example.org/ns#alice", &ctx), "#alice");
+    }
+
+    /// The base and the vocabulary are namespaces, not terms: an IRI equal to
+    /// one compacts as any IRI under it does, or stays whole.
+    #[test]
+    fn an_iri_equal_to_the_base_or_vocab_reads_back() {
+        let ctx = ParsedContext::parse(None, &json!({"@vocab": "urn:ex:"})).unwrap();
+        assert_eq!(compact("urn:ex:", &ctx), "urn:ex:");
+        for (base, compacted) in [
+            ("http://example.org/dir/", ""),
+            ("http://example.org/ns#", "#"),
+            ("http://example.org/doc", "http://example.org/doc"),
+        ] {
+            let ctx = ParsedContext::parse(None, &json!({"@base": base})).unwrap();
+            assert_eq!(compact_id(base, &ctx), compacted, "under {base}");
+            assert_eq!(crate::expand::iri(compacted, &ctx, false), base);
+        }
+    }
+
+    #[test]
+    fn tracking_names_the_vocab_and_base_by_their_keywords() {
+        let ctx = ParsedContext::parse(
+            None,
+            &json!({"@vocab": "urn:ex:", "@base": "http://example.org/"}),
+        )
+        .unwrap();
+        let used = Arc::new(Mutex::new(HashMap::new()));
+        let f = compact_fn(&ctx, Some(used.clone()));
+        assert_eq!(f("urn:ex:name"), "name");
+        assert_eq!(f("http://example.org/alice"), "alice");
+        let used = used.lock().unwrap();
+        assert_eq!(used.get("@vocab").map(String::as_str), Some("urn:ex:"));
+        assert_eq!(
+            used.get("@base").map(String::as_str),
+            Some("http://example.org/")
+        );
     }
 
     #[test]

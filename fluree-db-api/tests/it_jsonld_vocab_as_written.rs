@@ -202,3 +202,70 @@ async fn a_vocab_name_holding_a_colon_reads_back() {
         .expect("jsonld query");
     assert_eq!(rows, json!([{"@id": "urn:ex:s", "urn:ex:a:b": "x"}]));
 }
+
+/// An IRI equal to the `@base` or the `@vocab` comes back as an IRI that
+/// reads back under the same context, in JSON-LD and in SPARQL results.
+#[tokio::test]
+async fn an_iri_equal_to_the_base_or_vocab_reads_back() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    // A node named by the document's own base, and a reference to it.
+    let context = json!({"@base": "http://example.org/doc"});
+    let ledger0 = genesis_ledger(&fluree, "tx/equal-base:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": context, "@graph": [
+                {"@id": "", "http://example.org/title": "The doc"},
+                {"@id": "http://example.org/other", "http://example.org/cites": {"@id": ""}}
+            ]}),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let query = json!({
+        "@context": context,
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "http://example.org/cites": "?o"}
+    });
+    assert_eq!(
+        support::query_jsonld_formatted(&fluree, &ledger, &query)
+            .await
+            .expect("jsonld query"),
+        json!([{
+            "@id": "http://example.org/other",
+            "http://example.org/cites": {"@id": "http://example.org/doc"}
+        }])
+    );
+    let sparql = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "BASE <http://example.org/doc> SELECT ?o WHERE { <http://example.org/other> ?p ?o }",
+    )
+    .await
+    .expect("sparql query");
+    assert_eq!(sparql, json!([["http://example.org/doc"]]));
+
+    // A type equal to the vocabulary.
+    let context = json!({"@vocab": "urn:ex:"});
+    let ledger0 = genesis_ledger(&fluree, "tx/equal-vocab:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({"@context": context, "@id": "urn:ex:s", "@type": "urn:ex:", "name": "x"}),
+        )
+        .await
+        .expect("insert")
+        .ledger;
+    let query = json!({
+        "@context": context,
+        "select": {"?s": ["*"]},
+        "where": {"@id": "?s", "name": "x"}
+    });
+    assert_eq!(
+        support::query_jsonld_formatted(&fluree, &ledger, &query)
+            .await
+            .expect("jsonld query"),
+        json!([{"@id": "urn:ex:s", "@type": "urn:ex:", "name": "x"}])
+    );
+}
