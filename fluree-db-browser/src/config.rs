@@ -36,6 +36,15 @@ pub struct BrowserIoConfig {
     pub reconnect_max: Duration,
     /// IndexedDB persistence settings.
     pub cache: CacheConfig,
+    /// How long the driver waits for the IndexedDB open before giving up on
+    /// persistence for this session.
+    ///
+    /// An open can hang with no event at all — not `success`, not `error`,
+    /// not even `blocked` — when the database has been wedged. This bound is
+    /// what guarantees the driver's "resolved" signal always arrives, so
+    /// queued writes and their write-behind permits are never stranded. An
+    /// open that has not landed by now is not going to help this session.
+    pub cache_open_timeout: Duration,
 }
 
 impl Default for BrowserIoConfig {
@@ -50,6 +59,7 @@ impl Default for BrowserIoConfig {
             reconnect_initial: Duration::from_secs(1),
             reconnect_max: Duration::from_secs(30),
             cache: CacheConfig::default(),
+            cache_open_timeout: Duration::from_secs(10),
         }
     }
 }
@@ -120,6 +130,60 @@ impl Default for CacheConfig {
     }
 }
 
+/// Milliseconds for a browser timer (`setTimeout`, and so every
+/// `gloo_timers::TimeoutFuture` in this crate).
+///
+/// The saturating conversion this replaces was reaching for "effectively
+/// never" and produced the exact opposite. A `setTimeout` delay is stored
+/// in a SIGNED 32-bit int, so anything above `i32::MAX` overflows and the
+/// timer fires IMMEDIATELY — a `u32::MAX` fallback is a zero-delay timer,
+/// not an infinite one. (Observed, not theorized: substituting `u32::MAX`
+/// for the cache-open bound made a wedged open resolve instantly.)
+///
+/// Clamping to `i32::MAX` (~24.8 days) keeps the intent: too long to
+/// matter, and still a real delay. Durations that large are absurd for
+/// every knob here, which is precisely why the failure would be so hard to
+/// believe if it ever happened.
+// Only the wasm driver modules call this in production; the clamp test below
+// exercises it on host-test builds. `cfg(any(wasm32, test))` so a plain host
+// lib build — where nothing calls it — does not see it as dead code.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn timer_millis(duration: Duration) -> u32 {
+    const MAX_TIMER_MILLIS: u128 = i32::MAX as u128;
+    duration.as_millis().min(MAX_TIMER_MILLIS) as u32
+}
+
+/// A declared `Content-Length` that exceeds `max` (returns the offending
+/// length). Used to reject an oversized response body before it is
+/// materialized into wasm linear memory. A missing or unparseable value
+/// returns `None` — the pre-check does not apply, and the residency budget
+/// still rejects the block after the fact. Pure, so it is unit-tested here
+/// off-wasm; the wasm-only `driver::fetch` calls it.
+// cfg(any(wasm32, test)): the only production caller is the wasm driver, so a
+// host lib build would see it as dead code (the native test still exercises it).
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn declared_length_over_cap(content_length: Option<String>, max: u64) -> Option<u64> {
+    content_length
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&len| len > max)
+}
+
+/// One step of the incremental response-body cap: fold `chunk_len` into
+/// `running` (saturating — a chunk that would overflow `u64` is already far
+/// past any real cap, so wrapping and comparing wrong is not a risk worth
+/// taking) and report the new running total together with whether it now
+/// exceeds `max`. Hot path: one saturating add, one compare — called once
+/// per chunk read off the response stream. The counterpart to
+/// [`declared_length_over_cap`] for a chunked response that never declares
+/// a `Content-Length` at all, so the pre-check above has nothing to reject.
+/// Pure, so it is unit-tested here off-wasm; the wasm-only `driver::fetch`
+/// calls it once per chunk while draining the body.
+#[cfg(any(target_arch = "wasm32", test))]
+pub(crate) fn body_cap_step(running: u64, chunk_len: u64, max: u64) -> (u64, bool) {
+    let total = running.saturating_add(chunk_len);
+    (total, total > max)
+}
+
 impl CacheConfig {
     /// The eviction target in bytes (`budget_bytes * low_water_ratio`),
     /// clamped to a sane range.
@@ -132,6 +196,78 @@ impl CacheConfig {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+
+    /// The clamp is the whole point: a `u32::MAX` fallback overflows
+    /// `setTimeout`'s signed 32-bit delay and fires at once, so a bound
+    /// meant to be unreachable becomes a bound that always trips.
+    #[test]
+    fn timer_millis_clamps_below_the_set_timeout_overflow() {
+        assert_eq!(timer_millis(Duration::from_millis(0)), 0);
+        assert_eq!(timer_millis(Duration::from_secs(10)), 10_000);
+        // The largest delay a browser still treats as a delay.
+        let max = i32::MAX as u32;
+        assert_eq!(timer_millis(Duration::from_millis(u64::from(max))), max);
+        // Anything past it clamps DOWN to that, never wrapping to a small
+        // number and never reaching u32::MAX.
+        for absurd in [
+            Duration::from_millis(u64::from(max) + 1),
+            Duration::from_secs(60 * 60 * 24 * 365),
+            Duration::MAX,
+        ] {
+            let got = timer_millis(absurd);
+            assert_eq!(got, max, "{absurd:?}");
+            assert!(got <= max, "must never exceed a browser's signed delay");
+        }
+    }
+
+    #[test]
+    fn declared_length_over_cap_gates_oversized_bodies() {
+        const CAP: u64 = 256 * 1024 * 1024;
+        // Over the cap → rejected, reporting the offending length.
+        assert_eq!(
+            declared_length_over_cap(Some((CAP + 1).to_string()), CAP),
+            Some(CAP + 1)
+        );
+        // At or under → allowed.
+        assert_eq!(declared_length_over_cap(Some(CAP.to_string()), CAP), None);
+        assert_eq!(
+            declared_length_over_cap(Some("1024".to_string()), CAP),
+            None
+        );
+        // Whitespace tolerated.
+        assert_eq!(
+            declared_length_over_cap(Some(format!(" {} ", CAP + 5)), CAP),
+            Some(CAP + 5)
+        );
+        // Missing or unparseable → pre-check does not apply.
+        assert_eq!(declared_length_over_cap(None, CAP), None);
+        assert_eq!(
+            declared_length_over_cap(Some("not-a-number".to_string()), CAP),
+            None
+        );
+        assert_eq!(declared_length_over_cap(Some(String::new()), CAP), None);
+    }
+
+    #[test]
+    fn body_cap_step_gates_the_running_total_not_any_one_chunk() {
+        const CAP: u64 = 1024;
+        // Individually tiny chunks that cross the cap only in aggregate —
+        // exactly the shape a `declared_length_over_cap` pre-check cannot
+        // see (no header ever claims the total up front).
+        let (total, over) = body_cap_step(0, 600, CAP);
+        assert_eq!((total, over), (600, false));
+        let (total, over) = body_cap_step(total, 600, CAP);
+        assert_eq!((total, over), (1200, true), "the chunk that tips it over");
+        // At or under the cap: never flagged.
+        let (total, over) = body_cap_step(0, CAP, CAP);
+        assert_eq!((total, over), (CAP, false));
+
+        // Saturating: a single absurd chunk length cannot wrap the total
+        // back under the cap.
+        let (total, over) = body_cap_step(u64::MAX - 10, 100, CAP);
+        assert_eq!(total, u64::MAX);
+        assert!(over);
+    }
 
     #[test]
     fn from_max_memory_derives_every_memory_knob_from_one_ceiling() {
