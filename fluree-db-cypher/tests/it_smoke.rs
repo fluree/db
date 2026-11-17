@@ -1,5 +1,3 @@
-#![allow(clippy::needless_raw_string_hashes)]
-
 //! Smoke tests: scaffolding compiles and the parse entry point returns.
 
 use fluree_db_cypher::parse_cypher;
@@ -200,15 +198,12 @@ fn issue1873_read_after_write_is_rejected() {
         ),
         // Silent zero-flake commit: the filter ran before the SET it reads.
         (
-            r#"MATCH (n:P) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2"#,
+            r"MATCH (n:P) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2",
             "WITH",
         ),
         (r#"CREATE (n:P {id: "c"}) WITH n SET n.nm = "a""#, "WITH"),
-        (
-            r#"MATCH (n:P) SET n.a = 1 MATCH (m:Q) SET m.b = 2"#,
-            "MATCH",
-        ),
-        (r#"CREATE (n:P) UNWIND [1, 2] AS x SET n.v = x"#, "UNWIND"),
+        (r"MATCH (n:P) SET n.a = 1 MATCH (m:Q) SET m.b = 2", "MATCH"),
+        (r"CREATE (n:P) UNWIND [1, 2] AS x SET n.v = x", "UNWIND"),
         (
             r#"MERGE (n:P {id: "o"}) OPTIONAL MATCH (m:Q) SET n.v = 1"#,
             "OPTIONAL MATCH",
@@ -235,12 +230,12 @@ fn issue1873_reads_before_writes_still_parse() {
     // position.
     for src in [
         r#"MATCH (a:P {id: "a"}) WITH a MERGE (b:Q {id: "z"}) SET b.x = 1"#,
-        r#"MATCH (n:P) WITH n, n.name AS nm SET n.marker = nm"#,
+        r"MATCH (n:P) WITH n, n.name AS nm SET n.marker = nm",
         r#"MERGE (n:P {id: "y"}) SET n.nm = "a""#,
         r#"CREATE (n:P {id: "c9"})"#,
-        r#"MATCH (n:P) SET n.a = 1 SET n.b = 2"#,
-        r#"UNWIND [1, 2] AS x CREATE (n:P {v: x})"#,
-        r#"MATCH (n:P) RETURN n"#,
+        r"MATCH (n:P) SET n.a = 1 SET n.b = 2",
+        r"UNWIND [1, 2] AS x CREATE (n:P {v: x})",
+        r"MATCH (n:P) RETURN n",
     ] {
         let out = parse_cypher(src);
         assert!(
