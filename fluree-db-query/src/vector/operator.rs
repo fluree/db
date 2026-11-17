@@ -306,7 +306,7 @@ impl Operator for VectorSearchOperator {
 
             // Execute vector search
             let params = VectorSearchParams::new(&query_vector, self.pattern.metric, limit)
-                .with_as_of_t(if ctx.dataset.is_some() {
+                .with_as_of_t(if ctx.explicit_dataset().is_some() {
                     None
                 } else {
                     Some(ctx.to_t)
@@ -493,7 +493,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        let mut snapshot = LedgerSnapshot::genesis("test/main");
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
         // Ensure example IRIs used by tests are encodable to SIDs.
         snapshot
             .insert_namespace_code(100, "http://example.org/".to_string())

@@ -1,14 +1,33 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_query_aggregate_distinct.rs"]
+mod it_query_aggregate_distinct;
+
+#[path = "it_query_join_count.rs"]
+mod it_query_join_count;
+
+#[path = "it_limit_stops_work.rs"]
+mod it_limit_stops_work;
+
+#[path = "it_graph_scope_streams.rs"]
+mod it_graph_scope_streams;
+
+#[path = "it_novelty_subject_iri_formats.rs"]
+mod it_novelty_subject_iri_formats;
+
 #[path = "it_issue_1721_repro.rs"]
 mod it_issue_1721_repro;
 #[path = "it_issue_1723_sameterm_fold.rs"]
 mod it_issue_1723_sameterm_fold;
 #[path = "it_issue_1738_scan_narrowing.rs"]
 mod it_issue_1738_scan_narrowing;
+#[path = "it_property_join_filters.rs"]
+mod it_property_join_filters;
 #[path = "it_query_ask.rs"]
 mod it_query_ask;
+#[path = "it_query_bi_q4.rs"]
+mod it_query_bi_q4;
 #[path = "it_query_collect.rs"]
 mod it_query_collect;
 #[path = "it_query_construct.rs"]
@@ -25,6 +44,8 @@ mod it_query_sparql_annotations;
 mod it_query_sparql_count_distinct_star;
 #[path = "it_query_sparql_group_concat_iri.rs"]
 mod it_query_sparql_group_concat_iri;
+#[path = "it_query_sparql_grouped_projection.rs"]
+mod it_query_sparql_grouped_projection;
 #[path = "it_query_sparql_parse_errors.rs"]
 mod it_query_sparql_parse_errors;
 #[path = "it_query_sparql_path_literal_object.rs"]
@@ -33,11 +54,34 @@ mod it_query_sparql_path_literal_object;
 mod it_query_sparql_setop_subselect;
 #[path = "it_query_subquery.rs"]
 mod it_query_subquery;
+#[path = "it_query_subquery_unbound.rs"]
+mod it_query_subquery_unbound;
 #[path = "it_query_subselect_correlation.rs"]
 mod it_query_subselect_correlation;
+#[path = "it_query_ti3.rs"]
+mod it_query_ti3;
 #[path = "it_query_unwind.rs"]
 mod it_query_unwind;
 #[path = "it_query_values.rs"]
 mod it_query_values;
+#[path = "it_values_undef_placement.rs"]
+mod it_values_undef_placement;
 #[path = "it_w3c_result_formats.rs"]
 mod it_w3c_result_formats;
+
+#[path = "it_query_subquery_streaming.rs"]
+mod it_query_subquery_streaming;
+
+#[path = "it_union_default_graph.rs"]
+mod it_union_default_graph;
+
+#[path = "it_sparql_params.rs"]
+mod it_sparql_params;
+
+#[path = "it_query_sparql_vector_constant.rs"]
+mod it_query_sparql_vector_constant;
+
+#[path = "it_sparql_list_members.rs"]
+mod it_sparql_list_members;
+#[path = "it_sparql_lists.rs"]
+mod it_sparql_lists;

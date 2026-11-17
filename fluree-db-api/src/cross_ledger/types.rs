@@ -6,8 +6,11 @@
 //! check, memo lookup) are kept here and unit-tested in isolation.
 
 use super::CrossLedgerError;
+use crate::view::GraphDb;
 use crate::Fluree;
-use fluree_db_core::graph_registry::{config_graph_iri, txn_meta_graph_iri};
+use fluree_db_core::graph_registry::{names_config_graph, txn_meta_graph_iri};
+use fluree_db_core::{ContentId, LedgerId};
+use fluree_db_ledger::LedgerState;
 use fluree_db_policy::PolicyArtifactWire;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -55,15 +58,27 @@ impl std::fmt::Display for ArtifactKind {
     }
 }
 
-/// Memo / cycle-detection key. Includes `ArtifactKind` so concurrent
-/// (within one request) resolutions for different artifact kinds
-/// against the same `(ledger, graph, t)` don't collide.
-pub(crate) type ResolutionKey = (ArtifactKind, String, String, i64);
+/// The model-ledger head a resolution reads.
+///
+/// `t` alone does not identify it: a ledger dropped and created again
+/// under its name restarts at `t` 1, and a rebase can return a branch to a
+/// `t` it held before with other commits. The head commit's content id is
+/// unique to the history; `t` is what the materializers open the model at.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ModelHead {
+    pub t: i64,
+    pub commit_id: Option<ContentId>,
+}
+
+/// Memo / cycle-detection / governance-cache key. Includes `ArtifactKind`
+/// so concurrent (within one request) resolutions for different artifact
+/// kinds against the same `(ledger, graph, head)` don't collide.
+pub(crate) type ResolutionKey = (ArtifactKind, String, String, ModelHead);
 
 /// A successfully resolved, term-neutral governance artifact.
 ///
 /// Cached at the API layer by `(ArtifactKind, model_ledger_id,
-/// graph_iri, resolved_t)` — see [`ResolutionKey`]. Per-data-ledger
+/// graph_iri, model head)` — see [`ResolutionKey`]. Per-data-ledger
 /// interning is a separate step that happens at the wire→PolicySet
 /// boundary against D's snapshot.
 #[derive(Debug, Clone)]
@@ -74,6 +89,8 @@ pub struct ResolvedGraph {
     pub graph_iri: String,
     /// Model ledger `t` at which the artifact was materialized.
     pub resolved_t: i64,
+    /// Model ledger head commit at `resolved_t`.
+    pub commit_id: Option<ContentId>,
     /// The artifact itself, tagged by subsystem. Pattern-match this
     /// against the expected `GovernanceArtifact` variant for the
     /// requesting `ArtifactKind`.
@@ -234,11 +251,14 @@ impl SchemaArtifactWire {
     /// Translate to a Sid-form `SchemaBundleFlakes` against the
     /// data ledger's snapshot.
     ///
-    /// Each triple's IRIs are encoded via `snapshot.encode_iri_strict`.
-    /// Triples whose subject, predicate, or object IRI has no
-    /// registered namespace on D are dropped — D has no instance
-    /// data under those IRIs so the missing axiom can't fire on data
-    /// D doesn't have. The downstream whitelist check in
+    /// Each triple's IRIs are encoded via `snapshot.encode_iri`, which
+    /// falls back to the EMPTY namespace for an IRI D has never
+    /// registered. On a native D such a Sid matches no instance data,
+    /// so the axiom is inert; on a virtual (graph-source) D — a genesis
+    /// snapshot whose data lives outside its namespace table — it is
+    /// exactly the encoding the policy targets and the R2RML policy
+    /// gate use, so `f:onClass` expansion sees the model's hierarchy.
+    /// The downstream whitelist check in
     /// `SchemaBundleFlakes::from_collected_schema_triples` is the
     /// canonical filter; if a future cross-ledger producer emits
     /// non-whitelist triples they'll drop there.
@@ -262,9 +282,9 @@ impl SchemaArtifactWire {
                 continue;
             };
             let (Some(s_sid), Some(p_sid), Some(o_sid)) = (
-                snapshot.encode_iri_strict(&t.s),
-                snapshot.encode_iri_strict(&t.p),
-                snapshot.encode_iri_strict(o_iri),
+                snapshot.encode_iri(&t.s),
+                snapshot.encode_iri(&t.p),
+                snapshot.encode_iri(o_iri),
             ) else {
                 continue;
             };
@@ -532,6 +552,8 @@ pub struct WireOrigin {
     pub graph_iri: String,
     /// Model ledger `t` at which the artifact was materialized.
     pub resolved_t: i64,
+    /// Model ledger head commit at `resolved_t`.
+    pub commit_id: Option<ContentId>,
 }
 
 /// Per-request resolution context.
@@ -539,7 +561,7 @@ pub struct WireOrigin {
 /// Holds the full lifetime / consistency model for cross-ledger
 /// resolution within a single request:
 ///
-/// - `resolved_ts` captures the lazy per-request head-t per
+/// - `resolved_heads` captures the lazy per-request head per
 ///   canonical model ledger id (governance-context capture).
 ///   Lookup on miss reads M's head once and stores it; subsequent
 ///   references to the same M reuse the same value so policy and
@@ -558,15 +580,16 @@ pub struct WireOrigin {
 ///   cross-subsystem de-dup never trips cycle detection.
 pub struct ResolveCtx<'a> {
     /// Canonical data-ledger id D.
-    pub data_ledger_id: &'a str,
+    pub data_ledger_id: &'a LedgerId,
     /// The Fluree instance hosting D and (per the same-instance
     /// constraint) the referenced model ledger.
     pub fluree: &'a Fluree,
     /// Lazy governance-context capture: canonical model ledger id →
-    /// `resolved_t`. Phase 1a is the only producer (M's head at
-    /// first reference); pinned `f:atT` is rejected upstream until
-    /// Phase 3.
-    pub resolved_ts: HashMap<String, i64>,
+    /// its head. Phase 1a is the only producer (M's head at first
+    /// reference); pinned `f:atT` is rejected upstream until Phase 3.
+    /// The head's `t` and commit are pinned together: a later stage
+    /// opening M at the pinned `t` must key under the same commit.
+    pub resolved_heads: HashMap<LedgerId, ModelHead>,
     /// Active resolution stack (cycle detection). Keyed on the full
     /// resolution tuple including `ArtifactKind` so a `PolicyRules`
     /// resolve doesn't see a `Shapes` resolution of the same
@@ -575,48 +598,106 @@ pub struct ResolveCtx<'a> {
     /// Per-request completed memo, keyed on the same tuple so
     /// different artifact kinds can't return each other's entries.
     pub memo: HashMap<ResolutionKey, Arc<ResolvedGraph>>,
+    /// The data ledger's own state, when the caller has it in hand (the
+    /// staging paths do). A reference that names the data ledger itself is
+    /// served from here rather than from the ledger cache: staging may hold
+    /// that ledger's write lock, and the cache's read would wait on it
+    /// forever. See [`Self::open_model_db`].
+    pub data_state: Option<LedgerState>,
 }
 
 impl<'a> ResolveCtx<'a> {
     /// Build a fresh resolution context for a request against D.
-    pub fn new(data_ledger_id: &'a str, fluree: &'a Fluree) -> Self {
+    pub fn new(data_ledger_id: &'a LedgerId, fluree: &'a Fluree) -> Self {
         Self {
             data_ledger_id,
             fluree,
-            resolved_ts: HashMap::new(),
+            resolved_heads: HashMap::new(),
             active: Vec::new(),
             memo: HashMap::new(),
+            data_state: None,
         }
     }
 
-    /// Build a resolution context pre-seeded with `resolved_t`
-    /// captures from an earlier stage of the same logical request.
+    /// Carry the data ledger's state, so a reference the config makes to
+    /// the data ledger itself is answered from it.
+    pub fn with_data_state(mut self, state: LedgerState) -> Self {
+        self.data_state = Some(state);
+        self
+    }
+
+    /// Open the model ledger at `head` for a materializer.
+    ///
+    /// A state is used only at the head's commit, not just its `t`, so what
+    /// is materialized matches the key it is cached under.
+    ///
+    /// A model that is the data ledger itself never goes through the ledger
+    /// cache: the request resolving it may hold that ledger's write lock
+    /// (staging does), and the cache's read of the same lock would wait on
+    /// it forever. It is served from the state the caller passed, at the
+    /// same head, or loaded without the cache otherwise.
+    pub async fn open_model_db(
+        &self,
+        canonical_model_ledger_id: &str,
+        head: &ModelHead,
+    ) -> crate::error::Result<GraphDb> {
+        if canonical_model_ledger_id != self.data_ledger_id {
+            return self
+                .fluree
+                .load_graph_db_at_commit(canonical_model_ledger_id, head.t, head.commit_id.as_ref())
+                .await;
+        }
+        let at_head =
+            |state: &LedgerState| state.t() == head.t && state.head_commit_id == head.commit_id;
+        if let Some(state) = self.data_state.as_ref().filter(|s| at_head(s)) {
+            return Ok(GraphDb::from_ledger_state(state));
+        }
+        let state = self
+            .fluree
+            .load_ledger_uncached(canonical_model_ledger_id)
+            .await?;
+        if at_head(&state) {
+            return Ok(GraphDb::from_ledger_state(&state));
+        }
+        let drops = fluree_db_ledger::HeadDrops::of(
+            state.head_commit_id.as_ref(),
+            &state.snapshot.graph_registry,
+        );
+        self.fluree
+            .load_graph_db_historical(canonical_model_ledger_id, head.t, drops)
+            .await
+    }
+
+    /// Build a resolution context pre-seeded with head captures from
+    /// an earlier stage of the same logical request.
     ///
     /// Used by query preparation when a prior `wrap_policy` call on
-    /// the same view already pinned a model ledger's `resolved_t`:
+    /// the same view already pinned a model ledger's head:
     /// the new context inherits that pin so a second cross-ledger
     /// reference to the same M can't re-capture a later head and
     /// disagree with policy on which M version is in effect.
     /// `memo` and `active` are *not* shared — those are
     /// per-resolution-call state (cycle detection, dedup within a
     /// single dispatch tree) and don't carry across calls.
-    pub fn with_resolved_ts(
-        data_ledger_id: &'a str,
+    pub fn with_resolved_heads(
+        data_ledger_id: &'a LedgerId,
         fluree: &'a Fluree,
-        resolved_ts: HashMap<String, i64>,
+        resolved_heads: HashMap<LedgerId, ModelHead>,
     ) -> Self {
         Self {
             data_ledger_id,
             fluree,
-            resolved_ts,
+            resolved_heads,
             active: Vec::new(),
             memo: HashMap::new(),
+            data_state: None,
         }
     }
 }
 
 /// Reject selectors that resolve to the model ledger's `#config` or
-/// `#txn-meta` graphs.
+/// `#txn-meta` graphs. Any ledger's config graph IRI is M's config
+/// graph ([`names_config_graph`]).
 ///
 /// Applied *before* any storage round-trip on the model ledger —
 /// `#txn-meta` in particular can leak commit metadata, and `#config`
@@ -628,9 +709,7 @@ pub(crate) fn reject_if_reserved_graph(
     canonical_ledger_id: &str,
     graph_iri: &str,
 ) -> Result<(), CrossLedgerError> {
-    if graph_iri == config_graph_iri(canonical_ledger_id)
-        || graph_iri == txn_meta_graph_iri(canonical_ledger_id)
-    {
+    if names_config_graph(graph_iri) || graph_iri == txn_meta_graph_iri(canonical_ledger_id) {
         return Err(CrossLedgerError::ReservedGraphSelected {
             graph_iri: graph_iri.to_string(),
         });
@@ -659,8 +738,11 @@ pub(crate) fn check_cycle(
     key: &ResolutionKey,
 ) -> Result<(), CrossLedgerError> {
     if active.iter().any(|k| k == key) {
-        let mut chain = active.to_vec();
-        chain.push(key.clone());
+        let chain = active
+            .iter()
+            .chain(std::iter::once(key))
+            .map(|(kind, ledger, graph, head)| (*kind, ledger.clone(), graph.clone(), head.t))
+            .collect();
         return Err(CrossLedgerError::CycleDetected { chain });
     }
     Ok(())
@@ -681,6 +763,11 @@ mod tests {
             reject_if_reserved_graph(ledger, "urn:fluree:model:main#txn-meta"),
             Err(CrossLedgerError::ReservedGraphSelected { .. })
         ));
+        // Any ledger's config graph IRI names model:main's config graph.
+        assert!(matches!(
+            reject_if_reserved_graph(ledger, "urn:fluree:other:main#config"),
+            Err(CrossLedgerError::ReservedGraphSelected { .. })
+        ));
     }
 
     #[test]
@@ -689,16 +776,13 @@ mod tests {
         // A user-named graph that happens to live on the model
         // ledger is fine — we only block the system graphs.
         assert!(reject_if_reserved_graph(ledger, "http://example.org/policy").is_ok());
-        // Even a config-shaped IRI for a *different* ledger is fine —
-        // it can't actually resolve to model:main's #config.
-        assert!(
-            reject_if_reserved_graph(ledger, "urn:fluree:other:main#config").is_ok(),
-            "config IRI for a different ledger should not match"
-        );
+        // Not a ledger's config graph IRI: no ledger id before the `#`.
+        assert!(reject_if_reserved_graph(ledger, "urn:fluree:#config").is_ok());
     }
 
     fn key(ledger: &str, graph: &str, t: i64) -> ResolutionKey {
-        (ArtifactKind::PolicyRules, ledger.into(), graph.into(), t)
+        let head = ModelHead { t, commit_id: None };
+        (ArtifactKind::PolicyRules, ledger.into(), graph.into(), head)
     }
 
     #[test]
@@ -720,9 +804,15 @@ mod tests {
             CrossLedgerError::CycleDetected { chain } => {
                 // The chain should contain the original active stack
                 // (in order) plus the offending key appended.
+                let shown = (
+                    ArtifactKind::PolicyRules,
+                    "a:main".to_string(),
+                    "http://ex.org/p".to_string(),
+                    10,
+                );
                 assert_eq!(chain.len(), 3);
-                assert_eq!(chain[0], cycle_key);
-                assert_eq!(chain[2], cycle_key);
+                assert_eq!(chain[0], shown);
+                assert_eq!(chain[2], shown);
             }
             other => panic!("expected CycleDetected, got {other:?}"),
         }
@@ -738,22 +828,12 @@ mod tests {
         // pattern; it will be expanded in Phase 1b when SchemaClosure
         // lands. The contract this guards: adding a new ArtifactKind
         // doesn't make existing resolutions look cyclic.
-        let active = vec![(
-            ArtifactKind::PolicyRules,
-            "a:main".to_string(),
-            "http://ex.org/p".to_string(),
-            10,
-        )];
+        let active = vec![key("a:main", "http://ex.org/p", 10)];
         // Once Phase 1b adds e.g. ArtifactKind::SchemaClosure, this
         // test should use that variant to verify cross-kind isolation.
         // For now: same kind / different t (a clearly-non-cycle case)
         // exercises the same code path under the new tuple shape.
-        let later_pin = (
-            ArtifactKind::PolicyRules,
-            "a:main".to_string(),
-            "http://ex.org/p".to_string(),
-            20,
-        );
+        let later_pin = key("a:main", "http://ex.org/p", 20);
         assert!(check_cycle(&active, &later_pin).is_ok());
     }
 
@@ -774,12 +854,14 @@ mod tests {
         let payload = Arc::new(ResolvedGraph {
             model_ledger_id: resolution_key.1.clone(),
             graph_iri: resolution_key.2.clone(),
-            resolved_t: resolution_key.3,
+            resolved_t: resolution_key.3.t,
+            commit_id: None,
             artifact: GovernanceArtifact::PolicyRules(PolicyArtifactWire {
                 origin: fluree_db_policy::WireOrigin {
                     model_ledger_id: resolution_key.1.clone(),
                     graph_iri: resolution_key.2.clone(),
-                    resolved_t: resolution_key.3,
+                    resolved_t: resolution_key.3.t,
+                    commit_id: None,
                 },
                 restrictions: vec![],
             }),

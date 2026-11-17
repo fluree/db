@@ -38,6 +38,7 @@ use crate::ir::triple::TriplePattern;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::inline::{extend_schema, InlineOperator};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
+use crate::sort::SortSpec;
 use crate::temporal_mode::TemporalMode;
 use crate::var_registry::VarId;
 
@@ -103,6 +104,8 @@ pub struct ScanDatasetBuilder {
     index_hint: Option<IndexType>,
     mode: TemporalMode,
     schema: Arc<[VarId]>,
+    /// Scan with [`BinaryScanOperator::hiding_list_members`].
+    hide_list_members: bool,
 }
 
 impl ScanDatasetBuilder {
@@ -124,6 +127,7 @@ impl ScanDatasetBuilder {
             index_hint,
             mode,
             schema,
+            hide_list_members: false,
         }
     }
 
@@ -161,13 +165,20 @@ impl DatasetBuilder for ScanDatasetBuilder {
                     self.index_hint,
                 ),
             )),
-            TemporalMode::Current => Ok(Box::new(BinaryScanOperator::new_with_emit_and_index(
-                self.pattern.clone(),
-                self.object_bounds.clone(),
-                self.inline_ops.clone(),
-                self.emit,
-                self.index_hint,
-            ))),
+            TemporalMode::Current => {
+                let scan = BinaryScanOperator::new_with_emit_and_index(
+                    self.pattern.clone(),
+                    self.object_bounds.clone(),
+                    self.inline_ops.clone(),
+                    self.emit,
+                    self.index_hint,
+                );
+                Ok(Box::new(if self.hide_list_members {
+                    scan.hiding_list_members()
+                } else {
+                    scan
+                }))
+            }
         }
     }
 
@@ -211,7 +222,7 @@ struct DatasetMember {
 /// `Eq`/`Hash` exclude history metadata, so this is only armed in current mode
 /// (see [`DatasetOperator::open`]).
 ///
-/// MEMORY CLIFF (documented like `scan_graph_flakes`'s): unlike a
+/// MEMORY CLIFF (documented like `whole_graph_facts`'s): unlike a
 /// single-graph scan, a `>= 2`-member default union is no longer
 /// bounded-memory streaming — the seen-set grows O(distinct emitted rows)
 /// with full normalized `Binding` signatures as keys, exactly like a
@@ -258,11 +269,11 @@ impl BatchDeduper {
             return Ok(Batch::empty_schema_with_len(1));
         }
         let num_cols = batch.schema().len();
-        let (store, gv) = EqualityNorm::parts(&self.norm);
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
         let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
         for row_idx in 0..batch.len() {
             let signature: Vec<Binding> = (0..num_cols)
-                .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
+                .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), dicts, gv))
                 .collect();
             let mut h = FxHasher::default();
             signature.hash(&mut h);
@@ -301,6 +312,9 @@ pub struct DatasetOperator {
     /// True when members span multiple distinct ledger IDs, requiring
     /// `Binding::Sid` → `Binding::IriMatch` conversion.
     needs_provenance: bool,
+    /// True when members are several graphs of one ledger, whose rows must
+    /// leave decoded; see [`Self::member_ctx`].
+    decode_members: bool,
     /// Temporal mode captured at planner-time. Set-deduplication of the default
     /// union is only sound in current mode (history rows carry per-event
     /// assert/retract metadata that the dedup key deliberately ignores).
@@ -318,10 +332,39 @@ pub struct DatasetOperator {
     /// T1.3: an `ORDER BY … LIMIT` top-k directive, applied per member like
     /// `row_budget`. Per-member top-k is sound — the outer sort merges the members'
     /// partial top-k into the global one.
-    topk: Option<(VarId, usize, bool)>,
+    topk: Option<(Vec<SortSpec>, usize)>,
 }
 
 impl DatasetOperator {
+    /// The context member `graph` runs under.
+    ///
+    /// Members that are several graphs of one ledger keep the binary cursor,
+    /// but their rows leave for a scope of several graphs, which has no single
+    /// graph view to decode an encoded binding against (`ctx.graph_view()` is
+    /// `None`). A join substituting an undecodable `EncodedSid` would leave the
+    /// position unbound and pair every row with every other, and a NUM_BIG
+    /// handle decodes only against its own graph's arena. So such members
+    /// decode as they scan, where their own view is at hand.
+    fn member_ctx<'a>(
+        &self,
+        ctx: &ExecutionContext<'a>,
+        graph: &crate::dataset::GraphRef<'a>,
+    ) -> ExecutionContext<'a> {
+        Self::member_ctx_for(self.decode_members, ctx, graph)
+    }
+
+    fn member_ctx_for<'a>(
+        decode_members: bool,
+        ctx: &ExecutionContext<'a>,
+        graph: &crate::dataset::GraphRef<'a>,
+    ) -> ExecutionContext<'a> {
+        let mut member = ctx.with_graph_ref(graph);
+        if decode_members {
+            member.eager_materialization = true;
+        }
+        member
+    }
+
     /// Create a new dataset operator driven by the given builder.
     pub fn new(builder: Box<dyn DatasetBuilder>) -> Self {
         Self {
@@ -330,6 +373,7 @@ impl DatasetOperator {
             members: Vec::new(),
             current_member: 0,
             needs_provenance: false,
+            decode_members: false,
             mode: TemporalMode::Current,
             dedup: None,
             row_budget: None,
@@ -347,8 +391,8 @@ impl DatasetOperator {
         if let Some(budget) = self.row_budget {
             member.set_row_budget(budget);
         }
-        if let Some((sort_var, k, ascending)) = self.topk {
-            member.set_topk(sort_var, k, ascending);
+        if let Some((ordering, k)) = &self.topk {
+            member.set_topk(ordering, *k);
         }
     }
 
@@ -369,6 +413,24 @@ impl DatasetOperator {
     ) -> Self {
         let builder =
             ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
+        let mut op = Self::new(Box::new(builder));
+        op.mode = mode;
+        op
+    }
+
+    /// [`Self::scan`] of `pattern`'s stored rows that are not list members
+    /// (see [`BinaryScanOperator::hiding_list_members`]).
+    pub fn scan_hiding_list_members(
+        pattern: TriplePattern,
+        object_bounds: Option<ObjectBounds>,
+        inline_ops: Vec<InlineOperator>,
+        emit: EmitMask,
+        index_hint: Option<IndexType>,
+        mode: TemporalMode,
+    ) -> Self {
+        let mut builder =
+            ScanDatasetBuilder::new(pattern, object_bounds, inline_ops, emit, index_hint, mode);
+        builder.hide_list_members = true;
         let mut op = Self::new(Box::new(builder));
         op.mode = mode;
         op
@@ -409,6 +471,36 @@ pub(crate) fn stamp_provenance(
         .collect::<Result<Vec<_>>>()?;
 
     Batch::new(schema, stamped_columns).map_err(|e| QueryError::Internal(e.to_string()))
+}
+
+/// Stamp `batch` in the ledger a cross-ledger SERVICE body executes against,
+/// when the context arms per-scan provenance (`scan_provenance_ledger`); a
+/// pass-through everywhere else. For binding producers that are not wrapped
+/// by a `DatasetOperator` (property paths) but emit target-encoded `Sid`s.
+pub(crate) fn stamp_if_armed(batch: Batch, ctx: &ExecutionContext<'_>) -> Result<Batch> {
+    match &ctx.scan_provenance_ledger {
+        Some(ledger_id) => stamp_provenance(batch, ledger_id, ctx),
+        None => Ok(batch),
+    }
+}
+
+/// Stamp a parent row's raw `Sid`s in the REQUESTER's ledger (the context's
+/// active snapshot) before it seeds a body that executes against another
+/// ledger. Inside such a body every reference is namespace-neutral; a
+/// requester-encoded `Sid` copied into a body column (`BIND(?parent AS ?x)`)
+/// would otherwise be decoded through the target's table at the boundary.
+/// An undecodable `Sid` is left as is.
+pub(crate) fn stamp_seed_row(row: Vec<Binding>, ctx: &ExecutionContext<'_>) -> Vec<Binding> {
+    let requester: Arc<str> = Arc::from(ctx.active_snapshot.ledger_id.as_str());
+    row.into_iter()
+        .map(|b| match b {
+            Binding::Sid { sid, .. } => match ctx.active_snapshot.decode_sid(&sid) {
+                Some(iri) => Binding::iri_match(iri, sid, Arc::clone(&requester)),
+                None => Binding::sid(sid),
+            },
+            other => other,
+        })
+        .collect()
 }
 
 /// Stamp a single binding with ledger provenance.
@@ -509,13 +601,13 @@ impl Operator for DatasetOperator {
         }
     }
 
-    fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
+    fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
         // T1.3: record ORDER BY … LIMIT top-k; applied per member like the row
         // budget. Per-member top-k is sound — the outer sort merges the members'
         // partial top-k into the global one (same reasoning as `GraphOperator`'s
         // per-partition top-k). Switch-gated.
         if crate::r2rml::dataset_budget_enabled() {
-            self.topk = Some((sort_var, k, ascending));
+            self.topk = Some((ordering.to_vec(), k));
         }
     }
 
@@ -541,15 +633,24 @@ impl Operator for DatasetOperator {
         match ctx.active_graphs() {
             ActiveGraphs::Single => {
                 // Single-graph mode: build one operator, open with parent
-                // context directly. No fanout, no provenance stamping.
+                // context directly. No fanout; provenance stamping only when
+                // the context demands it — a cross-ledger SERVICE subtree sets
+                // `scan_provenance_ledger` so raw target-encoded `Sid`s never
+                // escape a scan (they would be re-decoded against the
+                // requester's namespace table the moment an intra-body join
+                // substitutes them into a pattern; issue #1665). Everywhere
+                // else the flag is `None` and this lane is unchanged.
                 let mut inner = self.builder.build()?;
                 self.apply_member_directives(inner.as_mut());
                 inner.open(ctx).await?;
+                self.needs_provenance = ctx.scan_provenance_ledger.is_some();
                 self.members.push(DatasetMember {
                     operator: inner,
-                    ledger_id: Arc::from(""),
+                    ledger_id: ctx
+                        .scan_provenance_ledger
+                        .clone()
+                        .unwrap_or_else(|| Arc::from("")),
                 });
-                self.needs_provenance = false;
             }
             ActiveGraphs::Many(graphs) => {
                 // Pre-scan: determine whether graphs span multiple ledgers
@@ -607,10 +708,12 @@ impl Operator for DatasetOperator {
                     None
                 };
 
+                self.decode_members = !multi_ledger && graphs.len() >= 2;
+
                 for graph in &graphs {
                     let mut inner = self.builder.build()?;
                     self.apply_member_directives(inner.as_mut());
-                    let mut per_graph_ctx = ctx.with_graph_ref(graph);
+                    let mut per_graph_ctx = self.member_ctx(ctx, graph);
 
                     // When provenance stamping is needed (multi-ledger),
                     // force the range fallback path so inner scans produce
@@ -662,7 +765,8 @@ impl Operator for DatasetOperator {
                 let member = &mut self.members[self.current_member];
                 match &graphs {
                     ActiveGraphs::Many(g) => {
-                        let graph_ctx = ctx.with_graph_ref(g[self.current_member]);
+                        let graph_ctx =
+                            Self::member_ctx_for(self.decode_members, ctx, g[self.current_member]);
                         member.operator.next_batch(&graph_ctx).await?
                     }
                     ActiveGraphs::Single => member.operator.next_batch(ctx).await?,
@@ -860,8 +964,13 @@ mod tests {
         fn set_row_budget(&mut self, budget: usize) {
             *self.budget.lock().unwrap() = Some(budget);
         }
-        fn set_topk(&mut self, sort_var: VarId, k: usize, ascending: bool) {
-            *self.topk.lock().unwrap() = Some((sort_var, k, ascending));
+        fn set_topk(&mut self, ordering: &[SortSpec], k: usize) {
+            let primary = &ordering[0];
+            *self.topk.lock().unwrap() = Some((
+                primary.var,
+                k,
+                matches!(primary.direction, crate::sort::SortDirection::Ascending),
+            ));
         }
     }
 
@@ -909,7 +1018,7 @@ mod tests {
     async fn open_and_drain(op: &mut dyn Operator) {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         op.open(&ctx).await.unwrap();
@@ -931,7 +1040,7 @@ mod tests {
     #[tokio::test]
     async fn dataset_forwards_topk_to_member() {
         let (mut op, (_budget, topk)) = recorder_dataset();
-        op.set_topk(VarId(3), 5, false);
+        op.set_topk(&[SortSpec::desc(VarId(3))], 5);
         open_and_drain(&mut op).await;
         assert_eq!(*topk.lock().unwrap(), Some((VarId(3), 5, false)));
     }

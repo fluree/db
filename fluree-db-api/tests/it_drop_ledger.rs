@@ -71,6 +71,60 @@ async fn drop_ledger_soft_mode_retracts_only() {
     assert!(!files.is_empty(), "Commit files should remain in soft mode");
 }
 
+/// The edge-annotation arenas have no storage layout of their own and land
+/// under the branch's `blob/` prefix; a hard drop must take them too.
+#[tokio::test]
+async fn hard_drop_removes_annotation_arenas_under_blob() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let ledger_id = "drop-blob-test:main";
+    let ledger = LedgerState::new(LedgerSnapshot::genesis(ledger_id), Novelty::new(0));
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": {"@id": "ex:emp/alice-acme", "ex:role": "Engineer"}
+                }
+            }),
+        )
+        .await
+        .expect("insert");
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let storage = fluree.admin_storage().expect("managed backend");
+    let blob_prefix = format!(
+        "fluree:file://{}/blob/",
+        ledger_id_to_path_prefix(ledger_id).unwrap()
+    );
+    assert!(
+        !storage
+            .list_prefix(&blob_prefix)
+            .await
+            .expect("list")
+            .is_empty(),
+        "the reindex should have sealed an annotation arena under blob/"
+    );
+
+    fluree
+        .drop_ledger("drop-blob-test", DropMode::Hard)
+        .await
+        .expect("drop");
+    let left = storage.list_prefix(&blob_prefix).await.expect("list");
+    assert!(
+        left.is_empty(),
+        "hard drop left files under blob/: {left:?}"
+    );
+}
+
 /// Test that hard drop deletes all files and retracts from nameservice.
 #[tokio::test]
 async fn drop_ledger_hard_mode_deletes_files() {
@@ -363,7 +417,7 @@ async fn drop_ledger_hard_clears_every_branch_and_shared() {
     // Nameservice empty for this ledger name.
     assert!(fluree
         .nameservice()
-        .list_branches("multi-drop")
+        .branch_records("multi-drop")
         .await
         .unwrap()
         .is_empty());
@@ -380,6 +434,100 @@ async fn drop_ledger_hard_clears_every_branch_and_shared() {
 
     // Alias is reusable.
     let _new = fluree.create_ledger("multi-drop").await.expect("recreate");
+}
+
+/// Dropping a fork releases the dictionary blobs only the fork's index chain
+/// referenced and keeps every blob the surviving branch still reaches.
+/// Dictionaries are ledger-wide, so the branch prefix delete alone would have
+/// left the fork's own blobs behind for a sweep.
+#[tokio::test]
+async fn drop_branch_releases_dictionary_blobs_only_the_branch_referenced() {
+    use crate::support::build_and_publish_index;
+    use fluree_db_core::ContentStore;
+    use fluree_db_indexer::{shared_refs_of_branches, BranchIndexHead};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let main = fluree.create_ledger("fork-dicts").await.unwrap();
+    let seed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": 1}]
+    });
+    fluree.insert(main, &seed).await.unwrap();
+    build_and_publish_index(&fluree, "fork-dicts:main").await;
+
+    fluree
+        .create_branch("fork-dicts", "dev", None, None)
+        .await
+        .unwrap();
+
+    // New subjects on the fork, then an index build: the fork's reverse
+    // dictionary leaves are rewritten, so its chain references blobs main's
+    // does not.
+    let dev = fluree.ledger("fork-dicts:dev").await.unwrap();
+    let subjects: Vec<_> = (0..50)
+        .map(|i| json!({"@id": format!("ex:dev-{i}"), "ex:val": i}))
+        .collect();
+    let more = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": subjects
+    });
+    fluree.insert(dev, &more).await.unwrap();
+    build_and_publish_index(&fluree, "fork-dicts:dev").await;
+
+    async fn dict_refs(
+        fluree: &fluree_db_api::Fluree,
+        ledger_id: &str,
+    ) -> std::collections::HashSet<fluree_db_core::ContentId> {
+        let head = fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .unwrap()
+            .expect("record")
+            .index_head_id;
+        shared_refs_of_branches(
+            fluree.backend(),
+            &[BranchIndexHead {
+                ledger_id: fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                index_head_id: head,
+            }],
+            None,
+        )
+        .await
+        .unwrap()
+    }
+    let main_refs = dict_refs(&fluree, "fork-dicts:main").await;
+    let dev_refs = dict_refs(&fluree, "fork-dicts:dev").await;
+    let dev_only: Vec<_> = dev_refs.difference(&main_refs).cloned().collect();
+    assert!(
+        !dev_only.is_empty(),
+        "the fork must reference dictionary blobs of its own for this test to mean anything"
+    );
+    assert!(
+        !main_refs.is_empty(),
+        "the surviving branch must reference dictionary blobs"
+    );
+
+    let report = fluree.drop_branch("fork-dicts", "dev").await.unwrap();
+    assert_eq!(report.status, DropStatus::Dropped);
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+    let store = fluree.content_store("fork-dicts:main");
+    for cid in &main_refs {
+        assert!(
+            store.has(cid).await.unwrap(),
+            "surviving branch's dictionary blob {cid} must remain"
+        );
+    }
+    for cid in &dev_only {
+        assert!(
+            !store.has(cid).await.unwrap(),
+            "fork-only dictionary blob {cid} must be released with the fork"
+        );
+    }
 }
 
 /// Test that drop cancels pending indexing before deletion (the flake fix).
@@ -438,7 +586,9 @@ async fn drop_ledger_cancels_pending_indexing() {
 
             // Trigger indexing but DON'T wait - immediately drop
             // This exercises the "drop while indexing is pending/in progress" scenario
-            let _completion = handle.trigger(ledger_id, 3).await;
+            let _completion = handle
+                .trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), 3)
+                .await;
 
             // Immediately call drop_ledger - should cancel + wait_for_idle internally
             // This is the key test: drop should handle the race gracefully
@@ -578,7 +728,7 @@ async fn drop_ledger_disconnects_from_cache() {
     let mgr = fluree.ledger_manager().expect("caching enabled");
     let cached_before = mgr.cached_aliases().await;
     assert!(
-        cached_before.contains(&ledger_id.to_string()),
+        cached_before.contains(&fluree_db_api::LedgerId::parse(ledger_id).unwrap()),
         "Ledger should be cached before drop"
     );
 
@@ -592,7 +742,402 @@ async fn drop_ledger_disconnects_from_cache() {
     // Verify ledger is NO LONGER in the cache
     let cached_after = mgr.cached_aliases().await;
     assert!(
-        !cached_after.contains(&ledger_id.to_string()),
+        !cached_after.contains(&fluree_db_api::LedgerId::parse(ledger_id).unwrap()),
         "Ledger should be evicted from cache after drop"
     );
+}
+
+/// The collector and a fork drop, end to end on file storage and the file
+/// nameservice with the worker running: real builds, passes releasing behind
+/// them inside release windows, and nothing a surviving chain references lost.
+#[tokio::test]
+async fn collector_and_fork_drop_keep_every_referenced_dictionary_on_file_storage() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(&path).build().expect("build");
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        crate::support::collecting_indexer_config(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            crate::support::run_collector_and_fork_drop_scenario(&fluree, &handle, "gc-e2e").await;
+        })
+        .await;
+}
+
+/// Ledger names may contain `/`. Hard-dropping `test/db` must reach only its
+/// own `test/db/@shared/dicts/`, never ledger `test`'s `test/@shared/dicts/`:
+/// the old path heuristic read a branchless `test/db` as `name/branch` and
+/// wiped the sibling ledger's dictionaries.
+#[tokio::test]
+async fn hard_drop_of_nested_name_keeps_the_parent_named_ledgers_dicts() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": "a string for the dicts"}]
+    });
+    for name in ["test", "test/db"] {
+        let ledger = fluree.create_ledger(name).await.expect("create");
+        fluree.insert(ledger, &txn).await.expect("insert");
+        fluree
+            .reindex(name, fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("reindex writes dict blobs");
+    }
+
+    let admin = fluree.admin_storage().expect("managed backend");
+    let parent_dicts = "fluree:file://test/@shared/dicts/";
+    let before = admin.list_prefix(parent_dicts).await.expect("list");
+    assert!(!before.is_empty(), "fixture: `test` must have dict blobs");
+
+    fluree
+        .drop_ledger("test/db", DropMode::Hard)
+        .await
+        .expect("drop test/db");
+
+    let after = admin.list_prefix(parent_dicts).await.expect("list");
+    assert_eq!(after, before, "dropping `test/db` deleted `test`'s dicts");
+    let nested = admin
+        .list_prefix("fluree:file://test/db/@shared/dicts/")
+        .await
+        .expect("list");
+    assert!(
+        nested.is_empty(),
+        "`test/db`'s own dicts must be reclaimed: {nested:?}"
+    );
+
+    // `test` still loads and answers from its index.
+    fluree.disconnect_ledger("test").await;
+    let db = fluree.db("test").await.expect("load test");
+    assert!(db.t > 0);
+}
+
+/// A legacy ledger whose name nests inside another ledger's storage
+/// (`a/main/index/child` lives under `a:main`'s `index/` directory) must
+/// survive a hard drop of `a` — its branches and its `@shared/` dictionaries.
+/// New names can no longer take a reserved layout segment, so the fixture is
+/// built the way such a ledger would already exist: without `create_ledger`.
+#[tokio::test]
+async fn hard_drop_keeps_a_nested_legacy_ledgers_files() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": "a string for the dicts"}]
+    });
+    let parent = fluree.create_ledger("a").await.expect("create a");
+    fluree.insert(parent, &txn).await.expect("insert a");
+    let child_id = "a/main/index/child:main";
+    let child = LedgerState::new(LedgerSnapshot::genesis(child_id), Novelty::new(0));
+    fluree.insert(child, &txn).await.expect("insert child");
+    for id in ["a", "a/main/index/child"] {
+        fluree
+            .reindex(id, fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("reindex writes dict blobs");
+    }
+
+    let admin = fluree.admin_storage().expect("managed backend");
+    let child_root = "fluree:file://a/main/index/child/";
+    let before = admin.list_prefix(child_root).await.expect("list");
+    assert!(
+        before.iter().any(|f| f.contains("/@shared/dicts/"))
+            && before.iter().any(|f| f.contains("/main/commit/")),
+        "fixture: child must have commits and shared dicts: {before:?}"
+    );
+
+    fluree
+        .drop_ledger("a", DropMode::Hard)
+        .await
+        .expect("drop a");
+
+    let after = admin.list_prefix(child_root).await.expect("list");
+    assert_eq!(
+        after, before,
+        "dropping `a` deleted the nested ledger's files"
+    );
+    fluree.disconnect_ledger(child_id).await;
+    assert!(fluree.db(child_id).await.expect("child still loads").t > 0);
+}
+
+/// Every file under `dir`, with its bytes.
+fn tree(dir: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Vec<u8>> {
+    let mut out = std::collections::BTreeMap::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let bytes = std::fs::read(&path).expect("read");
+                out.insert(path, bytes);
+            }
+        }
+    }
+    out
+}
+
+/// The files under `dir` that are gone or hold other bytes than in `before`.
+fn changed_since(
+    before: &std::collections::BTreeMap<std::path::PathBuf, Vec<u8>>,
+    dir: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let now = tree(dir);
+    before
+        .iter()
+        .filter(|(path, bytes)| now.get(*path) != Some(*bytes))
+        .map(|(path, _)| path.clone())
+        .chain(now.keys().filter(|p| !before.contains_key(*p)).cloned())
+        .collect()
+}
+
+/// Give `ledger` a branch under a name an earlier release allowed and
+/// `create_branch` now refuses: a placeholder branch's files moved under the
+/// path the legacy id names, and its record rewritten to match.
+async fn leave_a_legacy_branch(
+    fluree: &fluree_db_api::Fluree,
+    root: &std::path::Path,
+    ledger: &str,
+    legacy: &str,
+) {
+    fluree
+        .create_branch(ledger, "placeholder", None, None)
+        .await
+        .expect("create placeholder");
+    let placeholder_id = format!("{ledger}:placeholder");
+    let placeholder = fluree.ledger(&placeholder_id).await.expect("load");
+    fluree
+        .insert(
+            placeholder,
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": [{"@id": "ex:on-the-branch", "ex:val": 1}]
+            }),
+        )
+        .await
+        .expect("insert placeholder");
+    fluree.disconnect_ledger(&placeholder_id).await;
+
+    let on_disk = legacy.trim_start_matches('/');
+    std::fs::rename(
+        root.join(ledger).join("placeholder"),
+        root.join(ledger).join(on_disk),
+    )
+    .expect("move the branch's files");
+    let records = root.join("ns@v2").join(ledger);
+    let json = std::fs::read_to_string(records.join("placeholder.json"))
+        .expect("placeholder record")
+        .replace("placeholder", legacy);
+    std::fs::remove_file(records.join("placeholder.json")).expect("remove placeholder");
+    std::fs::write(records.join(format!("{on_disk}.json")), json)
+        .expect("write the branch's record");
+}
+
+/// A branch an earlier release let take a name the grammar now refuses (one
+/// beginning with `/`, or holding `@` or `#`) is listed under its id, though
+/// no request can name it. Dropping its ledger drops it with the rest: a soft
+/// drop retracts every record and keeps every file, and a hard drop leaves
+/// neither a record nor a file.
+#[tokio::test]
+async fn a_ledger_drop_takes_a_legacy_branch_with_it() {
+    for legacy in ["/old", "v@1", "v#1"] {
+        let tmp = tempfile::TempDir::new().expect("tempdir");
+        let path = tmp.path().to_string_lossy().to_string();
+        let fluree = FlureeBuilder::file(&path).build().expect("build");
+        let main = fluree.create_ledger("slashed").await.expect("create");
+        fluree
+            .insert(
+                main,
+                &json!({
+                    "@context": {"ex": "http://example.org/ns/"},
+                    "@graph": [{"@id": "ex:a", "ex:val": "a string for the dicts"}]
+                }),
+            )
+            .await
+            .expect("insert main");
+        fluree
+            .reindex("slashed", fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("reindex writes dict blobs");
+        leave_a_legacy_branch(&fluree, tmp.path(), "slashed", legacy).await;
+
+        let legacy_id = format!("slashed:{legacy}");
+        let records = || async {
+            fluree
+                .nameservice()
+                .all_records()
+                .await
+                .expect("list")
+                .into_iter()
+                .map(|r| (r.ledger_id.to_string(), r.retracted))
+                .collect::<std::collections::BTreeMap<_, _>>()
+        };
+        let listed = records().await;
+        assert!(
+            listed.len() == 2 && listed.get(&legacy_id) == Some(&false),
+            "{legacy}: listed under its id: {listed:?}"
+        );
+        assert!(
+            fluree.db(&legacy_id).await.is_err(),
+            "{legacy}: a request cannot name the branch"
+        );
+
+        let files = tmp.path().join("slashed");
+        let files_before = tree(&files);
+        let on_disk = format!("/slashed/{}/commit/", legacy.trim_start_matches('/'));
+        assert!(
+            files_before
+                .keys()
+                .any(|f| f.to_string_lossy().contains(&on_disk))
+                && files_before
+                    .keys()
+                    .any(|f| f.to_string_lossy().contains("/@shared/dicts/")),
+            "fixture: the branch has commits and the ledger shared dictionaries"
+        );
+
+        let soft = fluree
+            .drop_ledger("slashed", DropMode::Soft)
+            .await
+            .unwrap_or_else(|e| panic!("{legacy}: soft drop: {e}"));
+        assert_eq!(soft.status, DropStatus::Dropped, "{legacy}");
+        let listed = records().await;
+        assert!(
+            listed.len() == 2 && listed.values().all(|retracted| *retracted),
+            "{legacy}: a soft drop retracts every branch: {listed:?}"
+        );
+        assert_eq!(
+            changed_since(&files_before, &files),
+            Vec::<std::path::PathBuf>::new(),
+            "{legacy}: a soft drop keeps every file"
+        );
+
+        fluree
+            .drop_ledger("slashed", DropMode::Hard)
+            .await
+            .unwrap_or_else(|e| panic!("{legacy}: hard drop: {e}"));
+        assert!(
+            records().await.is_empty(),
+            "{legacy}: a hard drop leaves no record"
+        );
+        assert_eq!(
+            tree(&files).keys().collect::<Vec<_>>(),
+            Vec::<&std::path::PathBuf>::new(),
+            "{legacy}: a hard drop leaves no file"
+        );
+    }
+}
+
+/// A nested ledger's legacy branch `/old` has the path prefix
+/// `{name}//old`, which file storage lists as `{name}/old`. Neither a sweep
+/// nor a hard drop of the ledger it nests under may take its files for the
+/// outer ledger's own.
+#[tokio::test]
+async fn a_nested_ledgers_legacy_branch_survives_a_sweep_and_a_drop_of_the_outer_ledger() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": "ex:seed", "ex:val": "a string for the dicts"}]
+    });
+    let outer = fluree.create_ledger("a").await.expect("create a");
+    fluree.insert(outer, &txn).await.expect("insert a");
+    let child = "a/main/index/child";
+    let genesis = LedgerState::new(
+        LedgerSnapshot::genesis(&format!("{child}:main")),
+        Novelty::new(0),
+    );
+    fluree.insert(genesis, &txn).await.expect("insert child");
+    for id in ["a", child] {
+        fluree
+            .reindex(id, fluree_db_api::ReindexOptions::default())
+            .await
+            .expect("reindex");
+    }
+    leave_a_legacy_branch(&fluree, tmp.path(), child, "/old").await;
+
+    let child_files = tmp.path().join(child);
+    let before = tree(&child_files);
+    assert!(
+        before
+            .keys()
+            .any(|f| f.to_string_lossy().contains("/child/old/commit/")),
+        "fixture: the legacy branch has commits"
+    );
+
+    fluree.sweep_index_storage("a").await.expect("sweep a");
+    assert_eq!(
+        changed_since(&before, &child_files),
+        Vec::<std::path::PathBuf>::new(),
+        "sweeping `a` reclaimed the nested ledger's files"
+    );
+
+    fluree
+        .drop_ledger("a", DropMode::Hard)
+        .await
+        .expect("drop a");
+    assert_eq!(
+        changed_since(&before, &child_files),
+        Vec::<std::path::PathBuf>::new(),
+        "dropping `a` deleted the nested ledger's files"
+    );
+}
+
+/// A branch drop that cannot list ledgers must fail before touching anything:
+/// deleting the record while keeping the files would leave them unreachable.
+#[tokio::test]
+async fn drop_branch_fails_intact_when_ledgers_cannot_be_listed() {
+    use fluree_db_api::{Fluree, NameServiceMode};
+    use std::sync::Arc;
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let fluree = FlureeBuilder::file(&path).build().expect("build");
+    let txn = |id: &str| {
+        json!({
+            "@context": {"ex": "http://example.org/ns/"},
+            "@graph": [{"@id": id, "ex:val": 1}]
+        })
+    };
+    let main = fluree.create_ledger("drop-listing").await.unwrap();
+    fluree.insert(main, &txn("ex:a")).await.unwrap();
+    fluree
+        .create_branch("drop-listing", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("drop-listing:dev").await.unwrap();
+    fluree.insert(dev, &txn("ex:b")).await.unwrap();
+    let dev_commits = tmp.path().join("drop-listing/dev/commit");
+    assert!(dev_commits.read_dir().unwrap().next().is_some());
+
+    let failing = Arc::new(crate::race_nameservice::PausingNameService::new(
+        fluree.nameservice_mode().publisher_arc().unwrap(),
+    ));
+    failing.fail_listings();
+    let dropper = Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        NameServiceMode::ReadWrite(failing),
+    );
+    assert!(dropper.drop_branch("drop-listing", "dev").await.is_err());
+
+    let record = fluree
+        .nameservice()
+        .lookup("drop-listing:dev")
+        .await
+        .unwrap();
+    assert!(record.is_some_and(|r| !r.retracted), "record must survive");
+    assert!(dev_commits.read_dir().unwrap().next().is_some());
 }

@@ -52,6 +52,14 @@ Verb semantics make the class grant exact: class targeting matches pre ∪ post 
 | `--space <id>` | Attach the policy class to this space's grant on the dataset (hosted stacks; requires `--remote`). Merges with existing grant classes, never clobbers |
 | `--dry-run` | Print the compiled JSON-LD without transacting |
 
+For a virtual graph source (Iceberg / SQL), `<DATASET>` is the source's **model
+ledger** — the ledger named by `--model` when the source was mapped — since the
+source has no ledger of its own to hold policies. The `read` profile's
+`--connected` gate compiles to an `f:query`, which a virtual source cannot
+evaluate; `enable` warns when a registered source is governed by the model, and
+the gate hides the class there. Use a static profile for sources. See
+[Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
+
 Three class-shaped things are in play, with distinct roles: `--class` restricts *what data* is governed, `--property` optionally narrows it to columns, and the **policy class** selects *which policy set a request runs under* (via space grants / token `policy-class`).
 
 ### Semantics of re-running
@@ -114,7 +122,7 @@ Each `--property` spec is `"<iri> [type] [required] [in[v1,v2,...]]"` where type
 | `--closed` | Closed shape: instances may carry ONLY the declared properties (`rdf:type` excepted). Recommended for app-writable entities |
 | `--dry-run` | Print the compiled JSON-LD without transacting |
 
-> **Enforcement note:** Fluree runs SHACL at transaction time once any shapes exist in a ledger (reject mode by default). Defining an entity is not just documentation — it activates validation for its class. Existing data is not retro-validated; `fluree validate` produces a full report.
+> **Enforcement note:** Fluree runs SHACL at transaction time only where the ledger config enables it (`f:shaclEnabled true`; see [Enabling SHACL](../ledger-config/writing-config.md#enabling-shacl)). Defining an entity does not by itself activate validation; where SHACL is enabled, transactions that violate the entity's shape are rejected (reject mode by default). Existing data is not retro-validated; `fluree validate` produces a full report.
 
 Re-running `define` replaces the shape and its property shapes atomically — constraints from a previous definition (`sh:closed`, `sh:minCount`, `sh:in`, …) do not survive a re-run that dropped them. The entity class node itself is shared authorship with `model class define` and stays additive.
 

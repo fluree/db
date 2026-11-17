@@ -62,12 +62,12 @@ async fn apply_index<S: Storage + Clone + 'static>(
     // Extract metadata from FIR6 root
     let root = fluree_db_binary_index::IndexRoot::decode(&bytes).expect("decode FIR6 root");
     let meta = LedgerSnapshotMetadata {
-        ledger_id: root.ledger_id,
+        ledger_id: fluree_db_api::LedgerId::parse(&root.ledger_id).unwrap(),
         t: root.index_t,
         base_t: root.base_t,
         namespace_codes: root.namespace_codes.into_iter().collect(),
         ns_split_mode: root.ns_split_mode,
-        stats: root.stats,
+        stats: root.stats.map(std::sync::Arc::new),
         schema: root.schema,
         subject_watermarks: root.subject_watermarks,
         string_watermark: root.string_watermark,
@@ -76,6 +76,8 @@ async fn apply_index<S: Storage + Clone + 'static>(
         annotation_index: root.annotation_index.clone(),
         had_annotation_arena: root.had_annotation_arena,
         has_list_meta: root.has_list_meta,
+        graph_drops: root.graph_drops.clone(),
+        index_root_id: Some(root_id.clone()),
     };
     let mut db = LedgerSnapshot::new_meta(meta).expect("seed graph registry from root");
     db.range_provider = Some(Arc::new(provider));
@@ -1222,6 +1224,190 @@ async fn large_retype_batch_defers_to_rebuild_and_stays_correct() {
                 ),
                 Some(2),
                 "alice+bob now Employee.worksFor -> Organization"
+            );
+        })
+        .await;
+}
+
+/// #1266 — the rebuild gate scales with the index: a batch re-typing a small
+/// share of a ledger's typed subjects stays incremental even when it exceeds
+/// the configured floor, and a batch re-typing a large share still defers to a
+/// rebuild. Both stay current-state-correct.
+#[tokio::test(flavor = "current_thread")]
+async fn retype_gate_scales_with_typed_subjects() {
+    let (spans, _guard) = crate::support::span_capture::init_test_tracing();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    // Floor of 1, over 41 typed subjects: the gate opens past 41 / 8 = 5.
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small().with_incremental_retype_max_subjects(1),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    const FALLBACK: &str = "incremental indexing failed, falling back to full rebuild";
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/retype-gate-scales:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let mut people: Vec<JsonValue> = (0..40)
+                .map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Person", "ex:worksFor": {"@id": "ex:org1"}}))
+                .collect();
+            people.push(json!({"@id": "ex:org1", "@type": "ex:Organization"}));
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@graph": people}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert people");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            let retype = |ids: std::ops::Range<usize>| {
+                let ids: Vec<usize> = ids.collect();
+                json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "delete": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Person"})).collect::<Vec<_>>(),
+                    "insert": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Employee"})).collect::<Vec<_>>(),
+                })
+            };
+            let mut ledger = r1.ledger;
+            for (ids, falls_back, people, employees) in [(0..2, false, 38, 2), (2..9, true, 31, 9)] {
+                let before = spans.find_events(FALLBACK).len();
+                let r = fluree
+                    .update_with_opts(
+                        ledger,
+                        &retype(ids.clone()),
+                        TxnOpts::default(),
+                        CommitOpts::default(),
+                        &index_cfg,
+                    )
+                    .await
+                    .expect("retype");
+                let outcome =
+                    trigger_index_and_wait_outcome(&handle, r.ledger.ledger_id(), r.receipt.t)
+                        .await;
+                let fluree_db_api::IndexOutcome::Completed { root_id, .. } = outcome else {
+                    unreachable!("helper only returns Completed")
+                };
+                assert_eq!(
+                    spans.find_events(FALLBACK).len() > before,
+                    falls_back,
+                    "re-typing {} of 41 typed subjects: rebuild fallback expected = {falls_back}",
+                    ids.len()
+                );
+                let loaded = load_ledger_snapshot(&storage, &root_id.expect("root"), ledger_id)
+                    .await
+                    .expect("load snapshot");
+                assert_eq!(class_count(&loaded, "http://example.org/Person"), Some(people));
+                assert_eq!(class_count(&loaded, "http://example.org/Employee"), Some(employees));
+                assert_eq!(
+                    ref_class_total(
+                        &loaded,
+                        "http://example.org/Employee",
+                        "http://example.org/worksFor",
+                        "http://example.org/Organization"
+                    ),
+                    Some(employees),
+                    "re-typed subjects' edges move to Employee"
+                );
+                ledger = r.ledger;
+            }
+        })
+        .await;
+}
+
+/// #1266 — the rebuild gate's share counts typed subjects, not class
+/// memberships: with nine types per subject, re-typing 6 of 41 subjects
+/// passes an eighth of the subjects and defers to a rebuild.
+#[tokio::test(flavor = "current_thread")]
+async fn retype_gate_counts_subjects_not_class_memberships() {
+    let (spans, _guard) = crate::support::span_capture::init_test_tracing();
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let path = tmp.path().to_string_lossy().to_string();
+    let mut fluree = FlureeBuilder::file(path)
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .as_arc_indexing_nameservice()
+            .expect("test fluree has writable nameservice"),
+        fluree_db_indexer::IndexerConfig::small().with_incremental_retype_max_subjects(1),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+    const FALLBACK: &str = "incremental indexing failed, falling back to full rebuild";
+
+    local
+        .run_until(async move {
+            let ledger_id = "it/retype-gate-subjects:main";
+            let ledger0 = genesis_ledger_for_fluree(&fluree, ledger_id);
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let types: Vec<String> = std::iter::once("ex:Person".to_string())
+                .chain((0..8).map(|k| format!("ex:Tag{k}")))
+                .collect();
+            let people: Vec<JsonValue> = (0..41)
+                .map(|i| json!({"@id": format!("ex:p{i}"), "@type": types, "ex:worksFor": {"@id": "ex:org1"}}))
+                .collect();
+            let r1 = fluree
+                .insert_with_opts(
+                    ledger0,
+                    &json!({"@context": {"ex": "http://example.org/"}, "@graph": people}),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert people");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r1.ledger.ledger_id(), r1.receipt.t).await;
+
+            let ids: Vec<usize> = (0..6).collect();
+            let retype = json!({
+                "@context": {"ex": "http://example.org/"},
+                "delete": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Person"})).collect::<Vec<_>>(),
+                "insert": ids.iter().map(|i| json!({"@id": format!("ex:p{i}"), "@type": "ex:Employee"})).collect::<Vec<_>>(),
+            });
+            let before = spans.find_events(FALLBACK).len();
+            let r2 = fluree
+                .update_with_opts(
+                    r1.ledger,
+                    &retype,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("retype");
+            let _ =
+                trigger_index_and_wait_outcome(&handle, r2.ledger.ledger_id(), r2.receipt.t).await;
+            assert!(
+                spans.find_events(FALLBACK).len() > before,
+                "re-typing 6 of 41 subjects (9 types each) must defer to a rebuild"
             );
         })
         .await;
@@ -2556,6 +2742,133 @@ async fn ndv_cardinality_estimates_are_accurate() {
             assert!(
                 (18..=22).contains(&status_ndv_subjects),
                 "ex:status ndv_subjects should be ~20, got {status_ndv_subjects}"
+            );
+        })
+        .await;
+}
+
+/// The flat property roll-up the planner reads (`IndexStats::properties`)
+/// must keep its ndv across an incremental build over a base root without
+/// HLL sketches — a bulk import (only a full rebuild uploads sketches). The
+/// incremental seeds such properties with empty registers and clamps their
+/// ndv to the base estimate; the roll-up used to be taken before that clamp,
+/// so every untouched property published ndv 0 and the planner fell back to
+/// its 10-row bound-subject estimate — one write to a bulk-imported BSBM
+/// ledger made Explore Q5 4x slower.
+#[tokio::test]
+async fn flat_property_ndv_survives_incremental_over_sketchless_base() {
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let data_dir = tempfile::TempDir::new().expect("data tempdir");
+    let mut nt = String::new();
+    for i in 0..20 {
+        nt.push_str(&format!(
+            "<http://example.org/person{i}> <http://example.org/name> \"Person {i}\" .\n\
+             <http://example.org/person{i}> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.org/Person> .\n"
+        ));
+    }
+    std::fs::write(data_dir.path().join("00-people.nt"), nt).expect("write nt");
+
+    let mut fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file fluree");
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+    fluree.set_indexing_mode(fluree_db_api::tx::IndexingMode::Background(handle.clone()));
+
+    local
+        .run_until(async move {
+            let ledger_id = "test/ndv-incremental:main";
+            fluree
+                .create(ledger_id)
+                .import(data_dir.path())
+                .threads(1)
+                .memory_budget_mb(256)
+                .cleanup(false)
+                .execute()
+                .await
+                .expect("import");
+            let storage = fluree
+                .backend()
+                .admin_storage_cloned()
+                .expect("test uses managed backend");
+
+            let flat_name_stat = |loaded: &LedgerSnapshot| -> (u64, u64, u64) {
+                loaded
+                    .stats
+                    .as_ref()
+                    .and_then(|s| s.properties.as_ref())
+                    .and_then(|props| {
+                        props.iter().find(|p| {
+                            let sid = fluree_db_core::Sid::new(p.sid.0, &p.sid.1);
+                            loaded
+                                .decode_sid(&sid)
+                                .map(|iri| iri == "http://example.org/name")
+                                .unwrap_or(false)
+                        })
+                    })
+                    .map(|p| (p.count, p.ndv_values, p.ndv_subjects))
+                    .expect("ex:name property should exist in the flat roll-up")
+            };
+
+            let base_view = fluree.db(ledger_id).await.expect("imported view");
+            let (base_count, base_ndv_values, base_ndv_subjects) =
+                flat_name_stat(&base_view.snapshot);
+            assert_eq!(base_count, 20);
+            assert!(
+                (18..=22).contains(&base_ndv_subjects) && (18..=22).contains(&base_ndv_values),
+                "base ndv ~20: values {base_ndv_values}, subjects {base_ndv_subjects}"
+            );
+
+            // One unrelated write, indexed incrementally over the sketchless base.
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let ledger1 = fluree
+                .ledger(ledger_id)
+                .await
+                .expect("load imported ledger");
+            let delta = fluree
+                .insert_with_opts(
+                    ledger1,
+                    &json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "@id": "ex:note1",
+                        "ex:note": "pending"
+                    }),
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert delta");
+            let outcome =
+                trigger_index_and_wait_outcome(&handle, delta.ledger.ledger_id(), delta.receipt.t)
+                    .await;
+            let fluree_db_api::IndexOutcome::Completed { root_id, .. } = outcome else {
+                unreachable!("helper only returns Completed")
+            };
+            let delta_root = root_id.expect("delta root id");
+            let delta_loaded = load_ledger_snapshot(&storage, &delta_root, ledger_id)
+                .await
+                .expect("load delta root");
+            assert!(
+                delta_loaded.t > base_view.snapshot.t,
+                "the write must publish a newer root"
+            );
+            let (count, ndv_values, ndv_subjects) = flat_name_stat(&delta_loaded);
+            assert_eq!(count, 20, "ex:name count is untouched by the write");
+            assert_eq!(
+                (ndv_values, ndv_subjects),
+                (base_ndv_values, base_ndv_subjects),
+                "ex:name ndv must carry forward through the incremental build"
             );
         })
         .await;

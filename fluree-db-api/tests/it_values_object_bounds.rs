@@ -8,11 +8,10 @@
 //!    (materializing every row, including wide payloads) and the tiny VALUES
 //!    filtered afterwards — measured 1,600x slower than the equivalent
 //!    `FILTER ?v IN (...)` on a 129k-edge two-bound-endpoint join. Such
-//!    VALUES now lower to membership filters (see
-//!    `convert_star_values_to_membership_filters` in fluree-db-query; the
-//!    plan-shape pins live in that crate's unit tests). The tests here pin
-//!    the SEMANTICS the conversion must preserve: identical rows to the
-//!    filter form, duplicate-row multiplicity, and UNDEF match-any.
+//!    Small, selective object VALUES now seed object probes, and the other
+//!    VALUES join before unconstrained payload columns. The plan and fuel pins
+//!    below exercise two MULTI-ROW tables (a singleton uses a separate fold).
+//!    The joins retain duplicate-row multiplicity and UNDEF match-any.
 //!
 //! 2. `FILTER(?v IN (<iri> ...))` matched NOTHING against index-encoded
 //!    bindings: `eval_in` compared an `EncodedSid`/`Sid` row value against a
@@ -93,6 +92,163 @@ async fn run(fluree: &fluree_db_api::Fluree, sparql: &str) -> Vec<JsonValue> {
 fn sorted(mut rows: Vec<JsonValue>) -> Vec<JsonValue> {
     rows.sort_by_key(std::string::ToString::to_string);
     rows
+}
+
+/// The report's two-endpoint shape, including an edge with only its first
+/// endpoint in the set so dropping the second constraint cannot pass.
+async fn seed_endpoint_report(fluree: &fluree_db_api::Fluree, n: usize, indexed: bool) {
+    let ledger = genesis_ledger(fluree, LEDGER_ID);
+    let graph: Vec<_> = (0..n)
+        .map(|i| {
+            let (a, b) = match i {
+                0 => (entity_a(), entity_b()),
+                1 => (entity_b(), entity_a()),
+                2 => (entity_a(), entity_c()),
+                _ => (iri(i * 2), iri(i * 2 + 1)),
+            };
+            json!({
+            "@id": format!("http://example.org/edge/{i}"),
+            "ns:entity1": {"@id": a}, "ns:entity2": {"@id": b},
+            "ns:tag": ["one", "two"],
+            "ns:snap": format!("snapshot {i} {}", "x".repeat(256))
+            })
+        })
+        .collect();
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ns": "http://example.org/ns#"}, "@graph": graph
+            }),
+        )
+        .await
+        .unwrap();
+    if indexed {
+        rebuild_and_publish_index(fluree, LEDGER_ID).await;
+    }
+}
+
+fn endpoint_query(select: &str, values: &str) -> String {
+    // Payload deliberately first in source order.
+    format!(
+        "PREFIX ns: <http://example.org/ns#> SELECT {select} FROM <{LEDGER_ID}> WHERE {{
+        {values} ?ev ns:snap ?snap ; ns:entity1 ?a ; ns:entity2 ?b . }}"
+    )
+}
+
+fn physical_ops(plan: &JsonValue) -> Vec<String> {
+    let mut ops = vec![plan["op"].as_str().unwrap().to_owned()];
+    if let Some(children) = plan["children"].as_array() {
+        for edge in children {
+            ops.extend(physical_ops(&edge["node"]));
+        }
+    }
+    ops
+}
+
+#[tokio::test]
+async fn multirow_object_values_probe_before_payload_on_both_storage_paths() {
+    assert_index_defaults();
+    for indexed in [false, true] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        seed_endpoint_report(&fluree, 6_000, indexed).await;
+        let (a, b) = (entity_a(), entity_b());
+        let values = format!("VALUES ?a {{ <{a}> <{b}> }} VALUES ?b {{ <{a}> <{b}> }}");
+        let q = endpoint_query("?a ?b ?snap", &values);
+        // EXPLAIN currently reads snapshot stats only; runtime planning also
+        // assembles novelty stats. Pin its tree on the indexed path and actual
+        // execution fuel on BOTH paths.
+        if indexed {
+            let explain = fluree.explain_connection_sparql(&q).await.unwrap();
+            assert_eq!(
+                physical_ops(&explain["plan"]["physical"]),
+                vec![
+                    "ProjectOperator",
+                    "NestedLoopJoinOperator",
+                    "ValuesOperator",
+                    "NestedLoopJoinOperator",
+                    "NestedLoopJoinOperator",
+                    "ValuesOperator",
+                    "EmptyOperator",
+                ],
+                "indexed={indexed}: {explain}"
+            );
+        }
+        let r = fluree
+            .query_from()
+            .sparql(&q)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap();
+        assert_eq!(r.status, 200);
+        let rows = sorted(r.result["results"]["bindings"].as_array().unwrap().clone());
+        assert_eq!(rows.len(), 2);
+        // Per-row charges expose full scans even when everything is cached.
+        assert!(
+            r.fuel.unwrap() < 3.0,
+            "indexed={indexed}: fuel {:?}",
+            r.fuel
+        );
+        let filter = endpoint_query(
+            "?a ?b ?snap",
+            &format!("VALUES ?a {{ <{a}> <{b}> }} FILTER(?b IN (<{a}>, <{b}>))"),
+        );
+        assert_eq!(rows, sorted(run(&fluree, &filter).await));
+        // Projection pruning must keep both endpoint constraints alive.
+        assert_eq!(
+            run(&fluree, &endpoint_query("?snap", &values)).await.len(),
+            2
+        );
+        // An unprojected multi-valued property still multiplies a SELECT bag.
+        let fanout = format!("{values} ?ev ns:tag ?tag .");
+        assert_eq!(
+            run(&fluree, &endpoint_query("?snap", &fanout)).await.len(),
+            4
+        );
+        assert_eq!(
+            run(&fluree, &endpoint_query("DISTINCT ?snap", &fanout))
+                .await
+                .len(),
+            2
+        );
+        let duplicate =
+            format!("VALUES ?a {{ <{a}> <{a}> <{b}> }} VALUES ?b {{ <{a}> <{b}> <{b}> }}");
+        assert_eq!(
+            run(&fluree, &endpoint_query("?a ?b ?snap", &duplicate))
+                .await
+                .len(),
+            5
+        );
+        assert_eq!(
+            run(&fluree, &endpoint_query("DISTINCT ?snap", &duplicate))
+                .await
+                .len(),
+            2
+        );
+        let wildcard = format!("VALUES ?a {{ <{a}> <{b}> }} VALUES ?b {{ <{a}> <{b}> UNDEF }}");
+        assert_eq!(
+            run(&fluree, &endpoint_query("?a ?b ?snap", &wildcard))
+                .await
+                .len(),
+            5
+        );
+        let absent = format!("VALUES ?a {{ <{a}> <{b}> }} VALUES ?b {{ <http://example.org/missing1> <http://example.org/missing2> }}");
+        assert!(run(&fluree, &endpoint_query("?snap", &absent))
+            .await
+            .is_empty());
+        let correlated = format!(
+            "VALUES ?a {{ <{a}> <{b}> }} VALUES (?b ?tag) {{ (<{b}> \"one\") (<{a}> \"two\") }}"
+        );
+        let rows = run(&fluree, &endpoint_query("?b ?tag", &correlated)).await;
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            assert_eq!(
+                row["tag"]["value"],
+                if row["b"]["value"] == b { "one" } else { "two" }
+            );
+        }
+    }
 }
 
 /// The report's core claim: binding both endpoints of an edge with two

@@ -2,12 +2,19 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, next]
   pull_request:
-    branches: [main]
+    branches: [main, next]
 
+# Superseded pushes to main should cancel stale CI just like PR updates do.
+# Cache note: `save-if: main` still fires on a cancelled main job, because
+# `cache-on-failure: true` makes rust-cache's post step run on any status.
+# A burst of merges can therefore save a partially built target dir under
+# the exact key; later main runs hit that key and skip saving until
+# Cargo.lock, the toolchain, or another keyed input changes. Degraded, not
+# cold: PRs still restore whatever was saved.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 env:
@@ -19,84 +26,140 @@ env:
   # every compiling job below installs it via `rui314/setup-mold`.
   RUSTFLAGS: "-C link-arg=-fuse-ld=mold"
 
+# Save dependency caches on main; PRs restore them without filling the cache
+# quota with copies that other PRs and main cannot reuse. `next` deliberately
+# does not save either: the repo already sits at the cache quota, and its runs
+# fall back to main's caches.
 jobs:
-  fmt:
-    runs-on: ubuntu-latest
+  workflow-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - name: Install actionlint
+        working-directory: ${{ runner.temp }}
+        run: |
+          curl --fail --silent --show-error --location --retry 3 \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+            --output actionlint.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint.tar.gz" | sha256sum --check
+          mkdir -p actionlint-bin
+          tar -xzf actionlint.tar.gz -C actionlint-bin actionlint
+          echo "$RUNNER_TEMP/actionlint-bin" >> "$GITHUB_PATH"
+      - name: Validate GitHub Actions workflows
+        run: actionlint -shellcheck= -pyflakes=
+
+  fmt:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - name: Format
         run: cargo fmt --all -- --check
 
   clippy:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          # Avoid spending a minute deleting SDKs when the runner has room.
+          available_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if [ "$available_kb" -lt 15728640 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force
+          fi
+          df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Clippy
-        run: cargo clippy --all --all-features --all-targets -- -D warnings
+        run: cargo clippy --all --all-features --all-targets --locked -- -D warnings
+
+      # Clippy and the nextest job are both --all-features, so a target
+      # that only fails to compile under DEFAULT features (e.g. an example
+      # using feature-gated API without a `required-features` gate) is
+      # invisible to them. This compiles the shape a contributor's bare
+      # `cargo test -p <crate>` reaches first. Keep it alongside Clippy so it
+      # runs in parallel with nextest instead of extending the test job.
+      - name: Check (default features)
+        run: cargo check --workspace --all-targets --locked
+
+      # The server's optional features (sql, iceberg, delta, ...) are all on in
+      # the steps above, so a module gated by the wrong `#[cfg]` stays
+      # invisible. Build it with none of them.
+      - name: Check (server, no optional features)
+        run: cargo check -p fluree-db-server --no-default-features --features native --locked
 
   test:
-    runs-on: ubuntu-latest
+    # 8 cores / 32 GB: the workspace compile and nextest run are the CI critical path.
+    runs-on: ci-cd-large
     # Backstop so a hung/deadlocked test can never hold a runner for the full
     # 6h default again. Per-test kills are handled by `slow-timeout` in
     # `.config/nextest.toml`; this is the job-level safety net.
     timeout-minutes: 45
+    # moto mocks S3 and the AWS Glue Data Catalog for `it_iceberg_glue_moto`
+    # (fluree-db-api, feature `glue-moto`), which replays a committed
+    # Glue-written Iceberg fixture into it. `glue_moto_is_configured_in_ci` fails
+    # if FLUREE_GLUE_MOTO is set without the endpoint, so a skipped run cannot
+    # read as a pass.
+    services:
+      moto:
+        image: motoserver/moto:5.2.3
+        ports:
+          - 5000:5000
+    env:
+      FLUREE_GLUE_MOTO: "1"
+      FLUREE_GLUE_LOCAL_ENDPOINT: http://127.0.0.1:5000
     steps:
-      - name: Free disk space
+      - name: Runner capacity
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          nproc
+          free -h
+          df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
 
       - name: Test
-        run: cargo nextest run --workspace --all-features --no-fail-fast
+        run: cargo nextest run --workspace --all-features --no-fail-fast --locked
 
-      # Clippy and the nextest run above are both --all-features, so a target
-      # that only fails to compile under DEFAULT features (e.g. an example
-      # using feature-gated API without a `required-features` gate) is
-      # invisible to them. This compiles the shape a contributor's bare
-      # `cargo test -p <crate>` reaches first.
-      - name: Check (default features)
-        run: cargo check --workspace --all-targets
+      # Nextest does not execute rustdoc examples. Reuse the all-feature build
+      # above so public API examples cannot silently stop compiling or running.
+      - name: Documentation tests
+        timeout-minutes: 10
+        run: cargo test --workspace --all-features --doc --locked
 
   testsuite-sparql:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 55
     steps:
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          # Avoid spending a minute deleting SDKs when the runner has room.
+          available_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if [ "$available_kb" -lt 15728640 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force
+          fi
+          df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: true
 
@@ -105,6 +168,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: "testsuite-sparql -> target"
 
       - name: Format
@@ -129,18 +193,22 @@ jobs:
     # fluree-sql-bridge is a standalone workspace (it links sqlx + three
     # database drivers, none of which belong in the fluree binary), so the
     # workspace gates above never reach it.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # SQLite exercises the protocol in-process, but it is the one backend whose
     # string literals cannot misbehave. The escaping rule the bridge enforces
     # (NO_BACKSLASH_ESCAPES on MySQL) is only observable against a real server,
     # so both are supplied here. `server_backends_are_configured_in_ci` fails if
     # these ever stop being set, so a skipped test cannot read as a pass.
+    # Both servers run five hours behind UTC so that a zoned literal or value
+    # which silently lost its zone is off by five hours, not by nothing.
     services:
       mysql:
         image: mysql:8
         env:
           MYSQL_ROOT_PASSWORD: fluree
           MYSQL_DATABASE: bridge_test
+          TZ: America/New_York
         ports:
           - 3306:3306
         options: >-
@@ -153,6 +221,7 @@ jobs:
         env:
           POSTGRES_PASSWORD: fluree
           POSTGRES_DB: bridge_test
+          TZ: America/New_York
         ports:
           - 5432:5432
         options: >-
@@ -161,13 +230,16 @@ jobs:
           --health-timeout=5s
           --health-retries=30
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
       - uses: rui314/setup-mold@v1
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          workspaces: "fluree-sql-bridge -> target"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          workspaces: |
+            fluree-sql-bridge -> target
+            . -> target
 
       - name: Format
         working-directory: fluree-sql-bridge
@@ -184,121 +256,41 @@ jobs:
           FLUREE_BRIDGE_POSTGRES_URL: postgres://postgres:fluree@127.0.0.1:5432/bridge_test
         run: cargo test
 
-  bench-paths:
-    # Cost gate for bench-compare below, which is a ~30-minute job. GitHub's
-    # `paths:` filter is workflow-scoped and the rest of this workflow must run
-    # on every PR, so the filter lives here as a job output instead. Kept in
-    # ci.yml (rather than split into its own workflow) so the perf gate stays
-    # visible alongside the other required checks.
-    #
-    # Deliberately inclusive — a false positive costs one bench run, a false
-    # negative lets a regression through. Cargo.toml/Cargo.lock are in the list
-    # because a dependency or profile change moves timings without touching a
-    # single engine file.
-    runs-on: ubuntu-latest
-    outputs:
-      run: ${{ steps.filter.outputs.run }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - id: filter
+      # The SQL pushdown lane's golden tests pin statements against a fake
+      # endpoint; only a real database can confirm those statements return
+      # the rows the per-scan lane returns and the rows the fake pinned. The
+      # bridge is already built here, so run one over each database (an empty
+      # SQLite file, and the two services) and replay every lane case through
+      # all three, and the set-semantics cases (tables repeating triples)
+      # against a native ledger. The tests seed their own tables and skip
+      # loudly when a URL is unset; `live_bridge_backends_are_configured_in_ci`
+      # fails if any of the three is missing, so a skipped backend cannot read
+      # as a pass.
+      - name: Start a bridge over each database
+        run: |
+          bridge=fluree-sql-bridge/target/debug/fluree-sql-bridge
+          "$bridge" --database "sqlite://$RUNNER_TEMP/lane.db?mode=rwc" --listen 127.0.0.1:18080 &
+          "$bridge" --database "postgres://postgres:fluree@127.0.0.1:5432/bridge_test" --listen 127.0.0.1:18081 &
+          "$bridge" --database "mysql://root:fluree@127.0.0.1:3306/bridge_test" --listen 127.0.0.1:18082 &
+          for port in 18080 18081 18082; do
+            up=
+            for i in $(seq 1 60); do
+              if curl -sf "http://127.0.0.1:$port/v1/info" >/dev/null; then up=1; break; fi
+              sleep 1
+            done
+            if [ -z "$up" ]; then echo "bridge on $port did not come up" >&2; exit 1; fi
+          done
+
+      - name: Pushdown lane differential against SQLite, Postgres and MySQL
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        run: |
-          set -euo pipefail
-          # Pushes to main always run: main is where baselines are captured from.
-          if [ "${{ github.event_name }}" != "pull_request" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            echo "not a pull_request — running bench-compare"
-            exit 0
-          fi
-          changed="$(git diff --name-only "$BASE_SHA"...HEAD)"
-          echo "changed files:"; echo "$changed"
-          if echo "$changed" | grep -qE '^(fluree-db-query|fluree-db-api|fluree-db-core|fluree-db-novelty|fluree-db-binary-index|fluree-db-indexer|fluree-bench-[a-z-]+)/|^bench-baselines/|^regression-budget\.json$|^Cargo\.(toml|lock)$|^\.github/workflows/(ci|bench)\.yml$'; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-            echo "no perf-relevant paths changed — skipping bench-compare"
-          fi
-
-  bench-compare:
-    # Cheap per-PR perf gate. Runs the two cheapest benches at tiny/quick and
-    # compares against the committed baseline.
-    #
-    # Both metrics enforce ONLY when the baseline's host_class matches this
-    # runner's. It currently does not — the committed baseline is
-    # host_class=local — so on every PR today both wall-clock TIME and
-    # PEAK_MEM breaches print as ::warning:: annotations and the job exits 0.
-    # That downgrade is now explicit (`--allow-host-mismatch`) rather than
-    # implicit: comparing absolute numbers across host classes is a refusal by
-    # default, and a job that wants the annotations has to say so.
-    #
-    # Why not gate on memory now: shared ubuntu-latest runners flap, and a
-    # tracking allocator's peak moves with allocator behaviour, page size, and
-    # background load. The ±2.2% cross-machine figure this gate was first built
-    # on is one measurement between two specific machines, not a portability
-    # result — gating on it would fail unrelated PRs with no obvious cause, and
-    # it would be the LESS portable of the two signals doing the blocking.
-    #
-    # Capture a ci-ubuntu-latest baseline (bench.yml's workflow_dispatch capture
-    # job) and commit it, and both metrics flip to enforcing automatically —
-    # no code change. See BENCHMARKING.md, "Baselines: capture & compare".
-    #
-    # The committed baseline contains exactly this cheap subset, so `compare`
-    # needs no `--only`. Full workspace + medium: nightly.
-    needs: bench-paths
-    if: needs.bench-paths.outputs.run == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    env:
-      FLUREE_BENCH_PROFILE: quick
-      FLUREE_BENCH_SCALE: tiny
-      # CI-class marker. The committed baseline is host_class=local, so this
-      # mismatch is what makes both metrics advisory today.
-      # (FLUREE_BENCH_RUNNER_CLASS is still read as the pre-rename spelling.)
-      FLUREE_BENCH_HOST_CLASS: ci-ubuntu-latest
-    steps:
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
-
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-on-failure: true
-
-      # Clear stale sidecars first: rust-cache persists target/ across runs, and
-      # compare must not merge a mem number from a bench not rerun this session
-      # (review item 10), nor a corpus block from a run that never read that
-      # corpus. Then run the two cheap benches (writes criterion timings + fresh
-      # sidecars).
-      - name: Run cheap benches (tiny, quick)
-        run: |
-          rm -rf target/fluree-bench-mem target/fluree-bench-meta
-          cargo bench -p fluree-db-api --bench query_overlay_matrix
-          cargo bench -p fluree-db-api --bench query_hot_bsbm
-
-      # Compare against the committed baseline. Exit 1 on any breach of a metric
-      # the host-class match makes enforcing, 2 on a refusal to compare.
-      #
-      # --allow-host-mismatch is the phase-1 posture and nothing else: the
-      # committed baseline is host_class=local, this runner is
-      # ci-ubuntu-latest, and without the flag the job would refuse outright.
-      # DROP THIS FLAG once a ci-ubuntu-latest baseline is committed (bench.yml's
-      # bench-capture job) — the flag is what stands between annotations and a
-      # real gate. Phase-share drift enforces either way.
-      - name: Compare against committed baseline
-        run: |
-          cargo run -p fluree-bench-support --bin bench-baseline -- \
-            compare --baseline bench-baselines/guardrails-pre.json \
-            --allow-host-mismatch
+          # `live_bridge_backends_are_configured_in_ci` keys on this marker to
+          # know it is in the job that starts the bridges, and then requires all
+          # three URLs below. Keep them together.
+          FLUREE_LIVE_BRIDGE: "1"
+          FLUREE_SQL_BRIDGE_URL: http://127.0.0.1:18080
+          FLUREE_SQL_BRIDGE_POSTGRES_URL: http://127.0.0.1:18081
+          FLUREE_SQL_BRIDGE_MYSQL_URL: http://127.0.0.1:18082
+        run: cargo test -p fluree-db-api --features sql,native --test it_sql_pushdown_lane --test it_sql_graph_source --test it_sql_set_semantics live_bridge
 
   # Keeps the wasm32-unknown-unknown build honest: the whole engine stack must
   # keep compiling for the browser target (fluree-db-api pulls every wasm-path
@@ -309,7 +301,7 @@ jobs:
   # otherwise mask the target-scoped `getrandom_backend` cfg from
   # .cargo/config.toml — so the cfg is restated explicitly.
   wasm32:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     env:
       # -D warnings: `cargo check` exits 0 on warnings, so without this the
@@ -317,7 +309,7 @@ jobs:
       # stay cap-linted, so only workspace code is gated).
       RUSTFLAGS: -D warnings --cfg getrandom_backend="wasm_js"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
@@ -325,12 +317,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             . -> target
             wasm-probe -> target
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack
+          tool: wasm-pack@0.13.1
 
       # clippy, not check: `cargo check` cannot see clippy-only lints, and
       # nothing else runs clippy against the wasm32 target. Three of those
@@ -357,6 +350,95 @@ jobs:
       - name: Runtime smoke (wasm32 under Node)
         run: node wasm-probe/run-node.mjs
 
+  python:
+    # The `fluree` Python package is tested by pytest (its Rust lib is
+    # `test = false`), so no job above runs its tests. One abi3 wheel per OS
+    # the package ships on (python-release.yml), tested on the oldest and
+    # newest supported Pythons. A debug build: the release profile's LTO costs
+    # minutes and buys nothing for a test run. Windows runs here so a
+    # Unix-only assumption fails a PR, not a release.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            rustflags: "-C link-arg=-fuse-ld=mold"
+          # mold is Linux-only; clear the workflow-level linker flag.
+          - os: macos-26
+            rustflags: ""
+          - os: windows-2025
+            rustflags: ""
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      RUSTFLAGS: ${{ matrix.rustflags }}
+    steps:
+      - if: runner.os == 'Windows'
+        run: git config --global core.longpaths true
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+          cache-on-failure: true
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-python@v7
+        id: py310
+        with:
+          python-version: "3.10"
+      - uses: actions/setup-python@v7
+        id: py314
+        with:
+          python-version: "3.14"
+
+      - name: Build the wheel
+        shell: bash
+        run: |
+          py="${{ steps.py314.outputs.python-path }}"
+          "$py" -m pip install "maturin>=1.9,<2"
+          "$py" -m maturin build --locked --manifest-path fluree-db-python/Cargo.toml --out dist
+          "$py" -c 'import glob, zipfile; names = zipfile.ZipFile(glob.glob("dist/*.whl")[0]).namelist(); assert any(n.endswith(".dist-info/licenses/LICENSE") for n in names), "the wheel carries no LICENSE"'
+
+      # As in python-release.yml: a release's wheel would build for macOS 11
+      # with no error, so the floor is checked on every PR too.
+      - name: The macOS wheel targets macOS 14
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          whl=$(ls dist/*.whl); [[ $whl == *-macosx_14_0_arm64.whl ]]
+          unzip -q -o "$whl" 'fluree/*.so' -d "$RUNNER_TEMP/whl"
+          vtool -show-build "$RUNNER_TEMP"/whl/fluree/*.so | grep 'minos 14.0'
+
+      - name: Test on Python 3.10 and 3.14
+        shell: bash
+        run: |
+          for v in 310 314; do
+            [ $v = 310 ] && py="${{ steps.py310.outputs.python-path }}" || py="${{ steps.py314.outputs.python-path }}"
+            "$py" -m venv "venv-$v"
+            bin="venv-$v/bin"; [ "$RUNNER_OS" = Windows ] && bin="venv-$v/Scripts"
+            "$bin/python" -m pip install dist/*.whl pytest pandas polars
+            "$bin/python" -m pytest fluree-db-python/tests
+          done
+
+      # The package ships `py.typed`, so its annotations are part of the API.
+      - name: Type-check the package
+        if: runner.os == 'Linux'
+        working-directory: fluree-db-python
+        run: |
+          ../venv-314/bin/pip install mypy pandas-stubs polars
+          ../venv-314/bin/python -m mypy
+
+      # Published by docs.yml. Strict, so a docstring reference that resolves
+      # nowhere fails here rather than rendering as plain text.
+      - name: Build the API reference
+        if: runner.os == 'Linux'
+        working-directory: fluree-db-python
+        run: |
+          ../venv-314/bin/pip install -r docs/requirements.txt
+          ../venv-314/bin/python -m sphinx -n -W --keep-going -q -b html docs "$RUNNER_TEMP/python-api"
+
   # Executes the browser build (the wasm32 job only proves it compiles).
   # 1. The playground binding runs create → insert → query → format inside a
   #    dedicated worker in headless Chrome (wasm-bindgen-test, assertions on
@@ -364,34 +446,35 @@ jobs:
   # 2. The SHIPPED npm package (main-thread proxy → module worker → wasm) is
   #    driven end to end over the DevTools protocol with no COOP/COEP headers,
   #    which is the package's hosting contract.
-  # ubuntu-latest ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
+  # ubuntu-24.04 ships a matching Chrome + chromedriver pair. Same RUSTFLAGS
   # restatement as the wasm32 job (an env RUSTFLAGS masks .cargo/config.toml).
   wasm-smoke:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     env:
       RUSTFLAGS: --cfg getrandom_backend="wasm_js"
     steps:
       # This job carries a wasm32 target dir AND a native one (the peer
-      # gate's server binary), which is what pushed it into the same disk
-      # pressure `clippy`, `test`, `testsuite-sparql` and `bench-compare`
-      # all clear first.
+      # gate's server binary).
       - name: Free disk space
         run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
-          sudo docker image prune --all --force
+          # Avoid spending a minute deleting SDKs when the runner has room.
+          available_kb=$(df -Pk / | awk 'NR == 2 {print $4}')
+          if [ "$available_kb" -lt 15728640 ]; then
+            sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+            sudo docker image prune --all --force
+          fi
+          df -h /
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.97.0
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-      - uses: actions/setup-node@v4
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
 
@@ -494,11 +577,11 @@ jobs:
     # package and deliberately NOT a Cargo workspace member, so nothing it
     # contains can affect a Rust job — and equally, no Rust change can affect
     # it. ci.yml itself is in the list so a change to the job below runs it.
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       run: ${{ steps.filter.outputs.run }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
       - id: filter
@@ -526,14 +609,14 @@ jobs:
   react-sdk:
     needs: react-paths
     if: needs.react-paths.outputs.run == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     defaults:
       run:
         working-directory: fluree-react
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: npm

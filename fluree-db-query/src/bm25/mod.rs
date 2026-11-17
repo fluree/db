@@ -31,7 +31,7 @@ pub use fluree_db_binary_index::analyzer::{
 };
 pub use index::{
     Bm25Config, Bm25Index, Bm25Stats, CompiledPropertyDeps, DocKey, DocMeta, GraphSourceWatermark,
-    Posting, PostingList, PropertyDeps, TermEntry,
+    Posting, PostingList, PropertyDeps, PropertyDepsAnalysis, TermEntry,
 };
 pub use manifest::{Bm25Manifest, Bm25SnapshotEntry};
 pub use operator::{

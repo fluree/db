@@ -92,6 +92,22 @@ pub struct ReasoningModes {
     /// (query key `maxSeconds`, pragma `reasoning-max-seconds:`, config
     /// `f:reasoningMaxSeconds`, env `FLUREE_REASONING_MAX_SECONDS`).
     pub max_seconds: Option<u64>,
+
+    /// Materialization budget: max megabytes of derived facts before the
+    /// closure is capped. Same sourcing/precedence as [`Self::max_facts`]
+    /// (query key `maxMemoryMb`, pragma `reasoning-max-memory-mb:`, config
+    /// `f:reasoningMaxMemoryMb`, env `FLUREE_REASONING_MAX_MEMORY_MB`).
+    ///
+    /// `None` derives the ceiling from the effective fact cap, so the fact cap
+    /// binds first on ordinary data and this one only catches facts that are
+    /// abnormally large.
+    pub max_memory_mb: Option<u64>,
+
+    /// The time `NOW()` and `TODAY()` return in datalog rule bodies. `None`
+    /// uses the commit time of the queried snapshot. Query key
+    /// `"reasoningTime"` / SPARQL `# PRAGMA reasoning-time:`, an ISO 8601
+    /// datetime.
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
 }
 
 impl ReasoningModes {
@@ -274,22 +290,44 @@ impl ReasoningModes {
         // Parse the per-query materialization budget. Doesn't flip any mode
         // flag — it only takes effect when a reasoning mode is requested.
         if let Some(budget) = query.get("reasoningBudget") {
-            let (max_facts, max_seconds) = Self::parse_budget_json(budget)?;
+            let (max_facts, max_seconds, max_memory_mb) = Self::parse_budget_json(budget)?;
             modes.max_facts = max_facts;
             modes.max_seconds = max_seconds;
+            modes.max_memory_mb = max_memory_mb;
+        }
+
+        // Like the budget, the evaluation time enables no mode by itself.
+        if let Some(time) = query.get("reasoningTime") {
+            modes.evaluation_time = Self::parse_evaluation_time(time)?;
         }
 
         Ok(modes)
     }
 
+    /// Parse a `"reasoningTime"` value: an ISO 8601 datetime string.
+    pub fn parse_evaluation_time(
+        value: &serde_json::Value,
+    ) -> Result<Option<fluree_db_core::temporal::DateTime>, String> {
+        match value {
+            serde_json::Value::Null => Ok(None),
+            serde_json::Value::String(s) => fluree_db_core::temporal::DateTime::parse(s)
+                .map(Some)
+                .map_err(|e| format!("reasoningTime must be an ISO 8601 datetime: {e}")),
+            _ => Err("reasoningTime must be an ISO 8601 datetime string".to_string()),
+        }
+    }
+
     /// Parse a `"reasoningBudget"` JSON object.
     ///
-    /// Shape: `{"maxFacts": 20000000, "maxSeconds": 300}` (both optional;
-    /// `max-facts`/`max_facts` variants accepted).
-    fn parse_budget_json(value: &serde_json::Value) -> Result<(Option<u64>, Option<u64>), String> {
+    /// Shape: `{"maxFacts": 20000000, "maxSeconds": 300, "maxMemoryMb": 512}`
+    /// (all optional; `max-facts`/`max_facts` variants accepted).
+    #[allow(clippy::type_complexity)]
+    fn parse_budget_json(
+        value: &serde_json::Value,
+    ) -> Result<(Option<u64>, Option<u64>, Option<u64>), String> {
         let serde_json::Value::Object(obj) = value else {
             if value.is_null() {
-                return Ok((None, None));
+                return Ok((None, None, None));
             }
             return Err("reasoningBudget must be an object".to_string());
         };
@@ -308,7 +346,8 @@ impl ReasoningModes {
 
         let max_facts = field(&["maxFacts", "max-facts", "max_facts"])?;
         let max_seconds = field(&["maxSeconds", "max-seconds", "max_seconds"])?;
-        Ok((max_facts, max_seconds))
+        let max_memory_mb = field(&["maxMemoryMb", "max-memory-mb", "max_memory_mb"])?;
+        Ok((max_facts, max_seconds, max_memory_mb))
     }
 
     /// Parse a single mode string.
@@ -359,6 +398,7 @@ impl ReasoningModes {
         // rules are combined
         self.rules.extend(other.rules.iter().cloned());
         // budgets: first explicit value wins
+        self.max_memory_mb = self.max_memory_mb.or(other.max_memory_mb);
         self.max_facts = self.max_facts.or(other.max_facts);
         self.max_seconds = self.max_seconds.or(other.max_seconds);
         self

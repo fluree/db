@@ -42,14 +42,18 @@ use fluree_vocab::{config_iris, fluree, policy_iris};
 // Public API
 // ============================================================================
 
-/// Resolve a `GraphSourceRef` from config into concrete graph IDs for policy loading.
+/// Resolve a `GraphSourceRef` from config into concrete graph IDs for policy
+/// loading as of `to_t`.
 ///
 /// Returns `Err` if the source specifies unsupported features (`at_t`, `trust_policy`,
-/// `rollback_guard`, cross-ledger `ledger`). Returns the default graph `[0]` when
-/// `source` is `None`.
+/// `rollback_guard`, cross-ledger `ledger`), or names a graph that does not
+/// exist as of `to_t`, or that a drop after `to_t` took: the policy it held
+/// then is no longer readable, and reading it as empty would govern with no
+/// policy. Returns the default graph `[0]` when `source` is `None`.
 pub fn resolve_policy_source_g_ids(
     source: Option<&fluree_db_core::ledger_config::GraphSourceRef>,
     snapshot: &LedgerSnapshot,
+    to_t: i64,
 ) -> Result<Vec<fluree_db_core::GraphId>> {
     let source = match source {
         None => return Ok(DEFAULT_POLICY_GRAPHS.to_vec()),
@@ -79,7 +83,10 @@ pub fn resolve_policy_source_g_ids(
 
     let g_id = match source.graph_selector.as_deref() {
         Some(iri) if iri == config_iris::DEFAULT_GRAPH => Some(0u16),
-        Some(iri) => snapshot.graph_registry.graph_id_for_iri(iri),
+        Some(iri) => snapshot
+            .graph_registry
+            .existing_graph_id(iri, to_t)
+            .map_err(|floor| dropped_source("f:policySource", iri, floor, to_t))?,
         None => Some(0u16),
     };
 
@@ -90,6 +97,47 @@ pub fn resolve_policy_source_g_ids(
             source.graph_selector.as_deref().unwrap_or("<none>"),
         ))),
     }
+}
+
+/// The refusal of a configured source (`kind`, e.g. `f:policySource`) naming
+/// the graph `iri`, which a drop at `floor`, after `t`, took: what it held as
+/// of `t` is no longer readable.
+pub(crate) fn dropped_source(kind: &str, iri: &str, floor: i64, t: i64) -> ApiError {
+    ApiError::GraphNotFound(dropped_source_message(kind, iri, floor, t))
+}
+
+/// Refuse a governed read as of `to_t` whose stored policies or identity
+/// records live in a graph a later drop took: what the graph held then is
+/// gone, and governing without it would show what it hid. The default graph
+/// is the one this reaches, after `DROP DEFAULT` or `DROP ALL`; a dropped
+/// `f:policySource` graph is refused when it is resolved.
+fn refuse_dropped_policy_graphs(
+    snapshot: &LedgerSnapshot,
+    policy_graphs: &[fluree_db_core::GraphId],
+    to_t: i64,
+) -> Result<()> {
+    let registry = &snapshot.graph_registry;
+    if !registry.has_drops() {
+        return Ok(());
+    }
+    for &g_id in policy_graphs {
+        if let Some(floor) = registry.drop_after(g_id, to_t) {
+            let iri = match g_id {
+                fluree_db_core::DEFAULT_GRAPH_ID => config_iris::DEFAULT_GRAPH,
+                _ => registry.iri_for_graph_id(g_id).unwrap_or_default(),
+            };
+            return Err(dropped_source("policy", iri, floor, to_t));
+        }
+    }
+    Ok(())
+}
+
+/// The message of [`dropped_source`].
+pub(crate) fn dropped_source_message(kind: &str, iri: &str, floor: i64, t: i64) -> String {
+    format!(
+        "{kind} graph <{iri}> was dropped at t={floor}; what it held as of t={t} is no longer \
+         readable"
+    )
 }
 
 /// Build a `PolicyContext` from `GovernanceOptions`.
@@ -223,6 +271,12 @@ async fn build_policy_context_from_opts_inner(
     // root (unrestricted) context; `default_allow` governs instead.
     let has_cross_ledger_source = cross_ledger_restrictions.is_some();
 
+    // An identity binds, and a same-ledger policy class selects, from
+    // `policy_graphs`; an inline policy alone reads none of them.
+    if opts.identity.is_some() || (!has_cross_ledger_source && opts.policy_class.is_some()) {
+        refuse_dropped_policy_graphs(snapshot, policy_graphs, to_t)?;
+    }
+
     struct PolicyStatsLookup<'a> {
         overlay: &'a dyn fluree_db_core::OverlayProvider,
     }
@@ -305,15 +359,14 @@ async fn build_policy_context_from_opts_inner(
         };
 
         (identity_sid, merged)
-    } else if let (Some(identity_iri), Some(classes)) = (
-        &opts.identity,
-        opts.policy_class.as_ref().filter(|c| !c.is_empty()),
-    ) {
+    } else if let (Some(identity_iri), Some(classes)) = (&opts.identity, opts.policy_class.as_ref())
+    {
         // Same-ledger identity + explicit `policy-class`: the request's
         // classes select the policy set; the identity is BIND-ONLY — it
         // resolves to populate `?$identity` for f:query rules and never
         // drives rule selection. This mirrors the cross-ledger identity
-        // contract above.
+        // contract above. An explicitly empty class list selects no stored
+        // policies; it must not fall back to this identity's wider assignments.
         //
         // Without this arm, a request carrying both fields silently ignored
         // `policy-class` and fell through to identity-mode selection below —
@@ -414,16 +467,20 @@ async fn build_policy_context_from_opts_inner(
     // runtime class check, which is not. Left on the estimate lane anyway —
     // an uncached per-query builder cannot afford base probes — but the
     // exposure is a count-drift one, not a no-op.
-    let stats: Option<IndexStats> = if let Some(novelty) = novelty_for_stats {
+    let stats: Option<Arc<IndexStats>> = if restrictions.is_empty() {
+        // Empty policy sets never consult stats. Avoid scanning accumulated
+        // novelty while preserving the default-allow/root decision below.
+        None
+    } else if let Some(novelty) = novelty_for_stats {
         let indexed = snapshot.stats.clone().unwrap_or_default();
         let lookup = PolicyStatsLookup { overlay };
-        Some(
+        Some(Arc::new(
             fluree_db_novelty::assemble_full_stats(
                 &indexed, snapshot, overlay, novelty, to_t, &lookup,
             )
             .await
             .map_err(|e| ApiError::internal(format!("policy stats assembly failed: {e}")))?,
-        )
+        ))
     } else {
         snapshot.stats.clone()
     };
@@ -460,29 +517,43 @@ async fn build_policy_context_from_opts_inner(
 
     let view_set = build_policy_set(
         restrictions.clone(),
-        stats.as_ref(),
+        stats.as_deref(),
         PolicyAction::View,
         hierarchy.as_ref(),
     );
     let modify_set = build_policy_set(
         restrictions,
-        stats.as_ref(),
+        stats.as_deref(),
         PolicyAction::Modify,
         hierarchy.as_ref(),
     );
 
-    // Check if this is a root policy (unrestricted access).
+    // Root (unrestricted) lets every consumer skip enforcement: the cursor and
+    // probe fast paths, the per-flake filter, explain's statistics stripping,
+    // and the tracking record. That is sound exactly when no rule exists and
+    // the default allows, because then no read or write can be denied.
     //
-    // is_root = true ONLY when no explicit policy inputs (identity / policy-class / policy)
-    // were provided. When an identity IS specified but has no matching policies, is_root must
-    // be false so that `default_allow` (not a blanket bypass) governs access.
+    // With no explicit policy input an unset default counts as allow (the
+    // legacy no-policy case). Once any input selects policy — identity, class
+    // list, inline rules, policy values, or a configured cross-ledger source —
+    // root additionally requires an explicit `default_allow: true`: an unset
+    // default resolves to deny below, and a configured source that selects
+    // zero rules under deny must keep denying.
     let has_explicit_policy_input = opts.identity.is_some()
-        || opts.policy_class.as_ref().is_some_and(|v| !v.is_empty())
+        || opts.policy_class.is_some()
         || opts.policy.is_some()
+        || opts
+            .policy_values
+            .as_ref()
+            .is_some_and(|values| !values.is_empty())
         || has_cross_ledger_source;
-    let is_root = !has_explicit_policy_input
-        && view_set.restrictions.is_empty()
-        && modify_set.restrictions.is_empty();
+    let no_rules = view_set.restrictions.is_empty() && modify_set.restrictions.is_empty();
+    let is_root = no_rules
+        && if has_explicit_policy_input {
+            opts.default_allow == Some(true)
+        } else {
+            opts.default_allow != Some(false)
+        };
 
     // `default_allow` is honored as the caller set it, including for unknown identities.
     // An identity IRI that has no subject node in the ledger yields empty restrictions,
@@ -507,21 +578,12 @@ async fn build_policy_context_from_opts_inner(
     Ok(PolicyContext::new(wrapper, identity_sid))
 }
 
-/// Returns `true` iff `identity_iri` exists as a subject in the ledger but has
-/// **no** `f:policyClass` assignments — meaning no policy restrictions apply to
-/// that identity.
+/// Returns `true` iff `identity_iri` exists as a subject in the default policy
+/// graph but has no `f:policyClass` assignments there.
 ///
-/// This is the predicate used to decide whether a bearer-authenticated identity
-/// may impersonate another identity via `opts.identity` for policy testing.
-/// The semantics are:
-///
-/// - `FoundNoPolicies` → `true`: the identity is known and unrestricted, so it
-///   may delegate / impersonate.
-/// - `FoundWithPolicies` → `false`: the identity is itself policy-constrained
-///   and must not be allowed to bypass its own constraints by acting as another
-///   identity.
-/// - `NotFound` → `false`: an unknown identity must not gain impersonation
-///   rights regardless of `default_allow`.
+/// This describes local assignments only. It does not prove unrestricted
+/// access or confer authority to impersonate: configured/model policies and
+/// default-deny may still apply. Hosts must establish delegation separately.
 pub async fn identity_has_no_policies(
     snapshot: &LedgerSnapshot,
     overlay: &dyn fluree_db_core::OverlayProvider,
@@ -555,9 +617,8 @@ pub async fn identity_has_no_policies(
 /// carries restrictions. `default_allow` governs access in all three cases — the
 /// "not found" / "found-no-policies" distinction is about SID availability, not gating.
 ///
-/// A separate predicate, [`identity_has_no_policies`], uses this enum to gate
-/// impersonation (only `FoundNoPolicies` qualifies); that gate is orthogonal to
-/// `default_allow`.
+/// [`identity_has_no_policies`] exposes the local-assignment distinction for
+/// inspection. It is not an authorization or delegation check.
 enum IdentityLookupResult {
     /// The identity IRI cannot be resolved (unregistered namespace) or has no subject
     /// node in this ledger. No identity SID is available to bind `?$identity`.
@@ -783,7 +844,9 @@ async fn load_policies_of_classes(
         }
     }
 
-    // Load each policy's restrictions
+    // Load each policy's restrictions in a deterministic order.
+    let mut policy_sids: Vec<Sid> = policy_sids.into_iter().collect();
+    policy_sids.sort();
     let mut restrictions = Vec::new();
     for policy_sid in policy_sids {
         if let Some(restriction) =
@@ -1722,6 +1785,115 @@ fn extract_iris(value: &JsonValue) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_core::{Flake, GraphId, OverlayProvider};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountingOverlay {
+        novelty: Novelty,
+        reads: AtomicUsize,
+    }
+
+    impl OverlayProvider for CountingOverlay {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+
+        fn epoch(&self) -> u64 {
+            self.novelty.epoch()
+        }
+
+        fn for_each_overlay_flake(
+            &self,
+            g_id: GraphId,
+            index: IndexType,
+            first: Option<&Flake>,
+            rhs: Option<&Flake>,
+            leftmost: bool,
+            to_t: i64,
+            callback: &mut dyn FnMut(&Flake),
+        ) {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            self.novelty
+                .for_each_overlay_flake(g_id, index, first, rhs, leftmost, to_t, callback);
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_restrictions_skip_stats_and_preserve_defaults() {
+        let mut snapshot = LedgerSnapshot::genesis("policy-stats:main");
+        snapshot
+            .insert_namespace_code(100, "http://example.org/".to_string())
+            .unwrap();
+        let subject = Sid::new(100, "alice");
+        let property = Sid::new(100, "name");
+        let object = FlakeValue::String("Alice".to_string());
+        let mut novelty = Novelty::new(0);
+        // A non-type property forces full stats assembly to look up the
+        // subject's classes, making the unnecessary work observable.
+        novelty
+            .apply_commit(
+                vec![Flake::new(
+                    subject.clone(),
+                    property.clone(),
+                    object.clone(),
+                    Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                    1,
+                    true,
+                    None,
+                )],
+                1,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let overlay = CountingOverlay {
+            novelty,
+            reads: AtomicUsize::new(0),
+        };
+
+        for default_allow in [true, false] {
+            for bind_identity in [false, true] {
+                let opts = GovernanceOptions {
+                    default_allow: Some(default_allow),
+                    policy_values: bind_identity.then(|| {
+                        HashMap::from([(
+                            "?$identity".to_string(),
+                            serde_json::json!({"@id": "http://example.org/alice"}),
+                        )])
+                    }),
+                    ..Default::default()
+                };
+                let context = build_policy_context_from_opts(
+                    &snapshot,
+                    &overlay,
+                    Some(&overlay.novelty),
+                    1,
+                    &opts,
+                    &[0],
+                )
+                .await
+                .unwrap();
+
+                assert_eq!(overlay.reads.load(Ordering::Relaxed), 0);
+                assert_eq!(context.wrapper.is_root(), default_allow);
+                assert_eq!(context.wrapper.default_allow(), default_allow);
+                assert!(context.wrapper.view().restrictions.is_empty());
+                assert!(context.wrapper.modify().restrictions.is_empty());
+                assert_eq!(
+                    context
+                        .allow_modify_flake(&subject, &property, &object, &[])
+                        .unwrap(),
+                    default_allow
+                );
+                if bind_identity {
+                    assert_eq!(context.identity, subject);
+                    assert_eq!(
+                        context.wrapper.policy_values().get("?$identity"),
+                        Some(&subject)
+                    );
+                }
+            }
+        }
+    }
 
     // ========================================================================
     // extract_iris tests

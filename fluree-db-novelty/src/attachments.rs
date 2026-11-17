@@ -93,6 +93,20 @@ impl AttachmentNovelty {
         Self::default()
     }
 
+    /// Forget every attachment of an edge in one of `graphs` (`None` = the
+    /// default graph): a drop took the edges. The sticky
+    /// [`Self::has_annotations`] stays.
+    pub fn forget_graphs(&mut self, graphs: &[Option<fluree_db_core::Sid>]) {
+        if graphs.is_empty() || !self.has_annotations {
+            return;
+        }
+        self.forward.retain(|edge, _| !graphs.contains(&edge.g));
+        self.reverse.retain(|_, rows| {
+            rows.retain(|row| !graphs.contains(&row.edge.g));
+            !rows.is_empty()
+        });
+    }
+
     /// True iff at least one `f:reifies*` flake has been observed.
     ///
     /// Cascade fast-path: when both `Novelty::attachments.has_annotations()`
@@ -433,13 +447,11 @@ where
         latest
             .entry(other)
             .and_modify(|cur| {
-                // Tie-break on `op` at equal `t` so an assert (op = true)
-                // deterministically wins over a retract (op = false; false <
-                // true), matching the arena builder's `(t, op)` sort
-                // semantics. Without this, a novelty-only read and an
-                // arena-merged read could disagree when an edge is both
-                // asserted and retracted at the same `t`.
-                if (t, op) >= (cur.0, cur.1) {
+                // At equal `t` the assert holds (`same_t`), as in the arena
+                // builder's sort, so a novelty-only read and an arena-merged
+                // read agree when an edge is both asserted and retracted at
+                // the same `t`.
+                if fluree_db_core::same_t::supersedes((t, op), *cur) {
                     *cur = (t, op);
                 }
             })

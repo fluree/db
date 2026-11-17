@@ -2,7 +2,7 @@
 //!
 //! Implements logical operators: AND, OR, NOT
 
-use super::compare::{rdf_term_equal, EqOutcome};
+use super::compare::{rdf_term_equal_in, EqOutcome};
 use super::value::{ComparableValue, ComparisonError};
 use crate::binding::RowAccess;
 use crate::context::ExecutionContext;
@@ -179,7 +179,7 @@ fn generic_membership<'a, R: RowAccess, I: Iterator<Item = &'a Expression>>(
         match v.eval_to_comparable(row, ctx) {
             // Value equality (rdf_term_equal), so `1 IN (1.0)` matches
             // like `1 = 1.0` — not the variant-exact derived `==`.
-            Ok(Some(cv)) => match rdf_term_equal(&cv, &tv) {
+            Ok(Some(cv)) => match rdf_term_equal_in(&cv, &tv, ctx) {
                 EqOutcome::Eq => return Ok(Membership::Found),
                 EqOutcome::Ne => {}
                 // Incomparable datatypes → the same `Comparison` type

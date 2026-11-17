@@ -268,3 +268,85 @@ async fn bm25_sub_floor_max_fuel_rejected_before_parse() {
         "should reject on the floor before parsing, got: {msg}"
     );
 }
+
+/// SPARQL twin of `untracked_max_fuel_below_floor_rejected_before_parse`:
+/// `# PRAGMA max-fuel` caps an untracked query on the view path, and above the
+/// floor the same query runs.
+#[tokio::test]
+async fn untracked_sparql_max_fuel_pragma_below_floor_rejected() {
+    let (fluree, ledger) = seed_one().await;
+    const QUERY: &str = "SELECT ?name WHERE { ?s <http://a.co/name> ?name }";
+
+    let err = support::query_sparql(
+        &fluree,
+        &ledger,
+        &format!("# PRAGMA max-fuel: 0.5\n{QUERY}"),
+    )
+    .await
+    .expect_err("sub-floor max-fuel pragma should fail");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+
+    support::query_sparql(
+        &fluree,
+        &ledger,
+        &format!("# PRAGMA max-fuel: 100\n{QUERY}"),
+    )
+    .await
+    .expect("a budget above the floor runs");
+}
+
+/// On the tracked view path the AST's `# PRAGMA meta` chooses the tracking,
+/// as `opts.meta` does for JSON-LD: `time` alone reports no fuel.
+#[tokio::test]
+async fn tracked_sparql_meta_pragma_selects_tracking() {
+    let (fluree, ledger) = seed_one().await;
+    const QUERY: &str = "SELECT ?name WHERE { ?s <http://a.co/name> ?name }";
+    let db = support::graphdb_from_ledger(&ledger);
+
+    let all = db
+        .query(&fluree)
+        .sparql(QUERY)
+        .execute_tracked()
+        .await
+        .expect("tracked query");
+    assert!(all.fuel.is_some(), "control: all tracking by default");
+
+    let time_only = db
+        .query(&fluree)
+        .sparql(&format!("# PRAGMA meta: time\n{QUERY}"))
+        .execute_tracked()
+        .await
+        .expect("tracked query");
+    assert!(time_only.time.is_some());
+    assert!(time_only.fuel.is_none(), "{:?}", time_only.fuel);
+}
+
+/// A `FROM` naming a graph inside the ledger runs on the dataset path, which
+/// charges the floor against the pragma's `max-fuel` itself.
+#[tokio::test]
+async fn untracked_sparql_max_fuel_pragma_caps_a_within_ledger_dataset_query() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = support::genesis_ledger(&fluree, "fuel/floor-dataset:main");
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle("GRAPH <urn:fuel:g> { <http://a.co/x> <http://a.co/name> \"X\" . }")
+        .execute()
+        .await
+        .expect("seed a named graph")
+        .ledger;
+    const QUERY: &str = "SELECT ?name FROM <urn:fuel:g> WHERE { ?s <http://a.co/name> ?name }";
+
+    let rows = support::query_sparql(&fluree, &ledger, QUERY)
+        .await
+        .expect("control");
+    assert_eq!(rows.row_count(), 1, "control: the FROM graph resolves");
+
+    let err = support::query_sparql(
+        &fluree,
+        &ledger,
+        &format!("# PRAGMA max-fuel: 0.5\n{QUERY}"),
+    )
+    .await
+    .expect_err("sub-floor max-fuel pragma should fail");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+}

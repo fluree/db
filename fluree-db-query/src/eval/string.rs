@@ -96,6 +96,49 @@ pub fn eval_str<R: RowAccess>(
     ctx: Option<&ExecutionContext<'_>>,
 ) -> Result<Option<ComparableValue>> {
     check_arity(args, 1, "STR")?;
+    // A stored xsd:float narrows to f32 on the way into `ComparableValue`
+    // (the numeric lanes are single-precision), but its lexical form belongs
+    // to the stored f64: the serializer prints `canonical_xsd_double` of it,
+    // and STR() must agree per-term (#1695's float sibling). For the
+    // bare-variable shape — the only one whose argument IS a stored term —
+    // read the f64 straight from the binding. No widening artifact can
+    // arise: this f64 was parsed from the lexical, never widened from an
+    // f32. (A float value computed inside the expression is a genuine f32
+    // and keeps `canonical_xsd_float` via `into_string_value`.)
+    if let Expression::Var(var_id) = &args[0] {
+        if let Some(d) = crate::eval::stored_float_f64(row, *var_id, ctx) {
+            return Ok(Some(ComparableValue::String(Arc::from(
+                fluree_graph_ir::canonical_xsd_double(d),
+            ))));
+        }
+        // A late-materialized subject resolves once per distinct id per
+        // query; the memoized string is exactly what the generic path below
+        // produces for it (see `ExecutionContext::subject_iri_str_memo`).
+        if let (Some(ctx), Some(crate::binding::Binding::EncodedSid { s_id, .. })) =
+            (ctx, row.get(*var_id))
+        {
+            let s_id = *s_id;
+            let memo = ctx.subject_iri_str_memo(s_id, || {
+                // The generic path below, verbatim: an encoded subject
+                // evaluates to `ComparableValue::Iri` (one dictionary walk
+                // and one string build per call), a materialized one to `Sid`.
+                let v = args[0].eval_to_comparable(row, Some(ctx)).ok().flatten()?;
+                let s = match &v {
+                    ComparableValue::Sid(..) => {
+                        v.into_string_value_with_namespaces(Some(ctx.active_snapshot.namespaces()))
+                    }
+                    _ => v.into_string_value(),
+                };
+                match s {
+                    Some(ComparableValue::String(s)) => Some(s),
+                    _ => None,
+                }
+            });
+            if let Some(iri) = memo {
+                return Ok(Some(ComparableValue::String(iri)));
+            }
+        }
+    }
     let val = args[0].eval_to_comparable(row, ctx)?;
     Ok(val.and_then(|v| match &v {
         ComparableValue::Sid(..) => {

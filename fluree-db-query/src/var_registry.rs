@@ -19,10 +19,31 @@ impl VarId {
     }
 }
 
+/// Registry-name predicate: does this variable name belong to a
+/// non-projected internal / non-distinguished variable, which no user wrote
+/// by that name?
+///
+/// Three categories are reserved:
+/// - `?__*` — planner / aggregate / property-path synthetics.
+/// - `?#*`  — annotation-reifier and property-access synthetics (the `#` is
+///   comment-start in the SPARQL lexer so users cannot lex this prefix).
+/// - `_:*`  — SPARQL blank nodes used in WHERE patterns. Per SPARQL
+///   §4.1.4 these are non-distinguished variables; they bind values
+///   but are not part of the SELECT scope, so they don't appear in
+///   `SELECT *` results. This also covers blank-node-labelled reifiers
+///   (`~ _:ann`, `_:ann rdf:reifies …`) that the edge-annotation lowering
+///   registers under their literal blank-node label.
+///
+/// Every wildcard formatter hides these, `SELECT *` does not project them,
+/// and user-facing errors do not print them.
+pub fn is_internal_var_name(name: &str) -> bool {
+    name.starts_with("?__") || name.starts_with("?#") || name.starts_with("_:")
+}
+
 /// Registry mapping variable names to compact VarId indices
 ///
 /// Uses `Arc<str>` for cheap cloning and deduplication, aligning with `Sid.name`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct VarRegistry {
     name_to_id: HashMap<Arc<str>, VarId>,
     id_to_name: Vec<Arc<str>>,
@@ -66,6 +87,20 @@ impl VarRegistry {
         self.name_to_id.insert(arc_name.clone(), id);
         self.id_to_name.push(arc_name);
         id
+    }
+
+    /// A new variable named `{prefix}{n}`, for an `n` no registered name
+    /// has. Taken after every name a query writes is registered, it aliases
+    /// none of them.
+    pub fn fresh(&mut self, prefix: &str) -> VarId {
+        let mut n = self.id_to_name.len();
+        loop {
+            let name = format!("{prefix}{n}");
+            if !self.name_to_id.contains_key(name.as_str()) {
+                return self.get_or_insert(&name);
+            }
+            n += 1;
+        }
     }
 
     /// Get the VarId for a name, if it exists

@@ -34,9 +34,10 @@ use crate::io::parquet::{
     build_batch_schema, build_batch_schema_with_iceberg, calculate_column_chunk_ranges,
     parse_parquet_metadata_from_bytes, ParquetFooterCache, NULL_COLUMN_SENTINEL,
 };
+use crate::io::scope::StorageScope;
 use crate::io::SendIcebergStorage;
 use crate::metadata::Schema;
-use crate::scan::predicate::Expression;
+use crate::scan::predicate::{ExactRowFilter, Expression};
 use crate::scan::pruning::row_group_can_contain;
 use crate::scan::FileScanTask;
 
@@ -122,15 +123,28 @@ const LARGE_FILE_ADMIT_MAX_BYTES: u64 = 256 * 1024 * 1024;
 struct DiskCacheRef<'a> {
     cache: &'a Arc<DiskArtifactCache>,
     dir: &'a Path,
+    /// The storage identity the bytes are read under: part of every local name,
+    /// so a file fetched by one identity is never served to another that names
+    /// the same source path (nor joined to its single-flight fill, which is
+    /// keyed by the local name).
+    scope: &'a StorageScope,
 }
 
 impl DiskCacheRef<'_> {
     /// Stable local path for an immutable source file. The expected size is part
     /// of the key, so a cached file whose length differs is never even named.
+    /// The shared scope keeps the name files had before scopes existed.
     fn local_path(&self, source_path: &str, expected_size: u64) -> PathBuf {
         let h = xxhash_rust::xxh64::xxh64(source_path.as_bytes(), 0);
-        self.dir
-            .join(format!("iceberg-{h:016x}-{expected_size}.parquet"))
+        if self.scope.is_shared() {
+            self.dir
+                .join(format!("iceberg-{h:016x}-{expected_size}.parquet"))
+        } else {
+            self.dir.join(format!(
+                "iceberg-{h:016x}-{}-{expected_size}.parquet",
+                self.scope.file_segment()
+            ))
+        }
     }
 
     /// The local cache path iff a file of exactly `expected_size` bytes exists.
@@ -376,11 +390,18 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// a whole file already cached is served from disk; otherwise the file is
     /// cached whole only when the read is cheap (small file) or broad (touches a
     /// large share). Narrow projections keep range-reading from source.
+    ///
+    /// `scope` is the storage identity `storage` reads as
+    /// (`ResolvedStorage::scope` in `fluree-db-api`): cached files are keyed by
+    /// it, so one identity's files never serve another's reads. The footer
+    /// cache needs no scope: a footer is served only after `storage` has
+    /// answered the file's size (see [`Self::read_metadata`]).
     pub fn with_caches(
         storage: &'a S,
         footer_cache: &'a ParquetFooterCache,
         disk_cache: &'a Arc<DiskArtifactCache>,
         cache_dir: &'a Path,
+        scope: &'a StorageScope,
     ) -> Self {
         Self {
             storage,
@@ -388,6 +409,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             disk_cache: Some(DiskCacheRef {
                 cache: disk_cache,
                 dir: cache_dir,
+                scope,
             }),
             rowgroup_concurrency: 1,
         }
@@ -403,6 +425,12 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     }
 
     /// Read the Parquet file metadata (footer) using range reads.
+    ///
+    /// The footer cache is keyed by path and size alone, which is safe only
+    /// because the size comes from `storage` first: a reader whose identity
+    /// cannot see the file fails here, before a footer another identity cached
+    /// could be served. Keep the HEAD ahead of the cache lookup
+    /// (`a_cached_footer_is_served_only_after_the_store_answers_the_head`).
     pub async fn read_metadata(&self, path: &str) -> Result<Arc<ParquetMetaData>> {
         let file_size = self.storage.file_size(path).await?;
 
@@ -458,9 +486,32 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         Ok(metadata)
     }
 
+    /// The error a failed disk-cache fill of `path` reports, typed.
+    ///
+    /// The fill's leader gets the store's own error back (the fetch wraps it,
+    /// it does not stringify it), so a denial stays
+    /// [`IcebergError::StorageAccessDenied`] and a 403 surfaces as one. A
+    /// waiter that joined the leader's fill is handed only the leader's text,
+    /// so it asks the store once (a HEAD) and reports the store's own error
+    /// from that: a denial, a refused identity, a deferred store whose build
+    /// failed. Only a store that answers the HEAD leaves the fill's message.
+    async fn fill_error(&self, path: &str, error: std::io::Error) -> IcebergError {
+        let message = error.to_string();
+        if let Some(typed) = error
+            .into_inner()
+            .and_then(|inner| inner.downcast::<IcebergError>().ok())
+        {
+            return *typed;
+        }
+        match self.storage.file_size(path).await {
+            Err(own) => own,
+            Ok(_) => IcebergError::Storage(format!("disk-cache fill: {message}")),
+        }
+    }
+
     /// Read a file scan task into column batches.
     ///
-    /// Decodes via the Arrow reader ([`crate::io::arrow_reader`]) with:
+    /// Decodes via the Arrow reader (`crate::io::arrow_reader`) with:
     /// - projection pushdown (only the requested columns are read),
     /// - row-group pruning + exact row filtering from `task.residual_filter`.
     ///
@@ -518,10 +569,13 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                             .read(path)
                             .await
                             .map(|b| b.to_vec())
-                            .map_err(|e| std::io::Error::other(e.to_string()))
+                            .map_err(std::io::Error::other)
                     })
-                    .await
-                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                    .await;
+                let data = match data {
+                    Ok(data) => data,
+                    Err(e) => return Err(self.fill_error(path, e).await),
+                };
                 tracing::debug!(
                     path,
                     file_size,
@@ -576,7 +630,8 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 return crate::io::arrow_reader::decode_batches_arrow(
                     file_bytes,
                     &task.projected_field_ids,
-                    task.residual_filter.as_ref(),
+                    task.residual_filter.as_deref(),
+                    task.exact_filter.as_ref(),
                     task.iceberg_schema.as_deref(),
                     None,
                     None,
@@ -625,7 +680,8 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         crate::io::arrow_reader::decode_batches_arrow(
             file_bytes,
             &task.projected_field_ids,
-            task.residual_filter.as_ref(),
+            task.residual_filter.as_deref(),
+            task.exact_filter.as_ref(),
             task.iceberg_schema.as_deref(),
             None,
             None,
@@ -646,6 +702,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         let file_size = task.data_file.file_size_in_bytes as u64;
         let projected_field_ids = task.projected_field_ids.clone();
         let residual_filter = task.residual_filter.clone();
+        let exact_filter = task.exact_filter.clone();
         let iceberg_schema = task.iceberg_schema.clone();
         let runtime = Handle::current();
 
@@ -664,6 +721,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     file_size,
                     projected_field_ids,
                     residual_filter,
+                    exact_filter,
                     iceberg_schema,
                     runtime,
                     None,
@@ -679,16 +737,19 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                 let projected_bytes = projected_chunk_bytes(task, &metadata)?;
                 if admit_whole_file(file_size, projected_bytes) {
                     let local = dc.local_path(&path, file_size);
-                    dc.cache
+                    let filled = dc
+                        .cache
                         .coalesced_fetch(local.clone(), || async {
                             self.storage
                                 .read(&path)
                                 .await
                                 .map(|b| b.to_vec())
-                                .map_err(|e| std::io::Error::other(e.to_string()))
+                                .map_err(std::io::Error::other)
                         })
-                        .await
-                        .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
+                        .await;
+                    if let Err(e) = filled {
+                        return Err(self.fill_error(&path, e).await);
+                    }
                     tracing::debug!(path = %path, file_size, "Iceberg disk-cache fill (large, broad)");
                     let storage = Arc::new(LocalFileStorage {
                         path: local,
@@ -701,6 +762,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         file_size,
                         projected_field_ids,
                         residual_filter,
+                        exact_filter,
                         iceberg_schema,
                         runtime,
                         None,
@@ -719,6 +781,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             file_size,
             projected_field_ids,
             residual_filter,
+            exact_filter,
             iceberg_schema,
             runtime,
             None,
@@ -744,7 +807,8 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
         path: String,
         file_size: u64,
         projected_field_ids: Vec<i32>,
-        residual_filter: Option<Expression>,
+        residual_filter: Option<Arc<Expression>>,
+        exact_filter: Option<ExactRowFilter>,
         iceberg_schema: Option<Arc<Schema>>,
         runtime: Handle,
         max_rows: Option<usize>,
@@ -780,6 +844,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                     let path = path.clone();
                     let projected = projected_field_ids.clone();
                     let residual = residual_filter.clone();
+                    let exact = exact_filter.clone();
                     let schema = iceberg_schema.clone();
                     let runtime = runtime.clone();
                     handles.push(tokio::task::spawn_blocking(move || {
@@ -787,7 +852,8 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                         crate::io::arrow_reader::decode_batches_arrow(
                             cr,
                             &projected,
-                            residual.as_ref(),
+                            residual.as_deref(),
+                            exact.as_ref(),
                             schema.as_deref(),
                             None,
                             Some(&chunk),
@@ -812,7 +878,8 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             crate::io::arrow_reader::decode_batches_arrow(
                 chunk_reader,
                 &projected_field_ids,
-                residual_filter.as_ref(),
+                residual_filter.as_deref(),
+                exact_filter.as_ref(),
                 iceberg_schema.as_deref(),
                 max_rows,
                 None,
@@ -828,7 +895,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
     /// Unlike [`Self::read_task`], this never reads the whole file: it drives the
     /// range-backed chunk reader against the source store, and the row-group-0
     /// restriction + row budget in
-    /// [`decode_batches_arrow`](crate::io::arrow_reader::decode_batches_arrow)
+    /// `crate::io::arrow_reader::decode_batches_arrow`
     /// mean only the footer plus the first row group's projected column chunks are
     /// fetched, whatever the file size. It therefore returns at most
     /// `min(max_rows, rows-in-first-row-group)` rows and does **not** fill the
@@ -853,6 +920,7 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
             file_size,
             task.projected_field_ids.clone(),
             task.residual_filter.clone(),
+            task.exact_filter.clone(),
             task.iceberg_schema.clone(),
             Handle::current(),
             Some(max_rows),
@@ -905,11 +973,13 @@ impl<'a, S: SendIcebergStorage> SendParquetReader<'a, S> {
                             .read(path)
                             .await
                             .map(|b| b.to_vec())
-                            .map_err(|e| std::io::Error::other(e.to_string()))
+                            .map_err(std::io::Error::other)
                     })
-                    .await
-                    .map_err(|e| IcebergError::Storage(format!("disk-cache fill: {e}")))?;
-                return Ok(Bytes::from(data));
+                    .await;
+                return match data {
+                    Ok(data) => Ok(Bytes::from(data)),
+                    Err(e) => Err(self.fill_error(path, e).await),
+                };
             }
         } else if file_size < MIN_SPARSE_FILE_BYTES {
             // No disk cache: keep the small-file correctness behavior (read whole
@@ -1073,9 +1143,11 @@ mod tests {
     fn local_path_keys_on_size() {
         let dir = fresh_cache_dir("key");
         let cache = DiskArtifactCache::for_dir(&dir);
+        let shared = StorageScope::shared();
         let dc = DiskCacheRef {
             cache: &cache,
             dir: &dir,
+            scope: &shared,
         };
         // The same source path at a different size maps to a different cache
         // file, so a hit can never serve bytes of the wrong length.
@@ -1089,9 +1161,11 @@ mod tests {
     fn valid_local_requires_a_matching_size_on_disk() {
         let dir = fresh_cache_dir("valid");
         let cache = DiskArtifactCache::for_dir(&dir);
+        let shared = StorageScope::shared();
         let dc = DiskCacheRef {
             cache: &cache,
             dir: &dir,
+            scope: &shared,
         };
         let src = "s3://b/f.parquet";
         assert!(dc.valid_local(src, 4).is_none(), "absent file is not valid");
@@ -1101,6 +1175,380 @@ mod tests {
             dc.valid_local(src, 5).is_none(),
             "a different expected size names a different (absent) path"
         );
+    }
+
+    #[test]
+    fn the_shared_scope_keeps_the_name_cached_files_had_before_scopes() {
+        // Pinned literally: every data file an install cached before storage
+        // scopes existed is still found under the default configuration.
+        let dir = fresh_cache_dir("shared_name");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let shared = StorageScope::shared();
+        let dc = DiskCacheRef {
+            cache: &cache,
+            dir: &dir,
+            scope: &shared,
+        };
+        let h = xxhash_rust::xxh64::xxh64(b"s3://b/data/f.parquet", 0);
+        assert_eq!(
+            dc.local_path("s3://b/data/f.parquet", 4096),
+            dir.join(format!("iceberg-{h:016x}-4096.parquet"))
+        );
+        let scoped = StorageScope::of(&[("kind", "google"), ("principal", "a@p.iam")]);
+        let dc = DiskCacheRef {
+            cache: &cache,
+            dir: &dir,
+            scope: &scoped,
+        };
+        assert_ne!(
+            dc.local_path("s3://b/data/f.parquet", 4096),
+            dir.join(format!("iceberg-{h:016x}-4096.parquet"))
+        );
+    }
+
+    /// A source store that answers every read with its own bytes, optionally
+    /// holding each read until released (to overlap two fills).
+    #[derive(Debug, Clone)]
+    struct GatedSource {
+        bytes: Bytes,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl GatedSource {
+        fn new(fill: u8, len: usize) -> Self {
+            Self {
+                bytes: Bytes::from(vec![fill; len]),
+                gate: None,
+                reads: Arc::default(),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for GatedSource {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _permit = gate.acquire().await.expect("gate open");
+            }
+            Ok(self.bytes.clone())
+        }
+
+        async fn read_range(&self, _path: &str, range: Range<u64>) -> Result<Bytes> {
+            Ok(self.bytes.slice(range.start as usize..range.end as usize))
+        }
+
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            Ok(self.bytes.len() as u64)
+        }
+    }
+
+    #[tokio::test]
+    async fn two_identities_reading_one_path_never_share_a_cached_file() {
+        let dir = fresh_cache_dir("cross_identity");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let footers = ParquetFooterCache::new(8);
+        let path = "gs://lake/data/f.parquet";
+        let alice = StorageScope::of(&[("kind", "google"), ("principal", "alice@p.iam")]);
+        let bob = StorageScope::of(&[("kind", "google"), ("principal", "bob@p.iam")]);
+        let alice_store = GatedSource::new(b'A', 64);
+        let bob_store = GatedSource::new(b'B', 64);
+
+        let read = |store: &GatedSource, scope: &StorageScope| {
+            let store = store.clone();
+            let scope = scope.clone();
+            let footers = &footers;
+            let cache = &cache;
+            let dir = &dir;
+            async move {
+                SendParquetReader::with_caches(&store, footers, cache, dir, &scope)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        assert!(read(&alice_store, &alice).await.iter().all(|b| *b == b'A'));
+        // Bob's read is a miss under his own scope: he gets his store's bytes,
+        // and his store was asked.
+        assert!(read(&bob_store, &bob).await.iter().all(|b| *b == b'B'));
+        assert_eq!(bob_store.reads.load(std::sync::atomic::Ordering::SeqCst), 1);
+        // Each is now served from disk under its own scope.
+        assert!(read(&alice_store, &alice).await.iter().all(|b| *b == b'A'));
+        assert_eq!(
+            alice_store.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        // The control: under one shared scope the second reader IS handed the
+        // first one's bytes without its store being asked — what the scope
+        // prevents.
+        let shared = StorageScope::shared();
+        let shared_dir = fresh_cache_dir("cross_identity_control");
+        let shared_cache = DiskArtifactCache::for_dir(&shared_dir);
+        let first = GatedSource::new(b'A', 64);
+        let second = GatedSource::new(b'B', 64);
+        for (store, expected) in [(&first, b'A'), (&second, b'A')] {
+            let bytes = SendParquetReader::with_caches(
+                store,
+                &footers,
+                &shared_cache,
+                &shared_dir,
+                &shared,
+            )
+            .try_whole_bytes_no_footer(path, 64)
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(bytes.iter().all(|b| *b == expected));
+        }
+        assert_eq!(second.reads.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn two_identities_never_join_one_single_flight_fill() {
+        // Alice's fill is held open; Bob's fill of the same path under another
+        // scope must complete on its own rather than wait for (and be handed)
+        // Alice's bytes.
+        let dir = fresh_cache_dir("cross_identity_fill");
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let footers = Arc::new(ParquetFooterCache::new(8));
+        let path = "gs://lake/data/held.parquet";
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let mut alice_store = GatedSource::new(b'A', 64);
+        alice_store.gate = Some(Arc::clone(&gate));
+        let alice = StorageScope::of(&[("kind", "google"), ("principal", "alice@p.iam")]);
+        let alice_fill = {
+            let (cache, dir, footers) = (Arc::clone(&cache), dir.clone(), Arc::clone(&footers));
+            tokio::spawn(async move {
+                SendParquetReader::with_caches(&alice_store, &footers, &cache, &dir, &alice)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+                    .unwrap()
+                    .unwrap()
+            })
+        };
+        // Let Alice's fill become the in-flight leader.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        let bob_store = GatedSource::new(b'B', 64);
+        let bob = StorageScope::of(&[("kind", "google"), ("principal", "bob@p.iam")]);
+        let bob_bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            SendParquetReader::with_caches(&bob_store, &footers, &cache, &dir, &bob)
+                .try_whole_bytes_no_footer(path, 64),
+        )
+        .await
+        .expect("Bob's fill waited on Alice's: the single-flight key is not scoped")
+        .unwrap()
+        .unwrap();
+        assert!(bob_bytes.iter().all(|b| *b == b'B'));
+
+        gate.add_permits(1);
+        assert!(alice_fill.await.unwrap().iter().all(|b| *b == b'A'));
+    }
+
+    /// A store that refuses the object with `refusal` (a 403's denial, a
+    /// refused identity, a deferred build's failure): its reads (optionally
+    /// held until released) and its HEADs fail with it, counted.
+    #[derive(Debug, Clone)]
+    struct Refusing {
+        refusal: IcebergError,
+        gate: Option<Arc<tokio::sync::Semaphore>>,
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+        heads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    fn denial() -> IcebergError {
+        IcebergError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".to_string(),
+            key: "data/small.parquet".to_string(),
+            region: None,
+            message: "403".to_string(),
+        }
+    }
+
+    #[async_trait]
+    impl SendIcebergStorage for Refusing {
+        async fn read(&self, _path: &str) -> Result<Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if let Some(gate) = &self.gate {
+                let _permit = gate.acquire().await.expect("gate open");
+            }
+            Err(self.refusal.clone())
+        }
+        async fn read_range(&self, _path: &str, _range: Range<u64>) -> Result<Bytes> {
+            Err(self.refusal.clone())
+        }
+        async fn file_size(&self, _path: &str) -> Result<u64> {
+            self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(self.refusal.clone())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_denied_small_file_fill_is_a_typed_denial_for_its_leader_and_its_waiters() {
+        let refusals = [
+            ("denied_fill", denial()),
+            (
+                "refused_identity_fill",
+                IcebergError::HostIdentityRefused {
+                    kind: crate::host_identity::HostIdentityKind::Aws,
+                },
+            ),
+            (
+                "unvended_fill",
+                IcebergError::CatalogCredentialsNotVended {
+                    catalog_uri: "https://cat.example/v1".to_string(),
+                },
+            ),
+        ];
+        for (name, refusal) in refusals {
+            refused_fill_reports_the_stores_own_error(name, refusal).await;
+        }
+    }
+
+    async fn refused_fill_reports_the_stores_own_error(name: &str, refusal: IcebergError) {
+        let expected = format!("{refusal:?}");
+        let dir = fresh_cache_dir(name);
+        let cache = DiskArtifactCache::for_dir(&dir);
+        let footers = Arc::new(ParquetFooterCache::new(8));
+        let scope = StorageScope::shared();
+        let path = "gs://lake/data/small.parquet";
+
+        // One reader: the fill's leader gets the store's own error back.
+        let store = Refusing {
+            refusal: refusal.clone(),
+            gate: None,
+            reads: Arc::default(),
+            heads: Arc::default(),
+        };
+        let err = SendParquetReader::with_caches(&store, &footers, &cache, &dir, &scope)
+            .try_whole_bytes_no_footer(path, 64)
+            .await
+            .unwrap_err();
+        assert_eq!(format!("{err:?}"), expected);
+        assert_eq!(
+            store.heads.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the leader reports the read's own error, not a HEAD's"
+        );
+
+        // Two readers of one file: the second joins the first's fill and is
+        // handed only its text, yet still reports the store's error typed.
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let held = Refusing {
+            refusal,
+            gate: Some(Arc::clone(&gate)),
+            reads: Arc::default(),
+            heads: Arc::default(),
+        };
+        let leader = {
+            let (held, cache, dir, footers, scope) = (
+                held.clone(),
+                Arc::clone(&cache),
+                dir.clone(),
+                Arc::clone(&footers),
+                scope.clone(),
+            );
+            tokio::spawn(async move {
+                SendParquetReader::with_caches(&held, &footers, &cache, &dir, &scope)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let waiter = {
+            let (held, cache, dir, footers, scope) = (
+                held.clone(),
+                Arc::clone(&cache),
+                dir.clone(),
+                Arc::clone(&footers),
+                scope.clone(),
+            );
+            tokio::spawn(async move {
+                SendParquetReader::with_caches(&held, &footers, &cache, &dir, &scope)
+                    .try_whole_bytes_no_footer(path, 64)
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        gate.add_permits(2);
+        for outcome in [leader.await.unwrap(), waiter.await.unwrap()] {
+            let err = outcome.unwrap_err();
+            assert_eq!(format!("{err:?}"), expected);
+        }
+        assert_eq!(
+            held.reads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the waiter joined the leader's fill rather than reading itself"
+        );
+        assert_eq!(
+            held.heads.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "only the waiter asks the store, once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cached_footer_is_served_only_after_the_store_answers_the_head() {
+        /// A store that refuses every request, as one whose identity cannot
+        /// see the file does.
+        #[derive(Debug, Clone)]
+        struct Denied {
+            heads: Arc<std::sync::atomic::AtomicUsize>,
+        }
+        #[async_trait]
+        impl SendIcebergStorage for Denied {
+            async fn read(&self, _path: &str) -> Result<Bytes> {
+                Err(IcebergError::storage("denied"))
+            }
+            async fn read_range(&self, _path: &str, _range: Range<u64>) -> Result<Bytes> {
+                Err(IcebergError::storage("denied"))
+            }
+            async fn file_size(&self, _path: &str) -> Result<u64> {
+                self.heads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Err(IcebergError::StorageAccessDenied {
+                    scheme: "gs",
+                    bucket: "lake".to_string(),
+                    key: "data/f.parquet".to_string(),
+                    region: None,
+                    message: "403".to_string(),
+                })
+            }
+        }
+
+        let path = "gs://lake/data/f.parquet";
+        let footers = ParquetFooterCache::new(8);
+        // Another identity read (and cached) the footer.
+        let allowed = InMemorySource {
+            bytes: multitype_parquet(),
+        };
+        SendParquetReader::with_cache(&allowed, &footers)
+            .read_metadata(path)
+            .await
+            .expect("the allowed identity reads the footer");
+        assert!(footers
+            .get(path, allowed.bytes.len() as u64)
+            .await
+            .is_some());
+
+        // An identity that cannot see the file is refused at the HEAD, never
+        // handed the cached footer.
+        let denied = Denied {
+            heads: Arc::default(),
+        };
+        let err = SendParquetReader::with_cache(&denied, &footers)
+            .read_metadata(path)
+            .await
+            .expect_err("a cached footer must not answer a reader the store refuses");
+        assert!(
+            matches!(err, IcebergError::StorageAccessDenied { .. }),
+            "{err:?}"
+        );
+        assert_eq!(denied.heads.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
@@ -1289,11 +1737,13 @@ mod tests {
         };
         let bytes = multitype_parquet(); // row group 0 = ids [1, 2], row group 1 = id [3]
 
-        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None).unwrap();
+        let full = decode_batches_arrow(bytes.clone(), &[], None, None, None, None, None).unwrap();
         assert_eq!(id_of(&full), vec![Some(1), Some(2), Some(3)]);
 
-        let rg0 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[0])).unwrap();
-        let rg1 = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[1])).unwrap();
+        let rg0 =
+            decode_batches_arrow(bytes.clone(), &[], None, None, None, None, Some(&[0])).unwrap();
+        let rg1 =
+            decode_batches_arrow(bytes.clone(), &[], None, None, None, None, Some(&[1])).unwrap();
         let mut combined = id_of(&rg0);
         combined.extend(id_of(&rg1));
         assert_eq!(
@@ -1302,7 +1752,8 @@ mod tests {
             "subset [0] ++ subset [1] must equal the full sequential decode"
         );
 
-        let empty = decode_batches_arrow(bytes.clone(), &[], None, None, None, Some(&[])).unwrap();
+        let empty =
+            decode_batches_arrow(bytes.clone(), &[], None, None, None, None, Some(&[])).unwrap();
         assert_eq!(empty.iter().map(|b| b.num_rows).sum::<usize>(), 0);
     }
 
@@ -1418,6 +1869,7 @@ mod tests {
             split_offsets: None,
             sort_order_id: None,
         };
+        let residual = residual.map(Arc::new);
         match schema {
             Some(s) => FileScanTask::for_whole_file_with_schema(data_file, vec![], residual, s),
             None => FileScanTask::for_whole_file(data_file, vec![], residual),
@@ -1594,6 +2046,341 @@ mod tests {
         });
         // year 2020 dropped, year 2024 kept, year null dropped.
         assert_eq!(ids, vec![Some(2)], "decimal-backed integer filter mismatch");
+    }
+
+    fn multitype_schema() -> Arc<Schema> {
+        schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ])
+    }
+
+    fn exact(predicates: Vec<crate::scan::ExactPredicate>) -> Option<crate::scan::ExactRowFilter> {
+        crate::scan::ExactRowFilter::new(predicates)
+    }
+
+    fn cmp_pred(
+        field_id: i32,
+        column: &str,
+        op: crate::scan::predicate::ComparisonOp,
+        value: crate::scan::predicate::LiteralValue,
+    ) -> crate::scan::ExactPredicate {
+        crate::scan::ExactPredicate::Compare {
+            field_id,
+            column: column.to_string(),
+            op,
+            value,
+        }
+    }
+
+    async fn exact_ids(
+        bytes: &Bytes,
+        schema: Arc<Schema>,
+        filter: Option<crate::scan::ExactRowFilter>,
+    ) -> Result<Vec<Option<i64>>> {
+        use crate::io::batch::Column;
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let task = whole_file_task(bytes, None, Some(schema)).with_exact_filter(filter);
+        let batches = SendParquetReader::new(&source).read_task(&task).await?;
+        Ok(flatten(&batches, 0, |c| match c {
+            Column::Int64(v) => v.as_slice(),
+            _ => panic!("id not Int64"),
+        }))
+    }
+
+    /// An exact filter keeps exactly the rows satisfying every conjunct, with
+    /// SQL null semantics: a comparison with a null cell drops the row, `IS
+    /// NULL` keeps it. Rows: (1, alice, 10, true), (2, null, 20, false),
+    /// (3, carol, null, true).
+    #[tokio::test]
+    async fn exact_filter_keeps_exactly_the_satisfying_rows() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        use crate::scan::ExactPredicate;
+        let bytes = multitype_parquet();
+        let schema = multitype_schema();
+        let cases: Vec<(Vec<ExactPredicate>, Vec<Option<i64>>)> = vec![
+            (
+                vec![
+                    cmp_pred(3, "active", Op::Eq, Lit::Boolean(true)),
+                    ExactPredicate::IsNotNull {
+                        field_id: 1,
+                        column: "name".into(),
+                    },
+                ],
+                vec![Some(1), Some(3)],
+            ),
+            (
+                vec![ExactPredicate::IsNull {
+                    field_id: 2,
+                    column: "age".into(),
+                }],
+                vec![Some(3)],
+            ),
+            // The null age is unknown under `<>`, so row 3 is dropped too.
+            (
+                vec![cmp_pred(2, "age", Op::NotEq, Lit::Int32(10))],
+                vec![Some(2)],
+            ),
+            (
+                vec![cmp_pred(1, "name", Op::Gt, Lit::String("alice".into()))],
+                vec![Some(3)],
+            ),
+            (
+                vec![
+                    cmp_pred(0, "id", Op::GtEq, Lit::Int64(2)),
+                    cmp_pred(3, "active", Op::Eq, Lit::Boolean(false)),
+                ],
+                vec![Some(2)],
+            ),
+        ];
+        for (predicates, expected) in cases {
+            let shown: Vec<String> = predicates.iter().map(ToString::to_string).collect();
+            let ids = exact_ids(&bytes, Arc::clone(&schema), exact(predicates))
+                .await
+                .expect("decode");
+            assert_eq!(ids, expected, "{shown:?}");
+        }
+    }
+
+    /// A filter column absent from the data file (added to the schema after the
+    /// file was written) reads as null in every row.
+    #[tokio::test]
+    async fn exact_filter_reads_an_absent_column_as_null() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        use crate::scan::ExactPredicate;
+        let bytes = multitype_parquet();
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "int"),
+            ("active", "boolean"),
+            ("bday", "date"),
+            ("valid_to", "int"),
+        ]);
+        let all = exact_ids(
+            &bytes,
+            Arc::clone(&schema),
+            exact(vec![ExactPredicate::IsNull {
+                field_id: 5,
+                column: "valid_to".into(),
+            }]),
+        )
+        .await
+        .expect("decode");
+        assert_eq!(all, vec![Some(1), Some(2), Some(3)]);
+        for predicate in [
+            ExactPredicate::IsNotNull {
+                field_id: 5,
+                column: "valid_to".into(),
+            },
+            cmp_pred(5, "valid_to", Op::NotEq, Lit::Int32(0)),
+        ] {
+            let none = exact_ids(&bytes, Arc::clone(&schema), exact(vec![predicate]))
+                .await
+                .expect("decode");
+            assert!(none.is_empty(), "{none:?}");
+        }
+    }
+
+    /// A literal that does not compare exactly with the column fails the read
+    /// rather than keeping rows the filter may exclude (the advisory filter
+    /// keeps them all and lets the engine decide; nothing decides after this).
+    #[tokio::test]
+    async fn exact_filter_refuses_a_comparison_it_cannot_decide() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = multitype_parquet();
+        let err = exact_ids(
+            &bytes,
+            multitype_schema(),
+            exact(vec![cmp_pred(1, "name", Op::Eq, Lit::Boolean(true))]),
+        )
+        .await
+        .expect_err("a boolean literal cannot compare with a string column");
+        assert!(
+            err.to_string().contains("cannot be evaluated exactly"),
+            "{err}"
+        );
+    }
+
+    /// The caller must project every column the filter reads.
+    #[tokio::test]
+    async fn exact_filter_refuses_an_unprojected_column() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = multitype_parquet();
+        let source = InMemorySource {
+            bytes: bytes.clone(),
+        };
+        let mut task =
+            whole_file_task(&bytes, None, Some(multitype_schema())).with_exact_filter(exact(vec![
+                cmp_pred(3, "active", Op::Eq, Lit::Boolean(true)),
+            ]));
+        task.projected_field_ids = vec![0];
+        let err = SendParquetReader::new(&source)
+            .read_task(&task)
+            .await
+            .expect_err("the filter column is not projected");
+        assert!(err.to_string().contains("did not project"), "{err}");
+    }
+
+    /// `<>` with a decimal literal off the column's grid holds for every
+    /// non-null cell, and is unknown (dropped) for a null one. Rows of the
+    /// decimal(9,0) column: 2020, 2024, null.
+    #[tokio::test]
+    async fn exact_filter_off_grid_inequality_drops_nulls() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = decimal_backed_int_parquet();
+        let schema = schema_of(&[("id", "long"), ("year", "decimal(9, 0)")]);
+        let ids = exact_ids(
+            &bytes,
+            schema,
+            exact(vec![cmp_pred(
+                1,
+                "year",
+                Op::NotEq,
+                Lit::Decimal {
+                    unscaled: 20205,
+                    scale: 1,
+                },
+            )]),
+        )
+        .await
+        .expect("decode");
+        assert_eq!(ids, vec![Some(1), Some(2)]);
+    }
+
+    /// Rows (id, score double, ratio float): (1, -0.0, 0.5), (2, 0.0, NaN),
+    /// (3, NaN, 2.0), (4, 5.0, null), (5, null, -0.0), (6, 7.5, 3.0).
+    fn float_parquet() -> Bytes {
+        use parquet::data_type::{DoubleType, FloatType, Int64Type};
+        use parquet::file::properties::WriterProperties;
+        use parquet::file::writer::SerializedFileWriter;
+        use parquet::schema::parser::parse_message_type;
+
+        let message = "
+            message schema {
+              OPTIONAL INT64 id;
+              OPTIONAL DOUBLE score;
+              OPTIONAL FLOAT ratio;
+            }";
+        let schema = Arc::new(parse_message_type(message).unwrap());
+        let props = Arc::new(WriterProperties::builder().build());
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let mut writer = SerializedFileWriter::new(&mut buf, schema, props).unwrap();
+            let mut rg = writer.next_row_group().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<Int64Type>()
+                .write_batch(&[1, 2, 3, 4, 5, 6], Some(&[1, 1, 1, 1, 1, 1]), None)
+                .unwrap();
+            c.close().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<DoubleType>()
+                .write_batch(
+                    &[-0.0, 0.0, f64::NAN, 5.0, 7.5],
+                    Some(&[1, 1, 1, 1, 0, 1]),
+                    None,
+                )
+                .unwrap();
+            c.close().unwrap();
+            let mut c = rg.next_column().unwrap().unwrap();
+            c.typed::<FloatType>()
+                .write_batch(
+                    &[0.5, f32::NAN, 2.0, -0.0, 3.0],
+                    Some(&[1, 1, 1, 0, 1, 1]),
+                    None,
+                )
+                .unwrap();
+            c.close().unwrap();
+            rg.close().unwrap();
+            writer.close().unwrap();
+        }
+        Bytes::from(buf)
+    }
+
+    /// Floating-point columns compare as IEEE numbers, as the engine compares
+    /// `xsd:double`: a NaN cell satisfies only `<>`, -0.0 equals 0.0, and a
+    /// `float` cell compares with an integer literal exactly (widened to
+    /// `f64`). arrow-ord's totalOrder kernels would keep NaN under `>` and
+    /// split the zeros.
+    #[tokio::test]
+    async fn exact_filter_compares_floats_as_ieee_numbers() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = float_parquet();
+        let schema = schema_of(&[("id", "long"), ("score", "double"), ("ratio", "float")]);
+        let cases: Vec<(crate::scan::ExactPredicate, Vec<Option<i64>>)> = vec![
+            (
+                cmp_pred(1, "score", Op::Eq, Lit::Float64(0.0)),
+                vec![Some(1), Some(2)],
+            ),
+            (
+                cmp_pred(1, "score", Op::NotEq, Lit::Float64(5.0)),
+                vec![Some(1), Some(2), Some(3), Some(6)],
+            ),
+            (
+                cmp_pred(1, "score", Op::Gt, Lit::Float64(0.0)),
+                vec![Some(4), Some(6)],
+            ),
+            (
+                cmp_pred(1, "score", Op::GtEq, Lit::Float64(0.0)),
+                vec![Some(1), Some(2), Some(4), Some(6)],
+            ),
+            (
+                cmp_pred(1, "score", Op::Lt, Lit::Int64(6)),
+                vec![Some(1), Some(2), Some(4)],
+            ),
+            (
+                cmp_pred(2, "ratio", Op::Gt, Lit::Float64(1.0)),
+                vec![Some(3), Some(6)],
+            ),
+            (cmp_pred(2, "ratio", Op::Eq, Lit::Int32(0)), vec![Some(5)]),
+        ];
+        for (predicate, expected) in cases {
+            let shown = predicate.to_string();
+            let ids = exact_ids(&bytes, Arc::clone(&schema), exact(vec![predicate]))
+                .await
+                .expect("decode");
+            assert_eq!(ids, expected, "{shown}");
+        }
+    }
+
+    /// A `long` column widened from `int` still decodes older files as
+    /// `Int32`; a literal beyond `i32` is decided by the range, not refused.
+    /// Ages: 10, 20, null.
+    #[tokio::test]
+    async fn exact_filter_decides_a_literal_beyond_a_promoted_columns_range() {
+        use crate::scan::predicate::{ComparisonOp as Op, LiteralValue as Lit};
+        let bytes = multitype_parquet();
+        let schema = schema_of(&[
+            ("id", "long"),
+            ("name", "string"),
+            ("age", "long"),
+            ("active", "boolean"),
+            ("bday", "date"),
+        ]);
+        let big = 3_000_000_000_i64;
+        let cases = [
+            (Op::Lt, big, vec![Some(1), Some(2)]),
+            (Op::NotEq, big, vec![Some(1), Some(2)]),
+            (Op::Gt, big, vec![]),
+            (Op::Eq, big, vec![]),
+            (Op::Gt, -big, vec![Some(1), Some(2)]),
+            (Op::LtEq, -big, vec![]),
+        ];
+        for (op, n, expected) in cases {
+            let ids = exact_ids(
+                &bytes,
+                Arc::clone(&schema),
+                exact(vec![cmp_pred(2, "age", op, Lit::Int64(n))]),
+            )
+            .await
+            .expect("decode");
+            assert_eq!(ids, expected, "age {op} {n}");
+        }
     }
 
     /// Bounded first-row-group "peek": `read_task_sample` returns at most `n`

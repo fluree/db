@@ -132,8 +132,8 @@ Defines namespace mappings:
 
 The @context can be:
 - Inline (as above)
-- External URL: `"@context": "http://example.org/context.jsonld"`
-- Array of contexts: `"@context": [url1, {...}]`
+- A string, which Fluree does not fetch: it becomes the vocabulary (`@vocab`), so `"@context": "https://schema.org"` reads `name` as `https://schema.org/name`
+- An array of contexts, applied in order: `"@context": ["https://schema.org", {...}]`
 
 ### @graph
 
@@ -223,10 +223,10 @@ See [SPARQL UPDATE](../query/sparql.md#sparql-update) for complete documentation
 
 Fluree exposes four transaction endpoints (all under `/v1/fluree/`):
 
-- `POST /insert` — add triples (JSON-LD or Turtle)
+- `POST /insert` — add triples (JSON-LD, Turtle, TriG)
 - `POST /update` — WHERE/DELETE/INSERT (JSON-LD) and SPARQL UPDATE
 - `POST /upsert` — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
-- `POST /sync` — make one named graph's contents exactly the payload, committing only the delta (JSON-LD)
+- `POST /sync` — make one graph's contents exactly the payload, committing only the delta (JSON-LD, Turtle, N-Triples or TriG)
 
 See [Insert](insert.md), [Update](update-where-delete-insert.md), [Upsert](upsert.md), and [Sync](sync.md) for details.
 
@@ -290,10 +290,12 @@ Each commit includes rich metadata:
 - `flakes_retracted`: Number of retractions
 
 **Provenance (in `txn-meta` graph, under the commit subject):**
-- `f:identity`: Authenticated identity acting on the transaction. System-controlled — verified DID for signed requests, otherwise from `opts.identity` / `CommitOpts::identity`. Any user-supplied `f:identity` in the body is overridden.
-- `f:author`: Optional author claim. Pure user txn-meta — supply `f:author` as a top-level property in the envelope-form transaction body.
-- `f:message`: Optional commit message. Pure user txn-meta — supply `f:message` as a top-level property in the envelope-form transaction body.
+- `f:identity`: Authenticated identity acting on the transaction. System-controlled — verified DID for signed requests, otherwise from `opts.identity` / `CommitOpts::identity`. A transaction can't set it: `f:identity` in its txn-meta is refused.
+- `f:author`: Optional author claim. Pure user txn-meta — supply `f:author` as a top-level property in the envelope-form transaction body, or in a TriG `<#txn-meta>` block.
+- `f:message`: Optional commit message. Pure user txn-meta — supply `f:message` as a top-level property in the envelope-form transaction body, or in a TriG `<#txn-meta>` block.
 - `previous_commit_id`: ContentId of previous commit (in the commit envelope).
+
+`f:author` and `f:message` are the only predicates in Fluree's namespaces a transaction's txn-meta may carry. Any other, such as `f:t`, `f:identity` or `f:reverts`, is refused, because the commit's own provenance lives on the same subject.
 
 See [Commit Receipts](commit-receipts.md) for details.
 

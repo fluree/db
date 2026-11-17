@@ -104,13 +104,15 @@ async fn insert_family_data(
 async fn query_grandparent(
     fluree: &fluree_db_api::Fluree,
     ledger: &fluree_db_api::LedgerState,
-    ledger_id: &str,
 ) -> Vec<serde_json::Value> {
-    // Use `fluree.db(...)` instead of `GraphDb::from_ledger_state`
-    // so the view has `resolved_config` applied — the f:rulesSource
-    // routing only takes effect once `apply_config_datalog` runs,
-    // which requires the resolved config.
-    let view = fluree.db(ledger_id).await.expect("load db with config");
+    // Deliberately the bare constructor. A view built this way carries no
+    // resolved config, so `f:rulesSource` routing depends entirely on query
+    // preparation completing the ledger's config defaults
+    // (`complete_config_defaults`). This helper used to route through
+    // `fluree.db(...)` to work around that not happening (fluree/db#1577);
+    // now it is the pin. If these tests start failing with rules ignored,
+    // config defaults have stopped reaching bare views.
+    let view = fluree_db_api::GraphDb::from_ledger_state(ledger);
     let q = json!({
         "@context": {"ex": "http://example.org/"},
         "select": "?grandparent",
@@ -136,7 +138,7 @@ async fn rules_source_in_named_graph_is_honored() {
     let ledger = seed_rules_in_named_graph(&fluree, ledger_id, rules_iri).await;
     let ledger = insert_family_data(&fluree, ledger).await;
 
-    let results = query_grandparent(&fluree, &ledger, ledger_id).await;
+    let results = query_grandparent(&fluree, &ledger).await;
     assert!(
         results.contains(&json!("ex:charlie")),
         "f:rulesSource → named graph must route rule extraction; \
@@ -268,7 +270,7 @@ async fn rule_in_named_graph_without_rules_source_is_ignored() {
     let r = fluree.update(ledger, &rule_tx).await.expect("seed rule");
     let ledger = insert_family_data(&fluree, r.ledger).await;
 
-    let results = query_grandparent(&fluree, &ledger, ledger_id).await;
+    let results = query_grandparent(&fluree, &ledger).await;
     assert!(
         !results.contains(&json!("ex:charlie")),
         "without f:rulesSource the named-graph rule must not be \

@@ -35,7 +35,7 @@ use crate::var_registry::VarId;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryIndexStore, ColumnProjection, ColumnSet};
-use fluree_db_core::{FlakeValue, GraphId};
+use fluree_db_core::{FlakeValue, GraphId, Sid};
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
@@ -48,9 +48,15 @@ use std::sync::Arc;
 /// old policy-leak concern: under any non-root view policy the gate declines
 /// and the policy-enforced fallback runs, so restricted predicates never
 /// leak their existence or cardinality.
+///
+/// With `lists`, the counts are of SPARQL's view of RDF lists
+/// (`crate::list_view`): a predicate holding lists counts one owner edge per
+/// list in place of its members, and `rdf:first` and `rdf:rest` count one
+/// triple per member each, from the index's list census.
 pub fn stats_count_by_predicate_operator(
     pred_var: VarId,
     count_var: VarId,
+    lists: bool,
     fallback: Option<BoxedOperator>,
 ) -> FastPathOperator {
     let schema: Arc<[VarId]> = Arc::from(vec![pred_var, count_var].into_boxed_slice());
@@ -69,16 +75,46 @@ pub fn stats_count_by_predicate_operator(
             // streaming aggregate paths already tag it so — this per-predicate
             // fast-path must match or a COUNT re-typed as xsd:long leaks (agg02).
             let dt = WellKnownDatatypes::new().xsd_integer;
-            let mut pred_col: Vec<Binding> = Vec::with_capacity(counts.len());
-            let mut count_col: Vec<Binding> = Vec::with_capacity(counts.len());
-            for (p_id, count) in counts {
+            let census = if lists {
+                Some(
+                    store
+                        .list_census(ctx.binary_g_id)
+                        .map_err(|e| QueryError::from_io("list census", e))?,
+                )
+            } else {
+                None
+            };
+            let mut rows: Vec<(Sid, i64)> = Vec::with_capacity(counts.len() + 2);
+            for (p_id, mut count) in counts {
                 // Directory p_ids are persisted-store IDs by construction; an
                 // unresolvable one means the store and its directories
                 // disagree — fall back rather than emit a partial result.
                 let Some(iri) = store.resolve_predicate_iri(p_id) else {
                     return Ok(None);
                 };
-                pred_col.push(Binding::sid(store.encode_iri(iri)));
+                if let Some(c) = census.as_ref().and_then(|census| census.get(&p_id)) {
+                    count += c.lists as i64 - c.members as i64;
+                }
+                rows.push((store.encode_iri(iri), count));
+            }
+            let members: u64 = census
+                .iter()
+                .flat_map(|c| c.values())
+                .map(|c| c.members)
+                .sum();
+            if members > 0 {
+                for iri in [fluree_vocab::rdf::FIRST, fluree_vocab::rdf::REST] {
+                    let sid = store.encode_iri(iri);
+                    match rows.iter_mut().find(|(p, _)| *p == sid) {
+                        Some((_, count)) => *count += members as i64,
+                        None => rows.push((sid, members as i64)),
+                    }
+                }
+            }
+            let mut pred_col: Vec<Binding> = Vec::with_capacity(rows.len());
+            let mut count_col: Vec<Binding> = Vec::with_capacity(rows.len());
+            for (sid, count) in rows {
+                pred_col.push(Binding::sid(sid));
                 count_col.push(Binding::lit(FlakeValue::Long(count), dt.clone()));
             }
             let batch = Batch::new(batch_schema.clone(), vec![pred_col, count_col])

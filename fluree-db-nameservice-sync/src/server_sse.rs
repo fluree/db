@@ -6,6 +6,7 @@
 //! types used by the sync layer.
 
 use crate::watch::RemoteEvent;
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
 use fluree_sse::{SSE_KIND_GRAPH_SOURCE, SSE_KIND_LEDGER};
 
@@ -55,7 +56,6 @@ struct NsRetractedEnvelope {
 struct LedgerSseRecord {
     /// Canonical ledger alias, e.g. "books:main"
     ledger_id: String,
-    branch: String,
     #[serde(default)]
     commit_head_id: Option<String>,
     commit_t: i64,
@@ -73,8 +73,6 @@ struct LedgerSseRecord {
 struct GraphSourceSseRecord {
     /// Canonical graph source alias, e.g. "search:main"
     graph_source_id: String,
-    name: String,
-    branch: String,
     /// String form of graph source type, e.g. "f:Bm25Index"
     source_type: String,
     config: String,
@@ -90,14 +88,20 @@ fn parse_ns_record(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseErro
     match payload.kind.as_str() {
         SSE_KIND_LEDGER => {
             let record: LedgerSseRecord = serde_json::from_value(payload.record)?;
+            let Some(id) = parse_event_id(&record.ledger_id) else {
+                return Ok(None);
+            };
             Ok(Some(RemoteEvent::LedgerUpdated(ledger_sse_to_ns_record(
-                record,
+                id, record,
             ))))
         }
         SSE_KIND_GRAPH_SOURCE => {
             let record: GraphSourceSseRecord = serde_json::from_value(payload.record)?;
+            let Some(id) = parse_event_id(&record.graph_source_id) else {
+                return Ok(None);
+            };
             Ok(Some(RemoteEvent::GraphSourceUpdated(
-                gs_sse_to_graph_source_record(record),
+                gs_sse_to_graph_source_record(id, record),
             )))
         }
         // Unknown kind is not an error; ignore for forwards compatibility.
@@ -107,26 +111,35 @@ fn parse_ns_record(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseErro
 
 fn parse_ns_retracted(data: &str) -> Result<Option<RemoteEvent>, ServerSseParseError> {
     let payload: NsRetractedEnvelope = serde_json::from_str(data)?;
+    let Some(id) = parse_event_id(&payload.resource_id) else {
+        return Ok(None);
+    };
 
     match payload.kind.as_str() {
-        SSE_KIND_LEDGER => Ok(Some(RemoteEvent::LedgerRetracted {
-            ledger_id: payload.resource_id,
-        })),
+        SSE_KIND_LEDGER => Ok(Some(RemoteEvent::LedgerRetracted { ledger_id: id })),
         SSE_KIND_GRAPH_SOURCE => Ok(Some(RemoteEvent::GraphSourceRetracted {
-            graph_source_id: payload.resource_id,
+            graph_source_id: id,
         })),
         _ => Ok(None),
     }
 }
 
-fn ledger_sse_to_ns_record(record: LedgerSseRecord) -> NsRecord {
+/// An id this peer cannot represent is one resource it cannot mirror, not a
+/// schema mismatch: skip the event rather than count it toward the
+/// consecutive-parse-error limit that tears the stream down.
+fn parse_event_id(raw: &str) -> Option<LedgerId> {
+    LedgerId::parse(raw)
+        .inspect_err(|e| tracing::warn!(error = %e, "skipping SSE event for unparseable id"))
+        .ok()
+}
+
+fn ledger_sse_to_ns_record(ledger_id: LedgerId, record: LedgerSseRecord) -> NsRecord {
     use fluree_db_core::ContentId;
 
-    let (ledger_name, branch) = split_ledger_id_or_fallback(&record.ledger_id, &record.branch);
     NsRecord {
-        ledger_id: record.ledger_id.clone(),
-        name: ledger_name,
-        branch,
+        name: ledger_id.name().to_string(),
+        branch: ledger_id.branch().to_string(),
+        ledger_id,
         commit_head_id: record
             .commit_head_id
             .and_then(|s| s.parse::<ContentId>().ok()),
@@ -143,13 +156,16 @@ fn ledger_sse_to_ns_record(record: LedgerSseRecord) -> NsRecord {
     }
 }
 
-fn gs_sse_to_graph_source_record(record: GraphSourceSseRecord) -> GraphSourceRecord {
+fn gs_sse_to_graph_source_record(
+    graph_source_id: LedgerId,
+    record: GraphSourceSseRecord,
+) -> GraphSourceRecord {
     use fluree_db_core::ContentId;
 
     GraphSourceRecord {
-        graph_source_id: record.graph_source_id,
-        name: record.name,
-        branch: record.branch,
+        name: graph_source_id.name().to_string(),
+        branch: graph_source_id.branch().to_string(),
+        graph_source_id,
         source_type: GraphSourceType::from_type_string(&record.source_type),
         config: record.config,
         dependencies: record.dependencies,
@@ -157,14 +173,6 @@ fn gs_sse_to_graph_source_record(record: GraphSourceSseRecord) -> GraphSourceRec
         index_t: record.index_t,
         retracted: record.retracted,
     }
-}
-
-/// Split a ledger_id into (name, branch) using the canonical alias parser.
-///
-/// Falls back to (ledger_id, fallback_branch) if parsing fails.
-fn split_ledger_id_or_fallback(ledger_id: &str, fallback_branch: &str) -> (String, String) {
-    fluree_db_core::ledger_id::split_ledger_id(ledger_id)
-        .unwrap_or_else(|_| (ledger_id.to_string(), fallback_branch.to_string()))
 }
 
 #[cfg(test)]
@@ -311,14 +319,12 @@ mod tests {
             "fixture must be an id the parser rejects, or this test is vacuous"
         );
 
-        match parse_server_sse_event(&event).unwrap() {
-            Some(RemoteEvent::LedgerUpdated(record)) => {
-                assert_eq!(record.ledger_id, "mydb:main:extra");
-                assert_eq!(record.name, "mydb:main:extra", "verbatim, not split");
-                assert_eq!(record.branch, "main", "the wire's branch is the fallback");
-            }
-            other => panic!("expected LedgerUpdated, not a torn-down stream, got {other:?}"),
-        }
+        // Skipped (Ok(None)), not an Err: an Err counts toward the
+        // consecutive-parse-error limit that tears the stream down.
+        assert!(
+            matches!(parse_server_sse_event(&event), Ok(None)),
+            "an unrepresentable id must be skipped, not fail the stream"
+        );
     }
 
     #[test]

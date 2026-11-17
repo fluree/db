@@ -39,7 +39,7 @@ use fluree_db_query::policy::QueryPolicyEnforcer;
 use serde_json::{json, Value as JsonValue};
 
 use crate::error::ApiError;
-use crate::{Fluree, GraphDb, LedgerState, QueryExecutionOptions, Result};
+use crate::{Fluree, GraphDb, LedgerState, PolicyAuthorization, QueryExecutionOptions, Result};
 
 pub use fluree_db_graphql::limits::{Limits, DEFAULT_MAX_COMPLEXITY, DEFAULT_MAX_DEPTH};
 
@@ -263,7 +263,10 @@ pub async fn derive_schema(db: &GraphDb) -> Arc<DerivedSchema> {
 /// Everything the derived schema depends on, reduced to something comparable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SchemaCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
+    /// The view's graph: whether its config enables SHACL decides which
+    /// `sh:minCount` fields are non-null.
+    graph_id: fluree_db_core::GraphId,
     /// The indexed snapshot: its statistics are the schema's base.
     index_t: i64,
     /// The view's as-of time, which bounds the overlay half of the merge.
@@ -288,11 +291,33 @@ fn cache_key(db: &GraphDb) -> Option<SchemaCacheKey> {
     }
     Some(SchemaCacheKey {
         ledger_id: db.snapshot.ledger_id.clone(),
+        graph_id: db.graph_id,
         index_t: db.snapshot.t,
         as_of_t: db.t,
         overlay_version: db.overlay.content_version()?,
         context: hash_context(db.default_context.as_ref()),
     })
+}
+
+/// Format a lowered GraphQL read's rows, filtered by the view's policy.
+///
+/// Every GraphQL root field lowers to a subgraph projection, so this is where the
+/// whole surface's policy filtering happens. Formatting without the view's policy
+/// expands subjects the request was denied, even though its rows were filtered.
+async fn hydrate_rows(
+    result: &crate::QueryResult,
+    db: &GraphDb,
+) -> std::result::Result<JsonValue, GqlError> {
+    crate::format::format_results_async(
+        result,
+        &result.context,
+        db.as_graph_db_ref(),
+        &crate::format::FormatterConfig::jsonld(),
+        db.policy(),
+        None,
+    )
+    .await
+    .map_err(|e| GqlError::Execution(e.to_string()))
 }
 
 fn hash_context(context: Option<&JsonValue>) -> u64 {
@@ -627,6 +652,10 @@ async fn shapes(db: &GraphDb) -> Vec<ShapeDescription> {
     let Some(cache) = compiled_shapes(db).await else {
         return Vec::new();
     };
+    // `sh:minCount ≥ 1` makes a field non-null only where SHACL is enforced:
+    // elsewhere nothing keeps a record from lacking the value, and a non-null
+    // field would turn that record into an error on read.
+    let enforced = shacl_enforced(db).await;
     let snapshot = db.snapshot.as_ref();
     let policy = db
         .policy_enforcer()
@@ -658,7 +687,15 @@ async fn shapes(db: &GraphDb) -> Vec<ShapeDescription> {
                 name: shape.name.clone(),
                 description: shape.description.clone(),
                 closed: shape_is_closed(shape),
-                properties: shaped_properties(shape, snapshot, policy),
+                properties: shaped_properties(shape, snapshot, policy)
+                    .into_iter()
+                    .map(|mut property| {
+                        if !enforced {
+                            property.min_count = None;
+                        }
+                        property
+                    })
+                    .collect(),
             });
         }
     }
@@ -764,6 +801,29 @@ fn allowed_value(
 /// something to redo per request. The key adds `shacl_epoch` to the schema
 /// cache's: that epoch is exactly "a shape-affecting flake was committed", which
 /// is what the write path already keys its own compile cache on.
+/// Whether the ledger config enables SHACL for the view's graph: the view's
+/// resolved config, or the ledger's own when the view was built without it.
+async fn shacl_enforced(db: &GraphDb) -> bool {
+    let resolved = match db.resolved_config() {
+        Some(resolved) => Some(resolved.clone()),
+        None => {
+            let view = db.as_graph_db_ref();
+            let graph_iri = (db.graph_id != fluree_db_core::DEFAULT_GRAPH_ID)
+                .then(|| db.snapshot.graph_registry.iri_for_graph_id(db.graph_id))
+                .flatten();
+            crate::config_resolver::resolve_ledger_config(view.snapshot, view.overlay, view.t)
+                .await
+                .ok()
+                .flatten()
+                .map(|config| crate::config_resolver::resolve_effective_config(&config, graph_iri))
+        }
+    };
+    resolved
+        .as_ref()
+        .and_then(|resolved| crate::config_resolver::merge_shacl_opts(resolved, None, None))
+        .is_some_and(|shacl| shacl.enabled)
+}
+
 async fn compiled_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache>> {
     let key = shape_cache_key(db);
     if let Some(key) = &key {
@@ -784,7 +844,7 @@ async fn compiled_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache
 /// blocking a runtime worker on it would risk starving the very executor the
 /// reads need to make progress.
 async fn compile_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache>> {
-    let g_ids = crate::tx::resolve_shapes_source_g_ids(db.ledger_config(), &db.snapshot)
+    let g_ids = crate::tx::resolve_shapes_source_g_ids(db.ledger_config(), &db.snapshot, db.t)
         .unwrap_or_else(|_| vec![0]);
     let views: Vec<GraphDb> = g_ids
         .iter()
@@ -819,7 +879,7 @@ type ShapeCache =
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
     index_t: i64,
     shacl_epoch: u64,
     /// The compiled shapes bake in subclass expansion, so a hierarchy change
@@ -862,10 +922,14 @@ fn user_iri(sid: &Sid, snapshot: &LedgerSnapshot) -> Option<String> {
 /// every fact predates that build stays in the schema regardless of `to_t`. The
 /// schema is therefore a superset for a time-traveled view — queries against a
 /// type that did not yet exist return nothing rather than misreporting.
-fn merged_stats(snapshot: &LedgerSnapshot, overlay: &dyn OverlayProvider, to_t: i64) -> IndexStats {
+fn merged_stats(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Arc<IndexStats> {
     let indexed = snapshot.stats.clone().unwrap_or_default();
     match overlay.as_any().downcast_ref::<Novelty>() {
-        Some(novelty) => assemble_fast_stats_with(
+        Some(novelty) => Arc::new(assemble_fast_stats_with(
             &indexed,
             snapshot,
             novelty,
@@ -874,7 +938,7 @@ fn merged_stats(snapshot: &LedgerSnapshot, overlay: &dyn OverlayProvider, to_t: 
             NoveltyMerge::Reconciled {
                 site: stats_merge_site::GRAPHQL_SCHEMA,
             },
-        ),
+        )),
         None => indexed,
     }
 }
@@ -904,6 +968,8 @@ struct LedgerExecutor {
     /// many queries; they share one handle so a timeout or a client disconnect
     /// cancels all of them, not whichever happens to check next.
     options: QueryExecutionOptions,
+    /// Host-selected authority, rebuilt against each mutation's current state.
+    authorization: Option<PolicyAuthorization>,
 }
 
 impl LedgerExecutor {
@@ -948,10 +1014,7 @@ impl RootExecutor for LedgerExecutor {
             .query_with_options(&self.db, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(self.db.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, &self.db).await?;
         reshape::reshape(
             &lowered.shape,
             &self.schema.model,
@@ -993,15 +1056,43 @@ impl RootExecutor for LedgerExecutor {
         // nothing and means a refused mutation leaves the caller exactly where
         // it started rather than destroying the state a later field needs.
         let unchanged = ledger.clone();
-        let result = match lowered.verb {
-            Verb::Insert => self.fluree.insert(ledger, &lowered.transaction).await,
-            Verb::Upsert => self.fluree.upsert(ledger, &lowered.transaction).await,
-            Verb::Update => self.fluree.update(ledger, &lowered.transaction).await,
-        };
+        let result = async {
+            let default_options = crate::GovernanceOptions::default();
+            let opts = self
+                .authorization
+                .as_ref()
+                .map(PolicyAuthorization::options)
+                .unwrap_or(&default_options);
+            let policy = crate::build_transact_policy_context(
+                &self.fluree,
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                opts,
+            )
+            .await?;
+            let builder = self.fluree.stage_owned(ledger);
+            let mut builder = match lowered.verb {
+                Verb::Insert => builder.insert(&lowered.transaction),
+                Verb::Upsert => builder.upsert(&lowered.transaction),
+                Verb::Update => builder.update(&lowered.transaction),
+            };
+            if let Some(policy) = policy {
+                builder = builder.policy(policy);
+            }
+            if let Some(authorization) = &self.authorization {
+                builder = builder.commit_opts(crate::CommitOpts {
+                    identity: authorization.options().identity.clone(),
+                    ..Default::default()
+                });
+            }
+            builder.execute().await
+        }
+        .await;
         // A SHACL violation, a policy denial, or any other rejection arrives
         // here as an ordinary transaction error and becomes a GraphQL error.
-        // Nothing on this path can bypass them: it is the same write API any
-        // other client uses.
+        // Restore the prior state on policy-build errors as well as rejected writes.
         let result = result.map_err(|e| {
             slot.lock().replace(unchanged);
             GqlError::Execution(e.to_string())
@@ -1010,6 +1101,17 @@ impl RootExecutor for LedgerExecutor {
         let view = GraphDb::from_ledger_state(&committed)
             .with_default_context(self.db.default_context.clone());
         slot.lock().replace(committed);
+        let view = if let Some(authorization) = &self.authorization {
+            self.fluree
+                .wrap_policy(view, authorization.options())
+                .await
+                .map_err(|e| GqlError::Execution(e.to_string()))?
+        } else {
+            self.fluree
+                .wrap_policy_defaults(view)
+                .await
+                .map_err(|e| GqlError::Execution(e.to_string()))?
+        };
 
         self.read_back(&view, &request, &lowered.subjects).await
     }
@@ -1066,10 +1168,7 @@ impl LedgerExecutor {
             .query_with_options(view, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(view.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, view).await?;
         let objects = reshape::reshape(
             &lowered.shape,
             &self.schema.model,
@@ -1158,7 +1257,7 @@ impl Fluree {
         prepared: PreparedRequest<'_>,
         options: QueryExecutionOptions,
     ) -> Result<JsonValue> {
-        self.run_graphql(db, prepared, None, options).await
+        self.run_graphql(db, prepared, None, options, None).await
     }
 
     /// Execute a GraphQL request that may write.
@@ -1207,10 +1306,49 @@ impl Fluree {
         prepared: PreparedRequest<'_>,
         options: QueryExecutionOptions,
     ) -> Result<(JsonValue, LedgerState)> {
+        self.graphql_transact_authorized(ledger, default_context, prepared, options, None)
+            .await
+    }
+
+    /// Execute with host-verified policy selection for schema visibility,
+    /// every mutation, and each committed subject's read-back. Policy contexts
+    /// are rebuilt against the current state for serial mutation fields.
+    /// The host must separately authorize ledger read/write access.
+    pub async fn graphql_transact_with_authorization(
+        &self,
+        ledger: LedgerState,
+        default_context: Option<JsonValue>,
+        prepared: PreparedRequest<'_>,
+        options: QueryExecutionOptions,
+        authorization: &PolicyAuthorization,
+    ) -> Result<(JsonValue, LedgerState)> {
+        self.graphql_transact_authorized(
+            ledger,
+            default_context,
+            prepared,
+            options,
+            Some(authorization),
+        )
+        .await
+    }
+
+    async fn graphql_transact_authorized(
+        &self,
+        ledger: LedgerState,
+        default_context: Option<JsonValue>,
+        prepared: PreparedRequest<'_>,
+        options: QueryExecutionOptions,
+        authorization: Option<&PolicyAuthorization>,
+    ) -> Result<(JsonValue, LedgerState)> {
         let db = GraphDb::from_ledger_state(&ledger).with_default_context(default_context);
+        let db = if let Some(authorization) = authorization {
+            self.wrap_policy(db, authorization.options()).await?
+        } else {
+            self.wrap_policy_defaults(db).await?
+        };
         let slot = parking_lot::Mutex::new(Some(ledger));
         let envelope = self
-            .run_graphql(&db, prepared, Some(&slot), options)
+            .run_graphql(&db, prepared, Some(&slot), options, authorization)
             .await?;
         let ledger = slot.lock().take().ok_or_else(|| {
             ApiError::Internal("the ledger state was consumed by a failed mutation".to_string())
@@ -1224,6 +1362,7 @@ impl Fluree {
         prepared: PreparedRequest<'_>,
         ledger: Option<&parking_lot::Mutex<Option<LedgerState>>>,
         options: QueryExecutionOptions,
+        authorization: Option<&PolicyAuthorization>,
     ) -> Result<JsonValue> {
         let PreparedRequest { request, doc, .. } = prepared;
         let derived = derive_schema(db).await;
@@ -1248,6 +1387,7 @@ impl Fluree {
             ledger: ledger.map(|slot| parking_lot::Mutex::new(slot.lock().take())),
             explain: request.explain.then(|| parking_lot::Mutex::new(Vec::new())),
             options,
+            authorization: authorization.cloned(),
         });
         // Registering the schema costs thousands of allocations — 2.5 ms for a
         // hundred-class ledger — so it is cached beside the model rather than

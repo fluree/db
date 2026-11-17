@@ -239,6 +239,75 @@ async fn time_travel_index_current() {
         .await;
 }
 
+/// The index's class stats say every `ex:name` subject is an `ex:Tagged`, which
+/// licenses dropping the `@type` pattern for current reads. Below the index
+/// `t` that coverage does not hold, so the pattern must stay.
+#[tokio::test]
+async fn time_travel_below_index_keeps_type_pattern() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/tt-type-coverage:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let mut ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+            for tx in [
+                json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s1", "ex:name": "S1"}),
+                json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:s1", "@type": "ex:Tagged"}),
+            ] {
+                ledger = fluree
+                    .insert_with_opts(
+                        ledger,
+                        &tx,
+                        TxnOpts::default(),
+                        CommitOpts::default(),
+                        &index_cfg,
+                    )
+                    .await
+                    .expect("insert")
+                    .ledger;
+            }
+            let _ = trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            let status = fluree.index_status(ledger_id).await.expect("index_status");
+            assert_eq!(status.index_t, 2, "index should be at t=2");
+
+            // A single-ledger view, not `query_connection`: dataset execution
+            // never licenses the elision.
+            let tagged_names = |t: i64| {
+                let fluree = &fluree;
+                async move {
+                    let query = json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "select": "?name",
+                        "where": {"@id": "?s", "ex:name": "?name", "@type": "ex:Tagged"}
+                    });
+                    let db = fluree.db(ledger_id).await.expect("db").as_of(t);
+                    let result = fluree.query(&db, &query).await.expect("query");
+                    let ledger = fluree.ledger(ledger_id).await.expect("ledger");
+                    result.to_jsonld(&ledger.snapshot).expect("to_jsonld")
+                }
+            };
+            assert_eq!(tagged_names(1).await, json!([]), "ex:s1 was not typed at t=1");
+            assert_eq!(tagged_names(2).await, json!(["S1"]));
+        })
+        .await;
+}
+
 // =============================================================================
 // Scenario (c): Index + novelty - index is behind, novelty has newer data
 // =============================================================================

@@ -1,0 +1,7 @@
+{"@context": {"rdfs": "http://www.w3.org/2000/01/rdf-schema#", "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#", "owl": "http://www.w3.org/2002/07/owl#", "s": "https://schema.org/"},
+ "@graph": [
+  {"@id": "s:Person", "@type": "rdfs:Class", "rdfs:label": "Person", "rdfs:comment": "A person."},
+  {"@id": "s:Organization", "@type": "rdfs:Class", "rdfs:label": "Organization"},
+  {"@id": "s:worksFor", "@type": "rdf:Property", "rdfs:label": "worksFor", "s:domainIncludes": {"@id": "s:Person"}, "s:rangeIncludes": {"@id": "s:Organization"}},
+  {"@id": "s:Hybrid", "@type": "owl:Class", "owl:unionOf": {"@list": [{"@id": "s:Person"}, {"@id": "s:Organization"}]}}
+ ]}

@@ -1,6 +1,8 @@
 //! AWS SDK credential provider backed by vended credentials.
 
-use crate::credential::{CredentialCacheKey, SendCredentialResolver, VendedCredentials};
+use crate::credential::{
+    CredentialCacheKey, S3Credentials, SendCredentialResolver, VendedCredentials,
+};
 use aws_credential_types::provider::future::ProvideCredentials as ProvideCredentialsFuture;
 use aws_credential_types::provider::ProvideCredentials;
 use aws_credential_types::Credentials;
@@ -80,14 +82,21 @@ impl ProvideCredentials for VendedAwsCredentialProvider {
                     )
                 })?;
 
-            convert_to_aws_credentials(&vended)
+            match vended {
+                VendedCredentials::S3(s3) => convert_to_aws_credentials(&s3),
+                VendedCredentials::Gcs(_) => Err(
+                    aws_credential_types::provider::error::CredentialsError::not_loaded(
+                        "the catalog vended a GCS token, which cannot sign S3 requests",
+                    ),
+                ),
+            }
         })
     }
 }
 
 /// Convert vended credentials to AWS SDK credentials.
 fn convert_to_aws_credentials(
-    vended: &VendedCredentials,
+    vended: &S3Credentials,
 ) -> std::result::Result<Credentials, aws_credential_types::provider::error::CredentialsError> {
     let expiration = vended.expires_at.map(|dt| {
         std::time::SystemTime::UNIX_EPOCH
@@ -142,7 +151,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_convert_credentials() {
-        let vended = VendedCredentials {
+        let vended = S3Credentials {
             access_key_id: "AKIATEST".to_string(),
             secret_access_key: "secret123".to_string(),
             session_token: Some("session456".to_string()),
@@ -164,7 +173,7 @@ mod tests {
         let resolver = Arc::new(TestResolver::new());
         let key = CredentialCacheKey::for_read("https://polaris.example.com", "ns.table");
 
-        let creds = VendedCredentials {
+        let creds = VendedCredentials::S3(S3Credentials {
             access_key_id: "AKIATEST".to_string(),
             secret_access_key: "secret123".to_string(),
             session_token: None,
@@ -172,7 +181,7 @@ mod tests {
             endpoint: None,
             region: None,
             path_style: false,
-        };
+        });
 
         resolver.set_credentials(key.clone(), creds).await;
 

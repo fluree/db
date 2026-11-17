@@ -5,6 +5,12 @@ mod support;
 mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]
 mod it_differential_fastpath;
+#[path = "it_filter_pushdown_operators.rs"]
+mod it_filter_pushdown_operators;
+#[path = "it_jsonld_join_batched_lane.rs"]
+mod it_jsonld_join_batched_lane;
+#[path = "it_materializer_decode_errors.rs"]
+mod it_materializer_decode_errors;
 #[path = "it_nested_select_modifiers.rs"]
 mod it_nested_select_modifiers;
 #[path = "it_query_agent_json.rs"]
@@ -31,6 +37,8 @@ mod it_query_fulltext;
 mod it_query_geo;
 #[path = "it_query_geo_search.rs"]
 mod it_query_geo_search;
+#[path = "it_query_graph_names.rs"]
+mod it_query_graph_names;
 #[path = "it_query_grouping.rs"]
 mod it_query_grouping;
 #[path = "it_query_jsonld.rs"]
@@ -39,10 +47,14 @@ mod it_query_jsonld;
 mod it_query_jsonld_basic;
 #[path = "it_query_jsonld_compound.rs"]
 mod it_query_jsonld_compound;
+#[path = "it_query_jsonld_grouped_projection.rs"]
+mod it_query_jsonld_grouped_projection;
 #[path = "it_query_list_functions.rs"]
 mod it_query_list_functions;
 #[path = "it_query_misc.rs"]
 mod it_query_misc;
+#[path = "it_query_optional_encoded_bindings.rs"]
+mod it_query_optional_encoded_bindings;
 #[path = "it_query_optional_hashjoin.rs"]
 mod it_query_optional_hashjoin;
 #[path = "it_query_post_order_limit.rs"]
@@ -61,3 +73,9 @@ mod it_query_typed_json;
 mod it_query_vocab_id_compaction;
 #[path = "it_query_wildcard_system_facts.rs"]
 mod it_query_wildcard_system_facts;
+#[path = "it_reserved_graph_contract.rs"]
+mod it_reserved_graph_contract;
+#[path = "it_service_cross_ledger_iri.rs"]
+mod it_service_cross_ledger_iri;
+#[path = "it_unordered_output_order.rs"]
+mod it_unordered_output_order;

@@ -22,15 +22,236 @@ use cluster::{eventually, form_cluster, leader, start_node, Node};
 
 type CounterNode = Node<Counter>;
 use counter::{Counter, CounterCommand};
-use fluree_raft_core::forward::LeaderView;
+use fluree_raft_core::forward::{propose_via_leader, LeaderView, ProposeError};
 use fluree_raft_core::group::GroupId;
 use fluree_raft_core::node::NodeId;
-use fluree_raft_core::runtime::{run_periodic, spawn_leader_watcher, DEFAULT_LEADER_TASK_GRACE};
+use fluree_raft_core::runtime::{
+    run_periodic, spawn_leader_watcher, RaftGroupConfig, DEFAULT_LEADER_TASK_GRACE,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
+
+#[derive(Clone, Copy, Debug)]
+enum ProposeFault {
+    LostHeaders,
+    TruncatedBody,
+    NotLeader,
+    ServerError,
+    Bare503,
+    InvalidJson,
+    /// A leader too old to report the log id.
+    NoLogId,
+    MalformedLogId,
+}
+
+/// Forward to the real leader, then damage only the first proposal's
+/// response. Other RPCs pass through, so elections and replication stay real.
+async fn relay_fault_case(fault: ProposeFault) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let group_id = GroupId::new("relay-fault").unwrap();
+    let mut nodes: Vec<CounterNode> = vec![
+        start_node(1, &group_id, |_| {}).await,
+        start_node(2, &group_id, |_| {}).await,
+        start_node(3, &group_id, |_| {}).await,
+    ];
+    let upstream = nodes[0].addr.client_addr.clone();
+    let follower_upstream = nodes[1].addr.client_addr.clone();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    nodes[0].addr.raft_addr = format!("http://{}/raft/{group_id}", listener.local_addr().unwrap());
+    let proposals = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&proposals);
+    let proxy = tokio::spawn(async move {
+        let client = reqwest::Client::new();
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let client = client.clone();
+            let upstream = upstream.clone();
+            let follower_upstream = follower_upstream.clone();
+            let observed = Arc::clone(&observed);
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                loop {
+                    let mut byte = [0];
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                    assert!(request.len() < 64 * 1024);
+                    if request.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8(request).unwrap();
+                let path = headers
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let length: usize = headers
+                    .lines()
+                    .find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then(|| value.trim().parse().unwrap())
+                    })
+                    .unwrap_or(0);
+                let mut body = vec![0; length];
+                socket.read_exact(&mut body).await.unwrap();
+                let first =
+                    path.ends_with("/propose") && observed.fetch_add(1, Ordering::SeqCst) == 0;
+                // Exercise the real peer rejection wire response by sending
+                // the first proposal to a follower instead of the leader.
+                let rejected = first && matches!(fault, ProposeFault::NotLeader);
+                let upstream = if rejected {
+                    follower_upstream
+                } else {
+                    upstream
+                };
+                let response = client
+                    .post(format!("{upstream}{path}"))
+                    .header("content-type", "application/json")
+                    .body(body)
+                    .send()
+                    .await
+                    .unwrap();
+                let mut log_id = response
+                    .headers()
+                    .get("x-fluree-raft-log-id")
+                    .map(|value| value.to_str().unwrap().to_string());
+                let mut status = response.status();
+                let mut bytes = response.bytes().await.unwrap();
+                if rejected {
+                    assert_eq!(status, reqwest::StatusCode::SERVICE_UNAVAILABLE);
+                    assert_eq!(
+                        serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                        serde_json::json!({"error": "not_leader"})
+                    );
+                } else if first {
+                    assert!(status.is_success(), "leader must apply before fault");
+                    if matches!(fault, ProposeFault::LostHeaders) {
+                        return;
+                    }
+                    match fault {
+                        ProposeFault::ServerError => {
+                            status = reqwest::StatusCode::INTERNAL_SERVER_ERROR;
+                            bytes = "propose response encode error".into();
+                        }
+                        ProposeFault::Bare503 => {
+                            status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+                            bytes = "upstream unavailable".into();
+                        }
+                        ProposeFault::InvalidJson => bytes = "{".into(),
+                        ProposeFault::NoLogId => log_id = None,
+                        ProposeFault::MalformedLogId => log_id = Some("7".into()),
+                        _ => {}
+                    }
+                }
+                let log_id = log_id
+                    .map(|value| format!("X-Fluree-Raft-Log-Id: {value}\r\n"))
+                    .unwrap_or_default();
+                let headers = format!(
+                    "HTTP/1.1 {}\r\nContent-Length: {}\r\nConnection: close\r\n{log_id}\r\n",
+                    status,
+                    bytes.len()
+                );
+                socket.write_all(headers.as_bytes()).await.unwrap();
+                if first && matches!(fault, ProposeFault::TruncatedBody) {
+                    assert!(bytes.len() > 1);
+                    socket.write_all(&bytes[..1]).await.unwrap();
+                    // Give the relay time to receive headers before EOF.
+                    tokio::task::yield_now().await;
+                    return;
+                }
+                socket.write_all(&bytes).await.unwrap();
+            });
+        }
+    });
+    form_cluster(&nodes).await;
+    eventually("follower to recognize leader 1", || async {
+        LeaderView::current_leader(&*nodes[1].group.raft).await == Some(1)
+    })
+    .await;
+
+    let result = tokio::time::timeout(
+        Duration::from_secs(10),
+        propose_via_leader(&nodes[1].group.raft, CounterCommand::Add(1)),
+    )
+    .await
+    .expect("relay must finish");
+    let state = nodes[0].group.state.read().await.clone();
+    proxy.abort();
+    eprintln!(
+        "{fault:?}: result={result:?}, proposals={}, value={}, applies={}",
+        proposals.load(Ordering::SeqCst),
+        state.value,
+        state.applies
+    );
+    assert_eq!(state.value, 1, "one logical proposal must increment once");
+    assert_eq!(state.applies, 1);
+    match fault {
+        ProposeFault::NotLeader => {
+            let proposed = result.expect("the retry reaches the leader");
+            assert!(proposed.log_id.is_some(), "the leader reports the log id");
+            assert_eq!(proposals.load(Ordering::SeqCst), 2);
+        }
+        ProposeFault::NoLogId => {
+            let proposed = result.expect("a response without the log id still decodes");
+            assert_eq!(proposed.log_id, None);
+            assert_eq!(proposals.load(Ordering::SeqCst), 1);
+        }
+        _ => {
+            assert!(
+                matches!(result, Err(ProposeError::Unknown(_))),
+                "lost response must report an ambiguous outcome"
+            );
+            assert_eq!(proposals.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_does_not_reapply_after_losing_response_headers() {
+    relay_fault_case(ProposeFault::LostHeaders).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_does_not_reapply_after_truncated_response_body() {
+    relay_fault_case(ProposeFault::TruncatedBody).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_retries_explicit_rejection_before_apply() {
+    relay_fault_case(ProposeFault::NotLeader).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_reports_unknown_after_post_apply_server_error() {
+    relay_fault_case(ProposeFault::ServerError).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_does_not_retry_bare_503_after_apply() {
+    relay_fault_case(ProposeFault::Bare503).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_reports_unknown_after_invalid_success_json() {
+    relay_fault_case(ProposeFault::InvalidJson).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_through_a_leader_without_the_log_id_returns_the_response() {
+    relay_fault_case(ProposeFault::NoLogId).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_reports_unknown_after_a_malformed_log_id() {
+    relay_fault_case(ProposeFault::MalformedLogId).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn three_node_counter_cluster_replicates_and_tracks_membership() {
@@ -256,7 +477,9 @@ async fn a_task_that_ignores_cancellation_is_aborted_after_the_grace_period() {
 /// relays the command to the leader's `/propose` endpoint, the apply
 /// replicates, and the follower gets the application response back —
 /// the contract that lets a load balancer spread writes across a
-/// group's nodes instead of pinning them to whoever leads.
+/// group's nodes instead of pinning them to whoever leads. It also gets
+/// the entry the command committed as, which it can wait to apply
+/// before reading its own write.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_follower_propose_relays_to_the_leader_and_applies() {
     let group_id = GroupId::new("counter").expect("valid group id");
@@ -267,7 +490,8 @@ async fn a_follower_propose_relays_to_the_leader_and_applies() {
     ];
     form_cluster(&nodes).await;
 
-    let leader_id = leader(&nodes).await.id;
+    let leader = leader(&nodes).await;
+    let leader_id = leader.id;
     let follower = nodes
         .iter()
         .find(|n| n.id != leader_id)
@@ -285,16 +509,120 @@ async fn a_follower_propose_relays_to_the_leader_and_applies() {
         "a follower's direct client_write must refuse"
     );
 
-    // The relayed propose lands.
-    fluree_raft_core::forward::propose_via_leader(&follower.group.raft, CounterCommand::Add(41))
+    // The relayed propose lands, as the entry after one the leader
+    // proposed itself.
+    let on_leader = propose_via_leader(&leader.group.raft, CounterCommand::Add(1))
         .await
-        .expect("relayed propose applies");
+        .expect("the leader proposes")
+        .log_id
+        .expect("the leader reports the log id");
+    let relayed = propose_via_leader(&follower.group.raft, CounterCommand::Add(41))
+        .await
+        .expect("relayed propose applies")
+        .log_id
+        .expect("the relay reports the log id");
+    assert_eq!(relayed.index, on_leader.index + 1);
+
+    follower
+        .group
+        .wait_applied(relayed.index, Duration::from_secs(10))
+        .await
+        .expect("the follower applies its relayed write");
+    assert_eq!(follower.group.state.read().await.value, 42);
 
     for node in &nodes {
         let id = node.id;
-        eventually(&format!("node {id} to converge on 41"), || async {
-            node.group.state.read().await.value == 41
+        eventually(&format!("node {id} to converge on 42"), || async {
+            node.group.state.read().await.value == 42
         })
         .await;
     }
+}
+
+/// Two surviving voters must elect a leader after the third leads and dies.
+///
+/// openraft 0.9 draws one election timeout per process. Survivors whose draws
+/// round to the same election tick start every campaign together, each rejects
+/// the other's same-term vote request, and the split repeats term after term.
+/// The pinned openraft redraws per campaign, which breaks the tie. A 250 ms
+/// window against the 75 ms tick makes a shared tick likely: roughly one
+/// failover in eleven stalls without the redraw, so 48 failovers catch it.
+///
+/// Batches stay small on purpose. With too many clusters at once the runtime
+/// starves, vote responses miss the election window, and survivors stall at
+/// diverging terms — a different failure this test must not report.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn surviving_voters_elect_after_leader_loss() {
+    const BATCHES: u64 = 6;
+    const CLUSTERS_PER_BATCH: u64 = 8;
+    for batch in 0..BATCHES {
+        let mut failovers = tokio::task::JoinSet::new();
+        for cluster in 0..CLUSTERS_PER_BATCH {
+            failovers.spawn(fail_over_leader(batch * CLUSTERS_PER_BATCH + cluster));
+        }
+        let mut stalled = Vec::new();
+        while let Some(outcome) = failovers.join_next().await {
+            if let Some(report) = outcome.expect("failover task") {
+                stalled.push(report);
+            }
+        }
+        assert!(
+            stalled.is_empty(),
+            "batch {batch}: {} of {CLUSTERS_PER_BATCH} failovers elected no leader: {stalled:#?}",
+            stalled.len(),
+        );
+    }
+}
+
+/// Form a three-voter group, stop its leader, and wait for a survivor to
+/// lead. Returns the survivors' state if none does within the bound.
+async fn fail_over_leader(cluster: u64) -> Option<String> {
+    fn short_timeouts(config: &mut RaftGroupConfig) {
+        config.transport.rpc_timeout = Duration::from_millis(100);
+        config.raft.election_timeout_min = 250;
+        config.raft.election_timeout_max = 500;
+    }
+
+    let group_id = GroupId::new("counter").expect("valid group id");
+    let nodes: Vec<CounterNode> = vec![
+        start_node(1, &group_id, short_timeouts).await,
+        start_node(2, &group_id, short_timeouts).await,
+        start_node(3, &group_id, short_timeouts).await,
+    ];
+    form_cluster(&nodes).await;
+    let old_leader = leader(&nodes).await.id;
+
+    let voters: BTreeSet<NodeId> = [1, 2, 3].into_iter().collect();
+    for node in &nodes {
+        eventually("every node to follow the leader as a voter", || async {
+            LeaderView::current_leader(&*node.group.raft).await == Some(old_leader)
+                && node.group.state.read().await.voters == voters
+        })
+        .await;
+    }
+
+    let old = nodes
+        .iter()
+        .find(|n| n.id == old_leader)
+        .expect("leader node");
+    old.group.raft.shutdown().await.expect("leader shuts down");
+
+    // Without a redraw a stall is permanent; with one, a repeated tie is rare
+    // after a few campaigns of this length.
+    let survivors: Vec<&CounterNode> = nodes.iter().filter(|n| n.id != old_leader).collect();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
+        if survivors.iter().any(|n| n.group.is_leader()) {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let state: Vec<String> = survivors
+        .iter()
+        .map(|n| {
+            let m = n.group.raft.metrics().borrow().clone();
+            format!("node {} {:?} vote {}", n.id, m.state, m.vote)
+        })
+        .collect();
+    Some(format!("cluster {cluster}: {}", state.join(", ")))
 }

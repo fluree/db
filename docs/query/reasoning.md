@@ -57,6 +57,24 @@ Each mode has exactly one accepted string (case-insensitive):
 | `"datalog"` | Datalog rule execution |
 | `"none"` | Disable all reasoning |
 
+### Inside `opts`
+
+The reasoning keys (`reasoning`, `rules`, `ontology`, `reasoningBudget` and
+`reasoningTime`) can also go inside the query's `opts` object. Each key is
+read from the top level when it is there and from `opts` otherwise, so
+
+```json
+{
+  "select": ["?s"],
+  "where": {"@id": "?s", "ex:p": "?o"},
+  "reasoningBudget": {"maxFacts": 20000000},
+  "opts": {"reasoning": "datalog"}
+}
+```
+
+runs datalog under that budget. When both carry the same key, the top
+level's value is used.
+
 ## Default behavior
 
 Reasoning is **opt-in**. When the `reasoning` key is absent from a query, no
@@ -212,7 +230,19 @@ Enable RDFS + OWL 2 RL + Datalog together:
 ```
 
 OWL 2 RL facts are materialized first, then Datalog rules run over the
-combined base + OWL data, and finally RDFS query rewriting is applied.
+combined base + OWL data. OWL 2 RL materializes everything RDFS and OWL 2 QL
+query rewriting would add, so with `owl2rl` on the rewrite is skipped.
+
+Rule bodies don't use the `rdfs` and `owl2ql` rewrites. Under either mode
+without `owl2rl`, a program with a rule that negates or aggregates is
+refused: the rule would read an entailment the query sees as absent. Add
+`owl2rl`. See [Datalog rules](datalog-rules.md#negation).
+
+A rule that fails to parse or validate — a stored `f:rule` as much as a
+query-time one — fails the query with an error naming the rule and the
+offending construct. Rules are never skipped silently, because a reasoning
+query answered over a partial rule set is wrong in a way the caller cannot
+see. See [Datalog rules](datalog-rules.md#validation-a-rule-that-cannot-run-is-an-error).
 
 ## SPARQL
 
@@ -271,11 +301,14 @@ analytics with hypothetical sub-class chains.
 ## Interaction with ledger configuration
 
 If `f:reasoningDefaults` is set in the ledger configuration graph (see
-[Setting groups](../ledger-config/setting-groups.md)), those modes are the
-baseline for every query. The per-query `reasoning` parameter can:
+[Setting groups](../ledger-config/setting-groups.md)), those modes apply to
+every query that does not set `reasoning` itself. The per-query `reasoning`
+parameter can:
 
-- **Add modes** — the query modes are merged with the defaults.
-- **Disable all** — `"reasoning": "none"` overrides the defaults entirely.
+- **Replace them** — a query that sets `reasoning` runs its own modes
+  instead. The two are not merged, so a query that wants a default mode and
+  another lists both.
+- **Disable all** — `"reasoning": "none"` runs with no reasoning.
 
 The `f:overrideControl` setting on the ledger config determines whether
 query-time overrides are allowed. See
@@ -283,10 +316,23 @@ query-time overrides are allowed. See
 
 ## Materialization budget
 
-OWL 2 RL materialization runs under a budget (default: 1,000,000 derived
-facts / 30 seconds). When the closure exceeds the budget it is **capped**:
-the query still answers, but over an incomplete closure — results may be
-missing entailments. A capped run is therefore surfaced, not just logged:
+Materialization — OWL 2 RL and datalog rules alike — runs under a budget
+(default: 1,000,000 derived facts / 30 seconds). The limits are checked as
+work is dispatched rather than once a round, so a long round is bounded far
+more tightly than it used to be. They are not checked between every derived
+fact everywhere: an OWL 2 RL property chain, and the rules that produce
+`owl:sameAs`, each run to completion before the next check, so a single
+high-fan-out input can still carry a round past a limit before it is noticed.
+
+There is a third limit on the bytes those derived facts occupy. It has no
+default of its own: it is derived from the fact ceiling, at an allowance well
+above what an ordinary fact costs, so the **fact** cap is what binds on normal
+data and the memory cap only fires when facts are abnormally large — long
+IRIs, or big string and JSON literals. Raising `maxFacts` raises it with them.
+Both limits count only *derived* facts, not the base data the fixpoint reads. When the closure exceeds the budget it is
+**capped**: the query still answers, but over an incomplete closure —
+results may be missing entailments. A capped run is therefore surfaced, not
+just logged:
 
 - Tracked responses (`"opts": {"meta": true}` or the `fluree-track-*`
   headers) carry a top-level `reasoning` block:
@@ -306,19 +352,70 @@ missing entailments. A capped run is therefore surfaced, not just logged:
   ```
 
 - The same JSON rides the `x-fdb-reasoning` response header.
+- `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
+  `"iterations"` (the fixpoint hit its round limit before converging).
+- `rules_fired` breaks the tally down per rule. It counts derived **facts**
+  per rule, not rule applications: a rule that matches a thousand rows and
+  derives one new fact from them counts once.
+- When datalog rules are capped, `capped_rules` names the rules that were
+  running when the cap fired and `pending_rules` the rules it kept from
+  running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
+  time they returned (see [Datalog rules](datalog-rules.md)).
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):
 
 1. **Per query** — JSON-LD `"reasoningBudget": {"maxFacts": 20000000,
-   "maxSeconds": 300}`, or SPARQL `# PRAGMA reasoning-max-facts: 20000000` /
-   `# PRAGMA reasoning-max-seconds: 300`. Subject to the ledger's
+   "maxSeconds": 300, "maxMemoryMb": 512}`, or SPARQL
+   `# PRAGMA reasoning-max-facts: 20000000` /
+   `# PRAGMA reasoning-max-seconds: 300` /
+   `# PRAGMA reasoning-max-memory-mb: 512`. Subject to the ledger's
    `f:overrideControl` on `f:reasoningDefaults`.
-2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` in
-   `f:reasoningDefaults` (see
+2. **Per ledger** — `f:reasoningMaxFacts` / `f:reasoningMaxSeconds` /
+   `f:reasoningMaxMemoryMb` in `f:reasoningDefaults` (see
    [Setting groups](../ledger-config/setting-groups.md)).
 3. **Server-wide** — `FLUREE_REASONING_MAX_FACTS` /
-   `FLUREE_REASONING_MAX_SECONDS` environment variables.
+   `FLUREE_REASONING_MAX_SECONDS` / `FLUREE_REASONING_MAX_MEMORY_MB`
+   environment variables.
+
+**The query's own limits apply too.** Materialization runs on the query's
+behalf, so cancelling the query — a client disconnect, or a query timeout —
+stops OWL 2 RL and datalog rule bodies mid-run, and the query fails with the
+cancellation rather than answering over a partial closure. The work counts
+toward the query's fuel: OWL 2 RL charges 0.001 fuel for each fact a round
+processes, and rule bodies are charged like any query, including the
+property paths a transitive-closure rule runs as. Only the
+query that computes a materialization pays for it; queries answered from the
+cached result do not, and a run that was cancelled or ran out of fuel caches
+nothing.
+
+### Memory a cached result holds
+
+A materialization is cached (see below), and while cached it holds its
+derived facts. Joins over derived facts add to that. The first reasoning
+query whose join reads a derived predicate through a batched lane translates
+that predicate's facts into the index's internal ids, about 40 bytes per
+fact, and the result keeps the translation for every later query reading it.
+A predicate can be translated twice: once in subject order, and, for joins
+that probe by object, its reference-valued facts again in object order. The
+translations are made only when a query needs them and are dropped with the
+result.
+
+The memory limit above covers both: a result's derived facts and its
+translations together stay within it. Both sizes are estimates. A translation
+that would take a result past the limit is not made. The join runs per row
+instead, with the same answer, only slower, and the server logs one WARN for
+that result. The warning names the phase, the estimated sizes, the limit and
+the derived-fact count.
+
+To provision for reasoning, plan for each cached result to hold up to its
+memory limit. Up to 16 results are cached at once, one for each distinct
+combination of database state, reasoning modes, rules and budget. If the
+warning appears:
+
+- if the host has memory to spare, raise the memory limit;
+- if it doesn't, run fewer distinct reasoning workloads at once;
+- or narrow the rules or queries, so less is derived or translated.
 
 ## Performance considerations
 
@@ -326,8 +423,8 @@ The budget is configurable at three levels (highest precedence first):
 |------|----------|---------|
 | RDFS | Negligible — query rewriting only | N/A |
 | OWL 2 QL | Negligible — query rewriting only | N/A |
-| OWL 2 RL | First query materializes derived facts; subsequent queries use cache | LRU cache (16 entries), keyed on database state + reasoning modes |
-| Datalog | Each unique rule set + database state combination is cached | Same LRU cache as OWL 2 RL |
+| OWL 2 RL | First query materializes derived facts; subsequent queries use cache | LRU cache (16 entries), keyed on database state + reasoning modes + budget |
+| Datalog | Rule bodies run on the query executor; the first query materializes, later queries with the same rule set hit the cache | Same LRU cache as OWL 2 RL, keyed additionally on a content hash of the rule set (stored and query-time rules) |
 
 **Tips:**
 - Start with **RDFS** if you only need class/property hierarchies — it has
@@ -346,6 +443,8 @@ Reasoning composes with view policy, but mind the contract when both are on:
 - **OWL 2 QL** and **RDFS** rewrite the query and execute under your identity, so they are filtered like any normal query.
 - **OWL 2 RL** and **datalog** materialize derived facts into the query overlay; those facts are filtered by the **same per-flake view policy as base data**. A derived flake you may not view is dropped.
 - The engine filters a derived fact by its own `(subject, predicate, object)` — **not** by the base facts it was derived from. A rule or ontology axiom can therefore re-express hidden data under a viewable predicate (e.g. `ex:ssn rdfs:subPropertyOf ex:identifier`, or a rule deriving `ex:isHighEarner` from a hidden `ex:salary`) and the derived value will surface.
+- Materialized facts are computed once over all of the ledger's data and shared by every caller; the policy applies when rows are read, not while facts are derived.
+- The two approaches can therefore answer the same query differently under the same policy. With `ex:ssn rdfs:subPropertyOf ex:identifier` and `ex:ssn` hidden, a query for `ex:identifier` returns nothing under `"rdfs"`, because the rewritten query scans the hidden `ex:ssn`. Under `"owl2rl"` it returns the value, because the derived `ex:identifier` fact is itself viewable.
 
 **If you run reasoning under a non-root policy, your policy must cover the derived properties and classes** — deny them, or use `default-allow: false` so anything not explicitly allowed (including reasoning-introduced predicates) stays hidden.
 

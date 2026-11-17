@@ -11,8 +11,13 @@ use fluree_db_core::{
 };
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue};
 use fluree_vocab::namespaces::FLUREE_COMMIT;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
+mod segment_sums;
+pub(crate) use segment_sums::SegmentSumsSlot;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StatsAssemblyError {
@@ -144,6 +149,52 @@ pub enum NoveltyMerge {
     Reconciled { site: &'static str },
 }
 
+/// Whether merging `novelty` into `indexed` at `to_t` would reproduce `indexed`
+/// unchanged: the window is empty, or `to_t` is at or below the published
+/// index `t`, which novelty never reaches below.
+pub fn merge_is_identity(
+    indexed: &IndexStats,
+    snapshot: &LedgerSnapshot,
+    novelty: &Novelty,
+    to_t: i64,
+) -> bool {
+    novelty.is_empty() || to_t <= indexed_t(indexed, snapshot)
+}
+
+/// Stats for the query planner: an [`NoveltyMerge::Estimate`] merge that
+/// returns `indexed` itself when the merge is an identity.
+///
+/// The class table carries instance counts only, with no per-class property
+/// usage and no per-graph class tables. Anything that reads those needs
+/// [`assemble_fast_stats_with`] or [`assemble_full_stats_with`] instead.
+pub fn assemble_planner_stats(
+    indexed: &Arc<IndexStats>,
+    snapshot: &LedgerSnapshot,
+    novelty: &Novelty,
+    to_t: i64,
+    lookup: Option<&dyn StatsLookup>,
+) -> Arc<IndexStats> {
+    if merge_is_identity(indexed, snapshot, novelty, to_t) {
+        return Arc::clone(indexed);
+    }
+    if let Some(stats) = segment_sums::planner_stats(indexed, snapshot, novelty, to_t, lookup) {
+        return Arc::new(stats);
+    }
+    let mut deltas = NoveltyDeltaResolver::new(indexed, snapshot, novelty, NoveltyMerge::Estimate);
+    let stats = assemble_fast_stats_inner(
+        indexed,
+        snapshot,
+        novelty,
+        to_t,
+        lookup,
+        &mut deltas,
+        RestatedAttribution::IntraPass,
+        ClassDetail::CountsOnly,
+    );
+    deltas.finish();
+    Arc::new(stats)
+}
+
 /// Merge novelty into `indexed` with planner-grade [`NoveltyMerge::Estimate`]
 /// semantics. See [`assemble_fast_stats_with`] for the reconciled variant.
 pub fn assemble_fast_stats(
@@ -181,9 +232,22 @@ pub fn assemble_fast_stats_with(
         lookup,
         &mut deltas,
         RestatedAttribution::IntraPass,
+        ClassDetail::Full,
     );
     deltas.finish();
     stats
+}
+
+/// How much of the class table a merge produces.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ClassDetail {
+    /// Per-class property usage and per-graph class tables, as ledger-info,
+    /// GraphQL, the Cypher catalog shims and policy read them.
+    Full,
+    /// Ledger-wide instance counts only. The planner reads nothing more once
+    /// novelty is present: its one use of class property usage, the
+    /// redundant-`rdf:type` coverage proof, requires an empty window.
+    CountsOnly,
 }
 
 /// Who attributes a base-present restatement to a class its subject only gains
@@ -247,6 +311,7 @@ pub async fn assemble_full_stats_with(
         Some(lookup),
         &mut deltas,
         RestatedAttribution::DeferredToLookup,
+        ClassDetail::Full,
     );
     // Second pass over the same POST stream: restarting run tracking replays
     // the same first-flake-per-identity decisions, and the probe's per-(g,s,p)
@@ -389,7 +454,7 @@ pub async fn assemble_full_stats_with(
     }
 
     let graphs = stats.graphs.get_or_insert_with(Vec::new);
-    let mut graph_index: HashMap<GraphId, usize> = graphs
+    let mut graph_index: FxHashMap<GraphId, usize> = graphs
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.g_id, idx))
@@ -403,6 +468,7 @@ pub async fn assemble_full_stats_with(
     // means deciding which pass owns class attribution for the two-pass
     // assembly, which is a bigger change than reconciliation; see the residuals
     // list on #1391.
+    let mut class_index = GraphClassIndex::default();
     for (props_by_subject, gained_only) in [(subject_props, false), (restated_props, true)] {
         for ((g_id, subject), props) in props_by_subject {
             let Some(class_sids) = graph_subject_classes.get(&(g_id, subject.clone())) else {
@@ -416,7 +482,7 @@ pub async fn assemble_full_stats_with(
                 if gained_only && !gained.is_some_and(|gained| gained.contains(class_sid)) {
                     continue;
                 }
-                let class_entry = get_or_insert_class_entry(classes, class_sid);
+                let class_entry = class_index.entry(g_id, classes, class_sid);
                 for (property_sid, delta) in &props {
                     let prop_usage = get_or_insert_class_property(class_entry, property_sid);
                     merge_datatypes(&mut prop_usage.datatypes, &delta.datatypes);
@@ -467,6 +533,7 @@ fn assemble_fast_stats_inner(
     lookup: Option<&dyn StatsLookup>,
     deltas: &mut NoveltyDeltaResolver<'_>,
     restated: RestatedAttribution,
+    class_detail: ClassDetail,
 ) -> IndexStats {
     // Below the published index `t` the base index already answers the query:
     // novelty only ever holds flakes after it. Note the returned stats are
@@ -474,7 +541,7 @@ fn assemble_fast_stats_inner(
     // any of this as a statement about `to_t` (`observed_datatypes` is the one
     // that matters, see `StatsView::property_ref_only`) has to handle the
     // historical case itself.
-    if novelty.is_empty() || to_t <= indexed_t(indexed, snapshot) {
+    if merge_is_identity(indexed, snapshot, novelty, to_t) {
         return indexed.clone();
     }
 
@@ -489,7 +556,10 @@ fn assemble_fast_stats_inner(
     // query went quadratic in the group size exactly this way). Retraction
     // pairs net each entry to zero, so positive entries = live facts.
     // Predicates that already have indexed ndv skip this entirely.
-    let indexed_ndv: HashSet<(u16, &str)> = indexed
+    // These maps are keyed by the ledger's own terms, borrowed from novelty
+    // for the length of the pass, and are hashed for every novelty flake:
+    // FxHash, which needs no protection from adversarial keys here.
+    let indexed_ndv: FxHashSet<(u16, &str)> = indexed
         .properties
         .as_ref()
         .map(|props| {
@@ -500,11 +570,28 @@ fn assemble_fast_stats_inner(
                 .collect()
         })
         .unwrap_or_default();
-    type NdvAcc = (HashMap<(FlakeValue, Sid), i64>, HashMap<Sid, i64>);
-    let mut ndv_acc: HashMap<(u16, &str), NdvAcc> = HashMap::new();
-    let mut class_data = build_class_data(indexed);
-    let mut graphs = indexed.graphs.clone().unwrap_or_default();
-    let mut graph_index: HashMap<GraphId, usize> = graphs
+    type NdvAcc<'f> = (
+        FxHashMap<(&'f FlakeValue, &'f Sid), i64>,
+        FxHashMap<&'f Sid, i64>,
+    );
+    let mut ndv_acc: FxHashMap<(u16, &str), NdvAcc<'_>> = FxHashMap::default();
+    let counts_only = class_detail == ClassDetail::CountsOnly;
+    // With per-graph base stats the class table is re-derived by
+    // `union_per_graph_classes` after the loop, so this accumulator is unused.
+    let classes_from_graphs = indexed.graphs.as_ref().is_some_and(|g| !g.is_empty());
+    let track_class_data = !counts_only && !classes_from_graphs;
+    let mut class_data = if track_class_data {
+        build_class_data(indexed)
+    } else {
+        HashMap::new()
+    };
+    let mut class_count_deltas: HashMap<Sid, i64> = HashMap::new();
+    let mut graphs = match class_detail {
+        ClassDetail::Full => indexed.graphs.clone().unwrap_or_default(),
+        ClassDetail::CountsOnly => graphs_without_classes(indexed),
+    };
+    let mut class_index = GraphClassIndex::default();
+    let mut graph_index: FxHashMap<GraphId, usize> = graphs
         .iter()
         .enumerate()
         .map(|(idx, entry)| (entry.g_id, idx))
@@ -536,11 +623,17 @@ fn assemble_fast_stats_inner(
 
         if is_rdf_type(&flake.p) {
             if let FlakeValue::Ref(class_sid) = &flake.o {
-                let data = class_data.entry(class_sid.clone()).or_default();
-                data.count_delta += delta;
+                if counts_only {
+                    *class_count_deltas.entry(class_sid.clone()).or_insert(0) += delta;
+                    continue;
+                }
+                if track_class_data {
+                    let data = class_data.entry(class_sid.clone()).or_default();
+                    data.count_delta += delta;
+                }
                 let graph_entry = get_or_insert_graph_entry(&mut graphs, &mut graph_index, g_id);
                 let classes = graph_entry.classes.get_or_insert_with(Vec::new);
-                let class_entry = get_or_insert_class_entry(classes, class_sid);
+                let class_entry = class_index.entry(g_id, classes, class_sid);
                 class_entry.count = ((class_entry.count as i64) + delta).max(0) as u64;
 
                 let subject_classes = graph_subject_classes
@@ -569,10 +662,8 @@ fn assemble_fast_stats_inner(
         let sid_key = (flake.p.namespace_code, &*flake.p.name);
         if !indexed_ndv.contains(&sid_key) {
             let acc = ndv_acc.entry(sid_key).or_default();
-            *acc.0
-                .entry((flake.o.clone(), flake.dt.clone()))
-                .or_insert(0) += delta;
-            *acc.1.entry(flake.s.clone()).or_insert(0) += delta;
+            *acc.0.entry((&flake.o, &flake.dt)).or_insert(0) += delta;
+            *acc.1.entry(&flake.s).or_insert(0) += delta;
         }
         let property = property_deltas.entry(sid_key).or_default();
         property.count += delta;
@@ -591,6 +682,9 @@ fn assemble_fast_stats_inner(
             }
         }
 
+        if counts_only {
+            continue;
+        }
         if let Some(class_sids) = graph_subject_classes.get(&(g_id, flake.s.clone())) {
             let gained = gained_classes.get(&(g_id, flake.s.clone()));
             for class_sid in class_sids {
@@ -605,13 +699,15 @@ fn assemble_fast_stats_inner(
                 } else {
                     delta
                 };
-                let class = class_data.entry(class_sid.clone()).or_default();
-                let prop = class.properties.entry(flake.p.clone()).or_default();
-                prop.count_delta += class_delta;
+                if track_class_data {
+                    let class = class_data.entry(class_sid.clone()).or_default();
+                    let prop = class.properties.entry(flake.p.clone()).or_default();
+                    prop.count_delta += class_delta;
+                }
 
                 let graph_entry = get_or_insert_graph_entry(&mut graphs, &mut graph_index, g_id);
                 let classes = graph_entry.classes.get_or_insert_with(Vec::new);
-                let class_entry = get_or_insert_class_entry(classes, class_sid);
+                let class_entry = class_index.entry(g_id, classes, class_sid);
                 let prop_usage = get_or_insert_class_property(class_entry, &flake.p);
                 update_class_property_usage(
                     prop_usage,
@@ -624,7 +720,7 @@ fn assemble_fast_stats_inner(
         }
     }
 
-    let novelty_ndv: HashMap<(u16, &str), (u64, u64)> = ndv_acc
+    let novelty_ndv: FxHashMap<(u16, &str), (u64, u64)> = ndv_acc
         .into_iter()
         .map(|(sid, (values, subjects))| {
             (
@@ -637,10 +733,28 @@ fn assemble_fast_stats_inner(
         })
         .collect();
 
-    let mut stats = finalize_stats(indexed, property_deltas, class_data, &novelty_ndv);
-    stats.flakes = (indexed.flakes as i64 + flakes_delta).max(0) as u64;
-    stats.size = indexed.size + novelty.size as u64;
-    if !graphs.is_empty() {
+    let mut stats = IndexStats {
+        flakes: (indexed.flakes as i64 + flakes_delta).max(0) as u64,
+        size: indexed.size + novelty.size as u64,
+        properties: finalize_properties(indexed, property_deltas, &novelty_ndv),
+        classes: None,
+        graphs: None,
+        historical_since_t: indexed.historical_since_t,
+    };
+    if graphs.is_empty() {
+        // The base's per-graph section is `None` or empty, so this copies nothing.
+        stats.graphs = indexed.graphs.clone();
+        stats.classes = match class_detail {
+            ClassDetail::Full => {
+                debug_assert!(
+                    track_class_data,
+                    "per-graph base stats imply non-empty graphs"
+                );
+                finalize_classes(indexed, class_data)
+            }
+            ClassDetail::CountsOnly => counts_only_classes(indexed, class_count_deltas),
+        };
+    } else {
         graphs.sort_by_key(|entry| entry.g_id);
         for graph in &mut graphs {
             graph.properties.sort_by_key(|entry| entry.p_id);
@@ -659,7 +773,10 @@ fn assemble_fast_stats_inner(
                 }
             }
         }
-        stats.classes = union_per_graph_classes(&graphs);
+        stats.classes = match class_detail {
+            ClassDetail::Full => union_per_graph_classes(&graphs),
+            ClassDetail::CountsOnly => counts_only_classes(indexed, class_count_deltas),
+        };
         stats.graphs = Some(graphs);
     }
     stats
@@ -871,10 +988,10 @@ fn stamp_merge(site: &'static str, outcome: &'static str, scans: usize, duplicat
 ///
 /// It deliberately does **not** assume kept flakes alternate assert/retract.
 /// Novelty's set semantics are one-sided — `Novelty::apply_commit` suppresses
-/// redundant *asserts* only — and a same-`t` assert/retract pair reaches this
-/// fold retract-first because POST sorts `op` ascending, so runs like
-/// `(retract, assert, assert)` and `(retract, retract)` are both reachable.
-/// See `delta_in_graph`.
+/// redundant *asserts* only — and a same-`t` assert/retract pair (which
+/// commits written before the staging fix hold) can land in novelty, so runs
+/// like `(retract, retract)` and `(retract, assert, retract, assert)` are
+/// reachable. See `delta_in_graph`.
 ///
 /// Any consumer that folds novelty into indexed counts by hand — the stats
 /// assemblers here, `apoc.meta.data`'s per-`(class, property)` rollup — should
@@ -952,17 +1069,15 @@ impl<'a> NoveltyDeltaResolver<'a> {
     /// however many flakes the window holds.
     ///
     /// Resolution is the same rule [`crate::Novelty`]'s `fact_state::record`
-    /// applies — the highest `t` wins, and at equal `t` a retract beats an
-    /// assert — so the fold cannot disagree with what a read would see. It
+    /// applies ([`fluree_db_core::same_t::supersedes`]: the highest `t` wins,
+    /// and at equal `t` the assert holds), so the fold cannot disagree with
+    /// what a read would see, whatever order a run's flakes arrive in. It
     /// deliberately does **not** assume kept flakes alternate assert/retract.
-    /// They do not: `Novelty::apply_commit`'s dedup gate short-circuits on
-    /// `flake.op &&`, so it suppresses redundant *asserts* only and never
-    /// examines a retraction. And because POST sorts `op` ascending at equal
-    /// `t`, a same-`t` pair reaches this fold retract-first — the assert
-    /// arrives last despite having lost. `bulk_apply_commits` replays raw
-    /// persisted flakes on cold load, which is why the crate keeps
-    /// `same_t_assert_retract_keeps_later_reassert` around to pin that state as
-    /// legal.
+    /// They do not: `Novelty::apply_commit`'s dedup gate suppresses redundant
+    /// *asserts* only and never examines a retraction, and `bulk_apply_commits`
+    /// replays raw persisted flakes on cold load, which can hold a same-`t`
+    /// pair (`same_t_assert_retract_holds_the_assertion` in lib.rs pins that
+    /// state as legal).
     ///
     /// POST order puts `m` last, so flakes sharing `(p, o, dt, s)` are
     /// contiguous while distinct `m`s (language tags, list positions) interleave
@@ -1025,12 +1140,10 @@ impl<'a> NoveltyDeltaResolver<'a> {
             self.seen.clear();
         }
         if let Some((_, cur_t, cur_op)) = self.seen.iter_mut().find(|(m, _, _)| *m == flake.m) {
-            // Lifecycle resolution, verbatim from `NoveltyFactState::record`.
+            // Lifecycle resolution, as `NoveltyFactState::record` applies it.
             // A flake that does not win changes no presence and charges zero —
-            // that covers the same-`t` assert arriving behind its winning
-            // retract, and a redundant retract repeated at a later `t`.
-            let wins = flake.t > *cur_t || (flake.t == *cur_t && *cur_op && !flake.op);
-            if !wins {
+            // that covers a redundant retract repeated at a later `t`.
+            if !fluree_db_core::same_t::supersedes((flake.t, flake.op), (*cur_t, *cur_op)) {
                 return 0;
             }
             let delta = i64::from(flake.op) - i64::from(*cur_op);
@@ -1114,7 +1227,7 @@ fn graph_id_for_flake(snapshot: &LedgerSnapshot, flake: &Flake) -> GraphId {
     };
     snapshot
         .decode_sid(g_sid)
-        .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+        .and_then(|iri| snapshot.graph_registry.assigned_graph_id(&iri))
         .unwrap_or(0)
 }
 
@@ -1128,7 +1241,7 @@ fn indexed_t(indexed: &IndexStats, snapshot: &LedgerSnapshot) -> i64 {
 
 fn get_or_insert_graph_entry<'a>(
     graphs: &'a mut Vec<GraphStatsEntry>,
-    graph_index: &mut HashMap<GraphId, usize>,
+    graph_index: &mut FxHashMap<GraphId, usize>,
     g_id: GraphId,
 ) -> &'a mut GraphStatsEntry {
     if let Some(idx) = graph_index.get(&g_id).copied() {
@@ -1170,22 +1283,44 @@ fn get_or_insert_graph_property(
     graph_entry.properties.last_mut().expect("just inserted")
 }
 
-fn get_or_insert_class_entry<'a>(
-    classes: &'a mut Vec<ClassStatEntry>,
-    class_sid: &Sid,
-) -> &'a mut ClassStatEntry {
-    if let Some(idx) = classes
-        .iter()
-        .position(|entry| entry.class_sid == *class_sid)
-    {
-        return &mut classes[idx];
+/// Position index over each graph's `GraphStatsEntry::classes`, so class
+/// attribution is not a linear scan per novelty flake.
+///
+/// Positions are valid only while the vectors are append-only. Both passes
+/// sort them afterwards, so an index must not outlive its pass.
+#[derive(Default)]
+struct GraphClassIndex {
+    by_graph: HashMap<GraphId, HashMap<Sid, usize>>,
+}
+
+impl GraphClassIndex {
+    fn entry<'a>(
+        &mut self,
+        g_id: GraphId,
+        classes: &'a mut Vec<ClassStatEntry>,
+        class_sid: &Sid,
+    ) -> &'a mut ClassStatEntry {
+        let positions = self.by_graph.entry(g_id).or_insert_with(|| {
+            let mut positions = HashMap::with_capacity(classes.len());
+            for (idx, entry) in classes.iter().enumerate() {
+                // First occurrence wins, matching the scan this replaces.
+                positions.entry(entry.class_sid.clone()).or_insert(idx);
+            }
+            positions
+        });
+        let idx = if let Some(&idx) = positions.get(class_sid) {
+            idx
+        } else {
+            classes.push(ClassStatEntry {
+                class_sid: class_sid.clone(),
+                count: 0,
+                properties: Vec::new(),
+            });
+            positions.insert(class_sid.clone(), classes.len() - 1);
+            classes.len() - 1
+        };
+        &mut classes[idx]
     }
-    classes.push(ClassStatEntry {
-        class_sid: class_sid.clone(),
-        count: 0,
-        properties: Vec::new(),
-    });
-    classes.last_mut().expect("just inserted")
 }
 
 fn get_or_insert_class_property<'a>(
@@ -1337,10 +1472,10 @@ struct PropertyStatDelta {
     asserted_datatypes: HashSet<u8>,
 }
 
-type PropertyDeltaMap<'a> = HashMap<(u16, &'a str), PropertyStatDelta>;
+type PropertyDeltaMap<'a> = FxHashMap<(u16, &'a str), PropertyStatDelta>;
 
 fn build_property_deltas(indexed: &IndexStats) -> PropertyDeltaMap<'_> {
-    let mut deltas = PropertyDeltaMap::new();
+    let mut deltas = PropertyDeltaMap::default();
     if let Some(ref props) = indexed.properties {
         for entry in props {
             deltas.insert(
@@ -1435,13 +1570,12 @@ fn union_observed_datatypes(base: &[u8], asserted: &HashSet<u8>) -> Vec<u8> {
     tags
 }
 
-fn finalize_stats(
+fn finalize_properties(
     indexed: &IndexStats,
     property_deltas: PropertyDeltaMap<'_>,
-    class_data: HashMap<Sid, ClassDataMut>,
-    novelty_ndv: &HashMap<(u16, &str), (u64, u64)>,
-) -> IndexStats {
-    let properties = if property_deltas.is_empty() {
+    novelty_ndv: &FxHashMap<(u16, &str), (u64, u64)>,
+) -> Option<Vec<PropertyStatEntry>> {
+    if property_deltas.is_empty() {
         indexed.properties.clone()
     } else {
         let indexed_props: HashMap<(u16, &str), &PropertyStatEntry> = indexed
@@ -1506,9 +1640,16 @@ fn finalize_stats(
         } else {
             Some(props)
         }
-    };
+    }
+}
 
-    let classes = if class_data.is_empty() {
+/// Ledger-wide class table from the top-level accumulator. Only reached when
+/// the base carries no per-graph stats to union instead.
+fn finalize_classes(
+    indexed: &IndexStats,
+    class_data: HashMap<Sid, ClassDataMut>,
+) -> Option<Vec<ClassStatEntry>> {
+    if class_data.is_empty() {
         indexed.classes.clone()
     } else {
         let mut entries: Vec<_> = class_data.into_iter().collect();
@@ -1541,16 +1682,65 @@ fn finalize_stats(
         } else {
             Some(class_entries)
         }
-    };
-
-    IndexStats {
-        flakes: indexed.flakes,
-        size: indexed.size,
-        properties,
-        classes,
-        graphs: indexed.graphs.clone(),
-        historical_since_t: indexed.historical_since_t,
     }
+}
+
+/// [`ClassDetail::CountsOnly`] class table: base instance counts plus the
+/// window's `rdf:type` deltas, sorted by `class_sid`.
+///
+/// Touched classes are kept even at zero, as the full merge keeps them, since
+/// the planner treats a known-empty class differently from an unknown one.
+/// Clamping happens once on the total rather than per graph per flake as in
+/// the full merge; the two differ only when a window retracts type assertions
+/// that were never made.
+fn counts_only_classes(
+    indexed: &IndexStats,
+    mut deltas: HashMap<Sid, i64>,
+) -> Option<Vec<ClassStatEntry>> {
+    let base = indexed.classes.as_deref().unwrap_or(&[]);
+    let mut classes = Vec::with_capacity(base.len() + deltas.len());
+    for entry in base {
+        let delta = if deltas.is_empty() {
+            0
+        } else {
+            deltas.remove(&entry.class_sid).unwrap_or(0)
+        };
+        classes.push(ClassStatEntry {
+            class_sid: entry.class_sid.clone(),
+            count: (entry.count as i64 + delta).max(0) as u64,
+            properties: Vec::new(),
+        });
+    }
+    if !deltas.is_empty() {
+        classes.extend(deltas.into_iter().map(|(class_sid, delta)| ClassStatEntry {
+            class_sid,
+            count: delta.max(0) as u64,
+            properties: Vec::new(),
+        }));
+        classes.sort_by(|a, b| a.class_sid.cmp(&b.class_sid));
+    }
+    if classes.is_empty() {
+        None
+    } else {
+        Some(classes)
+    }
+}
+
+/// The base's per-graph stats without their class tables.
+fn graphs_without_classes(indexed: &IndexStats) -> Vec<GraphStatsEntry> {
+    indexed
+        .graphs
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|graph| GraphStatsEntry {
+            g_id: graph.g_id,
+            flakes: graph.flakes,
+            size: graph.size,
+            properties: graph.properties.clone(),
+            classes: None,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2265,11 +2455,9 @@ mod tests {
         let p = sid(10, "name");
         // `bulk_apply_commits` (cold load) replays raw persisted flakes, so an
         // assert+retract of one identity at the SAME `t` can both land — see
-        // `same_t_assert_retract_keeps_later_reassert` in lib.rs, which builds
-        // exactly this on purpose. `fact_state` resolves it retract-wins, so a
-        // later re-assert is kept; but `cmp_post` sorts `op` ASCENDING at equal
-        // `t`, so the losing assert arrives AFTER the winning retract and the
-        // walk sees (retract@1, assert@1, assert@2) — two consecutive asserts.
+        // `same_t_assert_retract_holds_the_assertion` in lib.rs. The pair holds
+        // the assertion, so the later re-assert is a no-op `apply_commit`
+        // dedups, and the walk sees (retract@1, assert@1).
         let (deltas, _) = deltas_over(
             Vec::new(),
             vec![
@@ -2290,12 +2478,11 @@ mod tests {
         let s = sid(10, "alice");
         let p = sid(10, "name");
         // Two same-`t` assert/retract pairs back to back. The first pair leaves
-        // the fact ABSENT (retract wins), so the second pair's assert passes
-        // `apply_commit`'s dedup gate and both of its ops land. The walk sees
-        // (retract@1, assert@1, retract@2, assert@2) — the second retract
-        // repeats the first's op, so a fold that only compared against the
-        // previous op would swallow it and then credit the trailing assert.
-        // Resolving presence the way `fact_state::record` does gets it right.
+        // the fact present (the assert holds); the second pair's assert is
+        // kept because its own commit retracts it, so both of its ops land.
+        // The walk sees (retract@1, assert@1, retract@2, assert@2). Resolving
+        // presence the way `fact_state::record` does charges each flake its
+        // change in presence, and the fact ends present.
         let (deltas, _) = deltas_over(
             Vec::new(),
             vec![
@@ -2307,8 +2494,8 @@ mod tests {
         );
         assert_eq!(
             deltas.iter().sum::<i64>(),
-            0,
-            "retract wins at t=2, so the fact is absent and was never in base: {deltas:?}"
+            1,
+            "the assert holds at t=2, so the fact is present and was never in base: {deltas:?}"
         );
     }
 
@@ -2715,5 +2902,445 @@ mod tests {
              over-count this whole change exists to remove"
         );
         assert_eq!(full_employee, one, "same, on the class-lookup arm");
+    }
+
+    // --- planner stats: counts-only class detail ---------------------------
+
+    fn retracted(mut flake: Flake) -> Flake {
+        flake.op = false;
+        flake
+    }
+
+    fn class_entry(class_sid: &Sid, count: u64, props: &[(&Sid, u64)]) -> ClassStatEntry {
+        ClassStatEntry {
+            class_sid: class_sid.clone(),
+            count,
+            properties: props
+                .iter()
+                .map(|(property, flakes)| ClassPropertyUsage {
+                    property_sid: (*property).clone(),
+                    datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), *flakes)],
+                    langs: Vec::new(),
+                    ref_classes: Vec::new(),
+                })
+                .collect(),
+        }
+    }
+
+    /// Everything the planner reads from merged stats, rendered comparably.
+    /// Class tables are reduced to `(class, count)`.
+    fn planner_projection(stats: &IndexStats) -> String {
+        let classes: Vec<(&Sid, u64)> = stats
+            .classes
+            .iter()
+            .flatten()
+            .map(|entry| (&entry.class_sid, entry.count))
+            .collect();
+        let graphs: Vec<String> = stats
+            .graphs
+            .iter()
+            .flatten()
+            .map(|graph| {
+                format!(
+                    "{}:{}:{}:{:?}",
+                    graph.g_id, graph.flakes, graph.size, graph.properties
+                )
+            })
+            .collect();
+        format!(
+            "flakes={} size={} since={:?}\nproperties={:?}\nclasses={:?}\ngraphs={:?}",
+            stats.flakes, stats.size, stats.historical_since_t, stats.properties, classes, graphs
+        )
+    }
+
+    /// The planner merge as the walk computes it, which segment sums replace.
+    fn walked_planner_stats(
+        indexed: &IndexStats,
+        snapshot: &LedgerSnapshot,
+        novelty: &Novelty,
+        to_t: i64,
+        lookup: Option<&dyn StatsLookup>,
+    ) -> IndexStats {
+        let mut deltas =
+            NoveltyDeltaResolver::new(indexed, snapshot, novelty, NoveltyMerge::Estimate);
+        let stats = assemble_fast_stats_inner(
+            indexed,
+            snapshot,
+            novelty,
+            to_t,
+            lookup,
+            &mut deltas,
+            RestatedAttribution::IntraPass,
+            ClassDetail::CountsOnly,
+        );
+        deltas.finish();
+        stats
+    }
+
+    /// [`planner_projection`] with each graph property's datatype breakdown
+    /// in tag order: the walk lists tags first-seen, the sums sorted.
+    fn sorted_planner_projection(stats: &IndexStats) -> String {
+        let mut stats = stats.clone();
+        for graph in stats.graphs.iter_mut().flatten() {
+            for property in &mut graph.properties {
+                property.datatypes.sort_unstable();
+            }
+        }
+        planner_projection(&stats)
+    }
+
+    /// Several commits over an indexed base: new and base facts asserted and
+    /// retracted, a type gained and lost, a predicate the index has no ndv
+    /// for, a language-tagged string and commit metadata. Every segment sums
+    /// to what walking every flake gives.
+    #[test]
+    fn segment_sums_match_the_walk() {
+        let (score, name, fresh, class_a) = (
+            sid(10, "score"),
+            sid(10, "name"),
+            sid(10, "fresh"),
+            sid(10, "A"),
+        );
+        let string_dt = Sid::new(fluree_vocab::namespaces::XSD, "string");
+        let lang_dt = Sid::new(fluree_vocab::namespaces::RDF, "langString");
+        let name_flake = |s: &str, v: &str, t: i64| {
+            Flake::new(
+                sid(10, s),
+                name.clone(),
+                FlakeValue::String(v.into()),
+                string_dt.clone(),
+                t,
+                true,
+                None,
+            )
+        };
+        let indexed = IndexStats {
+            flakes: 40,
+            size: 400,
+            properties: Some(vec![
+                PropertyStatEntry {
+                    sid: (10, "score".into()),
+                    count: 20,
+                    ndv_values: 10,
+                    ndv_subjects: 20,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 20)],
+                    observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
+                    historical_datatypes: vec![],
+                },
+                PropertyStatEntry {
+                    sid: (10, "name".into()),
+                    count: 20,
+                    ndv_values: 20,
+                    ndv_subjects: 20,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::STRING.as_u8(), 20)],
+                    observed_datatypes: vec![ValueTypeTag::STRING.as_u8()],
+                    historical_datatypes: vec![],
+                },
+            ]),
+            classes: Some(vec![class_entry(&class_a, 20, &[])]),
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 40,
+                size: 400,
+                properties: vec![GraphPropertyStatEntry {
+                    p_id: 7,
+                    count: 20,
+                    ndv_values: 10,
+                    ndv_subjects: 20,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 20)],
+                    observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
+                    historical_datatypes: vec![],
+                }],
+                classes: None,
+            }]),
+            historical_since_t: Some(0),
+        };
+
+        let mut novelty = Novelty::new(1);
+        let commits: Vec<Vec<Flake>> = vec![
+            vec![
+                prop_flake(sid(10, "a1"), score.clone(), 5, 2),
+                prop_flake(sid(10, "a2"), score.clone(), 6, 2),
+                retracted(prop_flake(sid(10, "b1"), score.clone(), 1, 2)),
+                type_flake(sid(10, "n1"), class_a.clone(), 2),
+                name_flake("n1", "new one", 2),
+                prop_flake(
+                    sid(fluree_vocab::namespaces::FLUREE_COMMIT, "c2"),
+                    sid(10, "t"),
+                    2,
+                    2,
+                ),
+            ],
+            vec![
+                prop_flake(sid(10, "n1"), fresh.clone(), 1, 3),
+                prop_flake(sid(10, "n2"), fresh.clone(), 1, 3),
+                prop_flake(sid(10, "n3"), fresh.clone(), 2, 3),
+                Flake::new(
+                    sid(10, "n2"),
+                    name.clone(),
+                    FlakeValue::String("bonjour".into()),
+                    lang_dt,
+                    3,
+                    true,
+                    Some(FlakeMeta::with_lang("fr")),
+                ),
+            ],
+            vec![
+                retracted(type_flake(sid(10, "n1"), class_a.clone(), 4)),
+                retracted(prop_flake(sid(10, "n2"), fresh.clone(), 1, 4)),
+                retracted(name_flake("b2", "old", 4)),
+                prop_flake(sid(10, "a1"), score.clone(), 5, 4),
+            ],
+        ];
+        for (t, flakes) in (2..).zip(commits) {
+            novelty.apply_commit(flakes, t, &HashMap::new()).unwrap();
+        }
+        let lookup = StubLookup {
+            p_ids: HashMap::from([
+                (score, RuntimePredicateId::from_u32(7)),
+                (name, RuntimePredicateId::from_u32(8)),
+                (fresh, RuntimePredicateId::from_u32(9)),
+            ]),
+            classes: HashMap::new(),
+        };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        for lookup in [Some(&lookup as &dyn StatsLookup), None] {
+            let summed = segment_sums::planner_stats(&indexed, &snapshot, &novelty, 4, lookup)
+                .expect("every segment is at or below t=4");
+            let walked = walked_planner_stats(&indexed, &snapshot, &novelty, 4, lookup);
+            assert_eq!(
+                sorted_planner_projection(&summed),
+                sorted_planner_projection(&walked)
+            );
+            // Twice: the second answer is served from the segment cache.
+            let again = segment_sums::planner_stats(&indexed, &snapshot, &novelty, 4, lookup)
+                .expect("cached");
+            assert_eq!(
+                sorted_planner_projection(&again),
+                sorted_planner_projection(&walked)
+            );
+        }
+        let fresh_entry = segment_sums::planner_stats(&indexed, &snapshot, &novelty, 4, None)
+            .and_then(|stats| stats.properties)
+            .and_then(|props| props.into_iter().find(|p| p.sid.1 == "fresh"))
+            .expect("the window's new predicate");
+        assert_eq!(
+            (
+                fresh_entry.count,
+                fresh_entry.ndv_values,
+                fresh_entry.ndv_subjects
+            ),
+            (2, 2, 2),
+            "ndv for a predicate the index has none for comes from the window"
+        );
+
+        // A segment past `to_t` cannot be summed whole: the walk answers.
+        assert!(segment_sums::planner_stats(&indexed, &snapshot, &novelty, 3, None).is_none());
+        let historical =
+            assemble_planner_stats(&Arc::new(indexed.clone()), &snapshot, &novelty, 3, None);
+        let walked = walked_planner_stats(&indexed, &snapshot, &novelty, 3, None);
+        assert_eq!(
+            sorted_planner_projection(&historical),
+            sorted_planner_projection(&walked)
+        );
+    }
+
+    /// A base with a populated class table and a window that exercises every
+    /// class-count transition: a class gaining an instance, one losing an
+    /// instance, one losing its last instance, a brand-new class, and a class
+    /// asserted and retracted inside the window.
+    fn class_transition_fixture() -> (IndexStats, Novelty, StubLookup) {
+        let (a, b, c, d, e) = (
+            sid(10, "A"),
+            sid(10, "B"),
+            sid(10, "C"),
+            sid(10, "D"),
+            sid(10, "E"),
+        );
+        let score = sid(10, "score");
+        let base_classes = vec![
+            class_entry(&a, 2, &[(&score, 2)]),
+            class_entry(&b, 2, &[(&score, 2)]),
+            class_entry(&c, 1, &[(&score, 1)]),
+        ];
+        let indexed = IndexStats {
+            flakes: 10,
+            size: 100,
+            properties: Some(vec![PropertyStatEntry {
+                sid: (10, "score".to_string()),
+                count: 5,
+                ndv_values: 5,
+                ndv_subjects: 5,
+                last_modified_t: 1,
+                datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 5)],
+                observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
+                historical_datatypes: vec![],
+            }]),
+            classes: Some(base_classes.clone()),
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 10,
+                size: 100,
+                properties: vec![GraphPropertyStatEntry {
+                    p_id: 7,
+                    count: 5,
+                    ndv_values: 5,
+                    ndv_subjects: 5,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 5)],
+                    observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
+                    historical_datatypes: vec![],
+                }],
+                classes: Some(base_classes),
+            }]),
+            historical_since_t: Some(0),
+        };
+
+        let mut novelty = Novelty::new(1);
+        novelty
+            .apply_commit(
+                vec![
+                    type_flake(sid(10, "a3"), a.clone(), 2),
+                    prop_flake(sid(10, "a3"), score.clone(), 3, 2),
+                    retracted(type_flake(sid(10, "b1"), b.clone(), 2)),
+                    retracted(type_flake(sid(10, "c1"), c.clone(), 2)),
+                    type_flake(sid(10, "d1"), d.clone(), 2),
+                    prop_flake(sid(10, "d1"), score.clone(), 4, 2),
+                    type_flake(sid(10, "e1"), e.clone(), 2),
+                ],
+                2,
+                &HashMap::new(),
+            )
+            .unwrap();
+        novelty
+            .apply_commit(
+                vec![retracted(type_flake(sid(10, "e1"), e, 3))],
+                3,
+                &HashMap::new(),
+            )
+            .unwrap();
+        let lookup = StubLookup {
+            p_ids: HashMap::from([(score, RuntimePredicateId::from_u32(7))]),
+            classes: HashMap::new(),
+        };
+        (indexed, novelty, lookup)
+    }
+
+    /// The planner's merge may drop class property usage, but everything the
+    /// planner does read must match the full estimate merge exactly —
+    /// including classes that net to zero, which the planner reads as
+    /// known-empty rather than unknown.
+    #[test]
+    fn planner_stats_match_full_merge_on_everything_the_planner_reads() {
+        let (indexed, novelty, lookup) = class_transition_fixture();
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let indexed = Arc::new(indexed);
+
+        let full = assemble_fast_stats(&indexed, &snapshot, &novelty, 3, Some(&lookup));
+        let planner = assemble_planner_stats(&indexed, &snapshot, &novelty, 3, Some(&lookup));
+
+        assert_eq!(planner_projection(&planner), planner_projection(&full));
+
+        let counts: Vec<(&str, u64)> = planner
+            .classes
+            .iter()
+            .flatten()
+            .map(|entry| (&*entry.class_sid.name, entry.count))
+            .collect();
+        assert_eq!(
+            counts,
+            vec![("A", 3), ("B", 1), ("C", 0), ("D", 1), ("E", 0)],
+            "fixture must exercise gain, loss, loss-to-zero, new, and net-zero"
+        );
+        assert!(
+            planner
+                .classes
+                .iter()
+                .flatten()
+                .all(|entry| entry.properties.is_empty()),
+            "planner stats carry no class property usage"
+        );
+        assert!(
+            planner
+                .graphs
+                .iter()
+                .flatten()
+                .all(|graph| graph.classes.as_ref().is_none_or(Vec::is_empty)),
+            "planner stats carry no per-graph class entries"
+        );
+        assert!(
+            full.classes
+                .iter()
+                .flatten()
+                .any(|entry| !entry.properties.is_empty()),
+            "the full merge must still attribute property usage, or this test \
+             compares two degraded outputs"
+        );
+    }
+
+    /// A base with a top-level class table but no per-graph section. The full
+    /// merge still creates per-graph entries for the window's flakes and then
+    /// replaces the class table with their union, which knows only the classes
+    /// the window touched and counts them from zero. The planner lane applies
+    /// the window to the base's own table instead. This pins that divergence
+    /// as deliberate: the planner's counts are the correct ones.
+    #[test]
+    fn planner_stats_keep_base_class_counts_without_per_graph_base_stats() {
+        let (mut indexed, novelty, _) = class_transition_fixture();
+        indexed.graphs = None;
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let indexed = Arc::new(indexed);
+
+        let full = assemble_fast_stats(&indexed, &snapshot, &novelty, 3, None);
+        let planner = assemble_planner_stats(&indexed, &snapshot, &novelty, 3, None);
+
+        let counts = |stats: &IndexStats| -> Vec<(String, u64)> {
+            stats
+                .classes
+                .iter()
+                .flatten()
+                .map(|entry| (entry.class_sid.name.to_string(), entry.count))
+                .collect()
+        };
+        let expect = |pairs: &[(&str, u64)]| -> Vec<(String, u64)> {
+            pairs.iter().map(|(n, c)| (n.to_string(), *c)).collect()
+        };
+        assert_eq!(
+            counts(&planner),
+            expect(&[("A", 3), ("B", 1), ("C", 0), ("D", 1), ("E", 0)])
+        );
+        // The full merge is not compared on counts: without a base per-graph
+        // section it rebuilds the class table from the window alone. The
+        // indexer always writes that section alongside root classes, so only
+        // hand-built stats reach this shape.
+        assert_eq!(
+            format!("{:?}", planner.properties),
+            format!("{:?}", full.properties)
+        );
+    }
+
+    /// An empty window, or a read at or below the published index `t`, must
+    /// hand back the caller's stats rather than a copy.
+    #[test]
+    fn planner_stats_share_the_base_when_the_merge_is_an_identity() {
+        let (indexed, novelty, lookup) = class_transition_fixture();
+        let indexed = Arc::new(indexed);
+
+        let genesis = LedgerSnapshot::genesis("test:main");
+        let empty = Novelty::new(1);
+        let shared = assemble_planner_stats(&indexed, &genesis, &empty, 3, Some(&lookup));
+        assert!(Arc::ptr_eq(&shared, &indexed), "empty window");
+
+        let mut published = LedgerSnapshot::genesis("test:main");
+        published.t = 5;
+        let shared = assemble_planner_stats(&indexed, &published, &novelty, 5, Some(&lookup));
+        assert!(Arc::ptr_eq(&shared, &indexed), "read at the published t");
+
+        let merged = assemble_planner_stats(&indexed, &genesis, &novelty, 3, Some(&lookup));
+        assert!(!Arc::ptr_eq(&merged, &indexed), "a real window must merge");
     }
 }

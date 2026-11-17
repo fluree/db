@@ -371,6 +371,43 @@ async fn policy_batched_join_lane_declines_index_only() {
                     && !rows[0].to_string().contains("222-22-2222"),
                 "index-only policy view must hide Bob's SSN, got: {jsonld:#?}"
             );
+
+            // COUNT(*) over the same join must respect the restricted view,
+            // including when a count drain attempts the batched subject lane.
+            let mut count_query = query.clone();
+            count_query["select"] = json!(["(as (count *) ?n)"]);
+            let count =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &count_query, &policy_ctx)
+                    .await
+                    .expect("join count with policy");
+            assert_eq!(
+                count.to_jsonld(&ledger_indexed.snapshot).expect("count jsonld"),
+                json!([[1]]),
+                "join count must exclude the hidden SSN"
+            );
+            count_query["select"] = json!(["?name", "(as (count *) ?n)"]);
+            count_query["groupBy"] = json!(["?name"]);
+            let grouped =
+                support::query_jsonld_with_policy(&fluree, &ledger_indexed, &count_query, &policy_ctx)
+                    .await
+                    .expect("grouped join count with policy");
+            let grouped = grouped.to_jsonld(&ledger_indexed.snapshot).expect("grouped jsonld");
+            assert_eq!(grouped, json!([[rows[0][0], 1]]));
+            let mut minus_query = json!({
+                "select": ["?name"],
+                "where": [
+                    {"@id":"?u", "http://schema.org/name":"?name"},
+                    ["minus", {"@id":"?u", "http://schema.org/ssn":"?ssn"}]
+                ]
+            });
+            let minus = support::query_jsonld_with_policy(&fluree, &ledger_indexed, &minus_query, &policy_ctx)
+                .await.expect("MINUS with policy");
+            assert_eq!(minus.to_jsonld(&ledger_indexed.snapshot).unwrap(), json!([["Bob"]]),
+                "a hidden fact must not eliminate its subject through MINUS");
+            minus_query["select"] = json!(["(as (count *) ?n)"]);
+            let count = support::query_jsonld_with_policy(&fluree, &ledger_indexed, &minus_query, &policy_ctx)
+                .await.expect("MINUS count with policy");
+            assert_eq!(count.to_jsonld(&ledger_indexed.snapshot).unwrap(), json!([[1]]));
         })
         .await;
 }
@@ -641,4 +678,112 @@ async fn policy_stats_count_by_predicate_uses_filtered_fallback() {
             );
         })
         .await;
+}
+
+/// Retracting an `rdfs:subPropertyOf` edge narrows policy at once, not at
+/// the next index build: the edge is in the published index and its
+/// retraction only in novelty. Before, the policy hierarchy kept the indexed
+/// edge, so `ex:ssn` stayed under the `ex:q` policies, and `rdfs` reasoning
+/// kept answering `ex:q` from it.
+#[tokio::test]
+async fn retracted_subproperty_edge_narrows_policy_before_reindex() {
+    use fluree_db_api::{TrackedTransactionInput, TxnType};
+
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let fluree = FlureeBuilder::file(tmp.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .expect("build");
+    let ledger_id = "it/policy-retracted-subproperty:main";
+    let context = json!({
+        "ex": "http://example.org/ns/",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    });
+    let edge = json!({"@id": "ex:ssn", "rdfs:subPropertyOf": {"@id": "ex:q"}});
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    let seed = json!({
+        "@context": context,
+        "@graph": [edge, {"@id": "ex:bob", "ex:ssn": "123-45-6789"}]
+    });
+    fluree.insert(ledger, &seed).await.unwrap();
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    let ledger = fluree.ledger(ledger_id).await.expect("reload");
+    assert!(
+        ledger.snapshot.range_provider.is_some(),
+        "expected binary index"
+    );
+    let retract = json!({"@context": context, "delete": edge});
+    let ledger = fluree.update(ledger, &retract).await.unwrap().ledger;
+
+    let policy_on_q = |action: &str| {
+        let opts = GovernanceOptions {
+            policy: Some(json!([{
+                "@id": "ex:onQ",
+                "f:onProperty": [{"@id": "http://example.org/ns/q"}],
+                "f:action": action,
+                "f:allow": true
+            }])),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        let ledger = ledger.clone();
+        async move {
+            policy_builder::build_policy_context_from_opts(
+                &ledger.snapshot,
+                ledger.novelty.as_ref(),
+                Some(ledger.novelty.as_ref()),
+                ledger.t(),
+                &opts,
+                &[0],
+            )
+            .await
+            .expect("build policy context")
+        }
+    };
+
+    let reader = policy_on_q("f:view").await;
+    let ssn = json!({
+        "@context": context,
+        "select": "?v",
+        "where": {"@id": "ex:bob", "ex:ssn": "?v"}
+    });
+    let seen = support::query_jsonld_with_policy(&fluree, &ledger, &ssn, &reader)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("format");
+    assert_eq!(seen, json!([]), "the retracted edge still widened the view");
+
+    let writer = policy_on_q("f:modify").await;
+    let write = json!({
+        "@context": context,
+        "insert": {"@id": "ex:bob", "ex:ssn": "000-00-0000"}
+    });
+    let input = TrackedTransactionInput::new(TxnType::Update, &write, TxnOpts::default(), &writer);
+    let index_cfg = IndexConfig {
+        reindex_min_bytes: 100_000,
+        reindex_max_bytes: 1_000_000_000,
+    };
+    let refused = fluree
+        .transact_tracked_with_policy(ledger.clone(), input, CommitOpts::default(), &index_cfg)
+        .await
+        .expect_err("the retracted edge still widened the modify grant");
+    assert_eq!(refused.status, 403, "{}", refused.error);
+
+    let entailed = json!({
+        "@context": context,
+        "select": "?v",
+        "where": {"@id": "ex:bob", "ex:q": "?v"},
+        "reasoning": "rdfs"
+    });
+    let answered = support::query_jsonld(&fluree, &ledger, &entailed)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("format");
+    assert_eq!(
+        answered,
+        json!([]),
+        "rdfs reasoning still entailed ex:q from the retracted edge"
+    );
 }

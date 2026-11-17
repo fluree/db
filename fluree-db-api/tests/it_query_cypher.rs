@@ -365,6 +365,70 @@ async fn transact_cypher_create_round_trips_to_jsonld_query() {
     assert_eq!(rows.row_count(), 1);
 }
 
+/// A variable named like another form's minted label stays its own node. Each
+/// statement here used to fuse two: `anon_7_11` with the anonymous node at
+/// that span, `rel_r` with relationship `r`'s annotation, and `ann_0` with the
+/// first anonymous relationship's annotation. A backticked variable holding a
+/// space is created and returned like any other.
+#[tokio::test]
+async fn transact_cypher_variables_never_spell_a_minted_label() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "it/cypher:minted-labels");
+    for stmt in [
+        "CREATE (:A), (anon_7_11:C)",
+        "CREATE (rel_r:P)-[r:KNOWS]->(b:Q)",
+        "CREATE (ann_0:R)-[:KNOWS]->(c:S)",
+    ] {
+        ledger = fluree
+            .transact_cypher(ledger, stmt)
+            .await
+            .expect(stmt)
+            .ledger;
+    }
+    let (result, returned) = fluree
+        .transact_cypher_returning(ledger, "CREATE (`my node`:T) RETURN `my node`", None)
+        .await
+        .expect("backticked variable");
+    let returned = returned.expect("RETURN produces rows");
+    let db = graphdb_from_ledger(&result.ledger);
+
+    let rows = |q: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            let cj = fluree
+                .query_cypher(db, q)
+                .await
+                .expect(q)
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .expect(q);
+            cj["results"][0]["data"]
+                .as_array()
+                .expect("data")
+                .iter()
+                .map(|d| d["row"].clone())
+                .collect::<Vec<JsonValue>>()
+        }
+    };
+
+    assert_eq!(rows("MATCH (n:A) RETURN labels(n)").await, [json!([["A"]])]);
+    assert_eq!(rows("MATCH (n:C) RETURN labels(n)").await, [json!([["C"]])]);
+    for q in [
+        "MATCH (x:P)-[r:KNOWS]->(:Q) RETURN id(x), id(r)",
+        "MATCH (x:R)-[e:KNOWS]->(:S) RETURN id(x), id(e)",
+    ] {
+        let found = rows(q).await;
+        assert_eq!(found.len(), 1, "{q}: {found:?}");
+        assert_ne!(found[0][0], found[0][1], "{q}: a node is its own edge");
+    }
+    assert_eq!(
+        rows("MATCH (n:T) RETURN id(n)").await,
+        [returned["results"][0]["data"][0]["row"].clone()],
+        "the returned node is the one stored"
+    );
+}
+
 #[tokio::test]
 async fn transact_cypher_set_property_replaces_old_value() {
     // End-to-end: seed via JSON-LD, MATCH … SET via Cypher, read back.
@@ -974,7 +1038,7 @@ async fn transact_cypher_match_create_return_edge() {
         data[0]["row"][0]
             .as_str()
             .expect("edge id")
-            .contains("cy_rel_e"),
+            .ends_with("--cyre"),
         "{rows}"
     );
 
@@ -1339,20 +1403,62 @@ async fn cypher_collect_through_with() {
         .collect();
     assert_eq!(rows, vec![json!("Bob"), json!("Carol")], "{unwound}");
 
-    // ORDER BY directly on a collect() list in the same WITH is still rejected
-    // (sorting a list value is unsound in v1).
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
-                   WITH p, collect(f.name) AS friends ORDER BY friends
-                   RETURN p.name, friends"#,
-            )
+    // ORDER BY on a collect() list in the same WITH, or on a list built from
+    // one, is still rejected (sorting a list value is unsound in v1).
+    for order_by in ["friends", "tail(friends)", "friends + ['x']"] {
+        let query = format!(
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY {order_by} RETURN p.name, friends"
+        );
+        assert!(
+            fluree.query_cypher(&db, &query).await.is_err(),
+            "ORDER BY on a collect() list in WITH is rejected: {query}"
+        );
+    }
+
+    // An ORDER BY key that reads the list and yields a scalar sorts after the
+    // aggregation, in a WITH and in a RETURN.
+    for (query, expected) in [
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY size(friends) \
+             RETURN p.name AS name, size(friends) AS n",
+            json!([["Bob", 1], ["Alice", 2]]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             RETURN p.name AS name, collect(f.name) AS friends ORDER BY size(friends) DESC",
+            json!(["Alice", "Bob"]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY any(x IN friends WHERE x = 'Bob') \
+             RETURN p.name AS name",
+            json!([["Bob"], ["Alice"]]),
+        ),
+    ] {
+        let cj = fluree
+            .query_cypher(&db, query)
             .await
-            .is_err(),
-        "ORDER BY on a collect() list in WITH is rejected"
-    );
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows: Vec<JsonValue> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"].clone())
+            .collect();
+        let rows = match expected.as_array().and_then(|e| e.first()) {
+            // Names only: the friends list's order is unspecified.
+            Some(JsonValue::String(_)) => {
+                JsonValue::Array(rows.iter().map(|r| r[0].clone()).collect())
+            }
+            _ => JsonValue::Array(rows),
+        };
+        assert_eq!(rows, expected, "{query}");
+    }
 }
 
 #[tokio::test]
@@ -2807,6 +2913,82 @@ async fn cypher_call_subquery_import_all() {
             .is_err(),
         "RETURN re-binding an outer name is rejected even under (*)"
     );
+}
+
+/// `x AS x` projects `x` unchanged, on novelty and on an indexed ledger, at
+/// the top level and inside `CALL (a) { … }`. The five CALL shapes are
+/// #1894's: each person gets its own name, once.
+#[tokio::test]
+async fn cypher_with_aliasing_a_variable_to_itself_keeps_every_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:self-alias";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "a1", "@type": "Person", "name": "Ann"},
+                    {"@id": "a2", "@type": "Person", "name": "Ben"},
+                    {"@id": "a3", "@type": "Person", "name": "Cy"},
+                    {"@id": "a4", "@type": "Person", "name": "Di"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let names = json!([["Ann"], ["Ben"], ["Cy"], ["Di"]]);
+    let pairs = json!([["Ann", "Ann"], ["Ben", "Ben"], ["Cy", "Cy"], ["Di", "Di"]]);
+    const CALL: &str = "MATCH (a:Person) CALL (a) { ";
+    let mut cases: Vec<(String, &JsonValue)> = Vec::new();
+    for body in [
+        "WITH a.name AS n RETURN n AS z",
+        "WITH a.name AS n, 1 AS k RETURN n AS z",
+        "WITH a AS a RETURN a.name AS z",
+        "WITH a, a.name AS n RETURN n AS z",
+        "RETURN a.name AS z",
+        "WITH a AS a, a.name AS n RETURN n AS z",
+        "WITH a AS b RETURN b.name AS z",
+    ] {
+        cases.push((format!("{CALL}{body} }} RETURN z"), &names));
+        cases.push((format!("{CALL}{body} }} RETURN a.name AS an, z"), &pairs));
+    }
+    for query in [
+        "MATCH (a:Person) WITH a AS a RETURN a.name AS z",
+        "MATCH (a:Person) WITH a AS a, a.name AS n RETURN n AS z",
+        "MATCH (a:Person) WITH a AS b RETURN b.name AS z",
+    ] {
+        cases.push((query.to_string(), &names));
+    }
+
+    let mut wrong = Vec::new();
+    for (label, db) in [("novelty", &novelty_db), ("indexed", &indexed_db)] {
+        for (query, expected) in &cases {
+            let cj = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .expect("cypher json");
+            let mut rows: Vec<JsonValue> = cj["results"][0]["data"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| r["row"].clone())
+                .collect();
+            rows.sort_by_key(std::string::ToString::to_string);
+            if &JsonValue::Array(rows.clone()) != *expected {
+                wrong.push(format!("{label}: {query}\n  got {rows:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
 #[tokio::test]
@@ -4558,24 +4740,52 @@ async fn transact_cypher_delete_relationship_rejects_parallel_edges() {
 }
 
 #[tokio::test]
-async fn transact_cypher_delete_relationship_requires_named_endpoints() {
-    // `DELETE r` needs both endpoints named so the parallel-edge probe can
-    // group by them. An anonymous endpoint is rejected.
+async fn transact_cypher_delete_relationship_with_an_anonymous_endpoint() {
+    // `DELETE r` retracts the edge `r` was matched on, which the pattern
+    // names whether or not its endpoints have names (the parallel check runs
+    // where the edge is retracted). It deletes that relationship alone.
     let fluree = FlureeBuilder::memory().build_memory();
     let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-anon");
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"CREATE (c:Person {name: "Cy"})"#,
         r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        r#"MATCH (a:Person {name: "Alice"}), (c:Person {name: "Cy"}) CREATE (a)-[:KNOWS]->(c)"#,
     ] {
         l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
     }
 
-    let err = fluree
-        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->() DELETE r")
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a)-[r:KNOWS]->(:Person {name: "Bob"}) DELETE r"#,
+        )
         .await
-        .expect_err("DELETE r with an anonymous endpoint must error");
-    assert!(format!("{err}").contains("endpoint"), "{err}");
+        .expect("DELETE r with an anonymous endpoint")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN a.name, b.name")
+        .await
+        .expect("relationships")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        rows["results"][0]["data"],
+        json!([{"row": ["Alice", "Cy"], "meta": [null, null]}]),
+        "only the relationship to Bob is deleted"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("nodes")
+            .row_count(),
+        3,
+        "every node survives"
+    );
 }
 
 #[tokio::test]
@@ -7061,6 +7271,61 @@ async fn cypher_unwind_runtime_list() {
         vec!["Alice", "Bob", "Carol", "Dave"],
         "one name per path node: {names}"
     );
+}
+
+#[tokio::test]
+async fn cypher_unwind_runtime_list_binds_the_alias_a_later_match_reads() {
+    // A runtime list (one that does not lower to VALUES) unwound into an alias
+    // a later MATCH reads: one row per element. Run after that MATCH, the
+    // UNWIND overwrote the node or value it bound, so every match came back
+    // once per element.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_ic1_chain(&fluree, "it/cypher:unwind-alias-later-match").await;
+    let items: Vec<JsonValue> = (1..=5)
+        .map(|i| json!({"@id": format!("item{i}"), "@type": "Item", "idx": i}))
+        .collect();
+    let l = fluree
+        .insert(l, &json!({"@context": ctx(), "@graph": items}))
+        .await
+        .expect("seed items")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let mut wrong = Vec::new();
+    for (query, expected) in [
+        (
+            "UNWIND range(1, 3) AS i MATCH (n:Item {idx: i}) RETURN n.idx",
+            json!([[1], [2], [3]]),
+        ),
+        (
+            r#"UNWIND [x IN ["Alice", "Carol"] | x] AS nm
+               MATCH (p:Person {name: nm}) RETURN p.name"#,
+            json!([["Alice"], ["Carol"]]),
+        ),
+        (
+            r#"MATCH (a:Person {name:"Alice"}),(c:Person {name:"Carol"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(c))
+               UNWIND nodes(p) AS pn
+               MATCH (pn:Person)
+               RETURN pn.name"#,
+            json!([["Alice"], ["Bob"], ["Carol"]]),
+        ),
+    ] {
+        let out = fluree
+            .query_cypher(&db, query)
+            .await
+            .expect(query)
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        let mut rows = out.as_array().expect("rows").clone();
+        rows.sort_by_key(ToString::to_string);
+        let rows = JsonValue::Array(rows);
+        if rows != expected {
+            wrong.push(format!("{query}\n  got {rows}\n  expected {expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[tokio::test]
@@ -9866,4 +10131,1322 @@ async fn cypher_untyped_rel_prop_read_large_unwind() {
         .find(|r| r[0] == json!("u0"))
         .expect("u0 present");
     assert_eq!(row0[2], json!("u1"));
+}
+
+// ============================================================================
+// Variable-length relationships and per-hop edge identity.
+//
+// A bounded, single-typed, directed range expands to a fixed chain of real
+// triple patterns, so every hop has ordinary row variables for its endpoints
+// and can carry its own annotation probe. The contract that establishes:
+//
+//   - an element of a bound var-length relationship list IS the hop's reifier
+//     when the hop is reified, and the synthesized relationship value when it
+//     is not — the same two-way binding a single `-[r:T]->` hop already has;
+//   - so row multiplicity follows edge multiplicity, k-fold over k hops;
+//   - and the routes that cannot carry identity (path enumeration) refuse the
+//     read instead of answering null.
+// ============================================================================
+
+/// Alice -0.9-> Bob -0.95-> Carol -0.5-> Dave, every edge reified with a
+/// `confidence` annotation.
+async fn seed_claims_chain(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let ledger0 = genesis_ledger(fluree, ledger_id);
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol", "@annotation": {"confidence": 0.95}}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol",
+                     "KNOWS": {"@id": "dave", "@annotation": {"confidence": 0.5}}},
+                    {"@id": "dave", "@type": "Person", "name": "Dave"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed claims chain")
+        .ledger
+}
+
+async fn cypher_rows(
+    fluree: &fluree_db_api::Fluree,
+    db: &fluree_db_api::GraphDb,
+    q: &str,
+) -> Vec<JsonValue> {
+    let cj = fluree
+        .query_cypher(db, q)
+        .await
+        .unwrap_or_else(|e| panic!("query failed: {e}\n{q}"))
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("cypher json");
+    cj["results"][0]["data"]
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(|r| r["row"].clone())
+        .collect()
+}
+
+#[tokio::test]
+async fn cypher_union_branch_rel_var_name_collision_keeps_both_branches() {
+    // The annotation-surface scan is per `Query` scope. UNION branches are
+    // independent scopes, so `r` naming a NODE in the second branch must not
+    // make `r` in the first branch — a relationship variable — annotation
+    // dependent. It used to: the first branch then lowered to a bare
+    // `EdgeAnnotation`, which matches only reified edges, and Bob silently
+    // vanished from a query over plain-RDF data.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:union-relvar-collision");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice", "knows": {"@id": "bob"}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let control = r#"MATCH (a:Person {name: "Alice"})-[r:knows]->(b) RETURN b.name AS out"#;
+    assert_eq!(
+        cypher_rows(&fluree, &db, control).await,
+        vec![json!(["Bob"])],
+        "control: the plain edge matches on its own"
+    );
+
+    // `r` rebound as a node in the second branch.
+    let collision = r#"MATCH (a:Person {name: "Alice"})-[r:knows]->(b) RETURN b.name AS out
+                       UNION ALL MATCH (r:Person {name: "Alice"}) RETURN r.name AS out"#;
+    // The same query with the second branch's variable renamed — the reference
+    // answer, since the two branches share no variables in Cypher's semantics.
+    let renamed = r#"MATCH (a:Person {name: "Alice"})-[r:knows]->(b) RETURN b.name AS out
+                     UNION ALL MATCH (q:Person {name: "Alice"}) RETURN q.name AS out"#;
+    assert_eq!(
+        cypher_rows(&fluree, &db, collision).await,
+        vec![json!(["Bob"]), json!(["Alice"])],
+        "both branches contribute their row"
+    );
+    assert_eq!(
+        cypher_rows(&fluree, &db, collision).await,
+        cypher_rows(&fluree, &db, renamed).await,
+        "renaming the second branch's variable must change nothing"
+    );
+}
+
+#[tokio::test]
+async fn cypher_list_iteration_loop_var_does_not_capture_a_same_named_rel_var() {
+    // The loop variable of a list iteration is loop-local — `lower/expr.rs`
+    // binds it with `bind_local`, so it can never name a row variable. Letting
+    // its name escape into the scope's annotation set makes a same-named
+    // *relationship* variable elsewhere in the scope lower as
+    // annotation-dependent: the bare `EdgeAnnotation` lane, which matches only
+    // reified edges and silently drops the unreified rows.
+    //
+    // Alice -0.9-> Bob is reified; Bob -> Carol is plain. `r` is both the loop
+    // variable of the `all(...)` and the relationship variable of the hop that
+    // has to match the plain edge.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:loop-var-name-collision");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol"}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let q = |loop_var: &str| {
+        format!(
+            r#"MATCH (b:Person {{name: "Bob"}})-[r:KNOWS]->(c:Person)
+               MATCH (a:Person {{name: "Alice"}})-[rs:KNOWS*1..1]->(b)
+               WHERE all({loop_var} IN rs WHERE {loop_var}.confidence > 0.5)
+               RETURN c.name AS name"#
+        )
+    };
+    // The control: a loop variable that collides with nothing.
+    assert_eq!(
+        cypher_rows(&fluree, &db, &q("x")).await,
+        vec![json!(["Carol"])],
+    );
+    // The same query with the loop variable renamed to collide with the row
+    // variable `r` must answer identically — the two are different variables.
+    assert_eq!(
+        cypher_rows(&fluree, &db, &q("r")).await,
+        vec![json!(["Carol"])],
+        "the loop variable of `all(...)` must not make the row variable `r` \
+         annotation-dependent and drop the unreified Bob->Carol edge"
+    );
+
+    // Same collision through a list comprehension rather than a predicate —
+    // the other `scan_list_iteration` call site.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (b:Person {name: "Bob"})-[r:KNOWS]->(c:Person)
+               MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..1]->(b)
+               RETURN c.name AS name, [r IN rs | r.confidence] AS confs"#,
+        )
+        .await,
+        vec![json!(["Carol", [0.9]])],
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_bound_rel_var_reads_per_hop_annotations() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:varlen-hop-annotations").await;
+    let db = graphdb_from_ledger(&l);
+
+    // `all(...)` over the bound list: Alice→Bob (0.9) and Alice→Bob→Carol
+    // (0.9, 0.95) qualify; the third hop to Dave (0.5) disqualifies its path.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..3]->(b:Person)
+               WHERE all(r IN rs WHERE r.confidence > 0.8)
+               RETURN b.name AS name ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob"]), json!(["Carol"])],
+    );
+
+    // A list comprehension reads each hop's own value, in traversal order.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)
+               RETURN b.name AS name, [r IN rs | r.confidence] AS confs ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob", [0.9]]), json!(["Carol", [0.9, 0.95]])],
+    );
+
+    // The list functions compose: `tail` and `reverse` rewrap the same
+    // elements, so each one still carries its own hop's identity.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)
+               RETURN b.name AS name,
+                      [r IN tail(rs) | r.confidence] AS rest,
+                      [r IN reverse(rs) | r.confidence] AS backwards
+               ORDER BY name"#,
+        )
+        .await,
+        vec![
+            json!(["Bob", [], [0.9]]),
+            json!(["Carol", [0.95], [0.95, 0.9]]),
+        ],
+    );
+
+    // `UNWIND rs AS r` makes each element a row variable, so `r.confidence`
+    // resolves as an ordinary subject property read against the reifier.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)
+               UNWIND rs AS r
+               RETURN b.name AS name, r.confidence AS c ORDER BY name, c"#,
+        )
+        .await,
+        vec![
+            json!(["Bob", 0.9]),
+            json!(["Carol", 0.9]),
+            json!(["Carol", 0.95]),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_relationships_of_bounded_path_reads_per_hop_annotations() {
+    // `relationships(p)` over a path bound by the fixed-chain expansion
+    // resolves to the identity-carrying list the expansion binds alongside the
+    // path value — `Binding::Path.edges` is `(start, predicate, end)` with no
+    // reifier slot, so computing it from the path value answers null.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:varlen-path-annotations").await;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..3]->(b:Person)
+               WHERE all(r IN relationships(p) WHERE r.confidence > 0.8)
+               RETURN b.name AS name ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob"]), json!(["Carol"])],
+    );
+
+    // The list must survive a `WITH` that projects the path variable; the
+    // projection would otherwise drop it and the read would fall back to the
+    // reifier-less path value.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, b
+               RETURN b.name AS name, [r IN relationships(p) | r.confidence] AS confs
+               ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob", [0.9]]), json!(["Carol", [0.9, 0.95]])],
+    );
+
+    // `nodes(p)` is unaffected: path nodes are real subject SIDs on every
+    // route, and reading their properties must stay allowed.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               RETURN b.name AS name, [n IN nodes(p) | n.name] AS ns ORDER BY name"#,
+        )
+        .await,
+        vec![
+            json!(["Bob", ["Alice", "Bob"]]),
+            json!(["Carol", ["Alice", "Bob", "Carol"]]),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn cypher_aggregating_with_drops_the_identity_list_instead_of_grouping_it() {
+    // An aggregating `WITH` fixes its group keys before the projection is
+    // built, so the identity-carrying relationship list cannot ride along: it
+    // is not a group key, and carrying it anyway delivers a `Binding::Grouped`
+    // to the RETURN, which trips `debug_assert!(false, "Grouped binding in
+    // filter evaluation")` in the engine's evaluator. Drop the list instead
+    // and let `relationships(p)` coalesce back to the path value — the
+    // fallback `lower/expr.rs` already documents. The path value carries no
+    // reifier, so the per-hop properties read null while `size()`, `type()`
+    // and the endpoints stay correct.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:varlen-aggregating-with").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Bounded range under a path variable, then an aggregating WITH.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, count(*) AS c
+               RETURN c AS c, size(relationships(p)) AS n,
+                      [r IN relationships(p) | r.confidence] AS confs
+               ORDER BY n"#,
+        )
+        .await,
+        vec![
+            json!([1, 1, [JsonValue::Null]]),
+            json!([1, 2, [JsonValue::Null, JsonValue::Null]]),
+        ],
+        "the list is dropped at an aggregating WITH; `relationships(p)` falls \
+         back to the reifier-less path value rather than grouping the list"
+    );
+
+    // The fixed one-hop path form routes through the same machinery
+    // (`single_fixed_hop` re-enters it as `*1..1`), so it needs the same drop.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b:Person)
+               WITH p, count(*) AS c
+               RETURN c AS c, [r IN relationships(p) | r.confidence] AS confs"#,
+        )
+        .await,
+        vec![json!([1, [JsonValue::Null]])],
+    );
+
+    // An aggregate over the list itself, reached through `size()` only.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, count(*) AS c
+               RETURN sum(size(relationships(p))) AS total"#,
+        )
+        .await,
+        vec![json!([3])],
+    );
+
+    // The contrast that must keep working: a NON-aggregating WITH still
+    // carries the list, so the same read answers the real per-hop annotations.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH p, b
+               RETURN b.name AS name, [r IN relationships(p) | r.confidence] AS confs
+               ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob", [0.9]]), json!(["Carol", [0.9, 0.95]])],
+    );
+
+    // And the workaround `docs/query/cypher.md` names: read the properties
+    // into a projected value *before* grouping, and the aggregating WITH
+    // carries that instead of the list.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+               WITH b, [r IN relationships(p) | r.confidence] AS confs, count(*) AS c
+               RETURN b.name AS name, confs AS confs, c AS c
+               ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob", [0.9], 1]), json!(["Carol", [0.9, 0.95], 1]),],
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_unreified_hops_degrade_to_null_not_dropped() {
+    // Alice -0.9-> Bob reified; Bob -> Carol plain. The per-hop probe is
+    // `Optional`, so a path containing an unreified hop still matches and that
+    // hop's element degrades to the synthesized relationship value — whose
+    // property surface is empty. A bare `EdgeAnnotation` would have dropped
+    // the whole path, taking `any(...)` and the list comprehension with it.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-mixed-reification");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol"}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let varlen = r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)"#;
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            &format!(
+                "{varlen} RETURN b.name AS name, [r IN rs | r.confidence] AS confs ORDER BY name"
+            ),
+        )
+        .await,
+        vec![
+            json!(["Bob", [0.9]]),
+            json!(["Carol", [0.9, JsonValue::Null]]),
+        ],
+        "the unreified second hop reads null, and its path is still returned"
+    );
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            &format!("{varlen} WHERE any(r IN rs WHERE r.confidence > 0.8) RETURN b.name AS name ORDER BY name"),
+        )
+        .await,
+        vec![json!(["Bob"]), json!(["Carol"])],
+        "`any` still sees the reified first hop of the two-hop path"
+    );
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            &format!("{varlen} WHERE all(r IN rs WHERE r.confidence > 0.8) RETURN b.name AS name ORDER BY name"),
+        )
+        .await,
+        vec![json!(["Bob"])],
+        "`all` excludes the path whose second hop has no annotation"
+    );
+    // The value surface is unchanged by binding the reifier: `type()` and
+    // `size()` read the same on a reified element as on a synthesized one.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            &format!("{varlen} RETURN b.name AS name, [r IN rs | type(r)] AS types, size(rs) AS n ORDER BY name"),
+        )
+        .await,
+        vec![
+            json!(["Bob", ["KNOWS"], 1]),
+            json!(["Carol", ["KNOWS", "KNOWS"], 2]),
+        ],
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_parallel_claims_multiply_rows_like_a_single_hop() {
+    // Two claims about the SAME Alice→Bob edge. `Pattern::EdgeAnnotation` is
+    // one row per (edge, annotation) pair, so a hop with two parallel claims
+    // doubles the rows and a k-hop chain multiplies k-fold. That is Cypher's
+    // answer — parallel relationships are distinct relationships — and it is
+    // exactly what a single `-[r:T]->` hop already does.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-parallel-claims");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": [
+                        {"@id": "bob", "@annotation": {"confidence": 0.9}},
+                        {"@id": "bob", "@annotation": {"confidence": 0.4}}
+                     ]},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol", "@annotation": {"confidence": 0.7}}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let sorted = |mut rows: Vec<JsonValue>| {
+        rows.sort_by_key(std::string::ToString::to_string);
+        rows
+    };
+
+    // The single-hop contract this matches.
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[r:KNOWS]->(b:Person)
+                   RETURN b.name AS name, r.confidence AS c"#,
+            )
+            .await
+        ),
+        vec![json!(["Bob", 0.4]), json!(["Bob", 0.9])],
+        "a single hop already yields one row per parallel claim",
+    );
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..1]->(b:Person)
+                   RETURN b.name AS name, [r IN rs | r.confidence] AS confs"#,
+            )
+            .await
+        ),
+        vec![json!(["Bob", [0.4]]), json!(["Bob", [0.9]])],
+        "a one-hop range matches the single-hop contract",
+    );
+    // Two hops: 2 claims × 1 claim = 2 rows, each carrying its own combination.
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*2..2]->(b:Person)
+                   RETURN b.name AS name, [r IN rs | r.confidence] AS confs"#,
+            )
+            .await
+        ),
+        vec![json!(["Carol", [0.4, 0.7]]), json!(["Carol", [0.9, 0.7]]),],
+        "row multiplicity is the product of the per-hop claim counts",
+    );
+
+    // Binding a path variable ALONE — no relationship variable and no property
+    // read anywhere — takes the same identity-carrying route, so it multiplies
+    // the same way. This is the visible change to existing path queries over
+    // reified ledgers, and it matches what `p = (a)-[:T]->(b)` already did for
+    // one hop.
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+                   RETURN b.name AS name"#,
+            )
+            .await
+        ),
+        vec![
+            json!(["Bob"]),
+            json!(["Bob"]),
+            json!(["Carol"]),
+            json!(["Carol"]),
+        ],
+        "a bound path multiplies on parallel claims exactly as a bound rel var does",
+    );
+    // Binding neither keeps one row per (start, end): with nothing to carry
+    // identity there is no per-claim fan-out, so an unbound range is the
+    // spelling that still answers once per reachable node.
+    assert_eq!(
+        sorted(
+            cypher_rows(
+                &fluree,
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[:KNOWS*1..2]->(b:Person)
+                   RETURN b.name AS name"#,
+            )
+            .await
+        ),
+        vec![json!(["Bob"]), json!(["Carol"])],
+    );
+}
+
+#[tokio::test]
+async fn cypher_multi_hop_path_property_read_refused_with_a_remedy() {
+    // A multi-hop path value is assembled by `MakePathHops` from the chain's
+    // node refs and per-hop `MakeRel` values, and a synthesized relationship
+    // value has no reifier slot — so `[r IN relationships(p) | r.prop]` over
+    // one answers null even when every edge in the chain IS reified. That is a
+    // wrong answer rather than a missing feature (the single-hop path form and
+    // the equivalent `*N..N` range both read the real annotations), so refuse
+    // it and name the spellings that work.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:multi-hop-path-props");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob",
+                     "KNOWS": {"@id": "carol", "@annotation": {"confidence": 0.95}},
+                     "WORKS_AT": {"@id": "acme", "@annotation": {"confidence": 0.7}}},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                    {"@id": "acme", "@type": "Org", "name": "Acme"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    // A uniformly-typed chain gets both remedies: per-hop relationship
+    // variables, and the bounded range that expresses the same chain.
+    for q in [
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+           RETURN [r IN relationships(p) | r.confidence] AS confs"#,
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+           WHERE all(r IN relationships(p) WHERE r.confidence > 0.8)
+           RETURN c.name AS name"#,
+        // Through a `WITH … AS` rename, which the alias walk resolves back.
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+           WITH c, relationships(p) AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+           RETURN c.name AS name"#,
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("multi-hop path property read must be refused")
+            .to_string();
+        assert!(
+            err.contains("carry no per-hop edge identity"),
+            "must say why: {err}"
+        );
+        assert!(
+            err.contains("Bind each hop's relationship variable"),
+            "must name the always-available remedy: {err}"
+        );
+        assert!(
+            err.contains("-[:KNOWS*2..2]->"),
+            "a uniformly-typed chain must also name the range that expresses it: {err}"
+        );
+    }
+
+    // A mixed-type chain has no single range that expresses it, so the message
+    // must not invent one.
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:WORKS_AT]->(o)
+               RETURN [r IN relationships(p) | r.confidence] AS confs"#,
+        )
+        .await
+        .expect_err("multi-hop path property read must be refused")
+        .to_string();
+    assert!(
+        err.contains("Bind each hop's relationship variable"),
+        "must still name the remedy that always exists: {err}"
+    );
+    assert!(
+        !err.contains("bounded range"),
+        "no single range expresses a mixed-type chain: {err}"
+    );
+
+    // Remedy 1 — per-hop relationship variables — reads the real annotations,
+    // and `p` stays bound alongside them.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[r1:KNOWS]->(b)-[r2:KNOWS]->(c)
+               RETURN r1.confidence AS c1, r2.confidence AS c2, length(p) AS n"#,
+        )
+        .await,
+        vec![json!([0.9, 0.95, 2])],
+    );
+    // Remedy 2 — the bounded range the message names.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*2..2]->(c)
+               RETURN [r IN relationships(p) | r.confidence] AS confs"#,
+        )
+        .await,
+        vec![json!([[0.9, 0.95]])],
+    );
+
+    // The refusal is scoped to the element *property* surface: everything the
+    // multi-hop path value can actually answer stays available on this route.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+               RETURN size(relationships(p)) AS n, length(p) AS len,
+                      [n IN nodes(p) | n.name] AS ns,
+                      [r IN relationships(p) | type(r)] AS types"#,
+        )
+        .await,
+        vec![json!([2, 2, ["Alice", "Bob", "Carol"], ["KNOWS", "KNOWS"]])],
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_enumerated_property_read_refused_with_a_remedy() {
+    // The routes resolved by path enumeration carry no per-hop edge identity,
+    // so a property read over their elements can only answer null. Refuse it,
+    // and name the edit that moves the pattern onto the route that works.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:varlen-enumerate-refusal").await;
+    let db = graphdb_from_ledger(&l);
+
+    for (q, remedy) in [
+        // Unbounded with a binding.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               RETURN [r IN rs | r.confidence] AS confs"#,
+            "give the range an upper bound",
+        ),
+        // Untyped with a binding.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs*1..2]->(b:Person)
+               RETURN [r IN rs | r.confidence] AS confs"#,
+            "name a relationship type",
+        ),
+        // Undirected.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]-(b:Person)
+               RETURN [r IN rs | r.confidence] AS confs"#,
+            "give the pattern a direction",
+        ),
+        // A zero lower bound.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*0..2]->(b:Person)
+               RETURN [r IN rs | r.confidence] AS confs"#,
+            "start the range at 1 rather than 0",
+        ),
+        // Reached through a path variable and `relationships(p)`.
+        (
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               WHERE all(r IN relationships(p) WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // Wrapped in a list function — the guard reads through to `rs`.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               RETURN [r IN tail(rs) | r.confidence] AS confs"#,
+            "give the range an upper bound",
+        ),
+        // Reached through `UNWIND`, where the element is a row variable.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               UNWIND rs AS r RETURN r.confidence AS c"#,
+            "give the range an upper bound",
+        ),
+        // Renamed by a `WITH … AS` alias. The scan attributes the element
+        // reads to the alias, so the refusal has to walk the rename back to
+        // the variable the pattern binds — otherwise the read is silently
+        // lowered onto the enumeration route and answers `[]`.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               WITH b, rs AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // The same rename applied to `relationships(p)` over a path variable.
+        (
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               WITH b, relationships(p) AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // An alias of an alias — the walk back has to run to a fixpoint.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               WITH b, rs AS xs
+               WITH b, xs AS ys WHERE all(r IN ys WHERE r.confidence > 0.8)
+               RETURN b.name AS name"#,
+            "give the range an upper bound",
+        ),
+        // A `WITH` alias consumed by a later `UNWIND`: the two renames have to
+        // compose, which is what makes one pass insufficient.
+        (
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+               WITH b, rs AS xs
+               UNWIND xs AS r RETURN r.confidence AS c"#,
+            "give the range an upper bound",
+        ),
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("enumerated property read must be refused")
+            .to_string();
+        assert!(
+            err.contains("does not retain per-hop edge identity"),
+            "must say why: {err}"
+        );
+        assert!(
+            err.contains(remedy),
+            "must name the remedy `{remedy}`: {err}"
+        );
+    }
+
+    // The remedy the message names actually works through the same alias: on
+    // the bounded route the expansion keeps per-hop identity, so the renamed
+    // list reads the real annotations rather than being refused.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2]->(b:Person)
+               WITH b, rs AS xs WHERE all(r IN xs WHERE r.confidence > 0.8)
+               RETURN b.name AS name ORDER BY name"#,
+        )
+        .await,
+        vec![json!(["Bob"]), json!(["Carol"])],
+    );
+
+    // …including through a `WITH` alias: the walk back resolves the alias to
+    // the expression it renamed, and `nodes()` contributes no relationship
+    // variables, so aliasing a node list does not drag `p` into the refusal.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               WITH p, nodes(p) AS ns
+               RETURN [n IN ns | n.name] AS names ORDER BY names"#,
+        )
+        .await,
+        vec![
+            json!([["Alice", "Bob"]]),
+            json!([["Alice", "Bob", "Carol"]]),
+            json!([["Alice", "Bob", "Carol", "Dave"]]),
+        ],
+    );
+
+    // The same reads over an enumerated path's NODES stay allowed — path nodes
+    // are real subject SIDs, so their properties read correctly everywhere.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               RETURN [n IN nodes(p) | n.name] AS ns ORDER BY ns"#,
+        )
+        .await,
+        vec![
+            json!([["Alice", "Bob"]]),
+            json!([["Alice", "Bob", "Carol"]]),
+            json!([["Alice", "Bob", "Carol", "Dave"]]),
+        ],
+    );
+
+    // And the inline-property form now names a spelling that works, instead of
+    // pointing at one that used to answer null.
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..2 {confidence: 0.9}]->(b) RETURN b"#,
+        )
+        .await
+        .expect_err("inline filter with a binding is still deferred")
+        .to_string();
+    assert!(
+        err.contains("WHERE all(r IN rs WHERE r.p = v)"),
+        "the refusal must name the bound form that works: {err}"
+    );
+}
+
+#[tokio::test]
+async fn cypher_properties_over_an_extracted_hop_is_refused_on_identity_less_routes() {
+    // `rs[0]`, `head(rs)` and `last(relationships(p))` pull a single hop out of
+    // a relationship list, so `properties(...)` / `keys(...)` over one is a
+    // read of the LIST'S ELEMENTS — the same conclusion `scan_list_iteration`
+    // draws for a loop body, reached without a loop variable. The scan filed
+    // those variables under `annotation`, which is keyed on row variables and
+    // is inert for a path or list variable, so the read slipped past both
+    // identity guards and answered null on the routes that carry no per-hop
+    // reifier.
+    //
+    // The `.prop` spelling needs nothing: a property accessor already requires
+    // a bare-variable target, so `relationships(p)[0].confidence` is an
+    // actionable error on every route. `properties()` and `keys()` have no
+    // such restriction, which is what left this one open.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:extracted-hop-properties").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        // Enumeration route, reached by indexing and by `head`/`last`.
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+           RETURN properties(relationships(p)[0]) AS ps"#,
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+           RETURN keys(relationships(p)[0]) AS ks"#,
+        r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+           RETURN properties(head(rs)) AS ps"#,
+        r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+           RETURN properties(last(rs)) AS ps"#,
+        // …and through a `WITH … AS` rename, composing with the alias walk.
+        r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+           WITH b, relationships(p) AS xs RETURN properties(xs[0]) AS ps"#,
+    ] {
+        let err = fluree
+            .query_cypher(&db, q)
+            .await
+            .expect_err("properties() over an enumerated hop must be refused")
+            .to_string();
+        assert!(
+            err.contains("does not retain per-hop edge identity"),
+            "must say why: {err}"
+        );
+    }
+
+    // The multi-hop path value route answers with its own message.
+    let err = fluree
+        .query_cypher(
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS]->(b)-[:KNOWS]->(c)
+               RETURN properties(relationships(p)[0]) AS ps"#,
+        )
+        .await
+        .expect_err("properties() over a multi-hop path hop must be refused")
+        .to_string();
+    assert!(
+        err.contains("carry no per-hop edge identity"),
+        "must say why: {err}"
+    );
+
+    // NOT refused: extracting a NODE. Path nodes are real subjects on every
+    // route, and the walk that decides this skips `nodes()`, so an extracted
+    // node keeps reading its properties.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH p = (a:Person {name: "Alice"})-[:KNOWS*]->(b:Person)
+               RETURN properties(nodes(p)[0]) AS ps LIMIT 1"#,
+        )
+        .await,
+        vec![json!([{"name": "Alice"}])],
+    );
+
+    // NOT refused: the bounded route retains per-hop identity, so the same
+    // extraction reads the hop's real annotation there. This is the asymmetry
+    // the refusal exists to make visible rather than silent.
+    let bounded = r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*1..1]->(b:Person)"#;
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            &format!("{bounded} RETURN properties(rs[0]) AS ps"),
+        )
+        .await,
+        vec![json!([{"confidence": 0.9}])],
+    );
+    assert_eq!(
+        cypher_rows(&fluree, &db, &format!("{bounded} RETURN keys(rs[0]) AS ks")).await,
+        vec![json!([["confidence"]])],
+    );
+
+    // NOT refused: `properties(rs)` asks for the properties of the LIST, not of
+    // an element. It is not an element-property read, so it must not pick up
+    // the identity refusal and its misleading remedy.
+    assert!(
+        fluree
+            .query_cypher(
+                &db,
+                r#"MATCH (a:Person {name: "Alice"})-[rs:KNOWS*]->(b:Person)
+                   RETURN properties(rs) AS ps"#,
+            )
+            .await
+            .err()
+            .map(|e| e.to_string())
+            .is_none_or(|e| !e.contains("per-hop edge identity")),
+        "properties() of the list itself is not an element read"
+    );
+}
+
+#[tokio::test]
+async fn cypher_var_length_probes_of_different_types_do_not_share_a_drain() {
+    // Every edge-annotation probe in a run reads its `f:reifies*` sidecar maps
+    // from one execution-scoped memo (a bounded range plans one probe per hop
+    // of per chain, and draining per operator multiplies the whole sidecar by
+    // the hop count). The memo's key therefore has to carry everything a drain
+    // FILTERS on: a typed relationship pins `f:reifiesPredicate` to a constant,
+    // so serving the `LIKES` probe from the `KNOWS` drain would find no
+    // annotation for the LIKES edge and degrade it to the synthesized
+    // relationship value — a silent null where a confidence is stored.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:varlen-two-types");
+    let l = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "alice", "@type": "Person", "name": "Alice",
+                     "KNOWS": {"@id": "bob", "@annotation": {"confidence": 0.9}},
+                     "LIKES": {"@id": "carol", "@annotation": {"confidence": 0.1}}},
+                    {"@id": "bob", "@type": "Person", "name": "Bob"},
+                    {"@id": "carol", "@type": "Person", "name": "Carol"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[ks:KNOWS*1..1]->(b)
+               MATCH (a)-[ls:LIKES*1..1]->(c)
+               RETURN [r IN ks | r.confidence] AS k, [r IN ls | r.confidence] AS l"#,
+        )
+        .await,
+        vec![json!([[0.9], [0.1]])],
+    );
+
+    // The same two shapes one range wider, so the sharing the memo DOES do
+    // (six probes per range here, all on one key) is exercised alongside the
+    // separation it must not do.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a:Person {name: "Alice"})-[ks:KNOWS*1..3]->(b)
+               MATCH (a)-[ls:LIKES*1..3]->(c)
+               RETURN [r IN ks | r.confidence] AS k, [r IN ls | r.confidence] AS l"#,
+        )
+        .await,
+        vec![json!([[0.9], [0.1]])],
+    );
+}
+
+/// Alice and Carol work somewhere located somewhere; Bob works nowhere.
+async fn seed_works_for_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let l = genesis_ledger(fluree, ledger_id);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Person {name: "Alice"})-[:WORKS_FOR]->(:Company {name: "Acme"})
+                        -[:LOCATED_IN]->(:City {name: "NYC"}),
+                      (:Person {name: "Bob"}),
+                      (:Person {name: "Carol"})-[:WORKS_FOR]->(:Company {name: "Globex"})
+                        -[:LOCATED_IN]->(:City {name: "SF"})"#,
+        )
+        .await
+        .expect("seed works-for graph")
+        .ledger
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_matches_nothing_in_later_match() {
+    // A null never matches, so Bob — whose `o` the OPTIONAL MATCH left null —
+    // drops out of the later MATCH instead of joining every located company.
+    // (SPARQL's unbound would be compatible with both.) Nor may the planner
+    // hoist the MATCH above the OPTIONAL MATCH: that seeded `o` with every
+    // located company and returned all six person×city pairs (#1924).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-match").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           MATCH (o)-[:LOCATED_IN]->(c)
+           RETURN p.name AS person, c.name AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(rows, vec![json!(["Alice", "NYC"]), json!(["Carol", "SF"])]);
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_stays_null_in_later_optional_match() {
+    // Bob's null `o` must not let the second OPTIONAL MATCH bind it to every
+    // located company: he keeps one row with a null city.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-optional").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           OPTIONAL MATCH (o)-[:LOCATED_IN]->(c)
+           RETURN p.name AS person, c.name AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "NYC"]),
+            json!(["Bob", null]),
+            json!(["Carol", "SF"])
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cypher_write_where_null_from_optional_match_stays_null() {
+    // The write path plans its WHERE separately from reads, so it needs the
+    // same null semantics: Bob's null `o` must not bind the second OPTIONAL
+    // MATCH to every located company and SET both cities on him.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-write-where").await;
+    let ledger = fluree
+        .transact_cypher(
+            ledger,
+            r#"MATCH (p:Person)
+               OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+               OPTIONAL MATCH (o)-[:LOCATED_IN]->(c)
+               WITH p, c.name AS cityName
+               SET p.city = cityName"#,
+        )
+        .await
+        .expect("set city")
+        .ledger;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person) RETURN p.name AS person, p.city AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "NYC"]),
+            json!(["Bob", null]),
+            json!(["Carol", "SF"])
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_matches_nothing_inside_exists() {
+    // Cypher's null semantics hold inside an EXISTS body too: Bob's null `o`
+    // must not act as a free variable that finds some located company.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-exists").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           RETURN p.name AS person, EXISTS { (o)-[:LOCATED_IN]->(:City) } AS located
+           ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", true]),
+            json!(["Bob", false]),
+            json!(["Carol", true])
+        ]
+    );
+}
+
+/// A Cypher read honors the caller's execution options and tracker: a fuel
+/// limit stops it, the tracker reports what it cost, and a cancelled handle
+/// stops it — as for SPARQL and JSON-LD.
+#[tokio::test]
+async fn cypher_reads_honor_fuel_limits_and_cancellation() {
+    use fluree_db_api::{QueryCancellation, QueryExecutionOptions, Tracker, TrackingOptions};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:limits");
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    let committed = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+    let cross = "MATCH (a:Person), (b:Person), (c:Person) RETURN count(*) AS n";
+    let options = QueryExecutionOptions::default();
+
+    let tracked = |max_fuel: Option<u64>| {
+        Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel,
+        })
+    };
+    let tracker = tracked(None);
+    let result = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracker)
+        .await
+        .expect("unlimited");
+    assert_eq!(result.row_count(), 1);
+    let fuel = tracker.tally().and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 0.0, "{fuel}");
+
+    let err = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracked(Some(1)))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+
+    let cancellation = QueryCancellation::new();
+    cancellation.cancel();
+    let err = fluree
+        .query_cypher_with_options(
+            &db,
+            cross,
+            None,
+            &QueryExecutionOptions::new().with_cancellation(cancellation),
+        )
+        .await
+        .expect_err("cancelled");
+    assert!(err.to_string().to_lowercase().contains("cancel"), "{err}");
+}
+
+/// The reads a Cypher write makes count against its fuel limit, as its
+/// staging does: a write whose read is the costly part stops at a limit its
+/// writes alone fit under.
+#[tokio::test]
+async fn cypher_write_reads_count_against_its_fuel_limit() {
+    use fluree_db_api::cypher_seq::{detect_sequential, CypherSeqInput};
+    use fluree_db_api::TrackingOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:write-fuel";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let write = |cypher: &'static str, max_fuel: Option<u64>| {
+        let fluree = &fluree;
+        async move {
+            let ast = fluree_db_cypher::parse_cypher(cypher).ast.expect("parse");
+            let plan = detect_sequential(&ast).expect("a sequential write");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("handle");
+            fluree
+                .stage(&handle)
+                .cypher_sequential(CypherSeqInput {
+                    plan,
+                    governance: Default::default(),
+                    skolem_txn_id: None,
+                })
+                .tracking(TrackingOptions {
+                    track_time: false,
+                    track_fuel: true,
+                    track_policy: false,
+                    max_fuel,
+                })
+                .execute()
+                .await
+        }
+    };
+    // A one-row MERGE, read through a 60^3 cross product: its writes cost
+    // ~10 fuel, its read ~220.
+    let cypher = "MATCH (a:Person), (b:Person), (c:Person) WHERE a.n + b.n + c.n = 177 \
+                  MERGE (t:Tag {name: 'probe'})";
+    let fifty_fuel = 50 * fluree_db_core::tracking::MICRO_FUEL_PER_FUEL;
+    let err = write(cypher, Some(fifty_fuel))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+    let committed = write(cypher, None).await.expect("unlimited");
+    let fuel = committed.tally.and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 50.0, "{fuel}");
+}
+
+/// `toFloat` reads a string as Cypher reads a float: `Infinity`, `-Infinity`
+/// and `NaN`, and `inf` in any case, as well as the numerals.
+#[tokio::test]
+async fn cypher_to_float_reads_infinity_and_nan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/cypher:to-float");
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"RETURN toFloat('Infinity') AS a, toFloat('-Infinity') AS b,
+                  toFloat('NaN') AS c, toFloat('inf') AS d, toFloat('INF') AS e,
+                  toFloat('2.5') AS f"#,
+    )
+    .await;
+    assert_eq!(rows, vec![json!(["INF", "-INF", "NaN", "INF", "INF", 2.5])]);
 }

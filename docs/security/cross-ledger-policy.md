@@ -173,6 +173,13 @@ bypasses the cross-ledger dispatch. A configured `f:policySource`
 in `#config` is **not** enough on its own to force enforcement at
 the HTTP query layer today.
 
+The graph-scoped read paths do not gate this way. A SPARQL query
+that resolves to a mapped graph source, and the MCP `sparql_query`
+tool, both read through `fluree.graph(<ledger>).query()`, which
+applies a ledger's or source's configured defaults whether or not
+the request carries policy inputs. A cross-ledger `f:policySource`
+reached through those defaults is resolved there.
+
 To engage cross-ledger policy on an HTTP query, send a request
 with at least one of:
 
@@ -233,6 +240,25 @@ under a cross-ledger `f:policySource`:
   `?$identity`), so `f:required` rules deny even for a legitimate
   owner. Keep identity/user records in the default graph, or bind
   `?$identity` explicitly via `opts.policy_values`.
+
+### Virtual graph sources (Iceberg / SQL)
+
+A graph source registered with `--model <ledger>` is a data ledger D with no
+data of its own: the model ledger's default graph is both its
+`f:policySource` and its `f:schemaSource`, and the contract above applies
+with two adjustments, because D has nowhere to hold identity records:
+
+- An identity-carrying request with no policy class looks the identity's
+  `f:policyClass` up **in M** instead of failing closed. An identity M does
+  not know selects no rules, and `default-allow` governs.
+- Schema axioms from M are interned even for namespaces D has never
+  registered (a virtual D registers none), so `f:onClass` /
+  `f:onProperty` expand through M's hierarchy. On a native D the same
+  axioms are inert, since D holds no data under those namespaces.
+
+`?$identity` stays unbound (D has no subject node for it), which only
+matters for `f:query` rules — and those cannot run against a virtual source
+anyway. See [Iceberg → Access policy](../graph-sources/iceberg.md#access-policy).
 
 One merge subtlety: an identity counts as a request policy input,
 so under the default `f:overrideControl` (`f:OverrideAll`) the
@@ -447,12 +473,17 @@ Specifics:
   transaction](../guides/cookbook-shacl.md#inline-shapes-per-transaction).
 - **Enforced surfaces**: JSON-LD transactions (insert / upsert /
   update, including TriG upserts), direct-flake Turtle inserts,
+  branch operations (merge, rebase, revert, and merge preview),
   and validation reports (`fluree validate` in ledger mode, the
   HTTP validate endpoint, `Fluree::validate_ledger`). Commit
   replay (graph-sync push) intentionally skips SHACL
   re-validation for cross-ledger sources: the origin already
   validated against M when the commit was authored, and
   re-resolving M at replay time could see a different head.
+  Branch operations are authoring, not replay: the state they
+  stage onto the target is a combination nobody has validated,
+  so they resolve M at operation time and enforce its shapes
+  like any transaction would.
 - **`sh:sparql` constraints travel over the wire** — the query
   text, `sh:prefixes` declarations, and their `owl:imports`
   closure are all projected. At write time the query lowers
@@ -461,7 +492,7 @@ Specifics:
   its namespace; a constraint over vocabulary D has never seen
   anywhere is silently inert (no rows, never an error).
 - **Steady-state cost is one nameservice lookup.** The wire is
-  cached per `(model, graph, resolved_t)` and the *compiled*
+  cached per `(model, graph, head)` and the *compiled*
   shapes (including parsed `sh:sparql` queries) are reused
   across transactions while M's head and D's shape-affecting
   epochs are unchanged. A commit on M invalidates both on the
@@ -513,8 +544,9 @@ Two related bounds, both off by default:
 - A transaction-requested `opts.validationMode: "warn"` is
   honored only where an operator has written an
   `f:shaclDefaults` group whose `f:overrideControl` permits it.
-  A ledger with shapes but no `#config` graph enforces
-  unconditionally and ignores the request.
+  A ledger whose config does not enable SHACL validates nothing
+  against its stored shapes, so there is nothing for the request
+  to relax (see [SHACL](../ledger-config/setting-groups.md)).
 
 ## Cross-ledger datalog rules
 
@@ -584,8 +616,8 @@ closed when configured:
 | `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. |
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
-| `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. |
-| `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. |
+| `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. Exception: a [virtual graph source](#virtual-graph-sources-iceberg--sql) looks the identity's classes up in M. |
+| `f:policySource` with `f:graphSelector` naming M's `#config` or `#txn-meta` | Request fails with `ReservedGraphSelected` before any storage read on M. Any ledger's config graph IRI (`urn:fluree:<ledger>#config`) is refused the same way. |
 | Transitive `owl:imports` across model ledgers (`f:schemaSource` recursion) | Not yet honored. Imports inside M's schema graph are projected but the resolver doesn't follow them across ledger boundaries. |
 
 The other reserved fields and source predicates may land in
@@ -612,7 +644,7 @@ The specific failure modes operators see:
 |-------------------------------|---------|
 | `ModelLedgerMissing`          | The named model ledger isn't present or is retracted on this instance. |
 | `GraphMissingAtT`             | The model ledger exists but the named graph IRI isn't in its graph registry. |
-| `ReservedGraphSelected`       | The selector targets `#config` or `#txn-meta` on M. |
+| `ReservedGraphSelected`       | The selector targets `#config` or `#txn-meta` on M, or any ledger's config graph IRI. |
 | `TranslationFailed`           | The policy graph was read but couldn't be projected to the wire format (typically corruption or a dictionary loss in M). |
 | `UnsupportedFeature`          | A reserved field (`f:atT` / `f:trustPolicy` / `f:rollbackGuard`) was set. |
 | `CrossInstanceUnsupported`    | `f:ledger` names a ledger on a different instance. |
@@ -627,11 +659,13 @@ clients can branch on the specific failure.
 ## Behavior on model ledger updates
 
 There is no explicit invalidation channel. The cache key includes
-the model ledger's `resolved_t` (its commit head at the time of
-capture), so new commits to M produce new cache keys
-automatically. The next request after M advances captures the
+the model ledger's head at the time of capture, its `t` and head
+commit id, so new commits to M, and a new ledger created under M's
+name after a drop, produce new cache keys automatically. The next request after M advances captures the
 new head; older entries age out under the cache's LRU/TinyLFU
-policy.
+policy. This holds across servers sharing the storage and
+nameservice: one whose ledger cache still holds a dropped M enforces
+the M created after it.
 
 Within a single request, every cross-ledger reference to the
 same M reuses one `resolved_t` value. Policy and any future

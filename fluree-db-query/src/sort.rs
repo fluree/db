@@ -63,9 +63,7 @@ fn materialize_encoded_for_sort(
                 other => {
                     let dt_sid = gv
                         .store()
-                        .dt_sids()
-                        .get(*dt_id as usize)
-                        .cloned()
+                        .resolve_dt_id_sid_for_value(*dt_id, &other)
                         .unwrap_or_else(|| Sid::new(0, ""));
                     let meta = gv.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
@@ -161,6 +159,11 @@ impl SortSpec {
         }
     }
 
+    /// `true` for an ascending key.
+    pub fn ascending(&self) -> bool {
+        matches!(self.direction, SortDirection::Ascending)
+    }
+
     /// Create a descending sort specification
     pub fn desc(var: VarId) -> Self {
         Self {
@@ -198,7 +201,9 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
         (Binding::Poisoned, _) => Ordering::Less,
         (_, Binding::Poisoned) => Ordering::Greater,
 
-        // Grouped sorts last (should not appear in normal sort contexts)
+        // Grouped sorts last. Unreachable: a sort key never reads a per-group
+        // list (the plan-time `Grouping::first_ungrouped_read` check); this
+        // comparator cannot fail, so it keeps a total order.
         (Binding::Grouped(_), Binding::Grouped(_)) => {
             debug_assert!(
                 false,
@@ -645,7 +650,7 @@ impl Operator for SortOperator {
                     if k == 0 {
                         BinaryHeap::new()
                     } else {
-                        BinaryHeap::with_capacity(k + 1)
+                        BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(k))
                     }
                 });
 
@@ -1097,7 +1102,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_single_column_asc() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1118,7 +1123,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_single_column_desc() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1139,7 +1144,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_multi_column() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1167,7 +1172,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_with_unbound() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1208,7 +1213,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_across_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1230,7 +1235,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_emits_in_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         // Use small batch size
         let ctx = ExecutionContext::new(&snapshot, &vars).with_batch_size(3);
@@ -1259,7 +1264,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_empty_input() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1274,7 +1279,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -1305,7 +1310,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_sort_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

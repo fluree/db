@@ -3,8 +3,9 @@
 //! The `ExecutionContext` provides access to database state and configuration
 //! needed by operators during execution.
 
+use crate::annotation_edge_probe::AnnotationSidecarCache;
 use crate::bm25::{Bm25IndexProvider, Bm25SearchProvider};
-use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet};
+use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet, MemberKind};
 use crate::error::QueryError;
 use crate::policy::QueryPolicyEnforcer;
 use crate::r2rml::{R2rmlProvider, R2rmlTableProvider};
@@ -175,6 +176,13 @@ pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
 /// once per distinct id instead of twice per row.
 pub type LangTagCache = Arc<Mutex<FxHashMap<u16, Option<Arc<str>>>>>;
 
+/// Per-query memo: `(store id, subject id)` → the full IRI `STR()` yields for
+/// a late-materialized subject. Shared across per-graph context derivations
+/// like [`LangTagCache`]; keyed by the store as well as the id because a
+/// dataset's ledgers have disjoint id spaces. See
+/// [`ExecutionContext::subject_iri_str_memo`].
+pub type SubjectIriCache = Arc<Mutex<FxHashMap<(u64, u64), Arc<str>>>>;
+
 /// Shared handle to the per-query overlay-ops memo
 /// ([`OverlayOpsCache`](crate::fast_path_common::OverlayOpsCache)).
 pub type SharedOverlayOpsCache = Arc<crate::fast_path_common::OverlayOpsCache>;
@@ -252,6 +260,11 @@ pub struct ExecutionContext<'a> {
     /// When present, scan operators should use this for per-leaf batch filtering
     /// via `filter_flakes`. This provides full f:query support without deadlocks.
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is: the query's primary
+    /// (a ledger or a graph source) when the caller resolves policy per
+    /// graph, `None` when it does not. A graph-source scan outside a dataset
+    /// reads this context's policy only when it is that source's own.
+    pub policy_source: Option<Arc<str>>,
     /// Optional BM25 index provider for `Pattern::IndexSearch` (legacy, returns raw index)
     pub bm25_provider: Option<&'a dyn Bm25IndexProvider>,
     /// Optional BM25 search provider for `Pattern::IndexSearch` (preferred, returns search results)
@@ -290,6 +303,10 @@ pub struct ExecutionContext<'a> {
     /// evaluation to compact IRIs the way `db.labels()` does: strip the
     /// vocab prefix, otherwise return the full IRI.
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return. `None` reads the wall clock on
+    /// every call. Rule bodies set it to the materialization's evaluation
+    /// time, so every rule in one run sees one clock.
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, an R2RML `RefObjectMap` object whose parent subject is a pure
     /// IRI template over the FK join columns is rendered directly from the child
     /// row's FK columns, skipping the parent-table scan and its referential
@@ -301,6 +318,18 @@ pub struct ExecutionContext<'a> {
     /// present-but-dangling FK differs (templated vs omitted). Read only for the
     /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
     pub trust_fk_refs: bool,
+    /// When true, every graph-source table scan emits a fixed row order, even
+    /// where the planner found no LIMIT or OFFSET in the query (see
+    /// [`crate::r2rml::ScanOrder`]). For a caller that slices the answer itself,
+    /// outside the query: the graph-source browse crawl pages subjects after the
+    /// query returns. Default `false`.
+    pub deterministic_scans: bool,
+    /// Most pairs a property path may compute before returning its first
+    /// row — one whose endpoints are both free or both constant; past it the
+    /// path fails with [`QueryError::ResourceLimit`]. `None` (the default)
+    /// leaves only the per-traversal visited-node cap. Datalog sets it for a
+    /// transitive-closure rule, which iterates instead when the path hits it.
+    pub path_pair_limit: Option<usize>,
     /// Optional binary columnar index store for fast local-file scans.
     ///
     /// When present, scan operators use the binary cursor path for queries
@@ -355,6 +384,10 @@ pub struct ExecutionContext<'a> {
     /// with its `ledger_id` in this set, it routes triple patterns through
     /// R2RML scan instead of native index scan.
     pub r2rml_graph_ids: std::collections::HashSet<Arc<str>>,
+    /// What the primary snapshot reads when there is no dataset, as the caller
+    /// that loaded it said (see [`MemberKind`]). A native primary's own id is
+    /// never looked up as a graph source.
+    pub primary_kind: MemberKind,
     /// Cached result of the multi-ledger check.
     ///
     /// `true` when the active query scope spans more than one distinct ledger ID.
@@ -380,6 +413,11 @@ pub struct ExecutionContext<'a> {
     /// by an EXACT `rr:class` match and a subclass-entailed subject would be
     /// silently dropped. Defaults to `false` (no reasoning).
     pub reasoning_active: bool,
+    /// The reasoning materialization's translated overlay ops, shared across
+    /// the queries reading it (see [`crate::reasoning_ops`]). Set with
+    /// `reasoning_active` when the query has derived facts; propagated across
+    /// per-graph derivations, which use it only while reading its overlay.
+    pub reasoning_ops: Option<crate::reasoning_ops::ReasoningOpsHandle>,
     /// The snapshot this context was originally constructed from.
     ///
     /// Equal to `active_snapshot` in the common single-graph case. In per-graph
@@ -389,11 +427,40 @@ pub struct ExecutionContext<'a> {
     /// SIDs — encoded in the original namespace space — can be decoded
     /// correctly (see `reencode_sid` in `build_match_val_for_snapshot`).
     pub original_snapshot: &'a LedgerSnapshot,
+    /// When set, every scan boundary in this context stamps its output rows'
+    /// `Binding::Sid`s to `Binding::IriMatch` decoded in this ledger (the
+    /// single-graph lane of `DatasetOperator` honors it — the multi-graph lane
+    /// already stamps its members unconditionally).
+    ///
+    /// Set ONLY by the cross-ledger `SERVICE` path (`service.rs`), where the
+    /// subtree executes against a foreign snapshot: raw scan `Sid`s there are
+    /// target-encoded, but the scan layer's pattern-constant contract decodes
+    /// constant SIDs against `original_snapshot` (see [`reencode_sid`]) — so a
+    /// target-encoded `Sid` substituted back into a pattern by an intra-body
+    /// join is decoded through the wrong namespace table. Stamping at the scan
+    /// boundary keeps every binding in the subtree namespace-neutral, exactly
+    /// as the multi-ledger dataset lane does. `None` everywhere else: the
+    /// common paths pay one `Option` check per scan open.
+    pub scan_provenance_ledger: Option<Arc<str>>,
+    /// Per-query memo: drained `f:reifies*` sidecar maps, shared by every
+    /// edge-annotation probe operator in the run whose drain would return the
+    /// same thing (see
+    /// [`AnnotationSidecarCache`]).
+    ///
+    /// A drain is O(#annotations in the ledger) and independent of the result
+    /// size, and a bounded variable-length Cypher range emits one probe
+    /// operator per hop of per chain — `*1..3` six, `*1..5` fifteen. Caching
+    /// per operator therefore multiplies the whole sidecar by the hop count;
+    /// caching per run costs what one hop costs.
+    pub annotation_sidecar_cache: AnnotationSidecarCache,
     /// Per-query memo: constant filter operands → internal subject id, so a
     /// `<const> != ?var` FILTER resolves the constant once, not per row.
     pub const_sid_cache: ConstSidCache,
     /// Per-query memo for binding-level language-tag ids — see [`LangTagCache`].
     pub lang_tag_cache: LangTagCache,
+    /// Per-query memo for `STR()` of late-materialized subjects — see
+    /// [`SubjectIriCache`].
+    pub subject_iri_cache: SubjectIriCache,
     /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
     /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
     /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
@@ -417,6 +484,16 @@ pub struct ExecutionContext<'a> {
     /// [`TranslatedOverlayCache`]). Complements `overlay_ops_cache`, which
     /// memoizes per-predicate subsets for the fast-path/probe lanes.
     pub translated_overlay_cache: TranslatedOverlayCache,
+}
+
+/// One graph a path traversal reads; see [`ExecutionContext::path_graphs`].
+pub struct PathGraph<'a> {
+    pub snapshot: &'a LedgerSnapshot,
+    pub overlay: &'a dyn OverlayProvider,
+    pub to_t: i64,
+    pub g_id: GraphId,
+    /// The view policy that filters this graph's edges.
+    pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
 }
 
 /// Re-encode a `Sid` from the primary/lowering snapshot into `target`'s
@@ -453,6 +530,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000, // Default batch size
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -465,7 +543,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -476,12 +557,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -510,6 +596,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -522,7 +609,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
+            path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -533,12 +623,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
+            scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -571,6 +666,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -583,7 +679,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
+            path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
             dict_novelty,
@@ -594,12 +693,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
+            scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -621,6 +725,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -633,7 +738,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -644,12 +752,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -670,6 +783,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -682,7 +796,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -693,12 +810,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -721,6 +843,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -733,7 +856,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
+            evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
+            path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
             dict_novelty: None,
@@ -744,12 +870,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: None,
             remote_service: None,
             r2rml_graph_ids: std::collections::HashSet::new(),
+            primary_kind: MemberKind::Unclassified,
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
+            scan_provenance_ledger: None,
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -925,6 +1056,18 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
+    /// See [`ExecutionContext::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
+        self
+    }
+
+    /// See [`ExecutionContext::path_pair_limit`].
+    pub fn with_path_pair_limit(mut self, limit: usize) -> Self {
+        self.path_pair_limit = Some(limit);
+        self
+    }
+
     /// Check if this context has an active (non-root) policy.
     ///
     /// Accounts for dataset mode: the top-level context may carry no enforcer
@@ -951,9 +1094,14 @@ impl<'a> ExecutionContext<'a> {
     /// is the range-fallback scan ([`BinaryScanOperator::filter_flakes_by_policy`]);
     /// every fast path and raw-leaflet reader that does *not* route emitted
     /// flakes through that filter MUST gate on `allow_unfiltered()` and decline
-    /// (fall back to the filtered scan) when it returns false. Adding a new
-    /// data-emitting operator that reads the index directly without consulting
-    /// this — or applying its own filter — is a policy leak.
+    /// (fall back to the filtered scan) when it returns false. The one
+    /// sanctioned refinement is per-predicate: a reader of exactly one
+    /// statically known predicate may instead consult
+    /// [`fast_path_common::policy_lane_for_predicate`](crate::fast_path_common::policy_lane_for_predicate),
+    /// which keeps the lane only when the view set provably cannot touch that
+    /// predicate. Adding a new data-emitting operator that reads the index
+    /// directly without consulting one of these — or applying its own filter
+    /// — is a policy leak.
     #[inline]
     pub fn allow_unfiltered(&self) -> bool {
         !self.has_policy()
@@ -997,6 +1145,19 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn is_multi_ledger(&self) -> bool {
         self.multi_ledger
+    }
+
+    /// Whether this is a history-range query over `[from_t, to_t]`.
+    ///
+    /// Equivalent to the plan's `TemporalMode::History`: both are derived
+    /// from the same `history_time_range()` at the dataset layer, and nothing
+    /// else sets `from_t`. Fast paths that read current leaflet state and
+    /// emit one row per fact must decline here — a history range needs every
+    /// assert and retract event in the window with its `t` and `op`, which
+    /// only the scan's history mode produces.
+    #[inline]
+    pub fn is_history_range(&self) -> bool {
+        self.from_t.is_some()
     }
 
     /// Compute the multi-ledger flag from dataset + active_graph state.
@@ -1065,6 +1226,16 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// The dataset the query named with `FROM` / `FROM NAMED`, if any.
+    ///
+    /// `None` for a union default graph (see [`DataSet::implicit`]), which is
+    /// scanned as a dataset but otherwise stands where no dataset would:
+    /// consult this, not `dataset`, for anything that depends on how the query
+    /// addressed its graphs rather than on which graphs a pattern scans.
+    pub fn explicit_dataset(&self) -> Option<&'a DataSet<'a>> {
+        self.dataset.filter(|ds| ds.is_explicit())
+    }
+
     /// Attach a dataset to this execution context for multi-graph queries
     pub fn with_dataset(mut self, dataset: &'a DataSet<'a>) -> Self {
         self.multi_ledger = Self::compute_multi_ledger(Some(dataset), &self.active_graph);
@@ -1090,26 +1261,55 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Require that the query targets exactly one graph.
+    /// The graphs a property path or shortest path traverses as one graph.
     ///
-    /// Returns `(db, overlay, to_t)` for the single active graph — either from
-    /// single-db mode or a dataset with exactly one active graph. Returns
-    /// `QueryError::InvalidQuery` if multiple graphs are active.
-    pub fn require_single_graph(
-        &self,
-    ) -> Result<(&'a LedgerSnapshot, &'a dyn OverlayProvider, i64), QueryError> {
+    /// That is the single active graph, or every member of a multi-graph
+    /// default graph drawn from one ledger: a union default graph, or `FROM`
+    /// naming several graphs of a ledger. Graphs of one ledger share its
+    /// namespace table, so a node reached in one member is the same node in
+    /// the next and a path continues across them. A default graph spanning
+    /// ledgers is refused, since their SIDs are not comparable.
+    pub fn path_graphs(&self) -> Result<Vec<PathGraph<'a>>, QueryError> {
         match self.active_graphs() {
-            ActiveGraphs::Single => Ok((self.active_snapshot, self.overlay(), self.to_t)),
-            ActiveGraphs::Many(graphs) if graphs.len() == 1 => {
-                let g = graphs[0];
-                Ok((g.snapshot, g.overlay, g.to_t))
-            }
-            ActiveGraphs::Many(_) => Err(QueryError::InvalidQuery(
-                "Property paths over multi-graph datasets are not supported; \
+            ActiveGraphs::Single => Ok(vec![PathGraph {
+                snapshot: self.active_snapshot,
+                overlay: self.overlay(),
+                to_t: self.to_t,
+                g_id: self.binary_g_id,
+                policy_enforcer: self.policy_enforcer.clone(),
+            }]),
+            ActiveGraphs::Many(_) if self.is_multi_ledger() => Err(QueryError::InvalidQuery(
+                "Property paths over a default graph spanning ledgers are not supported; \
                  use GRAPH to select a single graph"
                     .to_string(),
             )),
+            ActiveGraphs::Many(graphs) => Ok(graphs
+                .into_iter()
+                .map(|g| PathGraph {
+                    snapshot: g.snapshot,
+                    overlay: g.overlay,
+                    to_t: g.to_t,
+                    g_id: g.g_id,
+                    policy_enforcer: g
+                        .policy_enforcer
+                        .clone()
+                        .or_else(|| self.policy_enforcer.clone()),
+                })
+                .collect()),
         }
+    }
+
+    /// The snapshot a path traversal encodes its endpoints against. The graphs
+    /// of [`Self::path_graphs`] share one ledger's namespace table, so any of
+    /// them serves.
+    pub fn path_snapshot(&self) -> Result<&'a LedgerSnapshot, QueryError> {
+        if self.dataset.is_none() {
+            return Ok(self.active_snapshot);
+        }
+        Ok(self
+            .path_graphs()?
+            .first()
+            .map_or(self.active_snapshot, |g| g.snapshot))
     }
 
     /// True when the active scope resolves to exactly one graph and that
@@ -1241,6 +1441,23 @@ impl<'a> ExecutionContext<'a> {
         resolved
     }
 
+    /// `STR()` of a late-materialized subject, resolved once per distinct id
+    /// per query. A self-join over a hub evaluates `str(?a) > str(?b)` tens of
+    /// millions of times over a few thousand distinct subjects (StarBench
+    /// S10: 34M decodes of ~33k values were 7.6 s of an 8.8 s query), and each
+    /// evaluation walked the dictionary and formatted the prefix again.
+    /// `resolve` runs unlocked on a miss; a `None` from it is not memoized so
+    /// the caller's slow path can report it. Without a binary store there is
+    /// nothing late-materialized to memoize.
+    pub fn subject_iri_str_memo(
+        &self,
+        s_id: u64,
+        resolve: impl FnOnce() -> Option<Arc<str>>,
+    ) -> Option<Arc<str>> {
+        let store_id = self.binary_store.as_deref()?.store_id();
+        memoize_subject_iri(&self.subject_iri_cache, (store_id, s_id), resolve)
+    }
+
     /// Resolve a subject ID to an IRI, using DictNovelty-aware routing.
     ///
     /// Thin wrapper around [`BinaryGraphView::resolve_subject_iri`] which
@@ -1265,35 +1482,120 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
-    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
-    /// `None` when a dataset scopes the named set (`FROM NAMED`), the IRI is
-    /// unregistered, or it names a reserved system graph. The ledger alias is
-    /// reserved for the default graph and never resolves here, even if a
-    /// registered graph shares the ledger's IRI.
-    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
-        if self.dataset.is_some() || iri == self.active_snapshot.ledger_id.as_str() {
-            return None;
+    /// Whether `iri` names a graph the caller loaded as a ledger graph: a
+    /// dataset member (or member alias) of kind [`MemberKind::Native`], or,
+    /// with no dataset, a native primary's default graph by its own address.
+    /// Such a graph is never asked about as a graph source.
+    pub fn graph_is_native(&self, iri: &str) -> bool {
+        match self.dataset {
+            Some(ds) => ds
+                .named_graph(iri)
+                .is_some_and(|graph| graph.kind == MemberKind::Native),
+            None => {
+                self.primary_kind == MemberKind::Native && self.single_db_names_default_graph(iri)
+            }
         }
-        self.active_snapshot
-            .graph_registry
-            .graph_id_for_iri(iri)
-            .filter(|g| *g >= FIRST_USER_GRAPH_ID)
     }
 
-    /// User-registered named graph IRIs of the active snapshot, for `GRAPH ?g`
-    /// discovery. Excludes the default, reserved system graphs, and any graph
-    /// colliding with the ledger alias (which addresses the default graph);
-    /// empty in dataset mode.
+    /// What `GRAPH <iri>` names in this single-ledger view, through the table
+    /// every graph position of a ledger shares
+    /// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)):
+    /// the ledger's own address in any spelling is its default graph, `L#<g>`
+    /// the graph `<g>`, and any other IRI the graph registered by it. `None`
+    /// when the query names a dataset, whose members are the named graphs (a
+    /// union default graph names graphs as no dataset does).
+    fn single_db_graph_position<'i>(
+        &self,
+        iri: &'i str,
+    ) -> Option<fluree_db_core::GraphPosition<'i>> {
+        if self.explicit_dataset().is_some() {
+            return None;
+        }
+        Some(
+            fluree_db_core::TargetLedger::new(
+                &self.active_snapshot.ledger_id,
+                &self.active_snapshot.graph_registry,
+            )
+            .graph_position(iri),
+        )
+    }
+
+    /// Resolve a `GRAPH <iri>` to a user-registered named graph's `g_id`, or
+    /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
+    /// names no graph, or it names a reserved system graph or the default graph
+    /// (the ledger's own address, even if a registered graph shares the text).
+    ///
+    /// A graph dropped as of `to_t` names no graph here either, as one that
+    /// was never written does not.
+    pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
+        match self.single_db_graph_position(iri)? {
+            fluree_db_core::GraphPosition::Registered { g_id, .. }
+                if g_id >= FIRST_USER_GRAPH_ID
+                    && self
+                        .active_snapshot
+                        .graph_registry
+                        .visible_at(g_id, self.to_t) =>
+            {
+                Some(g_id)
+            }
+            _ => None,
+        }
+    }
+
+    /// Refuse a `GRAPH <iri>` naming a user graph that a commit after `to_t`
+    /// dropped: the query asks what the graph held then, which the drop took,
+    /// and reading that as an empty graph would answer something else.
+    pub fn refuse_dropped_graph(&self, iri: &str) -> crate::error::Result<()> {
+        if !self.active_snapshot.graph_registry.has_drops() {
+            return Ok(());
+        }
+        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
+            self.single_db_graph_position(iri)
+        {
+            if let Some(floor) = self
+                .active_snapshot
+                .graph_registry
+                .drop_after(g_id, self.to_t)
+            {
+                return Err(crate::error::QueryError::GraphDropped {
+                    graph: iri.to_string(),
+                    floor,
+                    t: self.to_t,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
+    /// the ledger's own address, in any spelling.
+    pub fn single_db_names_default_graph(&self, iri: &str) -> bool {
+        matches!(
+            self.single_db_graph_position(iri),
+            Some(fluree_db_core::GraphPosition::Default)
+        )
+    }
+
+    /// User-registered named graphs of the active snapshot, for `GRAPH ?g`
+    /// discovery, each under the name that reads it back
+    /// ([`TargetLedger::enumeration_name`](fluree_db_core::TargetLedger::enumeration_name)):
+    /// its IRI, or `L#<iri>` for a graph registered under the ledger's own
+    /// address. Excludes the default and reserved system graphs, and a graph
+    /// no name reads back; empty when the query names a dataset.
     pub fn single_db_user_graph_iris(&self) -> Vec<Arc<str>> {
-        if self.dataset.is_some() {
+        if self.explicit_dataset().is_some() {
             return Vec::new();
         }
-        let alias = self.active_snapshot.ledger_id.as_str();
-        self.active_snapshot
-            .graph_registry
-            .iter_entries()
-            .filter(|(g, iri)| *g >= FIRST_USER_GRAPH_ID && *iri != alias)
-            .map(|(_, iri)| Arc::from(iri))
+        let registry = &self.active_snapshot.graph_registry;
+        let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
+        registry
+            .iter_visible_entries(self.to_t)
+            .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
+            .filter_map(|(g, iri)| {
+                target
+                    .enumeration_name(iri, g)
+                    .map(|name| Arc::from(name.as_ref()))
+            })
             .collect()
     }
 
@@ -1320,6 +1622,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1332,7 +1635,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
+            path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1343,12 +1649,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
+            scan_provenance_ledger: self.scan_provenance_ledger.clone(),
+            annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
+            subject_iri_cache: self.subject_iri_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1380,6 +1691,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1392,7 +1704,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
+            path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
             dict_novelty: self.dict_novelty.clone(),
@@ -1403,12 +1718,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
+            scan_provenance_ledger: self.scan_provenance_ledger.clone(),
+            annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
+            subject_iri_cache: self.subject_iri_cache.clone(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1436,6 +1756,12 @@ impl<'a> ExecutionContext<'a> {
                 .policy_enforcer
                 .clone()
                 .or_else(|| self.policy_enforcer.clone()),
+            // A graph's own enforcer is built for that graph.
+            policy_source: if graph.policy_enforcer.is_some() {
+                Some(Arc::clone(&graph.ledger_id))
+            } else {
+                self.policy_source.clone()
+            },
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1448,7 +1774,10 @@ impl<'a> ExecutionContext<'a> {
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
+            evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
+            path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
             dict_novelty: Self::extract_dict_novelty(graph.snapshot),
@@ -1459,10 +1788,17 @@ impl<'a> ExecutionContext<'a> {
             english_lang_id: self.english_lang_id,
             remote_service: self.remote_service,
             r2rml_graph_ids: self.r2rml_graph_ids.clone(),
+            primary_kind: self.primary_kind,
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
+            // A fresh per-graph scope: dataset members are stamped at the
+            // member boundary by their owning `DatasetOperator`, and the
+            // cross-ledger SERVICE path re-arms this explicitly on the
+            // context it builds (`service.rs`).
+            scan_provenance_ledger: None,
             // This per-graph context switches to `graph`'s own store/snapshot
             // (see `binary_store`/`active_snapshot` above) while clearing
             // `multi_ledger`, so the single-ledger const→s_id fast path DOES run
@@ -1470,8 +1806,10 @@ impl<'a> ExecutionContext<'a> {
             // `const_sid_cache` is mandatory: its key is the const IRI ALONE
             // (store-implicit), so sharing the parent's would alias an s_id
             // resolved in one graph/store into another.
+            annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
+            subject_iri_cache: SubjectIriCache::default(),
             // The R2RML parent-lookup memo, by contrast, is SAFE to share here
             // (F19): its key carries `graph_source_id` + `as_of_t`
             // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
@@ -1505,7 +1843,7 @@ impl<'a> ExecutionContext<'a> {
     /// This is critical for decoding novelty-only subject/string IDs when executing via
     /// `BinaryScanOperator`. Without it, decoding falls back to persisted forward packs and
     /// fails for novelty IDs (e.g. "string id N not found in forward packs").
-    fn extract_dict_novelty(snapshot: &LedgerSnapshot) -> Option<Arc<DictNovelty>> {
+    pub(crate) fn extract_dict_novelty(snapshot: &LedgerSnapshot) -> Option<Arc<DictNovelty>> {
         snapshot
             .range_provider
             .as_ref()
@@ -1561,6 +1899,12 @@ impl<'a> ExecutionContext<'a> {
         self
     }
 
+    /// See [`reasoning_ops`](Self::reasoning_ops).
+    pub fn with_reasoning_ops(mut self, ops: crate::reasoning_ops::ReasoningOpsHandle) -> Self {
+        self.reasoning_ops = Some(ops);
+        self
+    }
+
     /// Mark that a reasoning/entailment mode is active for this query.
     ///
     /// See [`reasoning_active`](Self::reasoning_active). Used by the R2RML
@@ -1579,6 +1923,79 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_graph_id(mut self, g_id: GraphId) -> Self {
         self.binary_g_id = g_id;
         self
+    }
+}
+
+/// The memo behind [`ExecutionContext::subject_iri_str_memo`], keyed by
+/// `(store id, subject id)`. A hit skips `resolve`; a miss runs it unlocked
+/// and stores what it returns; a `None` is not stored. Bounded by clearing
+/// rather than evicting.
+fn memoize_subject_iri(
+    cache: &SubjectIriCache,
+    key: (u64, u64),
+    resolve: impl FnOnce() -> Option<Arc<str>>,
+) -> Option<Arc<str>> {
+    const MAX_ENTRIES: usize = 1 << 18;
+    if let Some(hit) = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+    {
+        return Some(hit.clone());
+    }
+    let resolved = resolve()?;
+    let mut cache = cache
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if cache.len() >= MAX_ENTRIES {
+        cache.clear();
+    }
+    cache.insert(key, resolved.clone());
+    Some(resolved)
+}
+
+#[cfg(test)]
+mod subject_iri_memo_tests {
+    use super::{memoize_subject_iri, SubjectIriCache};
+    use std::cell::Cell;
+    use std::sync::Arc;
+
+    #[test]
+    fn resolves_each_store_subject_once_and_never_memoizes_a_miss() {
+        let cache = SubjectIriCache::default();
+        let calls = Cell::new(0);
+        let resolve = |iri: Option<&str>| {
+            calls.set(calls.get() + 1);
+            iri.map(Arc::from)
+        };
+        let alice = Some("http://example.org/alice");
+
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 7), || resolve(alice)).as_deref(),
+            alice
+        );
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 7), || resolve(Some("stale"))).as_deref(),
+            alice,
+            "a hit returns the stored IRI without resolving"
+        );
+        assert_eq!(calls.get(), 1);
+
+        // A dataset's ledgers reuse subject ids for different nodes.
+        let bob = Some("http://example.org/bob");
+        assert_eq!(
+            memoize_subject_iri(&cache, (2, 7), || resolve(bob)).as_deref(),
+            bob
+        );
+        assert_eq!(calls.get(), 2);
+
+        // A failed resolve is not stored, so the next call resolves again.
+        assert_eq!(memoize_subject_iri(&cache, (1, 8), || resolve(None)), None);
+        assert_eq!(
+            memoize_subject_iri(&cache, (1, 8), || resolve(alice)).as_deref(),
+            alice
+        );
+        assert_eq!(calls.get(), 4);
     }
 }
 
@@ -1784,7 +2201,7 @@ mod budget_tests {
         let ceiling = per_query_memory_ceiling(full, 2); // 4 GiB each
         assert_eq!(ceiling, 4usize << 30);
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         // Two independent queries, each pinned to the divided ceiling as the runner
         // attach point does under FLUREE_QUERY_BUDGET_SHARE_DIV=2.
@@ -1811,5 +2228,70 @@ mod budget_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod dataset_scope_tests {
+    use super::*;
+    use crate::dataset::GraphRef;
+    use fluree_db_core::NoOverlay;
+
+    const G1: &str = "http://example.org/g1";
+
+    /// A union default graph is scanned as a dataset but names graphs as a
+    /// single ledger does: a named graph resolves through the ledger's
+    /// registry, as with no dataset at all. A dataset the query named scopes
+    /// the names to its own `FROM NAMED` instead.
+    #[test]
+    fn an_implicit_dataset_names_graphs_as_a_single_ledger_does() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        let g1 = snapshot.graph_registry.apply_delta([G1])[0].0;
+        let vars = VarRegistry::new();
+        let graph = |g_id| GraphRef::new(&snapshot, g_id, &NoOverlay, 0, Arc::from("test:main"));
+        let implicit = DataSet::new()
+            .implicit()
+            .with_default_graph(graph(0))
+            .with_default_graph(graph(g1));
+        let named = DataSet::new()
+            .with_default_graph(graph(0))
+            .with_default_graph(graph(g1));
+
+        let union = ExecutionContext::new(&snapshot, &vars).with_dataset(&implicit);
+        assert!(union.dataset.is_some() && union.explicit_dataset().is_none());
+        assert_eq!(union.single_db_user_graph_id(G1), Some(g1));
+        assert_eq!(
+            union.single_db_user_graph_iris(),
+            vec![Arc::<str>::from(G1)]
+        );
+
+        let from = ExecutionContext::new(&snapshot, &vars).with_dataset(&named);
+        assert!(from.explicit_dataset().is_some());
+        assert_eq!(from.single_db_user_graph_id(G1), None);
+        assert!(from.single_db_user_graph_iris().is_empty());
+    }
+
+    /// A path traverses every graph of a one-ledger default graph, and refuses
+    /// one spanning ledgers, whose SIDs are not comparable.
+    #[test]
+    fn path_graphs_span_one_ledger_only() {
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        let g1 = snapshot.graph_registry.apply_delta([G1])[0].0;
+        let vars = VarRegistry::new();
+        let graph =
+            |g_id, ledger: &str| GraphRef::new(&snapshot, g_id, &NoOverlay, 0, Arc::from(ledger));
+
+        let one_ledger = DataSet::new()
+            .with_default_graph(graph(0, "test:main"))
+            .with_default_graph(graph(g1, "test:main"));
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_dataset(&one_ledger);
+        let g_ids: Vec<GraphId> = ctx.path_graphs().unwrap().iter().map(|g| g.g_id).collect();
+        assert_eq!(g_ids, vec![0, g1]);
+
+        let two_ledgers = DataSet::new()
+            .with_default_graph(graph(0, "test:main"))
+            .with_default_graph(graph(0, "other:main"));
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_dataset(&two_ledgers);
+        assert!(ctx.path_graphs().is_err());
     }
 }

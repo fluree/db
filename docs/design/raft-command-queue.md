@@ -50,7 +50,11 @@ Client → POST /api/transact
    └─ this node is follower → HTTP forward to leader's client_addr
         ↓
 [QueuedTransactor on leader]
-   1. write QueuedRequest envelope to CAS  → request_cid
+   1. stamp the QueuedRequest envelope with a fresh submission id and
+      write it to CAS  → request_cid
+      (the stamp makes request_cid unique per submission, so identical
+       requests never share an envelope; body_hash leaves it out, so a
+       keyed retry still matches the original)
    2. arm interest on WaiterMap keyed by request_cid → ticket
       (before proposing: the queue_id does not exist yet, and arming
        first is what lets a fast worker's ApplyHead find a waiter)
@@ -102,6 +106,28 @@ Apply receipts come in two flavors:
 - **`AppliedReceipt::Minimal { head, t }`** — head identity only. Synthesized on every node when applying `ApplyHead`, used by remote nodes and as a fallback on the leader when the staged receipt is missing (e.g. after a leader transition that stranded the receipt).
 
 The split keeps the log encoding small (the heavy receipt fields don't replicate) while still giving the proposing client the rich result on the happy path. Followers that forwarded the original request see the leader's full response; followers reading the head independently see the minimal version.
+
+### Waiting for the outcome
+
+The leader's `QueuedTransactor` parks on its waiter ticket in probe intervals (default 8 s; `EmbeddedRaftConfig::with_submit_wait`). A probe that fires is a check, not a verdict: while the entry is still in the replicated per-branch queue and the cluster has a leader, the submission is alive and the wait continues without spending a retry attempt. Only a probe that finds the entry gone, or the node leaderless, spends an attempt on the idempotent re-propose path. A ceiling on total parked time (default 10 minutes; `with_submit_max_wait`) backstops a worker that never finishes, and reports the outcome as unknown rather than failed, because the commit may still land.
+
+Each waiter sleep is capped at the remaining ceiling budget, so a shorter ceiling takes effect before the next scheduled probe. An already-ready receipt still wins; a missing entry retains its outcome grace and retry handling.
+
+Two consequences of that shape:
+
+- The entry leaves the queue under the state lock, but the waiter resolves in the observer's effects, after the lock drops. A probe can see the entry gone a moment before the receipt lands, so a gone-entry probe waits a short grace on the ticket before spending an attempt.
+- The ceiling is longer than every other timeout on the path. The follower → leader forward middleware gives up after 60 s (`FORWARD_REQUEST_TIMEOUT` in `fluree-raft-core`), and the server binary applies no request timeout of its own, so a forwarded write whose stage outlasts 60 s returns a 504 at the follower while the leader commits it. Load balancers in front of the server usually sever idle requests sooner still. Aligning these is tracked in #1382.
+
+### Envelope lifetime
+
+Every submission writes an envelope of its own. `QueuedTransactor` stamps the request with a fresh submission id before encoding it, so `request_cid` is unique per submission even when two requests are byte-identical. `body_hash` is derived from the request with the stamp cleared, so a keyed retry still matches the original's idempotency entry.
+
+The envelope is released in one place, once the propose loop has settled what became of it:
+
+- **Turned away** on every attempt (a state-machine rejection or idempotency answer, or a Raft error before the log) — nothing will read it, so the proposer releases it.
+- **Joined** another submission's in-flight entry under the same key (`InFlight`) — that entry reads its own envelope, so this one is released.
+- **Queued** (`Enqueued`) — the queue owns the envelope from then on. It is released at apply (keyless) or at idempotency eviction; a later attempt that fails must not release it from under the entry.
+- **Unknown** (Raft `Fatal`) — the entry may have committed before the local loop crashed and a worker on the new leader may read it, so it is left in place. Eviction sweeps it if the entry never committed.
 
 ## Log entry types
 

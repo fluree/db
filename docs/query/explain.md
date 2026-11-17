@@ -338,6 +338,24 @@ fallback, and the exact index permutation (SPOT/POST/OPST/PSOT) a scan chooses.
 Surfacing those requires actually running the query (a future `EXPLAIN ANALYZE`
 mode), which `EXPLAIN` deliberately does not do.
 
+### Whole-graph distinct object counts
+
+For `SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }`, the indexed fast
+path counts overflow integers and decimals exactly using their NumBig arenas.
+`FLUREE_NUMBIG_EXACT_MAX_ENTRIES` optionally caps the total arena entries in
+the queried graph, including stale entries and values repeated across
+predicates. It is unset by default. Setting it to `0` forces queries with
+NumBig objects to the general pipeline; exceeding any configured cap does the
+same. This fallback scans the whole graph and can be substantially slower.
+The former `FLUREE_NUMBIG_EXACT_MAX_ROWS` setting is no longer used.
+
+The exact branch builds and sorts keys on every execution. Modern arenas
+already store normalized values; legacy arenas require normalization. Key
+storage scales with live entries across predicates before deduplication, plus
+wide-value allocations and temporary buffers. Predicates with stale arena
+handles require scanning their NumBig rows; mixed-type or legacy leaflets may
+also need decoding to establish liveness.
+
 ### Execution Hints
 
 Explain responses may also include an `execution-hints` array. These are not

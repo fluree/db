@@ -1,18 +1,20 @@
 //! V4 — GROUP BY / aggregate projection-scope validation.
 //!
 //! SPARQL 1.1 §11 / §18.2.4 and the `SelectClause` grammar note: when a
-//! query groups — an explicit `GROUP BY`, or an aggregate in the
-//! projection (implicit single group) — every projected variable must be
-//! a **group key** (a bare `GROUP BY ?v`, or the alias of a
-//! `GROUP BY (expr AS ?v)`) or appear only **inside an aggregate**; and
-//! `SELECT *` is not permitted with `GROUP BY`.
+//! query groups — an explicit `GROUP BY`, or an aggregate anywhere in its
+//! SELECT, HAVING or ORDER BY (implicit single group, §18.2.4.1) — every
+//! projected variable must be a **group key** (a bare `GROUP BY ?v`, or the
+//! alias of a `GROUP BY (expr AS ?v)`) or appear only **inside an
+//! aggregate**; and `SELECT *` is not permitted with `GROUP BY`.
 //!
 //! Leniencies (deliberate, to avoid over-rejection):
 //! - `GROUP BY (?v)` — a bracketed bare variable — counts as the key `?v`.
 //! - An alias assigned by an *earlier* item in the same SELECT clause is
 //!   usable in later projection expressions (`SELECT (SUM(?x) AS ?s)
 //!   (?s + 1 AS ?t)` is legal — the Extend chain binds `?s` first).
-//! - `HAVING` / `ORDER BY` expressions are not checked here.
+//! - `HAVING` / `ORDER BY` expressions are not checked here: a non-key
+//!   variable they read means `SAMPLE(?v)` (§18.2.4.1), which lowering
+//!   supplies.
 
 use std::collections::HashSet;
 
@@ -30,10 +32,11 @@ use crate::span::SourceSpan;
 /// itself has no span of its own).
 pub(super) fn check_projection_scope(
     variables: &SelectVariables,
-    group_by: Option<&GroupByClause>,
+    modifiers: &SolutionModifiers,
     clause_span: SourceSpan,
     diagnostics: &mut Vec<Diagnostic>,
 ) {
+    let group_by = modifiers.group_by.as_ref();
     let items = match variables {
         SelectVariables::Star => {
             // `SELECT *` cannot contain an aggregate, so only an explicit
@@ -57,11 +60,7 @@ pub(super) fn check_projection_scope(
         SelectVariables::Explicit(items) => items,
     };
 
-    let has_aggregate = items.iter().any(|item| match item {
-        SelectVariable::Var(_) => false,
-        SelectVariable::Expr { expr, .. } => expr.contains_aggregate(),
-    });
-    if group_by.is_none() && !has_aggregate {
+    if !modifiers.level_groups(variables) {
         return; // Not a grouped query.
     }
 
@@ -255,9 +254,92 @@ fn ungrouped_error(name: &str, span: SourceSpan, group_by: Option<&GroupByClause
         diag = diag.with_label(Label::new(group_by.span, "grouped here"));
     } else {
         diag = diag.with_note(
-            "An aggregate in the projection groups the whole solution into \
-             a single implicit group.",
+            "An aggregate in the SELECT, HAVING or ORDER BY clause groups the \
+             whole solution into a single implicit group.",
         );
     }
     diag
+}
+
+/// An aggregate — in the SELECT, HAVING or ORDER BY clause — whose argument
+/// reads an alias assigned by the same SELECT clause.
+///
+/// The alias is bound by the SELECT's `Extend`, which runs after aggregation
+/// (SPARQL 1.1 §18.2.4.4), so the aggregate would see it unbound: `COUNT(?alias)`
+/// would be 0 for every group. That answer is never what the query means, so
+/// the shape is rejected with a pointer to aggregating the expression itself.
+pub(super) fn check_aggregate_over_select_alias(
+    variables: &SelectVariables,
+    modifiers: &SolutionModifiers,
+    diagnostics: &mut Vec<Diagnostic>,
+) {
+    let SelectVariables::Explicit(items) = variables else {
+        return;
+    };
+    if !items
+        .iter()
+        .any(|item| matches!(item, SelectVariable::Expr { .. }))
+    {
+        return;
+    }
+    // Every query runs this check, so it allocates nothing until it reports:
+    // a SELECT clause is short enough to scan for an alias.
+    let is_alias = |name: &str| {
+        items.iter().any(
+            |item| matches!(item, SelectVariable::Expr { alias, .. } if alias.name.as_ref() == name),
+        )
+    };
+
+    let mut reported: HashSet<String> = HashSet::new();
+    let mut check = |expr: &Expression| {
+        expr.walk(&mut |e| {
+            let Expression::Aggregate {
+                expr: Some(arg), ..
+            } = e
+            else {
+                return;
+            };
+            arg.walk(&mut |e| {
+                let Expression::Var(v) = e else {
+                    return;
+                };
+                let name: &str = v.name.as_ref();
+                if is_alias(name) && reported.insert(name.to_string()) {
+                    diagnostics.push(
+                        Diagnostic::error(
+                            DiagCode::AggregateOverSelectAlias,
+                            format!(
+                                "?{name} is assigned by this SELECT clause, after \
+                                 aggregation, so it cannot be aggregated at the same level"
+                            ),
+                            v.span,
+                        )
+                        .with_help(
+                            "Aggregate the expression itself (e.g. COUNT(IF(...)) \
+                             instead of COUNT(?alias)), or compute the alias in a \
+                             sub-SELECT and aggregate over its result.",
+                        ),
+                    );
+                }
+            });
+        });
+    };
+
+    for item in items {
+        if let SelectVariable::Expr { expr, .. } = item {
+            check(expr);
+        }
+    }
+    if let Some(having) = &modifiers.having {
+        for condition in &having.conditions {
+            check(condition);
+        }
+    }
+    if let Some(order_by) = &modifiers.order_by {
+        for condition in &order_by.conditions {
+            if let OrderExpr::Expr(expr) = &condition.expr {
+                check(expr);
+            }
+        }
+    }
 }

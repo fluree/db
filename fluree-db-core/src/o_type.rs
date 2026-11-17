@@ -188,10 +188,13 @@ impl OType {
         (self.0 >> 14) as u8
     }
 
+    /// Largest value the 14-bit payload (bits 13:0) can hold.
+    pub const MAX_PAYLOAD: u16 = 0x3FFF;
+
     /// 14-bit payload (bits 13:0).
     #[inline]
     pub const fn payload(self) -> u16 {
-        self.0 & 0x3FFF
+        self.0 & Self::MAX_PAYLOAD
     }
 
     /// Whether `(o_type, o_key)` identifies an object term **graph-wide**.
@@ -255,9 +258,16 @@ impl OType {
     }
 
     /// Construct a customer-defined datatype OType from a payload.
+    ///
+    /// Panics if `payload` exceeds [`Self::MAX_PAYLOAD`]. A larger payload
+    /// would spill into the tag bits and silently become a different type.
+    /// Callers bound it through [`crate::ids::DatatypeDictId::MAX`].
     #[inline]
     pub const fn customer_datatype(payload: u16) -> Self {
-        debug_assert!(payload < 0x4000, "customer payload exceeds 14-bit range");
+        assert!(
+            payload <= Self::MAX_PAYLOAD,
+            "customer payload exceeds 14-bit range"
+        );
         Self(0x4000 | payload)
     }
 
@@ -345,6 +355,17 @@ impl OType {
     pub const fn is_string_dict(self) -> bool {
         self.0 >= Self::XSD_STRING.0 && self.0 <= Self::XSD_HEX_BINARY.0
             || self.0 == Self::FULLTEXT.0
+    }
+
+    /// True if `o_key` is a string-dictionary id — the only o_types that can
+    /// carry a literal's lexical string. Every other o_type decodes `o_key` as
+    /// the value itself, so pairing it with a string id misreads the id.
+    #[inline]
+    pub const fn is_string_keyed(self) -> bool {
+        matches!(
+            self.decode_kind(),
+            DecodeKind::StringDict | DecodeKind::JsonArena | DecodeKind::Duration
+        )
     }
 
     // ── langString helpers ─────────────────────────────────────────────
@@ -656,6 +677,30 @@ mod tests {
     }
 
     #[test]
+    fn customer_datatype_max_payload_stays_customer() {
+        let ot = OType::customer_datatype(OType::MAX_PAYLOAD);
+        assert!(ot.is_customer_datatype());
+        assert_eq!(ot.payload(), OType::MAX_PAYLOAD);
+    }
+
+    #[test]
+    #[should_panic(expected = "customer payload exceeds 14-bit range")]
+    fn customer_datatype_rejects_payload_past_max() {
+        let _ = OType::customer_datatype(OType::MAX_PAYLOAD + 1);
+    }
+
+    #[test]
+    fn datatype_dict_id_limit_matches_customer_payload() {
+        use crate::ids::DatatypeDictId;
+        let max = u32::from(DatatypeDictId::MAX);
+        let top = DatatypeDictId::try_from_dict_id(max).expect("max id fits");
+        assert!(OType::customer_datatype(top.as_u16()).is_customer_datatype());
+        assert_eq!(DatatypeDictId::try_from_dict_id(max + 1), None);
+        // The old u8 boundary is well inside the limit.
+        assert!(DatatypeDictId::try_from_dict_id(256).is_some());
+    }
+
+    #[test]
     fn sort_order_matches_proposal() {
         // Embedded types sort before dict-backed (tag 00 < 01 < 10 < 11).
         assert!(OType::XSD_INTEGER < OType::customer_datatype(0));
@@ -695,6 +740,37 @@ mod tests {
             OType::customer_datatype(10).decode_kind(),
             DecodeKind::StringDict
         );
+    }
+
+    #[test]
+    fn string_keyed_o_types() {
+        for ot in [
+            OType::XSD_STRING,
+            OType::XSD_ANY_URI,
+            OType::FULLTEXT,
+            OType::RDF_JSON,
+            OType::XSD_DURATION,
+            OType::lang_string(3),
+            OType::customer_datatype(9),
+        ] {
+            assert!(ot.is_string_keyed(), "{ot:?}");
+        }
+        for ot in [
+            OType::XSD_BOOLEAN,
+            OType::XSD_INTEGER,
+            OType::XSD_LONG,
+            OType::XSD_DOUBLE,
+            OType::XSD_DATE,
+            OType::XSD_DATE_TIME,
+            OType::XSD_TIME,
+            OType::XSD_G_YEAR,
+            OType::XSD_DAY_TIME_DURATION,
+            OType::IRI_REF,
+            OType::VECTOR,
+            OType::NUM_BIG_OVERFLOW,
+        ] {
+            assert!(!ot.is_string_keyed(), "{ot:?}");
+        }
     }
 
     #[test]

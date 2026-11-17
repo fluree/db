@@ -38,6 +38,12 @@ pub struct QueryPolicyExecutor<'a> {
     pub post_overlay: Option<&'a dyn OverlayProvider>,
     /// Target transaction time for the post-state overlay (the staged t)
     pub post_to_t: i64,
+    /// Snapshot to pair with `post_overlay`. A staged view can carry a range
+    /// provider whose dictionaries cover the staged flakes; post-state
+    /// conditions must read through it, or the binary lane cannot translate
+    /// the very subjects the transaction is introducing. Falls back to
+    /// `snapshot` when absent.
+    pub post_snapshot: Option<&'a LedgerSnapshot>,
 }
 
 impl<'a> QueryPolicyExecutor<'a> {
@@ -50,6 +56,7 @@ impl<'a> QueryPolicyExecutor<'a> {
             g_id: 0,
             post_overlay: None,
             post_to_t: snapshot.t,
+            post_snapshot: None,
         }
     }
 
@@ -66,6 +73,7 @@ impl<'a> QueryPolicyExecutor<'a> {
             g_id: 0,
             post_overlay: None,
             post_to_t: to_t,
+            post_snapshot: None,
         }
     }
 
@@ -82,6 +90,14 @@ impl<'a> QueryPolicyExecutor<'a> {
     pub fn with_post_state(mut self, overlay: &'a dyn OverlayProvider, to_t: i64) -> Self {
         self.post_overlay = Some(overlay);
         self.post_to_t = to_t;
+        self
+    }
+
+    /// Pair the post-state overlay with the snapshot it should be read
+    /// through (the staged view's, once its dictionaries cover the staged
+    /// flakes).
+    pub fn with_post_state_snapshot(mut self, snapshot: &'a LedgerSnapshot) -> Self {
+        self.post_snapshot = Some(snapshot);
         self
     }
 }
@@ -510,21 +526,25 @@ impl QueryPolicyExecutor<'_> {
         // Per-condition state selection: `f:postState` reads through the
         // staged overlay when one is attached; otherwise (read paths, no
         // transaction in flight) pre and post coincide with current state.
-        let (overlay, to_t) = match state {
+        let (snapshot, overlay, to_t) = match state {
             ConditionState::Post => match self.post_overlay {
-                Some(post) => (Some(post), self.post_to_t),
-                None => (self.overlay, self.to_t),
+                Some(post) => (
+                    self.post_snapshot.unwrap_or(self.snapshot),
+                    Some(post),
+                    self.post_to_t,
+                ),
+                None => (self.snapshot, self.overlay, self.to_t),
             },
-            ConditionState::Pre => (self.overlay, self.to_t),
+            ConditionState::Pre => (self.snapshot, self.overlay, self.to_t),
         };
 
         // Create the execution context WITHOUT policy (root context)
         // This is critical - policy queries must not be filtered by policy
         let ctx = if let Some(overlay) = overlay {
-            ExecutionContext::with_time_and_overlay(self.snapshot, vars, to_t, None, overlay)
+            ExecutionContext::with_time_and_overlay(snapshot, vars, to_t, None, overlay)
                 .with_graph_id(self.g_id)
         } else {
-            ExecutionContext::with_time(self.snapshot, vars, to_t, None).with_graph_id(self.g_id)
+            ExecutionContext::with_time(snapshot, vars, to_t, None).with_graph_id(self.g_id)
         };
 
         // Build the where clause operators (VALUES is now part of the patterns).

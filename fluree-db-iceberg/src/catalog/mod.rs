@@ -8,17 +8,49 @@ mod rest;
 mod table_identifier;
 
 pub use direct::DirectCatalogClient;
-pub use direct::{match_warehouse_table_dir, warehouse_dir_name};
+pub use direct::{
+    match_warehouse_namespace_dir, match_warehouse_table_dir, warehouse_dir_name,
+    warehouse_table_dir_candidates,
+};
 pub use rest::{RestCatalogClient, RestCatalogConfig};
 pub use table_identifier::{encode_namespace_for_rest, parse_table_identifier, TableIdentifier};
 
 #[cfg(feature = "aws")]
 pub use direct::SendDirectCatalogClient;
 
+#[cfg(feature = "aws")]
+mod aws_sdk;
+#[cfg(feature = "aws")]
+pub use aws_sdk::{GlueSdkCatalogClient, S3TablesSdkCatalogClient};
+
 use crate::credential::VendedCredentials;
 use crate::error::Result;
 use async_trait::async_trait;
 use std::collections::HashMap;
+
+/// Name the table a catalog refused access to (a denial, or Google's missing
+/// quota project). A refusal is raised where only the request is known (a REST
+/// path, an SDK operation), so each `load_table` relabels it with the table it
+/// was loading; any other error passes through.
+pub(crate) fn name_denied_table(
+    err: crate::IcebergError,
+    table_id: &TableIdentifier,
+) -> crate::IcebergError {
+    match err {
+        crate::IcebergError::CatalogAccessDenied { message, .. } => {
+            crate::IcebergError::CatalogAccessDenied {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
+                message,
+            }
+        }
+        crate::IcebergError::CatalogQuotaProjectRequired { .. } => {
+            crate::IcebergError::CatalogQuotaProjectRequired {
+                table: format!("{}.{}", table_id.namespace, table_id.table),
+            }
+        }
+        other => other,
+    }
+}
 
 /// Response from loading a table, including optional vended credentials.
 #[derive(Debug)]
@@ -81,4 +113,18 @@ pub trait SendCatalogClient: std::fmt::Debug + Send + Sync {
         table_id: &TableIdentifier,
         request_credentials: bool,
     ) -> Result<LoadTableResponse>;
+
+    /// The table's storage credentials, vended again (to renew ones about to
+    /// expire), matched against `metadata_location` as at `loadTable`.
+    ///
+    /// The default asks for a fresh `loadTable` with credential delegation; a
+    /// REST catalog asks its per-table credentials endpoint first.
+    async fn load_credentials(
+        &self,
+        table_id: &TableIdentifier,
+        metadata_location: &str,
+    ) -> Result<Option<VendedCredentials>> {
+        let _ = metadata_location;
+        Ok(self.load_table(table_id, true).await?.credentials)
+    }
 }

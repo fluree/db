@@ -19,9 +19,9 @@
 //! (`index_t`). Querying *before* the index point needs the history sidecar and
 //! defers to the generic pipeline. They split on whether novelty is present:
 //!
-//! - **Base lane** (`epoch == 0`): the persisted index is exact, so a plain
+//! - **Base lane** (no live novelty): the persisted index is exact, so a plain
 //!   reverse leaf-walk suffices.
-//! - **Overlay lane** (`epoch != 0`): the same reverse leaf-walk is merged with
+//! - **Overlay lane** (live novelty): the same reverse leaf-walk is merged with
 //!   the predicate's resolved novelty ops. This is a *row-set* merge (skip base
 //!   rows retracted by overlay; add overlay asserts; dedup by fact identity), so
 //!   it sidesteps the "base + asserts − retracts" arithmetic pitfall that only
@@ -139,11 +139,7 @@ pub fn post_order_desc_limit_operator(
             if ctx.to_t < store.max_t() {
                 return Ok(None);
             }
-            let overlay_present = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let overlay_present = crate::fast_path_common::overlay_has_novelty(ctx);
 
             let g_id: GraphId = ctx.binary_g_id;
             let need = offset.saturating_add(limit);
@@ -364,10 +360,10 @@ fn base_predicate_o_type(
 ) -> Result<OneOType> {
     let mut found = OneOType::Empty;
     for leaf in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
-        let handle = store
-            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
@@ -413,7 +409,8 @@ fn collect_post_desc_topk(
     // SortOperator's multiset semantics), and DISTINCT collapses them by the
     // projected `(s?, o)` below — neither needs `o_i`.
     let projection = projection_sid_okey();
-    let mut results: Vec<TopKRow> = Vec::with_capacity(need);
+    let mut results: Vec<TopKRow> =
+        Vec::with_capacity(fluree_db_core::topk::initial_capacity(need));
     // DISTINCT dedup key: (subject-or-0, o_type, o_key). When DISTINCT is set the
     // detector guarantees the object var is projected, so the object component is
     // always meaningful; the subject component is included only when projected.
@@ -568,7 +565,8 @@ fn collect_post_desc_topk_overlay(
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let projection = projection_sid_okey_oi();
 
-    let mut results: Vec<TopKRow> = Vec::with_capacity(need);
+    let mut results: Vec<TopKRow> =
+        Vec::with_capacity(fluree_db_core::topk::initial_capacity(need));
     let mut emitted: FxHashSet<OvRow> = FxHashSet::default(); // full-fact dedup
     let mut distinct_seen: FxHashSet<(u64, u64)> = FxHashSet::default(); // (s_or0, o_key)
     let mut assert_idx = 0usize;

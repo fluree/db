@@ -34,7 +34,7 @@ fn detect_update_format(
             "sparql" | "sparql-update" => Ok(UpdateFormat::SparqlUpdate),
             "cypher" | "opencypher" => Ok(UpdateFormat::Cypher),
             other => Err(CliError::Usage(format!(
-                "unknown update format '{other}'\n  {} valid formats: jsonld, sparql, cypher",
+                "unknown update format '{other}'\n  {} valid formats: jsonld (json-ld, json), sparql (sparql-update), cypher (opencypher)",
                 colored::Colorize::bold(colored::Colorize::cyan("help:"))
             ))),
         };
@@ -247,6 +247,42 @@ mod tests {
     fn detect_explicit_unknown_errors() {
         let result = detect_update_format(None, "", Some("turtle"));
         assert!(result.is_err());
+    }
+
+    /// Every spelling the match arms accept is named by the error that lists
+    /// them.
+    ///
+    /// Twin of `detect::tests::the_usage_error_names_every_format_the_flag_accepts`.
+    /// Both messages advertised the canonical spelling of each format and
+    /// silently omitted its aliases, so `--format json-ld` and
+    /// `--format opencypher` worked while the only text telling a user what to
+    /// type said they did not exist.
+    #[test]
+    fn the_usage_error_names_every_update_format_the_flag_accepts() {
+        let accepted = [
+            "jsonld",
+            "json-ld",
+            "json",
+            "sparql",
+            "sparql-update",
+            "cypher",
+            "opencypher",
+        ];
+        for fmt in accepted {
+            assert!(
+                detect_update_format(None, "", Some(fmt)).is_ok(),
+                "--format {fmt} must be accepted"
+            );
+        }
+        let err = detect_update_format(None, "", Some("turtle"))
+            .expect_err("turtle is not an update format")
+            .to_string();
+        for fmt in accepted {
+            assert!(
+                err.contains(fmt),
+                "the usage error must name '{fmt}'; got: {err}"
+            );
+        }
     }
 
     #[test]

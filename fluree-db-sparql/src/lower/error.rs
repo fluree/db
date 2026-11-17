@@ -71,6 +71,11 @@ pub enum LowerError {
         reason: String,
         span: SourceSpan,
     },
+
+    /// A grouping phase that cannot be built (see
+    /// `fluree_db_query::ir::GroupingError`)
+    #[error("Invalid grouping: {message}")]
+    InvalidGrouping { message: String, span: SourceSpan },
 }
 
 impl LowerError {
@@ -196,6 +201,7 @@ impl LowerError {
             Self::UnsupportedCountStar { span } => *span,
             Self::InvalidPropertyPath { span, .. } => *span,
             Self::InvalidLiteral { span, .. } => *span,
+            Self::InvalidGrouping { span, .. } => *span,
         }
     }
 }

@@ -6,10 +6,32 @@ Fluree supports four storage modes, each optimized for different deployment scen
 
 ### Memory Storage
 
-In-memory storage for development and testing:
+In-memory storage for development, testing, and CI. Start the server with `--memory`
+(or set `FLUREE_MEMORY_STORAGE=true`):
 
 ```bash
-./fluree-db-server --storage memory
+fluree server run --memory
+```
+
+The server needs no `.fluree/` directory, writes nothing to the directory it runs in, and loses
+every ledger when it exits. See
+[Throwaway server for tests and CI](running-fluree.md#throwaway-server-for-tests-and-ci).
+
+A connection config whose storage node has no backend fields also selects memory storage:
+
+```json
+{
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [{
+    "@id": "conn",
+    "@type": "Connection",
+    "indexStorage": {"@id": "mem", "@type": "Storage"}
+  }]
+}
+```
+
+```bash
+fluree server run --connection-config memory.jsonld
 ```
 
 **Characteristics:**
@@ -20,7 +42,7 @@ In-memory storage for development and testing:
 
 **Use Cases:**
 - Local development
-- Unit testing
+- Tests and CI runs
 - Temporary/ephemeral databases
 - Prototyping
 
@@ -31,12 +53,10 @@ In-memory storage for development and testing:
 
 ### File Storage
 
-Local file system storage:
+Local file system storage (the server's default, at `.fluree/storage` when no path is given):
 
 ```bash
-./fluree-db-server \
-  --storage file \
-  --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 **Characteristics:**
@@ -59,15 +79,13 @@ Local file system storage:
 
 ### AWS Storage
 
-Distributed storage using S3 and DynamoDB:
+Distributed storage using S3 and DynamoDB. Buckets, DynamoDB table, and region are set in a
+JSON-LD connection config file (requires a server built with the `aws` feature); see the
+[example in Configuration](configuration.md#connection-configuration-s3-dynamodb-etc) and the
+[connection config reference](../reference/connection-config-jsonld.md):
 
 ```bash
-./fluree-db-server \
-  --storage aws \
-  --s3-bucket fluree-prod-data \
-  --s3-region us-east-1 \
-  --dynamodb-table fluree-nameservice \
-  --dynamodb-region us-east-1
+fluree server run --connection-config /etc/fluree/connection.jsonld
 ```
 
 **Characteristics:**
@@ -94,43 +112,18 @@ Indexes are reproducible from commits, so they can use either Standard S3 or S3
 Express One Zone depending on latency and cost requirements. See
 [Serverless Storage Choices](serverless-storage.md) for benchmark-backed guidance.
 
-### IPFS Storage
+### IPFS Storage (experimental, Rust API only)
 
-Decentralized content-addressed storage via a local Kubo node:
+Content-addressed storage in IPFS through a local Kubo node. It is available only to programs
+that embed Fluree through the Rust API (`FlureeBuilder::build_ipfs`, with the `ipfs` feature on
+`fluree-db-api`). The server and CLI cannot use it, and a connection config cannot select it: a
+storage node with `ipfsApiUrl` is rejected.
 
-```json
-{
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
-      "@type": "Storage",
-      "ipfsApiUrl": "http://127.0.0.1:5001",
-      "ipfsPinOnPut": true
-    }
-  }]
-}
-```
+The builder keeps the nameservice in memory, so blocks persist in IPFS but a restarted process no
+longer knows each ledger's current commit. Use it to publish and fetch content-addressed Fluree
+data, not as durable primary storage.
 
-**Characteristics:**
-- Content-addressed (every blob identified by SHA-256 hash)
-- Immutable, tamper-evident storage
-- Decentralized replication via IPFS network
-- Fluree's native CIDs work directly with IPFS
-
-**Use Cases:**
-- Decentralized / censorship-resistant deployments
-- Content integrity verification
-- Cross-organization data sharing
-- Foundation for IPNS/ENS-based ledger discovery
-
-**Limitations:**
-- Requires a running Kubo node
-- No prefix listing (manifest-based tracking needed)
-- No native deletion (unpin + GC)
-- Higher write latency than local file I/O
-
-See [IPFS Storage Guide](ipfs-storage.md) for complete setup and configuration.
+See the [IPFS Storage Guide](ipfs-storage.md) for setup and details.
 
 ## Storage Architecture
 
@@ -211,11 +204,11 @@ Multiple processes coordinate via AWS.
      └─────────────┘
 ```
 
-Data stored as content-addressed blocks in IPFS via Kubo.
+Data stored as content-addressed blocks in IPFS via Kubo (Rust API only; the nameservice is in memory).
 
 ## Storage Encryption
 
-Fluree supports transparent AES-256-GCM encryption for data at rest. When enabled, all data is automatically encrypted before being written to storage.
+Fluree supports transparent AES-256-GCM encryption for data at rest. When enabled, every blob written through the storage layer is encrypted; the nameservice stays plaintext.
 
 ### Enabling Encryption
 
@@ -224,19 +217,24 @@ Fluree supports transparent AES-256-GCM encryption for data at rest. When enable
 export FLUREE_ENCRYPTION_KEY=$(openssl rand -base64 32)
 ```
 
-Configure via JSON-LD (file storage):
+Configure via JSON-LD (file storage). Nodes are located by `@id`, so give
+every node one:
 
 ```json
 {
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
+  "@context": {
+    "@base": "https://ns.flur.ee/config/connection/",
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "storage",
       "@type": "Storage",
       "filePath": "/var/lib/fluree",
       "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-    }
-  }]
+    },
+    {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+  ]
 }
 ```
 
@@ -244,25 +242,39 @@ For S3 storage with encryption:
 
 ```json
 {
-  "@context": {"@vocab": "https://ns.flur.ee/system#"},
-  "@graph": [{
-    "@type": "Connection",
-    "indexStorage": {
+  "@context": {
+    "@base": "https://ns.flur.ee/config/connection/",
+    "@vocab": "https://ns.flur.ee/system#"
+  },
+  "@graph": [
+    {
+      "@id": "storage",
       "@type": "Storage",
       "s3Bucket": "my-fluree-bucket",
-      "s3Endpoint": "https://s3.us-east-1.amazonaws.com",
       "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
+    },
+    {"@id": "publisher", "@type": "Publisher", "dynamodbTable": "fluree-nameservice"},
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "indexStorage": {"@id": "storage"},
+      "primaryPublisher": {"@id": "publisher"}
     }
-  }]
+  ]
 }
 ```
 
 **Key Features:**
 - AES-256-GCM authenticated encryption
-- Works natively with all storage backends (memory, file, S3)
+- Works with memory, file and S3 storage (not IPFS). Every terminal build method applies a
+  configured key except `build_ipfs()`, which rejects one, and `build_with()`, which leaves it
+  to the caller
+- Key sets and in-place key rotation; see [Key Rotation](../security/encryption.md#key-rotation)
 - Transparent encryption/decryption on read/write
 - Portable ciphertext format (encrypted data can be moved between backends)
 - Environment variable support for key configuration
+- The binary-index disk cache is bypassed, so no decrypted artifact is written
+  outside the encrypted storage (the nameservice stays plaintext)
 
 See [Storage Encryption](../security/encryption.md) for full documentation.
 
@@ -272,6 +284,7 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 
 ```text
 /var/lib/fluree/
+├── .fluree-lock              # Held by the server or Python process that has the directory open
 ├── ns@v2/                    # Nameservice records
 │   ├── mydb/
 │   │   ├── main.json        # Ledger metadata
@@ -345,35 +358,68 @@ See [Storage Encryption](../security/encryption.md) for full documentation.
 - High IOPS capability
 - Regular backups
 
+### One process per directory
+
+A file storage directory is used by one process at a time; threads within it share it. Two
+processes on one directory are not coordinated: each serves its own cached view of the ledgers,
+and both index and clean up the same files. To use one directory from several processes, run a
+[server](running-fluree.md) on it and send their requests to the server.
+
+A Fluree server (`fluree server run` or `start`) and the Python package lock the directory for as
+long as they have it open, through a `.fluree-lock` file at its root. A second server or Python
+process that opens the directory meanwhile is refused, with the process id of the one that holds
+it. The lock belongs to the running process, so a crash or `kill -9` releases it; the file left
+behind means nothing. Shared-storage query peers and Raft nodes, which share a directory with other
+processes on purpose, take no lock.
+
+Not every process takes the lock yet. CLI commands such as `fluree insert` route to a running
+server, but with `--direct`, or with no server running, they open the directory themselves and
+unlocked, so running one beside a Python process that has the directory open is unprotected. A
+Rust program takes the lock only when it asks for it (`FlureeBuilder::with_storage_lock()`, or
+`SharedFluree`).
+
+A filesystem that cannot lock (some network and FUSE mounts) fails to open. Set
+`FLUREE_STORAGE_ALLOW_UNLOCKED=true` to open it anyway, without protection from a second process.
+Any other error taking the lock, such as a lock file the process may not write, fails the open too.
+
+A lock keeps out only the processes whose operating system sees it. A container and its host that
+share a directory through a Docker Desktop bind mount both take the lock without error, as do two
+machines on an NFS mount with local-only locking (`nolock` or `local_lock`). Neither is refused, so
+make sure only one of them opens the directory.
+
 ### Durability
 
-Every write is atomic: bytes are staged alongside the destination and moved into
-place, so a reader never observes a partially written file, and an interrupted
-write leaves nothing at the final name.
+**Filesystem syncing (FSYNC) is on by default.** Fluree flushes committed data
+to durable storage so acknowledged commits survive a process crash or power
+loss. No configuration is needed to enable it.
 
-Whether an acknowledged write survives the machine *losing power* is controlled
-by the storage node's `durability` property, or by `FLUREE_STORAGE_FSYNC`:
+To turn FSYNC off, set this environment variable before starting Fluree:
 
-| Mode | Acknowledged when | Survives |
-|---|---|---|
-| `sync` (default) | bytes and directory entry flushed to the device | process death and power loss |
-| `page-cache` | bytes reach the OS page cache | process death only |
+```bash
+export FLUREE_STORAGE_FSYNC=0
+```
 
-This applies to the writes that are the source of truth — commits, transactions,
-ledger config, graph-source mappings — and to nameservice records. Index nodes,
-dictionaries, sketches and annotation arenas are always written page-cache: they
-are written at much higher volume than commits and can be rebuilt from the commit
-chain, so flushing them would cost throughput on the busiest path for no
-durability gain.
+With FSYNC off, writes reach the operating system's page cache without waiting
+for a disk flush. This can improve performance for development, benchmarks, or
+restartable imports, but a power loss or kernel panic can lose acknowledged
+commits. Keep FSYNC on for data you need to retain.
 
-Turning durability off is reasonable for bulk imports (restartable from the
-source data), CI, and benchmarks. It is not a safe default for a ledger you
-intend to keep.
+To turn it back on, set `FLUREE_STORAGE_FSYNC=1` and restart Fluree. The environment
+variable overrides the storage node's `durability` setting and applies only to
+local file storage; it does not disable Raft log flushing.
 
-> **macOS note.** `sync` on macOS issues `F_FULLFSYNC`, a full drive-cache
-> barrier that is far more expensive than the equivalent `fsync` on Linux —
-> measured here at ~4 ms versus ~0.08 ms. Local development on macOS may want
-> `FLUREE_STORAGE_FSYNC=0`; it is not representative of Linux production cost.
+With FSYNC on, Fluree keeps a short write-ahead log in `.fluree-wal/` under the
+storage root (one per node in a Raft cluster, under `.fluree-wal/owners/`). Log
+segments are written with zeros ahead of use so that each flush carries only
+data. A segment's size follows recent write volume, up to 8 MiB, and flushed
+segments are removed within about a second, so the log typically occupies one
+or two segments. On Linux, removing flushed segments syncs the entire filesystem
+holding the root. Other heavy writers on that filesystem, such as a large import
+or another service, can therefore slow it. Put the storage root on its own
+volume for predictable commit latency.
+
+Writes remain atomic with either setting: readers do not see partially written
+files.
 
 Because the staged file is moved into place, each write gives the destination a
 new inode. Ownership, permissions, ACLs and hard links applied to a *path* are
@@ -554,19 +600,18 @@ Required IAM permissions:
 
 ### Decision Matrix
 
-| Requirement | Memory | File | AWS | IPFS |
+| Requirement | Memory | File | AWS | IPFS (Rust API) |
 |-------------|--------|------|-----|------|
-| **Development** | Best | Good | Overkill | Overkill |
-| **Single server** | No | Best | Overkill | Good |
-| **Multi-server** | No | No | Best | Good |
-| **Persistence** | No | Yes | Yes | Yes |
+| **Development** | Best | Good | Overkill | Experimental |
+| **Single server** | No | Best | Overkill | No |
+| **Multi-server** | No | No | Best | No |
+| **Persistence** | No | Yes | Yes | Blocks only; ledger heads are in memory |
 | **Cloud-native** | No | No | Yes | No |
-| **Decentralized** | No | No | No | Best |
-| **Content integrity** | No | No | No | Best |
+| **Decentralized** | No | No | No | Blocks can replicate |
 | **Cost** | Free | Free | Monthly | Free |
 | **Setup complexity** | Trivial | Simple | Complex | Moderate |
 | **Performance** | Fastest | Fast | Good | Good |
-| **Durability** | None | Local | 11 9's | Network-wide |
+| **Durability** | None | Local | 11 9's | Blocks: network-wide; ledger heads: none |
 
 ### Recommendations
 
@@ -589,11 +634,8 @@ Required IAM permissions:
 - Cloud-native architecture
 
 **Use IPFS when:**
-- Decentralized storage required
-- Content integrity verification is critical
-- Cross-organization data sharing
-- Building toward IPNS/ENS-based ledger discovery
-- Censorship resistance is a requirement
+- You embed Fluree through the Rust API and want to publish or fetch content-addressed Fluree
+  data through IPFS, and don't need ledgers to survive a restart
 
 ## Switching Storage Modes
 
@@ -603,10 +645,12 @@ Export from the running system and import into the new one:
 
 ```bash
 # Export from memory
-curl -X POST http://localhost:8090/export?ledger=mydb:main > mydb-export.jsonld
+curl -X POST http://localhost:8090/v1/fluree/export/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"format": "jsonld"}' > mydb-export.jsonld
 
 # Stop memory server, start file server
-./fluree-db-server --storage file --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 
 # Import to file storage
 curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
@@ -633,8 +677,8 @@ aws dynamodb create-table \
     AttributeName=sk,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST
 
-# Start AWS-backed server
-./fluree-db-server --storage aws --s3-bucket fluree-prod-data
+# Start AWS-backed server (S3 bucket + DynamoDB table named in the connection config)
+fluree server run --connection-config /etc/fluree/connection.jsonld
 ```
 
 ### AWS to File
@@ -646,7 +690,7 @@ Download from S3:
 aws s3 sync s3://fluree-prod-data/ /var/lib/fluree/
 
 # Start file-backed server
-./fluree-db-server --storage file --data-dir /var/lib/fluree
+fluree server run --storage-path /var/lib/fluree
 ```
 
 ## Backup and Recovery
@@ -657,7 +701,9 @@ No native backup (data is ephemeral):
 
 ```bash
 # Export ledger
-curl -X POST http://localhost:8090/export?ledger=mydb:main > backup.jsonld
+curl -X POST http://localhost:8090/v1/fluree/export/mydb:main \
+  -H "Content-Type: application/json" \
+  -d '{"format": "jsonld"}' > backup.jsonld
 ```
 
 ### File Storage

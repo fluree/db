@@ -174,7 +174,7 @@ pub async fn submission_status(
         return Err(ServerError::unauthorized("Bearer token required"));
     }
     if let Some(principal) = bearer.0.as_ref() {
-        if !principal.can_read(&params.ledger) {
+        if !principal.can_read(&crate::error::scope_id(&params.ledger)?) {
             // Match the existence-leak avoidance in `info`: out-of-scope and
             // missing-ledger return the same 404 so a caller can't use the
             // response to distinguish them.
@@ -231,7 +231,7 @@ impl From<SubmissionState> for SubmissionStateResponse {
 impl From<OperationReceipt> for OperationDetailResponse {
     fn from(receipt: OperationReceipt) -> Self {
         match receipt {
-            OperationReceipt::Transaction(r) => Self::Transaction(r.into()),
+            OperationReceipt::Transaction(r) => Self::Transaction((*r).into()),
             OperationReceipt::Revert(r) => Self::Revert(r.into()),
             OperationReceipt::Merge(r) => Self::Merge(r.into()),
             OperationReceipt::Rebase(r) => Self::Rebase(r.into()),
@@ -249,6 +249,8 @@ fn body_kind_tag(kind: BodyKind) -> &'static str {
         | BodyKind::JsonLdUpsert
         | BodyKind::JsonLdUpdate
         | BodyKind::JsonLdGraphSync
+        | BodyKind::RdfGraphSync
+        | BodyKind::GraphInsert
         | BodyKind::TurtleInsert
         | BodyKind::TurtleUpsert
         | BodyKind::TrigUpsert
@@ -363,7 +365,7 @@ mod tests {
             commit_id: commit_id.clone(),
             t: 42,
             tally: None,
-            receipt: Some(Box::new(OperationReceipt::Transaction(
+            receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(
                 TransactionReceipt {
                     idempotency_key: Some(IdempotencyKey::new("client-key-42").expect("fits cap")),
                     commit: CommitReceipt {
@@ -376,7 +378,7 @@ mod tests {
                     tally: None,
                     cypher_return: None,
                 },
-            ))),
+            )))),
         }))
     }
 

@@ -40,6 +40,9 @@ pub struct LedgerConfig {
     /// Serving-posture defaults (`f:servingDefaults`). Ledger-scoped:
     /// never merged per-graph and not subject to override control.
     pub serving: Option<ServingDefaults>,
+    /// Query defaults (`f:queryDefaults`). Ledger-scoped: never merged
+    /// per-graph and not subject to override control.
+    pub query: Option<QueryDefaults>,
     /// Per-graph config overrides (`f:graphOverrides`).
     pub graph_overrides: Vec<GraphConfig>,
 }
@@ -98,6 +101,10 @@ pub struct ShaclDefaults {
     pub enabled: Option<bool>,
     /// `f:shapesSource` — reference to graph containing SHACL shapes.
     pub shapes_source: Option<GraphSourceRef>,
+    /// `f:additionalDataSource` — graphs read with the validated graph, as
+    /// one graph, when its nodes are checked. Which nodes are checked still
+    /// comes from the validated graph alone.
+    pub additional_data_sources: Vec<GraphSourceRef>,
     /// `f:validationMode` — reject or warn on validation failure.
     pub validation_mode: Option<ValidationMode>,
     /// Override control for this setting group.
@@ -130,6 +137,11 @@ pub struct ReasoningDefaults {
     /// seconds before the OWL2-RL closure is capped. `None` means use the
     /// system default.
     pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — materialization budget: max megabytes of
+    /// derived facts before the closure is capped. Like the other two this is
+    /// a correctness control, not a tuning knob: a capped closure is
+    /// incomplete. `None` means derive it from the effective fact cap.
+    pub max_memory_mb: Option<u64>,
     /// Override control for this setting group.
     pub override_control: OverrideControl,
 }
@@ -178,6 +190,21 @@ pub struct ServingDefaults {
     pub serve_blocks: Option<bool>,
     /// `f:publicVisibility` — ledger is discoverable/readable without a token.
     pub public_visibility: Option<bool>,
+}
+
+/// Query defaults from the config graph (`f:queryDefaults`).
+///
+/// Ledger-scoped: lives only on `f:LedgerConfig`, ignored on `f:GraphConfig`,
+/// and not subject to override control. A request may still choose for
+/// itself, since these shape what a query reads rather than what it may
+/// read.
+#[derive(Debug, Clone, Default)]
+pub struct QueryDefaults {
+    /// `f:unionDefaultGraph` — a query that does not choose its own default
+    /// graph reads the union of the ledger's default graph and its named
+    /// graphs (never the reserved `#txn-meta` / `#config` graphs). `None`
+    /// means off.
+    pub union_default_graph: Option<bool>,
 }
 
 /// Full-text indexing defaults from the config graph (`f:fullTextDefaults`).
@@ -233,6 +260,95 @@ pub struct TransactDefaults {
 }
 
 // ============================================================================
+// Empty setting groups
+// ============================================================================
+//
+// A group node that sets nothing (no field, and the default override
+// control) reads the same as no group at all: every consumer treats an unset
+// field as the system default. The config reader normalizes such a group to
+// absent, which keeps the choice among several group pointers deterministic
+// (an empty group never wins over a populated one).
+
+impl PolicyDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.default_allow.is_none()
+            && self.policy_source.is_none()
+            && self.policy_class.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ShaclDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.shapes_source.is_none()
+            && self.additional_data_sources.is_empty()
+            && self.validation_mode.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ReasoningDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.modes.is_none()
+            && self.schema_source.is_none()
+            && self.follow_owl_imports.is_none()
+            && self.ontology_import_map.is_empty()
+            && self.max_facts.is_none()
+            && self.max_seconds.is_none()
+            && self.max_memory_mb.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl DatalogDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.enabled.is_none()
+            && self.rules_source.is_none()
+            && self.allow_query_time_rules.is_none()
+            && self.override_control.is_default()
+    }
+}
+
+impl ServingDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.serve_query.is_none()
+            && self.serve_blocks.is_none()
+            && self.public_visibility.is_none()
+    }
+}
+
+impl QueryDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.union_default_graph.is_none()
+    }
+}
+
+impl FullTextDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.default_language.is_none()
+            && self.properties.is_empty()
+            && self.override_control.is_default()
+    }
+}
+
+impl TransactDefaults {
+    /// No field is set.
+    pub fn is_empty(&self) -> bool {
+        self.unique_enabled.is_none()
+            && self.constraints_sources.is_empty()
+            && self.override_control.is_default()
+    }
+}
+
+// ============================================================================
 // Per-graph overrides
 // ============================================================================
 
@@ -284,6 +400,11 @@ pub enum OverrideControl {
 }
 
 impl OverrideControl {
+    /// The control an absent `f:overrideControl` means (`AllowAll`).
+    pub fn is_default(&self) -> bool {
+        matches!(self, OverrideControl::AllowAll)
+    }
+
     /// Permissiveness level for ordering comparisons.
     /// `None` (0) < `IdentityRestricted` (1) < `AllowAll` (2).
     fn permissiveness(&self) -> u8 {
@@ -327,14 +448,14 @@ impl OverrideControl {
 
     /// Check if a given request identity is permitted to override.
     ///
-    /// `request_identity` is the server-verified canonical DID string.
+    /// `request_identity` is the auth-layer-verified identity.
     /// `None` means anonymous (no verified identity).
-    pub fn permits_override(&self, request_identity: Option<&str>) -> bool {
+    pub fn permits_override(&self, request_identity: Option<&crate::VerifiedIdentity>) -> bool {
         match self {
             OverrideControl::None => false,
             OverrideControl::AllowAll => true,
             OverrideControl::IdentityRestricted { allowed_identities } => request_identity
-                .map(|id| allowed_identities.contains(id))
+                .map(|id| allowed_identities.contains(id.as_str()))
                 .unwrap_or(false),
         }
     }
@@ -547,13 +668,15 @@ mod tests {
 
     #[test]
     fn permits_override_none_always_false() {
-        assert!(!OverrideControl::None.permits_override(Some("did:key:alice")));
+        assert!(!OverrideControl::None
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(!OverrideControl::None.permits_override(None));
     }
 
     #[test]
     fn permits_override_allow_all_always_true() {
-        assert!(OverrideControl::AllowAll.permits_override(Some("did:key:alice")));
+        assert!(OverrideControl::AllowAll
+            .permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(OverrideControl::AllowAll.permits_override(None));
     }
 
@@ -562,8 +685,8 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: identity_set(&["did:key:alice", "did:key:bob"]),
         };
-        assert!(ctrl.permits_override(Some("did:key:alice")));
-        assert!(ctrl.permits_override(Some("did:key:bob")));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
+        assert!(ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
     }
 
     #[test]
@@ -571,7 +694,7 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: identity_set(&["did:key:alice"]),
         };
-        assert!(!ctrl.permits_override(Some("did:key:bob")));
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:bob"))));
     }
 
     #[test]
@@ -587,7 +710,7 @@ mod tests {
         let ctrl = OverrideControl::IdentityRestricted {
             allowed_identities: HashSet::new(),
         };
-        assert!(!ctrl.permits_override(Some("did:key:alice")));
+        assert!(!ctrl.permits_override(Some(&crate::VerifiedIdentity::new("did:key:alice"))));
         assert!(!ctrl.permits_override(None));
     }
 

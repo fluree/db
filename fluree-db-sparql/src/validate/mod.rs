@@ -36,8 +36,7 @@ use crate::ast::pattern::{GraphPattern, TriplePattern};
 use crate::ast::query::{
     AskQuery, ConstructQuery, DescribeQuery, QueryBody, SelectQuery, SparqlAst,
 };
-use crate::ast::term::BlankNodeValue;
-use crate::ast::term::{PredicateTerm, SubjectTerm, Term};
+use crate::ast::term::{BlankNode, PredicateTerm, SubjectTerm, Term};
 use crate::ast::update::{
     DeleteData, DeleteWhere, InsertData, Modify, QuadData, QuadPattern, QuadPatternElement,
     UpdateOperation,
@@ -52,7 +51,7 @@ use crate::span::SourceSpan;
 /// `fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX` (that crate
 /// is a feature-gated dependency, so the value is duplicated here; a
 /// lowering-feature test asserts equality).
-const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
+pub(crate) const STABLE_BLANK_NODE_LABEL_PREFIX: &str = "fdb-";
 
 /// Fluree capability configuration.
 ///
@@ -156,7 +155,7 @@ impl<'a> Validator<'a> {
         self.validate_query_where(&query.where_clause.pattern);
         projection::check_projection_scope(
             &query.select.variables,
-            query.modifiers.group_by.as_ref(),
+            &query.modifiers,
             query.select.span,
             &mut self.diagnostics,
         );
@@ -170,25 +169,49 @@ impl<'a> Validator<'a> {
             &query.modifiers,
             &mut self.diagnostics,
         );
-        // The post-query VALUES clause shares the Values pattern arm
-        // (duplicate-variable check).
-        if let Some(values) = &query.values {
-            self.validate_graph_pattern(values);
-        }
+        projection::check_aggregate_over_select_alias(
+            &query.select.variables,
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
+        self.validate_trailing_values(query.values.as_deref());
     }
 
     fn validate_construct(&mut self, query: &ConstructQuery) {
         self.validate_query_where(&query.where_clause.pattern);
+        self.validate_trailing_values(query.values.as_deref());
         // Template triples don't need ground validation (they use WHERE variables)
+        // A grouping CONSTRUCT's HAVING and ORDER BY get the SELECT checks
+        // that apply without a projection.
+        projection::check_nested_aggregates(
+            &crate::ast::query::SelectVariables::Explicit(Vec::new()),
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
     }
 
     fn validate_ask(&mut self, query: &AskQuery) {
         self.validate_query_where(&query.where_clause.pattern);
+        self.validate_trailing_values(query.values.as_deref());
+        projection::check_nested_aggregates(
+            &crate::ast::query::SelectVariables::Explicit(Vec::new()),
+            &query.modifiers,
+            &mut self.diagnostics,
+        );
     }
 
     fn validate_describe(&mut self, query: &DescribeQuery) {
         if let Some(where_clause) = &query.where_clause {
             self.validate_query_where(&where_clause.pattern);
+        }
+        self.validate_trailing_values(query.values.as_deref());
+    }
+
+    /// A query's trailing VALUES clause shares the Values pattern arm
+    /// (duplicate-variable check).
+    fn validate_trailing_values(&mut self, values: Option<&GraphPattern>) {
+        if let Some(values) = values {
+            self.validate_graph_pattern(values);
         }
     }
 
@@ -394,32 +417,7 @@ impl<'a> Validator<'a> {
                         self.validate_no_blank_nodes_in_delete_triple(triple, context);
                     }
                 }
-                QuadPatternElement::Graph {
-                    name,
-                    triples,
-                    span,
-                } => {
-                    match name {
-                        crate::ast::pattern::GraphName::Iri(_iri) => {
-                            // Allowed (Phase 1)
-                        }
-                        crate::ast::pattern::GraphName::Var(v) => {
-                            self.diagnostics.push(
-                                Diagnostic::error(
-                                    DiagCode::UnsupportedGraphInUpdate,
-                                    format!(
-                                        "GRAPH ?{} is not supported in SPARQL Update {} templates",
-                                        v.name, context
-                                    ),
-                                    *span,
-                                )
-                                .with_label(Label::new(v.span, "graph variables not supported here"))
-                                .with_help(
-                                    "Use GRAPH <iri> { ... } with an explicit graph IRI, or rewrite to a fixed target graph.",
-                                ),
-                            );
-                        }
-                    }
+                QuadPatternElement::Graph { triples, .. } => {
                     if reject_blank_nodes {
                         for triple in triples {
                             self.validate_no_blank_nodes_in_delete_triple(triple, context);
@@ -435,45 +433,38 @@ impl<'a> Validator<'a> {
     /// constants addressing the existing stored node.
     fn validate_no_blank_nodes_in_delete_triple(&mut self, triple: &TriplePattern, context: &str) {
         if let SubjectTerm::BlankNode(bn) = &triple.subject {
-            self.reject_blank_node_in_delete(&bn.value, bn.span, context);
+            self.reject_blank_node_in_delete(bn, context);
         }
         if let Term::BlankNode(bn) = &triple.object {
-            self.reject_blank_node_in_delete(&bn.value, bn.span, context);
+            self.reject_blank_node_in_delete(bn, context);
         }
     }
 
-    fn reject_blank_node_in_delete(
-        &mut self,
-        value: &BlankNodeValue,
-        span: SourceSpan,
-        context: &str,
-    ) {
-        let label = match value {
-            BlankNodeValue::Labeled(l) => {
-                if l.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
-                    // Fluree stable id: denotes the stored node, not a fresh one.
-                    return;
-                }
-                format!("_:{l}")
-            }
-            BlankNodeValue::Anon => "[]".to_string(),
+    fn reject_blank_node_in_delete(&mut self, bn: &BlankNode, context: &str) {
+        let span = bn.span;
+        if bn.label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+            // Fluree stable id: denotes the stored node, not a fresh one.
+            return;
+        }
+        // A label the parser reserved (`[]`, `[ … ]`, `( … )`) is not one the
+        // user wrote, so the message names only the span.
+        let message = if bn.label.starts_with('-') {
+            format!("Blank node is not allowed in {context}")
+        } else {
+            format!("Blank node _:{} is not allowed in {context}", bn.label)
         };
         self.diagnostics.push(
-            Diagnostic::error(
-                DiagCode::BlankNodeInDelete,
-                format!("Blank node {label} is not allowed in {context}"),
-                span,
-            )
-            .with_label(Label::new(span, "blank node not allowed here"))
-            .with_help(
-                "SPARQL 1.1 Update forbids blank nodes in DELETE operations: a blank node \
+            Diagnostic::error(DiagCode::BlankNodeInDelete, message, span)
+                .with_label(Label::new(span, "blank node not allowed here"))
+                .with_help(
+                    "SPARQL 1.1 Update forbids blank nodes in DELETE operations: a blank node \
                  denotes a fresh node and can never match existing data. Use a variable \
                  bound by a WHERE clause, or a concrete IRI.",
-            )
-            .with_note(
-                "Fluree stable blank-node ids (_:fdb-...) are allowed here: they address \
+                )
+                .with_note(
+                    "Fluree stable blank-node ids (_:fdb-...) are allowed here: they address \
                  the existing stored node.",
-            ),
+                ),
         );
     }
 
@@ -679,7 +670,7 @@ impl<'a> Validator<'a> {
                 self.validate_graph_pattern(&query.pattern);
                 projection::check_projection_scope(
                     &query.variables,
-                    query.modifiers.group_by.as_ref(),
+                    &query.modifiers,
                     *span,
                     &mut self.diagnostics,
                 );
@@ -689,6 +680,11 @@ impl<'a> Validator<'a> {
                     &mut self.diagnostics,
                 );
                 projection::check_nested_aggregates(
+                    &query.variables,
+                    &query.modifiers,
+                    &mut self.diagnostics,
+                );
+                projection::check_aggregate_over_select_alias(
                     &query.variables,
                     &query.modifiers,
                     &mut self.diagnostics,
@@ -894,15 +890,24 @@ mod tests {
     }
 
     #[test]
-    fn test_delete_where_graph_variable_rejected() {
-        // Graph variables are unsupported in update templates (Phase 1), and
-        // the DELETE WHERE pattern is also the delete template.
+    fn test_delete_where_graph_variable_allowed() {
         let diags = validate_query("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
         assert!(
-            diags
-                .iter()
-                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
-            "GRAPH ?var should be rejected in DELETE WHERE: {diags:?}"
+            diags.iter().all(|d| !d.is_error()),
+            "GRAPH ?var should be allowed in DELETE WHERE: {diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_modify_graph_variable_templates_allowed() {
+        let diags = validate_query(
+            "DELETE { GRAPH ?g { ?s <http://example.org/p> \"old\" } } \
+             INSERT { GRAPH ?g { ?s <http://example.org/p> \"new\" } } \
+             WHERE { GRAPH ?g { ?s <http://example.org/p> \"old\" } }",
+        );
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "GRAPH ?var should be allowed in DELETE/INSERT templates: {diags:?}"
         );
     }
 
@@ -1081,10 +1086,8 @@ mod tests {
         );
         let diags = validate_with(&caps, "DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
         assert!(
-            diags
-                .iter()
-                .any(|d| d.code == DiagCode::UnsupportedGraphInUpdate),
-            "graph variables stay rejected in DELETE WHERE: {diags:?}"
+            diags.iter().all(|d| !d.is_error()),
+            "graph variables are allowed in DELETE WHERE: {diags:?}"
         );
         let diags = validate_with(
             &caps,
@@ -1386,6 +1389,66 @@ mod tests {
         let diags =
             validate_query("SELECT ?s WHERE { { SELECT ?o { ?s ?p ?o } GROUP BY ?s } ?s ?p ?o2 }");
         assert!(has_code(&diags, DiagCode::UngroupedVariableInProjection));
+    }
+
+    #[test]
+    fn test_projection_implicit_group_via_having_or_order_by() {
+        // §18.2.4.1: an aggregate in HAVING or ORDER BY groups the level too,
+        // so a projected variable must be a key or aggregated there as well.
+        for query in [
+            "SELECT ?o WHERE { ?s ?p ?o } HAVING (COUNT(*) > 1)",
+            "SELECT (STR(?o) AS ?x) WHERE { ?s ?p ?o } HAVING (COUNT(*) > 1)",
+            "SELECT ?o WHERE { ?s ?p ?o } ORDER BY DESC(COUNT(?o))",
+        ] {
+            let diags = validate_query(query);
+            assert!(
+                has_code(&diags, DiagCode::UngroupedVariableInProjection),
+                "{query}: {diags:?}"
+            );
+        }
+        // Not grouped: HAVING without an aggregate, or SELECT * (which projects
+        // the keys — none — under implicit grouping).
+        for query in [
+            "SELECT ?o WHERE { ?s ?p ?o } HAVING (?o > 1)",
+            "SELECT * WHERE { ?s ?p ?o } HAVING (COUNT(*) > 1)",
+        ] {
+            let diags = validate_query(query);
+            assert!(
+                !diags.iter().any(Diagnostic::is_error),
+                "{query}: {diags:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aggregate_over_same_level_select_alias_rejected() {
+        for query in [
+            "SELECT ?s (STR(?o) AS ?x) (COUNT(?x) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s",
+            "SELECT ?s (STR(?o) AS ?x) WHERE { ?s ?p ?o } GROUP BY ?s HAVING (COUNT(?x) > 1)",
+            "SELECT ?s (COUNT(?o) AS ?n) WHERE { ?s ?p ?o } GROUP BY ?s ORDER BY (SUM(?n))",
+            "SELECT ?s WHERE { { SELECT ?s (STR(?o) AS ?x) (COUNT(?x) AS ?c) \
+             WHERE { ?s ?p ?o } GROUP BY ?s } }",
+        ] {
+            let diags = validate_query(query);
+            let diag = diags
+                .iter()
+                .find(|d| d.code == DiagCode::AggregateOverSelectAlias)
+                .unwrap_or_else(|| panic!("{query}: {diags:?}"));
+            assert!(
+                diag.message
+                    .contains("is assigned by this SELECT clause, after aggregation"),
+                "{}",
+                diag.message
+            );
+        }
+        // The aggregate reads a WHERE variable, not the alias: fine.
+        let diags = validate_query(
+            "SELECT ?s (STR(?s) AS ?x) (COUNT(?o) AS ?c) WHERE { ?s ?p ?o } GROUP BY ?s",
+        );
+        assert!(
+            !has_code(&diags, DiagCode::AggregateOverSelectAlias),
+            "{diags:?}"
+        );
     }
 
     // =========================================================================

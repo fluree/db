@@ -29,6 +29,8 @@ pub struct ConfigReasoningBudget {
     pub max_facts: Option<u64>,
     /// `f:reasoningMaxSeconds` — max materialization wall-clock seconds.
     pub max_seconds: Option<u64>,
+    /// `f:reasoningMaxMemoryMb` — max megabytes of derived facts.
+    pub max_memory_mb: Option<u64>,
     /// Whether these values override a query-supplied budget.
     pub force: bool,
 }
@@ -39,9 +41,11 @@ impl ConfigReasoningBudget {
         if self.force {
             modes.max_facts = self.max_facts;
             modes.max_seconds = self.max_seconds;
+            modes.max_memory_mb = self.max_memory_mb;
         } else {
             modes.max_facts = modes.max_facts.or(self.max_facts);
             modes.max_seconds = modes.max_seconds.or(self.max_seconds);
+            modes.max_memory_mb = modes.max_memory_mb.or(self.max_memory_mb);
         }
     }
 }
@@ -196,6 +200,12 @@ pub struct GraphDb {
     /// Carried on `GraphDb` so downstream callers can apply identity gating
     /// at request time without re-reading the config graph.
     pub(crate) resolved_config: Option<ResolvedConfig>,
+    /// Successful resolution found no config; distinct from not yet resolved.
+    pub(crate) config_absent: bool,
+    /// This view's own union default graph switch, ahead of the ledger's
+    /// `f:unionDefaultGraph` and behind the query's; see
+    /// [`Self::with_union_default_graph`].
+    pub(crate) union_default_graph: Option<bool>,
 
     // ========================================================================
     // Datalog config (from config graph, applied at query boundary)
@@ -219,14 +229,15 @@ pub struct GraphDb {
     ///
     /// `wrap_policy` and `query` are separate Rust API calls but
     /// model a single HTTP request; if both touch the same model
-    /// ledger M, they must observe the same `resolved_t` for M.
+    /// ledger M, they must observe the same head of M.
     /// Carrying this map on the view lets `wrap_policy` capture
-    /// M's head-t and the subsequent `query` reuse that capture
+    /// M's head and the subsequent `query` reuse that capture
     /// when building its own `ResolveCtx`.
     ///
     /// Empty by default. Cloned via `Arc` so policy-wrap doesn't
     /// inflate the cached `GraphDb` cost.
-    pub(crate) cross_ledger_resolved_ts: Arc<std::collections::HashMap<String, i64>>,
+    pub(crate) cross_ledger_resolved_heads:
+        Arc<std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -235,6 +246,15 @@ pub struct GraphDb {
     /// rather than a real ledger. Query patterns should be auto-wrapped in
     /// `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
     pub(crate) graph_source_id: Option<Arc<str>>,
+    /// The table state a time-specified graph-source view reads
+    /// (`alias@time:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
+    /// provider before execution; `None` reads the source's current state.
+    pub(crate) graph_source_time: Option<fluree_db_query::r2rml::SourceTime>,
+    /// The snapshot is a graph source's empty genesis. Set together with
+    /// `graph_source_id`, and kept when a system graph is selected (which
+    /// drops `graph_source_id`), because the view's own id still names the
+    /// graph source: see [`Self::member_kind`].
+    pub(crate) over_graph_source: bool,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -295,12 +315,16 @@ impl GraphDb {
             default_context: None,
             ledger_config: None,
             resolved_config: None,
+            config_absent: false,
+            union_default_graph: None,
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
             rules_source_g_id: None,
-            cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
+            cross_ledger_resolved_heads: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
+            graph_source_time: None,
+            over_graph_source: false,
         }
     }
 
@@ -407,18 +431,39 @@ impl GraphDb {
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
         }
 
+        // The binary lane resolves overlay flakes through the persisted
+        // dictionary plus `DictNovelty`, both committed-state artefacts: the
+        // subjects and strings this transaction introduces are in neither.
+        // Read through a view-local extension of the base dictionaries, as
+        // SHACL and post-state policy do, so a preview neither fails to
+        // translate its own flakes nor re-walks the whole novelty per scan.
+        let staged_flakes = staged.view.staged_flakes();
+        let (dict_novelty, runtime_small_dicts) =
+            match fluree_db_transact::staged_dicts(base, staged_flakes)? {
+                Some(dicts) => {
+                    let provider = dicts.provider(snapshot.shared_namespaces());
+                    Arc::make_mut(&mut snapshot).range_provider = Some(provider);
+                    (dicts.dict_novelty, dicts.runtime_small_dicts)
+                }
+                None => {
+                    let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
+                    runtime_small_dicts.populate_from_flakes(staged_flakes);
+                    (
+                        Arc::clone(&base.dict_novelty),
+                        Arc::new(runtime_small_dicts),
+                    )
+                }
+            };
+
         // Clone base novelty and merge staged flakes into it so queries see
         // both committed and staged data.
         let mut combined = (*base.novelty).clone();
-        let staged_flakes = staged.view.staged_flakes().to_vec();
-        let mut runtime_small_dicts = (*base.runtime_small_dicts).clone();
         if !staged_flakes.is_empty() {
-            runtime_small_dicts.populate_from_flakes(&staged_flakes);
             let reverse_graph = snapshot
                 .build_reverse_graph()
                 .map_err(|e| crate::ApiError::internal(e.to_string()))?;
             combined
-                .apply_commit(staged_flakes, staged_t, &reverse_graph)
+                .apply_commit(staged_flakes.to_vec(), staged_t, &reverse_graph)
                 .map_err(|e| {
                     crate::ApiError::internal(format!(
                         "Failed to merge staged flakes into novelty: {e}"
@@ -435,8 +480,8 @@ impl GraphDb {
             staged_t,
             base.ledger_id(),
         );
-        gdb.dict_novelty = Some(base.dict_novelty.clone());
-        gdb.runtime_small_dicts = Some(Arc::new(runtime_small_dicts));
+        gdb.dict_novelty = Some(dict_novelty);
+        gdb.runtime_small_dicts = Some(runtime_small_dicts);
         // Carry binary store from the base ledger state
         gdb.binary_store = base
             .binary_store
@@ -496,6 +541,9 @@ impl GraphDb {
     /// let view = view.as_of(50);
     /// ```
     pub fn as_of(mut self, t: i64) -> Self {
+        if self.t != t {
+            self.clear_config_resolution();
+        }
         self.t = t;
         self
     }
@@ -513,6 +561,16 @@ impl GraphDb {
     /// `range_with_overlay()` must ensure the underlying `LedgerSnapshot.range_provider`
     /// is scoped appropriately for the chosen graph.
     pub fn with_graph_id(mut self, graph_id: GraphId) -> Self {
+        if self.graph_id != graph_id {
+            self.clear_config_resolution();
+            // Only the default graph routes to a virtual source's provider.
+            // Its system graphs read the empty genesis snapshot; dropping the
+            // model config must also drop the virtual-data routing tag.
+            if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                self.graph_source_id = None;
+                self.graph_source_time = None;
+            }
+        }
         self.graph_id = graph_id;
         self
     }
@@ -584,6 +642,28 @@ impl GraphDb {
         self
     }
 
+    fn clear_config_resolution(&mut self) {
+        self.config_absent = false;
+        self.resolved_config = None;
+        self.ledger_config = None;
+        self.rules_source_g_id = None;
+    }
+
+    pub(crate) fn config_is_resolved(&self) -> bool {
+        self.config_absent || self.resolved_config.is_some()
+    }
+
+    /// Set whether a query on this view reads its default graph as the union
+    /// of the ledger's default graph and its named graphs, whatever the
+    /// ledger's `f:unionDefaultGraph` says. A query's own switch still wins.
+    ///
+    /// A write-branch probe sets it off: it must see what the write will
+    /// stage against, and writes go to the default graph alone.
+    pub(crate) fn with_union_default_graph(mut self, on: bool) -> Self {
+        self.union_default_graph = Some(on);
+        self
+    }
+
     /// Get the full ledger config (if any).
     pub fn ledger_config(&self) -> Option<&LedgerConfig> {
         self.ledger_config.as_deref()
@@ -648,18 +728,23 @@ impl GraphDb {
     }
 
     /// Replace the carried governance-context capture (per-ledger
-    /// `resolved_t`s seen so far in this logical request).
-    pub fn with_cross_ledger_resolved_ts(
+    /// model heads seen so far in this logical request).
+    pub fn with_cross_ledger_resolved_heads(
         mut self,
-        ts: Arc<std::collections::HashMap<String, i64>>,
+        heads: Arc<
+            std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>,
+        >,
     ) -> Self {
-        self.cross_ledger_resolved_ts = ts;
+        self.cross_ledger_resolved_heads = heads;
         self
     }
 
     /// Read the carried governance-context capture.
-    pub fn cross_ledger_resolved_ts(&self) -> &Arc<std::collections::HashMap<String, i64>> {
-        &self.cross_ledger_resolved_ts
+    pub fn cross_ledger_resolved_heads(
+        &self,
+    ) -> &Arc<std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>>
+    {
+        &self.cross_ledger_resolved_heads
     }
 }
 
@@ -741,6 +826,16 @@ impl GraphDb {
         self.policy_enforcer.as_ref()
     }
 
+    /// What this view reads, for the executor's graph-source classification:
+    /// a view over a ledger is never looked up as a graph source.
+    pub(crate) fn member_kind(&self) -> fluree_db_query::MemberKind {
+        if self.graph_source_id.is_some() || self.over_graph_source {
+            fluree_db_query::MemberKind::GraphSource
+        } else {
+            fluree_db_query::MemberKind::Native
+        }
+    }
+
     /// Check if this is a root/unrestricted policy view.
     ///
     /// Returns `true` if no policy is attached, or if the policy is root.
@@ -771,6 +866,7 @@ impl GraphDb {
             // no permissive default denies every non-schema flake up front, in
             // `evaluate::allow_view_flake`, before any policy runs.
             denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
+            unevaluable_policies: Vec::new(),
         })
     }
 }

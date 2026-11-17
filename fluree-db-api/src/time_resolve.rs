@@ -1,7 +1,7 @@
 //! Index-based time travel resolution
 //!
 //! Replaces commit-chain walking with efficient O(log n) index queries for
-//! resolving `@iso:<datetime>` and `@commit:<prefix>` time travel specifiers.
+//! resolving `@time:<datetime>` and `@commit:<prefix>` time travel specifiers.
 //!
 //! # Background
 //!
@@ -25,11 +25,24 @@ use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
 use crate::error::{ApiError, Result};
 
 /// Convert epoch milliseconds to an ISO-8601 string for error messages.
-fn epoch_ms_to_iso(epoch_ms: i64) -> String {
+/// Epoch milliseconds as RFC 3339 (`2024-01-15T10:30:00.000Z`) for error text
+/// that names an instant; the one renderer every time-travel error uses.
+pub(crate) fn epoch_ms_to_iso(epoch_ms: i64) -> String {
     Utc.timestamp_millis_opt(epoch_ms)
         .single()
-        .map(|dt| dt.to_rfc3339())
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
         .unwrap_or_else(|| epoch_ms.to_string())
+}
+
+/// Parse the timestamp of a `@time:` / `@recorded:` selector. The one parser
+/// for every surface, so a malformed timestamp is the same (user) error on a
+/// ledger and on a graph source.
+pub(crate) fn parse_time_travel_iso(iso: &str) -> Result<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
+        ApiError::invalid_query(format!(
+            "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
+        ))
+    })
 }
 
 /// Resolve an ISO-8601 datetime to a transaction number using POST index queries.
@@ -91,11 +104,13 @@ where
     };
     tracing::debug!(earliest_time, "datetime_to_t: earliest ledger#time");
 
-    // Check if target is before earliest commit
+    // A time before the ledger existed is the caller's mistake, not a fault:
+    // a 400 on every surface that resolves one (query, export, branch, and a
+    // multi-query `asOf`).
     if target_epoch_ms < earliest_time {
         let target_iso = epoch_ms_to_iso(target_epoch_ms);
         let earliest_iso = epoch_ms_to_iso(earliest_time);
-        return Err(ApiError::internal(format!(
+        return Err(ApiError::invalid_query(format!(
             "There is no data as of {target_iso} (earliest commit is at {earliest_iso})"
         )));
     }
@@ -245,7 +260,7 @@ where
             // before the earliest receivedAt.
             let target_iso = epoch_ms_to_iso(target_epoch_ms);
             let earliest_iso = epoch_ms_to_iso(earliest_recv);
-            return Err(ApiError::internal(format!(
+            return Err(ApiError::invalid_query(format!(
                 "There is no data recorded as of {target_iso} (earliest commit was recorded \
                  at {earliest_iso})"
             )));
@@ -275,7 +290,10 @@ where
 ///
 /// # Algorithm
 ///
-/// 1. Normalize the prefix (strip `fluree:commit:` and `sha256:` if present)
+/// 1. Normalize the prefix to a hex digest via
+///    [`normalize_commit_ref`](crate::ledger_view::normalize_commit_ref) —
+///    shared with `ledger_view::resolve_commit_prefix`, the other copy of this
+///    scan, so the two surfaces accept exactly the same spellings
 /// 2. Bounded SPOT scan: `[Sid(FLUREE_COMMIT, prefix), Sid(FLUREE_COMMIT, prefix~))`
 /// 3. Track unique commit subjects
 /// 4. Return `flake.t` from the single match (or error on 0 / >1)
@@ -284,12 +302,14 @@ where
 ///
 /// * `snapshot` - The database snapshot to query
 /// * `overlay` - Optional overlay provider (novelty) for uncommitted data
-/// * `commit_prefix` - Commit CID prefix to match (hex digest, with or without standard prefixes)
+/// * `commit_prefix` - Commit CID prefix to match (hex digest, a full CID, or
+///   either with the `fluree:commit:` / `sha256:` wrapper)
 /// * `current_t` - Current head transaction number
 ///
 /// # Errors
 ///
 /// - If prefix is too short (< 6 chars) or too long (> 64 chars)
+/// - If the prefix is an abbreviated CID rather than a hex digest
 /// - If no commit matches the prefix
 /// - If multiple commits match (ambiguous prefix)
 pub async fn commit_to_t<O>(
@@ -301,29 +321,9 @@ pub async fn commit_to_t<O>(
 where
     O: OverlayProvider + ?Sized,
 {
-    // Step 1: Normalize the commit prefix
-    // Strip "fluree:commit:" prefix if present
-    let normalized = commit_prefix
-        .strip_prefix("fluree:commit:")
-        .unwrap_or(commit_prefix);
-    // Strip "sha256:" prefix if present
-    let normalized = normalized.strip_prefix("sha256:").unwrap_or(normalized);
-
-    // Validation: minimum 6 characters for useful prefix matching
-    if normalized.len() < 6 {
-        return Err(ApiError::query(format!(
-            "Commit prefix must be at least 6 characters, got {}",
-            normalized.len()
-        )));
-    }
-
-    // SHA-256 in hex is 64 characters
-    if normalized.len() > 64 {
-        return Err(ApiError::query(format!(
-            "Commit prefix too long ({} chars). SHA-256 in hex is 64 characters.",
-            normalized.len()
-        )));
-    }
+    // Step 1: Normalize the commit prefix to the hex digest the index is keyed on.
+    let normalized = crate::ledger_view::normalize_commit_ref(commit_prefix)?;
+    let normalized = normalized.as_str();
 
     // Step 2: Create bounded SPOT scan
     // Commit subjects use the FLUREE_COMMIT namespace with hex hash as name
@@ -398,32 +398,20 @@ where
     }
 
     // Step 4: Return result based on match count
+    // `CommitNotFound`, not `NotFound`: `load_view_from_source` takes any
+    // `is_not_found()` from `db_at` to mean the source is not a ledger.
     match matching_commits.len() {
-        0 => Err(ApiError::query(format!(
+        0 => Err(ApiError::CommitNotFound(format!(
             "No commit found with prefix: {normalized}"
         ))),
         1 => {
             let (_, t) = matching_commits[0];
             Ok(t)
         }
-        _ => {
-            // Multiple matches - ambiguous prefix
-            let commit_ids: Vec<String> = matching_commits
-                .iter()
-                .take(5)
-                .map(|(sid, _)| format!("fluree:commit:sha256:{}", sid.name))
-                .collect();
-            Err(ApiError::query(format!(
-                "Ambiguous commit prefix: {}. Multiple commits match: {:?}{}",
-                normalized,
-                commit_ids,
-                if matching_commits.len() > 5 {
-                    " ..."
-                } else {
-                    ""
-                }
-            )))
-        }
+        _ => Err(crate::ledger_view::ambiguous_commit_prefix(
+            normalized,
+            matching_commits.iter().map(|(sid, _)| sid.name.as_ref()),
+        )),
     }
 }
 
@@ -439,17 +427,7 @@ pub(crate) async fn resolve_time_spec(
         crate::TimeSpec::AtT(t) => Ok(*t),
         crate::TimeSpec::Latest => Ok(current_t),
         crate::TimeSpec::AtTime(iso) => {
-            let dt = chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
-                ApiError::internal(format!(
-                    "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-                ))
-            })?;
-            // `ledger#time` flakes store epoch milliseconds. Ceiling sub-ms precision
-            // to avoid truncation off-by-one.
-            let mut target_epoch_ms = dt.timestamp_millis();
-            if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
-                target_epoch_ms += 1;
-            }
+            let target_epoch_ms = iso_to_target_epoch_ms(iso)?;
             datetime_to_t(
                 &ledger.snapshot,
                 Some(ledger.novelty.as_ref()),
@@ -477,6 +455,9 @@ pub(crate) async fn resolve_time_spec(
             )
             .await
         }
+        crate::TimeSpec::AtSnapshot(_) => Err(ApiError::invalid_query(
+            crate::graph_source::SNAPSHOT_SPEC_ON_LEDGER,
+        )),
     }
 }
 
@@ -484,11 +465,7 @@ pub(crate) async fn resolve_time_spec(
 /// precision to avoid truncation off-by-one (commit-timestamp flakes store
 /// epoch milliseconds).
 pub(crate) fn iso_to_target_epoch_ms(iso: &str) -> Result<i64> {
-    let dt = chrono::DateTime::parse_from_rfc3339(iso).map_err(|e| {
-        ApiError::internal(format!(
-            "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-        ))
-    })?;
+    let dt = parse_time_travel_iso(iso)?;
     let mut target_epoch_ms = dt.timestamp_millis();
     if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
         target_epoch_ms += 1;

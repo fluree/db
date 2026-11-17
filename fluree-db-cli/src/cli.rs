@@ -156,6 +156,9 @@ impl PolicyArgs {
             },
             policy: self.resolve_policy()?,
             policy_values: self.resolve_policy_values()?,
+            // The CLI has no auth layer, so there is no verified identity to carry:
+            // `f:IdentityRestricted` override control always denies CLI requests.
+            server_identity: None,
             // Neither flag stays unset so the ledger's `f:defaultAllow` can
             // apply; `--no-default-allow` is the explicit fail-closed spelling.
             default_allow: self.default_allow_opt(),
@@ -264,7 +267,7 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 0)]
     pub parallelism: usize,
 
-    /// Timeout in seconds for remote HTTP requests (default: 300).
+    /// Timeout in seconds for remote HTTP requests.
     /// Set higher for long-running queries or transactions.
     #[arg(long, global = true, default_value_t = 300)]
     pub timeout: u64,
@@ -301,20 +304,8 @@ pub enum Commands {
         #[arg(long)]
         from: Option<PathBuf>,
 
-        /// CSV/Cypher import: how properties on a relationship (edge) are
-        /// stored. `annotated` (default) keeps them as RDF 1.2 / LPG
-        /// `@annotation` (queryable from Cypher and SPARQL); `plain` drops
-        /// them for pure RDF; `nary` (an intermediate node) is not
-        /// implemented yet.
-        #[arg(long, value_enum, default_value_t = EdgeProperties::Annotated)]
-        edge_properties: EdgeProperties,
-
-        /// CSV/Cypher import: base IRI namespace for minted ids, predicates,
-        /// and classes (e.g. `--base-iri http://ldbc.example/`). CSV defaults
-        /// to `http://example.org/`; Cypher defaults to bare names
-        /// (namespace 0), which zero-config Cypher queries read directly.
-        #[arg(long)]
-        base_iri: Option<String>,
+        #[command(flatten)]
+        import: ImportArgs,
 
         /// Import memory history from a git-tracked .fluree-memory/ directory.
         /// Each git commit becomes a Fluree transaction, enabling time-travel
@@ -327,45 +318,11 @@ pub enum Commands {
         #[arg(long)]
         no_user: bool,
 
-        /// Chunk size in MB for splitting large Turtle files (0 = derive from memory budget).
-        /// Only used when --from points to a .ttl file.
-        #[arg(long, default_value_t = 0)]
-        chunk_size_mb: usize,
-
-        /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
-        /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
-        #[arg(long, default_value_t = 0)]
-        memory_budget_mb: usize,
-
-        /// Number of parallel parse threads for bulk import.
-        /// 0 = auto (most logical cores, capped to fit the memory budget).
-        /// Explicit values are honored as-is (not capped), floored at 1.
-        #[arg(long, default_value_t = 0)]
-        parallelism: usize,
-
-        /// Namespace that salts the blank-node ids this import mints.
-        /// Defaults to the ledger id, so importing one source tree into two
-        /// ledgers gives them disjoint blank nodes. Pass the same value to
-        /// both to make them mint IDENTICAL ids instead — for a
-        /// rebuild-and-diff, a sharded load of one logical dataset, or a
-        /// staging/production pair you want to compare node-for-node.
-        /// Any string; two imports match iff they agree on it.
-        #[arg(long)]
-        skolem_namespace: Option<String>,
-
-        /// Records per leaflet in index files. Default: 25000.
-        /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
-        #[arg(long, default_value_t = 25_000)]
-        leaflet_rows: usize,
-
-        /// Leaflets per leaf file. Default: 10.
-        /// Larger values produce fewer leaf files (shallower tree, bigger reads).
-        #[arg(long, default_value_t = 10)]
-        leaflets_per_leaf: usize,
-
         /// Create the ledger on a remote server (by remote name, e.g., "origin").
-        /// Only valid with empty creates — incompatible with --from/--memory.
-        /// Use `fluree publish` if you also need to push local commits.
+        /// Empty, or with `--from`: a `.flpack` archive is restored on the
+        /// server, and a single source file is imported there when the server
+        /// offers source uploads. Incompatible with `--memory`. Use
+        /// `fluree publish` if you also need to push local commits.
         #[arg(long)]
         remote: Option<String>,
     },
@@ -434,7 +391,7 @@ pub enum Commands {
         action: GraphAction,
     },
 
-    /// Create, list, sync, or drop BM25 full-text search indexes (graph sources).
+    /// Create, list, sync, or drop BM25 full-text search indexes (graph sources)
     ///
     /// These commands run against a server when one is reachable — `--remote
     /// <name>` picks a configured remote, and otherwise a locally-running server
@@ -449,6 +406,7 @@ pub enum Commands {
     ///   fluree bm25 list --stale
     ///   fluree bm25 sync --index silver-search:main
     ///   fluree bm25 drop --index silver-search:main
+    #[command(verbatim_doc_comment)]
     Bm25 {
         #[command(subcommand)]
         action: Bm25Action,
@@ -461,8 +419,9 @@ pub enum Commands {
     ///   fluree insert -f data.ttl
     ///   fluree insert mydb -f data.jsonld
     ///   cat data.ttl | fluree insert
+    #[command(verbatim_doc_comment)]
     Insert {
-        /// Optional ledger name and/or inline data.
+        /// Optional ledger name and/or inline data
         ///
         /// With 0 args: uses active ledger; provide data via -e, -f, or stdin.
         /// With 1 arg: if it looks like data (JSON or Turtle), uses it as
@@ -470,6 +429,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -486,7 +446,7 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Data format (turtle or jsonld); auto-detected if omitted
+        /// Data format (turtle, trig or jsonld); auto-detected if omitted
         #[arg(long)]
         format: Option<String>,
 
@@ -505,8 +465,9 @@ pub enum Commands {
     ///   fluree update -f update.json
     ///   fluree update -f update.ru --format sparql
     ///   cat update.json | fluree update
+    #[command(verbatim_doc_comment)]
     Update {
-        /// Optional ledger name and/or inline data.
+        /// Optional ledger name and/or inline data
         ///
         /// With 0 args: uses active ledger; provide data via -e, -f, or stdin.
         /// With 1 arg: if it looks like data (JSON or SPARQL UPDATE), uses it as
@@ -514,6 +475,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -548,8 +510,9 @@ pub enum Commands {
     ///   fluree upsert '<http://example.org/alice> <http://example.org/name> "Alice" .'
     ///   fluree upsert mydb -f data.ttl
     ///   cat data.jsonld | fluree upsert
+    #[command(verbatim_doc_comment)]
     Upsert {
-        /// Optional ledger name and/or inline data.
+        /// Optional ledger name and/or inline data
         ///
         /// With 0 args: uses active ledger; provide data via -e, -f, or stdin.
         /// With 1 arg: if it looks like data (JSON or Turtle), uses it as
@@ -557,6 +520,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline data.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -573,7 +537,7 @@ pub enum Commands {
         #[arg(short = 'f', long = "file")]
         file: Option<PathBuf>,
 
-        /// Data format (turtle or jsonld); auto-detected if omitted
+        /// Data format (turtle, trig or jsonld); auto-detected if omitted
         #[arg(long)]
         format: Option<String>,
 
@@ -585,8 +549,9 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Synchronize a named graph: make its contents exactly the supplied
-    /// data, committing only the delta.
+    /// Make a graph's contents exactly the supplied data, committing only the delta
+    ///
+    /// Targets the default graph unless --graph names another.
     ///
     /// The target graph is the constant; the SOURCE of the desired contents
     /// is pluggable. Today the source is RDF text (Turtle or JSON-LD) from a
@@ -594,9 +559,11 @@ pub enum Commands {
     /// mapped sources (R2RML over Iceberg / CSV / Excel) will plug in.
     ///
     /// Examples:
+    ///   fluree sync mydb -f data.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl
     ///   fluree sync mydb --graph urn:example:ontology -f ontology.ttl --dry-run
     ///   cat export.jsonld | fluree sync --graph urn:example:ontology --remote origin
+    #[command(verbatim_doc_comment)]
     Sync {
         /// Optional ledger name and/or inline data (same resolution rules
         /// as `upsert`: 0 args = active ledger + -e/-f/stdin; 1 arg = data,
@@ -608,10 +575,10 @@ pub enum Commands {
         #[arg(short = 'l', long)]
         ledger: Option<String>,
 
-        /// Target named graph IRI — the sync scope. Required; the payload
-        /// never widens or narrows it.
+        /// Target named graph IRI — the sync scope; the payload never widens
+        /// or narrows it. Omit it to sync the default graph.
         #[arg(short = 'g', long)]
-        graph: String,
+        graph: Option<String>,
 
         /// Inline data expression (Turtle or JSON-LD).
         #[arg(short = 'e', long = "expr")]
@@ -648,8 +615,7 @@ pub enum Commands {
         policy: PolicyArgs,
     },
 
-    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD
-    /// template (the `LOAD CSV` analog).
+    /// Bulk-upsert CSV rows into a ledger via a per-row Cypher or JSON-LD template (the `LOAD CSV` analog)
     ///
     /// Reads the CSV locally and streams it to the ledger — local or remote —
     /// one batch per transaction (one commit each). All cell values are
@@ -666,6 +632,7 @@ pub enum Commands {
     ///     --cypher 'MERGE (n:Person {id: row.id}) SET n.name = row.name'
     ///   fluree load people --from people.csv \
     ///     --jsonld '{"where":{"@id":"?s","ex:id":"?id"},"insert":{"@id":"?s","ex:name":"?name"}}'
+    #[command(verbatim_doc_comment)]
     Load {
         /// Ledger name (defaults to the active ledger).
         ledger: Option<String>,
@@ -703,8 +670,9 @@ pub enum Commands {
     ///   fluree query mydb '{"select": ["*"], "where": {"@type": "Person"}}'
     ///   fluree query -f query.sparql
     ///   cat query.rq | fluree query
+    #[command(verbatim_doc_comment)]
     Query {
-        /// Optional ledger name and/or inline query.
+        /// Optional ledger name and/or inline query
         ///
         /// With 0 args: uses active ledger; provide query via -e, -f, or stdin.
         /// With 1 arg: if it looks like a query (SPARQL or JSON-LD), uses it
@@ -712,6 +680,7 @@ pub enum Commands {
         ///   reads from it; otherwise treats it as a ledger name.
         /// With 2 args: first is ledger name, second is inline query.
         #[arg(num_args = 0..=2)]
+        #[arg(verbatim_doc_comment)]
         args: Vec<String>,
 
         /// Ledger name (defaults to active ledger). Explicit alternative to
@@ -771,7 +740,15 @@ pub enum Commands {
         #[arg(long, conflicts_with_all = ["sparql", "jsonld"])]
         cypher: bool,
 
-        /// Query at a specific point in time (transaction number, commit hash, or ISO-8601 timestamp)
+        /// Query at a specific point in time.
+        ///
+        /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
+        /// `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the
+        /// wall-clock time the commit was recorded), and `commit:<prefix>`
+        /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
+        /// timestamp, or commit prefix also works; a bare integer is read as
+        /// a transaction number, so use `commit:<prefix>` to force a prefix
+        /// that is all digits.
         #[arg(long)]
         at: Option<String>,
 
@@ -838,6 +815,7 @@ pub enum Commands {
     ///
     /// See `docs/api/multi-query.md` for the full envelope wire format.
     #[command(name = "multi-query")]
+    #[command(verbatim_doc_comment)]
     MultiQuery {
         /// Optional path to envelope JSON file. With 0 args reads from
         /// stdin (or use -e / -f).
@@ -887,11 +865,17 @@ pub enum Commands {
         #[arg(short = 'l', long)]
         ledger: Option<String>,
 
-        /// Start of time range (transaction number, default: 1)
+        /// Start of time range (default: 1).
+        ///
+        /// Same spellings as `query --at`: `t:<N>`, `t:latest`/`latest`,
+        /// `time:<ISO-8601>` (`iso:` is an alias), `recorded:<ISO-8601>`, `commit:<prefix>`, or a
+        /// bare transaction number / timestamp / commit prefix.
         #[arg(long, default_value = "1")]
         from: String,
 
-        /// End of time range (transaction number or "latest", default: latest)
+        /// End of time range (default: latest).
+        ///
+        /// Same spellings as `--from`.
         #[arg(long, default_value = "latest")]
         to: String,
 
@@ -913,18 +897,7 @@ pub enum Commands {
         #[command(subcommand)]
         action: ContextAction,
     },
-    /// Validate data against SHACL shapes and print a validation report
-    ///
-    /// Ledger mode validates the current state of a local ledger against its
-    /// attached shapes (or ad-hoc shapes via --shacl / --shacl-graph).
-    /// File mode validates an RDF file in an ephemeral in-memory ledger —
-    /// nothing persists. Exits 1 when results at or above --fail-on exist.
-    ///
-    /// Examples:
-    ///   fluree validate mydb
-    ///   fluree validate mydb --shacl proposed-shapes.ttl
-    ///   fluree validate data.ttl --shacl shapes.ttl
-    ///   fluree validate data.jsonld --format jsonld
+
     /// Query a ledger through GraphQL
     ///
     /// The schema is derived from the ledger's own data — every class becomes a
@@ -936,6 +909,7 @@ pub enum Commands {
     ///   fluree graphql mydb '{ persons { id name } }'
     ///   fluree graphql mydb -f query.graphql --variables '{"n": 10}'
     #[cfg(feature = "graphql")]
+    #[command(verbatim_doc_comment)]
     Graphql {
         /// Optional ledger name and/or inline GraphQL document.
         ///
@@ -983,7 +957,20 @@ pub enum Commands {
         explain: bool,
     },
 
+    /// Validate data against SHACL shapes and print a validation report
+    ///
+    /// Ledger mode validates the current state of a local ledger against its
+    /// attached shapes (or ad-hoc shapes via --shacl / --shacl-graph).
+    /// File mode validates an RDF file in an ephemeral in-memory ledger —
+    /// nothing persists. Exits 1 when results at or above --fail-on exist.
+    ///
+    /// Examples:
+    ///   fluree validate mydb
+    ///   fluree validate mydb --shacl proposed-shapes.ttl
+    ///   fluree validate data.ttl --shacl shapes.ttl
+    ///   fluree validate data.jsonld --format jsonld
     #[cfg(feature = "shacl")]
+    #[command(verbatim_doc_comment)]
     Validate {
         /// Ledger name (with optional :branch) or an RDF data file
         /// (.ttl / .jsonld / .json). Defaults to the active ledger.
@@ -1027,10 +1014,11 @@ pub enum Commands {
         /// or ledger (`.flpack` archive — full ledger including commits and
         /// indexes, importable via `fluree create --from <file>.flpack`).
         ///
-        /// Note: exporting all graphs requires a dataset-capable format
+        /// Defaults to `turtle`, or to `ledger` when `-o` names a `.flpack`
+        /// file. Exporting all graphs requires a dataset-capable format
         /// (`trig` or `nquads`).
-        #[arg(long, default_value = "turtle")]
-        format: String,
+        #[arg(long)]
+        format: Option<String>,
 
         /// Write output to FILE instead of stdout. Required for --format ledger
         /// when stdout is a TTY (the archive is binary).
@@ -1042,17 +1030,35 @@ pub enum Commands {
         #[arg(long)]
         no_indexes: bool,
 
-        /// Export all named graphs (dataset export), including system graphs.
+        /// Export the default graph plus every named graph (dataset export).
         ///
         /// Use `--format trig` or `--format nquads` when this flag is set.
+        /// The ledger's own system graphs (`#txn-meta`, `#config`) are
+        /// excluded; see `--system-graphs`.
         #[arg(long)]
         all_graphs: bool,
+
+        /// Also emit the ledger's system graphs (`#txn-meta`, `#config`)
+        /// under `--all-graphs`. Diagnostic only — the result is named for
+        /// this ledger and does not re-import cleanly anywhere. Use
+        /// `--format ledger` to move a ledger.
+        #[arg(long, requires = "all_graphs")]
+        system_graphs: bool,
 
         /// Export a specific named graph by IRI.
         ///
         /// Mutually exclusive with `--all-graphs`.
         #[arg(long)]
         graph: Option<String>,
+
+        /// Emit edge annotations as raw `f:reifies*` system triples instead of
+        /// RDF 1.2 annotation syntax — the output of every release before 4.2.
+        ///
+        /// For consumers pinned to those bytes. Fluree's own write surfaces
+        /// reject hand-written `f:reifies*` triples, so this output only
+        /// re-imports through `fluree create --from`.
+        #[arg(long)]
+        raw_reifies: bool,
 
         /// JSON-LD context for prefix declarations (overrides ledger default).
         ///
@@ -1064,7 +1070,15 @@ pub enum Commands {
         #[arg(long, value_name = "FILE")]
         context_file: Option<std::path::PathBuf>,
 
-        /// Query at a specific point in time
+        /// Query at a specific point in time.
+        ///
+        /// Accepts `t:<N>` (transaction number), `t:latest`/`latest`,
+        /// `time:<ISO-8601>` (commit event time; `iso:` is an alias), `recorded:<ISO-8601>` (the
+        /// wall-clock time the commit was recorded), and `commit:<prefix>`
+        /// (hex digest, min 6 chars). A bare transaction number, ISO-8601
+        /// timestamp, or commit prefix also works; a bare integer is read as
+        /// a transaction number, so use `commit:<prefix>` to force a prefix
+        /// that is all digits.
         #[arg(long)]
         at: Option<String>,
 
@@ -1082,9 +1096,14 @@ pub enum Commands {
         #[arg(long)]
         oneline: bool,
 
-        /// Maximum number of commits to show
+        /// Maximum number of commits to show [default: 100]
         #[arg(short = 'n', long)]
         count: Option<usize>,
+
+        /// Show the whole chain, with no limit. Against a server this is still
+        /// bounded by the server's hard cap.
+        #[arg(long, conflicts_with = "count")]
+        all: bool,
 
         /// Execute against a remote server (by remote name, e.g., "origin")
         #[arg(long)]
@@ -1108,7 +1127,9 @@ pub enum Commands {
 
     /// Show the contents of a commit (decoded flakes with resolved IRIs)
     Show {
-        /// Commit identifier: t:<N>, hex-digest prefix (min 6 chars), or full CID
+        /// Commit identifier: `t:<N>` or a bare transaction number,
+        /// `commit:<prefix>` or a bare hex-digest prefix (min 6 chars), or a
+        /// full CID — same forms accepted by `branch create --at`.
         commit: String,
 
         /// Ledger name (defaults to active ledger)
@@ -1171,6 +1192,24 @@ pub enum Commands {
         action: AuthAction,
     },
 
+    /// Sign this machine in to a fluree.ai account
+    ///
+    /// Opens the account's approval page in a browser and waits while you
+    /// approve the code it shows. The sign-in is kept once per machine (not
+    /// per project) and refreshes itself; `fluree auth status` shows it.
+    Login {
+        /// Account service to sign in to
+        #[arg(long, value_name = "URL", default_value = crate::account::DEFAULT_ACCOUNT_URL)]
+        url: String,
+
+        /// Print the approval link instead of opening a browser (e.g. over SSH)
+        #[arg(long)]
+        no_browser: bool,
+    },
+
+    /// Sign this machine out of its fluree.ai account
+    Logout,
+
     /// Manage upstream tracking configuration
     Upstream {
         #[command(subcommand)]
@@ -1206,6 +1245,7 @@ pub enum Commands {
     ///
     /// Usage:
     ///   fluree publish <remote> [ledger]
+    #[command(verbatim_doc_comment)]
     Publish {
         /// Remote name (e.g., "origin")
         remote: String,
@@ -1224,6 +1264,7 @@ pub enum Commands {
     ///   fluree clone <remote> <ledger>                        # named-remote clone
     ///   fluree clone --origin <uri> <ledger>                  # CID-based clone
     ///   fluree clone --origin <uri> --token <tok> <ledger>    # with auth
+    #[command(verbatim_doc_comment)]
     Clone {
         /// Positional args: <remote> <ledger> (named-remote) or <ledger> (with --origin)
         #[arg(num_args = 1..=2)]
@@ -1312,6 +1353,18 @@ pub enum Commands {
         remote: Option<String>,
     },
 
+    /// Encryption at rest: held keys and key rotation
+    ///
+    /// Runs against a server (`--remote`) or, with `--connection-config`,
+    /// directly against the storage that config describes. A rotation
+    /// re-envelopes every blob on a retiring key under the current key, in
+    /// place and resumably; `verify` reports when none remain, which is the
+    /// signal to drop the old key from configuration.
+    Encryption {
+        #[command(subcommand)]
+        action: EncryptionAction,
+    },
+
     /// Manage the Fluree HTTP server
     Server {
         #[command(subcommand)]
@@ -1322,6 +1375,18 @@ pub enum Commands {
     Model {
         #[command(subcommand)]
         action: ModelAction,
+    },
+
+    /// Ontology tools for document extraction: what an HTTP reader reads, conversion, slicing
+    Ontology {
+        #[command(subcommand)]
+        action: OntologyAction,
+    },
+
+    /// Catalog tools for document extraction: records an extraction model links names to
+    Catalog {
+        #[command(subcommand)]
+        action: CatalogAction,
     },
 
     /// Developer memory — store and recall facts, decisions, constraints
@@ -1342,6 +1407,12 @@ pub enum Commands {
         action: DocsAction,
     },
 
+    /// Turn a folder of documents into a searchable graph: structure, chunks, embeddings
+    Doc {
+        #[command(subcommand)]
+        action: DocAction,
+    },
+
     /// Manage Apache Iceberg table connections
     Iceberg {
         #[command(subcommand)]
@@ -1354,29 +1425,34 @@ pub enum Commands {
         action: SqlAction,
     },
 
-    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg)
-    /// graph source: bulk-build every triple, verify it against the source, and
-    /// write it as a native ledger or a .flpack pack (DEC-003 Deliverable 1).
+    /// Manage Delta Lake graph sources (R2RML over Delta tables)
+    Delta {
+        #[command(subcommand)]
+        action: DeltaAction,
+    },
+
+    /// Materialize a native twin ledger from a virtual (R2RML-over-Iceberg) graph source
+    ///
+    /// Bulk-builds every triple, verifies it against the source, and writes it
+    /// as a native ledger or a .flpack pack.
     ///
     /// MACHINE-SAFETY: the default posture is co-resident-tolerant (a modest
     /// fixed memory budget + low parallelism, NOT own-the-box auto-sizing).
     /// Raise it explicitly with `--memory-budget-mb` / `--parallelism`, or pass
     /// `--max-performance` on a cleared machine to auto-size to the host.
     ///
-    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool (O1) — that
+    /// PARALLELISM: `--parallelism` sizes the produce-side worker pool — that
     /// many threads render + encode table batches concurrently (it also bounds the
-    /// concurrent snapshot pins and FK pre-index scans, O5). Default 2 (co-resident).
+    /// concurrent snapshot pins and FK pre-index scans). Default 2 (co-resident).
     ///
-    /// BUDGET MODEL: `--memory-budget-mb` now scales the chunk size for sub-2GB
-    /// budgets too (previously any budget below ~2GB underflowed to a fixed 128MB
-    /// chunk regardless — O6); below 2GB the chunk is ~budget×0.6 / working-set,
-    /// clamped to [16, 128] MB. Peak produce RAM ≈ parallelism × chunk × ~2.5 (one
-    /// chunk buffer + encoding sink per worker) plus the FK parent index. That
-    /// parent index — held resident for the whole build — is now CHARGED against the
-    /// budget (up to ~50% of it) and the build FAILS LOUD if it would overflow,
-    /// rather than silently OOM the host. Verify is memory-bounded in both modes
-    /// (O2): peak is O(sampled subjects) for `quick` and O(one external-sort run)
-    /// for `full`.
+    /// BUDGET MODEL: `--memory-budget-mb` scales the chunk size; below 2GB the
+    /// chunk is ~budget×0.6 / working-set, clamped to [16, 128] MB. Peak produce
+    /// RAM ≈ parallelism × chunk × ~2.5 (one chunk buffer + encoding sink per
+    /// worker) plus the FK parent index. That parent index — held resident for
+    /// the whole build — is CHARGED against the budget (up to ~50% of it) and the
+    /// build FAILS LOUD if it would overflow, rather than silently OOM the host.
+    /// Verify is memory-bounded in both modes: peak is O(sampled subjects) for
+    /// `quick` and O(one external-sort run) for `full`.
     Materialize {
         /// The virtual graph-source id to materialize (e.g. `dw-gs:main`).
         graph_source: String,
@@ -1388,7 +1464,7 @@ pub enum Commands {
 
         /// Output form: `pack` (a .flpack file, the default), `ledger` (a local
         /// native ledger, left registered), or `s3` (direct-S3 CAS publish —
-        /// not yet wired in the file-backed CLI; see DEC-003 §3).
+        /// not yet supported by the file-backed CLI).
         #[arg(long, value_enum, default_value_t = MaterializeOutput::Pack)]
         output: MaterializeOutput,
 
@@ -1420,13 +1496,9 @@ pub enum Commands {
         #[arg(long)]
         allow_mor_deletes: bool,
 
-        /// Proceed even if a foreign-key parent join key maps to MORE THAN ONE
-        /// parent row. By default the build is refused: the twin would bake one
-        /// deterministically-chosen parent per key (the lexicographically smallest)
-        /// and silently drop the rest — an R2RML RefObjectMap fan-out the builder
-        /// does not yet emit. With this flag the twin builds anyway and records the
-        /// anomaly (per-parent ambiguous-key counts) in its completion stamp.
-        /// Default: fail closed.
+        /// No effect; accepted for compatibility. A foreign-key parent join key
+        /// that matches more than one parent row gives one edge per distinct
+        /// parent subject, as R2RML specifies, so no source is refused for it.
         #[arg(long)]
         allow_duplicate_parent_keys: bool,
 
@@ -1449,13 +1521,12 @@ pub enum Commands {
 /// Output form for `fluree materialize`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum MaterializeOutput {
-    /// A `.flpack` pack file (prebuilt commits + index) — the negotiated door
-    /// for solo delivery. The default.
+    /// A `.flpack` pack file (prebuilt commits + index). The default.
     Pack,
     /// A local native ledger, left registered in this home.
     Ledger,
-    /// Direct-S3 CAS publish (the >40GB escape hatch). Not yet wired in the
-    /// file-backed CLI — see DEC-003 §3.
+    /// Direct-S3 CAS publish (for packs too large to ship as a file). Not yet
+    /// supported by the file-backed CLI.
     S3,
 }
 
@@ -1473,13 +1544,14 @@ pub enum MaterializeVerify {
 /// BM25 full-text index subcommands.
 #[derive(Subcommand)]
 pub enum Bm25Action {
-    /// Create a BM25 full-text search index over a ledger.
+    /// Create a BM25 full-text search index over a ledger
     ///
     /// The indexing query (FQL / JSON-LD) selects the documents and the text
     /// properties to index; it MUST select `@id`. Example indexing query:
     ///   {"@context":{"as":"https://www.w3.org/ns/activitystreams#"},
     ///    "where":{"@id":"?s"},
     ///    "select":{"?s":["@id","as:content","as:name","as:summary"]}}
+    #[command(verbatim_doc_comment)]
     Create {
         /// Graph-source name for the index (no ':'). The alias is
         /// `<name>:<branch>` (e.g. `silver-search:main`).
@@ -1571,6 +1643,84 @@ pub enum Bm25Action {
     },
 }
 
+/// Bulk-import options shared by `create --from` and `graph import`.
+#[derive(Args, Debug, Clone)]
+pub struct ImportArgs {
+    /// CSV/Cypher import: how properties on a relationship (edge) are
+    /// stored. `annotated` (default) keeps them as RDF 1.2 / LPG
+    /// `@annotation` (queryable from Cypher and SPARQL); `plain` drops
+    /// them for pure RDF; `nary` (an intermediate node) is not
+    /// implemented yet.
+    #[arg(long, value_enum, default_value_t = EdgeProperties::Annotated)]
+    pub edge_properties: EdgeProperties,
+
+    /// CSV/Cypher import: base IRI namespace for minted ids, predicates,
+    /// and classes (e.g. `--base-iri http://ldbc.example/`). CSV defaults
+    /// to `http://example.org/`; Cypher defaults to bare names
+    /// (namespace 0), which zero-config Cypher queries read directly.
+    #[arg(long)]
+    pub base_iri: Option<String>,
+
+    /// Chunk size in MB for splitting large Turtle files (0 = derive from memory budget).
+    /// Only used when --from points to a .ttl file.
+    #[arg(long, default_value_t = 0)]
+    pub chunk_size_mb: usize,
+
+    /// Memory budget in MB for bulk import (0 = auto: 80% of system RAM).
+    /// Derives chunk size, concurrency limits, and run budget when not set explicitly.
+    #[arg(long, default_value_t = 0)]
+    pub memory_budget_mb: usize,
+
+    /// Number of parallel parse threads for bulk import.
+    /// 0 = auto (most logical cores, capped to fit the memory budget).
+    /// Explicit values are honored as-is (not capped), floored at 1.
+    #[arg(long, default_value_t = 0)]
+    pub parallelism: usize,
+
+    /// Namespace that salts the blank-node ids this import mints.
+    /// Defaults to the ledger id (with `graph import`, the ledger id and
+    /// the graph IRI), so importing one source tree twice gives disjoint
+    /// blank nodes. Pass the same value to both imports to make them mint
+    /// IDENTICAL ids instead — for a rebuild-and-diff, a sharded load of
+    /// one logical dataset, or a staging/production pair you want to
+    /// compare node-for-node. Any string; two imports match iff they agree
+    /// on it.
+    #[arg(long)]
+    pub skolem_namespace: Option<String>,
+
+    /// Records per leaflet in index files. Default: 25000.
+    /// Larger values produce fewer, bigger leaflets (less I/O, more memory per read).
+    #[arg(long, default_value_t = 25_000)]
+    pub leaflet_rows: usize,
+
+    /// Leaflets per leaf file. Default: 10.
+    /// Larger values produce fewer leaf files (shallower tree, bigger reads).
+    #[arg(long, default_value_t = 10)]
+    pub leaflets_per_leaf: usize,
+}
+
+impl ImportArgs {
+    /// The import's options, falling back to the global `--memory-budget-mb`
+    /// and `--parallelism` where these leave them at 0.
+    pub fn opts(
+        self,
+        global_memory_budget_mb: usize,
+        global_parallelism: usize,
+    ) -> crate::commands::create::ImportOpts {
+        let or_global = |own: usize, global: usize| if own > 0 { own } else { global };
+        crate::commands::create::ImportOpts {
+            memory_budget_mb: or_global(self.memory_budget_mb, global_memory_budget_mb),
+            parallelism: or_global(self.parallelism, global_parallelism),
+            chunk_size_mb: self.chunk_size_mb,
+            skolem_namespace: self.skolem_namespace,
+            leaflet_rows: self.leaflet_rows,
+            leaflets_per_leaf: self.leaflets_per_leaf,
+            edge_policy: self.edge_properties.into(),
+            base_iri: self.base_iri,
+        }
+    }
+}
+
 /// Named-graph subcommands.
 #[derive(Subcommand)]
 pub enum GraphAction {
@@ -1586,6 +1736,7 @@ pub enum GraphAction {
     ///   fluree graph list --ledger mydb:feature-x
     ///   fluree graph list --ledger mydb --remote origin
     ///   fluree graph list --ledger mydb --include-system --json
+    #[command(verbatim_doc_comment)]
     List {
         /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
         /// Defaults to the active ledger.
@@ -1607,13 +1758,60 @@ pub enum GraphAction {
         include_system: bool,
     },
 
+    /// Bulk-import data into a new named graph of an existing ledger
+    ///
+    /// Runs the `fluree create --from` pipeline, continuing the ledger's
+    /// commits: every statement in the source lands in <IRI>, which must be
+    /// new to the ledger. IRIs and strings the ledger already holds keep
+    /// their identity, so the graph joins with the rest of the ledger. The
+    /// ledger's index is extended rather than rebuilt.
+    ///
+    /// The source holds default-graph data: Turtle, N-Triples, JSON-LD,
+    /// JSONL/NDJSON (optionally .gz/.zst), or CSV / Cypher, as a file or a
+    /// directory. TriG and N-Quads are refused, since they name graphs of
+    /// their own.
+    ///
+    /// A ledger with commits after its index is indexed first. Writes to
+    /// the ledger wait until the import finishes. With a local server
+    /// running, the import runs on the server (a single file); pass
+    /// --direct only when no server holds the storage.
+    ///
+    /// Examples:
+    ///   fluree graph import http://example.org/graph/products --from products/
+    ///   fluree graph import urn:example:payroll --from payroll.ttl.gz --ledger mydb
+    ///   fluree graph import urn:example:payroll --from payroll.ttl --ledger mydb --remote origin
+    #[command(verbatim_doc_comment)]
+    Import {
+        /// Full IRI of the new named graph.
+        iri: String,
+
+        /// File or directory to import.
+        #[arg(long)]
+        from: PathBuf,
+
+        /// Ledger identifier (e.g. "mydb" or "mydb:feature-x").
+        /// Defaults to the active ledger.
+        #[arg(short = 'l', long)]
+        ledger: Option<String>,
+
+        /// Import on a remote server (by remote name, e.g. "origin"). The
+        /// server must offer source uploads into a graph; `--from` must be
+        /// a single file.
+        #[arg(long)]
+        remote: Option<String>,
+
+        #[command(flatten)]
+        import: ImportArgs,
+    },
+
     /// Drop a named graph from a single branch of a ledger
     ///
-    /// Issues a transactional retract: every triple currently asserted
-    /// in the target graph is retracted in one new commit. History is
-    /// preserved — queries `as-of` an earlier `t` still see the graph
-    /// populated. The graph IRI remains registered so it can be
-    /// re-populated by a later insert.
+    /// SPARQL `DROP GRAPH`: one new commit, after which the graph and its
+    /// history are no longer queryable — a query `as-of` an earlier `t`
+    /// naming it is refused. The commits that wrote it keep its facts, so
+    /// a branch from before the drop still has them. Writing to the IRI
+    /// again starts the graph afresh. Use `CLEAR GRAPH` (SPARQL) to
+    /// retract the facts and keep their history instead.
     ///
     /// Refuses the default graph and the system `txn-meta` / `config`
     /// graphs.
@@ -1622,6 +1820,7 @@ pub enum GraphAction {
     ///   fluree graph drop urn:example:org/payroll --ledger mydb
     ///   fluree graph drop urn:example:org/payroll --ledger mydb:feature-x
     ///   fluree graph drop urn:example:org/payroll --ledger mydb --remote origin
+    #[command(verbatim_doc_comment)]
     Drop {
         /// Full IRI of the named graph to drop.
         iri: String,
@@ -1653,11 +1852,16 @@ pub enum BranchAction {
         #[arg(long)]
         from: Option<String>,
 
-        /// Commit to branch at (defaults to source branch HEAD).
+        /// Point on the source branch to branch at (defaults to its HEAD).
         ///
-        /// Accepts `t:N` for a transaction number, or a hex digest / full
-        /// CID for prefix resolution. The source branch must be indexed
-        /// for `t:` / prefix resolution (full CIDs work unconditionally).
+        /// Same spellings as `query --at`: `t:<N>` (transaction number),
+        /// `t:latest`/`latest`, `time:<ISO-8601>` (commit event time; `iso:` is
+        /// an alias), `recorded:<ISO-8601>` (the wall-clock time the commit was
+        /// recorded), and `commit:<prefix>` (hex digest, min 6 chars). A bare
+        /// transaction number, ISO-8601 timestamp, commit prefix, or full CID
+        /// also works; a bare integer is read as a transaction number, so use
+        /// `commit:<prefix>` to force a prefix that is all digits. The branch
+        /// starts at the commit `query --at` with the same value would read.
         #[arg(long)]
         at: Option<String>,
 
@@ -1787,6 +1991,11 @@ pub enum BranchAction {
         #[arg(long)]
         changes_after: Option<String>,
 
+        /// Skip SHACL validation of the merged state. Validation runs by
+        /// default and its outcome folds into `mergeable`.
+        #[arg(long)]
+        no_validate: bool,
+
         /// Emit the raw JSON preview instead of a human-readable summary
         #[arg(long)]
         json: bool,
@@ -1804,8 +2013,9 @@ pub enum BranchAction {
     ///
     /// Accepts either a list of positional commit references (cherry-pick
     /// style) or `--from`/`--to` to revert a git-style range. Each commit
-    /// reference may be a `t:N` transaction number, a hex digest prefix, or
-    /// a full commit ID — same forms accepted by `branch create --at`.
+    /// reference may be a `t:N` or bare transaction number, a `commit:<prefix>`
+    /// or bare hex digest prefix, or a full commit ID — same forms accepted by
+    /// `branch create --at`.
     Revert {
         /// Commits to revert (positional). May appear once for the
         /// single-commit case or multiple times for cherry-pick. Mutually
@@ -1837,6 +2047,11 @@ pub enum BranchAction {
         #[arg(long)]
         preview: bool,
 
+        /// With `--preview`: skip SHACL validation of the inverted state.
+        /// Validation runs by default and folds into `revertable`.
+        #[arg(long)]
+        no_validate: bool,
+
         /// When `--preview` is set: emit the raw JSON `RevertPreview`
         /// instead of a human-readable summary.
         #[arg(long)]
@@ -1850,6 +2065,93 @@ pub enum BranchAction {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+/// Where an `encryption` command runs.
+#[derive(clap::Args, Debug, Clone)]
+pub struct EncryptionTarget {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    /// Run directly against the storage a connection config (JSON-LD)
+    /// describes; the config must list every key involved
+    #[arg(long, value_name = "PATH", conflicts_with = "remote")]
+    pub connection_config: Option<PathBuf>,
+
+    /// Print the raw JSON response
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum EncryptionAction {
+    /// Show the held key ids and the rotation record, if any
+    Status {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Start (or resume) a rotation off `--retire` onto the current key
+    Rotate {
+        /// Id of the key being retired
+        #[arg(long)]
+        retire: u32,
+
+        /// Count what would be rewritten without writing anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Limit the sweep to one ledger (name or branch-qualified id)
+        #[arg(long)]
+        ledger: Option<String>,
+
+        /// Throttle rewrites, e.g. "50mb" per second
+        #[arg(long, value_name = "BYTES/S")]
+        rate: Option<String>,
+
+        /// Poll status until the sweep stops, printing progress
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Resume the rotation the record describes
+    Resume {
+        /// Poll status until the sweep stops, printing progress
+        #[arg(long)]
+        wait: bool,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Pause the running sweep after its next blob
+    Pause {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Cancel the running sweep; the next rotate starts over
+    Cancel {
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Count blobs still on a retiring key and stamp the record
+    Verify {
+        /// Id of the key being retired
+        #[arg(long)]
+        retire: u32,
+
+        #[command(flatten)]
+        target: EncryptionTarget,
+    },
+
+    /// Print a fresh base64 AES-256 key for AES256Key / AES256Keys
+    GenerateKey,
 }
 
 /// `cluster` subcommands.
@@ -2010,9 +2312,9 @@ pub enum ModelClassAction {
 pub enum ModelEntityAction {
     /// Define (or update) an entity: compiles to a SHACL node shape
     ///
-    /// NOTE: Fluree enforces SHACL at transaction time once any shapes exist
-    /// in a ledger (reject mode by default) — defining an entity activates
-    /// validation for its class.
+    /// NOTE: Fluree enforces SHACL at transaction time only where the ledger
+    /// config enables it (`f:shaclEnabled true`) — defining an entity does not
+    /// by itself activate validation for its class.
     Define {
         /// Target dataset (ledger alias)
         dataset: String,
@@ -2307,6 +2609,7 @@ pub enum MemoryAction {
     ///   fluree memory audit
     ///   fluree memory audit --base develop
     ///   fluree memory audit --all --format json
+    #[command(verbatim_doc_comment)]
     Audit {
         /// Audit every memory instead of just this branch's
         #[arg(long)]
@@ -2433,6 +2736,247 @@ pub enum DocsAction {
     },
 }
 
+/// `fluree ontology` subcommands.
+#[derive(Subcommand)]
+pub enum OntologyAction {
+    /// Write an ontology in the shape an extraction model reads well
+    ///
+    /// From tables: a CSV header (.csv, .tsv), a workbook's sheets (.xlsx), SQL
+    /// DDL (.sql), a Snowflake semantic view (.yaml), a Databricks Genie space
+    /// export (.json, with --comments for Unity Catalog's descriptions), a dbt
+    /// project's semantic models and model properties (.yml, or the project's
+    /// directory), an Apache Ossie semantic model (.yaml, .json), or a Neo4j
+    /// schema export (.json, from apoc.meta.schema() or db.schema.visualization()).
+    /// An Ossie ontology is written as it is, keeping its IRIs.
+    /// Tables become classes and columns properties, labelled
+    /// in words (`employer_id` reads "employer"); foreign keys become
+    /// relations; enumerated columns become a class with a catalog record per
+    /// value; primary keys are left out.
+    ///
+    /// From RDF (Turtle or JSON-LD): the ontology with what the model reads
+    /// made explicit: SKOS labels and definitions moved into rdfs:label and
+    /// rdfs:comment, identifier-style labels in words, OWL restrictions and
+    /// other blank-node constructs dropped, and OWL axioms and annotation
+    /// property declarations (which a reader would read as catalog records)
+    /// dropped. With --seed, a large vocabulary is
+    /// sliced to the classes the seeds reach first.
+    ///
+    /// Examples:
+    ///   fluree ontology from schema.sql > ontology.ttl
+    ///   fluree ontology from sales_view.yaml > ontology.ttl
+    ///   fluree ontology from ./models --base https://example.com/shop/ > ontology.ttl
+    ///   fluree ontology from accounts.csv --base https://example.com/crm/ > ontology.ttl
+    ///   fluree ontology from schemaorg.jsonld --seed schema:Person,schema:Organization > ontology.ttl
+    #[command(verbatim_doc_comment)]
+    From(OntologyFromArgs),
+
+    /// Report what an HTTP reader will and won't read of an ontology
+    ///
+    /// Applies the ontology input policy of an HTTP reader (an extraction
+    /// model reached over HTTP, `fluree doc ingest`'s [doc.reader]) locally,
+    /// and reports what a request carrying this ontology (and catalog) would
+    /// fail for, what the reader reads another way, what it never sees, and
+    /// advice, including whether it finds the events of each event class
+    /// (xt:EventClass) and their kinds. Nothing is sent anywhere. Exits 1 when a request would be
+    /// refused. The language-model extractor of `fluree doc ingest` reads more
+    /// of an ontology (domains, ranges, every parent class).
+    ///
+    /// Examples:
+    ///   fluree ontology check ontology.ttl
+    ///   fluree ontology check ontology.ttl --catalog accounts.ttl
+    ///   fluree ontology check schemaorg.jsonld --seed schema:Person --json
+    #[command(verbatim_doc_comment)]
+    Check(OntologyCheckArgs),
+}
+
+/// RDF syntaxes `fluree ontology` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OntologyInputFormat {
+    Turtle,
+    Jsonld,
+}
+
+/// RDF syntaxes `fluree ontology` writes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+pub enum OntologyOutputFormat {
+    #[default]
+    Turtle,
+    Jsonld,
+}
+
+#[derive(Args, Debug)]
+pub struct OntologyFromArgs {
+    /// The file to convert (`-` reads stdin), or a dbt project's directory
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Keep only what these classes reach: IRIs, prefixed names or labels,
+    /// comma-separated or repeated
+    #[arg(long, value_delimiter = ',', value_name = "CLASSES")]
+    pub seed: Vec<String>,
+
+    /// Steps --seed follows from the seed classes (properties of a class, then
+    /// the classes in their ranges)
+    #[arg(long, default_value_t = 1, value_name = "N", requires = "seed")]
+    pub depth: usize,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OntologyOutputFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Write enumerated columns' records here instead of with the ontology
+    #[arg(long, value_name = "FILE")]
+    pub catalog_out: Option<PathBuf>,
+
+    /// Namespace for the IRIs minted from tables (default:
+    /// https://example.com/<file name>/)
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// A text column with at most this many distinct values, each repeated,
+    /// becomes a class with a record per value (0: never; CSV and workbooks)
+    #[arg(long, default_value_t = 12, value_name = "N")]
+    pub enum_max: usize,
+
+    /// Unity Catalog table and column comments for a Genie export, as JSON:
+    /// {"table": {"": "table comment", "column": "column comment"}}
+    #[arg(long, value_name = "FILE")]
+    pub comments: Option<PathBuf>,
+
+    /// The input's format, when its extension doesn't say
+    #[arg(long, value_enum)]
+    pub input_format: Option<OntologyFromFormat>,
+}
+
+/// What `fluree ontology from` reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum OntologyFromFormat {
+    Turtle,
+    Jsonld,
+    Csv,
+    Xlsx,
+    Sql,
+    /// A Snowflake semantic view or Cortex Analyst semantic model (YAML)
+    Snowflake,
+    /// A Databricks Genie space export (JSON)
+    Genie,
+    /// A dbt project's semantic models and model properties (YAML, or a directory of them)
+    Dbt,
+    /// An Apache Ossie semantic model or ontology (YAML or JSON)
+    Ossie,
+    /// A Neo4j schema export: apoc.meta.schema() or db.schema.visualization() (JSON)
+    Neo4j,
+}
+
+/// `fluree catalog` subcommands.
+#[derive(Subcommand)]
+pub enum CatalogAction {
+    /// Write a catalog of SKOS records from a CSV file or a workbook sheet
+    ///
+    /// Each row becomes a record of --class: skos:prefLabel from --label,
+    /// skos:altLabel from --alt columns (several in a cell split on ; or |;
+    /// email addresses go to skos:hiddenLabel), skos:hiddenLabel from --code
+    /// columns, and skos:definition from --definition or written from
+    /// --describe columns. Reports the catalog's size against what one
+    /// extraction window holds, since the whole catalog goes in every window.
+    ///
+    /// Examples:
+    ///   fluree catalog from accounts.csv --class Organization --label name --alt aliases > accounts.ttl
+    ///   fluree catalog from crm.xlsx --sheet Accounts --class organization --ontology ontology.ttl --label Name --code "Account No" > accounts.ttl
+    #[command(verbatim_doc_comment)]
+    From(CatalogFromArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct CatalogFromArgs {
+    /// The rows: a CSV file (.csv, .tsv) or a workbook (.xlsx)
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// The class every record is typed with: an IRI, or a name (resolved
+    /// against --ontology when given, else minted under --base)
+    #[arg(long, value_name = "CLASS")]
+    pub class: String,
+
+    /// The column holding each record's name
+    #[arg(long, value_name = "COLUMN")]
+    pub label: String,
+
+    /// Columns holding other names for it (repeatable)
+    #[arg(long, value_name = "COLUMN")]
+    pub alt: Vec<String>,
+
+    /// Columns holding codes a document may use for it, such as account
+    /// numbers or tickers (repeatable)
+    #[arg(long, value_name = "COLUMN")]
+    pub code: Vec<String>,
+
+    /// The column holding a short description
+    #[arg(long, value_name = "COLUMN", conflicts_with = "describe")]
+    pub definition: Option<String>,
+
+    /// Columns to write a description from, as "column: value; ..."
+    #[arg(long, value_delimiter = ',', value_name = "COLUMNS")]
+    pub describe: Vec<String>,
+
+    /// The column holding each record's id, for its IRI (default: the label)
+    #[arg(long, value_name = "COLUMN")]
+    pub id: Option<String>,
+
+    /// Namespace for record IRIs (default: https://example.com/<file name>/)
+    #[arg(long, value_name = "IRI")]
+    pub base: Option<String>,
+
+    /// An ontology to find --class in, by IRI, prefixed name or label
+    #[arg(long, value_name = "FILE")]
+    pub ontology: Option<PathBuf>,
+
+    /// The workbook sheet to read (default: the first)
+    #[arg(long, value_name = "NAME")]
+    pub sheet: Option<String>,
+
+    /// Output format
+    #[arg(long, value_enum, default_value_t)]
+    pub format: OntologyOutputFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct OntologyCheckArgs {
+    /// The ontology to check (`-` reads stdin). A saved extraction request
+    /// (JSON-LD with xt:ontology and xt:instances graphs) works too
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// A catalog of records to check with it (SKOS records)
+    #[arg(long, value_name = "FILE")]
+    pub catalog: Option<PathBuf>,
+
+    /// Check the slice these classes reach instead of the whole ontology:
+    /// IRIs, prefixed names or labels, comma-separated or repeated
+    #[arg(long, value_delimiter = ',', value_name = "CLASSES")]
+    pub seed: Vec<String>,
+
+    /// Steps --seed follows from the seed classes
+    #[arg(long, default_value_t = 1, value_name = "N", requires = "seed")]
+    pub depth: usize,
+
+    /// Emit the report as JSON
+    #[arg(long)]
+    pub json: bool,
+
+    /// The input's format, when its extension doesn't say
+    #[arg(long, value_enum)]
+    pub input_format: Option<OntologyInputFormat>,
+}
+
 /// Server lifecycle subcommands.
 #[derive(Subcommand)]
 pub enum ServerAction {
@@ -2449,6 +2993,11 @@ pub enum ServerAction {
         /// Path to a JSON-LD connection config file (S3, DynamoDB, etc.)
         #[arg(long)]
         connection_config: Option<PathBuf>,
+
+        /// Keep all data in memory: needs no .fluree/ directory, writes
+        /// nothing to the working directory, and loses everything on exit
+        #[arg(long, conflicts_with_all = ["storage_path", "connection_config"])]
+        memory: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
@@ -2484,6 +3033,10 @@ pub enum ServerAction {
         /// Path to a JSON-LD connection config file (S3, DynamoDB, etc.)
         #[arg(long)]
         connection_config: Option<PathBuf>,
+
+        /// Accepted only to explain that memory storage is foreground-only
+        #[arg(long, hide = true)]
+        memory: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
@@ -2533,6 +3086,10 @@ pub enum ServerAction {
         /// Path to a JSON-LD connection config file (S3, DynamoDB, etc.)
         #[arg(long)]
         connection_config: Option<PathBuf>,
+
+        /// Accepted only to explain that memory storage is foreground-only
+        #[arg(long, hide = true)]
+        memory: bool,
 
         /// Log level (trace, debug, info, warn, error)
         #[arg(long)]
@@ -2684,6 +3241,7 @@ pub enum ContextAction {
     /// Examples:
     ///   fluree context set mydb '{"ex": "http://example.org/"}'
     ///   fluree context set mydb -f context.json
+    #[command(verbatim_doc_comment)]
     Set {
         /// Ledger name (defaults to active ledger)
         ledger: Option<String>,
@@ -2745,6 +3303,11 @@ pub struct TokenCreateArgs {
     /// Fluree identity claim (fluree.identity) - takes precedence over sub for policy
     #[arg(long)]
     pub identity: Option<String>,
+
+    /// Allow this backend credential to select request policies (requires --audience
+    /// and a receiving server that trusts the issuer as a policy authority)
+    #[arg(long, requires = "audiences")]
+    pub policy_select: bool,
 
     /// Grant access to all ledgers (fluree.events.all=true, fluree.storage.all=true)
     #[arg(long)]
@@ -2924,7 +3487,7 @@ pub enum RemoteAction {
 
 #[derive(Subcommand)]
 pub enum AuthAction {
-    /// Show authentication status for a remote
+    /// Show this machine's fluree.ai sign-in and a remote's authentication status
     Status {
         /// Remote name (defaults to only configured remote)
         #[arg(long)]
@@ -2958,8 +3521,20 @@ pub enum AuthAction {
     /// `fluree config list --reveal` only if you truly need the raw config.
     Token {
         /// Remote name (defaults to only configured remote)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "account")]
         remote: Option<String>,
+
+        /// The machine's fluree.ai sign-in (`fluree login`) instead of a
+        /// remote: an access token with time left, refreshed first if it
+        /// is about to expire. Needs no project.
+        #[arg(long)]
+        account: bool,
+
+        /// With `--account`: refresh the token even if it has time left,
+        /// e.g. after the account's configuration changed and the service
+        /// answers `config_stale`.
+        #[arg(long, requires = "account")]
+        refresh: bool,
     },
 }
 
@@ -3002,9 +3577,12 @@ pub enum IcebergAction {
     /// Map an Iceberg table as a graph source
     ///
     /// Examples:
-    ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --table openflights.airlines
-    ///   fluree iceberg map my-gs --catalog-uri https://... --r2rml mappings/airlines.ttl
-    ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table
+    ///   fluree iceberg map my-gs --catalog-uri https://polaris.example.com --r2rml mappings/airlines.ttl
+    ///   fluree iceberg map my-gs --mode direct --table-location s3://bucket/warehouse/ns/table --r2rml mappings/table.ttl
+    ///   fluree iceberg map my-gs --mode glue --region us-east-1 --r2rml mappings/sales.ttl
+    ///   fluree iceberg map my-gs --mode s3tables --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/demo --r2rml mappings/sales.ttl
+    ///   fluree iceberg map my-gs --remote origin --stored-mapping <MAPPING-ID>
+    #[command(verbatim_doc_comment)]
     Map(Box<IcebergMapArgs>),
 
     /// List Iceberg-family graph sources (Iceberg and R2RML mappings)
@@ -3050,9 +3628,108 @@ pub enum SqlAction {
     /// Examples:
     ///   fluree sql map orders-db --endpoint https://trino.example.com:8443 --r2rml mappings/orders.ttl --auth-bearer $TOKEN
     ///   fluree sql map crm --endpoint http://localhost:8080 --catalog pg --schema public --r2rml crm.ttl
+    #[command(verbatim_doc_comment)]
     Map(Box<SqlMapArgs>),
 
     /// List mapped graph sources (SQL, Iceberg and R2RML)
+    List {
+        /// List graph sources on a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Re-run the subject key uniqueness probe against the live tables and
+    /// store the result on the source
+    Check {
+        /// Graph source name (branch defaults to main)
+        name: String,
+    },
+
+    /// Show details for a mapped graph source
+    Info {
+        /// Graph source name
+        name: String,
+
+        /// Query a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+
+    /// Drop a mapped graph source
+    Drop {
+        /// Graph source name
+        name: String,
+
+        /// Required flag to confirm deletion
+        #[arg(long)]
+        force: bool,
+
+        /// Execute against a remote server (by remote name, e.g., "origin")
+        #[arg(long)]
+        remote: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum DeltaAction {
+    /// Map Delta Lake tables as an R2RML graph source
+    ///
+    /// Tables are named by path, or by their Unity Catalog name. By path, each
+    /// rr:tableName in the mapping resolves to its --table entry, else to a
+    /// directory under --root with the name's dots as separators
+    /// (dbo.orders -> <root>/dbo/orders). With --unity-uri, each rr:tableName is
+    /// a Unity Catalog name (catalog.schema.table, or shorter with
+    /// --unity-catalog / --unity-schema): Unity places the table and issues the
+    /// credentials that read it.
+    ///
+    /// Query a past table state with `<name>@snapshot:<delta-version>` or
+    /// `<name>@time:<ISO-8601>`.
+    ///
+    /// Examples:
+    ///   fluree delta map sales --root s3://lake/Tables --r2rml mappings/sales.ttl
+    ///   fluree delta map sales --table orders=s3://lake/raw/orders_v2 --r2rml sales.ttl
+    ///   fluree delta map sales --r2rml mappings/sales.ttl \
+    ///     --unity-uri https://<workspace>.cloud.databricks.com --unity-catalog main \
+    ///     --oauth2-client-id <application-id> \
+    ///     --oauth2-client-secret-env DATABRICKS_CLIENT_SECRET --s3-region us-east-1
+    #[command(verbatim_doc_comment)]
+    Map(Box<DeltaMapArgs>),
+
+    /// List what a Unity Catalog holds
+    ///
+    /// With no --unity-catalog, its catalogs; with one, that catalog's schemas
+    /// and tables; with --unity-schema too, that schema's tables. Each table
+    /// shows whether it is a Delta table this reader can read.
+    ///
+    /// Examples:
+    ///   fluree delta browse --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN
+    ///   fluree delta browse --unity-uri ... --auth-bearer-env ... --unity-catalog main
+    #[command(verbatim_doc_comment)]
+    Browse(Box<DeltaBrowseArgs>),
+
+    /// Show a Unity Catalog table's columns and declared keys
+    Preview(Box<DeltaTableArgs>),
+
+    /// Read a Unity Catalog table with the credentials Unity issues for it
+    Verify(Box<DeltaTableArgs>),
+
+    /// Generate an R2RML mapping from Unity Catalog tables
+    ///
+    /// Declared primary keys become subjects and declared foreign keys joins.
+    /// What had to be decided without one is said on standard error.
+    ///
+    /// Example:
+    ///   fluree delta generate main.sales.orders main.sales.customers \
+    ///     --unity-uri https://<workspace> --auth-bearer-env DATABRICKS_TOKEN \
+    ///     --base-namespace https://example.org/sales# -o sales.ttl
+    #[command(verbatim_doc_comment)]
+    Generate(Box<DeltaGenerateArgs>),
+
+    /// Check a mapping against the tables `delta map` would read, registering
+    /// nothing. Takes the options of `delta map`.
+    Validate(Box<DeltaValidateArgs>),
+
+    /// List mapped graph sources (Delta, SQL, Iceberg and R2RML)
     List {
         /// List graph sources on a remote server (by remote name, e.g., "origin")
         #[arg(long)]
@@ -3082,6 +3759,227 @@ pub enum SqlAction {
         #[arg(long)]
         remote: Option<String>,
     },
+}
+
+/// A Unity Catalog connection.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaUnityArgs {
+    /// Databricks workspace URL. For `map`, tables without a --table entry are
+    /// then named in Unity Catalog (catalog.schema.table), which says where
+    /// each lives and issues the credentials that read it. Excludes --root
+    #[arg(long, value_name = "URL")]
+    pub unity_uri: Option<String>,
+
+    /// Catalog that completes a table name of fewer than three parts, and
+    /// that `browse` lists
+    #[arg(long, requires = "unity_uri")]
+    pub unity_catalog: Option<String>,
+
+    /// Schema that completes a one-part table name, and that `browse` lists
+    #[arg(long, requires = "unity_uri")]
+    pub unity_schema: Option<String>,
+
+    // A Databricks token, or a service principal's OAuth2 client id and secret.
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
+}
+
+/// S3 options for tables read with credentials that name no region.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaS3Args {
+    /// S3 region override
+    #[arg(long)]
+    pub s3_region: Option<String>,
+
+    /// S3 endpoint override (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_endpoint: Option<String>,
+
+    /// Use path-style S3 URLs (MinIO, LocalStack)
+    #[arg(long)]
+    pub s3_path_style: bool,
+}
+
+/// Where a Delta source's tables are, and the mapping over them.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaSourceArgs {
+    /// Directory the mapping's table names resolve beneath: s3://bucket/prefix,
+    /// abfss://container@account.dfs.core.windows.net/path (or the OneLake
+    /// form), or a local path under FLUREE_ICEBERG_LOCAL_ROOTS
+    #[arg(long, conflicts_with = "unity_uri")]
+    pub root: Option<String>,
+
+    /// Explicit table location (repeatable): --table orders=s3://lake/raw/orders_v2
+    #[arg(long = "table", value_name = "NAME=LOCATION")]
+    pub table: Vec<String>,
+
+    /// R2RML mapping file. Each rr:tableName names a Delta table; rr:sqlQuery
+    /// is not supported.
+    #[arg(long)]
+    pub r2rml: PathBuf,
+
+    /// R2RML mapping media type (e.g., "text/turtle"); inferred from extension if omitted
+    #[arg(long)]
+    pub r2rml_type: Option<String>,
+
+    #[command(flatten)]
+    pub s3: DeltaS3Args,
+
+    /// Microsoft Entra tenant id of a service principal for abfss:// locations.
+    /// Omit the --azure-* options to use ambient Azure credentials.
+    #[arg(long)]
+    pub azure_tenant_id: Option<String>,
+
+    /// Service principal (application) client id
+    #[arg(long)]
+    pub azure_client_id: Option<String>,
+
+    /// Service principal client secret (stored with the graph source; prefer
+    /// --azure-client-secret-env)
+    #[arg(long, conflicts_with = "azure_client_secret_env")]
+    pub azure_client_secret: Option<String>,
+
+    /// Environment variable holding the client secret, read by the process
+    /// that reads the tables
+    #[arg(long, value_name = "VAR")]
+    pub azure_client_secret_env: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+}
+
+/// Arguments for mapping Delta tables as a graph source.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaMapArgs {
+    /// Graph source name (e.g., "sales")
+    pub name: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub source: DeltaSourceArgs,
+
+    /// Branch name (defaults to "main")
+    #[arg(long)]
+    pub branch: Option<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
+}
+
+/// Arguments for checking a mapping against the tables a `delta map` with the
+/// same options would read.
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaValidateArgs {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub source: DeltaSourceArgs,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum DeltaBrowseDepth {
+    Schemas,
+    Tables,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaBrowseArgs {
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    /// How far a listing of one catalog reaches
+    #[arg(long, value_enum, default_value = "tables")]
+    pub depth: DeltaBrowseDepth,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaTableArgs {
+    /// Table name, completed from --unity-catalog and --unity-schema
+    pub table: String,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    #[command(flatten)]
+    pub s3: DeltaS3Args,
+
+    /// Print the server's JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DeltaGenerateArgs {
+    /// Tables to map, in output order; completed from --unity-catalog and
+    /// --unity-schema
+    #[arg(required = true)]
+    pub tables: Vec<String>,
+
+    /// Execute against a remote server (by remote name, e.g., "origin")
+    #[arg(long)]
+    pub remote: Option<String>,
+
+    #[command(flatten)]
+    pub unity: DeltaUnityArgs,
+
+    /// The IRI every generated class, property and subject derives from
+    #[arg(long, value_name = "IRI")]
+    pub base_namespace: String,
+
+    /// Write the mapping here instead of standard output
+    #[arg(long, short, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// Subject columns for a table, in place of its declared or chosen key
+    /// (repeatable): --subject-key orders=order_id,line
+    #[arg(long, value_name = "TABLE=COLUMN[,COLUMN]")]
+    pub subject_key: Vec<String>,
+
+    /// Class name for a table (repeatable): --class-name orders=Purchase
+    #[arg(long, value_name = "TABLE=NAME")]
+    pub class_name: Vec<String>,
+
+    /// Give a table no subject unless it has a declared or provably non-null
+    /// key, instead of always choosing one
+    #[arg(long)]
+    pub strict_subjects: bool,
+
+    /// Keep foreign keys as plain values; emit no joins
+    #[arg(long)]
+    pub no_joins: bool,
+
+    /// Print the server's JSON (mapping, structure and diagnostics)
+    #[arg(long)]
+    pub json: bool,
 }
 
 /// Arguments for mapping a SQL endpoint as a graph source.
@@ -3131,37 +4029,45 @@ pub struct SqlMapArgs {
     #[arg(long)]
     pub user: Option<String>,
 
-    /// Bearer token for endpoint authentication
-    #[arg(long)]
-    pub auth_bearer: Option<String>,
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 
-    /// OAuth2 token URL for client credentials auth
-    #[arg(long)]
-    pub oauth2_token_url: Option<String>,
-
-    /// OAuth2 client ID
-    #[arg(long)]
-    pub oauth2_client_id: Option<String>,
-
-    /// OAuth2 client secret
-    #[arg(long)]
-    pub oauth2_client_secret: Option<String>,
-
-    /// OAuth2 scope
-    #[arg(long)]
-    pub oauth2_scope: Option<String>,
-
-    /// OAuth2 audience
-    #[arg(long)]
-    pub oauth2_audience: Option<String>,
+    #[command(flatten)]
+    pub google: GoogleAuthArgs,
 
     /// Session property (repeatable): --session query_max_run_time=5m
     #[arg(long = "session", value_name = "KEY=VALUE")]
     pub session: Vec<String>,
+
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
+
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
+
+    /// Skip the duplicate-subject probe: no table is refused, and queries
+    /// answer with set semantics wherever no declared key proves a map's
+    /// subjects unique
+    #[arg(long)]
+    pub allow_duplicate_subjects: bool,
 }
 
 /// Arguments for mapping an Iceberg table as a graph source.
+///
+/// A graph source needs a mapping: exactly one of `--r2rml` and
+/// `--stored-mapping`, which clap names together when neither is given.
 #[derive(Debug, Clone, clap::Args)]
+#[command(group(
+    clap::ArgGroup::new("mapping")
+        .required(true)
+        .multiple(false)
+        .args(["r2rml", "stored_mapping"])
+))]
 pub struct IcebergMapArgs {
     /// Graph source name (e.g., "my-iceberg-gs")
     pub name: String,
@@ -3170,7 +4076,7 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub remote: Option<String>,
 
-    /// Catalog mode: "rest" (default) or "direct"
+    /// Catalog mode: "rest" (default), "direct", "glue", or "s3tables"
     #[arg(long, default_value = "rest")]
     pub mode: String,
 
@@ -3179,8 +4085,8 @@ pub struct IcebergMapArgs {
     pub catalog_uri: Option<String>,
 
     /// Table identifier in namespace.table format (e.g., "openflights.airlines").
-    /// Required for rest mode without --r2rml. When using --r2rml, tables are
-    /// defined in the mapping file.
+    /// Optional: tables are defined in the --r2rml mapping file (for glue, each
+    /// rr:tableName is a Glue `<database>.<table>`).
     #[arg(long)]
     pub table: Option<String>,
 
@@ -3192,7 +4098,11 @@ pub struct IcebergMapArgs {
     /// (`fact_order.UIHGsQex/`). With an `--r2rml` mapping, each `rr:tableName`
     /// (e.g. `DW.FACT_ORDER`) is resolved to its own dir under the root via one
     /// S3 LIST, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively
-    /// on the name (namespace stripped). Warehouse mode is auto-detected when the
+    /// on the name. A root holding a directory per namespace
+    /// (`<root>/<namespace>/<table>`, or Hive/Glue's `<namespace>.db/`) is
+    /// searched there and only there, so a table missing from its namespace
+    /// directory is an error; a root with no such directory ignores the
+    /// namespace. Warehouse mode is auto-detected when the
     /// location's leaf directory does not name the requested table; a bare
     /// single-table location resolves as before. (A table named exactly after its
     /// parent directory would read as single-table.) No catalog/OAuth flags are
@@ -3200,9 +4110,27 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub table_location: Option<String>,
 
-    /// R2RML mapping file (Turtle format). Defines how Iceberg table rows
-    /// are mapped to RDF triples. When provided, table references come from
-    /// the mapping's rr:tableName entries.
+    /// AWS region of the Glue / S3 Tables catalog (glue / s3tables mode). Falls
+    /// back to --s3-region, then the AWS SDK's region chain; for s3tables, the
+    /// table bucket ARN's region. S3 data reads use --s3-region when given, else
+    /// this region.
+    #[arg(long)]
+    pub region: Option<String>,
+
+    /// AWS Glue catalog id for cross-account access (glue mode; defaults to the
+    /// caller's account)
+    #[arg(long)]
+    pub catalog_id: Option<String>,
+
+    /// AWS S3 Tables table-bucket ARN (required for s3tables mode),
+    /// e.g. "arn:aws:s3tables:us-east-1:123456789012:bucket/my-bucket"
+    #[arg(long)]
+    pub table_bucket_arn: Option<String>,
+
+    /// R2RML mapping file (Turtle format). Defines how Iceberg table rows are
+    /// mapped to RDF triples; table references come from the mapping's
+    /// rr:tableName entries. Required unless --stored-mapping names a mapping
+    /// the remote stores
     #[arg(long)]
     pub r2rml: Option<PathBuf>,
 
@@ -3210,41 +4138,62 @@ pub struct IcebergMapArgs {
     #[arg(long)]
     pub r2rml_type: Option<String>,
 
+    /// A catalog connection the remote stores, by its id there (--remote
+    /// only). Replaces every connection and credential option; nothing
+    /// secret is sent. Needs a mapping: --r2rml or --stored-mapping
+    #[arg(
+        long,
+        value_name = "ID",
+        value_parser = stored_id,
+        conflicts_with_all = INLINE_CONNECTION_ARGS
+    )]
+    pub stored_catalog: Option<String>,
+
+    /// An R2RML mapping the remote stores, by its id there (--remote only).
+    /// Replaces --r2rml, and implies the mapping's catalog connection, so no
+    /// connection option is given; --table defaults to the mapping's first
+    /// table. --stored-catalog may name the same connection
+    #[arg(
+        long,
+        value_name = "ID",
+        value_parser = stored_id,
+        conflicts_with_all = INLINE_CONNECTION_ARGS,
+        conflicts_with_all = ["r2rml", "r2rml_type"]
+    )]
+    pub stored_mapping: Option<String>,
+
     /// Branch name (defaults to "main")
     #[arg(long)]
     pub branch: Option<String>,
 
-    /// Bearer token for REST catalog authentication
-    #[arg(long)]
-    pub auth_bearer: Option<String>,
+    /// Model ledger (name:branch) governing this source: its default graph
+    /// supplies the view policies (`fluree model access enable <model> ...`)
+    /// and the class/property hierarchy they entail over.
+    #[arg(long, value_name = "LEDGER")]
+    pub model: Option<String>,
 
-    /// OAuth2 token URL for client credentials auth
-    #[arg(long)]
-    pub oauth2_token_url: Option<String>,
+    /// Fallback for governed requests that match no policy: `true` keeps the
+    /// source readable under authentication without a model (unset: deny).
+    #[arg(long, value_name = "BOOL")]
+    pub default_allow: Option<bool>,
 
-    /// OAuth2 client ID
-    #[arg(long)]
-    pub oauth2_client_id: Option<String>,
+    #[command(flatten)]
+    pub auth: CatalogAuthArgs,
 
-    /// OAuth2 client secret
-    #[arg(long)]
-    pub oauth2_client_secret: Option<String>,
-
-    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon / Polaris)
-    #[arg(long)]
-    pub oauth2_scope: Option<String>,
-
-    /// OAuth2 audience
-    #[arg(long)]
-    pub oauth2_audience: Option<String>,
+    #[command(flatten)]
+    pub google: GoogleAuthArgs,
 
     /// Warehouse identifier (REST mode)
     #[arg(long)]
     pub warehouse: Option<String>,
 
-    /// Disable vended credentials (REST mode, enabled by default)
-    #[arg(long)]
+    /// Disable vended credentials (REST mode, enabled by default); the same
+    /// as --storage-identity ambient
+    #[arg(long, conflicts_with = "storage_identity")]
     pub no_vended_credentials: bool,
+
+    #[command(flatten)]
+    pub storage: StorageIdentityArgs,
 
     /// S3 region override
     #[arg(long)]
@@ -3257,6 +4206,171 @@ pub struct IcebergMapArgs {
     /// Use path-style S3 URLs
     #[arg(long)]
     pub s3_path_style: bool,
+}
+
+/// Every `iceberg map` option that describes the catalog connection inline,
+/// by clap id (a flattened group by its struct's name). A stored reference
+/// names a connection the remote already holds, so none of these can stand
+/// beside `--stored-catalog` or `--stored-mapping`. An explicit `--mode`
+/// counts; its default does not, since clap checks conflicts against given
+/// values only.
+pub(crate) const INLINE_CONNECTION_ARGS: [&str; 14] = [
+    "mode",
+    "catalog_uri",
+    "table_location",
+    "region",
+    "catalog_id",
+    "table_bucket_arn",
+    "warehouse",
+    "no_vended_credentials",
+    "s3_region",
+    "s3_endpoint",
+    "s3_path_style",
+    "CatalogAuthArgs",
+    "GoogleAuthArgs",
+    "StorageIdentityArgs",
+];
+
+/// The id of a catalog connection or mapping a remote stores: any non-blank
+/// string, sent as given.
+fn stored_id(value: &str) -> Result<String, String> {
+    if value.trim().is_empty() {
+        Err("a stored id cannot be empty".to_string())
+    } else {
+        Ok(value.trim().to_string())
+    }
+}
+
+/// How a catalog or SQL endpoint is authenticated: a bearer token, or OAuth2
+/// client credentials (or, for an Iceberg REST catalog or SQL endpoint, a
+/// Google identity; see [`GoogleAuthArgs`]). At most one; a partial OAuth2
+/// set is refused.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct CatalogAuthArgs {
+    /// Bearer token. Stored with the graph source; prefer --auth-bearer-env
+    #[arg(long, conflicts_with = "auth_bearer_env")]
+    pub auth_bearer: Option<String>,
+
+    /// Environment variable holding the bearer token, read by the process that
+    /// reads the tables. The token is not stored. With --remote, the server
+    /// must list the variable in FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS
+    #[arg(long, value_name = "VAR")]
+    pub auth_bearer_env: Option<String>,
+
+    /// OAuth2 token URL for client credentials auth (for a Unity Catalog,
+    /// defaults to the workspace's own, <unity-uri>/oidc/v1/token)
+    #[arg(long)]
+    pub oauth2_token_url: Option<String>,
+
+    /// OAuth2 client ID (a Databricks service principal's application id)
+    #[arg(long)]
+    pub oauth2_client_id: Option<String>,
+
+    /// OAuth2 client secret. Stored with the graph source; prefer
+    /// --oauth2-client-secret-env
+    #[arg(long, conflicts_with = "oauth2_client_secret_env")]
+    pub oauth2_client_secret: Option<String>,
+
+    /// Environment variable holding the OAuth2 client secret; as --auth-bearer-env
+    #[arg(long, value_name = "VAR")]
+    pub oauth2_client_secret_env: Option<String>,
+
+    /// OAuth2 scope (e.g. "session:role:ICEBERG_READER" for Snowflake Horizon /
+    /// Polaris; for a Unity Catalog, defaults to all-apis)
+    #[arg(long)]
+    pub oauth2_scope: Option<String>,
+
+    /// OAuth2 audience
+    #[arg(long)]
+    pub oauth2_audience: Option<String>,
+}
+
+/// A Google identity for an Iceberg REST catalog (BigLake) or SQL endpoint:
+/// one credential source, refreshed automatically.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct GoogleAuthArgs {
+    /// Authenticate with the GCE/GKE metadata server's service account (a host
+    /// identity: the operator can refuse it with FLUREE_GRAPH_SOURCE_HOST_IDENTITIES)
+    #[arg(long)]
+    pub auth_google_metadata: bool,
+
+    /// Authenticate with the host's application-default credentials
+    /// (GOOGLE_APPLICATION_CREDENTIALS, else gcloud's), e.g. after
+    /// `gcloud auth application-default login`; a host identity
+    #[arg(long)]
+    pub auth_google_adc: bool,
+
+    /// Environment variable holding a service-account key's JSON, read by the
+    /// process that reads the tables. The key is not stored
+    #[arg(long, value_name = "VAR")]
+    pub auth_google_service_account_env: Option<String>,
+
+    /// A Workload Identity Federation credential configuration (what
+    /// `gcloud iam workload-identity-pools create-cred-config ... --aws`
+    /// prints). Not a secret: it is stored with the graph source
+    #[arg(long, value_name = "FILE")]
+    pub auth_google_wif_config: Option<PathBuf>,
+
+    /// The Google Cloud project catalog requests bill to (x-goog-user-project).
+    /// BigLake requires one for every identity; default: the project a
+    /// bq://projects/<P>/… or bl://projects/<P>/… warehouse names. Never sent
+    /// with storage reads
+    #[arg(long, value_name = "PROJECT")]
+    pub auth_google_quota_project: Option<String>,
+
+    /// OAuth scopes, comma-separated (default: cloud-platform)
+    #[arg(long, value_name = "SCOPES")]
+    pub auth_google_scopes: Option<String>,
+}
+
+/// Which identity reads an Iceberg source's metadata and data files.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum StorageIdentity {
+    /// The catalog's per-table vended credentials, required (the default for
+    /// a REST catalog, and for a bl:// BigLake warehouse)
+    Vended,
+    /// The host's ambient AWS credential chain
+    Ambient,
+    /// The REST catalog's own Google identity reads gs:// (the default for a
+    /// bq:// BigLake federation warehouse, which never vends)
+    Catalog,
+    /// A Google identity of the source's own (--storage-google-*), e.g. for
+    /// --mode direct on gs://
+    Google,
+}
+
+/// Which identity reads a source's files, and the source's own Google
+/// identity when it is `google`.
+#[derive(Debug, Clone, Default, clap::Args)]
+pub struct StorageIdentityArgs {
+    /// Which identity reads the table's files. Default: catalog for a bq://
+    /// warehouse, vended for a bl:// one, otherwise vended for a REST catalog
+    /// (unless --no-vended-credentials) and ambient for the other modes
+    #[arg(long, value_enum)]
+    pub storage_identity: Option<StorageIdentity>,
+
+    /// Read the files as the GCE/GKE metadata server's service account
+    #[arg(long)]
+    pub storage_google_metadata: bool,
+
+    /// Read the files with the host's application-default credentials
+    #[arg(long)]
+    pub storage_google_adc: bool,
+
+    /// Read the files as the service account whose key JSON this environment
+    /// variable holds (the key is not stored)
+    #[arg(long, value_name = "VAR")]
+    pub storage_google_service_account_env: Option<String>,
+
+    /// Read the files through this Workload Identity Federation credential
+    /// configuration (stored with the graph source)
+    #[arg(long, value_name = "FILE")]
+    pub storage_google_wif_config: Option<PathBuf>,
+
+    /// The project storage requests bill to (requester pays). Never defaulted,
+    /// and never the catalog's quota project
+    #[arg(long, value_name = "PROJECT")]
+    pub storage_google_quota_project: Option<String>,
 }
 
 #[cfg(test)]
@@ -3349,4 +4463,369 @@ mod tests {
             Some(&serde_json::Value::Bool(true))
         );
     }
+}
+
+/// `fluree doc` — documents in, a graph-RAG ledger out.
+#[allow(clippy::large_enum_variant)]
+#[derive(Subcommand, Debug)]
+pub enum DocAction {
+    /// Parse documents into a ledger: DoCO structure graph, retrieval chunks, embeddings, and a full-text index
+    ///
+    /// Reads PDF, Markdown, HTML, DOCX, PPTX, XLSX, WebVTT and SubRip
+    /// transcripts, email (.eml, .msg) and images. Parsing is deterministic
+    /// and local; with `[doc.vlm]` (or `[doc.llm]`) configured, pages the
+    /// parser could not read are escalated to that vision model. With
+    /// `[doc.embedding]` configured every chunk is embedded. Parses and model
+    /// readings are cached under `.fluree/cache/doc/`, so a re-run only pays
+    /// for what changed.
+    ///
+    /// Examples:
+    ///   fluree doc ingest ./contracts --ledger contracts
+    ///   fluree doc ingest report.pdf notes/ -l docs --no-escalate
+    ///   fluree config set doc.embedding.url http://localhost:11434/v1
+    ///   fluree config set doc.embedding.model nomic-embed-text
+    #[command(verbatim_doc_comment)]
+    Ingest(DocIngestArgs),
+
+    /// Parse one document and print its DoCO graph, without writing to a ledger
+    ///
+    /// Prints the structure graph `fluree doc ingest` would write for this
+    /// file, as JSON-LD: sections, paragraphs, lists, tables and their cells,
+    /// each with character offsets into the text projection and, for a PDF,
+    /// page and bounding box. `--format text` prints that projection instead.
+    /// Needs no project; where there is one (or a global config), its
+    /// `[doc.vlm]` reads what the deterministic pass could not, and its parse
+    /// cache is used.
+    ///
+    /// Examples:
+    ///   fluree doc parse report.pdf > report.jsonld
+    ///   fluree doc parse call.vtt --format text
+    ///   fluree doc parse memo.docx --doc-iri https://example.org/doc/memo
+    #[command(verbatim_doc_comment)]
+    Parse(DocParseArgs),
+
+    /// Read one document with an extraction model and print the reading,
+    /// without writing to a ledger
+    ///
+    /// Parses the file as `fluree doc parse` does, sends its text and
+    /// structure with the ontology and catalog to the HTTP reader that
+    /// serves `--model` (`[doc.reader]`), and prints its reading: a Fluree DB
+    /// transaction holding the run, the facts in the ontology's terms, the
+    /// claims behind them and the mentions (`--include`), each mention
+    /// anchored to the text's offsets. Needs no project; where there is one
+    /// (or a global config), its `[doc]` settings and caches are used. What
+    /// the read was billed, and each call's run, release and request ID, go
+    /// to stderr.
+    ///
+    /// Examples:
+    ///   fluree doc read invoice.pdf --ontology invoices.ttl --model reader-small
+    ///   fluree doc read memo.docx --ontology onto.ttl --catalog people.ttl --format turtle
+    ///   fluree doc read call.vtt --ontology onto.ttl -o call.trig --format trig
+    ///   fluree doc read memo.md --ontology onto.ttl --include none > facts.jsonld
+    #[command(verbatim_doc_comment)]
+    Read(DocReadArgs),
+
+    /// Search a ledger's chunks by meaning (vector) or by words (full-text)
+    ///
+    /// Examples:
+    ///   fluree doc search "termination notice period" -l contracts
+    ///   fluree doc search "LM358B supply voltage" --mode text -n 5
+    #[command(verbatim_doc_comment)]
+    Search(DocSearchArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct DocIngestArgs {
+    /// Files or directories to ingest
+    #[arg(required = true, value_name = "PATH")]
+    pub paths: Vec<PathBuf>,
+
+    /// Target ledger (default: the active ledger). Created when missing.
+    #[arg(short = 'l', long, value_name = "LEDGER")]
+    pub ledger: Option<String>,
+
+    /// IRI prefix documents are minted under; the path relative to the
+    /// ingested directory is appended, so a document keeps its IRI across runs
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// Skip embeddings even when `[doc.embedding]` is configured
+    #[arg(long)]
+    pub no_embed: bool,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Skip indexing after the run: the ledger's own index and the
+    /// full-text index
+    #[arg(long)]
+    pub no_index: bool,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+
+    /// Re-ingest documents already in the ledger with the same content,
+    /// parser and embedding model
+    #[arg(long)]
+    pub force: bool,
+
+    /// Emit a chunk once its buffer reaches this many characters
+    #[arg(long, default_value_t = 1500, value_name = "N")]
+    pub min_chars: usize,
+
+    /// Split a single element longer than this many characters
+    #[arg(long, default_value_t = 4000, value_name = "N")]
+    pub max_chars: usize,
+
+    /// Most crops one document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Ontology the language model extracts against: a ledger, or a
+    /// `.ttl` / `.jsonld` file. Needs `[doc.llm]` (or a Fluree AI account)
+    #[arg(long, value_name = "LEDGER|FILE")]
+    pub ontology: Option<String>,
+
+    /// The extraction model: one a `[doc.reader]` serves (its `models`),
+    /// which reads each document whole against `--ontology` and `--catalog`,
+    /// or a language model name for `[doc.llm]`. Default: `doc.model`, else
+    /// `[doc.llm] model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// `catalog` (the ontology and catalog), or `off` (nothing, overriding
+    /// `doc.reader.cache`). Config: `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
+    pub cache: Option<String>,
+
+    /// What a reader's answer holds besides the facts, which it always
+    /// holds: `claims` (the claim behind each fact), `mentions` (each
+    /// occurrence in the text and the record it links to), both, or `none`.
+    /// Default: `claims,mentions`
+    #[arg(long, value_name = "claims,mentions|claims|mentions|none")]
+    pub include: Option<String>,
+
+    /// Known entities, a catalog, to find by their labels (`skos:prefLabel`,
+    /// `skos:altLabel`, `skos:hiddenLabel`, `rdfs:label`, `schema:name`): a
+    /// ledger, a graph source mapped over a table (`fluree iceberg|sql|delta
+    /// map`), or a `.ttl` / `.jsonld` file, optionally scoped to one class
+    /// with `#Class`. Repeatable. A mention keeps the entity's own IRI
+    #[arg(long, visible_alias = "catalog", value_name = "LEDGER|FILE[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// What becomes of the relations the language model reports: `direct`
+    /// writes an edge for every predicate the model admits, `reified` keeps
+    /// them as review nodes only, `off` extracts entities alone. A reader's
+    /// facts always come with its reading (see `--include`)
+    #[arg(long, value_enum, default_value_t = DocRelationMode::Direct)]
+    pub relations: DocRelationMode,
+
+    /// A file of project priorities placed in the extraction prompt
+    /// (config: `doc.extraction.guidance`)
+    #[arg(long, value_name = "FILE")]
+    pub guidance: Option<PathBuf>,
+
+    /// A file replacing the extraction system prompt; keeps the `{model}`
+    /// and `{guidance}` slots (config: `doc.extraction.system_prompt`)
+    #[arg(long, value_name = "FILE")]
+    pub system_prompt: Option<PathBuf>,
+
+    /// A file replacing the extraction user prompt; keeps the `{existing}`
+    /// and `{document}` slots (config: `doc.extraction.user_prompt`)
+    #[arg(long, value_name = "FILE")]
+    pub user_prompt: Option<PathBuf>,
+
+    /// Chunks sent to the language model at once (config:
+    /// `doc.extraction.concurrency`, default 4)
+    #[arg(long, value_name = "N")]
+    pub concurrency: Option<usize>,
+
+    /// Drop new entities whose class is not in the ontology instead of
+    /// keeping them flagged `doc:offModel` (config: `doc.extraction.drop_off_model`)
+    #[arg(long)]
+    pub drop_off_model: bool,
+
+    /// Language of the documents, for stemming in the entity scan
+    #[arg(long, default_value = "en", value_name = "CODE")]
+    pub lang: String,
+
+    /// Skip entity and relation extraction even when `--ontology` or `--entities` is given
+    #[arg(long)]
+    pub no_extract: bool,
+
+    /// Parse, chunk and embed, then report what would be written — write nothing
+    #[arg(long)]
+    pub dry_run: bool,
+
+    /// Also write each document's transaction as `<relative-path>.jsonld` here
+    #[arg(long, value_name = "DIR")]
+    pub out_dir: Option<PathBuf>,
+}
+
+#[derive(Args, Debug)]
+pub struct DocParseArgs {
+    /// The document to parse
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// `doco` prints the structure graph; `text` prints the plain-text
+    /// projection its `nif:beginIndex`/`nif:endIndex` offsets index into
+    #[arg(long, value_enum, default_value_t = DocParseFormat::Doco)]
+    pub format: DocParseFormat,
+
+    /// Write to this file instead of stdout
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// IRI prefix the file name is appended to, forming the document IRI,
+    /// as `doc ingest` does
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// The document IRI in full, in place of `--base-iri` and the file name
+    #[arg(long, value_name = "IRI", conflicts_with = "base_iri")]
+    pub doc_iri: Option<String>,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Most crops the document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct DocReadArgs {
+    /// The document to read
+    #[arg(value_name = "FILE")]
+    pub file: PathBuf,
+
+    /// Ontology to read against: a `.ttl` / `.nt` / `.jsonld` / `.json`
+    /// file, or a ledger in the project
+    #[arg(long, value_name = "FILE|LEDGER")]
+    pub ontology: String,
+
+    /// Known entities, a catalog, to link mentions to: a file, a ledger,
+    /// or a graph source mapped over a table, optionally scoped to one
+    /// class with `#Class`. Repeatable
+    #[arg(long, visible_alias = "catalog", value_name = "FILE|LEDGER[#CLASS]", action = clap::ArgAction::Append)]
+    pub entities: Vec<String>,
+
+    /// The extraction model, one a `[doc.reader]` serves. Default: `doc.model`
+    #[arg(long, value_name = "ID")]
+    pub model: Option<String>,
+
+    /// What the reader may keep for the next request sharing it: `ontology`,
+    /// `catalog`, or `off` (nothing, overriding `doc.reader.cache`). Config:
+    /// `doc.reader.cache`
+    #[arg(long, value_name = "ontology|catalog|off")]
+    pub cache: Option<String>,
+
+    /// What the reading holds besides the facts, which it always holds:
+    /// `claims` (the claim behind each fact), `mentions` (each occurrence
+    /// in the text and the record it links to), both, or `none`
+    #[arg(
+        long,
+        value_name = "claims,mentions|claims|mentions|none",
+        default_value = "claims,mentions"
+    )]
+    pub include: String,
+
+    /// `jsonld` prints the reading as the reader wrote it, a Fluree DB
+    /// transaction (`fluree insert -f` takes it). A document read in
+    /// several calls is a transaction per call, so as `jsonld` it needs
+    /// `-o`, and each call goes to a file of its own. `trig` is the same as
+    /// TriG, the run in `<#txn-meta>`; `turtle` its statements without the
+    /// run
+    #[arg(long, value_enum, default_value_t = DocReadFormat::Jsonld)]
+    pub format: DocReadFormat,
+
+    /// Write to this file instead of stdout. A JSON-LD reading of several
+    /// calls goes to a file per call named after it: `FILE-1.jsonld`, …
+    #[arg(short = 'o', long, value_name = "FILE")]
+    pub output: Option<PathBuf>,
+
+    /// IRI prefix the file name is appended to, forming the document IRI,
+    /// as `doc ingest` does
+    #[arg(long, default_value = "urn:fluree:doc:", value_name = "IRI")]
+    pub base_iri: String,
+
+    /// The document IRI in full, in place of `--base-iri` and the file name
+    #[arg(long, value_name = "IRI", conflicts_with = "base_iri")]
+    pub doc_iri: Option<String>,
+
+    /// Never call a vision model, whatever `[doc.vlm]` says
+    #[arg(long)]
+    pub no_escalate: bool,
+
+    /// Most crops the document may send to the vision model
+    #[arg(long, default_value_t = 70, value_name = "N")]
+    pub max_crops: usize,
+
+    /// Neither read nor write the parse and reading caches
+    #[arg(long)]
+    pub no_cache: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocReadFormat {
+    Jsonld,
+    Turtle,
+    Trig,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocParseFormat {
+    Doco,
+    Text,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocRelationMode {
+    Direct,
+    Reified,
+    Off,
+}
+
+#[derive(Args, Debug)]
+pub struct DocSearchArgs {
+    /// What to look for
+    #[arg(required = true, value_name = "QUERY")]
+    pub query: String,
+
+    /// Ledger to search (default: the active ledger)
+    #[arg(short = 'l', long, value_name = "LEDGER")]
+    pub ledger: Option<String>,
+
+    /// Results to return
+    #[arg(short = 'n', long, default_value_t = 10, value_name = "N")]
+    pub limit: usize,
+
+    /// `vector` embeds the query with `[doc.embedding]` and scores every
+    /// chunk's embedding by cosine similarity; `text` runs BM25; `hybrid` runs
+    /// both and fuses their scores, each first mapped to 0–1; `auto` picks
+    /// hybrid when the chunks carry embeddings, the full-text index exists and
+    /// the query can be embedded, else whichever there is
+    #[arg(long, value_enum, default_value_t = DocSearchMode::Auto)]
+    pub mode: DocSearchMode,
+
+    /// Print the raw query result as JSON instead of a summary
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DocSearchMode {
+    Auto,
+    Vector,
+    Text,
+    Hybrid,
 }

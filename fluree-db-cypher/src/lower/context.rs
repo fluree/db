@@ -40,7 +40,11 @@ pub struct LoweringContext<'a, E: IriEncoder> {
     /// the statement (`e.prop`, `properties(e)`, …). A bound relationship
     /// variable outside this set can bind a synthesized relationship value
     /// from the plain base triple instead of requiring a reifier bundle.
-    annotation_dependent: std::collections::HashSet<String>,
+    scope_uses: super::annotation_use::ScopeUses,
+    /// Path variables bound by a bounded fixed-chain expansion, mapped to the
+    /// identity-carrying relationship list bound alongside them (see
+    /// `Self::register_path_rel_list`).
+    path_rel_lists: std::collections::HashMap<VarId, VarId>,
     /// Allow a bare `MATCH (n)` (no label, property, or relationship) to
     /// lower to a whole-graph distinct-subject scan. Off by default — a full
     /// scan is rarely what a production query intends; benchmarks and ad-hoc
@@ -74,7 +78,8 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
             vocab: None,
             overrides: HashMap::new(),
             scopes: Vec::new(),
-            annotation_dependent: std::collections::HashSet::new(),
+            scope_uses: Default::default(),
+            path_rel_lists: std::collections::HashMap::new(),
             allow_full_scan: false,
             reified_edges_possible: true,
             fuse_reachability_chains: false,
@@ -94,16 +99,46 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         self
     }
 
-    /// Record the statement-wide annotation-surface variable set (see
-    /// [`super::annotation_use`]).
-    pub(super) fn set_annotation_dependent(&mut self, vars: std::collections::HashSet<String>) {
-        self.annotation_dependent = vars;
+    /// Install the variable-use sets for the `Query` scope about to be
+    /// lowered, returning the previous ones for the caller to restore. Paired
+    /// save/restore (not a reset) because UNION branches and `CALL` bodies
+    /// nest: see [`super::annotation_use`] for why the sets are per-scope.
+    pub(super) fn swap_scope_uses(
+        &mut self,
+        uses: super::annotation_use::ScopeUses,
+    ) -> super::annotation_use::ScopeUses {
+        std::mem::replace(&mut self.scope_uses, uses)
     }
 
-    /// Whether `name` is used on the relationship annotation surface
-    /// anywhere in the statement.
+    /// Whether `name` is used on the relationship annotation surface in the
+    /// `Query` scope being lowered.
     pub(super) fn is_annotation_dependent(&self, name: &str) -> bool {
-        self.annotation_dependent.contains(name)
+        self.scope_uses.annotation.contains(name)
+    }
+
+    /// Record that the path variable `path` was bound by a bounded fixed-chain
+    /// expansion which also bound `rel_list` to the chain's relationship list.
+    ///
+    /// `Binding::Path.edges` is `(start, predicate, end)` with no reifier slot,
+    /// so `relationships(p)` computed from the path value alone cannot carry
+    /// per-hop edge identity. The fixed chain binds a list that can, and
+    /// `lower/expr.rs` resolves `relationships(p)` to it. The path value still
+    /// serves `nodes(p)`, `length(p)` and `RETURN p`.
+    pub(super) fn register_path_rel_list(&mut self, path: VarId, rel_list: VarId) {
+        self.path_rel_lists.insert(path, rel_list);
+    }
+
+    /// The identity-carrying relationship list bound alongside `path`, if it
+    /// came from a bounded fixed-chain expansion.
+    pub(super) fn path_rel_list(&self, path: VarId) -> Option<VarId> {
+        self.path_rel_lists.get(&path).copied()
+    }
+
+    /// Whether the *elements* of the list bound to `name` have their
+    /// properties read in the `Query` scope being lowered — `all(x IN name
+    /// WHERE x.p)`, `[x IN tail(name) | x.p]`, `UNWIND name AS x … x.p`.
+    pub(super) fn reads_element_properties(&self, name: &str) -> bool {
+        self.scope_uses.element_property.contains(name)
     }
 
     /// Push a new loop-local scope. Pair with [`Self::exit_scope`].
@@ -200,36 +235,39 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         rdf::TYPE
     }
 
-    /// Lower a resolved IRI to a pattern `Ref`, encoding to `Ref::Sid` when
-    /// the namespace is registered (parity with the SPARQL lowering — the
-    /// planner's stats lookups and the batched join lanes are Sid-gated and
-    /// silently degrade to per-row paths on `Ref::Iri`). Unregistered
-    /// namespaces stay `Ref::Iri`, which matches nothing at scan time.
+    /// Lower a resolved IRI to a pattern `Ref` through the shared
+    /// [`IriEncoder::encode_ref`] rule, with one Cypher-specific addition:
+    /// with no @vocab, a bare Cypher name (no scheme — identifiers can't
+    /// contain `:`) lives under namespace 0 (empty prefix), which
+    /// `encode_iri_strict` rejects by design, so it is constructed directly.
+    /// Scheme-ful strings (system IRIs like rdf:type, backticked IRIs) keep
+    /// the shared behavior: unregistered namespaces stay `Ref::Iri`.
     pub fn iri_ref(&self, iri: String) -> fluree_db_query::ir::Ref {
-        match self.encoder.encode_iri_strict(&iri) {
-            Some(sid) => fluree_db_query::ir::Ref::Sid(sid),
-            // No @vocab: a bare Cypher name (no scheme — identifiers
-            // can't contain `:`) lives under namespace 0 (empty
-            // prefix) — construct the Sid directly; `encode_iri_strict`
-            // rejects namespace 0 by design. Scheme-ful strings (system
-            // IRIs like rdf:type, backticked IRIs) keep the strict
-            // behavior: unregistered namespaces stay `Ref::Iri`.
-            None if self.vocab.is_none() && !iri.contains(':') => fluree_db_query::ir::Ref::Sid(
-                fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri),
-            ),
-            None => fluree_db_query::ir::Ref::Iri(iri.into()),
+        match self.encoder.encode_ref(&iri) {
+            fluree_db_query::ir::Ref::Iri(_) if self.is_bare_name(&iri) => {
+                fluree_db_query::ir::Ref::Sid(fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::EMPTY,
+                    iri,
+                ))
+            }
+            r => r,
         }
     }
 
     /// Object-position counterpart of [`Self::iri_ref`].
     pub fn iri_term(&self, iri: String) -> fluree_db_query::ir::Term {
-        match self.encoder.encode_iri_strict(&iri) {
-            Some(sid) => fluree_db_query::ir::Term::Sid(sid),
-            // Bare namespace-0 name — see [`Self::iri_ref`].
-            None if self.vocab.is_none() && !iri.contains(':') => fluree_db_query::ir::Term::Sid(
-                fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri),
-            ),
-            None => fluree_db_query::ir::Term::Iri(iri.into()),
+        match self.encoder.encode_term(&iri) {
+            fluree_db_query::ir::Term::Iri(_) if self.is_bare_name(&iri) => {
+                fluree_db_query::ir::Term::Sid(fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::EMPTY,
+                    iri,
+                ))
+            }
+            t => t,
         }
+    }
+
+    fn is_bare_name(&self, iri: &str) -> bool {
+        self.vocab.is_none() && !iri.contains(':')
     }
 }

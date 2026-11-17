@@ -11,9 +11,9 @@
 //! a list of property IRIs, no per-rule body, no class targets, no
 //! values.
 
-use super::types::{ConstraintsArtifactWire, WireOrigin};
+use super::types::{ConstraintsArtifactWire, ModelHead, WireOrigin};
+use super::ResolveCtx;
 use super::{encode_system_iri, CrossLedgerError};
-use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeTest};
 use fluree_vocab::config_iris;
 
@@ -22,22 +22,23 @@ use fluree_vocab::config_iris;
 #[tracing::instrument(
     name = "cross_ledger.constraints.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
-        resolved_t = resolved_t,
+        resolved_t = head.t,
     ),
 )]
 pub(super) async fn materialize_constraints(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
-    fluree: &Fluree,
+    head: &ModelHead,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<ConstraintsArtifactWire, CrossLedgerError> {
-    // 1. Open M at resolved_t.
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let resolved_t = head.t;
+    // 1. Open M at its head.
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, head)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
@@ -46,13 +47,14 @@ pub(super) async fn materialize_constraints(
         })?;
 
     // 2. Resolve graph_iri → g_id in M's graph registry.
-    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri)?.ok_or_else(|| {
-        CrossLedgerError::GraphMissingAtT {
-            ledger_id: canonical_model_ledger_id.to_string(),
-            graph_iri: graph_iri.to_string(),
-            resolved_t,
-        }
-    })?;
+    let g_id =
+        super::resolve_selector_g_id(&m_db.snapshot, graph_iri, m_db.t)?.ok_or_else(|| {
+            CrossLedgerError::GraphMissingAtT {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+            }
+        })?;
 
     // 3. Encode the system IRIs we need to scan against M. These
     //    come from default namespaces pre-registered at genesis,
@@ -111,6 +113,7 @@ pub(super) async fn materialize_constraints(
             model_ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
+            commit_id: head.commit_id.clone(),
         },
         property_iris,
     })

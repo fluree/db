@@ -407,6 +407,62 @@ async fn bm25_recreate_after_drop() {
     );
 }
 
+/// A dropped BM25 index stays as a tombstone whose snapshots are deleted; a
+/// query names it as not found rather than failing to read them.
+#[tokio::test]
+async fn bm25_query_after_drop_is_not_found() {
+    use fluree_db_query::bm25::Bm25SearchProvider;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "bm25/dropped:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{ "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming" }]
+    });
+    let ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("dropped-text", ledger_id, query))
+        .await
+        .unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+    let id = created.graph_source_id.as_str();
+    provider
+        .bm25_index(id, Some(ledger.t()), false, None)
+        .await
+        .expect("index before drop");
+    provider
+        .search_bm25(id, "rust", 10, None, false, None)
+        .await
+        .expect("search before drop");
+
+    fluree.drop_full_text_index(id).await.unwrap();
+    let not_found = |err: fluree_db_query::QueryError| {
+        assert!(
+            err.to_string().contains("Graph source not found"),
+            "after drop: {err}"
+        );
+    };
+    not_found(
+        provider
+            .bm25_index(id, Some(ledger.t()), false, None)
+            .await
+            .expect_err("index after drop"),
+    );
+    not_found(
+        provider
+            .search_bm25(id, "rust", 10, None, false, None)
+            .await
+            .expect_err("search after drop"),
+    );
+}
+
 /// Test BM25 federated query: FlureeIndexProvider loads index and search works
 ///
 /// This tests the full integration flow:
@@ -1720,4 +1776,559 @@ async fn scoped_indexing_query_narrows_the_indexed_scan() {
         "scoping one subject out of {CORPUS} did not narrow the indexed scan: \
          scoped {scoped_work} vs full {full_work} (fuel above the query floor)"
     );
+}
+
+/// A commit that touches NO indexed property must advance the watermark, not
+/// rebuild the index.
+///
+/// The regression: `sync_bm25_index` traced the commits, found an empty affected
+/// set, and treated that determinate "nothing I index changed" as if it were
+/// "I could not work out what changed" — falling back to a full resync. On an
+/// append-heavy ledger whose writes mostly miss the indexed properties, that made
+/// the *cheapest* possible window trigger the *most expensive* possible operation,
+/// once per commit. In production it produced 23 full rebuilds in 10 minutes and
+/// OOM-killed the process three times.
+///
+/// `was_full_resync` is the observable that separates the two paths. Doc count and
+/// watermark are identical either way — a resync arrives at the same correct index,
+/// just by rebuilding it — which is exactly why this went unnoticed.
+#[tokio::test]
+async fn sync_without_indexed_changes_advances_watermark_without_resync() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/noop:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    // The index depends on ex:title only.
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("noop-test", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let docs_before = before.num_docs();
+
+    // Commit something the index does not cover. NOTE the absence of `@type`:
+    // `affected_subjects` filters flakes by PREDICATE (`predicate_sids.contains(f.p)`),
+    // and this query's deps include `rdf:type` because it matches on `@type ex:Doc`.
+    // So any typed insert — even `@type ex:Observation`, an unrelated class — counts
+    // as touching an indexed predicate and never reaches the empty-set branch.
+    //
+    // The first version of this test used `{"@id":"ex:obs1","@type":"ex:Observation",
+    // "ex:reading":"42"}` and passed against the unfixed code, because of exactly
+    // that. Only a subject touching NO dependent predicate exercises this path.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:note1", "ex:reading":"42" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+    let ledger_t = ledger2.t();
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+
+    assert!(
+        !synced.was_full_resync,
+        "a commit touching no indexed property must NOT trigger a full resync; \
+         this is the bug that OOM-killed production three times"
+    );
+    assert_eq!(
+        synced.upserted, 0,
+        "nothing the index covers changed, so nothing should be upserted"
+    );
+    assert_eq!(
+        synced.new_watermark, ledger_t,
+        "the watermark must advance to the ledger's t, or every later sync \
+         re-walks a commit range that grows without bound"
+    );
+
+    // And the index itself is unchanged and still correct.
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(
+        after.num_docs(),
+        docs_before,
+        "an untouched index must keep its documents"
+    );
+}
+
+/// The complement of the test above: advancing the watermark on an empty
+/// change set is only sound when the tracked property set is *total*, and a
+/// wildcard select makes it anything but.
+///
+/// `select {"?x": ["*"]}` observes every property of the document, yet the
+/// dependency extractor can only name the ones it can see — here just
+/// `rdf:type` from the `where`. A commit that changes `ex:title` therefore
+/// touches no tracked property, the change set comes back empty, and the
+/// watermark-advance branch would record the index as current at a `t` whose
+/// change it never indexed. Every later sync starts above that `t`, so the
+/// staleness is permanent and `is_valid_at` vouches for it.
+///
+/// The sync must instead notice that its dependencies are incomplete and take
+/// the full rebuild. `was_full_resync` pins the routing; the term check pins
+/// the outcome that matters.
+#[tokio::test]
+async fn sync_with_wildcard_select_rebuilds_instead_of_advancing_past_the_change() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/wildcard:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["*"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("wildcard", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    // Touch a property the wildcard covers and no explicit dependency names.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"quokka" } ]
+    });
+    let ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a wildcard select cannot be tracked incrementally; the sync must rebuild"
+    );
+    assert_eq!(synced.new_watermark, ledger2.t());
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("quokka").is_some(),
+        "the new title never reached the index: the sync advanced past it"
+    );
+}
+
+/// A nested projection indexes text from *another* subject, so the flake that
+/// changes the document is not on the document. `affected_subjects` attributes
+/// a flake to its own subject, and the old extractor did not even see the
+/// nested predicate — either way the change set is empty and the index goes
+/// stale. Same required outcome as the wildcard case: rebuild.
+#[tokio::test]
+async fn sync_with_nested_projection_rebuilds_when_the_referenced_subject_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/nested:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ {
+            "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document",
+            "ex:author": { "@id":"ex:author1", "ex:name":"Ada" }
+        } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:title", { "ex:author": ["ex:name"] }] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("nested", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        before.term_idx("ada").is_some(),
+        "the nested author name should be part of the document text"
+    );
+
+    // Change the author, not the document.
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:author1", "ex:name":"Grace" } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a nested projection cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("grace").is_some(),
+        "the author's new name never reached the document that projects it"
+    );
+}
+
+/// Reasoning infers from properties the patterns never name: asserting
+/// `ex:Memo rdfs:subClassOf ex:Doc` makes every memo a document. No tracked
+/// property changes, so the sync must rebuild.
+#[tokio::test]
+async fn sync_with_reasoning_rebuilds_when_the_schema_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/reasoning:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let ctx = json!({
+        "ex": "http://example.org/",
+        "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+    });
+    let tx1 = json!({
+        "@context": ctx,
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" },
+            { "@id":"ex:memo1", "@type":"ex:Memo", "ex:title":"quokka" }
+        ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": ctx,
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:title"] },
+        "reasoning": "rdfs"
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("reasoning", ledger_id, query))
+        .await
+        .unwrap();
+    assert_eq!(created.doc_count, 1);
+
+    let tx2 = json!({
+        "@context": ctx,
+        "@graph": [ { "@id":"ex:Memo", "rdfs:subClassOf": { "@id":"ex:Doc" } } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "reasoning cannot be tracked incrementally; the sync must rebuild"
+    );
+
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        after.term_idx("quokka").is_some(),
+        "the memo, now a document, never reached the index"
+    );
+}
+
+/// A variable predicate observes every property, so the tracked set cannot be
+/// total. Here the changed property happens to be tracked anyway, which is why
+/// the index ends up correct on either path — the routing is the assertion.
+#[tokio::test]
+async fn sync_with_variable_predicate_always_rebuilds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "bm25/varpred:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx1 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Initial document" } ]
+    });
+    let ledger1 = fluree.insert(ledger0, &tx1).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [
+            { "@id":"?x", "@type":"ex:Doc" },
+            { "@id":"?x", "?p":"?v" }
+        ],
+        "select": { "?x": ["@id", "ex:title"] }
+    });
+    let created = fluree
+        .create_full_text_index(Bm25CreateConfig::new("varpred", ledger_id, query))
+        .await
+        .unwrap();
+    // `doc_count` reports result rows, and `?p ?v` yields one row per property
+    // of the document, so count documents in the index instead.
+    let before = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(before.num_docs(), 1);
+
+    let tx2 = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [ { "@id":"ex:doc1", "ex:title":"quokka" } ]
+    });
+    let _ledger2 = fluree.insert(ledger1, &tx2).await.unwrap().ledger;
+
+    let synced = fluree
+        .sync_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(
+        synced.was_full_resync,
+        "a variable predicate cannot be tracked incrementally; the sync must rebuild"
+    );
+    let after = fluree
+        .load_bm25_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(after.term_idx("quokka").is_some());
+}
+
+/// The refusal every route gives a query that names an index source where a
+/// graph is read.
+fn assert_not_a_graph<T: std::fmt::Debug>(
+    result: Result<T, fluree_db_api::ApiError>,
+    gs: &str,
+    route: &str,
+) {
+    let err = match result {
+        Ok(answer) => panic!("{route}: answered instead of refusing: {answer:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_type(),
+        "err:db/GraphSourceNotAGraph",
+        "{route}: {err}"
+    );
+    assert_eq!(err.status_code(), 400, "{route}: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!(
+            "graph source '{gs}' is a BM25 index, not a graph: query it with an \
+             f:graphSource pattern, with its source ledger as the dataset"
+        )),
+        "{route}: {message}"
+    );
+}
+
+/// An index source has no triples: its searches find it by the `f:graphSource`
+/// id in their own pattern, with the source ledger as the dataset. Named where
+/// a graph is read (the query target, `FROM`, `FROM NAMED`, `GRAPH`) it is
+/// refused on SPARQL and JSON-LD alike. Each route once answered something
+/// else: triple patterns read it as an empty graph (0 rows), the target
+/// answered "Ledger not found", and a search with the index as the dataset
+/// either answered (through `query_connection_with_bm25`) or failed with "No
+/// BM25 snapshot ... at t=0" (through `query_from`). The documented form, the
+/// source ledger as the dataset, still answers.
+#[tokio::test]
+async fn an_index_source_is_refused_as_a_graph_and_searched_through_its_ledger() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "notagraph/docs:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc", "ex:title":"Rust programming guide" },
+            { "@id":"ex:doc2", "@type":"ex:Doc", "ex:title":"Python for beginners" }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.expect("insert");
+    let cfg = Bm25CreateConfig::new(
+        "notagraph-search",
+        ledger_id,
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "where": [{ "@id":"?x", "@type":"ex:Doc", "ex:title":"?title" }],
+            "select": { "?x": ["@id", "ex:title"] }
+        }),
+    );
+    let gs = fluree
+        .create_full_text_index(cfg)
+        .await
+        .expect("create index")
+        .graph_source_id;
+    let ctx = json!({ "ex":"http://example.org/", "f": "https://ns.flur.ee/db#" });
+    let search = json!({
+        "f:graphSource": gs,
+        "f:searchText": "rust",
+        "f:searchLimit": 10,
+        "f:searchResult": {"f:resultId": "?doc", "f:resultScore": "?score"}
+    });
+
+    // A3, the documented form: the source ledger is the dataset.
+    let documented = json!({
+        "@context": ctx, "from": ledger_id, "where": [search], "select": ["?doc", "?score"]
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&documented)
+        .execute_formatted()
+        .await
+        .expect("search through the source ledger");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+    assert_eq!(
+        fluree
+            .query_connection_with_bm25(&documented)
+            .await
+            .expect("search through the source ledger")
+            .row_count(),
+        1
+    );
+
+    // A1 / A2: the same search with the index as the dataset.
+    let search_from_index = json!({
+        "@context": ctx, "from": gs, "where": [search], "select": ["?doc", "?score"]
+    });
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .jsonld(&search_from_index)
+            .execute_formatted()
+            .await,
+        &gs,
+        "A1 search, index as dataset",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_connection_with_bm25(&search_from_index)
+            .await
+            .map(|r| r.row_count()),
+        &gs,
+        "A2 query_connection_with_bm25, index as dataset",
+    );
+
+    // B / C / C2: triple patterns over FROM <index>.
+    let triples = json!({
+        "@context": ctx, "from": gs,
+        "where": [{"@id": "?s", "ex:title": "?t"}], "select": ["?s", "?t"]
+    });
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .jsonld(&triples)
+            .execute_formatted()
+            .await,
+        &gs,
+        "B JSON-LD from",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s ?t FROM <{gs}> WHERE {{ ?s <http://example.org/title> ?t }}"
+            ))
+            .execute_formatted()
+            .await,
+        &gs,
+        "C SPARQL FROM",
+    );
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!("SELECT * FROM <{gs}> WHERE {{ ?s ?p ?o }}"))
+            .execute_formatted()
+            .await,
+        &gs,
+        "C2 SPARQL FROM, ?s ?p ?o",
+    );
+
+    // D / D2: the index as the query target.
+    let target = fluree.graph(&gs);
+    let target_search = json!({"@context": ctx, "where": [search], "select": ["?doc", "?score"]});
+    assert_not_a_graph(
+        target
+            .query()
+            .jsonld(&target_search)
+            .execute_formatted()
+            .await,
+        &gs,
+        "D JSON-LD target",
+    );
+    assert_not_a_graph(
+        target
+            .query()
+            .sparql("SELECT * WHERE { ?s ?p ?o }")
+            .execute_formatted()
+            .await,
+        &gs,
+        "D2 SPARQL target",
+    );
+
+    // E: FROM NAMED <index> + GRAPH <index>.
+    assert_not_a_graph(
+        fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT * FROM <{ledger_id}> FROM NAMED <{gs}> WHERE {{ GRAPH <{gs}> {{ ?s ?p ?o }} }}"
+            ))
+            .execute_formatted()
+            .await,
+        &gs,
+        "E SPARQL FROM NAMED + GRAPH",
+    );
+    let named = json!({
+        "@context": ctx, "from": ledger_id, "fromNamed": [gs],
+        "where": [["graph", gs, {"@id": "?s", "ex:title": "?t"}]], "select": ["?s", "?t"]
+    });
+    assert_not_a_graph(
+        fluree.query_from().jsonld(&named).execute_formatted().await,
+        &gs,
+        "E JSON-LD fromNamed + graph",
+    );
+
+    // F: GRAPH <index> inside a query of the ledger, with no dataset naming it.
+    // Only the iceberg feature resolves a GRAPH IRI that names a graph source;
+    // without it the IRI names no graph in the ledger and matches nothing.
+    if cfg!(feature = "iceberg") {
+        let ledger = fluree.graph(ledger_id);
+        assert_not_a_graph(
+            ledger
+                .query()
+                .sparql(&format!("SELECT * WHERE {{ GRAPH <{gs}> {{ ?s ?p ?o }} }}"))
+                .execute_formatted()
+                .await,
+            &gs,
+            "F SPARQL GRAPH in a ledger query",
+        );
+        let in_ledger = json!({
+            "@context": ctx,
+            "where": [["graph", gs, {"@id": "?s", "ex:title": "?t"}]], "select": ["?s", "?t"]
+        });
+        assert_not_a_graph(
+            ledger.query().jsonld(&in_ledger).execute_formatted().await,
+            &gs,
+            "F JSON-LD graph in a ledger query",
+        );
+    }
 }

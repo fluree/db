@@ -9,9 +9,12 @@ use fluree_graph_ir::{Graph, Term, Triple};
 use crate::error::{R2rmlError, R2rmlResult};
 use crate::mapping::{
     ConstantValue, GraphMap, JoinCondition, LogicalTable, ObjectMap, PredicateMap,
-    PredicateObjectMap, RefObjectMap, SubjectMap, TermType, TriplesMap,
+    PredicateObjectMap, RefObjectMap, SubjectMap, TableKeys, TermType, TriplesMap,
 };
 use crate::vocab::R2RML;
+
+/// `f:key`, as the property an error names.
+const F_KEY: &str = "f:key";
 
 /// Extracts R2RML mappings from a Graph IR
 pub struct MappingExtractor<'a> {
@@ -72,7 +75,38 @@ impl<'a> MappingExtractor<'a> {
             }
         }
 
+        self.ensure_keys_on_logical_tables(&triples_maps)?;
+
         Ok(triples_maps)
+    }
+
+    /// Refuse an `f:key` anywhere but on a triples map's logical table: it
+    /// says nothing there, and a key the author meant for a table but wrote
+    /// on its subject map (say) would otherwise be dropped without a word.
+    fn ensure_keys_on_logical_tables(&self, triples_maps: &[TriplesMap]) -> R2rmlResult<()> {
+        let logical_tables: HashSet<&str> = triples_maps
+            .iter()
+            .flat_map(|tm| self.get_triples_for_subject(&tm.iri))
+            .filter(|t| t.p.as_iri() == Some(R2RML::LOGICAL_TABLE))
+            .filter_map(|t| node_key(&t.o))
+            .collect();
+        for triple in self.graph.iter() {
+            if triple.p.as_iri() != Some(fluree_vocab::fluree::KEY) {
+                continue;
+            }
+            if !node_key(&triple.s).is_some_and(|k| logical_tables.contains(k)) {
+                return Err(R2rmlError::InvalidValue {
+                    property: F_KEY.to_string(),
+                    message: format!(
+                        "f:key on {}, which is not the logical table of any triples map. \
+                         Declare a key on the rr:logicalTable node: \
+                         rr:logicalTable [ rr:tableName \"...\" ; f:key ( \"column\" ) ].",
+                        describe_term(&triple.s)
+                    ),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Reject a TriplesMap IRI that carries more than one logical table or
@@ -116,12 +150,159 @@ impl<'a> MappingExtractor<'a> {
         // Extract predicate-object maps
         let poms = self.extract_predicate_object_maps(&triples)?;
 
+        let declared_keys = self.extract_declared_keys(&triples, &logical_table)?;
+
         Ok(TriplesMap {
             iri: tm_iri.to_string(),
             logical_table,
             subject_map,
             predicate_object_maps: poms,
+            declared_keys,
         })
+    }
+
+    /// The keys declared on a triples map's logical table: each `f:key` an
+    /// `rdf:List` of one or more column-name strings, one list per key.
+    ///
+    /// Refused, rather than read as no key: an `f:key` that is not a list, an
+    /// empty list, an item that is not a plain string, a column named twice
+    /// in one key, and any other predicate in the `f:` namespace on the
+    /// logical table (a misspelled `f:key` would otherwise be ignored, and
+    /// the table read as keyless without a word). Other predicates on the
+    /// logical table are ignored, as always.
+    fn extract_declared_keys(
+        &self,
+        triples: &[&Triple],
+        logical_table: &LogicalTable,
+    ) -> R2rmlResult<TableKeys> {
+        let Some(table_node) = self.find_object_optional(triples, R2RML::LOGICAL_TABLE) else {
+            return Ok(TableKeys::none());
+        };
+        let table = describe_logical_table(logical_table);
+        let invalid = |message: String| R2rmlError::InvalidValue {
+            property: F_KEY.to_string(),
+            message: format!("on the logical table {table}: {message}"),
+        };
+
+        let mut lists: Vec<Vec<Term>> = Vec::new();
+        // The list being read from indexed list items (the parser's default
+        // shape for a collection): its items arrive in order, index 0 first.
+        let mut open: Option<Vec<Term>> = None;
+        for triple in self.get_triples_for_term(&table_node) {
+            let Some(p) = triple.p.as_iri() else { continue };
+            if p != fluree_vocab::fluree::KEY {
+                if p.starts_with(fluree_vocab::fluree::DB) {
+                    return Err(R2rmlError::InvalidValue {
+                        property: p.to_string(),
+                        message: format!(
+                            "unknown Fluree term on the logical table {table}; the only one a \
+                             logical table takes is f:key ({})",
+                            fluree_vocab::fluree::KEY
+                        ),
+                    });
+                }
+                continue;
+            }
+            match triple.list_index {
+                Some(0) => {
+                    lists.extend(open.take());
+                    open = Some(vec![triple.o.clone()]);
+                }
+                Some(i) => {
+                    match open.as_mut() {
+                        Some(items) if usize::try_from(i).ok() == Some(items.len()) => {
+                            items.push(triple.o.clone());
+                        }
+                        _ => return Err(invalid(
+                            "its list items are out of order, so the lists cannot be told apart"
+                                .to_string(),
+                        )),
+                    }
+                }
+                None => {
+                    lists.extend(open.take());
+                    lists.push(self.rdf_list_items(&triple.o).map_err(invalid)?);
+                }
+            }
+        }
+        lists.extend(open);
+
+        let mut keys = Vec::with_capacity(lists.len());
+        for items in lists {
+            if items.is_empty() {
+                return Err(invalid(
+                    "the list is empty; a key names one or more columns".to_string(),
+                ));
+            }
+            let mut columns: Vec<String> = Vec::with_capacity(items.len());
+            for item in &items {
+                let column = match item {
+                    Term::Literal {
+                        value: fluree_graph_ir::LiteralValue::String(s),
+                        datatype,
+                        language: None,
+                    } if datatype.is_xsd_string() && !s.is_empty() => s.to_string(),
+                    other => {
+                        return Err(invalid(format!(
+                            "a key's items are column names as plain strings, got {}",
+                            describe_term(other)
+                        )))
+                    }
+                };
+                if columns.contains(&column) {
+                    return Err(invalid(format!(
+                        "column \"{column}\" appears twice in one key"
+                    )));
+                }
+                columns.push(column);
+            }
+            keys.push(columns);
+        }
+        Ok(TableKeys::new(keys))
+    }
+
+    /// The items of the `rdf:List` whose head is `head`, read off its
+    /// `rdf:first` / `rdf:rest` spine. An error says why `head` is not one.
+    fn rdf_list_items(&self, head: &Term) -> Result<Vec<Term>, String> {
+        let mut items = Vec::new();
+        let mut node = head.clone();
+        let mut visited: HashSet<String> = HashSet::new();
+        loop {
+            if node.as_iri() == Some(fluree_vocab::rdf::NIL) {
+                return Ok(items);
+            }
+            let Term::BlankNode(id) = &node else {
+                return Err(format!(
+                    "expected a list of column names, as in f:key ( \"column\" ), got {}",
+                    describe_term(head)
+                ));
+            };
+            if !visited.insert(id.as_str().to_string()) {
+                return Err("the list does not end (its rdf:rest loops)".to_string());
+            }
+            let spine = self.get_triples_for_term(&node);
+            let firsts = self.find_objects(&spine, fluree_vocab::rdf::FIRST);
+            let rests = self.find_objects(&spine, fluree_vocab::rdf::REST);
+            match (firsts.as_slice(), rests.as_slice()) {
+                ([first], [rest]) => {
+                    items.push(first.clone());
+                    node = rest.clone();
+                }
+                _ if items.is_empty() && firsts.is_empty() && rests.is_empty() => {
+                    return Err(format!(
+                        "expected a list of column names, as in f:key ( \"column\" ), got {}",
+                        describe_term(head)
+                    ));
+                }
+                _ => {
+                    return Err(
+                        "the list is malformed (a node without exactly one rdf:first and one \
+                         rdf:rest)"
+                            .to_string(),
+                    )
+                }
+            }
+        }
     }
 
     /// Extract the logical table from a TriplesMap
@@ -136,12 +317,26 @@ impl<'a> MappingExtractor<'a> {
         if let Some(table_name) = self.find_object_optional(&table_triples, R2RML::TABLE_NAME) {
             if let Some(name) = self.term_to_string(&table_name) {
                 let normalized = LogicalTable::normalize_table_name(&name);
+                // An `rr:sqlQuery` map stands in for its table by an alias with
+                // this prefix, and every reader tells the two apart by it, so a
+                // table named that way would be read as a query's alias.
+                if LogicalTable::is_sql_query_alias(&normalized) {
+                    return Err(R2rmlError::InvalidValue {
+                        property: "rr:tableName".to_string(),
+                        message: format!(
+                            "\"{name}\" begins with \"{}\", which is reserved for the \
+                             aliases of rr:sqlQuery logical tables",
+                            crate::mapping::SQL_QUERY_ALIAS_PREFIX
+                        ),
+                    });
+                }
                 return Ok(LogicalTable::TableName(normalized));
             }
         }
 
-        // rr:sqlQuery — scanned as a derived table by SQL graph sources;
-        // Iceberg-backed sources refuse the alias at registration.
+        // rr:sqlQuery — scanned as a derived table by SQL graph sources, and
+        // evaluated in a restricted form by Iceberg sources; Delta sources
+        // refuse it.
         if let Some(query) = self.find_object_optional(&table_triples, R2RML::SQL_QUERY) {
             if let Some(sql) = self.term_to_string(&query) {
                 if sql.trim().is_empty() {
@@ -161,8 +356,28 @@ impl<'a> MappingExtractor<'a> {
 
     /// Extract the subject map from a TriplesMap
     fn extract_subject_map(&self, triples: &[&Triple]) -> R2rmlResult<SubjectMap> {
+        // A triples map has exactly one subject map, written as either rr:subject
+        // or rr:subjectMap. With both (or two shortcuts) only the first would be
+        // read, and everything on the other — rr:class, rr:graph — dropped
+        // without a word. (Two rr:subjectMap on one IRI are caught earlier by
+        // `ensure_no_collision`.)
+        let subject_shortcuts = self.find_objects(triples, R2RML::SUBJECT);
+        let subject_maps = self.find_objects(triples, R2RML::SUBJECT_MAP);
+        if subject_shortcuts.len() + subject_maps.len() > 1 {
+            return Err(R2rmlError::InvalidValue {
+                property: "rr:subject / rr:subjectMap".to_string(),
+                message: format!(
+                    "a triples map must have exactly one subject map, found {} rr:subject and \
+                     {} rr:subjectMap. Only the first would be read and the rest silently \
+                     dropped.",
+                    subject_shortcuts.len(),
+                    subject_maps.len()
+                ),
+            });
+        }
+
         // Check for shorthand rr:subject first
-        if let Some(subject_obj) = self.find_object_optional(triples, R2RML::SUBJECT) {
+        if let Some(subject_obj) = subject_shortcuts.into_iter().next() {
             let iri = self
                 .term_to_iri(&subject_obj)
                 .ok_or_else(|| R2rmlError::InvalidValue {
@@ -217,51 +432,130 @@ impl<'a> MappingExtractor<'a> {
         }
 
         // Extract rr:graph / rr:graphMap (subject-map-level named-graph routing).
-        subject_map.graph_map = self.extract_graph_map(&sm_triples);
+        subject_map.graph_map = self.extract_graph_map(&sm_triples)?;
 
         Ok(subject_map)
     }
 
     /// Extract a graph map from a term's triples: `rr:graph <iri>` (constant
     /// shortcut) or `rr:graphMap [ rr:template | rr:column | rr:constant ]`.
-    /// Returns `None` when neither is present (the triples land in the default
-    /// graph). A graph term is always an IRI, so there is no term-type to parse.
-    fn extract_graph_map(&self, triples: &[&Triple]) -> Option<GraphMap> {
-        // rr:graph <iri> — constant shortcut.
-        if let Some(graph_obj) = self.find_object_optional(triples, R2RML::GRAPH) {
-            if let Some(iri) = self.term_to_iri(&graph_obj) {
-                return Some(GraphMap::constant(iri));
-            }
+    /// `Ok(None)` means the triples land in the default graph: either no graph
+    /// map is present, or the constant is `rr:defaultGraph`, which R2RML defines
+    /// as naming the default graph.
+    ///
+    /// **Support here is deliberately a subset of R2RML, and the constructs
+    /// outside it are refused rather than ignored.** Silently dropping a graph
+    /// map is the failure mode with data consequences: `materialize_graph_from_batch`
+    /// keys the accumulator on the resolved graph, so a dropped map leaves every
+    /// row in the default graph, and two partitions holding the same subject IRI
+    /// then collapse onto one key and overwrite each other per predicate. A
+    /// mapping that asks for routing and silently gets none is worse than one
+    /// told it cannot have it, so each case below returns an error naming the
+    /// construct it refused: valid-but-unimplemented R2RML is `Unsupported`, a
+    /// malformed graph map is `InvalidValue`.
+    fn extract_graph_map(&self, triples: &[&Triple]) -> R2rmlResult<Option<GraphMap>> {
+        let graph_shortcuts = self.find_objects(triples, R2RML::GRAPH);
+        let graph_maps = self.find_objects(triples, R2RML::GRAPH_MAP);
+
+        // R2RML treats rr:graph and rr:graphMap as cumulative and repeatable — a
+        // term map may name several graphs and the triple goes into all of them.
+        // Exactly one is implemented, so anything asking for more has to fail
+        // rather than have all but the first silently discarded.
+        if graph_shortcuts.len() + graph_maps.len() > 1 {
+            return Err(R2rmlError::Unsupported(format!(
+                "multiple graph maps on one term map ({} rr:graph + {} rr:graphMap): \
+                 R2RML treats these as cumulative, but only a single graph per term \
+                 map is supported. Use one rr:graph or one rr:graphMap.",
+                graph_shortcuts.len(),
+                graph_maps.len()
+            )));
+        }
+
+        // rr:graph <iri> — constant shortcut. Its value MUST be an IRI; a literal
+        // or blank node here used to fall through as "no graph map".
+        if let Some(graph_obj) = graph_shortcuts.first() {
+            let iri = self
+                .term_to_iri(graph_obj)
+                .ok_or_else(|| R2rmlError::InvalidValue {
+                    property: "rr:graph".to_string(),
+                    message: format!("expected IRI, got {}", describe_term(graph_obj)),
+                })?;
+            return Ok(constant_graph(iri));
         }
 
         // rr:graphMap [ ... ] — a term map producing the graph IRI.
-        let graph_map_obj = self.find_object_optional(triples, R2RML::GRAPH_MAP)?;
+        let Some(graph_map_obj) = graph_maps.into_iter().next() else {
+            return Ok(None);
+        };
         let gm_triples = self.get_triples_for_term(&graph_map_obj);
-        let mut graph_map = GraphMap::default();
 
-        if let Some(template_obj) = self.find_object_optional(&gm_triples, R2RML::TEMPLATE) {
-            if let Some(template) = self.term_to_string(&template_obj) {
-                graph_map.template_columns = crate::mapping::extract_template_columns(&template);
-                graph_map.template = Some(template);
-            }
-        }
-        if let Some(column_obj) = self.find_object_optional(&gm_triples, R2RML::COLUMN) {
-            if let Some(col) = self.term_to_string(&column_obj) {
-                graph_map.column = Some(col);
-            }
-        }
-        if let Some(constant_obj) = self.find_object_optional(&gm_triples, R2RML::CONSTANT) {
-            if let Some(iri) = self.term_to_iri(&constant_obj) {
-                graph_map.constant = Some(iri);
+        // A graph map's term type MUST be rr:IRI. Anything else would be read and
+        // ignored, minting IRIs the author asked not to have.
+        if let Some(term_type_obj) = self.find_object_optional(&gm_triples, R2RML::TERM_TYPE) {
+            if self.term_to_iri(&term_type_obj).as_deref() != Some(R2RML::IRI) {
+                return Err(R2rmlError::InvalidValue {
+                    property: "rr:termType in rr:graphMap".to_string(),
+                    message: format!(
+                        "a graph map's term type must be rr:IRI, got {}",
+                        describe_term(&term_type_obj)
+                    ),
+                });
             }
         }
 
-        // A graphMap that parsed no usable value source is treated as absent.
-        if graph_map.is_empty() {
-            None
-        } else {
-            Some(graph_map)
+        let template = self
+            .find_object_optional(&gm_triples, R2RML::TEMPLATE)
+            .and_then(|t| self.term_to_string(&t));
+        let column = self
+            .find_object_optional(&gm_triples, R2RML::COLUMN)
+            .and_then(|t| self.term_to_string(&t));
+        let constant = self.find_object_optional(&gm_triples, R2RML::CONSTANT);
+
+        // A term map is exactly one of template-, column- or constant-valued.
+        // None of them is a malformed mapping, not an absent one: treating it as
+        // absent is exactly how routing silently degrades to the default graph.
+        // More than one would have the materializer pick the constant and drop
+        // the rest.
+        let sources = [template.is_some(), column.is_some(), constant.is_some()]
+            .into_iter()
+            .filter(|present| *present)
+            .count();
+        if sources == 0 {
+            return Err(R2rmlError::InvalidValue {
+                property: "rr:graphMap".to_string(),
+                message: "no rr:template, rr:column or rr:constant, so it names no graph. \
+                          Omit the graph map to target the default graph."
+                    .to_string(),
+            });
         }
+        if sources > 1 {
+            return Err(R2rmlError::InvalidValue {
+                property: "rr:graphMap".to_string(),
+                message: format!(
+                    "exactly one of rr:template, rr:column or rr:constant is allowed, found \
+                     {sources}. Only one value source would be read and the others ignored."
+                ),
+            });
+        }
+
+        if let Some(constant_obj) = constant {
+            // A graph map's constant MUST be an IRI (R2RML forbids literal and
+            // blank-node graphs).
+            let iri = self
+                .term_to_iri(&constant_obj)
+                .ok_or_else(|| R2rmlError::InvalidValue {
+                    property: "rr:constant in rr:graphMap".to_string(),
+                    message: format!(
+                        "a graph map's constant must be an IRI, got {}",
+                        describe_term(&constant_obj)
+                    ),
+                })?;
+            return Ok(constant_graph(iri));
+        }
+        if let Some(template) = template {
+            return Ok(Some(GraphMap::template(template)));
+        }
+        Ok(column.map(GraphMap::column))
     }
 
     /// Extract all predicate-object maps from a TriplesMap
@@ -282,6 +576,25 @@ impl<'a> MappingExtractor<'a> {
     /// Extract a single predicate-object map
     fn extract_predicate_object_map(&self, pom_term: &Term) -> R2rmlResult<PredicateObjectMap> {
         let pom_triples = self.get_triples_for_term(pom_term);
+
+        // R2RML also allows a graph map on a predicate-object map, scoping just
+        // that map's triples. `PredicateObjectMap` has no field for one and the
+        // materializer resolves the graph once per row from the SUBJECT map, so a
+        // POM-level graph map would be read and then ignored — the silent
+        // cross-partition collapse described on `extract_graph_map`. Refuse it by
+        // name; implementing it later can relax this without changing what the
+        // error means today.
+        if !self.find_objects(&pom_triples, R2RML::GRAPH).is_empty()
+            || !self.find_objects(&pom_triples, R2RML::GRAPH_MAP).is_empty()
+        {
+            return Err(R2rmlError::Unsupported(
+                "rr:graph / rr:graphMap on a predicate-object map is not supported. Only \
+                 subject-map-level graph maps are honored; a POM-level graph map would be \
+                 ignored and its triples would land in the subject's graph. Move the graph \
+                 map to the subject map."
+                    .to_string(),
+            ));
+        }
 
         // Extract predicate map
         let predicate_map = self.extract_predicate_map(&pom_triples)?;
@@ -540,6 +853,44 @@ impl<'a> MappingExtractor<'a> {
     }
 }
 
+/// A graph IRI named by a constant graph map. R2RML defines `rr:defaultGraph`
+/// as the default graph, which is what `None` already means downstream, so
+/// naming it is not an error: it is the long way of writing no graph map.
+fn constant_graph(iri: String) -> Option<GraphMap> {
+    if iri == R2RML::DEFAULT_GRAPH {
+        None
+    } else {
+        Some(GraphMap::constant(iri))
+    }
+}
+
+/// The key the subject index files a node under (an IRI, or a blank node's
+/// label), or `None` for a literal, which is never a subject.
+fn node_key(term: &Term) -> Option<&str> {
+    match term {
+        Term::Iri(iri) => Some(iri),
+        Term::BlankNode(blank) => Some(blank.as_str()),
+        Term::Literal { .. } => None,
+    }
+}
+
+/// A logical table, for an error message.
+fn describe_logical_table(table: &LogicalTable) -> String {
+    match table {
+        LogicalTable::TableName(name) => format!("\"{name}\""),
+        LogicalTable::SqlQuery { sql, .. } => format!("rr:sqlQuery \"{}\"", sql.trim()),
+    }
+}
+
+/// Describe a term for an error message: what kind it is, and its value.
+fn describe_term(term: &Term) -> String {
+    match term {
+        Term::Iri(iri) => format!("IRI <{iri}>"),
+        Term::BlankNode(_) => "a blank node".to_string(),
+        Term::Literal { value, .. } => format!("literal \"{}\"", value.lexical()),
+    }
+}
+
 #[cfg(all(test, feature = "turtle"))]
 mod tests {
     use super::*;
@@ -664,6 +1015,286 @@ mod tests {
             .expect("graph map parsed");
         assert_eq!(gm.constant.as_deref(), Some("http://example.org/g1"));
         assert!(gm.template.is_none() && gm.column.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Named-graph routing: what is refused, and why refusing beats ignoring.
+    //
+    // Before these guards every shape below loaded without a word. Most yielded
+    // `None`, so routing degraded to the default graph unannounced; the rest
+    // kept the first of several maps, or minted a graph named after
+    // rr:defaultGraph. Every assertion names the construct in the message so
+    // the mapping author can find it, and asserts the message rather than
+    // `is_err()` so one refusal cannot stand in for another.
+    // ------------------------------------------------------------------
+
+    fn extract(r2rml: &str) -> R2rmlResult<Vec<TriplesMap>> {
+        let graph = parse_r2rml(r2rml);
+        MappingExtractor::new(&graph).extract_all()
+    }
+
+    /// A one-table mapping whose subject map carries `subject_extra` beside its
+    /// template.
+    fn mapping_with_subject_map(subject_extra: &str) -> String {
+        format!(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [
+                    rr:template "http://example.org/{{id}}" ;
+                    {subject_extra}
+                ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#
+        )
+    }
+
+    /// The message of an `Unsupported` error, or panic saying what came back.
+    fn unsupported_message(r2rml: &str) -> String {
+        match extract(r2rml) {
+            Err(R2rmlError::Unsupported(msg)) => msg,
+            Err(other) => panic!("expected Unsupported, got {other:?}"),
+            Ok(_) => panic!("this mapping must be refused, not silently accepted"),
+        }
+    }
+
+    /// The `(property, message)` of an `InvalidValue` error, or panic saying
+    /// what came back.
+    fn invalid_value(r2rml: &str) -> (String, String) {
+        match extract(r2rml) {
+            Err(R2rmlError::InvalidValue { property, message }) => (property, message),
+            Err(other) => panic!("expected InvalidValue, got {other:?}"),
+            Ok(_) => panic!("this mapping must be refused, not silently accepted"),
+        }
+    }
+
+    /// The graph map of the one triples map in an accepted mapping.
+    fn accepted_graph_map(r2rml: &str) -> Option<GraphMap> {
+        let tms = extract(r2rml).expect("this mapping is within the supported subset");
+        tms[0].subject_map.graph_map.clone()
+    }
+
+    #[test]
+    fn refuses_multiple_cumulative_graph_maps() {
+        // R2RML would put the triples in BOTH graphs. One graph is implemented,
+        // so accepting this would discard the second without saying so.
+        let msg = unsupported_message(&mapping_with_subject_map("rr:graph ex:g1 ; rr:graph ex:g2"));
+        assert!(
+            msg.contains("multiple graph maps"),
+            "message must name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn rr_graph_default_graph_is_the_default_graph() {
+        // R2RML: a graph map producing rr:defaultGraph targets the default
+        // graph. Read as an ordinary constant it would mint a named graph called
+        // 'http://www.w3.org/ns/r2rml#defaultGraph' instead.
+        let gm = accepted_graph_map(&mapping_with_subject_map("rr:graph rr:defaultGraph"));
+        assert!(gm.is_none(), "rr:defaultGraph is no graph map, got {gm:?}");
+    }
+
+    #[test]
+    fn graph_map_constant_default_graph_is_the_default_graph() {
+        // The long form of the same spelling.
+        let gm = accepted_graph_map(&mapping_with_subject_map(
+            "rr:graphMap [ rr:constant rr:defaultGraph ]",
+        ));
+        assert!(gm.is_none(), "rr:defaultGraph is no graph map, got {gm:?}");
+    }
+
+    #[test]
+    fn refuses_rr_graph_with_a_literal_object() {
+        // The shortcut's value must be an IRI. A literal used to fall out of the
+        // parse as "no graph map" — the silent degradation in the function that
+        // exists to prevent it.
+        let (property, msg) = invalid_value(&mapping_with_subject_map(
+            r#"rr:graph "http://example.org/g1""#,
+        ));
+        assert_eq!(property, "rr:graph");
+        assert!(
+            msg.contains(r#"literal "http://example.org/g1""#),
+            "message must show the offending term: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_rr_graph_with_a_blank_node_object() {
+        let (property, msg) = invalid_value(&mapping_with_subject_map("rr:graph [ ]"));
+        assert_eq!(property, "rr:graph");
+        assert!(
+            msg.contains("blank node"),
+            "message must show the offending term: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_graph_map_constant_that_is_not_an_iri() {
+        // It has a constant; the constant is just not an IRI. The message must
+        // say that, not "no rr:template, rr:column or rr:constant".
+        let (property, msg) = invalid_value(&mapping_with_subject_map(
+            r#"rr:graphMap [ rr:constant "http://example.org/g" ]"#,
+        ));
+        assert_eq!(property, "rr:constant in rr:graphMap");
+        assert!(
+            msg.contains("must be an IRI") && msg.contains(r#"literal "http://example.org/g""#),
+            "message must say what to fix: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_graph_map_that_names_no_graph() {
+        // No template, column or constant: malformed, not absent. Treating it as
+        // absent is precisely how routing degrades to the default graph unseen.
+        let (property, msg) = invalid_value(&mapping_with_subject_map(
+            "rr:graphMap [ rr:termType rr:IRI ]",
+        ));
+        assert_eq!(property, "rr:graphMap");
+        assert!(
+            msg.contains("no rr:template, rr:column or rr:constant"),
+            "message must say which value sources were missing: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_graph_map_with_more_than_one_value_source() {
+        // A term map is exactly one of the three. With all three present the
+        // materializer would read the constant and ignore the rest.
+        let (property, msg) = invalid_value(&mapping_with_subject_map(
+            r#"rr:graphMap [ rr:template "http://example.org/g/{a}" ; rr:column "g" ; rr:constant ex:gc ]"#,
+        ));
+        assert_eq!(property, "rr:graphMap");
+        assert!(
+            msg.contains("exactly one of") && msg.contains("found 3"),
+            "message must count the value sources: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_graph_map_term_type_other_than_iri() {
+        // A graph map's term type must be rr:IRI. Anything else would be read
+        // and ignored, minting IRIs the author said not to.
+        let (property, msg) = invalid_value(&mapping_with_subject_map(
+            r#"rr:graphMap [ rr:template "http://example.org/g/{a}" ; rr:termType rr:Literal ]"#,
+        ));
+        assert_eq!(property, "rr:termType in rr:graphMap");
+        assert!(
+            msg.contains("must be rr:IRI") && msg.contains("r2rml#Literal"),
+            "message must name the term type given: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_a_predicate_object_map_graph_map() {
+        // Valid R2RML that scopes just this map's triples. `PredicateObjectMap`
+        // has no field for it and the graph is resolved once per row from the
+        // subject map, so it would be read and ignored.
+        let msg = unsupported_message(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] ;
+                rr:predicateObjectMap [
+                    rr:predicate ex:p ;
+                    rr:objectMap [ rr:column "c" ] ;
+                    rr:graph ex:g1
+                ] .
+        "#,
+        );
+        assert!(
+            msg.contains("predicate-object map"),
+            "message must name the construct: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_rr_subject_beside_rr_subject_map() {
+        // The shortcut used to win and return early, so the subject map — and
+        // the graph map on it — was never read.
+        let (property, msg) = invalid_value(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subject ex:s1 ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ; rr:graph ex:g1 ] ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        assert_eq!(property, "rr:subject / rr:subjectMap");
+        assert!(
+            msg.contains("exactly one subject map")
+                && msg.contains("1 rr:subject and 1 rr:subjectMap"),
+            "message must count both forms: {msg}"
+        );
+    }
+
+    #[test]
+    fn refuses_two_rr_subject_shortcuts() {
+        let (property, msg) = invalid_value(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "t" ] ;
+                rr:subject ex:s1 ;
+                rr:subject ex:s2 ;
+                rr:predicateObjectMap [ rr:predicate ex:p ; rr:objectMap [ rr:column "c" ] ] .
+        "#,
+        );
+        assert_eq!(property, "rr:subject / rr:subjectMap");
+        assert!(
+            msg.contains("2 rr:subject and 0 rr:subjectMap"),
+            "message must count both forms: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_single_subject_graph_map_is_still_accepted() {
+        // The refusals must not fire on the supported shape — this is the guard
+        // against over-rejecting, and it is the case the feature exists for.
+        let gm = accepted_graph_map(&mapping_with_subject_map(
+            r#"rr:graphMap [ rr:template "http://example.org/g/{tenant_id}" ]"#,
+        ))
+        .expect("graph map parsed");
+        assert_eq!(
+            gm.template.as_deref(),
+            Some("http://example.org/g/{tenant_id}")
+        );
+        assert_eq!(gm.template_columns, vec!["tenant_id"]);
+        assert!(gm.column.is_none() && gm.constant.is_none());
+    }
+
+    #[test]
+    fn a_graph_map_term_type_iri_is_accepted() {
+        // rr:IRI is the one term type a graph map may state.
+        let gm = accepted_graph_map(&mapping_with_subject_map(
+            r#"rr:graphMap [ rr:template "http://example.org/g/{tenant_id}" ; rr:termType rr:IRI ]"#,
+        ))
+        .expect("graph map parsed");
+        assert_eq!(
+            gm.template.as_deref(),
+            Some("http://example.org/g/{tenant_id}")
+        );
+    }
+
+    #[test]
+    fn a_graph_map_column_is_accepted() {
+        let gm = accepted_graph_map(&mapping_with_subject_map(
+            r#"rr:graphMap [ rr:column "graph_iri" ]"#,
+        ))
+        .expect("graph map parsed");
+        assert_eq!(gm.column.as_deref(), Some("graph_iri"));
+        assert!(gm.template.is_none() && gm.constant.is_none());
     }
 
     #[test]
@@ -871,5 +1502,233 @@ mod tests {
         let triples_maps = extractor.extract_all().unwrap();
 
         assert_eq!(triples_maps[0].table_name(), Some("namespace.table"));
+    }
+
+    // ------------------------------------------------------------------
+    // f:key: declared keys of a logical table.
+    // ------------------------------------------------------------------
+
+    /// A one-map mapping whose logical table carries `table_extra` after its
+    /// table name, and whose subject map carries `subject_extra`.
+    fn keyed_mapping(table_extra: &str, subject_extra: &str) -> String {
+        format!(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/> .
+
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "sets.customers_current" {table_extra} ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{{customer_id}}" {subject_extra} ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        "#
+        )
+    }
+
+    fn declared(tm: &TriplesMap) -> Vec<Vec<String>> {
+        tm.declared_keys.iter().map(<[String]>::to_vec).collect()
+    }
+
+    fn strings(keys: &[&[&str]]) -> Vec<Vec<String>> {
+        keys.iter()
+            .map(|k| k.iter().map(ToString::to_string).collect())
+            .collect()
+    }
+
+    #[test]
+    fn f_key_declares_a_key_of_the_logical_table() {
+        let tms = extract(&keyed_mapping(r#"; f:key ( "customer_id" )"#, "")).unwrap();
+        assert_eq!(declared(&tms[0]), strings(&[&["customer_id"]]));
+    }
+
+    #[test]
+    fn no_f_key_declares_no_key_and_serializes_as_before() {
+        let tms = extract(&keyed_mapping("", "")).unwrap();
+        assert!(tms[0].declared_keys.is_empty());
+        // The field is skipped when empty: a keyless map serializes (and so
+        // hashes for its twin) exactly as before keys could be declared.
+        let json = serde_json::to_value(&tms[0]).unwrap();
+        assert!(json.get("declared_keys").is_none(), "{json}");
+        // ... and a serialized keyed map reads back with its keys.
+        let keyed = extract(&keyed_mapping(r#"; f:key ( "customer_id" )"#, "")).unwrap();
+        let json = serde_json::to_string(&keyed[0]).unwrap();
+        let back: TriplesMap = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.declared_keys, keyed[0].declared_keys);
+    }
+
+    #[test]
+    fn f_key_lists_are_composite_and_repeatable() {
+        // A composite key is one list; each list is an alternative key.
+        let tms = extract(&keyed_mapping(
+            r#"; f:key ( "valid_from" "customer_id" ), ( "row_id" ) ; f:key ( "email" )"#,
+            "",
+        ))
+        .unwrap();
+        assert_eq!(
+            declared(&tms[0]),
+            strings(&[&["customer_id", "valid_from"], &["email"], &["row_id"]])
+        );
+    }
+
+    #[test]
+    fn f_key_reads_the_same_from_an_rdf_list_spine() {
+        // A graph parsed with collections as rdf:first/rdf:rest spines (what
+        // a conformant parser or another producer hands `from_graph`) holds
+        // the same keys as the indexed list items `from_turtle` reads.
+        let ttl = keyed_mapping(
+            r#"; f:key ( "valid_from" "customer_id" ), ( "row_id" ) ; f:key ( "email" )"#,
+            "",
+        );
+        let mut sink = GraphCollectorSink::new();
+        fluree_graph_turtle::parse_with_options(
+            &ttl,
+            &mut sink,
+            fluree_graph_turtle::ParserOptions::new()
+                .with_collections(fluree_graph_turtle::CollectionStyle::Spine),
+        )
+        .unwrap();
+        let graph = sink.into_graph();
+        let spine = MappingExtractor::new(&graph).extract_all().unwrap();
+        let indexed = extract(&ttl).unwrap();
+        assert_eq!(declared(&spine[0]), declared(&indexed[0]));
+        assert_eq!(declared(&spine[0]).len(), 3);
+    }
+
+    #[test]
+    fn f_key_on_a_query_backed_logical_table_is_accepted() {
+        let tms = extract(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                rr:logicalTable [
+                    rr:sqlQuery "SELECT * FROM sets.customers_history WHERE is_current = 1" ;
+                    f:key ( "customer_id" )
+                ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] .
+        "#,
+        )
+        .unwrap();
+        assert_eq!(declared(&tms[0]), strings(&[&["customer_id"]]));
+        assert!(tms[0].sql_query().is_some());
+    }
+
+    #[test]
+    fn f_key_on_a_shared_logical_table_node_applies_to_every_map_reading_it() {
+        let tms = extract(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/> .
+            <http://example.org/mapping#Customers> rr:tableName "sets.customers_current" ;
+                f:key ( "customer_id" ) .
+            <http://example.org/mapping#A> a rr:TriplesMap ;
+                rr:logicalTable <http://example.org/mapping#Customers> ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] .
+            <http://example.org/mapping#B> a rr:TriplesMap ;
+                rr:logicalTable <http://example.org/mapping#Customers> ;
+                rr:subjectMap [ rr:template "http://example.org/account/{customer_id}" ] .
+        "#,
+        )
+        .unwrap();
+        assert_eq!(tms.len(), 2);
+        for tm in &tms {
+            assert_eq!(declared(tm), strings(&[&["customer_id"]]), "{}", tm.iri);
+        }
+    }
+
+    /// The message of an `f:key` refusal, or panic saying what came back.
+    fn f_key_refusal(r2rml: &str) -> String {
+        let (property, message) = invalid_value(r2rml);
+        assert_eq!(property, "f:key", "{message}");
+        message
+    }
+
+    #[test]
+    fn refuses_an_f_key_that_is_not_a_list() {
+        for (value, shows) in [
+            (r#""customer_id""#, r#"literal "customer_id""#),
+            ("ex:customer_id", "IRI <http://example.org/customer_id>"),
+            ("[ ]", "a blank node"),
+        ] {
+            let msg = f_key_refusal(&keyed_mapping(&format!("; f:key {value}"), ""));
+            assert!(
+                msg.contains("expected a list of column names") && msg.contains(shows),
+                "{value}: {msg}"
+            );
+            assert!(
+                msg.contains("\"sets.customers_current\""),
+                "names the table: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_an_empty_f_key() {
+        let msg = f_key_refusal(&keyed_mapping("; f:key ( )", ""));
+        assert!(msg.contains("the list is empty"), "{msg}");
+    }
+
+    #[test]
+    fn refuses_an_f_key_item_that_is_not_a_plain_string() {
+        for (item, shows) in [
+            ("1", "literal \"1\""),
+            ("ex:customer_id", "IRI <http://example.org/customer_id>"),
+            (r#""customer_id"@en"#, r#"literal "customer_id""#),
+            (r#""""#, r#"literal """#),
+            (r#"( "customer_id" )"#, "a blank node"),
+        ] {
+            let msg = f_key_refusal(&keyed_mapping(&format!("; f:key ( {item} )"), ""));
+            assert!(
+                msg.contains("column names as plain strings") && msg.contains(shows),
+                "{item}: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn refuses_a_column_named_twice_in_one_key() {
+        let msg = f_key_refusal(&keyed_mapping(
+            r#"; f:key ( "customer_id" "customer_id" )"#,
+            "",
+        ));
+        assert!(msg.contains("\"customer_id\" appears twice"), "{msg}");
+    }
+
+    #[test]
+    fn refuses_an_unknown_fluree_term_on_a_logical_table() {
+        // A misspelled f:key would otherwise read as a keyless table.
+        let (property, msg) = invalid_value(&keyed_mapping(r#"; f:keys ( "customer_id" )"#, ""));
+        assert_eq!(property, "https://ns.flur.ee/db#keys");
+        assert!(msg.contains("unknown Fluree term"), "{msg}");
+        // Terms from other namespaces are ignored, as always.
+        let tms = extract(&keyed_mapping(r#"; <http://example.org/note> "x""#, "")).unwrap();
+        assert!(tms[0].declared_keys.is_empty());
+    }
+
+    #[test]
+    fn refuses_f_key_off_a_logical_table() {
+        // On the subject map ...
+        let msg = f_key_refusal(&keyed_mapping("", r#"; f:key ( "customer_id" )"#));
+        assert!(
+            msg.contains("not the logical table of any triples map"),
+            "{msg}"
+        );
+        // ... and on the triples map itself.
+        let msg = f_key_refusal(
+            r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix f: <https://ns.flur.ee/db#> .
+            <http://example.org/mapping#M> a rr:TriplesMap ;
+                f:key ( "customer_id" ) ;
+                rr:logicalTable [ rr:tableName "sets.customers_current" ] ;
+                rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ] .
+        "#,
+        );
+        assert!(
+            msg.contains("IRI <http://example.org/mapping#M>")
+                && msg.contains("not the logical table"),
+            "{msg}"
+        );
     }
 }

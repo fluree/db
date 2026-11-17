@@ -132,7 +132,7 @@ async fn validate_local(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&alias) {
+            if !p.can_read(&crate::error::scope_id(&alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -167,13 +167,7 @@ async fn validate_local(
             .fluree
             .validate_ledger(&alias, &options)
             .await
-            .map_err(|e| {
-                if e.is_not_found() {
-                    ServerError::not_found(format!("Ledger not found: {alias}"))
-                } else {
-                    ServerError::Api(e)
-                }
-            })?;
+            .map_err(ServerError::Api)?;
 
         tracing::info!(
             status = "success",
@@ -239,6 +233,7 @@ fn negotiate_response(report: &ValidateReport, headers: &FlureeHeaders) -> Respo
         "warnings": report.warning_count(),
         "infos": report.info_count(),
         "shapesChecked": report.shape_count,
+        "t": report.t,
         "results": report.results,
     }))
     .into_response()

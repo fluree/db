@@ -555,6 +555,10 @@ pub fn convert_field_to_column_value(
         Field::Str(v) => Some(ColumnValue::String(v.clone())),
         Field::Bytes(v) => Some(ColumnValue::Bytes(v.data().to_vec())),
         Field::Date(v) => Some(ColumnValue::Date(*v)),
+        // Iceberg time values use microseconds since midnight, represented by
+        // Int64 in our tabular schema. Parquet 58 exposes explicit time fields.
+        Field::TimeMillis(v) => Some(ColumnValue::Int64(i64::from(*v) * 1000)),
+        Field::TimeMicros(v) => Some(ColumnValue::Int64(*v)),
         Field::TimestampMillis(v) => {
             // Convert milliseconds to microseconds for consistent storage
             let micros = *v * 1000;
@@ -642,7 +646,7 @@ pub fn build_columns_from_values(
 
 /// Map one column's row-collected `ColumnValue`s to the typed [`Column`] for
 /// `field_type`. Extracted verbatim from [`build_columns_from_values`] so the
-/// Arrow direct decoder ([`crate::io::arrow_reader::arrow_column_to_column`]) can
+/// Arrow direct decoder (`crate::io::arrow_reader`'s column conversion) can
 /// reuse the EXACT same `ColumnValue` -> `Column` mapping for its cross-type
 /// fallback — this keeps the direct decode path byte-identical to the two-hop path.
 pub fn column_from_values(values: &[Option<ColumnValue>], field_type: &FieldType) -> Column {
@@ -1014,12 +1018,21 @@ fn decode_int96_column(
         )
         .map_err(|e| IcebergError::Storage(format!("Failed to read int96 column: {e}")))?;
 
-    // Convert INT96 to microseconds since epoch
-    let result = decode_with_nulls(records_read, values_read, &def_levels, &values, |int96| {
-        int96_to_nanos(int96) / 1000
-    });
+    let result = decode_with_nulls(
+        records_read,
+        values_read,
+        &def_levels,
+        &values,
+        int96_to_micros,
+    );
 
     Ok(Column::Timestamp(result))
+}
+
+/// Convert INT96 to microseconds since the Unix epoch, held to the
+/// microsecond at or before the instant, as a dateTime is.
+fn int96_to_micros(int96: &parquet::data_type::Int96) -> i64 {
+    fluree_db_core::temporal::micros_from_epoch_nanos(int96_to_nanos(int96))
 }
 
 /// Convert INT96 to nanoseconds since Unix epoch.
@@ -1602,6 +1615,13 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
             return FieldType::Date;
         }
 
+        if matches!(
+            converted_type,
+            parquet::basic::ConvertedType::TIME_MILLIS | parquet::basic::ConvertedType::TIME_MICROS
+        ) {
+            return FieldType::Int64;
+        }
+
         // Check for timestamp annotations
         // Parquet 2.0+ uses LogicalType for timezone info, converted_type doesn't distinguish
         if converted_type == parquet::basic::ConvertedType::TIMESTAMP_MILLIS
@@ -1611,7 +1631,7 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
             if let Some(parquet::basic::LogicalType::Timestamp {
                 is_adjusted_to_u_t_c: true,
                 ..
-            }) = basic_info.logical_type()
+            }) = basic_info.logical_type_ref()
             {
                 return FieldType::TimestampTz;
             }
@@ -1622,11 +1642,11 @@ fn parquet_type_to_field_type(parquet_type: &Arc<SchemaType>) -> FieldType {
         if converted_type == parquet::basic::ConvertedType::DECIMAL {
             // Try to get precision/scale from logical type
             if let Some(parquet::basic::LogicalType::Decimal { precision, scale }) =
-                basic_info.logical_type()
+                basic_info.logical_type_ref()
             {
                 return FieldType::Decimal {
-                    precision: precision as u8,
-                    scale: scale as i8,
+                    precision: *precision as u8,
+                    scale: *scale as i8,
                 };
             }
             // Fallback: use default precision/scale if not available
@@ -1675,6 +1695,20 @@ mod tests {
         let int96 = parquet::data_type::Int96::from(vec![0, 0, 2_440_588_u32]);
         let nanos = int96_to_nanos(&int96);
         assert_eq!(nanos, 0);
+    }
+
+    /// An INT96 timestamp is held to the microsecond at or before it, before
+    /// 1970 too: 500 ns before the epoch is the microsecond before it.
+    #[test]
+    fn int96_rounds_down_to_the_microsecond() {
+        let day_nanos: u64 = 86_400_000_000_000 - 500;
+        let int96 = parquet::data_type::Int96::from(vec![
+            day_nanos as u32,
+            (day_nanos >> 32) as u32,
+            2_440_587_u32,
+        ]);
+        assert_eq!(int96_to_nanos(&int96), -500);
+        assert_eq!(int96_to_micros(&int96), -1);
     }
 
     #[test]

@@ -2,21 +2,13 @@
 //! (not just agree with) aggregates over a multi-language predicate on a
 //! bulk-imported (lex-sorted) index.
 //!
-//! Kept as the ONLY test in its own `[[test]]` binary (not bundled into
-//! `grp_misc`), same convention as `it_cyclic_bgp_probe`. The assertions here
-//! are about instrumentation, which is process-shared in two ways that a
-//! bundled parallel run exposes: (1) tracing's callsite-interest cache is
-//! process-global — it is rebuilt when a dispatcher registers, but a callsite
-//! hit concurrently with that rebuild can briefly see stale interest and drop
-//! an event (this bit once under bare `cargo test` with heavy
-//! concurrent-build load); (2) the `set_default` capture is thread-local, so
-//! the assertions are sound only while every asserted event is emitted on
-//! this thread — fast-path internals fan work out to the shared work-stealing
-//! rayon pool, where an event lands on whichever participating thread's
-//! subscriber happens to be active. Neither hazard is deterministic; a
-//! standalone binary removes both under bare `cargo test` (bundled siblings
-//! share one process), which is what contributors reach for first. nextest
-//! already isolates per-process.
+//! Its own `[[test]]` binary predates the shared capture helper, which keeps a
+//! sibling test from leaving a callsite disabled. One hazard remains, and a
+//! binary of its own doesn't remove it: the capture is thread-local, so the
+//! assertions are sound only while every asserted event is emitted on this
+//! thread. Fast-path internals fan work out to the shared work-stealing rayon
+//! pool, where an event lands on whichever participating thread's subscriber
+//! happens to be active.
 #![cfg(feature = "native")]
 
 mod support;

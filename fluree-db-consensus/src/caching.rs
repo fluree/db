@@ -250,7 +250,12 @@ fn weigh_submission_error(err: &SubmissionError) -> usize {
     match err {
         SubmissionError::Execution { message, .. }
         | SubmissionError::NoveltyBackpressure { message }
-        | SubmissionError::NoveltyDeltaTooLarge { message } => message.capacity(),
+        | SubmissionError::NoveltyDeltaTooLarge { message }
+        | SubmissionError::DatatypeLimitExceeded { message }
+        | SubmissionError::CommitNotFound { message }
+        | SubmissionError::ConfigUnavailable { message }
+        | SubmissionError::CommitContention { message }
+        | SubmissionError::IndexNotLoaded { message } => message.capacity(),
         SubmissionError::KeyCollision
         | SubmissionError::AlreadyInFlight
         | SubmissionError::Overloaded => 0,
@@ -661,6 +666,11 @@ impl<C: Committer> CachingCommitter<C> {
             hasher.update((value.len() as u64).to_le_bytes());
             hasher.update(value);
         }
+        hasher.update((request.merged_commits.len() as u64).to_le_bytes());
+        for commit in &request.merged_commits {
+            hasher.update((commit.len() as u64).to_le_bytes());
+            hasher.update(commit);
+        }
         hash_governance(&mut hasher, &request.governance);
         hasher.finalize().into()
     }
@@ -677,9 +687,12 @@ impl<C: Committer> CachingCommitter<C> {
 /// moka cache.
 ///
 /// Determinism notes:
-/// - Scalar fields (`identity`, `default_allow`) and the
-///   length-prefixed string list (`policy_class`) hash to stable
-///   bytes for a given input.
+/// - Scalar fields (`identity`, `server_identity`, `default_allow`)
+///   and the length-prefixed string list (`policy_class`) hash to
+///   stable bytes for a given input. `server_identity` is included
+///   because two gateway credentials selecting the same policy
+///   identity share an `identity` yet may resolve
+///   `f:overrideControl` differently.
 /// - `policy_values` keys are sorted before iteration so HashMap
 ///   iteration order doesn't perturb the digest.
 /// - `policy` and individual `policy_values` entries are
@@ -692,6 +705,14 @@ impl<C: Committer> CachingCommitter<C> {
 fn hash_governance(hasher: &mut Sha256, governance: &GovernanceOptions) {
     hasher.update(b"gov");
     match governance.identity.as_deref() {
+        Some(identity) => {
+            hasher.update([1u8]);
+            hasher.update((identity.len() as u64).to_le_bytes());
+            hasher.update(identity.as_bytes());
+        }
+        None => hasher.update([0u8]),
+    }
+    match governance.server_identity.as_deref() {
         Some(identity) => {
             hasher.update([1u8]);
             hasher.update((identity.len() as u64).to_le_bytes());
@@ -800,7 +821,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
 
         let guard = match self.try_claim_slot(cache_key.clone(), body_hash).await? {
             ClaimOutcome::AlreadyDone(receipt) => match *receipt {
-                OperationReceipt::Transaction(r) => return Ok(r),
+                OperationReceipt::Transaction(r) => return Ok(*r),
                 _ => return Err(SubmissionError::KeyCollision),
             },
             ClaimOutcome::Claimed(g) => g,
@@ -819,7 +840,7 @@ impl<C: Committer> Committer for CachingCommitter<C> {
                 commit_id: r.commit.commit_id.clone(),
                 t: r.commit.t,
                 tally: r.tally.clone(),
-                receipt: Some(Box::new(OperationReceipt::Transaction(r.clone()))),
+                receipt: Some(Box::new(OperationReceipt::Transaction(Box::new(r.clone())))),
             }))
         })
         .await;
@@ -1064,6 +1085,7 @@ mod tests {
     use fluree_db_api::{
         CommitId, CommitRef, ConflictStrategy, FlureeBuilder, GovernanceOptions, TrackingOptions,
     };
+    use fluree_db_core::VerifiedIdentity;
     use fluree_db_transact::{CommitOpts, TxnOpts};
     use serde_json::{json, Value as JsonValue};
 
@@ -1152,6 +1174,8 @@ mod tests {
                     policy: Some(policy),
                     policy_enforcement: None,
                     reasoning: None,
+                    sql: None,
+                    sql_elided: None,
                 }),
                 receipt: None,
             })),
@@ -1552,6 +1576,23 @@ mod tests {
             message: "n".into()
         }
         .is_settled());
+        // Decided before commit construction, and permanent.
+        assert!(SubmissionError::DatatypeLimitExceeded {
+            message: "d".into()
+        }
+        .is_settled());
+        // A config read failure is decided before commit construction too:
+        // settled, so a keyed retry re-executes the submission.
+        assert!(SubmissionError::ConfigUnavailable {
+            message: "c".into()
+        }
+        .is_settled());
+        // Refused before staging read anything; retryable like the novelty
+        // refusals, so settled for the same reason.
+        assert!(SubmissionError::IndexNotLoaded {
+            message: "i".into()
+        }
+        .is_settled());
     }
 
     /// The `execution_failure` flattening must route novelty refusals by
@@ -1585,20 +1626,52 @@ mod tests {
             SubmissionError::NoveltyDeltaTooLarge { .. }
         ));
         assert!(matches!(
+            f(ApiError::Transact(TransactError::DatatypeLimitExceeded {
+                used: 16_369,
+                adding: 1,
+                max: 16_369
+            })),
+            SubmissionError::DatatypeLimitExceeded { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::IndexNotLoaded(
+                "the ledger's index (t=1) is not loaded".into()
+            ))),
+            SubmissionError::IndexNotLoaded { .. }
+        ));
+        assert!(matches!(
             f(ApiError::Transact(TransactError::EmptyTransaction)),
             SubmissionError::Execution { status: 400, .. }
+        ));
+        // A config read failure keeps its identity through the flattening,
+        // from the staging lanes and from the policy context alike.
+        assert!(matches!(
+            f(ApiError::Transact(TransactError::ConfigUnavailable(
+                "read failed".into()
+            ))),
+            SubmissionError::ConfigUnavailable { .. }
+        ));
+        assert!(matches!(
+            f(ApiError::ConfigUnavailable("read failed".into())),
+            SubmissionError::ConfigUnavailable { .. }
         ));
     }
 
     /// Executor scripted for the keyed-retry pin: refuses the first
-    /// transact with novelty backpressure, commits the second — the
+    /// transact with a retryable refusal, commits the second — the
     /// "indexer drained between attempts" shape.
     #[derive(Clone)]
-    struct ScriptedNoveltyExecutor(Arc<std::sync::atomic::AtomicUsize>);
+    struct ScriptedNoveltyExecutor(Arc<std::sync::atomic::AtomicUsize>, fn() -> SubmissionError);
 
     impl ScriptedNoveltyExecutor {
         fn new() -> Self {
-            Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)))
+            Self::refusing(|| SubmissionError::NoveltyBackpressure {
+                message: "Novelty at maximum size, reindexing required".into(),
+            })
+        }
+
+        fn refusing(refusal: fn() -> SubmissionError) -> Self {
+            Self(Arc::new(std::sync::atomic::AtomicUsize::new(0)), refusal)
         }
 
         fn calls(&self) -> usize {
@@ -1614,9 +1687,7 @@ mod tests {
         ) -> Result<TransactionReceipt, SubmissionError> {
             let attempt = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if attempt == 0 {
-                return Err(SubmissionError::NoveltyBackpressure {
-                    message: "Novelty at maximum size, reindexing required".into(),
-                });
+                return Err((self.1)());
             }
             Ok(TransactionReceipt {
                 idempotency_key: request.idempotency_key,
@@ -1683,6 +1754,39 @@ mod tests {
 
         // Same key, same body, after the condition clears: must re-execute
         // and commit — not 409 AlreadyInFlight, not a replayed refusal.
+        let second = committer.transact(req()).await;
+        let receipt = second.expect("keyed retry must re-execute and succeed");
+        assert_eq!(receipt.commit.t, 1);
+        assert_eq!(scripted.calls(), 2, "executor must run once per attempt");
+    }
+
+    /// The same pin for a refusal because this node has not loaded the
+    /// ledger's index: a keyed retry once it loads re-executes. Mutation
+    /// check: flipping its arm of `is_settled` to `false` fails this test
+    /// with `AlreadyInFlight` on the retry.
+    #[tokio::test]
+    async fn keyed_retry_after_index_not_loaded_reexecutes() {
+        let scripted = ScriptedNoveltyExecutor::refusing(|| SubmissionError::IndexNotLoaded {
+            message: "Index not loaded: the ledger's index (t=1) is not loaded".into(),
+        });
+        let committer: CachingCommitter<ScriptedNoveltyExecutor> = CachingCommitter {
+            executor: scripted.clone(),
+            cache: Cache::builder()
+                .time_to_live(DEFAULT_IDEMPOTENCY_TTL)
+                .max_capacity(DEFAULT_IDEMPOTENCY_CACHE_MAX_BYTES)
+                .weigher(weigh_cached_submission)
+                .build(),
+            admission: Arc::new(Semaphore::new(DEFAULT_PENDING_LIMIT)),
+            per_ledger_admission: Arc::new(DashMap::new()),
+            per_ledger_limit: DEFAULT_PER_LEDGER_PENDING_LIMIT,
+        };
+
+        let req = || request("test/db:main", Some("ingest-2"), sample_insert("a"));
+        let first = committer.transact(req()).await;
+        assert!(
+            matches!(first, Err(SubmissionError::IndexNotLoaded { .. })),
+            "first attempt must surface the refusal, got {first:?}"
+        );
         let second = committer.transact(req()).await;
         let receipt = second.expect("keyed retry must re-execute and succeed");
         assert_eq!(receipt.commit.t, 1);
@@ -2134,6 +2238,56 @@ mod tests {
             .await
             .expect_err("retry with same body but different identity must collide");
 
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn key_collision_with_different_server_identity_errors() {
+        // `server_identity` is the auth-layer-verified DID that
+        // `f:overrideControl` gates on. Two submissions with the same
+        // body and the same policy `identity` can still resolve
+        // override control differently when the credential behind them
+        // differs (two gateways selecting the same policy identity), so
+        // it must be part of the digest — including the None / Some edge.
+        let (_fluree, committer, ledger_id) = setup().await;
+        let body = sample_insert("alice");
+
+        // None vs Some.
+        let key = IdempotencyKey::new("01J5COLLIDE003").expect("test key fits cap");
+        committer
+            .transact(request(&ledger_id, Some(key.as_str()), body.clone()))
+            .await
+            .expect("first submission to succeed");
+        let mut req = request(&ledger_id, Some(key.as_str()), body.clone());
+        req.governance.server_identity = Some(VerifiedIdentity::new("did:example:admin"));
+        let err = committer
+            .transact(req)
+            .await
+            .expect_err("retry with same body but a verified identity must collide");
+        assert!(
+            matches!(err, SubmissionError::KeyCollision),
+            "expected KeyCollision, got {err:?}"
+        );
+
+        // Some(a) vs Some(b) with every other governance field equal. A
+        // verified identity alone is not a policy input, so the first
+        // submission commits without a policy context.
+        let key = IdempotencyKey::new("01J5COLLIDE004").expect("test key fits cap");
+        let mut first = request(&ledger_id, Some(key.as_str()), body.clone());
+        first.governance.server_identity = Some(VerifiedIdentity::new("did:example:root-a"));
+        committer
+            .transact(first)
+            .await
+            .expect("first submission to succeed");
+        let mut second = request(&ledger_id, Some(key.as_str()), body);
+        second.governance.server_identity = Some(VerifiedIdentity::new("did:example:root-b"));
+        let err = committer
+            .transact(second)
+            .await
+            .expect_err("retry with same body but different verified identity must collide");
         assert!(
             matches!(err, SubmissionError::KeyCollision),
             "expected KeyCollision, got {err:?}"
@@ -2713,8 +2867,25 @@ ex:alice ex:name "Alice" ."#;
             ledger_id: "test/committer:main".to_string(),
             commits,
             blobs: std::collections::HashMap::new(),
+            merged_commits: Vec::new(),
             governance: GovernanceOptions::default(),
         }
+    }
+
+    /// Two pushes that differ only in their merged commits must not share a
+    /// body hash. The cache would otherwise return the first push's receipt
+    /// for the second.
+    #[test]
+    fn push_body_hash_covers_merged_commits() {
+        let plain = push_request(Some("k"), vec![b"line".to_vec()]);
+        let with_merges = PushRequest {
+            merged_commits: vec![b"merged".to_vec()],
+            ..push_request(Some("k"), vec![b"line".to_vec()])
+        };
+        assert_ne!(
+            CachingCommitter::<LocalCommitter>::hash_push_body(&plain),
+            CachingCommitter::<LocalCommitter>::hash_push_body(&with_merges),
+        );
     }
 
     #[tokio::test]

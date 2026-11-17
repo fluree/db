@@ -26,7 +26,7 @@
 //! general graph-source semantics are unchanged.
 
 use rustc_hash::FxHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 
 use crate::aggregate::NumericAcc;
 use crate::binding::{Batch, Binding, BindingRow};
@@ -38,8 +38,9 @@ use crate::ir::{Expression, Function, GraphName, Pattern, Query, R2rmlPattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::operator::{
     decimal_canonical_of, object_column_is_numeric, rdf_term_eq_object_constant_cached,
-    LiteralEncoder,
+    scan_for_lookup, LiteralEncoder,
 };
+#[cfg(test)]
 use crate::r2rml::rewrite_patterns_for_r2rml;
 use crate::r2rml::ObjectConstant;
 use crate::var_registry::VarId;
@@ -52,8 +53,8 @@ use fluree_db_r2rml::mapping::{
     TermType, TriplesMap,
 };
 use fluree_db_r2rml::materialize::{
-    canonical_join, fill_join_key_from_batch, get_join_key_from_batch,
-    materialize_object_from_batch, materialize_subject_from_batch, subject_sort_key, RdfTerm,
+    canonical_join, fill_join_key_from_batch, get_join_key_from_batch, lexical_column,
+    materialize_object_from_batch, materialize_subject_from_batch, RdfTerm,
 };
 use fluree_db_tabular::{Column, ColumnBatch};
 use futures::StreamExt;
@@ -373,6 +374,15 @@ fn fused_r2rml_agg_enabled() -> bool {
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_FUSED_R2RML_AGG"))
 }
 
+/// The routing stamp the fused operator records at open: `Proceed` when it
+/// folds from column batches, `Fallback(GateDeclined)` when its open-time
+/// gates send the query to the fallback pipeline.
+pub const FUSED_R2RML_AGGREGATE_SITE: &str = "fused_r2rml_aggregate";
+
+/// Routing stamp for a fused fold over a map whose rows can repeat a solution:
+/// `proceed` when the fold runs and folds each solution once.
+pub const FUSED_R2RML_AGGREGATE_DEDUPE_SITE: &str = "fused_r2rml_aggregate_dedupe";
+
 /// Detect the fused shape: a single `GRAPH { triples }` block feeding an
 /// aggregation (implicit, or GROUP BY) of only `COUNT` / `SUM` / `AVG`, with no
 /// HAVING, post-binds, FILTER, ordering, or slicing. Whether the graph is
@@ -407,7 +417,7 @@ pub fn detect_fused_r2rml_aggregate(query: &Query) -> Option<FusedAggregatePlan>
     // projection check below still rejects any HAVING that lifts an aggregate not
     // present in the SELECT projection (that query stays on the generic path — the
     // conservative admission line). Post-aggregate BINDs are not foldable.
-    if !aggregation.binds.is_empty() {
+    if query.grouping.as_ref()?.binds().next().is_some() {
         return None;
     }
 
@@ -605,8 +615,10 @@ impl Acc {
 
     /// Fold a single row's value into this accumulator. `col` is the fold's
     /// pre-resolved column for this batch (`None` for `COUNT(*)`). Returns
-    /// `false` if an exact i128 sum would overflow (the caller re-runs on the
-    /// BigDecimal pipeline); all other folds always return `true`.
+    /// `false` when the row cannot be folded — an i128 sum that would overflow,
+    /// a value with no exact reading, or a double text cell that is not an XSD
+    /// lexical form — and the caller re-runs on the generic pipeline; all other
+    /// folds always return `true`.
     fn update_row(&mut self, fold: &Fold, col: Option<&Column>, row: usize) -> bool {
         match (self, fold) {
             (Acc::Count(n), Fold::CountRows) => {
@@ -627,12 +639,10 @@ impl Acc {
                 Some(c) => accumulate_exact_row(c, row, sum, scale, count),
                 None => true,
             },
-            (Acc::Double { sum, count, .. }, Fold::Numeric { .. }) => {
-                if let Some(c) = col {
-                    accumulate_double_row(c, row, sum, count);
-                }
-                true
-            }
+            (Acc::Double { sum, count, .. }, Fold::Numeric { .. }) => match col {
+                Some(c) => accumulate_double_row(c, row, sum, count),
+                None => true,
+            },
             _ => true,
         }
     }
@@ -686,7 +696,10 @@ impl Acc {
 }
 
 /// Add one row's exact (decimal/integer) value to the accumulator. Returns
-/// `false` if the i128 sum would overflow (the caller falls back to BigDecimal).
+/// `false` when the row has no exact reading — the i128 sum would overflow, or
+/// the cell does not parse as a decimal — and the caller falls back to the
+/// BigDecimal pipeline, which computes the row or poisons the group as the
+/// generic lane would. A null cell is a legitimate drop and returns `true`.
 fn accumulate_exact_row(
     col: &Column,
     row: usize,
@@ -720,33 +733,133 @@ fn accumulate_exact_row(
             Some(Some(v)) => add(sum, count, *v as i128),
             _ => true,
         },
+        // The declared datatype is exact but the physical column is not: a
+        // double (SQLite `NUMERIC` behind the bridge) or text (a CSV-shaped
+        // table). The generic path converts each value, so the fold must too —
+        // skipping the row would report a sum of 0 over a count of 0.
+        //
+        // Floats convert through their `to_string()` lexical, which is what the
+        // generic path materializes (`column_to_string`) and then parses.
+        // `BigDecimal::try_from(f64)` would take the exact binary expansion
+        // instead: `19.99f64` has scale 48, whose rescale leaves i128 and bails
+        // the fold on the first money-shaped row, while `19.99f32` fits at
+        // scale 19 and sums to `24.9899997711181640625` where the generic lane
+        // gives `24.99`. One lexical, one answer.
+        Column::Float64(values) => match values.get(row) {
+            Some(Some(v)) => accumulate_lexical(&v.to_string(), sum, scale, count),
+            _ => true,
+        },
+        Column::Float32(values) => match values.get(row) {
+            Some(Some(v)) => accumulate_lexical(&v.to_string(), sum, scale, count),
+            _ => true,
+        },
+        Column::String(values) => match values.get(row) {
+            Some(Some(text)) => accumulate_lexical(text, sum, scale, count),
+            _ => true,
+        },
         _ => true,
     }
 }
 
-/// Add one row's floating value to the accumulator. NaN is dropped (neither
-/// summed nor counted), mirroring the standard aggregate pipeline's numeric
-/// coercion, so a NaN value can't poison SUM/AVG or inflate the count.
-fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) {
-    match col {
-        Column::Float64(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                if !v.is_nan() {
-                    *sum += *v;
-                    *count += 1;
-                }
-            }
-        }
-        Column::Float32(values) => {
-            if let Some(Some(v)) = values.get(row) {
-                if !v.is_nan() {
-                    *sum += *v as f64;
-                    *count += 1;
-                }
-            }
-        }
-        _ => {}
+/// Fold one value's lexical form into the exact accumulator. An unparseable
+/// lexical (`"abc"`, or a NaN or infinite value from a float column) returns `false`
+/// to escalate: the generic lane materializes it under the exact datatype,
+/// `binding_to_numeric` fails, and `agg_sum`/`agg_avg` poison the group to
+/// unbound (SPARQL §18.5.1, agg-err-01). Silently omitting the row here would
+/// report a sum over the parseable subset instead.
+fn accumulate_lexical(text: &str, sum: &mut i128, scale: &mut i64, count: &mut u64) -> bool {
+    match text.trim().parse::<BigDecimal>() {
+        Ok(d) => add_exact(d, sum, scale, count),
+        Err(_) => false,
     }
+}
+
+/// Add a decimal to the exact i128 accumulator, widening the running scale
+/// to the value's own (so `"99.50"` keeps rendering with two places). `false`
+/// when the sum leaves i128 (the caller re-runs on BigDecimal).
+///
+/// A rescale of `sum`/`scale` may land before a later bail: that is fine and
+/// not a two-phase check waiting to happen — the rescaled pair denotes the same
+/// value, and on `false` the caller discards the accumulator wholesale.
+fn add_exact(d: BigDecimal, sum: &mut i128, scale: &mut i64, count: &mut u64) -> bool {
+    let (digits, exp) = d.as_bigint_and_exponent();
+    let (digits, exp) = if exp < 0 {
+        (digits * BigInt::from(10).pow((-exp) as u32), 0)
+    } else {
+        (digits, exp)
+    };
+    let Some(mut digits) = digits.to_i128() else {
+        return false;
+    };
+    if exp > *scale {
+        let Some(rescaled) = u32::try_from(exp - *scale)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .and_then(|f| sum.checked_mul(f))
+        else {
+            return false;
+        };
+        *sum = rescaled;
+        *scale = exp;
+    } else if exp < *scale {
+        let Some(d) = u32::try_from(*scale - exp)
+            .ok()
+            .and_then(|e| 10i128.checked_pow(e))
+            .and_then(|f| digits.checked_mul(f))
+        else {
+            return false;
+        };
+        digits = d;
+    }
+    match sum.checked_add(digits) {
+        Some(s) => {
+            *sum = s;
+            *count += 1;
+            true
+        }
+        None => false,
+    }
+}
+
+/// Add one row's floating value to the accumulator. NaN and the infinities are
+/// summed and counted like any other double, as the standard aggregate pipeline
+/// does: SUM is `op:numeric-add` (SPARQL 1.1 §18.5.1.3), so a NaN member makes
+/// the sum NaN. A physical exact column under a double datatype converts, as
+/// the generic path does; a text cell is read as the generic path reads an
+/// `xsd:double` string, with the XSD lexical parser (and the `inf`/`-inf`
+/// text of earlier imports). Returns `false` for a text cell that is not such
+/// a form, and the caller re-runs on the generic pipeline, which decides it.
+fn accumulate_double_row(col: &Column, row: usize, sum: &mut f64, count: &mut u64) -> bool {
+    if let Column::String(values) = col {
+        let Some(text) = values.get(row).and_then(|o| o.as_deref()) else {
+            return true;
+        };
+        let Some(v) = fluree_graph_ir::parse_xsd_double(text)
+            .or_else(|| crate::eval::legacy_import_infinity(text))
+        else {
+            return false;
+        };
+        *sum += v;
+        *count += 1;
+        return true;
+    }
+    let v: Option<f64> = match col {
+        Column::Float64(values) => values.get(row).copied().flatten(),
+        Column::Float32(values) => values.get(row).copied().flatten().map(f64::from),
+        Column::Int64(values) => values.get(row).copied().flatten().map(|i| i as f64),
+        Column::Int32(values) => values.get(row).copied().flatten().map(f64::from),
+        Column::Decimal { values, scale, .. } => values
+            .get(row)
+            .copied()
+            .flatten()
+            .map(|u| u as f64 / 10f64.powi(i32::from(*scale))),
+        _ => None,
+    };
+    if let Some(v) = v {
+        *sum += v;
+        *count += 1;
+    }
+    true
 }
 
 /// A GROUP BY key column: which table column, how to read it, and the encoded
@@ -758,9 +871,21 @@ struct GroupCol {
     dt_sid: Sid,
 }
 
+/// A GROUP BY key column of one scanned batch, in the form its key kind reads.
+/// [`GroupCol::key_column`] is the only constructor: an `xsd:string` key over
+/// a column the batch holds as anything but text is rendered there, once per
+/// batch, to the lexical forms the materializer gives its literals. That is
+/// the generic path's key for an un-annotated `rr:column` (its natural
+/// mapping here is the `xsd:string` of the rendered value), so an integer,
+/// float, decimal, boolean, temporal or binary column groups by `"10"`, `"-0"`,
+/// `"0.050000000"` exactly as the materialized rows do — a raw read finds no
+/// string in such a column and would drop every row.
+struct KeyColumn<'b>(std::borrow::Cow<'b, Column>);
+
 /// Supported GROUP BY key column kinds (slice 3).
 #[derive(Clone, Copy, Debug)]
 enum GKind {
+    /// An `xsd:string` key, read from a [`KeyColumn`] already in lexical form.
     String,
     Integer,
     /// P2a: a RefObjectMap group key — the group value is the referenced parent
@@ -948,13 +1073,31 @@ fn insert_dim_gkeys(
 }
 
 impl GroupCol {
+    /// This key's column in `batch` (absent → `None`), in the form
+    /// [`Self::key_at`] reads: see [`KeyColumn`].
+    fn key_column<'b>(&self, batch: &'b ColumnBatch) -> Option<KeyColumn<'b>> {
+        batch
+            .column_by_name(&self.column)
+            .map(|col| self.key_column_of(col))
+    }
+
+    fn key_column_of<'b>(&self, col: &'b Column) -> KeyColumn<'b> {
+        KeyColumn(match self.kind {
+            GKind::String => lexical_column(col),
+            GKind::Integer | GKind::Iri => std::borrow::Cow::Borrowed(col),
+        })
+    }
+
     /// Read this column's group-key value at a row.
-    fn key_at(&self, col: Option<&Column>, row: usize) -> GKey {
-        let Some(c) = col else { return GKey::Null };
+    fn key_at(&self, col: Option<&KeyColumn<'_>>, row: usize) -> GKey {
+        let Some(c) = col.map(|k| k.0.as_ref()) else {
+            return GKey::Null;
+        };
         match self.kind {
             // P2a: a ref-IRI key is Dim-sourced (from the FK→IRI map), never read
             // inline from the fact batch, so this is unreachable for it.
             GKind::Iri => GKey::Null,
+            // A `KeyColumn` of a string key is always a string column.
             GKind::String => match c {
                 Column::String(v) => v.get(row).cloned().flatten().map_or(GKey::Null, GKey::Str),
                 _ => GKey::Null,
@@ -990,8 +1133,8 @@ impl GroupCol {
     /// `GKey::Null` (a null/absent/wrong-typed cell), so the vector fold drops the
     /// same rows and groups identically; the value variants match `key_at` bit for
     /// bit (including the `NUMBER(n,0)` physical-Decimal integer coercion).
-    fn key_ref_at<'a>(&self, col: Option<&'a Column>, row: usize) -> Option<GKeyRef<'a>> {
-        let c = col?;
+    fn key_ref_at<'a>(&self, col: Option<&'a KeyColumn<'_>>, row: usize) -> Option<GKeyRef<'a>> {
+        let c = col?.0.as_ref();
         match self.kind {
             // P2a: a ref-IRI key is Dim-sourced; never read inline from the fact.
             GKind::Iri => None,
@@ -1051,6 +1194,12 @@ struct Resolved {
     /// columns. Empty means a constant subject (present on every row → the
     /// shortcut needs no null proof). Consumed only for the bare-COUNT fast path.
     count_non_null_cols: Vec<String>,
+    /// Filters pushed to the FACT scan so a provider can skip files and rows.
+    /// Each restates a condition the fold enforces per row (`filter`,
+    /// `fact_constraints`), so whether the provider applies it is a cost
+    /// matter only. Dim and membership scans push none: a key's every row
+    /// must be seen to tell whether it mints one subject.
+    scan_filters: Vec<crate::r2rml::ScanFilter>,
     /// PR-6 + S2: FK→GKey resolvers for dim-sourced GROUP BY keys, indexed by
     /// `KeySource::Dim.resolver`. EMPTY for a single-table plain-column fold (keys read
     /// straight from the scanned fact batch via `group_cols`). ONE entry for a fact⋈dim
@@ -1091,9 +1240,154 @@ struct Resolved {
     /// `Binding`s (datatype Sids pre-resolved from the fact TriplesMap). `None`
     /// when there are no MIN/MAX folds.
     minmax_encoder: Option<LiteralEncoder>,
+    /// When the scanned map can mint one solution from several rows: the
+    /// columns identifying a solution, so the fold folds each solution once.
+    /// `None` when every row is a distinct solution.
+    dedupe: Option<FoldDedupe>,
 }
 
-/// A built keep-min dim map: FK/parent join key → the parent's group-key values.
+/// The columns that identify one solution of a fused fold's pattern, read raw
+/// from each row: the subject template's columns (an injective template, so
+/// two rows mint one subject exactly when they agree on them) and the
+/// object's column. A row whose solution an earlier row already yielded is
+/// not folded again.
+struct FoldDedupe {
+    columns: Vec<(String, RawTerm)>,
+}
+
+/// How a column's raw value becomes its term, as far as telling two values
+/// apart goes: the term is a one-to-one function of the raw value for the
+/// physical types [`RawTerm::exact_for`] admits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawTerm {
+    /// The value's text: a subject template placeholder, or an object column
+    /// without a datatype, or `xsd:string`, or with a language tag.
+    Rendered,
+    /// Coerced to an integer.
+    Integer,
+    /// Coerced to a decimal.
+    Decimal,
+    Date,
+    Boolean,
+}
+
+impl RawTerm {
+    /// The object map's coercion, or `None` when the fold cannot tell its
+    /// terms apart by raw value (a coercion that maps two texts to one term,
+    /// such as "01" and "1" to the integer 1, or floating point).
+    fn of_object(datatype: Option<&str>, language: Option<&str>) -> Option<Self> {
+        use fluree_vocab::xsd;
+        if language.is_some() {
+            return Some(Self::Rendered);
+        }
+        match datatype {
+            None => Some(Self::Rendered),
+            Some(dt) if dt == xsd::STRING => Some(Self::Rendered),
+            Some(dt) if dt == xsd::INTEGER || dt == xsd::LONG || dt == xsd::INT => {
+                Some(Self::Integer)
+            }
+            Some(dt) if dt == xsd::DECIMAL => Some(Self::Decimal),
+            Some(dt) if dt == xsd::DATE => Some(Self::Date),
+            Some(dt) if dt == xsd::BOOLEAN => Some(Self::Boolean),
+            Some(_) => None,
+        }
+    }
+
+    /// Whether distinct raw values of `column` always become distinct terms.
+    fn exact_for(self, column: &Column) -> bool {
+        matches!(
+            (self, column),
+            (
+                Self::Rendered,
+                Column::Int32(_)
+                    | Column::Int64(_)
+                    | Column::String(_)
+                    | Column::Date(_)
+                    | Column::Boolean(_)
+                    | Column::Decimal { .. },
+            ) | (Self::Integer, Column::Int32(_) | Column::Int64(_))
+                | (
+                    Self::Decimal,
+                    Column::Int32(_) | Column::Int64(_) | Column::Decimal { .. }
+                )
+                | (Self::Date, Column::Date(_))
+                | (Self::Boolean, Column::Boolean(_))
+        )
+    }
+}
+
+/// Append row `row` of `column` to `out` so that two rows' bytes are equal
+/// exactly when their values are (an integer is one value whether the file
+/// stores it in 32 or 64 bits). A NULL is its own value, tagged apart from
+/// every non-null one: a key that folded it into the type's default would make
+/// a NULL and a `0` (or `""`, `false`) one solution wherever a caller has not
+/// already dropped NULL rows. `false` for a type with no such encoding.
+fn put_raw_value(column: &Column, row: usize, out: &mut Vec<u8>) -> bool {
+    const NULL: u8 = 0;
+    match column {
+        Column::Int32(v) => match v[row] {
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&i64::from(n).to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
+        Column::Int64(v) => match v[row] {
+            Some(n) => {
+                out.push(1);
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
+        Column::String(v) => match v[row].as_deref() {
+            Some(s) => {
+                let s = s.as_bytes();
+                out.push(2);
+                // The length as a LEB128 varint, so a string's bytes cannot run
+                // into the next value's.
+                let mut n = s.len();
+                loop {
+                    let byte = (n & 0x7f) as u8;
+                    n >>= 7;
+                    if n == 0 {
+                        out.push(byte);
+                        break;
+                    }
+                    out.push(byte | 0x80);
+                }
+                out.extend_from_slice(s);
+            }
+            None => out.push(NULL),
+        },
+        Column::Date(v) => match v[row] {
+            Some(d) => {
+                out.push(3);
+                out.extend_from_slice(&d.to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
+        Column::Boolean(v) => match v[row] {
+            Some(b) => {
+                out.push(4);
+                out.push(u8::from(b));
+            }
+            None => out.push(NULL),
+        },
+        Column::Decimal { values, scale, .. } => match values[row] {
+            Some(n) => {
+                out.push(5);
+                out.extend_from_slice(&scale.to_le_bytes());
+                out.extend_from_slice(&n.to_le_bytes());
+            }
+            None => out.push(NULL),
+        },
+        _ => return false,
+    }
+    true
+}
+
+/// A built dim map: FK/parent join key → the parent's group-key values (one subject
+/// per key, or the build declined).
 /// `Arc`d so ref group keys resolving to the SAME dim on the SAME parent join cols
 /// (e.g. shipTo/billTo → Customer) share one built map, not two (id=3717398042).
 type SharedDimMap = Arc<std::collections::HashMap<Vec<String>, Vec<GKey>>>;
@@ -1115,7 +1409,7 @@ struct GroupKeyResolver {
     /// attribute" into one drop, exactly as the inner join does. `Arc`d so two ref
     /// group keys to the SAME dim on the SAME parent join cols (e.g. shipTo/billTo →
     /// Customer) share ONE built map instead of scanning + holding it twice
-    /// (id=3717398042). Sound to share because the map is a constraint-free keep-min
+    /// (id=3717398042). Sound to share because the map is a constraint-free
     /// parent-key → IRI lookup fully determined by (parent TM, parent cols).
     map: SharedDimMap,
 }
@@ -1137,7 +1431,7 @@ struct Branch<'p> {
 /// P3: a classified FK branch. GROUP-KEY = the branch whose sub-chain binds a
 /// GROUP BY var (resolved via the existing FK→GKey [`GroupKeyResolver`]).
 /// SEMI-JOIN = a pure membership/constraint branch (e.g. order→customer=Enterprise),
-/// resolved to a keep-min-then-filter membership set the fact fold probes.
+/// resolved to a membership set the fact fold probes.
 #[derive(Debug)]
 enum JoinBranch<'p> {
     GroupKey(Branch<'p>),
@@ -1155,18 +1449,13 @@ struct BranchingStar<'p> {
 
 /// P3 (crt_join_reorder class): the resolved SEMI-JOIN branch, built once at `open`.
 /// A fact row survives iff its `fact_fk_cols` value (the root→branch first-hop FK)
-/// is in `membership` — the set of root-FK join keys whose keep-min-resolved branch
-/// chain satisfies every branch constraint (`build_semi_join_membership`). Because
-/// the set is built KEEP-MIN-THEN-FILTER (each hop resolves to the keep-min parent
-/// SUBJECT, byte-identical to the generic `build_parent_lookup`, THEN the kept row is
-/// filtered), the probe is byte-identical to the generic chained inner join even on a
-/// duplicate intermediate key.
+/// is in `membership` — the set of root-FK join keys whose branch chain satisfies
+/// every branch constraint (`build_semi_join_membership`).
 ///
-/// #1583: semi-join ≡ inner join here rests on each FK being SINGLE-VALUED — one fact
-/// row matches at most one branch row per hop. A fan-out `RefObjectMap` (one child →
-/// many parents) would make a discarded-dup row a legitimate join partner, so a
-/// membership *set* would then under-represent the fan-out; the fan-out follow-on must
-/// revisit this site (mirrors the P2a #1583 caveat on the FK→IRI group key).
+/// Semi-join ≡ inner join here rests on each FK being SINGLE-VALUED — one fact row
+/// joins at most one branch subject per hop. A key whose rows mint more than one
+/// subject joins a row to each (#1583), which a membership *set* cannot count, so the
+/// build declines such a key (mirroring the P2a FK→IRI group key).
 struct SemiJoinSet {
     /// Root-fact columns forming the probe key — the root→branch first-hop CHILD
     /// columns, in join-condition order (mirrors [`GroupKeyResolver::fact_fk_cols`]).
@@ -1176,12 +1465,12 @@ struct SemiJoinSet {
     membership: std::collections::HashSet<Vec<String>>,
 }
 
-/// P3 keep-min bookkeeping for one join key while building a [`SemiJoinSet`] level:
-/// the keep-min parent SUBJECT decides which duplicate row wins (matching the generic
-/// `parent_key_insert_keep_min`), and the WINNING row's own-constraint result +
-/// next-hop FK value decide membership — the load-bearing keep-min-THEN-filter order.
+/// P3 bookkeeping for one join key while building a [`SemiJoinSet`] level: the
+/// key's one subject, and its row's own-constraint result + next-hop FK value, which
+/// decide membership. Every other row of the key must agree on all three, or the
+/// build declines.
 struct KeptChainRow {
-    /// The kept row's parent subject term; the keep-min tie-break key.
+    /// The key's parent subject term.
     subject: RdfTerm,
     /// Whether the kept row satisfies this chain pattern's own folded constraints.
     passes_own: bool,
@@ -1272,6 +1561,11 @@ pub struct FusedR2rmlAggregateOperator {
     /// K≥2 or ≥2-ref shape declines to the generic pipeline. Rides ON TOP of `multifact`
     /// and `FLUREE_FUSED_R2RML_AGG_JOIN`, which remain independently killable underneath.
     multifact_gen: bool,
+    /// The row order the folded table scan owes the query (see
+    /// [`crate::r2rml::ScanOrder`]): deterministic unless the planner set `Any`
+    /// for a query with no slice, and deterministic whenever the execution
+    /// context requires it.
+    scan_order: crate::r2rml::ScanOrder,
 }
 
 impl FusedR2rmlAggregateOperator {
@@ -1304,7 +1598,15 @@ impl FusedR2rmlAggregateOperator {
             output_bound: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_OUTPUT_BOUND"),
             multifact: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT"),
             multifact_gen: crate::r2rml::env_switch_enabled("FLUREE_FUSED_R2RML_MULTIFACT_GEN"),
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
+    }
+
+    /// Set the row order the folded table scan owes the query (the planner's
+    /// `PlanningContext::scan_order`).
+    pub fn with_scan_order(mut self, order: crate::r2rml::ScanOrder) -> Self {
+        self.scan_order = order;
+        self
     }
 
     /// Resolve the predicate IRI a pattern object variable is bound by.
@@ -1368,14 +1670,14 @@ impl FusedR2rmlAggregateOperator {
     fn assemble_group_key(
         plan: &[KeySource],
         group_cols: &[GroupCol],
-        key_cols: &[Option<&Column>],
+        key_cols: &[Option<KeyColumn<'_>>],
         dim_probes: &[&[GKey]],
         row: usize,
     ) -> Option<Vec<GKey>> {
         let mut key = Vec::with_capacity(plan.len());
         for (pos, slot) in plan.iter().enumerate() {
             let k = match slot {
-                KeySource::Fact => group_cols[pos].key_at(key_cols[pos], row),
+                KeySource::Fact => group_cols[pos].key_at(key_cols[pos].as_ref(), row),
                 KeySource::Dim { resolver, slot } => dim_probes.get(*resolver)?.get(*slot)?.clone(),
             };
             if matches!(k, GKey::Null) {
@@ -1390,7 +1692,7 @@ impl FusedR2rmlAggregateOperator {
     /// member of EVERY set (AND — one membership set per semi-join branch). Returns
     /// `false` on the first branch whose fact-side FK is null (no branch triple ⇒ inner
     /// join drops the row) or whose stringified FK value is not in that branch's
-    /// keep-min-then-filter membership. Empty `sets` ⇒ `true` (the single-table /
+    /// membership. Empty `sets` ⇒ `true` (the single-table /
     /// pure-linear path, a no-op byte-identical to pre-P3). Each set is probed with the
     /// same stringification the membership build used, so both sides encode the join
     /// value identically. `fk_scratch` is the caller's reused per-batch buffer — filled
@@ -1559,6 +1861,66 @@ impl FusedR2rmlAggregateOperator {
 
     /// Resolve the single TriplesMap for the rewritten pattern, requiring exactly
     /// one (explicit IRI, or an unambiguous class/predicate match).
+    /// The columns identifying a solution of `patterns`, when the fold can
+    /// fold each solution once by reading them raw: one pattern over one
+    /// candidate map, no folded constraints from other patterns (a constraint
+    /// checked against its own row would miss a subject that holds it on
+    /// another), no projected predicate or type, a subject minted by an
+    /// injective IRI template, and an object (when the pattern binds one) read
+    /// from a column whose coercion keeps distinct values distinct. `None`
+    /// otherwise: the fold declines.
+    fn fold_dedupe_plan(
+        patterns: &[Pattern],
+        mapping: &CompiledR2rmlMapping,
+    ) -> Option<FoldDedupe> {
+        let [Pattern::R2rml(p)] = patterns else {
+            return None;
+        };
+        if !p.star_bindings.is_empty()
+            || !p.star_constraints.is_empty()
+            || p.predicate_var.is_some()
+            || p.type_var.is_some()
+            || p.subject_constant.is_some()
+        {
+            return None;
+        }
+        let maps = crate::r2rml::set_semantics::candidate_maps(p, mapping);
+        let [tm] = maps.as_slice() else {
+            return None;
+        };
+        if !crate::r2rml::set_semantics::emits_distinct_for(p, tm) {
+            return None;
+        }
+        let sm = &tm.subject_map;
+        if sm.constant.is_some() || sm.column.is_some() || sm.term_type != TermType::Iri {
+            return None;
+        }
+        let template = sm.template.as_deref()?;
+        if !fluree_db_r2rml::materialize::template_is_injective(template) {
+            return None;
+        }
+        let mut columns: Vec<(String, RawTerm)> = extract_template_columns(template)
+            .into_iter()
+            .map(|c| (c, RawTerm::Rendered))
+            .collect();
+        if p.object_var.is_some() {
+            let predicate = p.predicate_filter.as_deref()?;
+            match tm.object_map_for(predicate)? {
+                ObjectMap::Column {
+                    column,
+                    datatype,
+                    language,
+                    ..
+                } => {
+                    let raw = RawTerm::of_object(datatype.as_deref(), language.as_deref())?;
+                    columns.push((column.clone(), raw));
+                }
+                _ => return None,
+            }
+        }
+        Some(FoldDedupe { columns })
+    }
+
     fn resolve_triples_map<'m>(
         pattern: &R2rmlPattern,
         mapping: &'m CompiledR2rmlMapping,
@@ -1642,9 +2004,21 @@ impl Operator for FusedR2rmlAggregateOperator {
     }
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        self.resolved = self.resolve_at_open(ctx).await?;
+        // A view policy filters rows in the scan operator (`r2rml::policy`);
+        // folding straight from column batches would bypass it, so the fused
+        // path declines and the fallback pipeline enforces it.
+        self.resolved = if ctx.allow_unfiltered() {
+            self.resolve_at_open(ctx).await?
+        } else {
+            None
+        };
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
         if self.resolved.is_none() {
             tracing::debug!("fused R2RML aggregate: gates failed, using fallback pipeline");
+            stamp_fast_path(
+                FUSED_R2RML_AGGREGATE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
             self.use_fallback = true;
             self.fallback.open(ctx).await?;
         } else {
@@ -1652,6 +2026,10 @@ impl Operator for FusedR2rmlAggregateOperator {
                 aggs = self.aggregates.len(),
                 "fused R2RML aggregate: folding from column batches"
             );
+            stamp_fast_path(FUSED_R2RML_AGGREGATE_SITE, FastPathOutcome::Proceed);
+            if self.resolved.as_ref().is_some_and(|r| r.dedupe.is_some()) {
+                stamp_fast_path(FUSED_R2RML_AGGREGATE_DEDUPE_SITE, FastPathOutcome::Proceed);
+            }
         }
         self.state = OperatorState::Open;
         Ok(())
@@ -1677,7 +2055,7 @@ impl Operator for FusedR2rmlAggregateOperator {
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -1693,12 +2071,16 @@ impl Operator for FusedR2rmlAggregateOperator {
         // whole fused path (a disabled switch fails detection, so this is never
         // reached). The emitted binding is byte-identical to the scan+fold result
         // (`Acc::Count(n).finalize()`).
-        if count_shortcut_eligible(
-            resolved.filter.is_some(),
-            &resolved.group_cols,
-            &resolved.fact_constraints,
-            &resolved.folds,
-        ) {
+        // The manifest counts rows, so it answers only where every row is a
+        // distinct solution.
+        if resolved.dedupe.is_none()
+            && count_shortcut_eligible(
+                resolved.filter.is_some(),
+                &resolved.group_cols,
+                &resolved.fact_constraints,
+                &resolved.folds,
+            )
+        {
             let gs = resolved.pattern.graph_source_id.clone();
             let table = resolved.table_name.clone();
             let non_null_cols = resolved.count_non_null_cols.clone();
@@ -1716,14 +2098,20 @@ impl Operator for FusedR2rmlAggregateOperator {
             }
         }
 
+        let scan_order = if ctx.deterministic_scans {
+            crate::r2rml::ScanOrder::Deterministic
+        } else {
+            self.scan_order
+        };
         let mut stream = table_provider
-            .scan_table(
+            .scan_table_ordered(
                 &resolved.pattern.graph_source_id,
                 &resolved.table_name,
                 &resolved.projection,
-                &[],
+                &resolved.scan_filters,
                 None,
                 as_of_t,
+                scan_order,
             )
             .await?;
 
@@ -1746,9 +2134,20 @@ impl Operator for FusedR2rmlAggregateOperator {
         let vfold = self.vector_fold;
         let mut dict: hashbrown::HashTable<(Vec<GKey>, u32)> = hashbrown::HashTable::new();
         let mut group_accs: Vec<Vec<Acc>> = Vec::new();
-        let mut groups: std::collections::HashMap<Vec<GKey>, Vec<Acc>> =
-            std::collections::HashMap::new();
+        // Fx, not std's per-instance random hasher: the groups are emitted in
+        // this map's iteration order, which a LIMIT/OFFSET over a GROUP BY with no
+        // ORDER BY pages through, so it must not vary between executions.
+        let mut groups: rustc_hash::FxHashMap<Vec<GKey>, Vec<Acc>> =
+            rustc_hash::FxHashMap::default();
         let mut overflowed = false;
+        // Set semantics over a map that can mint a solution from several rows:
+        // the solutions folded so far, as their identifying columns' raw bytes
+        // (exact: `FoldDedupe`), each charged to the query budget. A column of
+        // a type whose raw bytes do not tell its terms apart hands the query to
+        // the generic pipeline, like an overflow.
+        let mut fold_seen = crate::r2rml::set_semantics::ArenaSet::new();
+        let fold_hasher = rustc_hash::FxBuildHasher;
+        let mut fold_scratch: Vec<u8> = Vec::new();
         'scan: while let Some(batch) = stream.next().await {
             // Checkpoint per fused-aggregate scan batch (deadline + memory budget): a
             // deadline/abort stops a large fused rollup mid-sweep, and a high-cardinality
@@ -1756,6 +2155,22 @@ impl Operator for FusedR2rmlAggregateOperator {
             // typed before OOM.
             ctx.checkpoint()?;
             let batch = batch?;
+            let dedupe_cols: Option<Vec<&Column>> = match &resolved.dedupe {
+                None => None,
+                Some(dedupe) => {
+                    let mut cols = Vec::with_capacity(dedupe.columns.len());
+                    for (name, raw) in &dedupe.columns {
+                        match batch.column_by_name(name) {
+                            Some(col) if raw.exact_for(col) => cols.push(col),
+                            _ => {
+                                overflowed = true;
+                                break 'scan;
+                            }
+                        }
+                    }
+                    Some(cols)
+                }
+            };
             let groups_before = if vfold {
                 group_accs.len()
             } else {
@@ -1772,10 +2187,8 @@ impl Operator for FusedR2rmlAggregateOperator {
                     }
                 })
                 .collect();
-            let key_cols: Vec<Option<&Column>> = gcols
-                .iter()
-                .map(|g| batch.column_by_name(&g.column))
-                .collect();
+            let key_cols: Vec<Option<KeyColumn>> =
+                gcols.iter().map(|g| g.key_column(&batch)).collect();
             let validity: Vec<Option<&Column>> = resolved
                 .validity_cols
                 .iter()
@@ -1849,14 +2262,33 @@ impl Operator for FusedR2rmlAggregateOperator {
                 // branch's constraints DROPS, the existence-semantics of the inner join.
                 // With K≥2 the probes AND (a miss on ANY branch drops the row), exactly
                 // as the K chained inner joins compose. Byte-identical to the generic
-                // chained join because each `membership` was built keep-min-THEN-filter
-                // (the discarded-dup soundness line). A null FK ⇒ no branch triple ⇒
+                // chained join because each `membership` admits only keys minting one
+                // subject (a duplicate key declines the build). A null FK ⇒ no branch triple ⇒
                 // drop; each set's FK child columns are also null-dropped by
                 // `validity_cols`, so this probe never sees a null-FK row on the reachable
                 // path. #1583: rests on each FK being single-valued (see `SemiJoinSet`).
                 if !Self::row_passes_semi_joins(&resolved.semi_joins, &batch, row, &mut fk_scratch)
                 {
                     continue;
+                }
+                // Fold each solution once: a row whose solution an earlier row
+                // already yielded adds nothing to the set of triples.
+                if let Some(cols) = &dedupe_cols {
+                    fold_scratch.clear();
+                    for col in cols {
+                        put_raw_value(col, row, &mut fold_scratch);
+                    }
+                    let hash = fold_hasher.hash_one(fold_scratch.as_slice());
+                    match fold_seen.insert_new(&fold_scratch, hash, &fold_hasher, ctx)? {
+                        Some(true) => {}
+                        Some(false) => continue,
+                        // A key longer than the set holds: the generic
+                        // pipeline answers.
+                        None => {
+                            overflowed = true;
+                            break 'scan;
+                        }
+                    }
                 }
                 let accs: &mut Vec<Acc> = if gcols.is_empty() {
                     &mut implicit
@@ -1908,7 +2340,9 @@ impl Operator for FusedR2rmlAggregateOperator {
                         let mut dropped = false;
                         for (pos, slot) in resolved.group_key_plan.iter().enumerate() {
                             let comp = match slot {
-                                KeySource::Fact => gcols[pos].key_ref_at(key_cols[pos], row),
+                                KeySource::Fact => {
+                                    gcols[pos].key_ref_at(key_cols[pos].as_ref(), row)
+                                }
                                 KeySource::Dim { resolver, slot } => dim_probes
                                     .get(*resolver)
                                     .and_then(|g| g.get(*slot))
@@ -2056,9 +2490,20 @@ impl Operator for FusedR2rmlAggregateOperator {
             ctx.tracker.consume_fuel(1)?;
         }
 
-        // An i128 accumulator overflowed: the exact answer needs BigDecimal, so
-        // run the whole query on the normal pipeline instead (nothing has been
-        // emitted yet, so this is a clean handoff).
+        if resolved.dedupe.is_some() {
+            tracing::debug!(
+                solutions = fold_seen.len(),
+                charged_bytes = fold_seen.charged(),
+                peak_bytes = fold_seen.peak(),
+                "fused R2RML aggregate: deduplication set released"
+            );
+        }
+        fold_seen.release(ctx);
+
+        // An i128 accumulator overflowed (or a deduplicated column's type has
+        // no exact raw encoding): the exact answer needs the normal pipeline,
+        // so run the whole query there instead (nothing has been emitted yet,
+        // so this is a clean handoff).
         if overflowed {
             self.use_fallback = true;
             self.fallback.open(ctx).await?;
@@ -2206,36 +2651,67 @@ impl FusedR2rmlAggregateOperator {
         // mapping below. A missing provider / load failure leaves `mapping` as
         // `None`, which disables fusion and, for a genuine R2RML scan, falls
         // back to the normal path.
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
         };
+        // Only a graph that is an R2RML source has a mapping to load; for one
+        // that is (the precomputed set or a probe says so), a failed load fails
+        // the query instead of reading the source through the native fallback.
+        // A graph loaded as a ledger graph is never probed.
         let mapping = match ctx.r2rml_provider {
-            Some(provider) => provider
-                .compiled_mapping(&self.graph_iri, as_of_t)
-                .await
-                .ok(),
-            None => None,
+            Some(provider)
+                if ctx.r2rml_graph_ids.contains(self.graph_iri.as_ref())
+                    || (!ctx.graph_is_native(&self.graph_iri)
+                        && provider.has_r2rml_mapping(&self.graph_iri).await?) =>
+            {
+                Some(provider.compiled_mapping(&self.graph_iri, as_of_t).await?)
+            }
+            _ => None,
         };
 
         // Rewrite the inner triples for this graph using the active snapshot.
         // A non-R2RML graph (or an unconvertible pattern) leaves triples
         // unconverted → fall back.
-        let rr = rewrite_patterns_for_r2rml(
+        let rr = crate::r2rml::rewrite_patterns_for_r2rml_source(
+            ctx,
             &self.inner_patterns,
             &self.graph_iri,
-            ctx.active_snapshot,
             mapping.as_deref(),
-            ctx.reasoning_active,
             // Count/aggregate path never merges a projected type-var (it folds
             // scalar columns and materializes no type rows); keep the two-scan
             // rewrite so the browse merge is confined to the crawl projection path.
             false,
-        );
+        )
+        .await?;
         if rr.unconverted_count > 0 {
             return Ok(None);
         }
+        // The fold counts and sums table rows, and the manifest COUNT counts
+        // them without reading any: both answer over the graph (a set of
+        // triples) only when each row the patterns read is a distinct solution.
+        // Where that is not proven, a single-pattern fold can still run by
+        // folding each solution once (`fold_dedupe_plan`); any other shape runs
+        // on the generic pipeline, whose scans remove repeats.
+        let Some(m) = mapping.as_deref() else {
+            return Ok(None);
+        };
+        let fold_dedupe = if crate::r2rml::set_semantics::rows_are_solutions(
+            ctx,
+            &rr.patterns,
+            &self.graph_iri,
+            m,
+        )
+        .await?
+        {
+            None
+        } else {
+            match Self::fold_dedupe_plan(&rr.patterns, m) {
+                Some(plan) => Some(plan),
+                None => return Ok(None),
+            }
+        };
         // The single-`R2rml` shape gate below also keeps this path decline-safe
         // against non-lowered sub-scopes (`rr.unsupported`): a surviving
         // PropertyPath/Subquery breaks the shape, so we fall back to the normal
@@ -2300,11 +2776,16 @@ impl FusedR2rmlAggregateOperator {
             return Ok(None);
         };
 
-        // Resolve the fact-side folded constant-object constraints to per-row
-        // scalar-column checks. Declines (`None`) if any constraint's predicate is a
-        // RefObjectMap object or is absent — those keep the materialize path (no
-        // silent over-count). Empty for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
-        let Some(fact_constraints) = Self::resolve_star_constraint_checks(&pattern, tm) else {
+        // Resolve the fact-side constant-object constraints to per-row
+        // scalar-column checks: the folded `star_constraints` AND a standalone
+        // `?s pred const` member, which the rewrite leaves as
+        // `predicate_filter`/`object_constant`. Both are also pushed to the scan
+        // (`scan_filters`), but a provider may apply a pushed filter inexactly or
+        // not at all, so the fold must enforce them itself. Declines
+        // (`None`) if any constraint's predicate is a RefObjectMap object or is
+        // absent — those keep the materialize path (no silent over-count). Empty
+        // for an unconstrained COUNT/SUM/AVG/MIN/MAX plan.
+        let Some(fact_constraints) = Self::resolve_pattern_constraints(&pattern, tm) else {
             return Ok(None);
         };
 
@@ -2330,18 +2811,17 @@ impl FusedR2rmlAggregateOperator {
         let mut ref_group_keys: Vec<(Vec<String>, Vec<String>, String)> = Vec::new();
         for gv in &self.group_by {
             let Some((col, datatype)) = Self::scalar_column_for_var(&pattern, tm, *gv) else {
-                // P2a (#1583 fan-out caveat): admit a RefObjectMap group key — the
-                // `GROUP BY ?c` where `?c` is a referenced parent IRI (crt_highcard).
-                // The generic path resolves `?c` through `build_parent_lookup`
-                // (parent scan → parent-subject IRI, deterministic keep-min on a
-                // duplicate parent key, drop on a dangling/NULL FK — NOT a fan-out,
-                // since a non-crawl aggregate has `trust_fk_refs=false`). We fold on
-                // that same IRI, minted once per parent row at resolver-build (O(dim),
-                // the cost `build_parent_lookup` already pays) instead of once per
-                // fact row, and emit it as an IRI term at output. WHEN true R2RML
-                // RefObjectMap fan-out lands (issue #1583), this admission changes
-                // group multiplicity and MUST be revisited in the same change — the
-                // fused path and generic path must flip together.
+                // P2a: admit a RefObjectMap group key — the `GROUP BY ?c` where `?c`
+                // is a referenced parent IRI (crt_highcard). The generic path
+                // resolves `?c` through `build_parent_lookup` (parent scan → the
+                // distinct subjects of each parent key, a fact row joining each;
+                // drop on a dangling/NULL FK, since a non-crawl aggregate has
+                // `trust_fk_refs=false`). We fold on that same IRI, minted once per
+                // parent row at resolver-build (O(dim), the cost `build_parent_lookup`
+                // already pays) instead of once per fact row, and emit it as an IRI
+                // term at output. A key minting more than one subject (#1583 fan-out)
+                // puts a fact row in several groups, which this single-valued
+                // resolver cannot fold: its build declines.
                 let Some((rom, parent_tm)) =
                     Self::ref_object_map_for_var(&pattern, tm, *gv, &mapping)
                 else {
@@ -2458,7 +2938,15 @@ impl FusedR2rmlAggregateOperator {
         // non-empty, the vectorized fast path is gated off and the per-row path
         // (which enforces it) runs — the win is still skipping RDF
         // materialization, not skipping null checks.
-        let mut validity_cols: Vec<String> = tm.subject_map.template_columns.clone();
+        // The template's columns are read from the template itself, as for
+        // `count_non_null_cols` below: `template_columns` is only as complete
+        // as whatever built the map.
+        let mut validity_cols: Vec<String> = tm
+            .subject_map
+            .template
+            .as_deref()
+            .map(extract_template_columns)
+            .unwrap_or_default();
         if let Some(c) = &tm.subject_map.column {
             validity_cols.push(c.clone());
         }
@@ -2539,13 +3027,34 @@ impl FusedR2rmlAggregateOperator {
             None => None,
         };
 
+        // This fold takes its FILTER from the query rather than from the
+        // rewrite, so the comparisons the rewrite would have attached to the
+        // pattern are collected here.
+        let scan_filters = {
+            let mut pushing = pattern.clone();
+            if let Some(expr) = &self.filter {
+                let mut comparisons = Vec::new();
+                super::rewrite::collect_pushdowns(expr, &mut comparisons);
+                pushing.scan_filters.extend(
+                    comparisons.into_iter().map(|(var, op, value)| {
+                        crate::ir::adapters::ScanPushdown { var, op, value }
+                    }),
+                );
+            }
+            super::operator::pattern_scan_filters(&pushing, tm)
+        };
+
+        // The fold reads a solution's identifying columns to fold it once.
+        if let Some(dedupe) = &fold_dedupe {
+            projection.extend(dedupe.columns.iter().map(|(c, _)| c.clone()));
+        }
         projection.sort();
         projection.dedup();
 
         // P2a + S2: build one FK→IRI resolver per admitted RefObjectMap group key by
         // scanning its parent dimension ONCE — minting the parent-subject IRI per row
-        // exactly as `build_parent_lookup` does, with deterministic keep-min on a
-        // duplicate parent join key (matching the generic query path post-#1529), so each
+        // exactly as `build_parent_lookup` does, and declining when a parent join key
+        // mints more than one subject (#1583: the generic path joins each), so each
         // fused group key is byte-identical to the materialized IRI. Null parent subject /
         // null join key rows are skipped (they can never satisfy the join); a fact-row
         // probe miss then folds "dangling FK" and "null parent" into one drop, exactly as
@@ -2553,7 +3062,7 @@ impl FusedR2rmlAggregateOperator {
         // resolver index `i` matches the `KeySource::Dim { resolver: i, .. }` plan above.
         let mut group_resolvers: Vec<GroupKeyResolver> = Vec::with_capacity(ref_group_keys.len());
         // id=3717398042: two ref group keys to the SAME dim on the SAME parent join cols
-        // (e.g. shipTo/billTo → Customer) build an IDENTICAL keep-min parent-key → IRI map
+        // (e.g. shipTo/billTo → Customer) build an IDENTICAL parent-key → IRI map
         // — its contents depend only on (parent TM, parent cols), never on the fact-side
         // FK. Cache the built map by that pair and share it (Arc) so the second key reuses
         // the first's scan + map instead of re-scanning the dim and holding a duplicate.
@@ -2588,9 +3097,15 @@ impl FusedR2rmlAggregateOperator {
             let gs = &pattern.graph_source_id;
             let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
-            let mut s = table_provider
-                .scan_table(gs, &parent_table, &parent_proj, &[], None, as_of_t)
-                .await?;
+            let mut s = scan_for_lookup(
+                table_provider,
+                gs,
+                &parent_table,
+                &parent_proj,
+                &[],
+                as_of_t,
+            )
+            .await?;
             while let Some(batch) = s.next().await {
                 ctx.checkpoint()?;
                 let batch = batch?;
@@ -2604,22 +3119,19 @@ impl FusedR2rmlAggregateOperator {
                             Ok(Some(RdfTerm::Iri(iri))) => iri,
                             _ => continue, // null / non-IRI subject → skip (blank node declined above)
                         };
-                    // Deterministic keep-min on a duplicate parent join key: keep the
-                    // lexicographically smaller IRI, byte-identical to
-                    // `parent_key_insert_keep_min` on the generic path. The subject is a
-                    // pure IRI here (blank node declined above), so this raw-string `<` is
-                    // exactly the shared `subject_sort_key` comparator applied to
-                    // `RdfTerm::Iri` — the third keep-min copy shares that ordering
-                    // (id=3717339907).
+                    // #1583: a referencing row joins every distinct subject its key
+                    // matches, so a fact row lands in one group per subject. The
+                    // single-valued map can fold only a key whose rows all mint one
+                    // subject (repeats of it, e.g. a history table's versions, are
+                    // benign); a key minting a second subject declines to the
+                    // generic path, which fans out.
                     match map.entry(key) {
                         std::collections::hash_map::Entry::Vacant(v) => {
                             v.insert(vec![GKey::Str(iri)]);
                         }
-                        std::collections::hash_map::Entry::Occupied(mut e) => {
-                            if let Some(GKey::Str(cur)) = e.get().first() {
-                                if iri < *cur {
-                                    e.insert(vec![GKey::Str(iri)]);
-                                }
+                        std::collections::hash_map::Entry::Occupied(e) => {
+                            if !matches!(e.get().first(), Some(GKey::Str(cur)) if *cur == iri) {
+                                return Ok(None);
                             }
                         }
                     }
@@ -2644,12 +3156,14 @@ impl FusedR2rmlAggregateOperator {
             expr_folds,
             validity_cols,
             count_non_null_cols,
+            scan_filters,
             group_resolvers,
             semi_joins: Vec::new(),
             group_key_plan,
             fact_constraints,
             minmax_folds,
             minmax_encoder,
+            dedupe: fold_dedupe,
         }))
     }
 
@@ -2851,7 +3365,7 @@ impl FusedR2rmlAggregateOperator {
     /// P3 + S1: decompose a BRANCHING-STAR join — a fact ROOT with ≥2 FK branches, each
     /// a linear sub-chain — into its root + classified branches, or `None` when the
     /// shape is not the admitted class. The structural half of the branching path; the
-    /// soundness core (per-branch keep-min-then-filter membership + the AND fold probe)
+    /// soundness core (per-branch membership + the AND fold probe)
     /// lives in `resolve_branching_star_at_open` / `build_semi_join_membership`.
     ///
     /// Classification: a branch is GROUP-KEY if any of its patterns binds a GROUP BY
@@ -3021,8 +3535,9 @@ impl FusedR2rmlAggregateOperator {
         Some(checks)
     }
 
-    /// P3: gather ALL of a semi-join chain pattern's folded constant-object
-    /// constraints — from `star_constraints` AND from a STANDALONE const-object
+    /// Gather ALL of a pattern's constant-object constraints (the single-scan
+    /// fact pattern and every semi-join chain pattern use this) — from
+    /// `star_constraints` AND from a STANDALONE const-object
     /// member (`predicate_filter` + `object_constant`). The distinction is
     /// load-bearing: the rewrite folds a constant object into `star_constraints` only
     /// when the subject ALSO has a var-object member (the group-key branch's terminal,
@@ -3033,7 +3548,7 @@ impl FusedR2rmlAggregateOperator {
     /// membership UNFILTERED and admit every row (a silent SUM over-count). Declines
     /// (`None`) if the standalone constraint's predicate is not a scalar-column
     /// `PredicateObjectMap` — never silently ignored.
-    fn resolve_semijoin_pattern_constraints(
+    fn resolve_pattern_constraints(
         pattern: &R2rmlPattern,
         tm: &TriplesMap,
     ) -> Option<Vec<ResolvedConstraint>> {
@@ -3560,7 +4075,12 @@ impl FusedR2rmlAggregateOperator {
         // covered by the FK cols).
         let fact_fk_cols = hops[0].0.clone();
         let first_join_var = join_vars[0];
-        let mut validity_cols: Vec<String> = fact_tm.subject_map.template_columns.clone();
+        let mut validity_cols: Vec<String> = fact_tm
+            .subject_map
+            .template
+            .as_deref()
+            .map(extract_template_columns)
+            .unwrap_or_default();
         if let Some(c) = &fact_tm.subject_map.column {
             validity_cols.push(c.clone());
         }
@@ -3620,7 +4140,7 @@ impl FusedR2rmlAggregateOperator {
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -3674,9 +4194,15 @@ impl FusedR2rmlAggregateOperator {
         let mut map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
             std::collections::HashMap::new();
         {
-            let mut s = table_provider
-                .scan_table(gs, &terminal_table, &terminal_proj, &[], None, as_of_t)
-                .await?;
+            let mut s = scan_for_lookup(
+                table_provider,
+                gs,
+                &terminal_table,
+                &terminal_proj,
+                &[],
+                as_of_t,
+            )
+            .await?;
             while let Some(batch) = s.next().await {
                 // Checkpoint the terminal-dim drain (deadline + memory budget): the
                 // FK→GKey `map` is fully retained to probe the fact scan, so a large dim
@@ -3688,9 +4214,9 @@ impl FusedR2rmlAggregateOperator {
                 // fact-subset keys are read inline from the fact batch at fold time.
                 // An all-fact plan leaves this empty, so the map stores `[]` per FK
                 // and degenerates to a join-existence set (invariant #1).
-                let attr_cols: Vec<Option<&Column>> = dim_group_cols
+                let attr_cols: Vec<Option<KeyColumn>> = dim_group_cols
                     .iter()
-                    .map(|g| batch.column_by_name(&g.column))
+                    .map(|g| g.key_column(&batch))
                     .collect();
                 for row in 0..batch.num_rows {
                     let Some(key) = get_join_key_from_batch(&terminal_parent_cols, &batch, row)
@@ -3722,7 +4248,7 @@ impl FusedR2rmlAggregateOperator {
                     let mut gkeys = Vec::with_capacity(dim_group_cols.len());
                     let mut any_null = false;
                     for (g, c) in dim_group_cols.iter().zip(&attr_cols) {
-                        let k = g.key_at(*c, row);
+                        let k = g.key_at(c.as_ref(), row);
                         if matches!(k, GKey::Null) {
                             any_null = true;
                             break;
@@ -3762,9 +4288,8 @@ impl FusedR2rmlAggregateOperator {
             proj.dedup();
             let mut next_map: std::collections::HashMap<Vec<String>, Vec<GKey>> =
                 std::collections::HashMap::new();
-            let mut s = table_provider
-                .scan_table(gs, &inter_table, &proj, &[], None, as_of_t)
-                .await?;
+            let mut s =
+                scan_for_lookup(table_provider, gs, &inter_table, &proj, &[], as_of_t).await?;
             while let Some(batch) = s.next().await {
                 // Checkpoint the interior-dim drain (deadline + memory budget). This is
                 // the loop that builds the potentially multi-million-row interior FK→GKey
@@ -3810,6 +4335,7 @@ impl FusedR2rmlAggregateOperator {
             validity_cols,
             // The COUNT(*) manifest shortcut is single-table only.
             count_non_null_cols: Vec::new(),
+            scan_filters: Vec::new(),
             // The join path is a single terminal-dim resolver (resolver index 0),
             // matching the `KeySource::Dim { resolver: 0, .. }` plan above.
             group_resolvers: vec![GroupKeyResolver {
@@ -3821,14 +4347,17 @@ impl FusedR2rmlAggregateOperator {
             fact_constraints: fact_checks,
             minmax_folds,
             minmax_encoder,
+            // Only a single-table fold deduplicates; a join is admitted only
+            // over maps whose rows are distinct solutions.
+            dedupe: None,
         }))
     }
 
     /// P3 (crt_join_reorder class) + S1 (K≥2 generality): resolve a fused aggregate over
     /// a decomposed BRANCHING-STAR join — a fact root with exactly one GROUP-KEY branch
     /// and one-or-more SEMI-JOIN branches (`decompose_branching_star`). Builds one
-    /// SEMI-JOIN membership set PER semi-join branch (keep-min-then-filter,
-    /// `build_semi_join_membership`), then resolves the GROUP-KEY branch as a linear
+    /// SEMI-JOIN membership set PER semi-join branch (`build_semi_join_membership`),
+    /// then resolves the GROUP-KEY branch as a linear
     /// chain `[root, group_branch.chain…]` via the shared
     /// [`Self::resolve_linear_chain_at_open`], with EVERY semi-join branch's root FK
     /// stripped from the fact's required objects and the membership sets threaded in for
@@ -3863,14 +4392,14 @@ impl FusedR2rmlAggregateOperator {
         let Some(root_tm) = Self::resolve_triples_map(root, mapping) else {
             return Ok(None);
         };
-        // Build every SEMI-JOIN branch's membership set first (keep-min-then-filter). A
+        // Build every SEMI-JOIN branch's membership set first. A
         // branch it cannot resolve soundly declines the whole fuse. The strip set is
         // every semi-join branch's root FK var — all covered by the membership probes,
         // not scalar/group objects.
         let mut semi_joins: Vec<SemiJoinSet> = Vec::with_capacity(semi_branches.len());
         let mut strip: Vec<VarId> = Vec::with_capacity(semi_branches.len());
         // KNOWN CEILING (id=3717398042, non-blocking): two semi-branches touching the
-        // SAME dim table each scan it independently and hold their own keep-min map. Unlike
+        // SAME dim table each scan it independently and hold their own key map. Unlike
         // the S2 ref-IRI dedup above, a semi-join membership SET's contents depend on the
         // branch's own constraints (the s1_same_table shape filters buyer='Enterprise' vs
         // seller='SMB' on the SAME Customer table), so a (parent_tm, parent_cols) share is
@@ -3878,9 +4407,9 @@ impl FusedR2rmlAggregateOperator {
         // or a scan-once-build-N-filtered-sets refactor. Left as a tracked follow-on (the
         // independent builds are sound; see s1_same_table_semi_branches_independent) rather
         // than folded into this PR. See also the ScanFilter-pushdown ceiling: the membership
-        // scan intentionally passes no filters/top-k — keep-min must see ALL rows to pick
-        // the min parent subject BEFORE the constraint filter, so a full resident dim scan +
-        // resident keep-min map is a structural cost of this keep-min-then-filter approach.
+        // scan intentionally passes no filters/top-k — it must see ALL of a key's rows to
+        // tell whether they mint one subject and agree BEFORE the constraint filter, so a
+        // full resident dim scan + resident key map is a structural cost of this approach.
         for semi_branch in &semi_branches {
             let Some(sj) = self
                 .build_semi_join_membership(ctx, mapping, root, root_tm, semi_branch)
@@ -3905,36 +4434,32 @@ impl FusedR2rmlAggregateOperator {
             .await
     }
 
-    /// P3 SEMI-JOIN membership build (crt_join_reorder class) — KEEP-MIN-THEN-FILTER,
-    /// the load-bearing soundness invariant.
+    /// P3 SEMI-JOIN membership build (crt_join_reorder class).
     ///
     /// The branch is a linear FK sub-chain `root ─root_join_var→ chain[0] ─…→
     /// chain[m-1]`, its terminal carrying the membership constraint (e.g.
     /// `order → customer[segment="Enterprise"]`). Returns the set of ROOT-FK join keys
     /// whose chain — resolved the way the generic pipeline resolves it — satisfies
-    /// every constraint. The generic pipeline resolves each FK to the keep-min parent
-    /// SUBJECT (`build_parent_lookup` via `parent_key_insert_keep_min`) and then filters
-    /// THAT one row, so on a duplicate intermediate key it tests the keep-min row, not
-    /// "any duplicate". Building the set the other way — union every key some duplicate
-    /// row admits (filter-then-union) — would WRONGLY admit a key whose keep-min row
-    /// fails but a discarded duplicate passes. So each level is built keep-min-then-
-    /// filter and composed terminal→root: for a key, keep the row with the smallest
-    /// parent subject, then admit the key iff THAT row passes its own constraints AND
-    /// (interior) its next-hop FK is in the next level's admitted set.
+    /// every constraint. The generic pipeline joins each FK to every subject its parent
+    /// key matches (`build_parent_lookup`), so a fact row counts once per joined
+    /// subject; a set counts it once, so each level admits only a key whose rows all
+    /// mint ONE subject and agree on its constraint result and next-hop FK, and
+    /// declines otherwise. Composed terminal→root: admit a key iff its row passes its
+    /// own constraints AND (interior) its next-hop FK is in the next level's admitted
+    /// set.
     ///
-    /// Bounded: each level's keep-min map is charged via `record_alloc` and the scan
+    /// Bounded: each level's key map is charged via `record_alloc` and the scan
     /// loop `checkpoint`s per batch, so an oversized branch aborts typed
     /// (`MemoryBudgetExceeded`, 507) before OOM — the same fail-loud shape
     /// `build_parent_lookup` uses. Declines (`Ok(None)` → materialize) on any hop that
     /// is not a single-column `RefObjectMap`, a missing parent TM/table, or a
     /// constraint not reducible to a scalar column.
     ///
-    /// #1583: the membership *set* models an inner join only while each FK is
-    /// single-valued (one fact row → at most one branch row per hop). A fan-out
-    /// `RefObjectMap` must revisit this (see [`SemiJoinSet`]). Relatedly, the keep-min
-    /// build DECLINES a same-key/same-subject SCD-2 collision whose rows disagree on the
-    /// constraint result or next-hop FK (id=3717339904) — keep-min alone would let scan
-    /// order decide the answer.
+    /// The build DECLINES a key minting two subjects (#1583, see [`SemiJoinSet`]) and a
+    /// same-key/same-subject SCD-2 collision whose rows disagree on the constraint
+    /// result or next-hop FK (id=3717339904) — keeping one row would let scan order
+    /// decide the answer. It declines exactly when some key's rows are not all alike,
+    /// so whether it declines does not depend on the order a level's rows arrive in.
     async fn build_semi_join_membership(
         &self,
         ctx: &ExecutionContext<'_>,
@@ -3947,7 +4472,7 @@ impl FusedR2rmlAggregateOperator {
         let table_provider = ctx.r2rml_table_provider.ok_or_else(|| {
             QueryError::InvalidQuery("R2RML table provider not configured".to_string())
         })?;
-        let as_of_t = if ctx.dataset.is_some() {
+        let as_of_t = if ctx.explicit_dataset().is_some() {
             None
         } else {
             Some(ctx.to_t)
@@ -3962,7 +4487,7 @@ impl FusedR2rmlAggregateOperator {
         // A chain pattern's VAR-OBJECT members OTHER than its next-hop FK impose a BGP
         // existence requirement (the object column must be non-null for the triple to
         // match) — and, across two branches sharing the object var, a cross-branch
-        // equality — NEITHER of which this keep-min membership build honors: it projects
+        // equality — NEITHER of which this membership build honors: it projects
         // only join / subject / constraint / next-FK columns and never consults a bound
         // object member. Silently dropping one OVER-ADMITS the root FK (e.g.
         // `?c :segment "Enterprise" ; :region ?r` with a null region admits a customer
@@ -4047,16 +4572,15 @@ impl FusedR2rmlAggregateOperator {
             // standalone by the rewrite, so reading only star_constraints would admit
             // every row (silent over-count). Declines if a constraint can't resolve to
             // a scalar column.
-            let Some(checks) = Self::resolve_semijoin_pattern_constraints(chain[h], chain_tms[h])
-            else {
+            let Some(checks) = Self::resolve_pattern_constraints(chain[h], chain_tms[h]) else {
                 return Ok(None);
             };
             chain_checks.push(checks);
         }
 
         // Build the admitted key set per level, terminal (m-1) → root (0). `admitted`
-        // after level `i` = the set of hop[i].parent-key values whose keep-min chain
-        // from chain[i] onward satisfies every constraint.
+        // after level `i` = the set of hop[i].parent-key values whose chain from
+        // chain[i] onward satisfies every constraint.
         let mut admitted: std::collections::HashSet<Vec<String>> = std::collections::HashSet::new();
         for level in (0..m).rev() {
             let tm = chain_tms[level];
@@ -4088,14 +4612,12 @@ impl FusedR2rmlAggregateOperator {
             proj.sort();
             proj.dedup();
 
-            // key → keep-min(parent subject) row bookkeeping.
+            // key → its one subject's row bookkeeping.
             let mut kept: std::collections::HashMap<Vec<String>, KeptChainRow> =
                 std::collections::HashMap::new();
-            let mut s = table_provider
-                .scan_table(gs, &table, &proj, &[], None, as_of_t)
-                .await?;
+            let mut s = scan_for_lookup(table_provider, gs, &table, &proj, &[], as_of_t).await?;
             while let Some(batch) = s.next().await {
-                // Bound the keep-min build: charge each new key + checkpoint per batch,
+                // Bound the build: charge each new key + checkpoint per batch,
                 // so an oversized branch aborts typed before OOM (build_parent_lookup
                 // parity).
                 ctx.checkpoint()?;
@@ -4116,10 +4638,10 @@ impl FusedR2rmlAggregateOperator {
                     } else {
                         get_join_key_from_batch(&next_fk_cols, &batch, row)
                     };
-                    // Deterministic keep-min on the parent SUBJECT, byte-identical to
-                    // `parent_key_insert_keep_min`: the lexicographically smaller subject
-                    // wins; an equal subject is a benign duplicate (no replace). The
-                    // WINNING row's `passes_own` + `next_fk` are what decide membership.
+                    // One subject per key: a membership set counts a fact row once,
+                    // while the generic join counts it once per subject its key
+                    // matches (#1583), so a key minting a second subject declines.
+                    // The kept row's `passes_own` + `next_fk` decide membership.
                     match kept.entry(key) {
                         Entry::Vacant(v) => {
                             v.insert(KeptChainRow {
@@ -4128,30 +4650,23 @@ impl FusedR2rmlAggregateOperator {
                                 next_fk,
                             });
                         }
-                        Entry::Occupied(mut e) => {
+                        Entry::Occupied(e) => {
                             // id=3717339904 (SCD-2 same-key/same-subject gap): two dim
                             // rows sharing the join key that mint the SAME subject but
                             // disagree on `passes_own` (the constraint result) or
                             // `next_fk` (the next hop) are the normal SCD-2 case (multiple
                             // versions per key, same subject template, differing on
-                            // IS_CURRENT / a versioned FK). keep-min discriminates only by
-                            // subject, so it would keep whichever row the scan hit first —
-                            // a scan-order-dependent ANSWER (the generic chained join
-                            // materializes every version's triples; this fold tests one).
+                            // IS_CURRENT / a versioned FK). Keeping one row per key would
+                            // keep whichever row the scan hit first — a scan-order-dependent
+                            // ANSWER (the generic chained join materializes every version's
+                            // triples; this fold tests one).
                             // Decline to the generic path. An IDENTICAL duplicate (same
                             // subject, same constraint result, same next FK) is benign.
-                            if subject == e.get().subject {
-                                if passes_own != e.get().passes_own || next_fk != e.get().next_fk {
-                                    return Ok(None);
-                                }
-                            } else if subject_sort_key(&subject)
-                                < subject_sort_key(&e.get().subject)
+                            if subject != e.get().subject
+                                || passes_own != e.get().passes_own
+                                || next_fk != e.get().next_fk
                             {
-                                e.insert(KeptChainRow {
-                                    subject,
-                                    passes_own,
-                                    next_fk,
-                                });
+                                return Ok(None);
                             }
                         }
                     }
@@ -4159,7 +4674,7 @@ impl FusedR2rmlAggregateOperator {
                 ctx.record_alloc((kept.len() - kept_before) * crate::context::GROUP_EST_BYTES);
             }
 
-            // Reduce the kept (keep-min) rows to this level's admitted set.
+            // Reduce the kept rows to this level's admitted set.
             let prev_admitted = std::mem::take(&mut admitted);
             let mut level_admitted: std::collections::HashSet<Vec<String>> =
                 std::collections::HashSet::new();
@@ -4193,6 +4708,136 @@ impl FusedR2rmlAggregateOperator {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_raw_key_is_exact_only_where_the_coercion_keeps_values_apart() {
+        use fluree_vocab::xsd;
+        let ints = Column::Int64(vec![Some(1)]);
+        let strs = Column::String(vec![Some("01".to_string())]);
+        let floats = Column::Float64(vec![Some(1.0)]);
+        let rendered = RawTerm::of_object(None, None).unwrap();
+        assert!(rendered.exact_for(&ints) && rendered.exact_for(&strs));
+        assert!(!rendered.exact_for(&floats), "float text is not one-to-one");
+        // "01" and "1" are one integer: a string column under xsd:integer is not exact.
+        let integer = RawTerm::of_object(Some(xsd::INTEGER), None).unwrap();
+        assert!(integer.exact_for(&ints) && !integer.exact_for(&strs));
+        assert!(RawTerm::of_object(Some(xsd::DOUBLE), None).is_none());
+        assert_eq!(
+            RawTerm::of_object(Some(xsd::INTEGER), Some("en")),
+            Some(RawTerm::Rendered)
+        );
+        // One integer whether a file stores it in 32 or 64 bits.
+        let (mut a, mut b) = (Vec::new(), Vec::new());
+        assert!(put_raw_value(&Column::Int32(vec![Some(7)]), 0, &mut a));
+        assert!(put_raw_value(&Column::Int64(vec![Some(7)]), 0, &mut b));
+        assert_eq!(a, b);
+        // Strings are length-prefixed: ("ab","c") is not ("a","bc").
+        let (mut x, mut y) = (Vec::new(), Vec::new());
+        for (out, parts) in [(&mut x, ["ab", "c"]), (&mut y, ["a", "bc"])] {
+            for part in parts {
+                put_raw_value(&Column::String(vec![Some(part.to_string())]), 0, out);
+            }
+        }
+        assert_ne!(x, y);
+        assert!(!put_raw_value(&floats, 0, &mut Vec::new()));
+    }
+
+    /// A NULL keys apart from every value, the type's default included, and
+    /// alike with another NULL of any type.
+    #[test]
+    fn a_raw_key_tags_null_apart_from_the_default() {
+        let key = |column: Column, row: usize| {
+            let mut out = Vec::new();
+            assert!(put_raw_value(&column, row, &mut out));
+            out
+        };
+        for (null, default) in [
+            (Column::Int32(vec![None]), Column::Int32(vec![Some(0)])),
+            (Column::Int64(vec![None]), Column::Int64(vec![Some(0)])),
+            (
+                Column::String(vec![None]),
+                Column::String(vec![Some(String::new())]),
+            ),
+            (Column::Date(vec![None]), Column::Date(vec![Some(0)])),
+            (
+                Column::Boolean(vec![None]),
+                Column::Boolean(vec![Some(false)]),
+            ),
+        ] {
+            assert_ne!(key(null.clone(), 0), key(default, 0), "{null:?}");
+            assert_eq!(key(null, 0), [0u8]);
+        }
+    }
+
+    #[test]
+    fn a_fold_deduplicates_only_a_single_pattern_it_can_key_exactly() {
+        use fluree_db_r2rml::mapping::PredicateMap;
+        const NAME: &str = "http://example.org/name";
+        let pom = |column: &str, datatype: Option<&str>| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(NAME),
+            object_map: ObjectMap::Column {
+                column: column.to_string(),
+                datatype: datatype.map(str::to_string),
+                language: None,
+                term_type: TermType::Literal,
+            },
+        };
+        let history = |template: &str, datatype: Option<&str>| {
+            TriplesMap::new("#History", "history")
+                .with_subject_template(template)
+                .with_predicate_object(pom("name", datatype))
+        };
+        let pattern = || R2rmlPattern::new("gs", VarId(0), Some(VarId(1))).with_predicate(NAME);
+        let plan = |maps: Vec<TriplesMap>, p: R2rmlPattern| {
+            FusedR2rmlAggregateOperator::fold_dedupe_plan(
+                &[Pattern::R2rml(p)],
+                &CompiledR2rmlMapping::new(maps),
+            )
+            .map(|d| d.columns)
+        };
+        assert_eq!(
+            plan(vec![history("http://ex/c/{id}", None)], pattern()),
+            Some(vec![
+                ("id".to_string(), RawTerm::Rendered),
+                ("name".to_string(), RawTerm::Rendered)
+            ])
+        );
+        // Two placeholders separated by a character the escape passes through.
+        assert!(plan(vec![history("http://ex/c/{a}-{b}", None)], pattern()).is_none());
+        // An integer coercion is admitted here; whether the column's values
+        // keep apart under it (an integer column, not a string one) is checked
+        // against each batch (`RawTerm::exact_for`), which hands a string
+        // column to the generic pipeline.
+        assert_eq!(
+            plan(
+                vec![history(
+                    "http://ex/c/{id}",
+                    Some(fluree_vocab::xsd::INTEGER)
+                )],
+                pattern()
+            )
+            .map(|c| c[1].1),
+            Some(RawTerm::Integer)
+        );
+        // A coercion that is never one-to-one declines here.
+        assert!(plan(
+            vec![history("http://ex/c/{id}", Some(fluree_vocab::xsd::DOUBLE))],
+            pattern()
+        )
+        .is_none());
+        // Two candidate maps.
+        let other = TriplesMap::new("#Other", "other")
+            .with_subject_template("http://ex/o/{id}")
+            .with_predicate_object(pom("name", None));
+        assert!(plan(vec![history("http://ex/c/{id}", None), other], pattern()).is_none());
+        // A constant folded from another pattern is checked against its own row.
+        let mut constrained = pattern();
+        constrained.star_constraints = vec![(
+            "http://example.org/city".to_string(),
+            ObjectConstant::Scalar(crate::r2rml::ScanValue::Str("Miami".to_string())),
+        )];
+        assert!(plan(vec![history("http://ex/c/{id}", None)], constrained).is_none());
+    }
+
     use super::*;
     use crate::ir::grouping::AggregateSpec;
 
@@ -4313,6 +4958,7 @@ mod tests {
             dt_sid: Sid::new(1, "string"),
         };
         let col = Column::String(vec![Some("SMB".to_string()), None]);
+        let col = gc.key_column_of(&col);
         // Present value → the raw string, the xsd:string lexical form materialize emits.
         assert_eq!(gc.key_at(Some(&col), 0), GKey::Str("SMB".to_string()));
         // NULL value and a missing column both read as Null (row drops == BGP exclusion).
@@ -4353,7 +4999,7 @@ mod tests {
             (gc_str(), Column::String(vec![Some("A".into()), None]), 0),
             (gc_str(), Column::String(vec![Some("A".into()), None]), 1),
             (gc_str(), Column::String(vec![Some("A".into())]), 5),
-            (gc_str(), Column::Int64(vec![Some(7)]), 0), // wrong physical type
+            (gc_str(), Column::Int64(vec![Some(7)]), 0), // rendered: "7"
             (gc_int(), Column::Int64(vec![Some(42), None]), 0),
             (gc_int(), Column::Int64(vec![Some(42), None]), 1),
             (gc_int(), Column::Int32(vec![Some(-3)]), 0),
@@ -4395,18 +5041,85 @@ mod tests {
             ),
         ];
         for (gc, col, row) in &cases {
-            let owned = gc.key_at(Some(col), *row);
+            let col = gc.key_column_of(col);
+            let owned = gc.key_at(Some(&col), *row);
             let borrowed = gc
-                .key_ref_at(Some(col), *row)
+                .key_ref_at(Some(&col), *row)
                 .map(GKeyRef::to_owned_key)
                 .unwrap_or(GKey::Null);
             assert_eq!(owned, borrowed, "kind {:?} row {}", gc.kind, row);
-            if let Some(r) = gc.key_ref_at(Some(col), *row) {
+            if let Some(r) = gc.key_ref_at(Some(&col), *row) {
                 assert!(r.eq_owned(&owned), "eq_owned disagrees for {owned:?}");
             }
         }
         assert_eq!(gc_str().key_at(None, 0), GKey::Null);
         assert!(gc_str().key_ref_at(None, 0).is_none());
+    }
+
+    /// An `xsd:string` key over a column the batch holds in another physical
+    /// type reads the materializer's rendering of each cell, owned and borrowed,
+    /// and a null cell still drops the row. Cells that compare equal as numbers
+    /// but render differently (`-0.0` / `0.0`) stay apart, as their strings do.
+    #[test]
+    fn string_key_over_any_physical_type_reads_the_rendered_value() {
+        let cases: Vec<(Column, &[Option<&str>])> = vec![
+            (Column::Int32(vec![Some(10), None]), &[Some("10"), None]),
+            (
+                Column::Int64(vec![Some(-3), Some(9)]),
+                &[Some("-3"), Some("9")],
+            ),
+            (
+                Column::Float32(vec![Some(-0.0), Some(0.0)]),
+                &[Some("-0"), Some("0")],
+            ),
+            (
+                Column::Float64(vec![Some(f64::NAN), Some(1e21)]),
+                &[Some("NaN"), Some("1000000000000000000000")],
+            ),
+            (
+                Column::Boolean(vec![Some(true), Some(false)]),
+                &[Some("true"), Some("false")],
+            ),
+            (
+                Column::Date(vec![Some(-1), Some(0)]),
+                &[Some("1969-12-31"), Some("1970-01-01")],
+            ),
+            (
+                Column::Timestamp(vec![Some(1), Some(0)]),
+                &[
+                    Some("1970-01-01T00:00:00.000001Z"),
+                    Some("1970-01-01T00:00:00Z"),
+                ],
+            ),
+            (
+                Column::TimestampTz(vec![Some(-1), None]),
+                &[Some("1969-12-31T23:59:59.999999Z"), None],
+            ),
+            (
+                Column::Bytes(vec![Some(vec![0, 1]), Some(vec![])]),
+                &[Some("0001"), Some("")],
+            ),
+            (
+                Column::Decimal {
+                    values: vec![Some(50_000_000), Some(-500_000_000)],
+                    precision: 38,
+                    scale: 9,
+                },
+                &[Some("0.050000000"), Some("-0.500000000")],
+            ),
+        ];
+        let gc = gc_str();
+        for (col, expected) in &cases {
+            let key_col = gc.key_column_of(col);
+            for (row, want) in expected.iter().enumerate() {
+                let want = want.map_or(GKey::Null, |s| GKey::Str(s.to_string()));
+                assert_eq!(gc.key_at(Some(&key_col), row), want, "{col:?} row {row}");
+                let borrowed = gc
+                    .key_ref_at(Some(&key_col), row)
+                    .map_or(GKey::Null, GKeyRef::to_owned_key);
+                assert_eq!(borrowed, want, "{col:?} row {row} (borrowed)");
+            }
+        }
     }
 
     /// N1 hash-consistency invariant (the resize-safety guard): the borrowed probe
@@ -4735,7 +5448,7 @@ mod tests {
         use fluree_db_core::LedgerSnapshot;
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap, RefObjectMap};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -4812,7 +5525,7 @@ mod tests {
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -4884,7 +5597,7 @@ mod tests {
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -5013,7 +5726,7 @@ mod tests {
         use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
         use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -5271,7 +5984,7 @@ mod tests {
                 object_map: ObjectMap::column("SEGMENT"),
             });
         let mapping = CompiledR2rmlMapping::new(vec![customer]);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let tm = mapping.triples_maps.values().next().unwrap();
 
         let s = VarId(0);
@@ -5288,8 +6001,16 @@ mod tests {
             Term::Value(FlakeValue::String("Enterprise".to_string())),
         );
         let rewrite = |pats: &[Pattern]| {
-            rewrite_patterns_for_r2rml(pats, "gs:main", &snapshot, Some(&mapping), false, false)
-                .patterns
+            rewrite_patterns_for_r2rml(
+                pats,
+                "gs:main",
+                &snapshot,
+                Some(&mapping),
+                &crate::r2rml::set_semantics::TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+                false,
+                false,
+            )
+            .patterns
         };
 
         // q038: the direct-path ungrouped constrained COUNT splits into 2 patterns.
@@ -5511,14 +6232,18 @@ mod tests {
             output: QueryOutput::select_all(vec![out]),
             patterns,
             reasoning: ReasoningConfig::default(),
-            grouping: Grouping::assemble(group_by, vec![agg], vec![], None),
+            grouping: Grouping::assemble(group_by, vec![agg], vec![], None)
+                .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         }
     }
 
@@ -5697,8 +6422,8 @@ mod tests {
         struct MapProvider(Arc<CompiledR2rmlMapping>);
         #[async_trait]
         impl R2rmlProvider for MapProvider {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -5721,7 +6446,7 @@ mod tests {
             FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let map_provider = MapProvider(Arc::clone(&mapping));
 
@@ -5768,6 +6493,16 @@ mod tests {
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
     ) -> Vec<(String, i64)> {
+        try_ref_iri_group_by(mapping, batches)
+            .await
+            .expect("the fused ref-IRI GROUP BY must fold, not decline")
+    }
+
+    /// [`run_ref_iri_group_by`], or `None` when the fused path declines.
+    async fn try_ref_iri_group_by(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+    ) -> Option<Vec<(String, i64)>> {
         use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
         use crate::seed::EmptyOperator;
         use crate::var_registry::VarRegistry;
@@ -5781,8 +6516,8 @@ mod tests {
         }
         #[async_trait]
         impl R2rmlProvider for P {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -5827,7 +6562,7 @@ mod tests {
             aggregates: vec![(cnt, AggregateFn::CountAll)],
         };
         let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = P {
             m: mapping,
@@ -5836,6 +6571,9 @@ mod tests {
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
         op.open(&ctx).await.expect("open");
+        if op.use_fallback {
+            return None;
+        }
         // Drain ALL output batches: output-bounding emits a high-cardinality rollup in
         // bounded chunks across multiple next_batch calls, so a single-call consumer
         // would see only the first chunk. (This also exercises the multi-batch drain.)
@@ -5864,7 +6602,7 @@ mod tests {
             "the fused ref-IRI GROUP BY must produce output, not decline"
         );
         out.sort();
-        out
+        Some(out)
     }
 
     /// A `#Order --custRef(RefObjectMap CFK->CID)--> #Customer` mapping. The customer
@@ -5872,7 +6610,7 @@ mod tests {
     /// the join column (the keep-min case).
     fn order_customer_mapping(customer_subject_template: &str) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#Order", "order")
                 .with_subject_template("http://ex/order/{OID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -6005,7 +6743,7 @@ mod tests {
             vec![batch_of(vec![i64_col("CID", 1, vec![Some(10), Some(20)])])],
         );
         let provider = CrtProvider { mapping, batches };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -6021,36 +6759,99 @@ mod tests {
         );
     }
 
+    /// A fold's row-validity columns hold the subject template's columns,
+    /// read from the template itself: a map whose `template_columns` were never
+    /// filled (any construction but the loader's, a field set directly) still
+    /// drops a row whose key column is NULL, which mints no subject.
     #[tokio::test]
-    async fn ref_iri_group_key_keep_min_on_duplicate_parent_key() {
-        // Rider (b): a DUPLICATE parent join key with DISTINCT subjects. The customer
-        // subject is keyed on SID (not the join column CID), so join key 10 mints two
-        // subjects cust/b (row 0) and cust/a (row 1). The generic path
-        // (parent_key_insert_keep_min) keeps the lexicographically SMALLER — cust/a —
-        // so the fused fold must too (last-wins would pick cust/b). One order joins key
-        // 10 → exactly one group cust/a, count 1.
-        let mapping = order_customer_mapping("http://ex/cust/{SID}");
+    async fn validity_columns_come_from_the_subject_template() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::{ObjectMap, PredicateMap, PredicateObjectMap};
+        let (s_var, v_var, cnt) = (VarId(0), VarId(1), VarId(20));
+        let mut tm = TriplesMap::new("#T", "t").with_predicate_object(PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex/v"),
+            object_map: ObjectMap::column("V"),
+        });
+        tm.subject_map.template = Some("http://ex/t/{ID}".to_string());
+        assert!(tm.subject_map.template_columns.is_empty());
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![tm]));
+        let mut fact = R2rmlPattern::new("gs", s_var, Some(v_var));
+        fact.triples_map_iri = Some("#T".to_string());
+        fact.predicate_filter = Some("http://ex/v".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![],
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
         let mut batches = std::collections::HashMap::new();
         batches.insert(
-            "order".to_string(),
-            batch_of(vec![
-                i64_col("OID", 1, vec![Some(1)]),
-                i64_col("CFK", 2, vec![Some(10)]),
-            ]),
+            "t".to_string(),
+            vec![batch_of(vec![
+                i64_col("ID", 1, vec![Some(1), None]),
+                i64_col("V", 2, vec![Some(5), Some(6)]),
+            ])],
         );
-        batches.insert(
-            "customer".to_string(),
-            batch_of(vec![
-                i64_col("CID", 1, vec![Some(10), Some(10)]),
-                str_col("SID", 2, vec![Some("b".to_string()), Some("a".to_string())]),
-            ]),
+        let provider = CrtProvider { mapping, batches };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+        let resolved = op
+            .resolve_at_open(&ctx)
+            .await
+            .expect("resolve")
+            .expect("a COUNT over one column fuses");
+        assert!(
+            resolved.validity_cols.iter().any(|c| c == "ID"),
+            "the subject's key column must be a validity column: {:?}",
+            resolved.validity_cols
         );
-        let out = run_ref_iri_group_by(mapping, batches).await;
+    }
+
+    #[tokio::test]
+    async fn ref_iri_group_key_declines_a_key_minting_two_subjects() {
+        // #1583: the customer subject is keyed on SID (not the join column CID), so
+        // join key 10 can mint two subjects. Then the generic path joins the order to
+        // both, putting it in two groups, which the single-valued resolver cannot fold:
+        // the fused path declines, in either row order. A key whose rows all mint ONE
+        // subject (a history table's versions) still folds, one edge per order.
+        let mapping = order_customer_mapping("http://ex/cust/{SID}");
+        let batches = |sids: [&str; 2]| {
+            let mut batches = std::collections::HashMap::new();
+            batches.insert(
+                "order".to_string(),
+                batch_of(vec![
+                    i64_col("OID", 1, vec![Some(1)]),
+                    i64_col("CFK", 2, vec![Some(10)]),
+                ]),
+            );
+            batches.insert(
+                "customer".to_string(),
+                batch_of(vec![
+                    i64_col("CID", 1, vec![Some(10), Some(10)]),
+                    str_col("SID", 2, sids.iter().map(|s| Some(s.to_string())).collect()),
+                ]),
+            );
+            batches
+        };
+        for sids in [["b", "a"], ["a", "b"]] {
+            assert!(
+                try_ref_iri_group_by(Arc::clone(&mapping), batches(sids))
+                    .await
+                    .is_none(),
+                "a key minting two subjects must decline ({sids:?})"
+            );
+        }
         assert_eq!(
-            out,
+            run_ref_iri_group_by(mapping, batches(["a", "a"])).await,
             vec![("http://ex/cust/a".to_string(), 1)],
-            "keep-min must bind the lexicographically smaller parent subject (cust/a), \
-             byte-identical to build_parent_lookup"
+            "a key minting one subject twice folds to one edge"
         );
     }
 
@@ -6094,7 +6895,7 @@ mod tests {
         amt_dt: &str,
     ) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#Event", "event")
                 .with_subject_template("http://ex/event/{EID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -6157,6 +6958,16 @@ mod tests {
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
     ) -> Vec<(String, String, Binding)> {
+        try_s2_two_ref(mapping, batches)
+            .await
+            .expect("the two-ref-key fold must not decline")
+    }
+
+    /// [`run_s2_two_ref`], or `None` when the fused path declines.
+    async fn try_s2_two_ref(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, fluree_db_tabular::ColumnBatch>,
+    ) -> Option<Vec<(String, String, Binding)>> {
         use crate::r2rml::{ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanFilter};
         use crate::seed::EmptyOperator;
         use crate::var_registry::VarRegistry;
@@ -6170,8 +6981,8 @@ mod tests {
         }
         #[async_trait]
         impl R2rmlProvider for P {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -6205,7 +7016,7 @@ mod tests {
         let mut op =
             FusedR2rmlAggregateOperator::new(s2_two_ref_plan(), Box::new(EmptyOperator::new()));
         op.multifact_gen = true; // the ≥2-ref widening must admit
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = P {
             m: mapping,
@@ -6214,6 +7025,9 @@ mod tests {
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
         op.open(&ctx).await.expect("open");
+        if op.use_fallback {
+            return None;
+        }
         let mut out = Vec::new();
         while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
             let n = batch.column(c).map(<[Binding]>::len).unwrap_or(0);
@@ -6230,7 +7044,7 @@ mod tests {
             }
         }
         out.sort_by_key(|(c, p, _)| (c.clone(), p.clone()));
-        out
+        Some(out)
     }
 
     /// (S2-a) VALUE-IDENTITY: SUM(amount) grouped by TWO ref-IRI keys equals the generic
@@ -6360,48 +7174,59 @@ mod tests {
         );
     }
 
-    /// (S2-b) KEEP-MIN on the SECOND ref key (product): a duplicate product join key
-    /// PID=100 with DISTINCT subjects prod/b (row 0) and prod/a (row 1). The generic path
-    /// keeps the lexicographically smaller subject (prod/a), so the fused resolver must
-    /// too — the same keep-min P2a proved for one ref key, now at the 2nd resolver.
+    /// (S2-b) The SECOND ref key (product) declines like the first: a product join key
+    /// PID=100 minting two subjects (prod/b, prod/a) puts the event in two groups on
+    /// the generic path (#1583), so the fused resolver declines; PID=100 minting one
+    /// subject twice folds.
     #[tokio::test]
-    async fn s2_two_ref_iri_keep_min_on_second_ref() {
+    async fn s2_two_ref_iri_declines_a_second_ref_key_minting_two_subjects() {
         let mapping = event_cust_prod_mapping(
             "http://ex/cust/{CID}",
             "http://ex/prod/{PSID}",
             fluree_vocab::xsd::INTEGER,
         );
-        let mut batches = std::collections::HashMap::new();
-        batches.insert(
-            "event".to_string(),
-            batch_of(vec![
-                i64_col("EID", 1, vec![Some(1)]),
-                i64_col("CFK", 2, vec![Some(10)]),
-                i64_col("PFK", 3, vec![Some(100)]),
-                i64_col("AMT", 4, vec![Some(50)]),
-            ]),
+        let batches = |psids: [&str; 2]| {
+            let mut batches = std::collections::HashMap::new();
+            batches.insert(
+                "event".to_string(),
+                batch_of(vec![
+                    i64_col("EID", 1, vec![Some(1)]),
+                    i64_col("CFK", 2, vec![Some(10)]),
+                    i64_col("PFK", 3, vec![Some(100)]),
+                    i64_col("AMT", 4, vec![Some(50)]),
+                ]),
+            );
+            batches.insert(
+                "customer".to_string(),
+                batch_of(vec![i64_col("CID", 1, vec![Some(10)])]),
+            );
+            batches.insert(
+                "product".to_string(),
+                batch_of(vec![
+                    str_col(
+                        "PSID",
+                        1,
+                        psids.iter().map(|s| Some(s.to_string())).collect(),
+                    ),
+                    i64_col("PID", 2, vec![Some(100), Some(100)]),
+                ]),
+            );
+            batches
+        };
+        assert!(
+            try_s2_two_ref(Arc::clone(&mapping), batches(["b", "a"]))
+                .await
+                .is_none(),
+            "a 2nd ref key minting two subjects must decline"
         );
-        batches.insert(
-            "customer".to_string(),
-            batch_of(vec![i64_col("CID", 1, vec![Some(10)])]),
-        );
-        // PID=100 twice, subjects prod/b then prod/a → keep-min is prod/a.
-        batches.insert(
-            "product".to_string(),
-            batch_of(vec![
-                str_col("PSID", 1, vec![Some("b".into()), Some("a".into())]),
-                i64_col("PID", 2, vec![Some(100), Some(100)]),
-            ]),
-        );
-        let out = run_s2_two_ref(mapping, batches).await;
         assert_eq!(
-            out,
+            run_s2_two_ref(mapping, batches(["a", "a"])).await,
             vec![(
                 "http://ex/cust/10".into(),
                 "http://ex/prod/a".into(),
                 long_sum(50)
             )],
-            "the 2nd ref resolver must keep-min the product subject (prod/a), not last-wins prod/b"
+            "a 2nd ref key minting one subject twice folds"
         );
     }
 
@@ -6425,8 +7250,8 @@ mod tests {
         }
         #[async_trait]
         impl R2rmlProvider for P {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -6481,7 +7306,7 @@ mod tests {
             "http://ex/prod/{PID}",
             fluree_vocab::xsd::INTEGER,
         );
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let provider = P {
             m: Arc::clone(&mapping),
@@ -6602,7 +7427,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -6705,14 +7530,17 @@ mod tests {
             output: QueryOutput::select_all(vec![g, c]),
             patterns: vec![graph_triple(s, o)],
             reasoning: ReasoningConfig::default(),
-            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], None).expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6734,14 +7562,18 @@ mod tests {
             reasoning: ReasoningConfig::default(),
             // HAVING references the projected aggregate ?c (no synthetic extra) →
             // outs == projected → fused.
-            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c))),
+            grouping: Grouping::assemble(vec![g], vec![agg], vec![], Some(Expression::Var(c)))
+                .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_some());
     }
@@ -6771,14 +7603,18 @@ mod tests {
                 vec![agg, agg2],
                 vec![],
                 Some(Expression::Var(c2)),
-            ),
+            )
+            .expect("valid grouping"),
             ordering: Vec::new(),
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         assert!(detect_fused_r2rml_aggregate(&q).is_none());
     }
@@ -7011,6 +7847,8 @@ mod tests {
         };
         let ground = Column::String(vec![Some("Ground".into())]);
         let null_str = Column::String(vec![None]);
+        let ground = || Some(s_col.key_column_of(&ground));
+        let null_str = || Some(s_col.key_column_of(&null_str));
 
         // Resolver-0 probe slices (S2: `dim_probes` is one slice per resolver).
         let year: &[GKey] = &[GKey::Int(2024)];
@@ -7023,7 +7861,7 @@ mod tests {
 
         // plan [Fact(shipMethod), Dim{0,0}=year] → [Str, Int] in order.
         let gc = vec![s_col.clone(), i_col.clone()];
-        let kc = vec![Some(&ground), None];
+        let kc = vec![ground(), None];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact, dim0],
@@ -7036,7 +7874,7 @@ mod tests {
         );
         // Swapped order [Dim{0,0}=year, Fact(shipMethod)] → [Int, Str].
         let gc2 = vec![i_col.clone(), s_col.clone()];
-        let kc2 = vec![None, Some(&ground)];
+        let kc2 = vec![None, ground()];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[dim0, KeySource::Fact],
@@ -7048,7 +7886,7 @@ mod tests {
             Some(vec![GKey::Int(2024), GKey::Str("Ground".into())])
         );
         // Null FACT key position → drop.
-        let kc_null = vec![Some(&null_str), None];
+        let kc_null = vec![null_str(), None];
         assert_eq!(
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact, dim0],
@@ -7086,7 +7924,7 @@ mod tests {
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact],
                 std::slice::from_ref(&s_col),
-                &[Some(&ground)],
+                &[ground()],
                 &[],
                 0
             ),
@@ -7101,7 +7939,7 @@ mod tests {
             FusedR2rmlAggregateOperator::assemble_group_key(
                 &[KeySource::Fact],
                 std::slice::from_ref(&s_col),
-                &[Some(&ground)],
+                &[ground()],
                 &[empty_dim],
                 0
             ),
@@ -7125,28 +7963,19 @@ mod tests {
             precision: 38,
             scale: 0,
         };
-        assert_eq!(gc.key_at(Some(&scale0), 0), GKey::Int(2024));
-        assert_eq!(
-            gc.key_at(Some(&scale0), 1),
-            GKey::Null,
-            "null decimal → null key"
-        );
+        let key = |col: &Column, row: usize| gc.key_at(Some(&gc.key_column_of(col)), row);
+        assert_eq!(key(&scale0, 0), GKey::Int(2024));
+        assert_eq!(key(&scale0, 1), GKey::Null, "null decimal → null key");
         // Exact-integer decimal with a non-zero scale (202400 · 10^-2 = 2024).
         let scaled = Column::Decimal {
             values: vec![Some(202_400)],
             precision: 38,
             scale: 2,
         };
-        assert_eq!(gc.key_at(Some(&scaled), 0), GKey::Int(2024));
+        assert_eq!(key(&scaled, 0), GKey::Int(2024));
         // The native integer columns still read.
-        assert_eq!(
-            gc.key_at(Some(&Column::Int64(vec![Some(7)])), 0),
-            GKey::Int(7)
-        );
-        assert_eq!(
-            gc.key_at(Some(&Column::Int32(vec![Some(3)])), 0),
-            GKey::Int(3)
-        );
+        assert_eq!(key(&Column::Int64(vec![Some(7)]), 0), GKey::Int(7));
+        assert_eq!(key(&Column::Int32(vec![Some(3)]), 0), GKey::Int(3));
     }
 
     #[test]
@@ -7167,37 +7996,192 @@ mod tests {
                 output: QueryOutput::select_all(vec![out]),
                 patterns: vec![graph_triple(s, o)],
                 reasoning: ReasoningConfig::default(),
-                grouping: Grouping::assemble(vec![], vec![agg], vec![], None),
+                grouping: Grouping::assemble(vec![], vec![agg], vec![], None)
+                    .expect("valid grouping"),
                 ordering: Vec::new(),
                 order_binds: Vec::new(),
                 limit: None,
                 offset: None,
                 post_values: None,
                 include_system_facts: false,
+                union_default_graph: None,
                 cypher_vocab: None,
+                unmatched_optional: Default::default(),
+                rdf_list_view: false,
             };
             assert!(detect_fused_r2rml_aggregate(&q).is_some());
         }
     }
 
     #[test]
-    fn accumulate_double_row_drops_nan() {
-        // A NaN must be dropped (not summed, not counted), matching the standard
-        // aggregate pipeline — else SUM/AVG poison to NaN and the count inflates.
+    fn accumulate_double_row_sums_nan_and_infinities() {
+        // SUM is op:numeric-add (SPARQL 1.1 §18.5.1.3): a NaN member makes the
+        // sum NaN and is counted, as in the standard aggregate pipeline.
         let col = Column::Float64(vec![Some(1.0), Some(f64::NAN), Some(3.0)]);
         let (mut sum, mut count) = (0.0f64, 0u64);
         for row in 0..3 {
-            accumulate_double_row(&col, row, &mut sum, &mut count);
+            assert!(accumulate_double_row(&col, row, &mut sum, &mut count));
         }
-        assert_eq!(count, 2, "NaN row is not counted");
-        assert_eq!(sum, 4.0, "NaN does not poison the sum");
+        assert_eq!(count, 3, "the NaN row is counted");
+        assert!(sum.is_nan(), "NaN propagates through the sum");
 
         let col32 = Column::Float32(vec![Some(2.0f32), Some(f32::NAN)]);
         let (mut sum, mut count) = (0.0f64, 0u64);
-        accumulate_double_row(&col32, 0, &mut sum, &mut count);
-        accumulate_double_row(&col32, 1, &mut sum, &mut count);
-        assert_eq!(count, 1);
-        assert_eq!(sum, 2.0);
+        assert!(accumulate_double_row(&col32, 0, &mut sum, &mut count));
+        assert!(accumulate_double_row(&col32, 1, &mut sum, &mut count));
+        assert_eq!(count, 2);
+        assert!(sum.is_nan());
+
+        // INF + finite = INF; INF + -INF = NaN.
+        let inf = Column::Float64(vec![
+            Some(f64::INFINITY),
+            Some(2.0),
+            Some(f64::NEG_INFINITY),
+        ]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        assert!(accumulate_double_row(&inf, 0, &mut sum, &mut count));
+        assert!(accumulate_double_row(&inf, 1, &mut sum, &mut count));
+        assert_eq!(sum, f64::INFINITY);
+        assert!(accumulate_double_row(&inf, 2, &mut sum, &mut count));
+        assert!(sum.is_nan());
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn text_typed_numeric_columns_fold_like_the_generic_path() {
+        // A `NUMERIC` column a SQLite bridge reports as varchar: the generic
+        // path parses each value, so the fold must sum the text (it used to
+        // skip such rows and report 0 with a count of 0).
+        let col = Column::String(vec![
+            Some("99.50".into()),
+            None,
+            Some("5".into()),
+            Some("2.125".into()),
+        ]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..4 {
+            assert!(accumulate_exact_row(
+                &col, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 3);
+        assert_eq!(
+            (sum, scale),
+            (106_625, 3),
+            "99.50 + 5 + 2.125 at the widest scale"
+        );
+
+        // A physical double under an exact datatype (SQLite NUMERIC behind
+        // the bridge) converts too.
+        let dbl = Column::Float64(vec![Some(99.5), None, Some(5.0)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..3 {
+            assert!(accumulate_exact_row(
+                &dbl, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 2);
+        assert_eq!((sum, scale), (1045, 1));
+
+        let (mut dsum, mut dcount) = (0.0f64, 0u64);
+        for row in 0..4 {
+            assert!(accumulate_double_row(&col, row, &mut dsum, &mut dcount));
+        }
+        assert_eq!(dcount, 3);
+        assert_eq!(dsum, 106.625);
+    }
+
+    /// A text cell under a double datatype is read with the XSD lexical
+    /// parser, as the generic path reads it. Any other text sends the query
+    /// to the generic pipeline rather than being read the Rust way or skipped.
+    #[test]
+    fn double_text_cells_read_as_xsd_or_escalate() {
+        let col = Column::String(vec![
+            Some("INF".into()),
+            Some("-1.5E0".into()),
+            Some("inf".into()),
+            None,
+            Some("Infinity".into()),
+            Some("nan".into()),
+            Some(" 2.5".into()),
+            Some("abc".into()),
+        ]);
+        let (mut sum, mut count) = (0.0f64, 0u64);
+        assert!(accumulate_double_row(&col, 0, &mut sum, &mut count));
+        assert!(accumulate_double_row(&col, 1, &mut sum, &mut count));
+        assert_eq!((sum, count), (f64::INFINITY, 2));
+        // The text earlier imports stored for INF.
+        assert!(accumulate_double_row(&col, 2, &mut sum, &mut count));
+        assert!(accumulate_double_row(&col, 3, &mut sum, &mut count), "null");
+        assert_eq!((sum, count), (f64::INFINITY, 3));
+        for row in 4..8 {
+            assert!(
+                !accumulate_double_row(&col, row, &mut sum, &mut count),
+                "row {row} escalates"
+            );
+        }
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn float_columns_fold_on_the_generic_lane_lexical() {
+        // Money-shaped doubles are not dyadic, so their exact binary expansion
+        // runs to scale 48 (f64) / 19 (f32). Folding that expansion would bail
+        // the f64 fast path on the first row and make the f32 one disagree with
+        // the generic lane; both must fold the `to_string()` lexical the
+        // generic lane materializes and parses.
+        let dbl = Column::Float64(vec![Some(19.99), None, Some(5.0)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..3 {
+            assert!(
+                accumulate_exact_row(&dbl, row, &mut sum, &mut scale, &mut count),
+                "a non-dyadic double must fold, not escalate"
+            );
+        }
+        assert_eq!(count, 2);
+        assert_eq!((sum, scale), (2499, 2), "19.99 + 5 at the widest scale");
+
+        let flt = Column::Float32(vec![Some(19.99f32), Some(5.0f32)]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        for row in 0..2 {
+            assert!(accumulate_exact_row(
+                &flt, row, &mut sum, &mut scale, &mut count
+            ));
+        }
+        assert_eq!(count, 2);
+        assert_eq!(
+            (sum, scale),
+            (2499, 2),
+            "f32 must give the generic lane's 24.99, not 24.9899997711181640625"
+        );
+    }
+
+    #[test]
+    fn unconvertible_exact_cells_escalate_rather_than_omit() {
+        // The generic lane materializes these under the exact datatype,
+        // `binding_to_numeric` fails, and SUM/AVG poison the group to unbound
+        // (SPARQL 18.5.1, agg-err-01). The fold cannot silently sum the rest:
+        // `false` hands the query to the exact pipeline, which poisons.
+        for col in [
+            Column::String(vec![Some("abc".into())]),
+            Column::Float64(vec![Some(f64::NAN)]),
+            Column::Float64(vec![Some(f64::INFINITY)]),
+            Column::Float32(vec![Some(f32::NAN)]),
+        ] {
+            let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+            assert!(
+                !accumulate_exact_row(&col, 0, &mut sum, &mut scale, &mut count),
+                "an unconvertible cell must escalate, not be omitted"
+            );
+        }
+
+        // A null is still a legitimate drop, not an escalation.
+        let nulls = Column::String(vec![None]);
+        let (mut sum, mut scale, mut count) = (0i128, 0i64, 0u64);
+        assert!(accumulate_exact_row(
+            &nulls, 0, &mut sum, &mut scale, &mut count
+        ));
+        assert_eq!(count, 0);
     }
 
     #[test]
@@ -7289,7 +8273,7 @@ mod tests {
     fn crt_mapping(qty_dt: &str) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
         use fluree_vocab::xsd;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#OrderLine", "order_line")
                 .with_subject_template("http://ex/ol/{OLID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -7416,8 +8400,8 @@ mod tests {
     }
     #[async_trait]
     impl crate::r2rml::R2rmlProvider for CrtProvider {
-        async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-            true
+        async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+            Ok(true)
         }
         async fn compiled_mapping(
             &self,
@@ -7477,6 +8461,16 @@ mod tests {
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
     ) -> Vec<(String, Binding)> {
+        try_crt(mapping, batches)
+            .await
+            .expect("crt_join_reorder must FUSE (not decline)")
+    }
+
+    /// [`run_crt`], or `None` when the branching-star path declines.
+    async fn try_crt(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+    ) -> Option<Vec<(String, Binding)>> {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
         let pats = crt_patterns();
@@ -7485,7 +8479,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -7495,8 +8489,7 @@ mod tests {
         let resolved = op
             .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
             .await
-            .expect("resolve must not error")
-            .expect("crt_join_reorder must FUSE (not decline)");
+            .expect("resolve must not error")?;
         op.resolved = Some(resolved);
         let (cat, u) = (VarId(12), VarId(20));
         // Drain all output batches (output-bounding may chunk the rollup).
@@ -7515,7 +8508,7 @@ mod tests {
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        Some(out)
     }
 
     fn long_sum(n: i64) -> Binding {
@@ -7631,7 +8624,7 @@ mod tests {
                 object_map: ObjectMap::column("REGION"),
             });
         let mapping = CompiledR2rmlMapping::new(vec![customer]);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let (c, r) = (VarId(3), VarId(30));
         let seg_const = Pattern::Triple(TriplePattern::new(
             Ref::Var(c),
@@ -7648,6 +8641,7 @@ mod tests {
             "gs:main",
             &snapshot,
             Some(&mapping),
+            &crate::r2rml::set_semantics::TableKeyEvidence::assume_keyed_by_subjects(&mapping),
             false,
             false,
         )
@@ -7695,7 +8689,7 @@ mod tests {
         let (ol, o, p, c) = (VarId(0), VarId(1), VarId(2), VarId(3));
         let (qty, cat, r) = (VarId(10), VarId(12), VarId(30));
         let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let t = |s: VarId, pred: &str, obj: Term| {
             Pattern::Triple(TriplePattern::new(
                 Ref::Var(s),
@@ -7723,14 +8717,22 @@ mod tests {
         if with_region {
             bgp.push(t(c, "http://ex/region", Term::Var(r)));
         }
-        rewrite_patterns_for_r2rml(&bgp, "gs:main", &snapshot, Some(&mapping), false, false)
-            .patterns
-            .into_iter()
-            .filter_map(|p| match p {
-                Pattern::R2rml(rp) => Some(rp),
-                _ => None,
-            })
-            .collect()
+        rewrite_patterns_for_r2rml(
+            &bgp,
+            "gs:main",
+            &snapshot,
+            Some(&mapping),
+            &crate::r2rml::set_semantics::TableKeyEvidence::assume_keyed_by_subjects(&mapping),
+            false,
+            false,
+        )
+        .patterns
+        .into_iter()
+        .filter_map(|p| match p {
+            Pattern::R2rml(rp) => Some(rp),
+            _ => None,
+        })
+        .collect()
     }
 
     /// OVER-DECLINE GUARD (id=3717398030 refix): the rewrite folds a SOLE FK member into
@@ -7758,7 +8760,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches: clean_batches(),
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -7802,7 +8804,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches: clean_batches(),
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -7856,7 +8858,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -7871,6 +8873,265 @@ mod tests {
             resolved.is_none(),
             "a same-key/same-subject SCD-2 collision with differing constraint results \
              must DECLINE (keep-min would let scan order decide the answer)"
+        );
+    }
+
+    /// The semi-join build reads each level in no particular order, so whether it
+    /// declines must not depend on the order a level's rows arrive in. `ORDER_KEY` 10
+    /// is held by three `order_t` rows: `order/o10` (customer 1000, Enterprise) and two
+    /// rows minting a second subject that disagree on the customer (1000 vs 1002). A
+    /// key minting two subjects joins a fact row to each (#1583), which a membership
+    /// set cannot count, so the fuse declines to the generic path in every arrival
+    /// order, whichever subject sorts first (`o50` after `o10`, `o05` before it), and
+    /// so it does when the second subject's rows agree with `o10`'s on everything
+    /// else. Only rows all alike, as in the clean fixture, fuse.
+    #[tokio::test]
+    async fn p3_semijoin_decline_does_not_depend_on_row_order() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        fn order_t(rows: &[(&str, i64, i64)]) -> ColumnBatch {
+            mk_batch(vec![
+                scol("OID", 1, rows.iter().map(|r| r.0).collect()),
+                icol("ORDER_KEY", 2, rows.iter().map(|r| Some(r.1)).collect()),
+                icol("CUSTOMER_KEY", 3, rows.iter().map(|r| Some(r.2)).collect()),
+            ])
+        }
+        async fn fuses(batches: std::collections::HashMap<String, Vec<ColumnBatch>>) -> bool {
+            let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+            let pats = crt_patterns();
+            let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+            let provider = CrtProvider {
+                mapping: Arc::clone(&mapping),
+                batches,
+            };
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let ctx =
+                ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
+            let star =
+                FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+                    .expect("crt_join_reorder must decompose");
+            crt_op()
+                .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+                .await
+                .expect("resolve must not error")
+                .is_some()
+        }
+        let others = [("o11", 11, 1000), ("o12", 12, 1001), ("o13", 13, 1002)];
+        let orders_of = |key10: [(&'static str, i64, i64); 3]| {
+            let mut runs = Vec::new();
+            for perm in [
+                [0, 1, 2],
+                [0, 2, 1],
+                [1, 0, 2],
+                [1, 2, 0],
+                [2, 0, 1],
+                [2, 1, 0],
+            ] {
+                let rows: Vec<(&str, i64, i64)> = perm
+                    .iter()
+                    .map(|&i| key10[i])
+                    .chain(others.iter().copied())
+                    .collect();
+                runs.push(vec![order_t(&rows)]);
+                runs.push(rows.iter().map(|r| order_t(&[*r])).collect());
+            }
+            runs
+        };
+
+        for (label, key10) in [
+            (
+                "second subject after o10",
+                [("o50", 10, 1000), ("o50", 10, 1002), ("o10", 10, 1000)],
+            ),
+            (
+                "second subject before o10",
+                [("o05", 10, 1000), ("o05", 10, 1002), ("o10", 10, 1000)],
+            ),
+            (
+                "second subject agreeing on the customer",
+                [("o50", 10, 1000), ("o50", 10, 1000), ("o10", 10, 1000)],
+            ),
+        ] {
+            for order_batches in orders_of(key10) {
+                let mut batches = clean_batches();
+                batches.insert("order_t".to_string(), order_batches);
+                assert!(
+                    !fuses(batches).await,
+                    "{label}: a key minting two subjects declines in every order"
+                );
+            }
+        }
+        // The same three rows, all alike, fuse in every order.
+        for order_batches in orders_of([("o10", 10, 1000), ("o10", 10, 1000), ("o10", 10, 1000)]) {
+            let mut batches = clean_batches();
+            batches.insert("order_t".to_string(), order_batches);
+            assert!(fuses(batches).await, "identical rows are one row");
+        }
+    }
+
+    /// A dimension or semi-join level read folds into a map or set whose contents do
+    /// not depend on read order, so it asks for no order; the fact scan keeps the
+    /// order the operator owes. Covers the semi-join levels (`customer`, `order_t`),
+    /// the group-key terminal dimension (`product`) and a single-table ref group key's
+    /// parent (`customer` under `order_customer_mapping`).
+    #[tokio::test]
+    async fn dimension_reads_ask_for_no_order() {
+        use crate::r2rml::ScanOrder;
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+
+        #[derive(Debug)]
+        struct Recorder<'p> {
+            inner: &'p CrtProvider,
+            reads: std::sync::Mutex<Vec<(String, Option<ScanOrder>)>>,
+        }
+        #[async_trait]
+        impl crate::r2rml::R2rmlProvider for Recorder<'_> {
+            async fn has_r2rml_mapping(&self, gs: &str) -> crate::error::Result<bool> {
+                self.inner.has_r2rml_mapping(gs).await
+            }
+            async fn compiled_mapping(
+                &self,
+                gs: &str,
+                t: Option<i64>,
+            ) -> Result<Arc<CompiledR2rmlMapping>> {
+                self.inner.compiled_mapping(gs, t).await
+            }
+        }
+        #[async_trait]
+        impl crate::r2rml::R2rmlTableProvider for Recorder<'_> {
+            async fn scan_table(
+                &self,
+                gs: &str,
+                table: &str,
+                p: &[String],
+                f: &[crate::r2rml::ScanFilter],
+                tk: Option<&crate::r2rml::ScanTopK>,
+                t: Option<i64>,
+            ) -> Result<crate::r2rml::ColumnBatchStream> {
+                self.reads.lock().unwrap().push((table.to_string(), None));
+                self.inner.scan_table(gs, table, p, f, tk, t).await
+            }
+            async fn scan_table_ordered(
+                &self,
+                gs: &str,
+                table: &str,
+                p: &[String],
+                f: &[crate::r2rml::ScanFilter],
+                tk: Option<&crate::r2rml::ScanTopK>,
+                t: Option<i64>,
+                order: ScanOrder,
+            ) -> Result<crate::r2rml::ColumnBatchStream> {
+                self.reads
+                    .lock()
+                    .unwrap()
+                    .push((table.to_string(), Some(order)));
+                self.inner.scan_table(gs, table, p, f, tk, t).await
+            }
+        }
+        fn orders_of(reads: &[(String, Option<ScanOrder>)], table: &str) -> Vec<Option<ScanOrder>> {
+            reads
+                .iter()
+                .filter(|(t, _)| t == table)
+                .map(|(_, o)| *o)
+                .collect()
+        }
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+
+        // The branching star: semi-join levels and the group-key dimension.
+        let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
+        let inner = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches: clean_batches(),
+        };
+        let recorder = Recorder {
+            inner: &inner,
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&recorder, &recorder);
+        let pats = crt_patterns();
+        let refs: Vec<&R2rmlPattern> = pats.iter().collect();
+        let star = FusedR2rmlAggregateOperator::decompose_branching_star(&refs, &[VarId(12)], true)
+            .expect("crt_join_reorder must decompose");
+        let mut op = crt_op();
+        op.resolved = Some(
+            op.resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
+                .await
+                .expect("resolve must not error")
+                .expect("crt_join_reorder must fuse"),
+        );
+        while op.next_batch(&ctx).await.expect("next_batch").is_some() {}
+        let reads = recorder.reads.lock().unwrap().clone();
+        for table in ["customer", "order_t", "product"] {
+            assert_eq!(
+                orders_of(&reads, table),
+                vec![Some(ScanOrder::Any)],
+                "{table}: {reads:?}"
+            );
+        }
+        assert_eq!(
+            orders_of(&reads, "order_line"),
+            vec![Some(ScanOrder::Deterministic)],
+            "the fact scan keeps its order: {reads:?}"
+        );
+
+        // A single-table GROUP BY on a reference: its parent's FK -> IRI map.
+        let mapping = order_customer_mapping("http://ex/cust/{CID}");
+        let mut batches = std::collections::HashMap::new();
+        batches.insert(
+            "order".to_string(),
+            vec![mk_batch(vec![
+                icol("OID", 1, vec![Some(1), Some(2), Some(3)]),
+                icol("CFK", 2, vec![Some(7), Some(8), Some(7)]),
+            ])],
+        );
+        batches.insert(
+            "customer".to_string(),
+            vec![mk_batch(vec![icol("CID", 1, vec![Some(7), Some(8)])])],
+        );
+        let inner = CrtProvider {
+            mapping: Arc::clone(&mapping),
+            batches,
+        };
+        let recorder = Recorder {
+            inner: &inner,
+            reads: std::sync::Mutex::new(Vec::new()),
+        };
+        let ctx =
+            ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&recorder, &recorder);
+        let (o, c, cnt) = (VarId(0), VarId(1), VarId(20));
+        let mut fact = R2rmlPattern::new("gs", o, Some(c));
+        fact.triples_map_iri = Some("#Order".to_string());
+        fact.predicate_filter = Some("http://ex/custRef".to_string());
+        let plan = FusedAggregatePlan {
+            graph_iri: Arc::from("gs"),
+            inner_patterns: vec![Pattern::R2rml(fact)],
+            filter: None,
+            agg_binds: vec![],
+            group_by: vec![c],
+            aggregates: vec![(cnt, AggregateFn::CountAll)],
+        };
+        let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+        op.open(&ctx).await.expect("open");
+        let mut groups = 0;
+        while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+            groups += batch.column(c).map(<[Binding]>::len).unwrap_or(0);
+        }
+        assert_eq!(groups, 2, "one group per customer");
+        let reads = recorder.reads.lock().unwrap().clone();
+        assert_eq!(
+            orders_of(&reads, "customer"),
+            vec![Some(ScanOrder::Any)],
+            "the reference's parent: {reads:?}"
+        );
+        assert_eq!(
+            orders_of(&reads, "order"),
+            vec![Some(ScanOrder::Deterministic)],
+            "the fact scan keeps its order: {reads:?}"
         );
     }
 
@@ -7977,7 +9238,7 @@ mod tests {
             };
             FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()))
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // ON: multiple bounded chunks, each ≤ the bound, union == full result.
@@ -8033,103 +9294,75 @@ mod tests {
         );
     }
 
-    /// (b) KEEP-MIN-THEN-FILTER DISCRIMINATOR: a duplicate ORDER_KEY where the keep-min
-    /// Order row (smaller subject) points at a NON-Enterprise customer and the
-    /// DISCARDED duplicate points at an Enterprise customer. The generic join resolves
-    /// the FK to the keep-min parent subject and tests THAT row, so the order line
-    /// DROPS. A naive filter-then-union membership set (admit the key because SOME
-    /// duplicate matches) would WRONGLY include it — this fixture is built so that
-    /// bug would produce Widgets=50 instead of the correct empty result.
+    /// (b) A semi-join key minting two subjects declines: ORDER_KEY=1 on two Order rows
+    /// with distinct subjects joins the order line to both on the generic path (#1583),
+    /// and a membership set counts the line once whatever the subjects' constraints say,
+    /// so the fold declines. Both subjects on the Enterprise customer is the case only
+    /// the subject check catches (the generic answer is Widgets=100, a set's 50); the
+    /// others differ in the next hop too. A key minting ONE subject on identical rows
+    /// folds.
     #[tokio::test]
-    async fn p3_crt_join_reorder_keep_min_then_filter_excludes() {
-        let mut m = std::collections::HashMap::new();
-        m.insert(
-            "order_line".to_string(),
-            vec![mk_batch(vec![
-                icol("OLID", 1, vec![Some(1)]),
-                icol("ORDER_KEY", 2, vec![Some(1)]),
-                icol("PRODUCT_KEY", 3, vec![Some(100)]),
-                icol("QTY", 4, vec![Some(50)]),
-            ])],
-        );
-        // Two Order rows, SAME ORDER_KEY=1, distinct subjects: order/a (keep-min) →
-        // customer 200 (SMB); order/b (discarded) → customer 100 (Enterprise).
-        m.insert(
-            "order_t".to_string(),
-            vec![mk_batch(vec![
-                scol("OID", 1, vec!["a", "b"]),
-                icol("ORDER_KEY", 2, vec![Some(1), Some(1)]),
-                icol("CUSTOMER_KEY", 3, vec![Some(200), Some(100)]),
-            ])],
-        );
-        m.insert(
-            "customer".to_string(),
-            vec![mk_batch(vec![
-                icol("CUSTOMER_KEY", 1, vec![Some(100), Some(200)]),
-                scol("SEGMENT", 2, vec!["Enterprise", "SMB"]),
-            ])],
-        );
-        m.insert(
-            "product".to_string(),
-            vec![mk_batch(vec![
-                icol("PRODUCT_KEY", 1, vec![Some(100)]),
-                scol("CATEGORY", 2, vec!["Widgets"]),
-                bcol("IS_CURRENT", 3, vec![Some(true)]),
-            ])],
-        );
-        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m).await;
-        assert!(
-            out.is_empty(),
-            "keep-min Order row is SMB → the line drops; filter-then-union would wrongly \
-             admit it (Widgets=50). Got {out:?}"
-        );
-    }
-
-    /// (b-control) The SAME duplicate-key fixture with the subjects SWAPPED so the
-    /// keep-min row is now the Enterprise one — the order line must be INCLUDED. The
-    /// contrast with the test above proves the keep-min tie-break (not "any duplicate
-    /// matches") decides membership.
-    #[tokio::test]
-    async fn p3_crt_join_reorder_keep_min_control_includes() {
-        let mut m = std::collections::HashMap::new();
-        m.insert(
-            "order_line".to_string(),
-            vec![mk_batch(vec![
-                icol("OLID", 1, vec![Some(1)]),
-                icol("ORDER_KEY", 2, vec![Some(1)]),
-                icol("PRODUCT_KEY", 3, vec![Some(100)]),
-                icol("QTY", 4, vec![Some(50)]),
-            ])],
-        );
-        // order/a (keep-min) → customer 100 (Enterprise); order/b (discarded) → 200 (SMB).
-        m.insert(
-            "order_t".to_string(),
-            vec![mk_batch(vec![
-                scol("OID", 1, vec!["a", "b"]),
-                icol("ORDER_KEY", 2, vec![Some(1), Some(1)]),
-                icol("CUSTOMER_KEY", 3, vec![Some(100), Some(200)]),
-            ])],
-        );
-        m.insert(
-            "customer".to_string(),
-            vec![mk_batch(vec![
-                icol("CUSTOMER_KEY", 1, vec![Some(100), Some(200)]),
-                scol("SEGMENT", 2, vec!["Enterprise", "SMB"]),
-            ])],
-        );
-        m.insert(
-            "product".to_string(),
-            vec![mk_batch(vec![
-                icol("PRODUCT_KEY", 1, vec![Some(100)]),
-                scol("CATEGORY", 2, vec!["Widgets"]),
-                bcol("IS_CURRENT", 3, vec![Some(true)]),
-            ])],
-        );
-        let out = run_crt(crt_mapping(fluree_vocab::xsd::INTEGER), m).await;
+    async fn p3_crt_join_reorder_declines_a_semi_join_key_minting_two_subjects() {
+        let batches = |oids: [&str; 2], customers: [i64; 2]| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "order_line".to_string(),
+                vec![mk_batch(vec![
+                    icol("OLID", 1, vec![Some(1)]),
+                    icol("ORDER_KEY", 2, vec![Some(1)]),
+                    icol("PRODUCT_KEY", 3, vec![Some(100)]),
+                    icol("QTY", 4, vec![Some(50)]),
+                ])],
+            );
+            m.insert(
+                "order_t".to_string(),
+                vec![mk_batch(vec![
+                    scol("OID", 1, oids.to_vec()),
+                    icol("ORDER_KEY", 2, vec![Some(1), Some(1)]),
+                    icol(
+                        "CUSTOMER_KEY",
+                        3,
+                        customers.iter().map(|c| Some(*c)).collect(),
+                    ),
+                ])],
+            );
+            m.insert(
+                "customer".to_string(),
+                vec![mk_batch(vec![
+                    icol("CUSTOMER_KEY", 1, vec![Some(100), Some(200)]),
+                    scol("SEGMENT", 2, vec!["Enterprise", "SMB"]),
+                ])],
+            );
+            m.insert(
+                "product".to_string(),
+                vec![mk_batch(vec![
+                    icol("PRODUCT_KEY", 1, vec![Some(100)]),
+                    scol("CATEGORY", 2, vec!["Widgets"]),
+                    bcol("IS_CURRENT", 3, vec![Some(true)]),
+                ])],
+            );
+            m
+        };
+        for customers in [[100, 100], [200, 100], [100, 200]] {
+            assert!(
+                try_crt(
+                    crt_mapping(fluree_vocab::xsd::INTEGER),
+                    batches(["a", "b"], customers)
+                )
+                .await
+                .is_none(),
+                "a semi-join key minting two subjects must decline ({customers:?})"
+            );
+        }
+        let out = run_crt(
+            crt_mapping(fluree_vocab::xsd::INTEGER),
+            batches(["a", "a"], [100, 100]),
+        )
+        .await;
         assert_eq!(
             out,
             vec![("Widgets".to_string(), long_sum(50))],
-            "keep-min Order row is Enterprise → the line is included"
+            "a key minting one Enterprise subject on identical rows folds"
         );
     }
 
@@ -8164,7 +9397,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches: m,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let cancel = QueryCancellation::new();
         cancel.set_memory_limit(64); // < GROUP_EST_BYTES → the first batch's charge trips
@@ -8196,7 +9429,7 @@ mod tests {
         let mapping = crt_mapping(fluree_vocab::xsd::INTEGER);
         let pats = crt_patterns();
         let refs: Vec<&R2rmlPattern> = pats.iter().collect();
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
 
         // OFF → decline (Ok(None)).
@@ -8255,7 +9488,7 @@ mod tests {
     fn s1_mapping(qty_dt: &str) -> Arc<CompiledR2rmlMapping> {
         use fluree_db_r2rml::mapping::PredicateMap;
         use fluree_vocab::xsd;
-        Arc::new(CompiledR2rmlMapping::new(vec![
+        Arc::new(crate::r2rml::set_semantics::keyed_by_subjects(vec![
             TriplesMap::new("#Ticket", "ticket")
                 .with_subject_template("http://ex/t/{TID}")
                 .with_predicate_object(PredicateObjectMap {
@@ -8483,6 +9716,16 @@ mod tests {
         mapping: Arc<CompiledR2rmlMapping>,
         batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
     ) -> Vec<(String, Binding)> {
+        try_s1(mapping, batches)
+            .await
+            .expect("S1 K=2 shape must FUSE (not decline)")
+    }
+
+    /// [`run_s1`], or `None` when the branching-star path declines.
+    async fn try_s1(
+        mapping: Arc<CompiledR2rmlMapping>,
+        batches: std::collections::HashMap<String, Vec<ColumnBatch>>,
+    ) -> Option<Vec<(String, Binding)>> {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::LedgerSnapshot;
         let pats = s1_patterns();
@@ -8493,7 +9736,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -8501,8 +9744,7 @@ mod tests {
         let resolved = op
             .resolve_branching_star_at_open(&ctx, mapping.as_ref(), star)
             .await
-            .expect("resolve must not error")
-            .expect("S1 K=2 shape must FUSE (not decline)");
+            .expect("resolve must not error")?;
         op.resolved = Some(resolved);
         let (cat, u) = (VarId(12), VarId(20));
         let mut out = Vec::new();
@@ -8520,7 +9762,7 @@ mod tests {
             }
         }
         out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        Some(out)
     }
 
     /// Clean (unique-key) S1 fixture. Six tickets; the answer keeps only rows passing
@@ -8729,102 +9971,74 @@ mod tests {
         );
     }
 
-    /// (S1-b) KEEP-MIN-THEN-FILTER at the NEW (2nd) semi-join site (the agent branch):
-    /// two Employee rows share EMPLOYEE_KEY=500 with distinct subjects. Keep-min subject
-    /// `emp/a` is department "Sales" (fails); the discarded dup `emp/b` is "Support"
-    /// (passes). The ticket must DROP — filter-then-union would wrongly admit it. Guards
-    /// the discarded-dup soundness line at the branch S1 adds, not just #1582's site.
+    /// (S1-b) The NEW (2nd) semi-join site (the agent branch) declines like the first:
+    /// two Employee rows share EMPLOYEE_KEY=500 with distinct subjects (emp/a, emp/b),
+    /// so the generic path joins the ticket to both (#1583) and the membership set
+    /// cannot count it; the fold declines. Both subjects in Support is the case only
+    /// the subject check catches. A key minting one subject on identical rows folds.
     #[tokio::test]
-    async fn s1_keep_min_then_filter_excludes_on_agent_branch() {
-        let mut m = std::collections::HashMap::new();
-        m.insert(
-            "ticket".to_string(),
-            vec![mk_batch(vec![
-                icol("TID", 1, vec![Some(1)]),
-                icol("PRODUCT_KEY", 2, vec![Some(100)]),
-                icol("CUSTOMER_KEY", 3, vec![Some(1000)]),
-                icol("AGENT_KEY", 4, vec![Some(500)]),
-                icol("QTY", 5, vec![Some(50)]),
-            ])],
-        );
-        m.insert(
-            "product".to_string(),
-            vec![mk_batch(vec![
-                icol("PRODUCT_KEY", 1, vec![Some(100)]),
-                scol("CATEGORY", 2, vec!["Widgets"]),
-                bcol("IS_CURRENT", 3, vec![Some(true)]),
-            ])],
-        );
-        m.insert(
-            "customer".to_string(),
-            vec![mk_batch(vec![
-                icol("CUSTOMER_KEY", 1, vec![Some(1000)]),
-                scol("SEGMENT", 2, vec!["Enterprise"]),
-            ])],
-        );
-        // Same EMPLOYEE_KEY=500, distinct subjects: emp/a (keep-min) → Sales; emp/b → Support.
-        m.insert(
-            "employee".to_string(),
-            vec![mk_batch(vec![
-                scol("AID", 1, vec!["a", "b"]),
-                icol("EMPLOYEE_KEY", 2, vec![Some(500), Some(500)]),
-                scol("DEPARTMENT", 3, vec!["Sales", "Support"]),
-            ])],
-        );
-        let out = run_s1(s1_mapping(fluree_vocab::xsd::INTEGER), m).await;
-        assert!(
-            out.is_empty(),
-            "keep-min agent row is Sales → the ticket drops; filter-then-union would wrongly \
-             admit it (Widgets=50). Got {out:?}"
-        );
-    }
-
-    /// (S1-b-control) The SAME agent duplicate-key fixture with departments SWAPPED so
-    /// the keep-min row is now "Support" — the ticket must be INCLUDED. The contrast with
-    /// the test above proves keep-min (not "any duplicate matches") decides membership at
-    /// the S1 site.
-    #[tokio::test]
-    async fn s1_keep_min_control_includes_on_agent_branch() {
-        let mut m = std::collections::HashMap::new();
-        m.insert(
-            "ticket".to_string(),
-            vec![mk_batch(vec![
-                icol("TID", 1, vec![Some(1)]),
-                icol("PRODUCT_KEY", 2, vec![Some(100)]),
-                icol("CUSTOMER_KEY", 3, vec![Some(1000)]),
-                icol("AGENT_KEY", 4, vec![Some(500)]),
-                icol("QTY", 5, vec![Some(50)]),
-            ])],
-        );
-        m.insert(
-            "product".to_string(),
-            vec![mk_batch(vec![
-                icol("PRODUCT_KEY", 1, vec![Some(100)]),
-                scol("CATEGORY", 2, vec!["Widgets"]),
-                bcol("IS_CURRENT", 3, vec![Some(true)]),
-            ])],
-        );
-        m.insert(
-            "customer".to_string(),
-            vec![mk_batch(vec![
-                icol("CUSTOMER_KEY", 1, vec![Some(1000)]),
-                scol("SEGMENT", 2, vec!["Enterprise"]),
-            ])],
-        );
-        // emp/a (keep-min) → Support; emp/b (discarded) → Sales.
-        m.insert(
-            "employee".to_string(),
-            vec![mk_batch(vec![
-                scol("AID", 1, vec!["a", "b"]),
-                icol("EMPLOYEE_KEY", 2, vec![Some(500), Some(500)]),
-                scol("DEPARTMENT", 3, vec!["Support", "Sales"]),
-            ])],
-        );
-        let out = run_s1(s1_mapping(fluree_vocab::xsd::INTEGER), m).await;
+    async fn s1_declines_an_agent_key_minting_two_subjects() {
+        let batches = |aids: [&str; 2], departments: [&str; 2]| {
+            let mut m = std::collections::HashMap::new();
+            m.insert(
+                "ticket".to_string(),
+                vec![mk_batch(vec![
+                    icol("TID", 1, vec![Some(1)]),
+                    icol("PRODUCT_KEY", 2, vec![Some(100)]),
+                    icol("CUSTOMER_KEY", 3, vec![Some(1000)]),
+                    icol("AGENT_KEY", 4, vec![Some(500)]),
+                    icol("QTY", 5, vec![Some(50)]),
+                ])],
+            );
+            m.insert(
+                "product".to_string(),
+                vec![mk_batch(vec![
+                    icol("PRODUCT_KEY", 1, vec![Some(100)]),
+                    scol("CATEGORY", 2, vec!["Widgets"]),
+                    bcol("IS_CURRENT", 3, vec![Some(true)]),
+                ])],
+            );
+            m.insert(
+                "customer".to_string(),
+                vec![mk_batch(vec![
+                    icol("CUSTOMER_KEY", 1, vec![Some(1000)]),
+                    scol("SEGMENT", 2, vec!["Enterprise"]),
+                ])],
+            );
+            m.insert(
+                "employee".to_string(),
+                vec![mk_batch(vec![
+                    scol("AID", 1, aids.to_vec()),
+                    icol("EMPLOYEE_KEY", 2, vec![Some(500), Some(500)]),
+                    scol("DEPARTMENT", 3, departments.to_vec()),
+                ])],
+            );
+            m
+        };
+        for departments in [
+            ["Support", "Support"],
+            ["Sales", "Support"],
+            ["Support", "Sales"],
+        ] {
+            assert!(
+                try_s1(
+                    s1_mapping(fluree_vocab::xsd::INTEGER),
+                    batches(["a", "b"], departments)
+                )
+                .await
+                .is_none(),
+                "an agent key minting two subjects must decline ({departments:?})"
+            );
+        }
+        let out = run_s1(
+            s1_mapping(fluree_vocab::xsd::INTEGER),
+            batches(["a", "a"], ["Support", "Support"]),
+        )
+        .await;
         assert_eq!(
             out,
             vec![("Widgets".to_string(), long_sum(50))],
-            "keep-min agent row is Support → the ticket is included"
+            "an agent key minting one Support subject on identical rows folds"
         );
     }
 
@@ -8995,7 +10209,7 @@ mod tests {
             mapping: Arc::clone(&mapping),
             batches,
         };
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx =
             ExecutionContext::new(&snapshot, &vars).with_r2rml_providers(&provider, &provider);
@@ -9079,5 +10293,76 @@ mod tests {
             "two semi-join branches on the SAME dim table enforce independently: buyer=Enterprise \
              drops D4 (SMB buyer), seller=SMB drops D5 (Enterprise seller)"
         );
+    }
+
+    /// A GROUP BY with no ORDER BY emits its groups in the fold map's
+    /// iteration order, which a LIMIT/OFFSET pages through: it must be the same
+    /// on every execution over the same rows, on both fold paths. Fresh
+    /// operators fold the same 200 rows into 50 groups; every run emits the
+    /// groups in one order. (A per-instance random hasher gives a different
+    /// order per run.)
+    #[tokio::test]
+    async fn grouped_output_order_is_the_same_on_every_execution() {
+        use crate::seed::EmptyOperator;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        use fluree_db_r2rml::mapping::PredicateMap;
+        let mapping = Arc::new(CompiledR2rmlMapping::new(vec![TriplesMap::new("#T", "t")
+            .with_subject_template("http://ex/t/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/grp"),
+                object_map: ObjectMap::column("G"),
+            })]));
+        let groups: Vec<String> = (0..200).map(|i| format!("g{:02}", (i * 7) % 50)).collect();
+        let mut b = std::collections::HashMap::new();
+        b.insert(
+            "t".to_string(),
+            vec![mk_batch(vec![
+                icol("ID", 1, (0..200).map(Some).collect()),
+                scol("G", 2, groups.iter().map(String::as_str).collect()),
+            ])],
+        );
+        let (s, g, cnt) = (VarId(0), VarId(1), VarId(20));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        for vector_fold in [false, true] {
+            let mut runs: Vec<Vec<String>> = Vec::new();
+            for _ in 0..4 {
+                let mut pat = R2rmlPattern::new("gs", s, Some(g));
+                pat.triples_map_iri = Some("#T".to_string());
+                pat.predicate_filter = Some("http://ex/grp".to_string());
+                let plan = FusedAggregatePlan {
+                    graph_iri: Arc::from("gs"),
+                    inner_patterns: vec![Pattern::R2rml(pat)],
+                    filter: None,
+                    agg_binds: vec![],
+                    group_by: vec![g],
+                    aggregates: vec![(cnt, AggregateFn::CountAll)],
+                };
+                let provider = CrtProvider {
+                    mapping: Arc::clone(&mapping),
+                    batches: b.clone(),
+                };
+                let ctx = ExecutionContext::new(&snapshot, &vars)
+                    .with_r2rml_providers(&provider, &provider);
+                let mut op = FusedR2rmlAggregateOperator::new(plan, Box::new(EmptyOperator::new()));
+                // Set the field, never the process env (see the bounding test).
+                op.vector_fold = vector_fold;
+                op.open(&ctx).await.expect("open");
+                assert!(!op.use_fallback, "vector_fold={vector_fold}: the fold ran");
+                let mut order = Vec::new();
+                while let Some(batch) = op.next_batch(&ctx).await.expect("next_batch") {
+                    for binding in batch.column(g).expect("group column") {
+                        order.push(format!("{binding:?}"));
+                    }
+                }
+                assert_eq!(order.len(), 50, "vector_fold={vector_fold}: 50 groups");
+                runs.push(order);
+            }
+            assert!(
+                runs.windows(2).all(|w| w[0] == w[1]),
+                "vector_fold={vector_fold}: group order differs between runs"
+            );
+        }
     }
 }

@@ -1,0 +1,737 @@
+//! Validation for branch operations.
+//!
+//! Merge (fast-forward included), rebase, revert, and their previews build
+//! their commits on a path parallel to the transaction pipeline, staging
+//! flakes straight into a [`StagedLedger`]. This module runs the checks the
+//! transaction path runs on a staged view (`check_staged_write`: SHACL and
+//! uniqueness under the target's configuration, and the staged-config
+//! guard), so a branch operation whose resulting state the ledger's
+//! configuration rejects fails exactly as a transaction producing that state
+//! would. R2 is enforced when the data is written; branch operations
+//! re-check the integrity of the target's config groups (R1/R3).
+//!
+//! A branch operation is authoring, not replay: the combination it stages
+//! onto the target is new state nobody has validated. So, unlike commit
+//! replay, a cross-ledger `f:shapesSource` is resolved and enforced here
+//! rather than skipped. Branch operations carry no request surface (no
+//! requested validation mode, identity, inline shapes, or authoring context)
+//! and run the ledger's configured posture.
+
+use crate::commit_data::NetChange;
+use crate::error::{ApiError, Result};
+use crate::rebase::ConflictStrategy;
+use fluree_db_core::graph_registry::{names_config_graph, CONFIG_GRAPH_ID};
+use fluree_db_core::{ConflictKey, Flake, GraphId, Sid};
+use fluree_db_ledger::{LedgerState, StagedLedger};
+use fluree_db_transact::TransactError;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+
+/// Outcome of validating a branch operation's staged view.
+///
+/// Warn-mode violations are logged by the validator and never surface here,
+/// matching the transaction path. Only a rejection produces an outcome: a
+/// SHACL violation report, a uniqueness violation, or a refusal of the
+/// staged-config guard.
+#[derive(Debug, Default)]
+pub(crate) struct BranchOpValidation {
+    /// Why the operation may not apply, `None` when the view conforms.
+    rejection: Option<Rejection>,
+}
+
+/// Why a branch operation's staged view may not apply.
+#[derive(Debug)]
+enum Rejection {
+    /// A SHACL or uniqueness violation: the error a transaction producing
+    /// the same state would fail with.
+    Check(TransactError),
+    /// The staged config conflicts with the target's: a config group the
+    /// operation would split, a second value, or another branch's config
+    /// graph. The target's state blocks the operation (409).
+    Config(String),
+}
+
+impl BranchOpValidation {
+    pub(crate) fn conforms(&self) -> bool {
+        self.rejection.is_none()
+    }
+
+    /// The rejection as a report for a preview: the SHACL violation report,
+    /// or the uniqueness violation's or config refusal's message. `None` when
+    /// the view conforms.
+    pub(crate) fn report(&self) -> Option<String> {
+        self.rejection.as_ref().map(|rejection| match rejection {
+            #[cfg(feature = "shacl")]
+            Rejection::Check(TransactError::ShaclViolation(report)) => report.to_string(),
+            Rejection::Check(other) => other.to_string(),
+            Rejection::Config(message) => message.clone(),
+        })
+    }
+
+    /// Turn a rejected outcome into the error a transaction producing the
+    /// same state would return.
+    pub(crate) fn into_result(self) -> Result<()> {
+        self.into_result_with(|report| report)
+    }
+
+    /// Like [`Self::into_result`], with `describe` wrapping the refusal's
+    /// message in the operation's own context (which commit a rebase stopped
+    /// on, say): a SHACL report and a config refusal. A uniqueness violation
+    /// is returned as its typed error, which carries no free text.
+    pub(crate) fn into_result_with(self, describe: impl FnOnce(String) -> String) -> Result<()> {
+        match self.rejection {
+            None => Ok(()),
+            #[cfg(feature = "shacl")]
+            Some(Rejection::Check(TransactError::ShaclViolation(report))) => {
+                let message = describe(report.message().to_string());
+                let report =
+                    fluree_db_transact::ShaclViolations::new(message, report.results().to_vec());
+                Err(TransactError::ShaclViolation(report).into())
+            }
+            Some(Rejection::Check(rejection)) => {
+                let _ = describe;
+                Err(rejection.into())
+            }
+            Some(Rejection::Config(message)) => Err(ApiError::BranchConflict(describe(message))),
+        }
+    }
+}
+
+/// Route, in `reverse_graph`, the graphs in `graph_iris` that it cannot route
+/// yet: a graph `state` has not registered by the id the commit's
+/// registration will assign it, and another ledger's config graph IRI to the
+/// config graph. Returns the new graphs' IRIs by that id. The Sids are
+/// resolved against the state's namespaces plus `namespace_delta`, the codes
+/// the incoming commits introduced, so they match the Sids their flakes carry.
+fn route_incoming_graphs(
+    state: &LedgerState,
+    namespace_delta: &HashMap<u16, String>,
+    graph_iris: &BTreeSet<String>,
+    reverse_graph: &mut HashMap<Sid, GraphId>,
+) -> Result<HashMap<GraphId, String>> {
+    let registry = &state.snapshot.graph_registry;
+    let new: Vec<String> = graph_iris
+        .iter()
+        .filter(|iri| registry.assigned_graph_id(iri).is_none())
+        .cloned()
+        .collect();
+    let aliases: Vec<&String> = graph_iris
+        .iter()
+        .filter(|iri| {
+            names_config_graph(iri)
+                && state
+                    .snapshot
+                    .encode_iri(iri)
+                    .is_none_or(|sid| !reverse_graph.contains_key(&sid))
+        })
+        .collect();
+    if new.is_empty() && aliases.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&state.snapshot);
+    ns.adopt_delta_for_persistence(namespace_delta)
+        .map_err(|e| {
+            ApiError::BranchConflict(format!(
+                "the incoming commits' namespace allocations conflict with the target's: {e}"
+            ))
+        })?;
+    let ids = registry.provisional_ids(&new);
+    let mut named = HashMap::new();
+    for iri in new {
+        let (Some(&g_id), Some(sid)) = (ids.get(iri.as_str()), ns.lookup_sid_for_iri(&iri)) else {
+            continue;
+        };
+        reverse_graph.insert(sid, g_id);
+        named.insert(g_id, iri);
+    }
+    for iri in aliases {
+        if let Some(sid) = ns.lookup_sid_for_iri(iri) {
+            reverse_graph.insert(sid, CONFIG_GRAPH_ID);
+        }
+    }
+    Ok(named)
+}
+
+/// A merge's or revert's net change, named as `state` stores each fact, for
+/// the kinds of value whose index key two terms can share
+/// ([`FlakeValue::index_key_may_merge_terms`]). The net change was folded
+/// from commits written against other states, so it can name such a fact
+/// under a term `state` does not hold it under. An assertion of a fact
+/// `state` holds is dropped, as a restatement; a retraction retracts the
+/// fact under every term `state` holds it by (novelty holds the subtypes of
+/// one big integer apart until the next index build), or is dropped when
+/// `state` holds none. Otherwise the commit could hold a retraction and an
+/// assertion of one fact at one `t`, which a commit may not hold
+/// (`build_commit` refuses it), or keep a term the change meant to remove.
+///
+/// Only those kinds are read, one read per slot they touch
+/// ([`CurrentFacts::all_named_by`]); any other change is returned as is.
+///
+/// [`FlakeValue::index_key_may_merge_terms`]: fluree_db_core::FlakeValue::index_key_may_merge_terms
+/// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
+async fn as_stored(state: &LedgerState, flakes: Vec<Flake>) -> Result<Vec<Flake>> {
+    use fluree_db_transact::{CurrentFacts, Slot};
+    let asked: Vec<(usize, Slot)> = flakes
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.o.index_key_may_merge_terms())
+        .filter_map(|(n, f)| Slot::in_ledger(state, &f.g, &f.s, &f.p).map(|slot| (n, slot)))
+        .collect();
+    if asked.is_empty() {
+        return Ok(flakes);
+    }
+    let items: Vec<(Slot, &Flake)> = asked
+        .iter()
+        .map(|(n, slot)| (slot.clone(), &flakes[*n]))
+        .collect();
+    let named = CurrentFacts::new(state).all_named_by(&items).await?;
+    let mut keep = vec![true; flakes.len()];
+    let mut renamed = Vec::new();
+    let mut more = Vec::new();
+    for ((n, _), held) in asked.iter().zip(named) {
+        let flake = &flakes[*n];
+        match (flake.op, held.is_empty()) {
+            (true, false) | (false, true) => keep[*n] = false,
+            (false, false) => {
+                let mut retractions = held
+                    .into_iter()
+                    .map(|fact| fact.retract(flake.t).into_flake());
+                if let Some(first) = retractions.next() {
+                    renamed.push((*n, first));
+                }
+                more.extend(retractions);
+            }
+            (true, true) => {}
+        }
+    }
+    let mut flakes = flakes;
+    for (n, retraction) in renamed {
+        flakes[n] = retraction;
+    }
+    let mut keep = keep.into_iter();
+    flakes.retain(|_| keep.next().unwrap_or(true));
+    flakes.extend(more);
+    Ok(flakes)
+}
+
+/// An undo's net change with each fact its deciding commit held as a
+/// same-`t` pair (`NetChange::same_t_pairs`) resolved by the fact's
+/// presence just before that commit. The pair left the fact present
+/// whatever it was before, and the commit alone can't say which, so the
+/// undo writes the state before it: the fact asserted if it was present,
+/// retracted if it wasn't. Like any undo, that is a restatement when the
+/// head already agrees, and a change when a later commit in the range
+/// changed the fact again (a revert of the pair's commit and a later
+/// delete restores the value). One read per pair, at the deciding commit's
+/// `t - 1`; only commits written before the staging fix hold pairs.
+async fn undo_same_t_pairs(state: &LedgerState, undo: NetChange) -> Result<Vec<Flake>> {
+    use fluree_db_transact::{CurrentFacts, Slot};
+    let NetChange {
+        flakes: mut inverted,
+        same_t_pairs,
+    } = undo;
+    if same_t_pairs.is_empty() {
+        return Ok(inverted);
+    }
+    let mut by_t: BTreeMap<i64, Vec<usize>> = BTreeMap::new();
+    for &n in &same_t_pairs {
+        by_t.entry(inverted[n].t).or_default().push(n);
+    }
+    let mut present_before: Vec<(usize, bool)> = Vec::with_capacity(same_t_pairs.len());
+    for (t, positions) in by_t {
+        let mut asked: Vec<(usize, Slot)> = Vec::with_capacity(positions.len());
+        for n in positions {
+            let f = &inverted[n];
+            match Slot::in_ledger(state, &f.g, &f.s, &f.p) {
+                Some(slot) => asked.push((n, slot)),
+                // A graph the state doesn't have held nothing.
+                None => present_before.push((n, false)),
+            }
+        }
+        let items: Vec<(Slot, &Flake)> = asked
+            .iter()
+            .map(|(n, slot)| (slot.clone(), &inverted[*n]))
+            .collect();
+        let held = CurrentFacts::at(state, t - 1).named_by(&items).await?;
+        for ((n, _), held) in asked.iter().zip(held) {
+            present_before.push((*n, held.is_some()));
+        }
+    }
+    for (n, present) in present_before {
+        inverted[n].op = present;
+    }
+    Ok(inverted)
+}
+
+impl crate::Fluree {
+    /// Stage `flakes` onto `state` and validate the result against the
+    /// ledger's SHACL configuration and shapes.
+    ///
+    /// This is the one way a branch operation builds a view to commit: the
+    /// staging and the validation travel together so no operation can copy
+    /// one without the other. Returns the validated view and the outcome;
+    /// the caller decides what a rejection means (merge and revert fail,
+    /// rebase names the commit it stopped on, preview reports it).
+    ///
+    /// `namespace_delta` holds the namespace codes the operation introduces,
+    /// which the snapshot will not carry until the commit lands; they make
+    /// the operation's own terms encodable for `sh:sparql` lowering and
+    /// resolvable in messages. `op` names the operation in error messages.
+    pub(crate) async fn stage_validated(
+        &self,
+        state: LedgerState,
+        flakes: Vec<Flake>,
+        namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
+        op: &'static str,
+    ) -> Result<(StagedLedger, BranchOpValidation)> {
+        self.stage_validated_with(state, flakes, namespace_delta, graph_iris, op, None, None)
+            .await
+    }
+
+    /// [`Self::stage_validated`], for a merge from `merge_source` and with
+    /// the target's config when the caller has already read it (a
+    /// fast-forward reads it to learn whether the target governs writes), so
+    /// the checks do not read it again.
+    #[allow(clippy::too_many_arguments)]
+    async fn stage_validated_with(
+        &self,
+        state: LedgerState,
+        flakes: Vec<Flake>,
+        namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
+        op: &'static str,
+        merge_source: Option<&str>,
+        config: Option<&crate::tx::ConfigRead>,
+    ) -> Result<(StagedLedger, BranchOpValidation)> {
+        let mut reverse_graph = state.snapshot.build_reverse_graph().map_err(|e| {
+            ApiError::internal(format!("Failed to build reverse graph during {op}: {e}"))
+        })?;
+        let new_graph_iris =
+            route_incoming_graphs(&state, namespace_delta, graph_iris, &mut reverse_graph)?;
+        let mut view = StagedLedger::new(state, flakes, &reverse_graph)
+            .map_err(|e| ApiError::internal(format!("Failed to stage flakes during {op}: {e}")))?;
+        let outcome = self
+            .validate_branch_op_view(
+                &mut view,
+                namespace_delta,
+                &new_graph_iris,
+                op,
+                merge_source,
+                config,
+            )
+            .await?;
+        Ok((view, outcome))
+    }
+
+    /// The merge's staging, shared by the merge itself and its preview:
+    /// resolve `source_flakes` from `source_branch` under `strategy` against
+    /// `target_state`, then stage and validate the result.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn stage_merge(
+        &self,
+        target_state: LedgerState,
+        source_branch: &str,
+        source_flakes: Vec<Flake>,
+        conflicts: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
+    ) -> Result<(StagedLedger, BranchOpValidation)> {
+        let resolved = self
+            .apply_two_way_strategy(source_flakes, conflicts, strategy, &target_state)
+            .await?;
+        let resolved = as_stored(&target_state, resolved).await?;
+        self.stage_validated_with(
+            target_state,
+            resolved,
+            namespace_delta,
+            graph_iris,
+            "merge",
+            Some(source_branch),
+            None,
+        )
+        .await
+    }
+
+    /// Revert's staging, shared by the revert itself and its preview:
+    /// resolve `inverted` under `strategy` against `target_state`, then stage
+    /// and validate the result.
+    ///
+    /// `None` when the strategy leaves nothing to apply, such as
+    /// `TakeBranch` with full overlap. There is no commit to build then, and
+    /// nothing that could be rejected.
+    pub(crate) async fn stage_revert(
+        &self,
+        target_state: LedgerState,
+        undo: NetChange,
+        conflicts: &[ConflictKey],
+        strategy: &ConflictStrategy,
+        namespace_delta: &HashMap<u16, String>,
+        graph_iris: &BTreeSet<String>,
+    ) -> Result<Option<(StagedLedger, BranchOpValidation)>> {
+        let inverted = undo_same_t_pairs(&target_state, undo).await?;
+        let staged = self
+            .apply_two_way_strategy(inverted, conflicts, strategy, &target_state)
+            .await?;
+        let staged = as_stored(&target_state, staged).await?;
+        if staged.is_empty() {
+            return Ok(None);
+        }
+        self.stage_validated(target_state, staged, namespace_delta, graph_iris, "revert")
+            .await
+            .map(Some)
+    }
+
+    /// The target's state before a fast-forward, and whether its
+    /// configuration governs writes ([`governs_writes`]).
+    ///
+    /// A fast-forward adopts the source's commits as they are, so the target
+    /// checks them first ([`Self::validate_fast_forward`]), against its
+    /// configuration as it is before the merge, exactly as it would a
+    /// transaction writing the same change. The state comes from the ledger
+    /// cache when it holds the target at `record`'s head, else from storage.
+    pub(crate) async fn fast_forward_base<C>(
+        &self,
+        target_id: &fluree_db_core::LedgerId,
+        target_store: &C,
+        record: &fluree_db_nameservice::NsRecord,
+    ) -> Result<FastForwardBase>
+    where
+        C: fluree_db_core::ContentStore + Clone + 'static,
+    {
+        let cached = match self.ledger_manager.as_ref() {
+            Some(manager) => manager.get_loaded_view(target_id).await.filter(|view| {
+                view.t == record.commit_t && view.head_commit_id == record.commit_head_id
+            }),
+            None => None,
+        };
+        let state = match cached {
+            Some(view) => view.to_ledger_state(),
+            None => {
+                self.load_queryable_state_with_store(target_store.clone(), record.clone())
+                    .await?
+            }
+        };
+        let config = crate::tx::load_transaction_config(&state).await?;
+        let governed = config.as_deref().is_some_and(governs_writes);
+        Ok(FastForwardBase {
+            state,
+            governed,
+            config: crate::tx::ConfigRead::resolved(config),
+        })
+    }
+
+    /// Check a fast-forward from `source_branch` onto `base` (from
+    /// [`Self::fast_forward_base`]): stage the adopted commits' net change
+    /// (the source's line since the target's head) onto it and run the
+    /// transaction checks under its configuration. `None` when there is
+    /// nothing to check: the target governs no writes and the change carries
+    /// no config settings, so it fast-forwards as before.
+    pub(crate) async fn validate_fast_forward(
+        &self,
+        base: FastForwardBase,
+        source_branch: &str,
+        source_store: &impl fluree_db_core::ContentStore,
+        diff: &fluree_db_core::BranchDiff,
+    ) -> Result<Option<BranchOpValidation>> {
+        let (data, _keys) = crate::merge::collect_commit_data(
+            source_store,
+            &diff.source.commits,
+            &diff.source.own,
+            &mut crate::commit_data::ConfigGraphs::for_target(&base.state),
+        )
+        .await?;
+        if !base.governed && !carries_config_settings(&base.state, &data) {
+            return Ok(None);
+        }
+        let (_view, outcome) = self
+            .stage_validated_with(
+                base.state,
+                data.net.flakes,
+                &data.namespace_delta,
+                &data.graph_iris,
+                "merge",
+                Some(source_branch),
+                Some(&base.config),
+            )
+            .await?;
+        Ok(Some(outcome))
+    }
+
+    /// Run the checks a transaction runs on its staged view
+    /// ([`crate::tx::check_staged_write`]) against the target's
+    /// configuration: SHACL and uniqueness, under the target's pre-operation
+    /// config, and the staged-config guard's re-check of the target's config
+    /// groups. `new_graph_iris` names graphs the incoming commits create,
+    /// which the target's registry does not know yet; `op` names the
+    /// operation in refusals, and `merge_source` the branch a merge takes.
+    async fn validate_branch_op_view(
+        &self,
+        view: &mut StagedLedger,
+        namespace_delta: &HashMap<u16, String>,
+        new_graph_iris: &HashMap<GraphId, String>,
+        op: &'static str,
+        merge_source: Option<&str>,
+        config: Option<&crate::tx::ConfigRead>,
+    ) -> Result<BranchOpValidation> {
+        use crate::config_guard::GuardScope;
+        use crate::tx::{check_staged_write, StagedWriteError, WriteChecks};
+        use fluree_db_transact::NamespaceRegistry;
+
+        if !view.has_staged() {
+            return Ok(BranchOpValidation::default());
+        }
+        if let Some(refusal) = self
+            .system_graph_write(view, new_graph_iris, op, merge_source)
+            .await?
+        {
+            return Ok(BranchOpValidation {
+                rejection: Some(Rejection::Config(refusal)),
+            });
+        }
+
+        let base = view.base();
+        let ledger_id = base.snapshot.ledger_id.clone();
+        let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(&ledger_id, self);
+
+        // The staged namespace registry: the snapshot's codes plus the ones
+        // this operation brings in (its delta then holds them, for violation
+        // messages and `sh:sparql` lowering).
+        // Sibling branches allocate codes independently, so a code or prefix
+        // the source introduced can already mean something else on the
+        // target. The commit builder rejects such a merge too; surfacing it
+        // here, as a conflict rather than an internal error, lets a preview
+        // answer instead of failing.
+        let mut staged_ns = NamespaceRegistry::from_db(&base.snapshot);
+        staged_ns
+            .adopt_delta_for_persistence(namespace_delta)
+            .map_err(|e| {
+                ApiError::BranchConflict(format!(
+                    "the source branch's namespace allocations conflict with the target's: {e}"
+                ))
+            })?;
+        // Graph routing for the staged flakes: every named graph they touch,
+        // with its IRI for per-graph config resolution. The default graph
+        // always gets the ledger-wide settings.
+        let mut graph_delta: rustc_hash::FxHashMap<u16, String> = rustc_hash::FxHashMap::default();
+        for (g_id, _) in view.staged_flakes_by_graph().filter(|(g_id, _)| *g_id != 0) {
+            let iri = base
+                .snapshot
+                .graph_registry
+                .iri_for_graph_id(g_id)
+                .map(str::to_string)
+                .or_else(|| new_graph_iris.get(&g_id).cloned());
+            if let Some(iri) = iri {
+                graph_delta.entry(g_id).or_insert(iri);
+            }
+        }
+
+        // A branch operation only needs to know whether anything rejected
+        // it; whether a check ran (commit provenance for a transaction) does
+        // not matter here.
+        match check_staged_write(
+            view,
+            &mut staged_ns,
+            &graph_delta,
+            WriteChecks {
+                config,
+                ..WriteChecks::new(GuardScope::BranchOperation(op))
+            },
+            &mut resolve_ctx,
+        )
+        .await
+        {
+            Ok(_governed) => Ok(BranchOpValidation::default()),
+            Err(StagedWriteError::Rejected(rejection)) => Ok(BranchOpValidation {
+                rejection: Some(Rejection::Check(rejection)),
+            }),
+            Err(StagedWriteError::ConfigRefused(message)) => Ok(BranchOpValidation {
+                rejection: Some(Rejection::Config(message)),
+            }),
+            Err(StagedWriteError::Failed(e)) => Err(e.into()),
+        }
+    }
+}
+
+impl crate::Fluree {
+    /// Why a branch operation may not write a system graph, if it does.
+    ///
+    /// A merge may change the target's config graph (asserting or
+    /// retracting) only from a branch the target was created from, directly
+    /// or not: the target took that branch's config at the fork, and its
+    /// later config changes reach the target the same way. What any other
+    /// branch wrote there configures that branch; config is changed on the
+    /// branch it configures. A merge never changes the target's txn-meta
+    /// graph.
+    ///
+    /// No branch operation may write another branch's txn-meta graph, which
+    /// is named for that branch and holds its commit metadata, unless the
+    /// target was created from that branch: it is then an ordinary graph on
+    /// the target, copied at the fork. Retractions (a revert cleaning such a
+    /// graph up) are allowed.
+    async fn system_graph_write(
+        &self,
+        view: &StagedLedger,
+        new_graph_iris: &HashMap<GraphId, String>,
+        op: &str,
+        merge_source: Option<&str>,
+    ) -> Result<Option<String>> {
+        use fluree_db_core::graph_registry::{CONFIG_GRAPH_ID, TXN_META_GRAPH_ID};
+        let base = view.base();
+        let ledger_id = base.snapshot.ledger_id.to_string();
+        if let Some(source) = merge_source {
+            let writes = |g| view.staged_flakes_by_graph().any(|(g_id, _)| g_id == g);
+            let refused = if writes(TXN_META_GRAPH_ID) {
+                Some(TXN_META_GRAPH_ID)
+            } else if writes(CONFIG_GRAPH_ID)
+                && !self.is_ancestor_branch(&ledger_id, source).await?
+            {
+                Some(CONFIG_GRAPH_ID)
+            } else {
+                None
+            };
+            if let Some(g_id) = refused {
+                let role = if g_id == CONFIG_GRAPH_ID {
+                    fluree_db_core::GraphSel::Config
+                } else {
+                    fluree_db_core::GraphSel::TxnMeta
+                };
+                return Ok(Some(format!(
+                    "the merge would change this branch's {role} graph <{}> with what the \
+                     source branch wrote there, which configures the source branch only; \
+                     change this branch's {role} on this branch itself",
+                    base.snapshot
+                        .graph_registry
+                        .iri_for_graph_id(g_id)
+                        .unwrap_or_default()
+                )));
+            }
+        }
+        let mut written: BTreeSet<GraphId> = BTreeSet::new();
+        for (g_id, flake) in view.staged_flakes_by_graph() {
+            if flake.op && g_id != fluree_db_core::DEFAULT_GRAPH_ID {
+                written.insert(g_id);
+            }
+        }
+        for g_id in written {
+            let iri = new_graph_iris
+                .get(&g_id)
+                .map(String::as_str)
+                .or_else(|| base.snapshot.graph_registry.iri_for_graph_id(g_id));
+            let Some((branch, role)) =
+                iri.and_then(|iri| crate::config_guard::other_branch_system_graph(iri, &ledger_id))
+            else {
+                continue;
+            };
+            if self.is_ancestor_branch(&ledger_id, branch).await? {
+                continue;
+            }
+            return Ok(Some(format!(
+                "the {op} would write to branch {branch}'s {role} graph <{}>: what is written \
+                 there on a branch configures that branch only and is not carried over as \
+                 {role}; make the change on this branch, or revert it on {branch} first",
+                iri.unwrap_or_default()
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Whether `branch` is one `ledger_id`'s branch was created from,
+    /// directly or through other branches.
+    async fn is_ancestor_branch(&self, ledger_id: &str, branch: &str) -> Result<bool> {
+        let mut id = fluree_db_core::LedgerId::parse(ledger_id)?;
+        // A branch chain is short; the bound only guards a malformed cycle.
+        for _ in 0..64 {
+            let Some(record) = self.nameservice().lookup(&id).await? else {
+                return Ok(false);
+            };
+            let Some(parent) = record.source_branch else {
+                return Ok(false);
+            };
+            if parent == branch {
+                return Ok(true);
+            }
+            id = fluree_db_core::LedgerId::from_parts(id.name(), &parent)?;
+        }
+        Ok(false)
+    }
+}
+
+/// A fast-forward target's state before the merge.
+pub(crate) struct FastForwardBase {
+    /// The target's state at the merge's head.
+    pub(crate) state: LedgerState,
+    /// Whether its configuration governs writes ([`governs_writes`]).
+    pub(crate) governed: bool,
+    /// Its configuration, read once: the checks reuse it.
+    pub(crate) config: crate::tx::ConfigRead,
+}
+
+/// Whether the adopted change carries anything a branch operation's config
+/// checks can refuse: a config field ([`crate::config_vocab::is_config_field`],
+/// the config reader's vocabulary) for the split-group and second-value
+/// checks, or a write to the target's config or txn-meta graph or to another
+/// branch's system graph of this ledger. Every such refusal needs one of
+/// them (a config typed outside the config graph is refused only where it is
+/// written), so a change without any (data, edge annotations included) is
+/// accepted unchecked into a target that governs no writes.
+fn carries_config_settings(
+    target: &LedgerState,
+    data: &crate::commit_data::CollectedCommitData,
+) -> bool {
+    let mut ns = fluree_db_transact::NamespaceRegistry::from_db(&target.snapshot);
+    // The adopted commits' own namespace codes, so a config graph first
+    // written on the source still encodes as its flakes do. A conflicting
+    // delta is the merge's to refuse; it cannot make the change config-free.
+    if ns
+        .adopt_delta_for_persistence(&data.namespace_delta)
+        .is_err()
+    {
+        return true;
+    }
+    let own_system_graphs: Vec<Sid> = [
+        fluree_db_core::config_graph_iri(&target.snapshot.ledger_id),
+        fluree_db_core::graph_registry::txn_meta_graph_iri(&target.snapshot.ledger_id),
+    ]
+    .iter()
+    .filter_map(|iri| ns.lookup_sid_for_iri(iri))
+    .collect();
+    let ledger_id = target.snapshot.ledger_id.to_string();
+    let mut graphs_seen: std::collections::HashSet<&Sid> = std::collections::HashSet::new();
+    data.net.flakes.iter().any(|flake| {
+        crate::config_vocab::is_config_field(&flake.p)
+            || flake.g.as_ref().is_some_and(|g| {
+                own_system_graphs.contains(g)
+                    || (graphs_seen.insert(g)
+                        && ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
+                            let iri = format!("{prefix}{}", g.name);
+                            crate::config_guard::other_branch_system_graph(&iri, &ledger_id)
+                                .is_some()
+                        }))
+            })
+    })
+}
+
+/// Whether a ledger configuration governs writes: SHACL or uniqueness
+/// enabled, ledger-wide or for any graph. (Which graphs a write actually
+/// touches, and each one's effective setting, is decided by the checks
+/// themselves; this only says whether running them can matter.)
+pub(crate) fn governs_writes(config: &fluree_db_core::ledger_config::LedgerConfig) -> bool {
+    use fluree_db_core::ledger_config::{ShaclDefaults, TransactDefaults};
+    let shacl = |group: &Option<ShaclDefaults>| {
+        group
+            .as_ref()
+            .is_some_and(|shacl| shacl.enabled == Some(true))
+    };
+    let unique = |group: &Option<TransactDefaults>| {
+        group
+            .as_ref()
+            .is_some_and(|transact| transact.unique_enabled == Some(true))
+    };
+    shacl(&config.shacl)
+        || unique(&config.transact)
+        || config
+            .graph_overrides
+            .iter()
+            .any(|graph| shacl(&graph.shacl) || unique(&graph.transact))
+}

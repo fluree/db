@@ -268,7 +268,7 @@ mod tests {
     /// trap family as `DistinctOperator`'s zero-column fix.
     #[tokio::test]
     async fn test_limit_truncation_keeps_zero_column_row_count() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -290,7 +290,7 @@ mod tests {
     /// under the limit must flow through with its count intact.
     #[tokio::test]
     async fn test_limit_passthrough_keeps_zero_column_row_count() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -304,7 +304,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_exact_batch_size() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -326,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_smaller_than_batch() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -348,7 +348,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_larger_than_input() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -370,7 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_zero() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -388,7 +388,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_spans_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -419,7 +419,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -457,7 +457,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_limit_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -523,7 +523,7 @@ mod tests {
         use crate::offset::OffsetOperator;
         use crate::project::ProjectOperator;
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -548,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn budget_is_min_of_limit_and_inherited() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

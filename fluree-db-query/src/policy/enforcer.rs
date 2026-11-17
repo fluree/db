@@ -130,7 +130,7 @@ impl QueryPolicyEnforcer {
             // Get subject classes from cache
             let subject_classes = self
                 .policy
-                .get_cached_subject_classes(g_id, &flake.s)
+                .get_cached_subject_classes(g_id, to_t, &flake.s)
                 .unwrap_or_default();
 
             // Async policy check with f:query support
@@ -188,7 +188,7 @@ impl QueryPolicyEnforcer {
         // Get subject classes from cache
         let subject_classes = self
             .policy
-            .get_cached_subject_classes(g_id, &flake.s)
+            .get_cached_subject_classes(g_id, to_t, &flake.s)
             .unwrap_or_default();
 
         // Async policy check

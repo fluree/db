@@ -2,10 +2,10 @@
 //!
 //! Lives on the `Fluree` handle so resolved artifacts are shareable
 //! across requests and across every data ledger that references the
-//! same `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)`.
+//! same `(ArtifactKind, model_ledger_id, graph_iri, model head)`.
 //! That is the property that makes "model edit propagates atomically
 //! to every governed dataset" cheap — one cache entry is reused by
-//! every D that points at the same M graph at the same M-t.
+//! every D that points at the same M graph at the same M head.
 //!
 //! Phase 1a uses a Moka TinyLFU cache bounded by entry count. Unifying
 //! with `fluree-db-binary-index::LeafletCache`'s byte budget is a
@@ -22,8 +22,9 @@
 //! - Resolver: per-request memo miss → cache lookup → cache miss
 //!   triggers materialization → write back into both per-request memo
 //!   and instance cache → return.
-//! - Cache invalidation is implicit: new commits to M produce new
-//!   `resolved_t` values and therefore new keys. Old entries age out
+//! - Cache invalidation is implicit: every new head of M, including one
+//!   that repeats an earlier `t` (M dropped and recreated, or rebased),
+//!   has a new head commit and therefore a new key. Old entries age out
 //!   under TinyLFU eviction. There is no watermark-on-write channel.
 
 use super::types::{ResolutionKey, ResolvedGraph};

@@ -220,15 +220,18 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
 | `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
 | `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
-| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_property_path.rs` (property-path traversal), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline), `fluree-db-api/benches/query_hot_fanout_star.rs` (same-subject star with an unprojected fan-out object — the property-join semijoin demotion) |
+| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_property_path.rs` (property-path traversal), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline), `fluree-db-api/benches/query_hot_list_view.rs` (what one unrelated list costs SPARQL queries, CONSTRUCTs and a JSON-LD crawl that do not read it, on ledgers with and without the list), `fluree-db-api/benches/query_hot_fanout_star.rs` (same-subject star with an unprojected fan-out object — the property-join semijoin demotion), `fluree-db-api/benches/query_hot_construct_formats.rs` (CONSTRUCT serialized as JSON-LD, RDF/XML, Turtle and N-Triples, with allocation peak and churn; plus the Graph Store `GET` queries, plain and with the annotation `UNION`, over the default and a named graph, before and after the ledger holds an annotation), `fluree-db-api/benches/query_hot_negation_count.rs` (MINUS and NOT EXISTS lanes, join COUNT(*) folds), `fluree-db-api/benches/query_hot_limit_startup.rs` (LIMIT startup goals and star probe windows), `fluree-db-api/benches/query_hot_grouped_projection.rs` (grouped queries projecting a SELECT expression, executed and rendered as SPARQL JSON, with allocation peak and churn) |
 | `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
+| `datalog` | rule materialization after a commit (derived-facts cache missed) | `fluree-db-api/benches/datalog_fixpoint.rs` |
 | `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
 | `spatial` | S2 covering / build / query | `fluree-db-spatial/benches/spatial_bench.rs` |
 | `insert_formats` | JSON-LD vs Turtle insert format comparison | `fluree-db-api/benches/insert_formats.rs` |
+| `jsonld_parse` | JSON-LD transaction parsing alone (expansion, annotation lowering, templates; no staging) | `fluree-db-api/benches/jsonld_parse.rs` |
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
 | `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
+| `policy` | verified-claim parsing and request authorization binding | `fluree-db-api/benches/policy_authorization.rs` |
 
 **Reserved categories** (not yet in use; add a row here when you ship
 the first bench under that prefix): `core` (foundational ops —
@@ -361,12 +364,13 @@ The fix is to wrap setup work that touches the runtime in `rt.block_on`:
 let rt = bench_runtime();
 
 b.iter_batched(
-    // setup — wrap in block_on so the reactor is alive while
-    // FlureeBuilder::file(...).build() runs.
+    // Setup runs in block_on, so the reactor is alive while
+    // FlureeBuilder::file(...).build_async() runs.
     || rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-            .build()
+            .build_async()
+            .await
             .unwrap();
         (dir, fluree)
     }),
@@ -481,3 +485,36 @@ When reviewing someone else's bench, check:
   integration test (`fluree-bench-support/tests/workspace_reconcile.rs`)
   and is invoked by the `bench-gate` CI job — there is no library
   function for it.
+
+## Policy authorization
+
+Run `cargo bench -p fluree-db-api --features credential --bench policy_authorization`
+to measure fixed policy binding. It compares ordinary and delegated claim parsing
+and simple/multiple-source normalization, reporting latency and allocation bytes.
+Tracking-allocator overhead is included; signature verification, issuer lookup,
+networking, and database policy evaluation are excluded. Use `CRITERION_HOME` to
+choose the output directory.
+
+Authorization reuses token verification and adds claim parsing, an authority check,
+and request validation/normalization. It adds no ledger lookup, network request,
+or per-fact authorization work. Embedded binding clones query JSON; large inline
+policies increase parsing and cloning cost.
+
+### Full HTTP policy path
+
+Run `cargo bench -p fluree-db-server --bench policy_http` to compare warm,
+in-process HTTP queries with auth disabled, ordinary credentials, fixed
+selections, request selections, and 32 inline rules. Every case must return the
+same one-row result before timing. This benchmark includes signature verification,
+credential validation, body/header binding, config resolution, database execution,
+and response serialization. Socket/TLS costs are excluded. The fixture uses 256
+novelty-resident records with indexing disabled; these numbers do not characterize
+cold storage, indexed workloads, or large federated queries.
+
+Use the same benchmark source, build features, and machine on both revisions
+when comparing the no-auth case against `main`. For a quick correctness check,
+run `cargo test -p fluree-db-server --bench policy_http -- --test`. The bench
+declares `required-features = ["native", "credential"]`; both are default
+features, so it is silently skipped only under `--no-default-features`. Config
+absence is cached on each view, and regression tests verify that wrapping
+followed by execution does not repeat the config scan.

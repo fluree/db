@@ -233,8 +233,9 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
     let kind = match &query.grouping {
         // Scalars: single implicit group, aggregates only.
         Some(Grouping::Implicit {
-            aggregation: Aggregation { aggregates, binds },
+            aggregation: Aggregation { aggregates },
             having: None,
+            binds,
         }) => {
             if !binds.is_empty() || select_vars.len() != aggregates.len() {
                 return None;
@@ -254,8 +255,9 @@ pub(crate) fn detect_whole_graph_scalar_aggs(query: &Query) -> Option<WholeGraph
         // Histogram: GROUP BY the accessor value, one COUNT(*) / COUNT(?n).
         Some(Grouping::Explicit {
             group_by,
-            aggregation: Some(Aggregation { aggregates, binds }),
+            aggregation: Some(Aggregation { aggregates }),
             having: None,
+            binds,
         }) => {
             let prop_var = prop_var?;
             // The group key is the accessor var or its projection alias
@@ -536,7 +538,7 @@ fn overlay_lane_eligible(ctx: &crate::context::ExecutionContext<'_>) -> bool {
         .as_ref()
         .is_some_and(|store| ctx.to_t >= store.max_t())
         && !ctx.is_multi_ledger()
-        && ctx.from_t.is_none()
+        && !ctx.is_history_range()
         && ctx.allow_unfiltered()
         && crate::fast_path_common::overlay_has_novelty(ctx)
 }
@@ -987,7 +989,7 @@ fn compute_histogram(
         return Ok(Some(batch));
     };
     let prepared = crate::eval::PreparedBoolExpression::new(filter.clone());
-    match crate::filter::filter_batch(&batch, &prepared, schema, ctx)? {
+    match crate::filter::filter_batch(batch, &prepared, ctx)? {
         Some(filtered) => Ok(Some(filtered)),
         // Every group rejected: a legitimately empty result, not a decline.
         None => Ok(Some(crate::fast_path_common::empty_batch(schema.clone())?)),

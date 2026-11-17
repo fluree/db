@@ -1,0 +1,810 @@
+//! One Google identity behind every Google-authenticated request a graph
+//! source makes: the Iceberg REST catalog (BigLake), and the SQL and Delta
+//! sources that share [`AuthConfig`](crate::auth::AuthConfig).
+//!
+//! Hand-rolled over the codebase's own token cache and hardened HTTP client
+//! rather than `google-cloud-auth`: credential JSON comes from tenants on a
+//! hosted stack, and Google's formats can name arbitrary token endpoints, local
+//! files, URLs and executables. A library follows what it is given; this
+//! accepts a validated subset and refuses the rest:
+//!
+//! - **metadata**: the GCE/GKE metadata server, at a pinned URL;
+//! - **service_account**: an RS256 JWT assertion at `oauth2.googleapis.com`;
+//! - **external_account**: Workload Identity Federation from AWS: a SigV4-signed
+//!   GetCallerIdentity at `sts.googleapis.com`, then optionally
+//!   `iamcredentials.googleapis.com` impersonation;
+//! - **application_default**: the host's gcloud ADC file.
+//!
+//! Metadata, ADC and host-signed WIF are host identities, gated by the
+//! instance's [`HostIdentityPolicy`](crate::host_identity::HostIdentityPolicy).
+//! A host identity is the server's own, so its token is attached only to
+//! requests for Google's APIs (`https://*.googleapis.com`, or a host the
+//! operator names in [`TOKEN_HOSTS_ENV`]), never to whatever URL a source's
+//! configuration names; see [`GoogleIdentity::ensure_token_destination`].
+//! Signing (service-account JWTs, WIF subject tokens) needs the `aws` feature,
+//! which every shipped build enables; without it those sources refuse.
+
+mod adc;
+#[cfg(feature = "aws")]
+mod aws_subject;
+mod cache;
+mod credentials;
+mod external_account;
+mod metadata;
+mod service_account;
+mod wire;
+
+/// The credential type [`AwsSubjectCredentials::credentials`] returns,
+/// re-exported so an embedder implements the trait against the same version.
+#[cfg(feature = "aws")]
+pub use aws_credential_types::Credentials as AwsCredentials;
+#[cfg(feature = "aws")]
+pub use aws_subject::AwsSubjectCredentials;
+pub use credentials::{ExternalAccountConfig, GoogleCredentials, EXTERNAL_ACCOUNT_CONFIG_FORMS};
+
+use std::sync::{Arc, OnceLock};
+
+use async_trait::async_trait;
+use chrono::{DateTime, Utc};
+use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
+
+use crate::auth::token::CachedToken;
+use crate::auth::{CatalogAuth, IdentityContext, SendCatalogAuth};
+use crate::error::{IcebergError, Result};
+use crate::host_identity::HostIdentityKind;
+
+/// The scope Google catalog auth asks for by default (BigLake accepts it, or
+/// `bigquery`).
+pub const CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
+
+/// Operator override for the metadata server's token URL, for tests and
+/// unusual deployments. Never settable per source.
+pub const METADATA_URL_ENV: &str = "FLUREE_GOOGLE_METADATA_URL";
+
+/// Hosts, beyond Google's own APIs, that a token minted from a host identity
+/// may be sent to: a comma-separated list of host names (`host` matches that
+/// host exactly, `*.example.com` its subdomains), for tests and private
+/// endpoints. Operator-only, read once; never settable per source.
+pub const TOKEN_HOSTS_ENV: &str = "FLUREE_GOOGLE_TOKEN_HOSTS";
+
+/// Google's OAuth token endpoint (service-account assertions, refresh tokens).
+pub(crate) const OAUTH2_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
+/// Google's Security Token Service (Workload Identity Federation).
+pub(crate) const STS_TOKEN_URL: &str = "https://sts.googleapis.com/v1/token";
+/// Google's IAM credentials API (service-account impersonation).
+const IAM_CREDENTIALS_URL: &str = "https://iamcredentials.googleapis.com";
+/// The metadata server's token URL for the attached service account.
+pub(crate) const METADATA_TOKEN_URL: &str =
+    "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token";
+
+const QUOTA_PROJECT_HEADER: &str = "x-goog-user-project";
+
+/// Where token requests go. Production values are pinned; a test points them
+/// at a mock (they are not settable from any config).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GoogleEndpoints {
+    pub(crate) oauth2_token: String,
+    pub(crate) sts_token: String,
+    pub(crate) iam_credentials: String,
+    pub(crate) metadata_token: String,
+    /// Part of every token-cache key. Empty in production; each test's mock
+    /// Google gets its own, because mock servers are pooled and reuse their
+    /// URLs, so the URLs alone would let one test see another's tokens.
+    pub(crate) cache_partition: String,
+    /// Hosts beyond `*.googleapis.com` a host identity's token may go to
+    /// ([`TOKEN_HOSTS_ENV`]), lowercased.
+    pub(crate) token_hosts: Vec<String>,
+}
+
+impl GoogleEndpoints {
+    /// This process's endpoints: Google's, with the metadata URL from
+    /// [`METADATA_URL_ENV`] when the operator set it (read once).
+    pub(crate) fn process() -> &'static GoogleEndpoints {
+        static ENDPOINTS: OnceLock<GoogleEndpoints> = OnceLock::new();
+        ENDPOINTS.get_or_init(|| GoogleEndpoints {
+            oauth2_token: OAUTH2_TOKEN_URL.to_string(),
+            sts_token: STS_TOKEN_URL.to_string(),
+            iam_credentials: IAM_CREDENTIALS_URL.to_string(),
+            metadata_token: std::env::var(METADATA_URL_ENV)
+                .ok()
+                .filter(|url| !url.is_empty())
+                .unwrap_or_else(|| METADATA_TOKEN_URL.to_string()),
+            cache_partition: String::new(),
+            token_hosts: parse_token_hosts(std::env::var(TOKEN_HOSTS_ENV).ok().as_deref()),
+        })
+    }
+
+    /// Every endpoint at `base` (a mock server), for tests.
+    #[cfg(test)]
+    pub(crate) fn at(base: &str) -> GoogleEndpoints {
+        static PARTITION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        GoogleEndpoints {
+            oauth2_token: format!("{base}/token"),
+            sts_token: format!("{base}/v1/token"),
+            iam_credentials: base.to_string(),
+            metadata_token: format!(
+                "{base}/computeMetadata/v1/instance/service-accounts/default/token"
+            ),
+            cache_partition: format!(
+                "test-{}",
+                PARTITION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ),
+            token_hosts: Vec::new(),
+        }
+    }
+}
+
+/// The [`TOKEN_HOSTS_ENV`] list: trimmed, lowercased, empty entries dropped.
+pub(crate) fn parse_token_hosts(raw: Option<&str>) -> Vec<String> {
+    raw.unwrap_or_default()
+        .split(',')
+        .map(|host| host.trim().trim_end_matches('.').to_ascii_lowercase())
+        .filter(|host| !host.is_empty())
+        .collect()
+}
+
+/// Whether a host identity's token may go to `url`: an `https` URL on
+/// `googleapis.com` or a subdomain of it (which covers BigLake, BigQuery and
+/// Private Service Connect's `*.p.googleapis.com`), or any URL on a host the
+/// operator listed. `Err` carries the host to name in the refusal.
+fn token_destination_allowed(
+    url: &str,
+    operator_hosts: &[String],
+) -> std::result::Result<(), String> {
+    let parsed = reqwest::Url::parse(url).map_err(|_| "(not a URL)".to_string())?;
+    let host = parsed
+        .host_str()
+        .map(|host| host.trim_end_matches('.').to_ascii_lowercase())
+        .ok_or_else(|| "(no host)".to_string())?;
+    let google_api = parsed.scheme() == "https"
+        && (host == "googleapis.com" || host.ends_with(".googleapis.com"));
+    let operator_listed = operator_hosts
+        .iter()
+        .any(|listed| match listed.strip_prefix("*.") {
+            Some(domain) => host.ends_with(&format!(".{domain}")),
+            None => *listed == host,
+        });
+    if google_api || operator_listed {
+        Ok(())
+    } else {
+        Err(host)
+    }
+}
+
+/// What kind of credential a [`GoogleIdentity`] holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GoogleSource {
+    /// The metadata server (a host identity).
+    Metadata,
+    /// A service-account key.
+    ServiceAccount,
+    /// Workload Identity Federation; `host_signed` when the AWS subject token
+    /// is signed with the host's own credential chain (a host identity).
+    ExternalAccount {
+        /// Signed by the host's AWS chain rather than an embedder's subject.
+        host_signed: bool,
+    },
+    /// The host's application-default credentials (a host identity).
+    ApplicationDefault,
+}
+
+/// A minted Google access token.
+#[derive(Clone)]
+pub struct AccessToken {
+    /// The bearer token.
+    pub token: String,
+    /// When Google said it expires.
+    pub expires_at: DateTime<Utc>,
+}
+
+/// Redacting `Debug`: the token is a live bearer credential.
+impl std::fmt::Debug for AccessToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AccessToken")
+            .field("token", &"***")
+            .field("expires_at", &self.expires_at)
+            .finish()
+    }
+}
+
+impl From<CachedToken> for AccessToken {
+    fn from(token: CachedToken) -> Self {
+        AccessToken {
+            token: token.access_token,
+            expires_at: token.expires_at,
+        }
+    }
+}
+
+/// The credential material an identity mints with.
+enum Material {
+    Metadata(metadata::MetadataSource),
+    #[cfg_attr(not(feature = "aws"), allow(dead_code))]
+    ServiceAccount(service_account::ServiceAccountKey),
+    #[cfg(feature = "aws")]
+    ExternalAccount {
+        spec: external_account::ExternalAccountSpec,
+        subject: Arc<dyn AwsSubjectCredentials>,
+    },
+    ApplicationDefault {
+        path: std::path::PathBuf,
+    },
+}
+
+/// A Google identity: mints and caches access tokens for any scope set.
+///
+/// Tokens live in a process-wide cache keyed by this identity's non-secret
+/// fingerprint, the AWS subject that signed it (WIF), a digest binding it to
+/// its secret (service accounts), and the sorted scopes; each key refreshes
+/// single-flight with a margin before expiry.
+pub struct GoogleIdentity {
+    material: Material,
+    source: GoogleSource,
+    principal: String,
+    quota_project: Option<String>,
+    /// Non-secret identity + the endpoints it is exchanged at.
+    fingerprint: String,
+    binding: Option<[u8; 32]>,
+    subject: String,
+    endpoints: GoogleEndpoints,
+    http: reqwest::Client,
+}
+
+/// Redacting `Debug`: the kind, principal and quota project, never material.
+impl std::fmt::Debug for GoogleIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleIdentity")
+            .field("source", &self.source)
+            .field("principal", &self.principal)
+            .field("quota_project", &self.quota_project)
+            .finish_non_exhaustive()
+    }
+}
+
+impl GoogleIdentity {
+    /// Build the identity `credentials` describe. `credentials` must be
+    /// hydrated (a `secret_ref` fails closed). `quota_project`, when given,
+    /// wins over the credential JSON's `quota_project_id`. Host identities are
+    /// checked against `ctx`'s policy here, before anything is read.
+    ///
+    /// No network I/O: the first token is minted on first use.
+    pub fn new(
+        credentials: &GoogleCredentials,
+        quota_project: Option<&str>,
+        ctx: &IdentityContext,
+    ) -> Result<Self> {
+        Self::with_endpoints(credentials, quota_project, ctx, GoogleEndpoints::process())
+    }
+
+    pub(crate) fn with_endpoints(
+        credentials: &GoogleCredentials,
+        quota_project: Option<&str>,
+        ctx: &IdentityContext,
+        endpoints: &GoogleEndpoints,
+    ) -> Result<Self> {
+        if let Some(project) = quota_project {
+            if !is_project_id(project) {
+                return Err(IcebergError::GoogleCredentialsInvalid(
+                    "quota_project is not a Google Cloud project id".to_string(),
+                ));
+            }
+        }
+        let built = match credentials {
+            GoogleCredentials::Metadata => {
+                ctx.policy.ensure(HostIdentityKind::GoogleMetadata)?;
+                let source = metadata::MetadataSource::new(&endpoints.metadata_token)?;
+                Built {
+                    fingerprint: format!("metadata|{}", source.url()),
+                    material: Material::Metadata(source),
+                    source: GoogleSource::Metadata,
+                    principal: "metadata".to_string(),
+                    file_quota_project: None,
+                    binding: None,
+                    subject: "-".to_string(),
+                }
+            }
+            GoogleCredentials::ServiceAccount { key } => {
+                let key = service_account::ServiceAccountKey::parse(
+                    &key.resolve()?,
+                    "service_account.key",
+                )?;
+                Built::service_account(key, endpoints)?
+            }
+            GoogleCredentials::ExternalAccount { config } => {
+                let spec = external_account::parse(&config.resolve()?)?;
+                Built::external_account(spec, ctx, endpoints)?
+            }
+            GoogleCredentials::ApplicationDefault => {
+                ctx.policy
+                    .ensure(HostIdentityKind::GoogleApplicationDefault)?;
+                let path = adc::locate()?;
+                let file = adc::read(&path)?;
+                let principal = file.principal();
+                if let adc::AdcFile::ServiceAccount(_) = &file {
+                    require_signing("application_default (service_account)")?;
+                }
+                Built {
+                    fingerprint: format!("adc|{principal}|{}", endpoints.oauth2_token),
+                    file_quota_project: file.quota_project_id().map(str::to_string),
+                    material: Material::ApplicationDefault { path },
+                    source: GoogleSource::ApplicationDefault,
+                    principal,
+                    // The ADC file is one host-global, policy-gated identity, so
+                    // there is no tenant to bind against here; its token is bound
+                    // per use instead, to the secrets the file holds then
+                    // (`read_adc`), so a changed file never serves an old token.
+                    binding: None,
+                    subject: "-".to_string(),
+                }
+            }
+        };
+        let http = crate::net::hardened_client_builder()
+            .connect_timeout(std::time::Duration::from_secs(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| IcebergError::Http(format!("Failed to build HTTP client: {e}")))?;
+        Ok(Self {
+            material: built.material,
+            source: built.source,
+            principal: built.principal,
+            quota_project: quota_project
+                .map(str::to_string)
+                .or(built.file_quota_project),
+            fingerprint: format!("{}|{}", built.fingerprint, endpoints.cache_partition),
+            binding: built.binding,
+            subject: built.subject,
+            endpoints: endpoints.clone(),
+            http,
+        })
+    }
+
+    /// A token for `scopes` (cloud-platform when empty), from the cache when
+    /// one is outside its refresh margin, else minted single-flight.
+    pub async fn access_token(&self, scopes: &[&str]) -> Result<AccessToken> {
+        let adc = self.read_adc()?;
+        let scopes = grantable_scopes(normalize_scopes(scopes), adc.as_ref());
+        let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
+        let token = slot
+            .get_or_fetch(|| self.fetch(&scopes, adc.as_ref()))
+            .await?;
+        Ok(token.into())
+    }
+
+    /// Mint a fresh token for `scopes`, replacing the cached one (after a
+    /// server refused it), at most once per 30 s per cached token: within that
+    /// window of the last forced renewal the held token is kept, and the
+    /// caller's retry reports the server's refusal. This keeps one source's
+    /// 401s from re-minting, over and over, a token many sources share.
+    pub async fn refresh(&self, scopes: &[&str]) -> Result<()> {
+        let adc = self.read_adc()?;
+        let scopes = grantable_scopes(normalize_scopes(scopes), adc.as_ref());
+        let slot = cache::slot(&self.key(&scopes, adc.as_ref()));
+        slot.refetch(|| self.fetch(&scopes, adc.as_ref()))
+            .await
+            .map(|_minted| ())
+    }
+
+    /// The ADC file as it is now, for an application-default identity (`None`
+    /// for every other source). Read on every use, before the cache is
+    /// consulted, so its secrets key the cached token: a refreshed login is
+    /// picked up and a changed file never serves the old token. The identity
+    /// the source was opened with must still be the one in the file.
+    fn read_adc(&self) -> Result<Option<adc::AdcFile>> {
+        let Material::ApplicationDefault { path } = &self.material else {
+            return Ok(None);
+        };
+        let file = adc::read(path)?;
+        if file.principal() != self.principal {
+            return Err(IcebergError::GoogleCredentialsInvalid(
+                "application_default: the credentials file now holds a different identity \
+                 than when this source was opened"
+                    .to_string(),
+            ));
+        }
+        Ok(Some(file))
+    }
+
+    /// The project Google requests bill to (`x-goog-user-project`): the
+    /// explicit `quota_project`, else the credential JSON's `quota_project_id`.
+    pub fn quota_project(&self) -> Option<&str> {
+        self.quota_project.as_deref()
+    }
+
+    /// A stable, non-secret name for this identity: the service-account email,
+    /// `wif:<audience>[→<impersonated SA>]`, `metadata`, or
+    /// `adc:<client id or SA email>`.
+    pub fn principal(&self) -> &str {
+        &self.principal
+    }
+
+    /// What kind of credential this is.
+    pub fn source(&self) -> GoogleSource {
+        self.source
+    }
+
+    /// The host identity this credential is, if it is one: the metadata
+    /// server, the host's ADC file, or WIF signed with the host's own AWS
+    /// chain. `None` for a source's own service-account key or a WIF exchange
+    /// signed with an embedder's (per-tenant) subject.
+    pub fn host_kind(&self) -> Option<HostIdentityKind> {
+        match self.source {
+            GoogleSource::Metadata => Some(HostIdentityKind::GoogleMetadata),
+            GoogleSource::ApplicationDefault => Some(HostIdentityKind::GoogleApplicationDefault),
+            GoogleSource::ExternalAccount { host_signed: true } => {
+                Some(HostIdentityKind::GoogleHostSignedWif)
+            }
+            GoogleSource::ServiceAccount | GoogleSource::ExternalAccount { host_signed: false } => {
+                None
+            }
+        }
+    }
+
+    /// Refuse, before any token is minted, to send this identity's token to
+    /// `url` when it is a host identity and `url` is not one of Google's APIs
+    /// (or a host the operator listed in [`TOKEN_HOSTS_ENV`]). A host identity
+    /// is the server's own: a source naming `https://attacker.example` as its
+    /// catalog must not receive the server's token. A source's own
+    /// credential (service-account key, embedder-signed WIF) goes wherever
+    /// the source points: it is the tenant's to give.
+    pub fn ensure_token_destination(&self, url: &str) -> Result<()> {
+        let Some(kind) = self.host_kind() else {
+            return Ok(());
+        };
+        token_destination_allowed(url, &self.endpoints.token_hosts)
+            .map_err(|host| IcebergError::GoogleTokenHostRefused { kind, host })
+    }
+
+    fn key(&self, scopes: &[String], adc: Option<&adc::AdcFile>) -> cache::TokenKey {
+        cache::TokenKey {
+            identity: self.fingerprint.clone(),
+            binding: adc.map(adc::AdcFile::binding).or(self.binding),
+            subject: self.subject.clone(),
+            scopes: scopes.to_vec(),
+        }
+    }
+
+    /// Mint a token. `adc` is the file [`read_adc`](Self::read_adc) read for
+    /// this call, so the token is minted from the secrets that key it.
+    async fn fetch(&self, scopes: &[String], adc: Option<&adc::AdcFile>) -> Result<CachedToken> {
+        let token = match &self.material {
+            Material::Metadata(source) => source.fetch(scopes).await,
+            Material::ServiceAccount(key) => self.fetch_service_account(key, scopes).await,
+            #[cfg(feature = "aws")]
+            Material::ExternalAccount { spec, subject } => {
+                spec.fetch(subject.as_ref(), &self.http, &self.endpoints, scopes)
+                    .await
+            }
+            Material::ApplicationDefault { .. } => match adc {
+                Some(adc::AdcFile::AuthorizedUser(user)) => {
+                    user.fetch(&self.http, &self.endpoints, scopes).await
+                }
+                Some(adc::AdcFile::ServiceAccount(key)) => {
+                    self.fetch_service_account(key, scopes).await
+                }
+                None => Err(IcebergError::GoogleCredentialsInvalid(
+                    "application_default: the credentials file was not read".to_string(),
+                )),
+            },
+        }?;
+        tracing::debug!(
+            source = ?self.source,
+            principal = %self.principal,
+            valid_for_s = (token.expires_at - Utc::now()).num_seconds(),
+            "Google access token minted"
+        );
+        Ok(token)
+    }
+
+    #[cfg(feature = "aws")]
+    async fn fetch_service_account(
+        &self,
+        key: &service_account::ServiceAccountKey,
+        scopes: &[String],
+    ) -> Result<CachedToken> {
+        key.fetch(&self.http, &self.endpoints.oauth2_token, scopes)
+            .await
+    }
+
+    #[cfg(not(feature = "aws"))]
+    async fn fetch_service_account(
+        &self,
+        _key: &service_account::ServiceAccountKey,
+        _scopes: &[String],
+    ) -> Result<CachedToken> {
+        Err(signing_unavailable("service_account"))
+    }
+}
+
+/// The parts of an identity each source works out.
+struct Built {
+    material: Material,
+    source: GoogleSource,
+    principal: String,
+    file_quota_project: Option<String>,
+    fingerprint: String,
+    binding: Option<[u8; 32]>,
+    subject: String,
+}
+
+impl Built {
+    fn service_account(
+        key: service_account::ServiceAccountKey,
+        endpoints: &GoogleEndpoints,
+    ) -> Result<Self> {
+        require_signing("service_account")?;
+        let binding = Some(key.binding);
+        Ok(Built {
+            fingerprint: format!(
+                "sa|{}|{}|{}",
+                key.client_email, key.private_key_id, endpoints.oauth2_token
+            ),
+            principal: key.client_email.clone(),
+            file_quota_project: key.quota_project_id.clone(),
+            material: Material::ServiceAccount(key),
+            source: GoogleSource::ServiceAccount,
+            binding,
+            subject: "-".to_string(),
+        })
+    }
+
+    #[cfg(feature = "aws")]
+    fn external_account(
+        spec: external_account::ExternalAccountSpec,
+        ctx: &IdentityContext,
+        endpoints: &GoogleEndpoints,
+    ) -> Result<Self> {
+        // An embedder's subject is its own per-tenant identity; only the
+        // host's chain is a host identity the policy governs.
+        let (subject, subject_key, host_signed): (Arc<dyn AwsSubjectCredentials>, String, bool) =
+            match &ctx.aws_subject {
+                Some(subject) => (
+                    Arc::clone(subject),
+                    format!("embedder:{}", subject.principal_key()),
+                    false,
+                ),
+                None => {
+                    ctx.policy.ensure(HostIdentityKind::GoogleHostSignedWif)?;
+                    (
+                        Arc::new(aws_subject::HostAwsSubject::default()),
+                        aws_subject::HOST_PRINCIPAL_KEY.to_string(),
+                        true,
+                    )
+                }
+            };
+        let principal = match &spec.impersonate {
+            Some(email) => format!("wif:{}→{email}", spec.audience),
+            None => format!("wif:{}", spec.audience),
+        };
+        Ok(Built {
+            fingerprint: format!(
+                "wif|{}|{}|{}|{}|{}",
+                spec.audience,
+                spec.impersonate.as_deref().unwrap_or("-"),
+                spec.lifetime_secs,
+                endpoints.sts_token,
+                endpoints.iam_credentials
+            ),
+            principal,
+            file_quota_project: spec.quota_project_id.clone(),
+            source: GoogleSource::ExternalAccount { host_signed },
+            material: Material::ExternalAccount { spec, subject },
+            binding: None,
+            subject: subject_key,
+        })
+    }
+
+    #[cfg(not(feature = "aws"))]
+    fn external_account(
+        _spec: external_account::ExternalAccountSpec,
+        _ctx: &IdentityContext,
+        _endpoints: &GoogleEndpoints,
+    ) -> Result<Self> {
+        Err(signing_unavailable("external_account"))
+    }
+}
+
+/// Signing needs the `aws` feature; refuse where it is off.
+fn require_signing(source: &str) -> Result<()> {
+    if cfg!(feature = "aws") {
+        Ok(())
+    } else {
+        Err(signing_unavailable(source))
+    }
+}
+
+/// Typed like any other credential refusal, so it surfaces as
+/// `err:auth/GoogleCredentialsInvalid` (400) rather than a generic error.
+fn signing_unavailable(source: &str) -> IcebergError {
+    IcebergError::GoogleCredentialsInvalid(format!(
+        "{source} credentials are not available in this build: they need request \
+         signing, which this fluree-db-iceberg was compiled without (the `aws` feature)"
+    ))
+}
+
+/// A digest binding a cached token to the secret parts that prove its
+/// identity. Each part is length-prefixed, so no two splits of the same bytes
+/// collide. Held in memory only; never logged or persisted.
+pub(super) fn secret_binding(parts: &[&str]) -> [u8; 32] {
+    use sha2::Digest;
+    let mut digest = sha2::Sha256::new();
+    for part in parts {
+        digest.update((part.len() as u64).to_le_bytes());
+        digest.update(part.as_bytes());
+    }
+    digest.finalize().into()
+}
+
+/// Sorted, de-duplicated scopes; cloud-platform when none are given.
+fn normalize_scopes(scopes: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = scopes
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if out.is_empty() {
+        out.push(CLOUD_PLATFORM_SCOPE.to_string());
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The scopes a token for `scopes` is minted for. A user's credentials (an
+/// `authorized_user` ADC file, gcloud's `application-default login`) are a
+/// refresh token, and a refresh grant may request only scopes the user
+/// consented to: gcloud's login consents to cloud-platform, so asking for
+/// `devstorage.read_only` is refused (`400 invalid_scope`). A user's token is
+/// therefore never down-scoped: it is minted for cloud-platform, for the
+/// catalog and for storage alike, which then share one cached token. User
+/// credentials are for development on a person's own machine, and a host
+/// identity the operator can refuse (`google-adc`). Every other source (a
+/// service account, WIF, the metadata server, an ADC service-account key) is
+/// minted for exactly the scopes asked: read-only for storage.
+fn grantable_scopes(scopes: Vec<String>, adc: Option<&adc::AdcFile>) -> Vec<String> {
+    match adc {
+        Some(adc::AdcFile::AuthorizedUser(_)) => vec![CLOUD_PLATFORM_SCOPE.to_string()],
+        _ => scopes,
+    }
+}
+
+/// Parse a stored comma-separated scope list (`None` → cloud-platform).
+pub(crate) fn parse_scopes(scopes: Option<&str>) -> Result<Vec<String>> {
+    let Some(raw) = scopes else {
+        return Ok(vec![CLOUD_PLATFORM_SCOPE.to_string()]);
+    };
+    let parsed: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if parsed.is_empty() || parsed.iter().any(|s| s.contains(char::is_whitespace)) {
+        return Err(IcebergError::GoogleCredentialsInvalid(
+            "scopes must be a comma-separated list of OAuth scopes".to_string(),
+        ));
+    }
+    Ok(normalize_scopes(
+        &parsed.iter().map(String::as_str).collect::<Vec<_>>(),
+    ))
+}
+
+/// A Google Cloud project id as `x-goog-user-project` takes it (including the
+/// legacy domain-scoped `example.com:project` form).
+pub(crate) fn is_project_id(project: &str) -> bool {
+    !project.is_empty()
+        && project.len() <= 100
+        && project
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b':' | b'_'))
+}
+
+/// A service-account email (`name@project.iam.gserviceaccount.com`, or a
+/// Google-managed one): one `@`, and nothing that could leave a URL path
+/// segment.
+pub(crate) fn is_service_account_email(email: &str) -> bool {
+    let Some((local, domain)) = email.split_once('@') else {
+        return false;
+    };
+    let part = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_'))
+    };
+    email.len() <= 254 && part(local) && part(domain) && domain.contains('.')
+}
+
+/// Google's public universe.
+fn is_google_universe(universe: &str) -> bool {
+    universe == "googleapis.com"
+}
+
+/// Catalog auth with a [`GoogleIdentity`]: `Authorization: Bearer <token>`,
+/// plus `x-goog-user-project` when the identity carries a quota project.
+pub struct GoogleCatalogAuth {
+    identity: Arc<GoogleIdentity>,
+    scopes: Vec<String>,
+}
+
+impl std::fmt::Debug for GoogleCatalogAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleCatalogAuth")
+            .field("identity", &self.identity)
+            .field("scopes", &self.scopes)
+            .finish()
+    }
+}
+
+impl GoogleCatalogAuth {
+    /// Authenticate requests as `identity` with `scopes`.
+    pub fn new(identity: Arc<GoogleIdentity>, scopes: Vec<String>) -> Self {
+        Self { identity, scopes }
+    }
+
+    /// The identity requests are made as.
+    pub fn identity(&self) -> &GoogleIdentity {
+        &self.identity
+    }
+
+    fn scope_refs(&self) -> Vec<&str> {
+        self.scopes.iter().map(String::as_str).collect()
+    }
+
+    /// The headers for a request to `url`. The destination is checked first,
+    /// so a token that may not go there is never even minted.
+    async fn headers(&self, url: &str) -> Result<HeaderMap> {
+        self.identity.ensure_token_destination(url)?;
+        let token = self.identity.access_token(&self.scope_refs()).await?;
+        let mut headers = HeaderMap::new();
+        let mut bearer =
+            HeaderValue::from_str(&format!("Bearer {}", token.token)).map_err(|_| {
+                IcebergError::Auth("Google issued an unusable access token".to_string())
+            })?;
+        bearer.set_sensitive(true);
+        headers.insert(AUTHORIZATION, bearer);
+        if let Some(project) = self.identity.quota_project() {
+            // Validated as a project id at construction, so always a valid value.
+            let value = HeaderValue::from_str(project).map_err(|_| {
+                IcebergError::GoogleCredentialsInvalid(
+                    "quota_project is not a Google Cloud project id".to_string(),
+                )
+            })?;
+            headers.insert(HeaderName::from_static(QUOTA_PROJECT_HEADER), value);
+        }
+        Ok(headers)
+    }
+}
+
+#[async_trait(?Send)]
+impl CatalogAuth for GoogleCatalogAuth {
+    async fn request_headers(&self, url: &str) -> Result<HeaderMap> {
+        self.headers(url).await
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        self.identity.refresh(&self.scope_refs()).await
+    }
+}
+
+#[async_trait]
+impl SendCatalogAuth for GoogleCatalogAuth {
+    async fn request_headers(&self, url: &str) -> Result<HeaderMap> {
+        self.headers(url).await
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        self.identity.refresh(&self.scope_refs()).await
+    }
+}
+
+/// The metadata URL a stored `google_metadata` record names must be this
+/// process's own (see [`metadata::check_stored_url`]).
+pub(crate) fn check_stored_metadata_url(
+    stored: Option<&str>,
+    endpoints: &GoogleEndpoints,
+) -> Result<()> {
+    metadata::check_stored_url(stored, &endpoints.metadata_token)
+}
+
+#[cfg(test)]
+mod tests;

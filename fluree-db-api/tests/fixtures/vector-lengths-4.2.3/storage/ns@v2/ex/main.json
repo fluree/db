@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "@id": "ex:main",
+  "@type": [
+    "f:LedgerSource"
+  ],
+  "f:ledger": {
+    "@id": "ex"
+  },
+  "f:branch": "main",
+  "f:commitCid": "bagaybqabciqkxop4mfmakhmti32riedrzzvuhzh4ywntz574ii4mznttdin6tza",
+  "f:t": 2,
+  "f:status": "ready",
+  "f:statusV": 1,
+  "f:configV": 0
+}

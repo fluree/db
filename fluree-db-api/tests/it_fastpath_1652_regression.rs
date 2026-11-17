@@ -109,8 +109,9 @@ fn star_turtle() -> String {
 /// Chain ledger: `?a ex:sigPub ?b . ?b rdf:type ?c` with a `rdfs:subClassOf`
 /// tail on `?c` (classes c-0/c-1 have 2/1 superclasses, the rest none), plus a
 /// mixed-object `ex:kind` second hop and literal objects sprinkled into
-/// `sigPub` itself. Indexed with 3-row leaflets so object groups of the POST
-/// walk straddle leaflet boundaries — the shape that lost rows.
+/// `sigPub` itself, and an all-IRI `ex:cites` (a → b) to head an OPTIONAL
+/// chain. Indexed with 3-row leaflets so object groups of the POST walk
+/// straddle leaflet boundaries — the shape that lost rows.
 fn chain_turtle() -> String {
     let mut buf = String::from(
         "@prefix ex: <http://example.org/ns/> .\n\
@@ -141,6 +142,9 @@ fn chain_turtle() -> String {
             buf.push_str(&format!(", \"lit-{i}\" "));
         }
         buf.push_str(" .\n");
+    }
+    for i in 0..N_A {
+        buf.push_str(&format!("ex:a-{i:04} ex:cites ex:b-{:04} .\n", i % N_B));
     }
     buf
 }
@@ -240,7 +244,8 @@ enum Routing {
 struct Case {
     name: &'static str,
     ledger: Ledger,
-    sparql: &'static str,
+    /// SPARQL, or a JSON-LD query (a string starting with `{`).
+    query: &'static str,
     /// Hand-pinned rows as `normalize` renders them (sorted JSON row strings).
     /// Both the fast lane and the generic pipeline must produce exactly this.
     expected: &'static [&'static str],
@@ -259,7 +264,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star topk COUNT over signature star",
             ledger: Star,
-            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+            query: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
                      ?s ex:bibtexType ?o1 . ?s ex:hasSignature ?o2 .\n\
                      } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
             expected: &[
@@ -273,7 +278,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star topk COUNT over string-tag star",
             ledger: Star,
-            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+            query: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
                      ?s ex:bibtexType ?o1 . ?s ex:hasTag ?o2 .\n\
                      } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
             expected: &[
@@ -290,7 +295,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star topk COUNT over two-predicate star",
             ledger: Star,
-            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+            query: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
                      ?s ex:bibtexType ?o1 . ?s ex:hasSignature ?o2 . ?s ex:hasTag ?o3 .\n\
                      } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
             expected: &[
@@ -307,7 +312,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star topk COUNT+MIN+MAX",
             ledger: Star,
-            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) (MIN(?s) AS ?mn) (MAX(?s) AS ?mx) WHERE {\n\
+            query: "SELECT ?o1 (COUNT(?s) AS ?count) (MIN(?s) AS ?mn) (MAX(?s) AS ?mx) WHERE {\n\
                      ?s ex:bibtexType ?o1 . ?s ex:hasSignature ?o2 .\n\
                      } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
             expected: &[
@@ -325,7 +330,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star topk shared filter object var declines",
             ledger: Star,
-            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+            query: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
                      ?s ex:bibtexType ?o1 . ?s ex:refA ?x . ?s ex:refB ?x .\n\
                      } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
             expected: &[
@@ -342,7 +347,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "star topk distinct filter object vars keep the lane",
             ledger: Star,
-            sparql: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
+            query: "SELECT ?o1 (COUNT(?s) AS ?count) WHERE {\n\
                      ?s ex:bibtexType ?o1 . ?s ex:refA ?x . ?s ex:refB ?y .\n\
                      } GROUP BY ?o1 ORDER BY DESC(?count) LIMIT 10",
             expected: &[
@@ -361,14 +366,14 @@ fn cases() -> Vec<Case> {
         Case {
             name: "chain COUNT(*) plain",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c . }",
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c . }",
             expected: &["[57]"],
             routing: MustFire(PLAN_SITE),
         },
         Case {
             name: "chain COUNT(*) OPTIONAL tail",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c .\n\
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c .\n\
                      OPTIONAL { ?c rdfs:subClassOf ?d . } }",
             expected: &["[67]"],
             routing: MustFire(PLAN_SITE),
@@ -376,7 +381,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "chain COUNT(*) MINUS tail",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c .\n\
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c .\n\
                      MINUS { ?c rdfs:subClassOf ?d . } }",
             expected: &["[41]"],
             routing: MustFire(PLAN_SITE),
@@ -384,7 +389,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "chain COUNT(*) EXISTS tail",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c .\n\
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b rdf:type ?c .\n\
                      FILTER EXISTS { ?c rdfs:subClassOf ?d . } }",
             expected: &["[16]"],
             routing: MustFire(PLAN_SITE),
@@ -395,14 +400,14 @@ fn cases() -> Vec<Case> {
         Case {
             name: "chain COUNT(*) mixed-object hop",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c . }",
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c . }",
             expected: &["[54]"],
             routing: MustFire(PLAN_SITE),
         },
         Case {
             name: "chain COUNT(*) mixed-object hop, OPTIONAL tail",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c .\n\
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c .\n\
                      OPTIONAL { ?c rdfs:subClassOf ?d . } }",
             expected: &["[56]"],
             routing: MustFire(PLAN_SITE),
@@ -410,9 +415,20 @@ fn cases() -> Vec<Case> {
         Case {
             name: "chain COUNT(*) mixed-object hop, MINUS tail",
             ledger: Chain,
-            sparql: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c .\n\
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:sigPub ?b . ?b ex:kind ?c .\n\
                      MINUS { ?c rdfs:subClassOf ?d . } }",
             expected: &["[52]"],
+            routing: MustFire(PLAN_SITE),
+        },
+        // OPTIONAL chain head through the mixed-object hop: `ex:kind`'s mixed
+        // leaflets must decode `o_type` so its literals weigh 0. Only b-0000
+        // reaches a class with superclasses (c-0, two), and a-0/a-25 cite it.
+        Case {
+            name: "chain-head COUNT(*) OPTIONAL through mixed-object hop",
+            ledger: Chain,
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?a ex:cites ?b .\n\
+                     OPTIONAL { ?b ex:kind ?c . ?c rdfs:subClassOf ?d . } }",
+            expected: &["[42]"],
             routing: MustFire(PLAN_SITE),
         },
         // ---- Case 3: composite (s,o) join ---------------------------------
@@ -422,8 +438,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "composite join, no arena values (keeps fast path)",
             ledger: CompositeClean,
-            sparql:
-                "SELECT (COUNT(*) AS ?count) WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }",
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }",
             expected: &["[5]"],
             routing: MustFire(PLAN_SITE),
         },
@@ -433,13 +448,15 @@ fn cases() -> Vec<Case> {
         Case {
             name: "composite join, arena values (declines to generic)",
             ledger: CompositeNumBig,
-            sparql:
-                "SELECT (COUNT(*) AS ?count) WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }",
+            query: "SELECT (COUNT(*) AS ?count) WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }",
             expected: &["[9]"],
             routing: MustNotFire(PLAN_SITE),
         },
-        // List rows (`o_i`): the generic join treats every list element as its
-        // own fact, so a var-object join is a bag join over them today — s2's
+        // List rows (`o_i`), in JSON-LD, which reads a list's members as values
+        // of its predicate (SPARQL reads them as RDF list cells, which no two
+        // lists share; see `it_sparql_lists`). The generic join treats every
+        // list element as its own fact, so a var-object join is a bag join over
+        // them — s2's
         // two `q-1` entries on each side pair up 2×2 = 4, s3 pairs its single
         // shared `r-1` once, and s1 never matches (see the fixture). This pins
         // what the generic pipeline yields, not a ruling: whether list
@@ -447,15 +464,18 @@ fn cases() -> Vec<Case> {
         // settling it may change this number. What the case does assert is
         // that the count lane cannot express the shape in an
         // (s, o_type, o_key) key, so it must decline and agree with whatever
-        // the generic join answers. (The membership lane would answer as a
+        // the generic join answers. (The membership lane used to answer as a
         // semi-join — one row per driving row, 3 — which the planner's
-        // driving-size gate now keeps it away from at this fixture's size;
-        // the lane's answer at or above the gate is unpinned.)
+        // driving-size gate keeps away from this fixture's size; its answer
+        // at or above the gate is pinned to the generic one by
+        // `it_membership_join_list_rows`, #1687.)
         Case {
             name: "composite join, list rows (declines to generic)",
             ledger: CompositeList,
-            sparql:
-                "SELECT (COUNT(*) AS ?count) WHERE { ?s ex:createdBy ?o . ?s ex:authoredBy ?o }",
+            query: r#"{"@context": {"ex": "http://example.org/ns/"},
+                       "select": ["(as (count *) ?count)"],
+                       "where": [{"@id": "?s", "ex:createdBy": "?o"},
+                                 {"@id": "?s", "ex:authoredBy": "?o"}]}"#,
             expected: &["[5]"],
             routing: MustNotFire(PLAN_SITE),
         },
@@ -550,16 +570,22 @@ async fn setup_list_ledger(alias: &str) -> (tempfile::TempDir, Fluree) {
     (dir, fluree)
 }
 
-async fn run_query(fluree: &Fluree, alias: &str, sparql: &str) -> Value {
-    let full = format!("{PREFIX}{sparql}");
+async fn run_query(fluree: &Fluree, alias: &str, query: &str) -> Value {
     let snapshot = fluree.graph(alias).load().await.expect("load");
-    snapshot
-        .query()
-        .sparql(&full)
+    let full = format!("{PREFIX}{query}");
+    let jsonld: Value;
+    let builder = snapshot.query();
+    let builder = if query.trim_start().starts_with('{') {
+        jsonld = serde_json::from_str(query).expect("JSON-LD query");
+        builder.jsonld(&jsonld)
+    } else {
+        builder.sparql(&full)
+    };
+    builder
         .format(FormatterConfig::jsonld())
         .execute_formatted()
         .await
-        .unwrap_or_else(|e| panic!("query {sparql}: {e}"))
+        .unwrap_or_else(|e| panic!("query {query}: {e}"))
 }
 
 fn normalize(rows: &Value) -> Vec<String> {
@@ -617,7 +643,7 @@ async fn issue_1652_shapes_match_generic_and_keep_their_fast_paths() {
     for c in &cases {
         let (fluree, alias) = env(c.ledger);
         let before = store.find_events("fast-path outcome").len();
-        fast.push(normalize(&run_query(fluree, alias, c.sparql).await));
+        fast.push(normalize(&run_query(fluree, alias, c.query).await));
         proceeded.push(
             store.find_events("fast-path outcome")[before..]
                 .iter()
@@ -633,7 +659,7 @@ async fn issue_1652_shapes_match_generic_and_keep_their_fast_paths() {
     let mut generic: Vec<Vec<String>> = Vec::new();
     for c in &cases {
         let (fluree, alias) = env(c.ledger);
-        generic.push(normalize(&run_query(fluree, alias, c.sparql).await));
+        generic.push(normalize(&run_query(fluree, alias, c.query).await));
     }
     set_fast_paths_disabled(false);
 

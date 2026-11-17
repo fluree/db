@@ -83,13 +83,14 @@ impl NamespaceRegistry {
     /// defaults. This indicates corrupt persisted data — no legacy data
     /// exists to recover from, so failing fast is the correct behavior.
     pub fn from_db(snapshot: &LedgerSnapshot) -> Self {
-        let mut codes = NamespaceCodes::new(); // seeded with defaults
-        let snapshot_ns: HashMap<u16, String> = snapshot
-            .namespaces()
-            .iter()
-            .map(|(&k, v)| (k, v.clone()))
-            .collect();
-        codes.merge_delta(&snapshot_ns).unwrap_or_else(|e| {
+        // Shared by refcount, not copied: a ledger with thousands of
+        // namespaces would otherwise rebuild both tables on every
+        // transaction.
+        let codes = NamespaceCodes::layered_over(
+            snapshot.shared_namespaces(),
+            snapshot.shared_namespace_reverse(),
+        )
+        .unwrap_or_else(|e| {
             panic!(
                 "namespace conflict merging snapshot into defaults — \
                  snapshot namespace codes are corrupt: {e}"
@@ -425,7 +426,7 @@ impl SharedNamespaceAllocator {
     /// assignments from the registry.
     /// Returns `Err` on a namespace bimap conflict.
     pub fn sync_from_registry(&self, reg: &NamespaceRegistry) -> Result<(), NsAllocError> {
-        let delta = reg.codes.code_to_prefix_map().clone();
+        let delta = reg.codes.code_to_prefix_map();
         let mut inner = self.inner.write();
         inner.merge_delta(&delta)
     }
@@ -437,11 +438,7 @@ impl SharedNamespaceAllocator {
     /// the snapshot.
     pub fn snapshot(&self) -> (FxHashMap<String, u16>, u16) {
         let inner = self.inner.read();
-        let codes: FxHashMap<String, u16> = inner
-            .prefix_to_code_map()
-            .iter()
-            .map(|(k, &v)| (k.clone(), v))
-            .collect();
+        let codes: FxHashMap<String, u16> = inner.prefix_to_code_map().into_iter().collect();
         (codes, inner.next_code())
     }
 }
@@ -529,6 +526,11 @@ impl WorkerCache {
         Sid::new(BLANK_NODE, local)
     }
 
+    /// The prefix a namespace code stands for.
+    pub fn prefix_for_code(&self, code: u16) -> Option<String> {
+        self.alloc.get_prefix(code)
+    }
+
     /// Consume the cache and return the set of codes first observed after
     /// the snapshot. The serial finalizer uses these for commit-order publication.
     pub fn into_new_codes(self) -> FxHashSet<u16> {
@@ -582,6 +584,27 @@ impl NsAllocator<'_> {
             NsAllocator::Exclusive(reg) => reg.blank_node_sid(unique_id),
             NsAllocator::Cached(cache) => cache.blank_node_sid(unique_id),
         }
+    }
+
+    /// The IRI a SID from [`Self::sid_for_iri`] stands for, or `None` when
+    /// its namespace code has no prefix here. An overflow Sid carries its
+    /// whole IRI in `name`, under no prefix.
+    pub fn iri_for_sid(&self, sid: &Sid) -> Option<String> {
+        if sid.namespace_code == OVERFLOW {
+            return Some(sid.name.to_string());
+        }
+        let prefix = match self {
+            NsAllocator::Exclusive(reg) => reg.get_prefix(sid.namespace_code).map(str::to_string),
+            NsAllocator::Cached(cache) => cache.prefix_for_code(sid.namespace_code),
+        }?;
+        Some(format!("{prefix}{}", sid.name))
+    }
+
+    /// The IRI `sid` names, for a message: [`Self::iri_for_sid`], or the bare
+    /// name when its namespace code has no prefix here.
+    pub fn iri(&self, sid: &Sid) -> String {
+        self.iri_for_sid(sid)
+            .unwrap_or_else(|| sid.name.to_string())
     }
 }
 

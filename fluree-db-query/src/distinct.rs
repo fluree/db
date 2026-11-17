@@ -6,12 +6,13 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
-use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
+use crate::object_binding::{equality_norm, normalize_for_key_cow, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use hashbrown::HashMap;
 use rustc_hash::{FxBuildHasher, FxHasher};
+use std::borrow::Cow;
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -58,6 +59,11 @@ impl DistinctOperator {
         }
     }
 
+    /// Recover the child when a runtime-only dedup wrapper is closed.
+    pub(crate) fn into_child(self) -> BoxedOperator {
+        self.child
+    }
+
     /// Get the number of unique rows seen so far
     pub fn unique_count(&self) -> usize {
         self.seen.len()
@@ -87,6 +93,19 @@ impl DistinctOperator {
 
 #[async_trait]
 impl Operator for DistinctOperator {
+    // The trait object has no Default; replace it with a closed wrapper's stub.
+    #[allow(clippy::box_default)]
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        if self.state != OperatorState::Created {
+            return None;
+        }
+        self.state = OperatorState::Closed;
+        Some(std::mem::replace(
+            &mut self.child,
+            Box::new(crate::seed::EmptyOperator::new()),
+        ))
+    }
+
     /// Item 11 (F-AUD-7): DECLINE forwarding — DISTINCT may collapse arbitrarily
     /// many input rows into one, so producing `k` distinct rows can require
     /// unboundedly many input rows. Explicit (was a silent trait-default no-op) so
@@ -174,24 +193,32 @@ impl Operator for DistinctOperator {
             }
 
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            // Reused across rows: a duplicate row costs a hash and a probe, no
+            // allocation; only rows that survive are copied into an owned key.
+            let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
 
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             for row_idx in 0..batch.len() {
                 if self.norm.is_some() {
-                    let (store, gv) = EqualityNorm::parts(&self.norm);
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
-                    // bindings pass through untouched).
-                    let signature: RowSignature = (0..num_cols)
-                        .map(|col| normalize_for_key(batch.get_by_col(row_idx, col), store, gv))
-                        .collect();
+                    // bindings pass through untouched, borrowed).
+                    scratch.clear();
+                    scratch.extend((0..num_cols).map(|col| {
+                        normalize_for_key_cow(batch.get_by_col(row_idx, col), dicts, gv)
+                    }));
+                    // `Cow` hashes as the binding it wraps, so this equals the
+                    // stored `Vec<Binding>` hash the map recomputes on rehash.
                     let mut h = FxHasher::default();
-                    signature.hash(&mut h);
+                    scratch.hash(&mut h);
                     let hash = h.finish();
-                    let entry = self
-                        .seen
-                        .raw_entry_mut()
-                        .from_hash(hash, |sig| *sig == signature);
+                    let entry = self.seen.raw_entry_mut().from_hash(hash, |sig| {
+                        sig.len() == scratch.len()
+                            && sig.iter().zip(&scratch).all(|(a, b)| a == b.as_ref())
+                    });
                     if let hashbrown::hash_map::RawEntryMut::Vacant(v) = entry {
+                        let signature: RowSignature =
+                            scratch.iter().map(|b| b.as_ref().clone()).collect();
                         v.insert_hashed_nocheck(hash, signature, ());
                         for (col_idx, col) in columns.iter_mut().enumerate() {
                             col.push(batch.get_by_col(row_idx, col_idx).clone());
@@ -342,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_unique() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -377,7 +404,7 @@ mod tests {
     /// returned an empty graph instead of its one triple.
     #[tokio::test]
     async fn test_distinct_zero_column_batches_yield_exactly_one_row() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -408,7 +435,7 @@ mod tests {
     /// the fix must not manufacture a row out of an empty solution sequence.
     #[tokio::test]
     async fn test_distinct_zero_column_empty_child_stays_empty() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -421,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_duplicates() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -440,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_mixed() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -477,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_across_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -510,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_batch_all_dupes_skipped() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -538,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_multi_column() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -558,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_unbound() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -583,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_poisoned() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -608,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -639,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

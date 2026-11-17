@@ -46,8 +46,9 @@
 //!   `TranslationFailed` (no silent drop; dropping a target would
 //!   produce a structurally weaker policy than authored).
 
+use super::types::ModelHead;
+use super::ResolveCtx;
 use super::{encode_system_iri, CrossLedgerError};
-use crate::Fluree;
 use fluree_db_core::{FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeTest, Sid};
 use fluree_vocab::policy_iris;
 
@@ -70,22 +71,23 @@ use std::collections::HashSet;
 #[tracing::instrument(
     name = "cross_ledger.policy.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
-        resolved_t = resolved_t,
+        resolved_t = head.t,
     ),
 )]
 pub(super) async fn materialize_policy_rules(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
-    fluree: &Fluree,
+    head: &ModelHead,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<PolicyArtifactWire, CrossLedgerError> {
-    // 1. Open M at resolved_t.
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let resolved_t = head.t;
+    // 1. Open M at its head.
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, head)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
@@ -95,13 +97,14 @@ pub(super) async fn materialize_policy_rules(
 
     // 2. Resolve graph_iri → g_id in M's graph registry (handling
     //    `f:defaultGraph` as g_id=0).
-    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri)?.ok_or_else(|| {
-        CrossLedgerError::GraphMissingAtT {
-            ledger_id: canonical_model_ledger_id.to_string(),
-            graph_iri: graph_iri.to_string(),
-            resolved_t,
-        }
-    })?;
+    let g_id =
+        super::resolve_selector_g_id(&m_db.snapshot, graph_iri, m_db.t)?.ok_or_else(|| {
+            CrossLedgerError::GraphMissingAtT {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+            }
+        })?;
 
     // 3. Encode the predicate IRIs we need to scan against M's
     //    namespace map. These come from default namespaces
@@ -185,6 +188,10 @@ pub(super) async fn materialize_policy_rules(
     //    set. Subjects the loader returns `None` for are silently
     //    skipped — that's the existing local-side semantics for
     //    malformed rules.
+    // Sorted so the wire artifact (and everything cached from it) is
+    // deterministic rather than following HashSet iteration order.
+    let mut policy_subjects: Vec<Sid> = policy_subjects.into_iter().collect();
+    policy_subjects.sort();
     let policy_graphs = [g_id];
     let mut wire_restrictions = Vec::with_capacity(policy_subjects.len());
     for policy_sid in policy_subjects {
@@ -230,6 +237,7 @@ pub(super) async fn materialize_policy_rules(
             model_ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
+            commit_id: head.commit_id.clone(),
         },
         restrictions: wire_restrictions,
     })

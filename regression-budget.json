@@ -4,7 +4,15 @@
   "_comment": "Per-bench, per-scale percentage regression CI accepts. 5.0 means observed time may exceed the committed baseline by up to 5%. Omitted scales fall back to default_budget_pct. Numbers below are placeholders until the first nightly run lands a baseline; tighten them in a follow-up PR once baselines exist. See BENCHMARKING.md and docs/contributing/benches.md.",
   "crates": {
     "fluree-db-api": {
+      "policy_authorization": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
       "insert_formats": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
+      "jsonld_parse": {
         "tiny": 10.0,
         "small": 5.0
       },
@@ -29,12 +37,27 @@
         "small": 5.0,
         "medium": 5.0
       },
+      "transact_upsert_replace": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "transact_delete_wide_slot": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
       "query_overlay_only_range": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 5.0
       },
       "query_cold_reload": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
+      "query_time_travel_below_index": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 5.0
@@ -69,12 +92,32 @@
         "small": 5.0,
         "medium": 5.0
       },
+      "annotation_varlength_probe": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 5.0
+      },
       "query_hot_bsbm_bi": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
       },
       "query_hot_optional": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_negation_count": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_limit_startup": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "datalog_fixpoint": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
@@ -89,7 +132,27 @@
         "small": 5.0,
         "medium": 3.0
       },
+      "query_hot_list_view": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_construct_formats": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
       "query_hot_fanout_star": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_values_star": {
+        "tiny": 10.0,
+        "small": 5.0,
+        "medium": 3.0
+      },
+      "query_hot_grouped_projection": {
         "tiny": 10.0,
         "small": 5.0,
         "medium": 3.0
@@ -100,6 +163,20 @@
         "medium": 3.0
       },
       "graphql_schema": {
+        "small": 5.0
+      },
+      "dataset_build": {
+        "tiny": 10.0,
+        "small": 5.0
+      }
+    },
+    "fluree-db-server": {
+      "policy_http": {
+        "tiny": 10.0,
+        "small": 5.0
+      },
+      "dataset_http": {
+        "tiny": 10.0,
         "small": 5.0
       }
     },

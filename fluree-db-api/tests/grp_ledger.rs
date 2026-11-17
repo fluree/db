@@ -1,12 +1,27 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "support/merge_race.rs"]
+mod race_nameservice;
+
 #[path = "it_branch.rs"]
 mod it_branch;
+#[path = "it_branch_shacl.rs"]
+mod it_branch_shacl;
+#[path = "it_branch_time_travel.rs"]
+mod it_branch_time_travel;
+#[path = "it_commit_contention.rs"]
+mod it_commit_contention;
 #[path = "it_drop_ledger.rs"]
 mod it_drop_ledger;
 #[path = "it_drop_named_graph.rs"]
 mod it_drop_named_graph;
+#[path = "it_graph_drop.rs"]
+mod it_graph_drop;
+#[path = "it_graph_scoped_writes.rs"]
+mod it_graph_scoped_writes;
+#[path = "it_json_canonicalization.rs"]
+mod it_json_canonicalization;
 #[path = "it_ledger_info_named_graphs.rs"]
 mod it_ledger_info_named_graphs;
 #[path = "it_ledger_lifecycle.rs"]
@@ -15,6 +30,14 @@ mod it_ledger_lifecycle;
 mod it_merge;
 #[path = "it_merge_preview.rs"]
 mod it_merge_preview;
+#[path = "it_named_graph_conflict_retractions.rs"]
+mod it_named_graph_conflict_retractions;
+#[path = "it_profile_ledger.rs"]
+mod it_profile_ledger;
+#[path = "it_push_after_merge.rs"]
+mod it_push_after_merge;
+#[path = "it_push_retraction_validation.rs"]
+mod it_push_retraction_validation;
 #[path = "it_read_your_writes.rs"]
 mod it_read_your_writes;
 #[path = "it_rebase.rs"]
@@ -23,9 +46,13 @@ mod it_rebase;
 mod it_refresh;
 #[path = "it_revert.rs"]
 mod it_revert;
+#[path = "it_revert_legacy_phantom.rs"]
+mod it_revert_legacy_phantom;
 #[path = "it_revert_preview.rs"]
 mod it_revert_preview;
 #[path = "it_stable_hashes.rs"]
 mod it_stable_hashes;
 #[path = "it_sync_graph.rs"]
 mod it_sync_graph;
+#[path = "it_sync_graph_rdf.rs"]
+mod it_sync_graph_rdf;

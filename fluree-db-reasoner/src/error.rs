@@ -27,6 +27,14 @@ pub enum ReasonerError {
         crate::KNOWN_RULE_NAMES.join(", ")
     )]
     UnknownRule(String),
+
+    /// The request the closure was computed for was cancelled.
+    #[error("Reasoning cancelled: {0}")]
+    Cancelled(fluree_db_core::QueryCancellationReason),
+
+    /// The request the closure was computed for ran out of fuel.
+    #[error(transparent)]
+    FuelExceeded(#[from] fluree_db_core::FuelExceededError),
 }
 
 /// Result type for reasoning operations

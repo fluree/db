@@ -1,5 +1,6 @@
 //! Error types for the indexer
 
+use fluree_db_core::task::TaskFailure;
 use thiserror::Error;
 
 /// Indexer errors
@@ -49,6 +50,11 @@ pub enum IndexerError {
     #[error("Background indexer has shut down")]
     IndexerShutdown,
 
+    /// A build task was cancelled: the runtime is shutting down underneath
+    /// the indexer. Not a failed build — nothing for this process to retry.
+    #[error("{0} was cancelled (runtime shutdown or abort)")]
+    Cancelled(String),
+
     /// Error applying index to ledger state
     #[error("Ledger apply error: {0}")]
     LedgerApply(String),
@@ -56,6 +62,14 @@ pub enum IndexerError {
     /// Incremental indexing aborted; caller should fall back to full rebuild.
     #[error("Incremental index aborted: {0}")]
     IncrementalAbort(String),
+
+    /// A commit's content could not be resolved into index records. Resolution
+    /// depends only on the commit's bytes and on what the build resolved before
+    /// it, so the same build fails the same way every time it runs: neither a
+    /// timed retry nor a full rebuild in place of an incremental one can
+    /// succeed.
+    #[error("Committed data cannot be indexed: {0}")]
+    Unindexable(String),
 
     /// General-purpose error for spatial index building and other auxiliary pipelines.
     #[error("{0}")]
@@ -67,6 +81,27 @@ pub enum IndexerError {
     /// a limited tracker.
     #[error("Indexer fuel limit exceeded: {0}")]
     FuelExceeded(#[from] fluree_db_core::tracking::FuelExceededError),
+}
+
+impl IndexerError {
+    /// Whether running the same build again can succeed. `false` for
+    /// [`Unindexable`](Self::Unindexable), whose cause is in the commit chain
+    /// itself; every other failure may be transient.
+    pub fn is_retryable(&self) -> bool {
+        !matches!(self, Self::Unindexable(_))
+    }
+
+    /// Classify a joined build task's `JoinError`. Cancellation gets its own
+    /// variant so the orchestrator can decline to retry; a panic keeps its
+    /// payload text and stays a `StorageWrite` failure as before.
+    pub fn from_join(task: &str, e: tokio::task::JoinError) -> Self {
+        let failure = TaskFailure::from(e);
+        if failure.is_cancelled() {
+            Self::Cancelled(task.to_string())
+        } else {
+            Self::StorageWrite(failure.describe(task))
+        }
+    }
 }
 
 impl From<serde_json::Error> for IndexerError {

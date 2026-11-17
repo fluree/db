@@ -30,31 +30,61 @@ Fluree also exposes a non-standard extension that reads commit metadata off a
 quoted triple (`<< s p o >> f:t ?t`, `f:op ?op`) for transaction-time and
 assert/retract introspection.
 
+Turtle 1.2 annotation syntax is accepted on ingest — `{| ... |}` annotation
+tails, the `~` reifier, `<< s p o >>` reified triples and
+`r rdf:reifies <<( s p o )>>` — on every Turtle write path (insert, upsert,
+import, graph sync over the CLI or `/sync`), inside TriG `GRAPH { }` blocks, and in N-Triples and
+N-Quads files. All forms assert the base triple: Fluree reifies asserted
+edges, so `<< s p o >>` is asserting here where RDF 1.2 makes it
+non-asserting. The `VERSION "1.2"` / `@version`
+directive and `--ltr` / `--rtl` base-direction language tags are accepted.
+The vendored W3C RDF 1.1 and RDF 1.2 Turtle suites run in CI
+(`testsuite-sparql/tests/w3c_rdf.rs`), with known gaps in the skip register.
+
 Not yet supported:
-- Turtle 1.2 / TriG 1.2 annotation syntax on ingest (`{| ... |}` annotation
-  tails, the `~` reifier, and `<<( ... )>>` triple terms) — convert to JSON-LD,
-  or add annotations via SPARQL `INSERT DATA`, instead
-- Triple terms as arbitrary object values (only as the `rdf:reifies` object)
+- Triple terms as arbitrary object values: `<<( ... )>>` is accepted on
+  ingest only as the object of `rdf:reifies`
 - Triple terms in subject position and nested triple terms
 - Multiple triples reified by a single annotation
 
 See [Edge annotations](../concepts/edge-annotations.md).
 
+Base-direction language tags (`"text"@en--ltr`) parse and round-trip, but are
+stored as a single `rdf:langString` whose language is the whole `en--ltr`
+string, rather than as `rdf:dirLangString` with a separate direction. Nothing
+is dropped, but `LANG()` returns `en--ltr`, JSON-LD output carries that in
+`@language`, and `langMatches(?l, "en")` will not match it. First-class
+`rdf:dirLangString` is a future extension.
+
 **Specification:** https://www.w3.org/TR/rdf12-concepts/
 
 ### JSON-LD 1.1
 
-**Status:** Fully compliant
+**Status:** Compliant, with the deviations listed below
 
 Fluree supports JSON-LD 1.1:
 - @context for namespace mappings
 - @id for resource identification
 - @type for type specification
-- @graph for multiple entities
+- @graph for multiple entities, and named graph objects (an object whose `@id` names the graph and whose `@graph` holds its nodes)
+- @reverse, @included and @nest
 - @value and @type for literals
 - @language for language tags
+- Term definitions that coerce values with `@type` (`@id`, `@vocab`, `@json` or a datatype) or set `@language` (`null` included), and terms defined as `null`, whose properties are dropped
+- `@container` values `@list`, `@set`, `@language` and `@index`
 - Nested objects
 - Arrays
+- @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
+
+Fluree extension: a node's own `"@graph": "<graph IRI>"` writes the node, and every node nested in it, to that graph (`"default"` and `"config"` name the default graph and the ledger's config graph). `@index` is accepted and ignored.
+
+Deviations from the JSON-LD 1.1 expansion algorithm:
+- Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
+- A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
+- A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
+- A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
+- `@container` values `@id`, `@type` and `@graph` are refused. A property-valued `@index` is refused where an index map uses it.
+- A string `@value` on a value object typed `@json` is read as a serialized JSON document: `{"@value": "{\"a\": 1}", "@type": "@json"}` is the object, not a string. A string under a term typed `@json` is the JSON string itself.
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
@@ -80,10 +110,20 @@ Supported SPARQL features:
 - Subqueries (evaluated independently — an inner `ORDER BY`/`LIMIT`/`OFFSET` scopes the sub-SELECT before it joins the enclosing pattern, per SPARQL 1.1 §18.2; there are no correlated/LATERAL sub-SELECTs)
 - Blank-node property lists (`[ :p ?o ]`) in subject and object position
 - Property paths (`+`, `*`, `?`, `^`, `|`, `/`, `!` negated sets, and transitive over a sequence including inverse steps `(^a/b)+`; see [SPARQL docs](../query/sparql.md#property-paths))
+- MINUS, VALUES, and FILTER EXISTS / NOT EXISTS
+- SERVICE against local ledgers (`fluree:ledger:<name>`); remote HTTP endpoints are not supported
+- Result formats: SELECT/ASK as SPARQL-results JSON or XML, CSV or TSV; CONSTRUCT/DESCRIBE as JSON-LD, Turtle, N-Triples, RDF/XML, TriG or N-Quads (see [SPARQL output negotiation](../api/endpoints.md#post-queryledger))
+- `GRAPH` blocks in a CONSTRUCT template, writing into named graphs (an extension, as in Apache Jena ARQ; see [CONSTRUCT](../query/construct.md#named-graphs-in-the-template))
 
 **Aggregate result types:** COUNT and SUM of integers return `xsd:integer` (per W3C spec), not `xsd:long`. SUM of mixed types and AVG return `xsd:double`.
 
 **Empty-group aggregates:** Over an implicit single group (no `GROUP BY`) whose pattern matches nothing, `COUNT`, `SUM`, and `AVG` return their identity `"0"^^xsd:integer` (SPARQL 1.1 §18.5.1); `MIN`, `MAX`, and `SAMPLE` have no identity element and return unbound. A query *with* `GROUP BY` over an empty pattern returns zero rows.
+
+**Grouped queries:** A query groups when it has a `GROUP BY` or an aggregate anywhere in SELECT, HAVING or ORDER BY (§18.2.4.1). Its SELECT expressions are evaluated once per group, in SELECT order (§18.2.4.4), after HAVING unless HAVING reads them (below), and `SELECT *` projects its GROUP BY keys. In HAVING and ORDER BY, a variable that is neither a key nor aggregated means `SAMPLE(?v)` (§18.2.4.1); HAVING without grouping filters the solutions (§18.2.4.2). ASK and CONSTRUCT group the same way: ASK is true when some group passes HAVING, and CONSTRUCT instantiates its template once per group, where a template variable that is not a GROUP BY key is unbound and the triples that read it are skipped (DESCRIBE refuses GROUP BY and HAVING). Two shapes are rejected rather than evaluated literally: a projected variable that is neither a GROUP BY key nor aggregated (§11.4, including when the only aggregate is in HAVING or ORDER BY), and an aggregate over an alias of the same SELECT clause, which the spec would evaluate as unbound (`COUNT` = 0 for every group).
+
+**HAVING reads SELECT aliases (extension of §18.2.4):** In a grouped query, HAVING can read an alias of the same SELECT clause, whether the alias names an aggregate (`(COUNT(?e) AS ?n) … HAVING (?n > 1)`) or an expression (`(COUNT(?e) + 0 AS ?n)`, `(IF(?a = "Net", "network", "other") AS ?seg) … HAVING (?seg = "network")`). The expressions HAVING reads, and the aliases they read in turn, are evaluated before HAVING; the others after it. Each is evaluated once per group either way, so HAVING tests the value the query returns, even for `RAND()` or `STRUUID()`. SPARQL 1.1 evaluates every SELECT expression after HAVING, so there such an alias is unbound and the HAVING condition fails. Many SPARQL engines make the same extension, and the W3C aggregate tests always repeat the aggregate in HAVING, so they pin neither reading. For a query that behaves the same everywhere, repeat the aggregate or expression in HAVING instead of reading its alias. JSON-LD `having` and Cypher `WITH … WHERE` follow the same rule.
+
+**Trailing VALUES in a grouped query (deviation from §18.2.4.3):** A `VALUES` block after the WHERE clause, at the top level of any query form or in a sub-SELECT, is joined with the WHERE solutions before grouping, so it restricts what the aggregates count: `SELECT ?a (COUNT(?e) AS ?n) WHERE { ?e ex:area ?a } GROUP BY ?a VALUES ?e { ex:e1 }` counts `ex:e1` alone. The spec joins it after HAVING instead, pairing each group row with each VALUES row. The expressions the level evaluates before grouping (an aggregate's input expression, a `GROUP BY` expression, and the SELECT expressions placed before grouping: all of them in a query that does not group) run after the join, so they read the VALUES variables: `SELECT (SUM(?n * ?v) AS ?s) WHERE { ?e ex:n ?n } VALUES ?v { 2 }` doubles the sum, at the top level as in a sub-SELECT. HAVING still reads a VALUES variable as unbound, as it would in the spec's order, unless the WHERE binds it or it is a GROUP BY key. For queries that behave the same on any SPARQL processor, put the `VALUES` block inside the WHERE clause to restrict the aggregates' input, or move the grouped query into a sub-SELECT and put the `VALUES` block after the outer WHERE to join it with the grouped rows.
 
 **Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity, an unknown datatype IRI — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.)
 
@@ -91,9 +131,13 @@ Supported SPARQL features:
 
 Why: before this, a parsed value kept its offset and source lexical while it sat in novelty and lost both once indexed (the binary index stores an instant for `dateTime`, and days / microseconds-since-midnight for `date` / `time`, with no room for an offset). So every consumer that read either — comparison, equality, hashing, arithmetic, the accessors, `TZ`, rendering — answered one thing before a background reindex and another after: the same query over unchanged data returning a different result, with no write behind it and no way for a caller to predict which they would get. Those six tests passed only because the conformance harness never reindexes. Preserving the offset instead does not fit: an `ObjKey` is a `u64` already spending 59 bits on a microsecond-range instant, an arena handle would destroy the inline key ordering that dateTime range pushdown depends on, and a sidecar would keep the offset for a value the caller can render in whichever zone they want. Discarding it at the door is what makes there be exactly one representation. **Ordering, comparison and range queries are unchanged for `dateTime`** — they always used the normalized instant. Applications that need a wall-clock offset should store it as its own property.
 
+**Fractional seconds past the microsecond are not kept (deviation from XSD's arbitrary precision):** an `xsd:dateTime` or `xsd:time` keeps six fractional digits, and digits past them are dropped the moment the value is parsed, in a write and in a query alike: `"2010-12-21T15:38:02.123456789Z"` is `"2010-12-21T15:38:02.123456Z"`. So two lexicals that differ only past the microsecond are one value for `=`, `DISTINCT`, `GROUP BY` and `ORDER BY`, and `SECONDS` returns at most six fractional digits. A query constant is held to the microsecond like every value, so it compares as the value written with it, for equality and for ordering alike: `FILTER(?t >= "2020-01-01T00:00:00.123456789Z"^^xsd:dateTime)` finds a value written with that lexical, `<` the same constant does not, and exactly one of `<`, `=` and `>` holds between a stored value and a constant. That holds for a typed literal and a cast in SPARQL, a Cypher `datetime()`/`time()` constant, and a constant bound first through `VALUES` or `BIND`, which all answer alike. A plain string compared with a temporal value (the JSON-LD filter form) is ordered as the temporal it reads as, held to the microsecond the same way. Exactly one of `<`, `=` and `>` holds for typed temporal operands only: a plain string is not value-equal to a temporal, as on earlier versions, so a string that orders equal to one satisfies `<=` and `>=` but need not satisfy `=`. Why: the commit log writes six digits and the index keys microseconds, so a value held with more matched itself only until the ledger was reloaded or indexed, and then stopped: a `DELETE DATA` naming it as written committed nothing after a restart, and a constant written past the microsecond never equalled a stored value. Dropping the digits where the value is read makes the value written the value stored. Applications that need more precision should store it as its own property.
+
 **Date/time arithmetic (extension beyond §17.3):** The operator mapping table maps `-` only over numeric operands, so `?d1 - ?d2` on two temporal values is a type error under the published spec — and, per the expression-error rule above, that surfaces as an unbound variable rather than a failure. Fluree instead implements the XPath operators [SEP-0002](https://github.com/w3c/sparql-dev/blob/main/SEP/SEP-0002/sep-0002.md) specifies: the three *differences* (`dateTime`/`date`/`time` minus its own kind) yield a signed `xsd:dayTimeDuration`, and the *shifts* (`± xsd:dayTimeDuration` or `± xsd:yearMonthDuration`, plus duration ± duration within one family) yield the left operand's kind. Shifting is calendar-aware: month arithmetic clamps to the end of the month (`2026-01-31 + P1M` = `2026-02-28`), `xsd:time` wraps within its day, and `xsd:date ± dayTimeDuration` keeps only the date part. This matches SEP-0002's XPath semantics for every `xsd:dateTime` operand and for `xsd:date`/`xsd:time` operands written without an offset (see the next paragraph for the rest), but queries using it are **not portable** to a processor implementing only the published spec.
 
 **Arithmetic over offset-carrying `xsd:date` / `xsd:time` operands (deviation from XPath):** follows from the paragraph above. XPath anchors each such operand in its own timezone; Fluree has already discarded it, so `"2026-01-01+05:00" - "2026-01-01Z"` is `PT0S` where XPath says `-PT5H`, and XPath's own `op:subtract-times` example `"17:00:00-06:00" - "08:00:00+09:00"` answers `PT9H` rather than `P1D`. `xsd:dateTime` arithmetic matches XPath exactly, since the instant is the value. Pinned across both storage lanes by `it_temporal_lane_stability`.
+
+**Lists are read as their members (deviation from RDF's list structure):** A list written as `( … )` or `{"@list": [...]}` is stored in order under the subject and property that hold it, and SPARQL reads its members as values of that property, as JSON-LD does. Its `rdf:first`/`rdf:rest` cells are not triples a query can match, so `ex:items/rdf:rest*/rdf:first` and a `( ?x ?y )` pattern find nothing for it (W3C tests `list-2` to `list-4`). The Graph Store `GET`, `fluree export` and the JSON-LD crawl return each list whole and in order, and so do a CONSTRUCT whose template repeats the WHERE triple that read the list, and DESCRIBE. See [Lists](../query/sparql.md#lists).
 
 **Dataset clauses (§13.2):** A `FROM` / `FROM NAMED` clause defines the query's dataset exhaustively — the default graph is the union of the `FROM` clauses, and `GRAPH ?g` ranges over exactly the `FROM NAMED` graphs. `FROM NAMED` with no `FROM` therefore gives an **empty default graph**. **Changed in 4.1.4:** the HTTP endpoints now implement this; earlier releases substituted a ledger's default graph, and separately enumerated the ledger alias as an extra named graph, which duplicated every `GRAPH ?g` solution. The embedded Rust API was already conformant, so this removes a divergence between surfaces rather than introducing one. The change covers all four HTTP query surfaces — ledger-scoped and connection-scoped `/query`, plus both streaming routes — and the JSON-LD `fromNamed` form follows the identical semantics, so byte-equivalent SPARQL and JSON-LD queries return the same result. A query with no dataset clause keeps its existing behavior. Requests that name only named graphs while also carrying patterns outside `GRAPH { ... }` / `["graph", ...]` receive an `x-fdb-warning` response header. See [Datasets and named graphs](../concepts/datasets-and-named-graphs.md#http-endpoints-and-default-graph-behavior).
 
@@ -107,28 +151,70 @@ Why: before this, a parsed value kept its offset and source lexical while it sat
 
 ### SPARQL 1.1 Update
 
-**Status:** Partial support
+**Status:** Supported, except remote `LOAD`
 
 Supported:
-- INSERT DATA (including `GRAPH <iri> { ... }` named-graph blocks)
-- DELETE DATA (including `GRAPH <iri> { ... }` named-graph blocks)
-- DELETE WHERE (default graph only — `GRAPH` blocks are rejected)
+- INSERT DATA and DELETE DATA, including `GRAPH <iri> { ... }` blocks
+- DELETE WHERE, including `GRAPH <iri>` and `GRAPH ?g` blocks
 - DELETE/INSERT WHERE, including the `DELETE { } WHERE { }` and
-  `INSERT { } WHERE { }` short forms, with optional `WITH`/`USING` clauses and
-  `GRAPH <iri> { ... }` blocks in templates
+  `INSERT { } WHERE { }` short forms, `WITH` / `USING` / `USING NAMED`, and
+  `GRAPH <iri>` or `GRAPH ?g` blocks in templates
+- Graph management: CLEAR and DROP (`GRAPH <iri>`, `DEFAULT`, `NAMED`, `ALL`),
+  CREATE, ADD, COPY and MOVE, each with `SILENT`
+- Several operations in one request, separated by `;`: they run in order, each
+  seeing the previous one's changes, and commit as one transaction
 
-Not yet supported:
-- Variable graph names (`GRAPH ?g { ... }`) in any update — only ground IRIs
-- `GRAPH` blocks inside DELETE WHERE
-- LOAD
-- CLEAR
-- DROP
-- CREATE
-- COPY, MOVE, ADD
+Differences from the specification:
+- Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op
+- `DROP` takes the graph's history with it: a query as of an earlier `t` that
+  names the graph is refused. `MOVE` drops its source the same way. Only an
+  identity without a restricting policy may drop. The commits keep the
+  dropped facts, so a branch from before the drop has them
+- `CREATE` registers the graph without making it visible until it holds a
+  triple, so `CREATE` of an existing graph is not an error, and `CLEAR` of a
+  graph that does not exist is not an error either
+- The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
+  management operations
+- A list is written and deleted through its members: deleting a value deletes
+  every entry of a list that holds it, and a compact list's cells cannot be
+  edited one by one; a list stored as its triples, such as a second list on one
+  property, is edited as triples ([Writing lists](../query/sparql.md#writing-lists))
+- `ADD` of a list the destination already holds restates it, and so does
+  `ADD` of the same list again beside another list there
 
-JSON-LD transactions remain available as an alternative write surface.
+See [SPARQL UPDATE](../query/sparql.md#sparql-update-restrictions). JSON-LD
+transactions remain available as an alternative write surface.
 
 **Specification:** https://www.w3.org/TR/sparql11-update/
+
+### SPARQL 1.1 Graph Store HTTP Protocol
+
+**Status:** Supported, indirect graph identification
+
+`GET`, `HEAD`, `PUT`, `POST` and `DELETE` on `/v1/fluree/data/{ledger}` with
+`?graph={iri}` or `?default`. `PUT` commits only the difference from the
+graph's current contents. `DELETE` of a named graph is `DROP GRAPH`, which
+takes its history; of the default graph, `CLEAR DEFAULT`, which keeps it. `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML.
+Direct graph identification (the request URL as the graph IRI)
+is not supported. See [Graph Store Protocol](../api/graph-store.md).
+
+**Specification:** https://www.w3.org/TR/sparql11-http-rdf-update/
+
+### SPARQL Service Description
+
+**Status:** Supported
+
+A `GET` on `/v1/fluree/query` or `/v1/fluree/query/{ledger}` with no `query`
+parameter returns a description of the endpoint in JSON-LD, Turtle, N-Triples
+or RDF/XML, chosen by `Accept`. It names the endpoint, the SPARQL query
+language (`sd:SPARQLQuery` at versions 1.0 through 1.2, and `sd:SPARQL11Query`
+for older clients), the result formats, and simple entailment, plus
+`sd:UnionDefaultGraph` on a ledger whose
+[union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph)
+is on. See [Service description](../api/endpoints.md#service-description).
+
+**Specification:** https://www.w3.org/TR/sparql11-service-description/ and the
+SPARQL 1.2 Service Description draft
 
 ### SPARQL 1.2
 
@@ -139,12 +225,14 @@ Supported query and update annotation syntax:
 - Named reifiers: `?s ?p ?o ~ ?r {| ... |}` (IRI, blank-node, or variable reifier)
 - `rdf:reifies` form with `<<( s p o )>>` triple terms
 - Annotations in `INSERT DATA` / `DELETE DATA`
+- Annotations in `CONSTRUCT` templates (`~ ?r`, `{| ... |}`, and `?r rdf:reifies <<( s p o )>>`),
+  written by every result format
 
 Not yet supported:
 - Triple-term accessor functions: `TRIPLE()`, `SUBJECT()`, `PREDICATE()`,
   `OBJECT()`, `isTRIPLE()`
-- Triple terms as arbitrary values, in `CONSTRUCT` patterns, or in subject
-  position; multi-triple and nested annotations
+- Triple terms as arbitrary values (a `CONSTRUCT` template accepts one only as the object of
+  `rdf:reifies`) or in subject position; multi-triple and nested annotations
 - Named-graph edge annotations in SPARQL UPDATE (default graph only)
 - W3C SPARQL 1.2 test-suite execution (manifests present but not yet run)
 
@@ -223,11 +311,14 @@ These features are controlled at compile time via Cargo:
 | `iceberg` | No | Apache Iceberg/R2RML graph source support |
 | `shacl` | No | SHACL constraint validation (requires fluree-db-transact + fluree-db-shacl). Default in server/CLI. |
 | `graphql` | No | GraphQL endpoint over a schema derived from ledger data and SHACL shapes. Implies `shacl` (tier 2 reads shapes); pulls in `async-graphql`. Default in server/CLI. |
+| `sql` | No | SQL graph sources (R2RML over a Trino-protocol endpoint). Implies `iceberg` |
+| `delta` | No | Delta Lake graph sources (R2RML over Delta tables). Implies `iceberg` |
 | `vector` | No | Embedded vector similarity search (HNSW indexes via usearch) |
 | `ipfs` | No | IPFS-backed storage via Kubo HTTP RPC |
 | `search-remote-client` | No | HTTP client for remote BM25 and vector search services |
+| `residency` | No | Leaf-residency instrumentation for the query and index crates |
 | `aws-testcontainers` | No | Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers) |
-| `full` | No | Convenience bundle: `native`, `credential`, `iceberg`, `shacl`, `ipfs`, `graphql` |
+| `full` | No | Convenience bundle: `native`, `credential`, `iceberg`, `sql`, `shacl`, `ipfs`, `graphql` |
 
 Example:
 ```toml
@@ -243,8 +334,14 @@ fluree-db-api = { path = "../fluree-db-api", features = ["native", "credential"]
 | `credential` | Yes | Signed request verification (forwards to `fluree-db-api/credential`) |
 | `shacl` | Yes | SHACL constraint validation (forwards to `fluree-db-api/shacl`) |
 | `iceberg` | Yes | Apache Iceberg/R2RML graph source support (forwards to `fluree-db-api/iceberg`) |
+| `sql` | Yes | SQL graph sources over a Trino-protocol endpoint (forwards to `fluree-db-api/sql`) |
+| `delta` | Yes | Delta Lake graph sources (forwards to `fluree-db-api/delta`) |
+| `graphql` | Yes | GraphQL endpoints (forwards to `fluree-db-api/graphql`) |
+| `bolt` | Yes | Bolt protocol listener for Neo4j drivers; binds only when `bolt_listen_addr` is configured |
 | `aws` | No | AWS S3 storage + DynamoDB nameservice (forwards to `fluree-db-api/aws`) |
 | `oidc` | No | OIDC JWT verification via JWKS (RS256 tokens from external IdPs) |
+| `raft` | No | Raft-replicated clusters (see [Raft clusters](../operations/raft-clusters.md)) |
+| `mimalloc` | No | mimalloc as the global allocator |
 | `swagger-ui` | No | Swagger UI endpoint |
 | `otel` | No | OpenTelemetry tracing |
 
@@ -266,44 +363,220 @@ SPARQL `PRAGMA reasoning` directive) or per ledger (via
 [Query-time reasoning](../query/reasoning.md) and
 [Setting groups](../ledger-config/setting-groups.md).
 
-## Parsing Modes
-
-### Strict Mode (Default)
-
-Enforces strict compliance with standards:
-- Invalid IRIs rejected
-- Type mismatches rejected
-- Strict JSON-LD parsing
-
-```bash
-./fluree-db-server --strict-mode true
-```
-
-### Lenient Mode
-
-More permissive parsing:
-- Attempts to fix malformed IRIs
-- Coerces types when possible
-- Accepts non-standard syntax
-
-```bash
-./fluree-db-server --strict-mode false
-```
-
-Use lenient mode only when you fully control inputs and explicitly want permissive parsing behavior.
-
 ## API Versioning
 
-Current API version: v1
-
-**Version Header:**
-```http
-X-Fluree-API-Version: 1
-```
+Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 ### Behavior changes
 
-Response-shape changes within v1 that a client may need to account for.
+Changes within v1 that a client may need to account for.
+
+#### `DROP` drops a graph's history (breaking)
+
+SPARQL `DROP GRAPH`, `DROP DEFAULT`, `DROP NAMED` and `DROP ALL` used to retract the graph's facts, as `CLEAR` does. They now take the graph out of the ledger: what it held is no longer queryable at the head or as of any earlier `t`, and a query that names the graph as of a `t` before the drop is refused with a 404. The drop commits without retracting anything, so it costs the same for any size of graph and is not limited by `FLUREE_MAX_GRAPH_SCAN_FLAKES`. Writing to the graph again starts it afresh, under the same IRI. The commits that wrote the dropped facts keep them: a branch created at a `t` before the drop reads them. A drop is therefore not a deletion: the facts stay in the ledger's storage. The same applies to `fluree graph drop`, `POST /v1/fluree/drop-graph`, the Graph Store Protocol's `DELETE` of a named graph, the Python `Ledger.drop_graph`, and the source graph of `MOVE`.
+
+- Dropping needs an identity without a restricting policy; others get a 403. `CLEAR` is unchanged and remains available under policy.
+- `DROP GRAPH` of a graph that does not exist, or that was dropped, is an error unless `SILENT` (it used to be a no-op).
+- A commit that drops a graph cannot be read by a release before this one, which refuses it rather than showing the dropped graph. A ledger that never drops a graph is unchanged and stays readable by them.
+- Merging, rebasing or reverting across a drop is supported only when the result keeps the drop as committed: a fast-forward merge or rebase. Push and pull carry a drop like any other commit. The receiver applies it as the writer did, and pushing one needs an identity without a restricting policy.
+- A BM25 or vector index whose indexing query reads a dropped graph is rebuilt at its next sync, and BM25 retires its snapshots from before the drop. Until that sync, searches serve the snapshot they had.
+- A reasoning query as of a `t` before the drop of a graph its `f:schemaSource` reads (the starting graph, or one it follows through `owl:imports`) is refused with a 404, as a query naming the graph is.
+- A governed query as of a `t` before the drop of the graph its stored policies live in is refused with a 404: the default graph after `DROP DEFAULT` or `DROP ALL`, or the `f:policySource` graph. Governing it with the policies gone would show what they hid. The same query without policy reads as it did.
+
+#### Writing schema triples is checked by modify policy
+
+Schema triples (`rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property) used to be exempt from `f:modify` policy, so any identity able to transact could write or retract them. A policy on a class or property also covers its subclasses and subproperties, so writing the hierarchy changes what policies allow. Schema triples are now checked like any other flake. An identity with `f:defaultAllow` or no policy is unaffected. A restricted identity that maintains the ontology needs modify permission for those triples: an `f:onProperty` policy on the four schema properties, and one on `rdf:type` whose condition admits only class and property types ([Schema writes](../security/policy-in-transactions.md#schema-writes) has the pair). This includes `CLEAR` and `DROP` of a graph holding schema triples. Reading the schema is unchanged: view policy still lets every schema triple through. See [Schema writes](../security/policy-in-transactions.md#schema-writes).
+
+The class and property hierarchy that policy targeting, SHACL targeting, GraphQL interfaces and `rdfs` reasoning read is now built from the default graph's current state alone. A retracted `rdfs:subClassOf` or `rdfs:subPropertyOf` edge stops counting at once; it used to count until the next index build. An edge in a named graph no longer counts at all; it used to count after an index build.
+
+SHACL `sh:class` now reads the same hierarchy. A retracted edge stops counting at once, and an edge in a named graph counts only when that graph is an `f:shapesSource` or [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graph. Before, both counted for `sh:class` until the next index build, so a value that conformed only through such an edge could be accepted on an indexed ledger and refused on an unindexed one.
+
+#### SHACL is enforced only where the ledger config enables it (breaking)
+
+Shapes no longer enable SHACL on their own. A ledger that holds shapes but has no config setting `f:shaclEnabled true` used to validate every write against them in reject mode; it now validates nothing until its config enables SHACL, ledger-wide or per graph. Ledgers whose config already enables SHACL are unchanged, and so are configs without a SHACL group, which were already unenforced. The same applies to shapes published through GraphQL or `fluree model entity define`, and to branch merge, rebase, revert and push. In a GraphQL schema, `sh:minCount ≥ 1` makes a field non-null only where the config enables SHACL; elsewhere the field is nullable.
+
+Ledger info reports an affected ledger as `shapes present; SHACL enforcement not configured` (`configDiagnostics`; `fluree info` prints it), and the ledger logs the same as a warning once each time it loads. A shape counts whether it is typed (`sh:NodeShape`, `sh:PropertyShape`) or only has a target (`sh:targetClass`, `sh:targetNode`, `sh:targetSubjectsOf`, `sh:targetObjectsOf`); a config that sets `f:shaclEnabled false` is not reported. A branch created from a ledger that has no index yet reads none of its source's config, so SHACL is off on that branch, where the source's shapes used to be enforced (tracked in #2069). To keep enforcing, enable SHACL in the config. For a ledger that holds shapes and no config, that is one `INSERT DATA` writing a config with `f:shaclEnabled true`; a ledger that already has a config attaches the setting to its existing config subject: [Enabling SHACL](../ledger-config/writing-config.md#enabling-shacl).
+
+Inline shapes sent with a transaction (`opts.shapes`) are now governed by the SHACL group's `f:overrideControl` rather than by `f:shaclEnabled`: they apply without config, and under `f:OverrideAll` even where `f:shaclEnabled false`; under `f:OverrideNone` (or `f:IdentityRestricted` without a matching verified identity) the transaction is refused with a 400. They validate only themselves. They are not supported in a policy-scoped request (one with an identity or policy inputs, or on a ledger whose config sets policy defaults, ledger-wide or for a graph, other than an unrestricted `f:defaultAllow true`), which is refused with a 400; support is a follow-up. The same rule applies to inline uniqueness constraints (`opts.uniqueProperties`). See [Inline shapes](../guides/cookbook-shacl.md#inline-shapes-per-transaction). A transaction body's `opts.shapes` and `opts.uniqueProperties` are now read by the embedded API and by the CLI in local mode as well as by the server (they were ignored there), a malformed value is refused, and a build without SHACL support refuses inline shapes. Inline shapes, a requested validation mode and inline uniqueness constraints passed programmatically (`TxnOpts`) now apply to a plain Turtle insert as they did to TriG (a plain Turtle document ignored them).
+
+#### Branch operations are validated like transactions, fast-forwards included
+
+A fast-forward merge used to adopt the source's commits without validation. Into a target whose config enables SHACL or uniqueness (ledger-wide or for any graph), it is now validated against the target's config as it was before the merge, as a transaction writing the adopted change would be, and refused on a violation; `fluree branch diff` and `GET /merge-preview` report its `validation`. Merge, rebase and revert now enforce uniqueness constraints as well as SHACL, and a plain Turtle insert enforces uniqueness like the other write paths.
+
+Merges (fast-forwards included), rebases and reverts also re-check the target's config groups, and refuse, as a conflict with the target's state (HTTP 409), a result that would leave a setting group's fields outside the config graph or a single-valued setting with two values. A branch that carries a split config from before these checks is refused until the config is repaired ([Repairing a config split across graphs](../ledger-config/writing-config.md#repairing-a-config-split-across-graphs)). A fast-forward into a target that enables neither SHACL nor uniqueness, whose commits carry no config settings, is unchanged.
+
+A merge or rebase that would carry what a branch wrote to its own config graph (`urn:fluree:mydb:dev#config`) or `#txn-meta` graph into another branch is refused (HTTP 409). Such writes configure only the branch that made them; on the target they would land in an ordinary graph. Merging from a branch the target was created from is not affected. Likewise, a merge (fast-forward or not) that would change the target's own config or `#txn-meta` graph with what another branch wrote there, where that graph is an ordinary one, is refused (HTTP 409): change a branch's config on that branch.
+
+Push validates each named graph a pushed commit writes under that graph's own config. A pushed commit that writes a graph which neither the receiving ledger nor the pushed commits register is refused (HTTP 422).
+
+#### Config writes are checked, and config-only writes are never blocked by validation
+
+A transaction that writes a setting group into the config graph with its fields in another graph (in that transaction or split across two), types an `f:LedgerConfig` / `f:GraphConfig` outside the config graph, writes config fields outside it on the recommended config subject `urn:fluree:{ledger_id}:config:ledger` (on a ledger with no config too), or leaves a single-valued setting (or the ledger's `f:LedgerConfig` subject) with two values is refused with a `Parse error` (HTTP 400). Writing the same value again is still accepted. See [What a config write is checked for](../ledger-config/writing-config.md#what-a-config-write-is-checked-for).
+
+Each operation of a multi-operation SPARQL update, each clause of a Cypher write, and each write staged in a transaction (`Fluree::begin_transaction`) is validated against the shapes, uniqueness constraints and config in effect before the request, as a single transaction is: an earlier operation that changes the config, a shape or a constraint does not change how a later one in the same request is checked. A model ledger the config names (a cross-ledger `f:shapesSource`, say) is read at one head for the whole request: the one its first lookup found. The config checks run once, on the request's result. Explicit Bolt transactions are not requests of this kind: they commit each statement as it runs, so each statement is checked against the state before it, as separate transactions are. A write or transaction staged before another commit that declares a property unique (`f:enforceUnique`) stages again when it commits, and is checked against the declaration.
+
+A transaction that writes only the config graph is no longer validated against SHACL shapes or uniqueness constraints, and no longer needs a shapes, schema or constraints source to be resolvable, so a config repair is never blocked by the source it repairs (a policy source still applies to config writes). Shapes that target nodes in the config graph are no longer checked. Where SHACL or uniqueness is enabled and its source cannot be resolved, data writes fail with an error naming it, and a config read failure now fails a write instead of letting it through without uniqueness checks. A failure to read the ledger config answers HTTP 500 with `err:storage/ReadFailure` on the write lanes, branch operations, push and queries (a transaction, a multi-operation update, a branch operation, push, the transaction policy context, a query); it was a 400 `Parse error` (a 422 on push, and `err:system/ConfigError` for the policy context and queries). Validation (`fluree validate` and `/validate`) fails the same way; it used to validate as if the ledger had no config.
+
+#### JSON-LD nested nodes are written to their enclosing node's graph
+
+Since 4.2.4, a node object nested under a node with an `@graph` selector is written to that graph, as JSON-LD nesting implies (in 4.2.3 and earlier it landed in the default graph). The rule now covers every node shape and every JSON-LD reader: `@list` items follow their enclosing node's graph too, as does `@reverse`, `@included` and `@nest` content, now supported. A nested node's own `@graph` wins for its subtree; give it `"@graph": "default"` to keep it in the default graph. JSON-LD named graph objects (`{"@id": "<graph>", "@graph": [...]}`), whose content used to be silently dropped, are now stored. A config that a release before 4.2.4 wrote with nested setting groups (#1979) still reads as empty: [Repairing a config split across graphs](../ledger-config/writing-config.md#repairing-a-config-split-across-graphs) moves the fields it stranded.
+
+A term defined in a scoped (property- or type-scoped) `@context` whose `@id` is a compact IRI over a prefix only the outer context defines (`"a": {"@id": "ex:a", "@context": {"b": {"@id": "ex:b"}}}`) now expands to the full IRI. It used to stay compact, so the key was written as the string `ex:b`, an IRI with the scheme `ex`. Data already written that way stays as it is.
+
+Related JSON-LD changes: graph names must be absolute IRIs (a relative one is resolved against `@base` and refused without one, and a graph name no longer expands through `@vocab`); `"config"` names the ledger's config graph; a graph variable in an update template writes to the graph the WHERE clause binds; a node-level `@graph` in a `where` clause is a `GRAPH` pattern, its graph name resolved as in insert and delete templates, and in a CONSTRUCT template, the `"construct": true` shorthand included, it names the graph the node's triples are written to (it was read as a property named `@graph`, and the triples went to the default graph); `@reverse`, `@included` and `@nest` are supported and other unknown `@`-keywords on a node are refused; blank node labels are scoped to the whole document; a single object with a string `@graph` has no transaction metadata; an update's `fromNamed` list that gives one name to two graphs is refused (an alias spelled `urn:default` that names another graph among them, since that name means the default graph); `"default"` in an update's `from` list reads the default graph beside the other graphs listed (it was dropped); and `opts.unionDefaultGraph` is refused on an update, as a SPARQL update refuses the `union-default-graph` pragma. Bulk JSON-LD import reads all of this as a transaction does (see below).
+
+#### Bulk JSON-LD import writes graph-scoped data, and refuses what it cannot place
+
+A bulk JSON-LD import (`fluree create --from`, `.jsonld` and `.jsonl`/`.ndjson`) now writes `@graph` scoping as a transaction does: a node's graph selector puts it and the nodes nested in it in that graph, and a JSON-LD named graph puts its content there, through the same graph-name table a transaction and a TriG import use. In 4.2.4 such documents imported with their graph selectors folded into the default graph and the named graphs' content dropped. A few documents that imported before now fail, naming what they cannot place: an unknown `@`-keyword on a node (it used to be dropped), and a graph name a transaction refuses as well. `"config"` and `"txn-meta"` stay refused, as in a TriG import. Each `.jsonl` line is read as a document of its own under the shared context.
+
+#### A JSON number reads as the nearest double
+
+A JSON number is now read as the double nearest to it, as the SPARQL and Turtle readers already did. Roughly one in ten numbers written with 16 or more significant digits (one in six at exactly 17), and some with an exponent past ±22 (`1e-30`), used to read as a neighbouring double: `0.9452706955539223` was stored as `0.9452706955539224`. This applied to every JSON reader (a transaction, a bulk import, a JSON-LD query's `where` and `values`), including an `xsd:decimal` or `@json` value written as a JSON number, and a SPARQL literal did not match a value written through JSON-LD.
+
+An application that embeds `fluree-db-api` gets the same reading for its own `serde_json` parsing, because Cargo enables `float_roundtrip` for the whole build. Parsing JSON that is mostly floats takes about 20–43% longer, which makes an insert of embedding vectors about 7% slower end to end; a transaction-shaped document parses as fast as before.
+
+Data already stored is not rewritten; see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
+
+#### JSON-LD term definitions coerce values as JSON-LD 1.1 defines
+
+A transaction, a bulk import and a JSON-LD query now read these term definitions as JSON-LD 1.1 does. A document that uses one writes different values than it did:
+
+- **`"@type": "@vocab"`**: a string value is an IRI (a term, a compact IRI, or relative to `@vocab`, else `@base`). It was stored as a string.
+- **`"@type": "@json"`**: the whole value is one JSON literal. A number, boolean or string was stored as an `xsd` value, and an array was split into separate values, its objects becoming nodes. A string is the JSON string, so `"5"` is not the number.
+- **`"@language": null`** on a term: its strings are untagged. They took the default language.
+- **A default `@language` with a datatype**, from the term or the value object: the datatype wins and the value has no language. The document was refused.
+- **`"@container": "@index"`**: the map's values are the property's values and the keys are dropped. The map was stored as a blank node with the keys as its properties.
+- **A term defined as `null`, or with `"@id": null`**: its property is dropped, and so is a `@vocab` value or `@type` that names it. The bare `null` form failed to parse, and the `"@id": null` form wrote the key as a property relative to `@vocab`.
+- **A property-valued `@index`** (`"@index": "<property>"`): an index map under such a term is refused. Its keys were dropped silently.
+
+A JSON-LD `where` clause reads a `@vocab` and a `@json` term the same way, so a pattern written under the context of the insert matches what the insert wrote: `"status": "Active"` looks for the IRI, and `"doc": 5` for the JSON literal `5`. A variable, and a value object (`{"@value": ...}`), keep their meaning under a `@json` term. A pattern on a term defined as `null` is refused. A map in `where` stays a node pattern under an `@index` term: to match a value written through an index map, write the value itself (`"m": "x"`, not `"m": {"a": "x"}`).
+
+Data already stored is not rewritten; see the next section for what that means for values these terms wrote before.
+
+#### Data written by an earlier release that reads differently
+
+No stored format changes. These kinds of earlier data behave differently after the upgrade:
+
+- **A config with two values for one setting-group pointer** (for example two `f:shaclDefaults` or `f:policyDefaults` groups on the config subject, typically a split config plus a corrected one written beside it). The reader now uses the non-empty group whose IRI sorts lowest; earlier releases could pick an empty one. A SHACL or policy group that had no effect therefore takes effect, including a stored `f:defaultAllow false`. Ledger info reports this as `ambiguous-pointer`. Remove the group you do not want, in the config graph.
+- **Edges written through a reverse-defined term** (a context term with `"@reverse"`). With `"childOf": {"@reverse": "ex:child"}`, the node `{"@id": "ex:kid", "childOf": {"@id": "ex:mom"}}` means `ex:mom ex:child ex:kid`. Earlier releases stored `ex:kid ex:child ex:mom`, as if the term were not reversed. The term is now read as JSON-LD defines it, so the same document no longer reaches an edge an earlier release stored: deleting with it does nothing. To repair a predicate that was written only through a reverse term, flip its edges once, for example `DELETE { ?s ex:child ?o } INSERT { ?o ex:child ?s } WHERE { ?s ex:child ?o }`. If it was also written in the forward direction, select only the edges the reverse term wrote.
+- **Values written through a `@vocab`, `@json` or `@index` term** (see [JSON-LD term definitions coerce values as JSON-LD 1.1 defines](#json-ld-term-definitions-coerce-values-as-json-ld-11-defines)). They keep the shape the earlier release stored, and the same context now reads and writes the new one, so a `where` pattern, a delete or an upsert written through the term no longer reaches them. A string stored through a `@vocab` term becomes the IRI with one update, here for terms relative to `http://example.org/`: `DELETE { ?s ex:status ?old } INSERT { ?s ex:status ?new } WHERE { ?s ex:status ?old FILTER(isLiteral(?old)) BIND(IRI(CONCAT("http://example.org/", STR(?old))) AS ?new) }`. Values stored through a `@json` or an `@index` term have no general rewrite (a split array does not record which values it held together): delete them by the property's full IRI and write the documents again.
+- **A JSON number an earlier release read as a neighbouring double** (see [A JSON number reads as the nearest double](#a-json-number-reads-as-the-nearest-double)). It keeps the double it was stored as, and an `xsd:decimal` its changed digit, so a JSON-LD pattern or delete that names the number no longer reaches it, inserting the same document again adds a second value beside it, and an upsert replaces it with the nearest double. Fluree cannot tell such a value from one sent as written: upsert the source documents again to repair a property, or match within a tolerance, for example `FILTER(ABS(?v - 0.9452706955539223e0) < 1e-15)`.
+- **Facts an update stored under a fallback namespace code.** A `where` constant in a namespace the ledger had not seen yet was stored under a fallback code, so once the namespace got its own code, a lookup by the IRI missed those facts. Every IRI an update writes is now stored under its canonical code. Facts already stored the fallback way stay split from the IRI's other facts; there is no migration.
+- **Vectors of more than one length on one property.** An earlier release could store vectors of several lengths on one property in one graph. Writes to such a property refuse any further length (see [A property keeps one vector length per graph](#a-property-keeps-one-vector-length-per-graph)). To fix it, export the ledger and import it into a new one, keeping one length per property or moving the others to another property.
+
+`@annotation` on a value of a reverse property (inside `@reverse`, or under a reverse-defined term) now annotates the edge in the direction it is stored.
+
+#### Graph-source requests are checked strictly (breaking)
+
+Every Iceberg route, `sql/map` and every Delta route now reads its connection, auth and storage identity through one codec, and refuses with `400` (`err:api/InvalidGraphSourceConfig`, the message naming the field, never its value) requests an earlier release accepted:
+
+- **An unknown field**, at the top level or inside a structured `catalog`, `io`, `auth` or `unity`. An earlier release ignored it, so a misspelled field (`warehose`, `auth_bearer_tokn`) did nothing and the source was registered without it. A route still ignores a field that another route of the same kind takes (`depth`, `table`, `name`, `r2rml`, …), so one body can go to browse, preview and map in turn: see [Iceberg connection](../api/endpoints.md#iceberg-connection) and [Delta catalog routes](../api/endpoints.md#post-api_base_urldeltacatalog-and-deltar2rml).
+- **Auth given two ways, or only partly.** On `sql/map`, OAuth2 used to win silently over a bearer token, and an OAuth2 token URL without its secret registered the source with no auth.
+- **An environment variable the operator does not list** in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning), for every `_env` field and `{"env_var": …}` on every route. `azure_client_secret_env` on the Delta routes skipped the list before.
+- **A catalog that states its `type` and is not that type**, such as `{"type": "direct", "uri": …}` with no `table_location`, which was read as a REST catalog.
+
+Registration also refuses what every query of the source would refuse, where it used to register a source that could not be read: a mapped Direct location that names no namespace and table, and a source whose storage the operator's host-identity policy refuses (`403`, `err:auth/HostIdentityRefused`; the policy allows every host identity unless [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) or `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS` is set).
+
+Google identity failures have their own codes where they were `500` (`err:system/InternalError`) on a query and `400` (`err:system/ConfigError`) on a preview: `err:auth/GoogleTokenExchange` (`401`, `403` or `502`), `err:auth/GoogleCredentialsInvalid` (`400`), `err:auth/HostIdentityRefused` (`403`) and `err:catalog/QuotaProjectRequired` (`403`). See [Errors](../api/errors.md).
+
+A `fluree sql map --remote` from this release sends a bearer token or OAuth2 client credentials as the flat fields, which an earlier server reads; a Google identity or an `_env` secret it sends is not read by an earlier server, which registers the source with no auth. A `fluree iceberg map --remote` from this release sends the structured `catalog` and `io`, which an earlier server does not read: it refuses the request with `400` (no `catalog_uri`). Use a CLI of the server's release against an earlier server.
+
+#### Lists in SPARQL updates and RDF text are stored as lists
+
+A `( … )` in a SPARQL update, and a list spelled out as `rdf:first`/`rdf:rest` triples over the document's own blank nodes in a Turtle, TriG or N-Triples insert or upsert or in a SPARQL update, used to be stored as those triples. They are now stored as a list, as a JSON-LD `@list` is, so `ex:s ex:items ?o` binds the members and `rdf:rest*/rdf:first` finds nothing for them. Lists already stored as triples stay triples, and read as them. A bulk import (`fluree create --from`) still stores a spelled-out list as its triples. See [Lists](../query/sparql.md#lists).
+
+- A second, different list on one subject and property used to merge into the first. It is now stored beside the first, as its triples. Inserting the same members in the same order restates the stored list, and an upsert replaces it.
+- A CONSTRUCT whose template repeats the WHERE triple that read a list, and DESCRIBE, write the list as `( … )` or `{"@list": [...]}`, in order and with repeats; they wrote its members as repeated values. `fluree export` writes lists the same way, in list order; it wrote them as repeated values in index order.
+- OWL 2 RL reasoning reads list axioms written as a Turtle `( … )` or a JSON-LD `@list`. It used to read only lists stored as triples, so such axioms were ignored.
+
+#### Deleting a value a list repeats deletes every entry holding it
+
+A delete naming a value, without a list position, used to delete the first entry of a list holding it, unless its WHERE clause handed each stored entry over (`DELETE { ex:s ex:items ?o } WHERE { ex:s ex:items ?o FILTER(?o = 1) }`), which deleted every one. It now deletes every entry of a list that holds the value, and the value where it is also stored beside the list, however it is written: SPARQL `DELETE DATA`, `DELETE WHERE`, a WHERE with `VALUES`, and a JSON-LD `delete`. A value that is no list entry is deleted as before. To remove one entry of a list that repeats a value, upsert the list.
+
+#### An update keeps a stored triple it both deletes and inserts
+
+An update's templates are instantiated once per `WHERE` solution. A stored triple deleted on more solutions than it was inserted on used to be retracted; it now stays, as SPARQL 1.1 Update's `(DS − D) ∪ I` defines. A stored triple an update deletes and re-inserts as it is no longer commits anything. A ledger that already ran the first shape keeps that retraction as an ordinary commit: the fact stays gone until it is inserted again. See [Idempotent](../transactions/retractions.md#idempotent).
+
+#### A retraction and an assertion of one fact at one `t` read as the assertion
+
+A commit can hold a fact retracted and asserted at the same `t` (one pulled from elsewhere, or one an earlier release wrote). Such a pair used to read as absent on some paths, such as live reads and incremental index builds, and present after a full rebuild. It now reads as present everywhere: in queries, time travel, stats and class-based policy. Nothing on disk changes. A value an earlier incremental build already dropped this way comes back at the next full rebuild (`fluree reindex`, see [Reindex](../indexing-and-search/reindex.md)). Rebase replays such a commit as its assertion, and revert restores what held before the commit. Local writes never produce such a pair; one that would is refused with an internal error (HTTP 500).
+
+#### Writes name facts as storage keeps them
+
+- A `DELETE DATA` or a JSON-LD `delete` that names a stored ill-typed literal (such as `"2024-02-30"^^xsd:date`) by its text used to delete it. It is now refused, as an insert of it is. Bind it through a variable instead, or replace the property's values ([Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)).
+- A `dateTime` or `time` written past the microsecond used to keep every digit until the ledger was reloaded or indexed, and six after. It now keeps six fractional digits from the moment it is read, on every write path and in query constants, as the SPARQL 1.1 Query deviation above describes. A `DELETE DATA` naming such a value as it was written now finds it after a restart.
+- A big integer with an XSD subtype is one fact per value. Deleting and re-inserting one, or changing only its subtype, used to lose the value on an indexed ledger; such writes now commit nothing and keep it. A `DELETE DATA` naming it under another integer subtype deletes it.
+- A Turtle or TriG upsert with blank nodes whose spelling differs from what is stored (`1` against `"1"^^xsd:integer`, tag case, a statement written twice) mints its blank nodes once more on the first upsert after the upgrade. Later upserts of the same document commit nothing. The orphan query in [How RDF Text Is Read](../transactions/turtle.md#how-rdf-text-is-read) lists the earlier nodes.
+
+#### A ledger's own address names its default graph in every graph position
+
+Graph and dataset references now resolve through one table ([The ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position)). What changes on a ledger `mydb:main`:
+
+- A write to `GRAPH <mydb:main>`, in any spelling (a template, a data quad, a TriG block, a bulk-import block), used to write a graph named by that text. It now writes the default graph, and `GRAPH <mydb:main#http://ex.org/g>` writes the graph `http://ex.org/g`. A write to the address with a time (`mydb:main@t:1`) is refused (400). `COPY`, `MOVE` or `ADD … TO <mydb:main>` with no graph registered there is refused (400): name the default graph `DEFAULT`.
+- `GRAPH <urn:fluree:mydb:main>` or `GRAPH <mydb>` in a query, and `GRAPH <mydb:main>` in an update's `WHERE`, read the default graph. They used to read a graph registered under that text.
+- A `USING` graph the ledger does not have contributes nothing, so `DELETE … USING <typo> WHERE …` deletes nothing. It used to read the default graph.
+- Under a SPARQL `BASE`, a bare ledger name in `FROM <mydb>` is a relative IRI and resolves against the base; name the branch (`mydb:main`).
+- Statuses: an unknown graph in a dataset clause is 404 `err:db/GraphNotFound` (it was 500). A malformed address, an empty `from`, a pinned `FROM` on a view, and a JSON-LD dataset on a view that names anything but the view's own ledger are 400 (the last used to be ignored). `SERVICE` to a ledger outside the dataset is 400, with no rows under `SILENT`; it used to answer from the current dataset. A nameservice lookup that fails inside a query is 500 `err:system/NameServiceError`.
+- `fluree query --remote … --at` posts the query as written to the pinned path: a SPARQL query with its own `FROM` is accepted (it was refused), and a JSON-LD `from` naming a graph is kept (it was overwritten). See [fluree query](../cli/query.md).
+
+Earlier data:
+
+- A branch whose name begins with `/`, which v4.0.0 through v4.2.1 could create, can no longer be addressed. Its data is intact; export it (`fluree export L:/branch`) with the release you run before upgrading.
+- A graph an earlier version registered under the ledger's address (for instance by a TriG block `GRAPH <mydb:main> { … }`) keeps its data and is reached as `<mydb:main#mydb:main>`: the address, `#`, and the IRI it is registered under. One registered under the address with a keyword is reached the same way, as `<mydb:main#mydb:main#config>`. `GRAPH ?g` lists it under that name, in queries and updates alike, so a `?g` binding reads it back. The graph-management verbs (`CLEAR`, `DROP`, `ADD`, `COPY`, `MOVE`) read `mydb:main#<g>` as the graph `<g>` too, so `DROP GRAPH <mydb:main#mydb:main#config>` acts on such a graph. The address alone keeps naming the graph registered under it, never the default graph, so they also reach that graph by the address itself. To move its data into the default graph:
+
+  ```sparql
+  ADD GRAPH <mydb:main> TO DEFAULT ;
+  DROP GRAPH <mydb:main>
+  ```
+
+  `DROP` takes the old graph's history with it and needs an identity without a restricting policy. `CLEAR GRAPH <mydb:main>` in its place keeps the history, and works under policy.
+
+#### Datalog rules derive into named graphs and read the commit time
+
+- A stored JSON-LD rule whose insert names a graph (`{"@id": "ex:g", "@graph": [ … ]}`, or `"@graph": "ex:g"` on an insert node) used to derive into the default graph. It now derives into `ex:g`, and if the ledger has no graph `ex:g`, every datalog query on the ledger fails with an error naming it. Create the graph, or remove the graph name from the rule. See [Named graphs](../query/datalog-rules.md#named-graphs).
+- `NOW()` and `TODAY()` in a rule body return the commit time (or the query's `reasoningTime`) instead of the wall clock. On a snapshot with no commit time, a program that calls them needs `reasoningTime`. See [Fixpoint evaluation](../query/datalog-rules.md#fixpoint-evaluation).
+- A run whose budget leaves a negating or aggregating rule unfinished fails with an error naming the rule; it used to answer from partial input. Positive programs still answer capped.
+- Under `rdfs` or `owl2ql` without `owl2rl`, a program with a rule that negates or aggregates is refused with an error naming the rule, also when the modes come from `f:reasoningDefaults`. Add `owl2rl`, or drop the negation or aggregate.
+- Reasoning keys are read one by one, each from the top level when it is there, else from `opts`. A top-level `reasoningBudget` or `reasoningTime` beside `opts.reasoning` used to make the top level the only source and drop the mode without a word.
+
+#### Materialization and property paths are charged fuel
+
+A query that materializes (OWL 2 RL or datalog) now pays fuel for it; a query served from the reasoning cache doesn't. A query with a fuel limit can therefore fail while materializing, and a cancelled or out-of-fuel run caches nothing. Every property-path query pays fuel for the edges it reads and the rows it emits. A client disconnect or a query timeout now fails a query that is still materializing. Raise the fuel limit of queries that start failing. See [What Is Fuel?](../query/tracking-and-fuel.md#what-is-fuel).
+
+#### Compact graph names in JSON-LD expand against the context
+
+A compact graph name in a JSON-LD `where` (`["graph", "ex:g", …]`) now names the expanded IRI when the query's `@context` defines `ex`. It used to be matched as written. A name that is not an IRI, such as a `fromNamed` alias or a ledger or graph-source name, is kept as written. Two consequences to check before upgrading:
+
+- A stored JSON-LD `f:query` policy that named its graph compactly evaluated against no graph and denied. It now reads the graph, and may grant.
+- An update whose `where` named its graph compactly committed nothing. It now writes.
+
+#### A property keeps one vector length per graph
+
+In each graph, every vector a property holds has the length of the first vector it received there, and retracting vectors does not reset it. A write of another length is refused with `Invalid vector` (HTTP 422, `err:db/InvalidTransaction`), and a bulk import stops with it. To keep embeddings of two lengths, such as two models', put them on two properties or in two graphs. See [Length](../indexing-and-search/vector-search.md#length). For a ledger that already holds two lengths, see [Data written by an earlier release](#data-written-by-an-earlier-release-that-reads-differently).
+
+#### A ledger whose index store fails to load answers with the failure
+
+A ledger whose binary index store failed to load used to be cached without the store until a restart. Writes that read nothing from the index committed without the checks that need it. The load now fails with its own error (HTTP 500). Requests within a short window get that error without loading again, and the next request after it loads again, so the ledger heals without a restart. A write on a state whose index is older than the ledger's is refused with HTTP 503 `err:db/IndexNotLoaded`, which can be retried; it used to be refused only for a vector write. See [Errors](../api/errors.md).
+
+#### A server or Python process locks its file storage directory
+
+A transaction server (`fluree server run` or `start`) and Python's `connect()` now take an exclusive lock on `<root>/.fluree-lock` for as long as they hold the directory. A second server or Python process on the same directory is refused, with `err:system/StorageInUse` (HTTP 423) or `fluree.DatabaseInUseError`; it used to open the directory beside the first, uncoordinated. A filesystem that cannot lock (some network and FUSE mounts) now fails to open; set `FLUREE_STORAGE_ALLOW_UNLOCKED=true` to open it without that protection. Peers on shared storage and Raft nodes don't take the lock, and one-shot CLI commands don't either. Rust embedders opt in with `FlureeBuilder::with_storage_lock()`. See [One process per directory](../operations/storage.md#one-process-per-directory).
+
+#### Old index versions are kept by age, with a ceiling of 10
+
+Garbage collection used to keep at least 5 old index versions whatever their age, and with no upper bound every version superseded within the last 15 minutes. The floor is now 0 and a ceiling of 10 applies. A ledger that publishes slowly keeps no old version once its last one has been superseded for 15 minutes. One that publishes fast keeps at most 10 old versions, so a query still reading an older version can lose its files. Time travel does not depend on old versions. To keep a floor, set `--gc-max-old-indexes` (`FLUREE_GC_MAX_OLD_INDEXES`, `gc_max_old_indexes`). For ledgers that publish fast and serve long queries, raise `--gc-hard-max-old-indexes`. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention).
+
+The `Garbage collection complete` log line's `retained_count` is replaced by `retained`, `retention_target`, `past_target` and, when the walk stopped early, `stopped_by`. A pass that releases nothing while versions are past the target logs `Garbage collection released nothing` at `INFO`. Update alerts that read `retained_count`.
+
+`fluree branch list`, the server's branch route and the Python binding now return an error naming a branch record they cannot read. They used to return a list that left that branch out.
+
+#### `fluree doc` ledgers move to a new graph on the next ingest
+
+The first `fluree doc ingest` after the upgrade re-parses and re-ingests every document once, and the ledger moves to the new graph shape: `doco:Document` becomes `foaf:Document`, `doco:ListItem` goes away, and every chunk, mention, relation and structure-node IRI moves. The previous extraction is retracted in full. A triple you added to a chunk or relation node stays on that node's old IRI. Triples on the document node are unaffected, since its IRI doesn't move. An embedding model whose width differs from the one the ledger holds is refused ([Mixing models](../unstructured/concepts/vector-search.md#mixing-models)). See [What gets built](../unstructured/concepts/what-gets-built.md).
+
+#### macOS builds need macOS 14 or later
+
+The CLI binary and the Python wheel for Apple silicon are built for macOS 14 (Sonoma) and later; earlier releases ran on macOS 11. On an older macOS the CLI does not start, and Homebrew refuses to install or upgrade it, leaving the installed version in place. `pip install fluree` installs the last release built for macOS 11 instead; asking for a later version by number finds no wheel.
 
 #### `fluree-track-policy` is now parsed by the server
 
@@ -354,29 +627,22 @@ Supported SPARQL versions:
 | Format | Read | Write |
 |--------|------|-------|
 | JSON-LD | Yes | Yes |
-| Turtle | Yes | Yes |
-| N-Triples | Yes | Yes |
-| N-Quads | Yes | Yes |
-| TriG | Yes | Yes |
-| RDF/XML | No | CONSTRUCT/DESCRIBE results only |
+| Turtle | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
+| N-Triples | Yes | Yes (export, CONSTRUCT/DESCRIBE results, Graph Store `GET`) |
+| N-Quads | Yes | Yes (export, CONSTRUCT/DESCRIBE results) |
+| TriG | Yes | Yes (export, CONSTRUCT/DESCRIBE results) |
+| RDF/XML | No | CONSTRUCT/DESCRIBE results and Graph Store `GET` only |
 
 Import accepts `.ttl`, `.nt`, `.nq`, `.trig`, and `.jsonld`/`.jsonl` files, each
 with transparent `.gz` / `.zst` decompression.
 
 ## Protocol Support
 
-### HTTP Versions
+### HTTP and TLS
 
-- HTTP/1.1: Fully supported
-- HTTP/2: Supported
-- HTTP/3: Planned
-
-### TLS Versions
-
-- TLS 1.2: Supported
-- TLS 1.3: Supported
-- SSL 3.0: Not supported (deprecated)
-- TLS 1.0/1.1: Not supported (deprecated)
+The server speaks HTTP/1.1 over plain TCP. It does not terminate TLS or serve
+HTTP/2 itself: put it behind a reverse proxy or load balancer for HTTPS and
+HTTP/2.
 
 ## Client Support
 
@@ -405,7 +671,7 @@ Fluree works with:
 
 **Server:**
 - Linux (x86_64, aarch64)
-- macOS (Intel, Apple Silicon)
+- macOS 14 or later (Apple silicon)
 - Windows (x86_64)
 
 **Clients:**
@@ -449,10 +715,9 @@ Fluree can import from:
 ### Export Formats
 
 Export Fluree data to:
-- Turtle files
-- JSON-LD documents
-- SPARQL CONSTRUCT results
-- Any RDF format
+- Turtle, N-Triples, N-Quads, TriG or JSON-LD, with `fluree export` or the export endpoint
+- SPARQL CONSTRUCT / DESCRIBE results as JSON-LD, Turtle, N-Triples, RDF/XML, TriG or N-Quads
+- One graph at a time through the Graph Store Protocol
 
 ## Feature Roadmap
 
@@ -460,10 +725,10 @@ Export Fluree data to:
 
 **Query:**
 - SPARQL property paths: nested transitive steps inside a composite repeated unit (`(a+/b)+`); `{n,m}` depth ranges
-- SPARQL 1.1 Federation (`SERVICE`)
-- Full SPARQL UPDATE (LOAD, CLEAR, DROP, CREATE, COPY, MOVE, ADD; variable graph names)
+- SPARQL 1.1 Federation: remote `SERVICE` endpoints (local-ledger `SERVICE` is supported)
+- Remote `LOAD` in SPARQL UPDATE
 - GeoSPARQL: remaining OGC functions (only `geof:distance` is implemented today)
-- RDF 1.2 / SPARQL 1.2: Turtle 1.2 annotation syntax on ingest; triple-term accessor functions; W3C 1.2 test-suite execution
+- RDF 1.2 / SPARQL 1.2: triple terms as values and the triple-term accessor functions; the RDF 1.2 Turtle evaluation suite (blocked on triple terms)
 
 **Storage:**
 - Additional cloud providers (GCP, Azure)
@@ -521,9 +786,8 @@ Works with data engineering tools:
 
 ### Rust Version
 
-Building from source requires:
-- Rust 1.75.0 or later
-- Cargo 1.75.0 or later
+Building from source uses the Rust toolchain pinned in `rust-toolchain.toml`
+(currently 1.97.0), which `rustup` installs automatically.
 
 ### Dependencies
 

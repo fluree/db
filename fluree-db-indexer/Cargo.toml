@@ -8,6 +8,9 @@ repository.workspace = true
 
 [features]
 default = []
+# Hooks for tests in other crates: halting a ledger without unindexable
+# data, and building incrementally with no fallback to a full rebuild.
+test-utils = []
 # Enable the embedded orchestrator (post-commit indexing helpers)
 embedded-orchestrator = ["dep:fluree-db-ledger"]
 
@@ -19,6 +22,7 @@ fluree-db-nameservice = { path = "../fluree-db-nameservice" }
 fluree-db-ledger = { path = "../fluree-db-ledger", optional = true }
 fluree-db-spatial = { path = "../fluree-db-spatial" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
+fluree-db-stats = { path = "../fluree-db-stats" }
 
 # Core dependencies
 futures.workspace = true
@@ -55,6 +59,8 @@ rayon.workspace = true
 # For HLL tests (proper hash distribution)
 xxhash-rust.workspace = true
 tempfile = "3"
+tracing-subscriber.workspace = true
+fluree-test-support = { path = "../fluree-test-support" }
 
 [lints]
 workspace = true

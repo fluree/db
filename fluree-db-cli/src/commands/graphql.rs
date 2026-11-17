@@ -28,8 +28,8 @@ pub async fn run(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     let alias = context::resolve_ledger(explicit_ledger, dirs)?;
-    let fluree = context::build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let fluree = context::build_fluree(dirs).await?;
+    let ledger_id = context::to_ledger_id(&alias)?;
     // The default context decides the GraphQL names and the form `id` values take,
     // so it is not optional here the way it is for a raw JSON-LD query.
     let view = fluree.db_with_default_context(&ledger_id).await?;

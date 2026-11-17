@@ -147,8 +147,7 @@ impl ColumnBatch {
     /// `t`). Used by the leaflet cache's superset fallback so a warm-on-write
     /// `ColumnSet::ALL` batch can serve narrower reads.
     ///
-    /// Sound only when `self` already covers `requested` (`cached ⊇ requested`);
-    /// the cache guarantees this by projecting only an `ALL` batch.
+    /// Sound only when `self` already covers `requested` (`cached ⊇ requested`).
     pub fn project_to(&self, requested: ColumnSet) -> ColumnBatch {
         macro_rules! keep {
             ($col:expr, $field:ident) => {
@@ -167,6 +166,30 @@ impl ColumnBatch {
             o_type: keep!(ColumnId::OType, o_type),
             o_i: keep!(ColumnId::OI, o_i),
             t: keep!(ColumnId::T, t),
+        }
+    }
+
+    /// `self` with the `columns` of `other` (a decode of the same leaflet)
+    /// taken in its place.
+    pub fn with_columns_from(&self, other: &ColumnBatch, columns: ColumnSet) -> ColumnBatch {
+        debug_assert_eq!(self.row_count, other.row_count);
+        macro_rules! pick {
+            ($col:expr, $field:ident) => {
+                if columns.contains($col) {
+                    other.$field.clone()
+                } else {
+                    self.$field.clone()
+                }
+            };
+        }
+        ColumnBatch {
+            row_count: self.row_count,
+            s_id: pick!(ColumnId::SId, s_id),
+            o_key: pick!(ColumnId::OKey, o_key),
+            p_id: pick!(ColumnId::PId, p_id),
+            o_type: pick!(ColumnId::OType, o_type),
+            o_i: pick!(ColumnId::OI, o_i),
+            t: pick!(ColumnId::T, t),
         }
     }
 }
@@ -219,6 +242,16 @@ impl ColumnSet {
     #[inline]
     pub fn single(col: ColumnId) -> Self {
         Self(1 << col as u16)
+    }
+
+    #[inline]
+    pub fn covers(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    #[inline]
+    pub fn difference(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
     }
 }
 

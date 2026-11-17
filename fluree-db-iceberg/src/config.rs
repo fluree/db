@@ -3,7 +3,7 @@
 //! This module defines the JSON-serializable configuration structures
 //! stored in `GraphSourceRecord.config` for Iceberg graph sources.
 
-use crate::auth::AuthConfig;
+use crate::auth::{AuthConfig, GoogleCredentials};
 use crate::catalog::parse_table_identifier;
 use crate::catalog::TableIdentifier;
 use crate::error::{IcebergError, Result};
@@ -60,6 +60,19 @@ pub struct IcebergGsConfig {
     /// (legacy behavior; fields cleared in a later revision are NOT removed).
     #[serde(default)]
     pub order_by: Option<String>,
+    /// Optional model ledger (`name:branch`) governing this source: its
+    /// default graph supplies the view policies and the `rdfs:subClassOf` /
+    /// `rdfs:subPropertyOf` hierarchy used to expand policy targets, the way a
+    /// native ledger's `f:policySource` / `f:schemaSource` config references do.
+    /// A virtual source has no ledger of its own to hold either.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Optional `default-allow` for governed requests that carry policy inputs
+    /// but match no policy — the same tri-state as a native ledger's
+    /// `f:defaultAllow` config. Lets an admin declare a source readable under
+    /// authentication without attaching a model. Unset: fail-closed (`false`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_allow: Option<bool>,
 }
 
 /// Declares how a delete is encoded in the source table's append log so the
@@ -139,7 +152,9 @@ impl IcebergGsConfig {
     ///
     /// For `Direct` catalog configs, if no explicit `table` config is set,
     /// the table identifier is derived from the last two path segments of
-    /// `table_location` (e.g., `s3://bucket/warehouse/ns/table` → `ns.table`).
+    /// `table_location` (e.g., `s3://bucket/warehouse/ns/table` → `ns.table`),
+    /// the bucket counting as one (`s3://bucket/lake` → `bucket.lake`). A
+    /// single-segment location (`s3://bucket`) takes the namespace `default`.
     pub fn table_identifier(&self) -> Result<TableIdentifier> {
         let id_str = self.table.identifier();
         if !id_str.is_empty() {
@@ -151,23 +166,63 @@ impl IcebergGsConfig {
             let path = table_location
                 .trim_start_matches("s3://")
                 .trim_start_matches("s3a://")
+                .trim_start_matches("gs://")
                 .trim_start_matches("file://");
             let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
-            if segments.len() >= 3 {
-                // segments[0] = bucket, segments[1..n-2] = warehouse path,
-                // segments[n-2] = namespace, segments[n-1] = table
-                let ns = segments[segments.len() - 2];
-                let table = segments[segments.len() - 1];
-                return Ok(TableIdentifier {
-                    namespace: ns.to_string(),
-                    table: table.to_string(),
-                });
+            // The last segment names the table and the one before it the
+            // namespace; for an object-store location one level under its
+            // bucket that is the bucket. A lone segment (a bucket, or a
+            // top-level directory) has no parent to name one.
+            match segments.as_slice() {
+                [.., ns, table] => {
+                    return Ok(TableIdentifier {
+                        namespace: (*ns).to_string(),
+                        table: (*table).to_string(),
+                    });
+                }
+                [table] => {
+                    return Ok(TableIdentifier {
+                        namespace: "default".to_string(),
+                        table: (*table).to_string(),
+                    });
+                }
+                [] => {}
             }
         }
 
         Err(IcebergError::Config(
             "Cannot determine table identifier from config".to_string(),
         ))
+    }
+
+    /// Checks shared by the native-AWS catalog modes (Glue, S3 Tables).
+    fn validate_aws_sdk_catalog(&self, mode: &str) -> Result<()> {
+        // Every table is named `<namespace>.<table>`; nothing derives from a path.
+        self.table_identifier()?;
+        // The catalog returns a metadata location only — never credentials — so
+        // a source that requires vended credentials could never be satisfied.
+        // Refuse it here, as Direct mode does, rather than read with the ambient
+        // identity the config said not to use.
+        if self.io.vended_credentials {
+            return Err(IcebergError::Config(format!(
+                "Vended credentials are not supported with the {mode} catalog — it reads S3 \
+                 with the ambient AWS credential chain; set io.vended_credentials = false"
+            )));
+        }
+        self.io.validate_s3_overrides()
+    }
+
+    /// The IO settings this source's S3 reads use. For the native-AWS catalog
+    /// modes (Glue, S3 Tables) `s3_region` falls back to the catalog's own
+    /// region — see [`IoConfig::with_catalog_region`]; every other mode reads
+    /// with `io` as configured.
+    pub fn storage_io(&self) -> std::borrow::Cow<'_, IoConfig> {
+        match self.catalog.aws_region() {
+            Some(region) if self.io.s3_region.is_none() => {
+                std::borrow::Cow::Owned(self.io.with_catalog_region(Some(region)))
+            }
+            _ => std::borrow::Cow::Borrowed(&self.io),
+        }
     }
 
     /// Validate the configuration.
@@ -186,17 +241,37 @@ impl IcebergGsConfig {
                         "catalog.table_location is required".to_string(),
                     ));
                 }
-                let is_object_store =
-                    table_location.starts_with("s3://") || table_location.starts_with("s3a://");
+                use crate::io::location::LocationScheme;
+                let scheme = LocationScheme::of(table_location);
                 // `file:///abs/path` (and the `file:/abs` single-slash variant) or a
                 // bare absolute path: a catalog-less LOCAL table, read from the
                 // filesystem with no object store or catalog service involved.
-                let is_local = crate::local_guard::is_local_location(table_location);
-                if !is_object_store && !is_local {
+                if scheme == LocationScheme::Other {
                     return Err(IcebergError::Config(format!(
                         "Direct catalog table_location must be an S3 URI (s3:// or s3a://), a \
-                         file:// URI, or an absolute local path, got: {table_location}"
+                         GCS URI (gs://), a file:// URI, or an absolute local path, got: \
+                         {table_location}"
                     )));
+                }
+                // A gs:// table is read by a Google identity (io.storage_auth
+                // `google`), or by AWS only through the GCS interop endpoint;
+                // refused here rather than at the first read.
+                if scheme == LocationScheme::Gs {
+                    let served = match &self.io.storage_auth {
+                        Some(StorageAuth::Google { .. }) => true,
+                        None | Some(StorageAuth::Ambient) => {
+                            crate::io::location::s3_serves(scheme, self.io.s3_endpoint.as_deref())
+                        }
+                        Some(StorageAuth::Vended | StorageAuth::Catalog) => false,
+                    };
+                    if !served {
+                        return Err(IcebergError::Config(format!(
+                            "Direct catalog table_location {table_location} is a gs:// URI, which \
+                             this source's storage identity does not read: set io.storage_auth to \
+                             `google` (a Google identity), or io.s3_endpoint to the GCS interop \
+                             endpoint (https://storage.googleapis.com)"
+                        )));
+                    }
                 }
                 // Local locations are fail-closed: permitted only under an
                 // operator-allowlisted root. Refuse at creation rather than
@@ -213,12 +288,90 @@ impl IcebergGsConfig {
                     ));
                 }
             }
+            CatalogConfig::Glue { .. } => {
+                self.catalog.validate_aws_sdk_catalog()?;
+                self.validate_aws_sdk_catalog("Glue")?;
+            }
+            CatalogConfig::S3Tables { .. } => {
+                self.catalog.validate_aws_sdk_catalog()?;
+                self.validate_aws_sdk_catalog("S3 Tables")?;
+            }
         }
+
+        self.validate_storage_auth()?;
 
         if let Some(delete) = &self.delete {
             delete.validate()?;
         }
 
+        Ok(())
+    }
+
+    /// Validate `io.storage_auth` against the catalog it reads beside.
+    ///
+    /// - `vended` needs a REST catalog (the only kind that vends);
+    /// - `catalog` needs a REST catalog whose own auth is a Google identity
+    ///   (`google` or `google_metadata`), since that identity reads `gs://`;
+    /// - `ambient` and `google` are valid in any mode;
+    /// - `vended_credentials` must agree with it (`true` exactly for `vended`):
+    ///   the flag predates `storage_auth` and is still what older readers of a
+    ///   stored config consult, so the two may not say different things.
+    pub fn validate_storage_auth(&self) -> Result<()> {
+        let Some(storage_auth) = &self.io.storage_auth else {
+            return Ok(());
+        };
+        let kind = storage_auth.kind();
+        let rest_auth = match &self.catalog {
+            CatalogConfig::Rest { auth, .. } => Some(auth),
+            _ => None,
+        };
+        match storage_auth {
+            StorageAuth::Vended if rest_auth.is_none() => {
+                return Err(IcebergError::Config(
+                    "io.storage_auth `vended` needs a REST catalog: no other catalog mode vends \
+                     storage credentials"
+                        .to_string(),
+                ));
+            }
+            StorageAuth::Catalog
+                if !matches!(
+                    rest_auth,
+                    Some(AuthConfig::Google { .. } | AuthConfig::GoogleMetadata { .. })
+                ) =>
+            {
+                return Err(IcebergError::Config(
+                    "io.storage_auth `catalog` needs a REST catalog authenticated with a Google \
+                     identity (auth type `google` or `google_metadata`): that identity is what \
+                     reads the table's gs:// files"
+                        .to_string(),
+                ));
+            }
+            StorageAuth::Google {
+                credentials,
+                quota_project,
+            } => {
+                if quota_project
+                    .as_deref()
+                    .is_some_and(|p| !crate::auth::google::is_project_id(p))
+                {
+                    return Err(IcebergError::GoogleCredentialsInvalid(
+                        "io.storage_auth.quota_project is not a Google Cloud project id"
+                            .to_string(),
+                    ));
+                }
+                credentials.validate_static()?;
+            }
+            StorageAuth::Vended | StorageAuth::Ambient | StorageAuth::Catalog => {}
+        }
+        let vended = matches!(storage_auth, StorageAuth::Vended);
+        if self.io.vended_credentials != vended {
+            return Err(IcebergError::Config(format!(
+                "io.storage_auth `{kind}` contradicts io.vended_credentials = {}: set \
+                 vended_credentials = {vended} (it must be true exactly when storage_auth is \
+                 `vended`)",
+                self.io.vended_credentials
+            )));
+        }
         Ok(())
     }
 }
@@ -234,18 +387,20 @@ impl IcebergGsConfig {
 ///
 /// # Serde
 ///
-/// Uses a helper enum with `#[serde(untagged)]` to accept both the new tagged
-/// format (`{"type": "rest", ...}`) and the legacy flat struct format
-/// (`{"uri": "...", "auth": ...}`).
-#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
-#[serde(from = "CatalogConfigHelper", into = "CatalogConfigHelper")]
+/// Serialized tagged (`{"type": "rest", ...}`). Read tagged, or in the legacy
+/// untyped form (`{"uri": "...", "auth": ...}`, a REST catalog). A stated
+/// `type` selects its variant: input that is not that variant is refused,
+/// naming the key where it stops (`table_location` missing, `type` unknown),
+/// never read as another variant.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(into = "CatalogConfigHelper")]
 #[allow(clippy::large_enum_variant)] // Config type, not in hot paths
 pub enum CatalogConfig {
     /// Discover metadata via an Iceberg REST catalog API.
     Rest {
         /// Catalog type identifier (e.g., "polaris", "rest").
         catalog_type: String,
-        /// Base URI of the catalog (e.g., "https://polaris.example.com").
+        /// Base URI of the catalog (e.g., `https://polaris.example.com`).
         uri: String,
         /// Authentication configuration.
         auth: AuthConfig,
@@ -266,9 +421,124 @@ pub enum CatalogConfig {
         /// `metadata/` subdirectory with Iceberg metadata files.
         table_location: String,
     },
+
+    /// AWS Glue Data Catalog via the native AWS SDK (`aws-sdk-glue`).
+    ///
+    /// Resolves the table's `metadata_location` from Glue `GetTable`, then reads
+    /// metadata/manifests/data from S3 with the ambient AWS credential chain. The
+    /// Glue *database* is the table identifier's namespace. No REST/SigV4/vended
+    /// credentials are involved — the SDK signs its own calls.
+    Glue {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        #[serde(default)]
+        region: Option<String>,
+        /// Glue catalog id for cross-account access (`None` = the caller's account).
+        #[serde(default)]
+        catalog_id: Option<String>,
+    },
+
+    /// AWS S3 Tables via the native AWS SDK (`aws-sdk-s3tables`).
+    ///
+    /// Resolves the table's metadata location from `GetTableMetadataLocation`,
+    /// then reads from the managed table bucket with the ambient AWS credential
+    /// chain.
+    S3Tables {
+        /// AWS region. Falls back to the SDK default chain / `io.s3_region` if `None`.
+        #[serde(default)]
+        region: Option<String>,
+        /// The S3 Tables table-bucket ARN
+        /// (`arn:aws:s3tables:<region>:<account>:bucket/<name>`).
+        table_bucket_arn: String,
+    },
 }
 
 impl CatalogConfig {
+    /// The region configured on a native-AWS catalog mode (Glue, S3 Tables);
+    /// `None` for REST and Direct, which call no AWS catalog API.
+    ///
+    /// An S3 Tables bucket ARN names its region, so S3 Tables falls back to it.
+    pub fn aws_region(&self) -> Option<&str> {
+        match self {
+            CatalogConfig::Glue { region, .. } => region.as_deref(),
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => region
+                .as_deref()
+                .or_else(|| s3tables_bucket_arn_region(table_bucket_arn).ok()),
+            CatalogConfig::Rest { .. } | CatalogConfig::Direct { .. } => None,
+        }
+    }
+
+    /// Validate a native-AWS catalog's own settings (Glue, S3 Tables): region
+    /// shape, a non-empty Glue catalog id, a well-formed S3 Tables bucket ARN
+    /// whose region agrees with `region`. No-op for REST and Direct. Shared by
+    /// [`IcebergGsConfig::validate`] and the onboarding (browse/preview) path,
+    /// which has a catalog but no table.
+    pub fn validate_aws_sdk_catalog(&self) -> Result<()> {
+        match self {
+            CatalogConfig::Glue { region, catalog_id } => {
+                validate_aws_region("catalog.region", region.as_deref())?;
+                if catalog_id.as_deref().is_some_and(|id| id.trim().is_empty()) {
+                    return Err(IcebergError::Config(
+                        "Glue catalog.catalog_id must not be empty (omit it for the caller's \
+                         account)"
+                            .to_string(),
+                    ));
+                }
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                validate_aws_region("catalog.region", region.as_deref())?;
+                let arn_region = s3tables_bucket_arn_region(table_bucket_arn)?;
+                // The bucket lives in the ARN's region; a different `region` could
+                // only send the catalog call to the wrong endpoint.
+                if let Some(region) = region.as_deref().filter(|r| *r != arn_region) {
+                    return Err(IcebergError::Config(format!(
+                        "S3Tables catalog.region '{region}' contradicts the table bucket ARN's \
+                         region '{arn_region}' (omit catalog.region to use the ARN's)"
+                    )));
+                }
+            }
+            CatalogConfig::Rest { .. } | CatalogConfig::Direct { .. } => {}
+        }
+        Ok(())
+    }
+
+    /// Whether this catalog can vend storage credentials. Only a REST catalog
+    /// can; Direct has no catalog, and Glue / S3 Tables return a metadata
+    /// location only, so their reads always use the ambient AWS identity.
+    pub fn vends_credentials(&self) -> bool {
+        matches!(self, CatalogConfig::Rest { .. })
+    }
+
+    /// A display label for the catalog in logs and errors: the REST URI, the
+    /// Glue catalog id (`aws-glue` for the caller's own account), the S3 Tables
+    /// bucket ARN, or the Direct table location.
+    pub fn catalog_label(&self) -> &str {
+        match self {
+            CatalogConfig::Rest { uri, .. } => uri,
+            CatalogConfig::Direct { table_location } => table_location,
+            CatalogConfig::Glue { catalog_id, .. } => catalog_id.as_deref().unwrap_or("aws-glue"),
+            CatalogConfig::S3Tables {
+                table_bucket_arn, ..
+            } => table_bucket_arn,
+        }
+    }
+
+    /// The region a native-AWS catalog's API is called in — see
+    /// [`aws_catalog_region`]. `None` for REST and Direct.
+    pub fn aws_catalog_region<'a>(&'a self, io: &'a IoConfig) -> Option<&'a str> {
+        match self {
+            CatalogConfig::Glue { .. } | CatalogConfig::S3Tables { .. } => {
+                aws_catalog_region(self.aws_region(), io)
+            }
+            CatalogConfig::Rest { .. } | CatalogConfig::Direct { .. } => None,
+        }
+    }
+
     /// Create a REST catalog config with common defaults.
     pub fn rest(uri: impl Into<String>) -> Self {
         CatalogConfig::Rest {
@@ -293,82 +563,152 @@ impl CatalogConfig {
             table_location: loc,
         }
     }
+
+    /// Create an AWS Glue Data Catalog config.
+    pub fn glue(region: Option<String>, catalog_id: Option<String>) -> Self {
+        CatalogConfig::Glue { region, catalog_id }
+    }
+
+    /// Create an AWS S3 Tables catalog config from a table-bucket ARN.
+    pub fn s3_tables(region: Option<String>, table_bucket_arn: impl Into<String>) -> Self {
+        CatalogConfig::S3Tables {
+            region,
+            table_bucket_arn: table_bucket_arn.into(),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
-// Serde helper: supports both tagged enum format and legacy flat struct format.
+// Serde: tagged out; tagged or legacy untyped in.
 // ---------------------------------------------------------------------------
 
-/// Internal serde helper that uses `#[serde(untagged)]` to accept both the
-/// new tagged format (`{"type": "rest", ...}`) and the legacy flat struct
-/// format (`{"uri": "...", "auth": ...}`).
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(untagged)]
-enum CatalogConfigHelper {
-    /// New tagged format.
-    Tagged(TaggedCatalogConfig),
-    /// Legacy flat struct format (deserializes as Rest).
-    Legacy(LegacyCatalogConfig),
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize)]
+/// The serialized form: always tagged.
+#[derive(Serialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 #[allow(clippy::large_enum_variant)]
-enum TaggedCatalogConfig {
+enum CatalogConfigHelper {
     Rest {
-        #[serde(default = "default_catalog_type")]
         catalog_type: String,
         uri: String,
-        #[serde(default)]
         auth: AuthConfig,
-        #[serde(default)]
         warehouse: Option<String>,
     },
     Direct {
         table_location: String,
     },
+    Glue {
+        region: Option<String>,
+        catalog_id: Option<String>,
+    },
+    S3Tables {
+        region: Option<String>,
+        table_bucket_arn: String,
+    },
 }
 
-/// Legacy format: flat struct with `uri` as a required field.
-#[derive(Debug, Clone, Deserialize, Serialize)]
-struct LegacyCatalogConfig {
-    #[serde(default = "default_catalog_type")]
-    catalog_type: String,
-    uri: String,
-    #[serde(default)]
-    auth: AuthConfig,
-    #[serde(default)]
-    warehouse: Option<String>,
+/// A catalog's `type`.
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum CatalogKind {
+    Rest,
+    Direct,
+    Glue,
+    S3Tables,
 }
 
 fn default_catalog_type() -> String {
     "polaris".to_string()
 }
 
-impl From<CatalogConfigHelper> for CatalogConfig {
-    fn from(helper: CatalogConfigHelper) -> Self {
-        match helper {
-            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Rest {
-                catalog_type,
-                uri,
-                auth,
-                warehouse,
-            })
-            | CatalogConfigHelper::Legacy(LegacyCatalogConfig {
-                catalog_type,
-                uri,
-                auth,
-                warehouse,
-            }) => CatalogConfig::Rest {
-                catalog_type,
-                uri,
-                auth,
-                warehouse,
-            },
-            CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location }) => {
-                CatalogConfig::Direct { table_location }
+/// Read by key rather than through `#[serde(untagged)]`: an untagged reading
+/// falls back to the legacy REST form whenever the stated variant does not
+/// parse (so `{"type": "direct", "uri": …}` read as REST), and its one error
+/// says only that no variant matched. Each key is read as its own type, so a
+/// refusal names the key; which variant the keys make is decided by `type`
+/// alone, and its absence means the legacy REST form. Keys no variant knows
+/// are ignored, as serde ignores them everywhere a record is read.
+impl<'de> Deserialize<'de> for CatalogConfig {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        deserializer.deserialize_map(CatalogConfigVisitor)
+    }
+}
+
+struct CatalogConfigVisitor;
+
+impl<'de> serde::de::Visitor<'de> for CatalogConfigVisitor {
+    type Value = CatalogConfig;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a catalog configuration object")
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(
+        self,
+        mut map: A,
+    ) -> std::result::Result<CatalogConfig, A::Error> {
+        use serde::de::Error;
+
+        fn set<'de, A: serde::de::MapAccess<'de>, T: Deserialize<'de>>(
+            map: &mut A,
+            slot: &mut Option<T>,
+            name: &'static str,
+        ) -> std::result::Result<(), A::Error> {
+            if slot.is_some() {
+                return Err(A::Error::duplicate_field(name));
+            }
+            *slot = Some(map.next_value()?);
+            Ok(())
+        }
+
+        let mut kind: Option<CatalogKind> = None;
+        let mut catalog_type: Option<String> = None;
+        let mut uri: Option<String> = None;
+        let mut auth: Option<AuthConfig> = None;
+        let mut warehouse: Option<Option<String>> = None;
+        let mut table_location: Option<String> = None;
+        let mut region: Option<Option<String>> = None;
+        let mut catalog_id: Option<Option<String>> = None;
+        let mut table_bucket_arn: Option<String> = None;
+        while let Some(key) = map.next_key::<String>()? {
+            match key.as_str() {
+                "type" => set(&mut map, &mut kind, "type")?,
+                "catalog_type" => set(&mut map, &mut catalog_type, "catalog_type")?,
+                "uri" => set(&mut map, &mut uri, "uri")?,
+                "auth" => set(&mut map, &mut auth, "auth")?,
+                "warehouse" => set(&mut map, &mut warehouse, "warehouse")?,
+                "table_location" => set(&mut map, &mut table_location, "table_location")?,
+                "region" => set(&mut map, &mut region, "region")?,
+                "catalog_id" => set(&mut map, &mut catalog_id, "catalog_id")?,
+                "table_bucket_arn" => set(&mut map, &mut table_bucket_arn, "table_bucket_arn")?,
+                _ => {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
             }
         }
+        let required = |value: Option<String>, name: &'static str| {
+            value.ok_or_else(|| A::Error::missing_field(name))
+        };
+        Ok(match kind.unwrap_or(CatalogKind::Rest) {
+            CatalogKind::Rest => CatalogConfig::Rest {
+                catalog_type: catalog_type.unwrap_or_else(default_catalog_type),
+                uri: required(uri, "uri")?,
+                auth: auth.unwrap_or_default(),
+                warehouse: warehouse.flatten(),
+            },
+            CatalogKind::Direct => CatalogConfig::Direct {
+                table_location: required(table_location, "table_location")?,
+            },
+            CatalogKind::Glue => CatalogConfig::Glue {
+                region: region.flatten(),
+                catalog_id: catalog_id.flatten(),
+            },
+            CatalogKind::S3Tables => CatalogConfig::S3Tables {
+                region: region.flatten(),
+                table_bucket_arn: required(table_bucket_arn, "table_bucket_arn")?,
+            },
+        })
     }
 }
 
@@ -380,15 +720,25 @@ impl From<CatalogConfig> for CatalogConfigHelper {
                 uri,
                 auth,
                 warehouse,
-            } => CatalogConfigHelper::Tagged(TaggedCatalogConfig::Rest {
+            } => CatalogConfigHelper::Rest {
                 catalog_type,
                 uri,
                 auth,
                 warehouse,
-            }),
+            },
             CatalogConfig::Direct { table_location } => {
-                CatalogConfigHelper::Tagged(TaggedCatalogConfig::Direct { table_location })
+                CatalogConfigHelper::Direct { table_location }
             }
+            CatalogConfig::Glue { region, catalog_id } => {
+                CatalogConfigHelper::Glue { region, catalog_id }
+            }
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => CatalogConfigHelper::S3Tables {
+                region,
+                table_bucket_arn,
+            },
         }
     }
 }
@@ -428,6 +778,60 @@ pub struct IoConfig {
     /// Use path-style S3 URLs (for MinIO, LocalStack)
     #[serde(default)]
     pub s3_path_style: bool,
+    /// Which identity reads the table's files. Absent (every record written
+    /// before this field existed) means what `vended_credentials` says on the
+    /// source's catalog; see [`IoConfig::effective_storage_auth`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_auth: Option<StorageAuth>,
+}
+
+/// Which identity reads a graph source's data and metadata files.
+///
+/// ```json
+/// {"type": "vended"}
+/// {"type": "ambient"}
+/// {"type": "catalog"}
+/// {"type": "google", "credentials": {"source": "service_account", "key": {"env_var": "SA_KEY"}}, "quota_project": "p"}
+/// ```
+///
+/// Explicit, never inferred: a vending catalog that failed to vend must not
+/// silently fall back to another identity.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum StorageAuth {
+    /// The catalog's per-table vended credentials, required: a table it vends
+    /// nothing for is refused.
+    Vended,
+    /// The host's ambient AWS credential chain (a host identity).
+    Ambient,
+    /// The REST catalog's own Google identity reads `gs://` — Google's model
+    /// for BigLake federation (`bq://`), which never vends. The identity, not
+    /// its quota project: the catalog auth's `quota_project` bills BigLake's
+    /// API, and is never sent with a storage read (to GCS,
+    /// `x-goog-user-project` is a requester-pays billing project).
+    Catalog,
+    /// A Google identity of the source's own, for `gs://` (e.g. Direct mode).
+    Google {
+        /// Where the credential comes from.
+        credentials: GoogleCredentials,
+        /// The project storage requests bill to (requester pays), sent as
+        /// `x-goog-user-project`; unset, a read names no billing project. A
+        /// credential JSON's own `quota_project_id` is not used for storage.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        quota_project: Option<String>,
+    },
+}
+
+impl StorageAuth {
+    /// The variant's stored tag.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            StorageAuth::Vended => "vended",
+            StorageAuth::Ambient => "ambient",
+            StorageAuth::Catalog => "catalog",
+            StorageAuth::Google { .. } => "google",
+        }
+    }
 }
 
 fn default_vended_credentials() -> bool {
@@ -441,7 +845,140 @@ impl Default for IoConfig {
             s3_region: None,
             s3_endpoint: None,
             s3_path_style: false,
+            storage_auth: None,
         }
+    }
+}
+
+impl IoConfig {
+    /// The storage identity a source of `catalog` with these settings reads
+    /// as: `storage_auth` when set, else what `vended_credentials` has always
+    /// meant — the catalog's vended credentials on a REST catalog, the host's
+    /// ambient identity on any other (no other catalog vends). The one rule:
+    /// the storage decision and the `loadTable` request both follow it.
+    pub fn effective_storage_auth(
+        &self,
+        catalog: &CatalogConfig,
+    ) -> std::borrow::Cow<'_, StorageAuth> {
+        match &self.storage_auth {
+            Some(storage_auth) => std::borrow::Cow::Borrowed(storage_auth),
+            None if self.vended_credentials && matches!(catalog, CatalogConfig::Rest { .. }) => {
+                std::borrow::Cow::Owned(StorageAuth::Vended)
+            }
+            None => std::borrow::Cow::Owned(StorageAuth::Ambient),
+        }
+    }
+
+    /// Whether a `loadTable` from `catalog` asks it to vend storage
+    /// credentials (and reads the ones it returns): exactly when the source
+    /// reads with them ([`Self::effective_storage_auth`]).
+    pub fn requests_vended_credentials(&self, catalog: &CatalogConfig) -> bool {
+        matches!(*self.effective_storage_auth(catalog), StorageAuth::Vended)
+    }
+
+    /// These settings reading with `storage_auth`, with `vended_credentials`
+    /// set to agree with it (see [`IcebergGsConfig::validate_storage_auth`]).
+    pub fn with_storage_auth(&self, storage_auth: StorageAuth) -> IoConfig {
+        IoConfig {
+            vended_credentials: matches!(storage_auth, StorageAuth::Vended),
+            storage_auth: Some(storage_auth),
+            ..self.clone()
+        }
+    }
+
+    /// These settings with `s3_region` falling back to a native-AWS catalog's
+    /// region: a lake's catalog and its data normally share a region, so a user
+    /// who names only the catalog's region still reads S3 there. An explicit
+    /// `s3_region` wins — the data may live in another region than the catalog.
+    pub fn with_catalog_region(&self, catalog_region: Option<&str>) -> IoConfig {
+        IoConfig {
+            s3_region: self
+                .s3_region
+                .clone()
+                .or_else(|| catalog_region.map(str::to_string)),
+            ..self.clone()
+        }
+    }
+
+    /// Validate the S3 overrides that end up in an SDK endpoint: the region's
+    /// shape (it becomes part of a hostname) and the endpoint's SSRF guard.
+    pub fn validate_s3_overrides(&self) -> Result<()> {
+        validate_aws_region("io.s3_region", self.s3_region.as_deref())?;
+        if let Some(endpoint) = self.s3_endpoint.as_deref() {
+            crate::net::validate_s3_endpoint(endpoint)?;
+        }
+        Ok(())
+    }
+}
+
+/// The table identifier a catalog-mode source (rest, glue, s3tables) records
+/// when ALL its tables come from its R2RML mapping (each `rr:tableName` names
+/// one). It satisfies the `namespace.table` shape the config requires and is
+/// never loaded; anything that lists a mapped source's tables skips it.
+pub const MAPPING_DEFINED_TABLE: &str = "default.default";
+
+/// The region a native-AWS catalog's API (Glue `GetTable`, S3 Tables
+/// `GetTableMetadataLocation`) is called in: the mode's own `region`, else
+/// `io.s3_region` (the same region the data reads use), else `None`, which
+/// defers to the AWS SDK's region chain (`AWS_REGION`, profile, IMDS).
+///
+/// The one resolution both the query path and the browse/preview path use, so
+/// the catalog call and the S3 reads cannot disagree about a region the user
+/// gave only once.
+pub fn aws_catalog_region<'a>(mode_region: Option<&'a str>, io: &'a IoConfig) -> Option<&'a str> {
+    mode_region.or(io.s3_region.as_deref())
+}
+
+/// The region of an S3 Tables table-bucket ARN,
+/// `arn:<partition>:s3tables:<region>:<account-id>:bucket/<name>`, or a config
+/// error naming what is wrong with it. Accepts every AWS partition (`aws`,
+/// `aws-cn`, `aws-us-gov`).
+pub fn s3tables_bucket_arn_region(arn: &str) -> Result<&str> {
+    let invalid = |why: &str| {
+        IcebergError::Config(format!(
+            "S3Tables table_bucket_arn must be an S3 Tables bucket ARN \
+             (arn:aws:s3tables:<region>:<account-id>:bucket/<name>); {why}: {arn}"
+        ))
+    };
+    let parts: Vec<&str> = arn.splitn(6, ':').collect();
+    let [prefix, partition, service, region, account, resource] = parts.as_slice() else {
+        return Err(invalid("it has too few ':'-separated parts"));
+    };
+    if *prefix != "arn" || !partition.starts_with("aws") || *service != "s3tables" {
+        return Err(invalid("it is not an s3tables ARN"));
+    }
+    if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(invalid("the account id is not 12 digits"));
+    }
+    if resource.strip_prefix("bucket/").is_none_or(str::is_empty) {
+        return Err(invalid("the resource is not bucket/<name>"));
+    }
+    validate_aws_region("table_bucket_arn region", Some(region))?;
+    Ok(region)
+}
+
+/// Refuse a region that is not shaped like an AWS region (`us-east-1`,
+/// `us-gov-west-1`, `cn-north-1`). The AWS SDK interpolates the region into the
+/// service hostname (`glue.<region>.amazonaws.com`), so a value carrying `.`,
+/// `/` or `:` would point a signed request at another host.
+pub fn validate_aws_region(field: &str, region: Option<&str>) -> Result<()> {
+    let Some(region) = region else {
+        return Ok(());
+    };
+    let well_formed = !region.is_empty()
+        && region.len() <= 32
+        && region.split('-').all(|part| {
+            !part.is_empty()
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        });
+    if well_formed {
+        Ok(())
+    } else {
+        Err(IcebergError::Config(format!(
+            "{field} '{region}' is not an AWS region (expected e.g. us-east-1)"
+        )))
     }
 }
 
@@ -539,6 +1076,50 @@ mod tests {
     // ── New tagged format ──
 
     #[test]
+    fn a_stated_catalog_type_is_never_read_as_another() {
+        let read = |json: &str| serde_json::from_str::<CatalogConfig>(json);
+        // A Direct without its location, or a misspelled type, used to read
+        // as a legacy REST catalog because `uri` was present.
+        let e = read(r#"{"type": "direct", "uri": "https://c"}"#).unwrap_err();
+        assert!(
+            e.to_string().contains("missing field `table_location`"),
+            "{e}"
+        );
+        let e = read(r#"{"type": "dirct", "uri": "https://c"}"#).unwrap_err();
+        assert!(e.to_string().contains("unknown variant"), "{e}");
+        let e = read(r#"{"type": "s3tables", "uri": "https://c"}"#).unwrap_err();
+        assert!(e.to_string().contains("table_bucket_arn"), "{e}");
+        let e = read(r#"{"type": "rest", "uri": "https://c", "uri": "https://d"}"#).unwrap_err();
+        assert!(e.to_string().contains("duplicate field `uri`"), "{e}");
+        assert!(read(r#"["rest"]"#).is_err());
+        // No type is the legacy REST form; unknown keys are ignored on read.
+        assert_eq!(
+            read(r#"{"uri": "https://c", "extra": 1}"#).unwrap(),
+            CatalogConfig::rest("https://c")
+        );
+        assert!(read(r#"{"warehouse": "w"}"#).is_err());
+        // Each variant reads back what it writes.
+        for config in [
+            CatalogConfig::Rest {
+                catalog_type: "rest".into(),
+                uri: "https://c".into(),
+                auth: AuthConfig::Bearer {
+                    token: crate::config_value::ConfigValue::from_env("T"),
+                },
+                warehouse: Some("w".into()),
+            },
+            CatalogConfig::rest("https://c"),
+            CatalogConfig::direct("s3://b/w/ns/t"),
+            CatalogConfig::glue(Some("us-east-1".into()), Some("123".into())),
+            CatalogConfig::glue(None, None),
+            CatalogConfig::s3_tables(None, "arn:aws:s3tables:us-east-1:1:bucket/b"),
+        ] {
+            let json = serde_json::to_string(&config).unwrap();
+            assert_eq!(read(&json).unwrap(), config, "{json}");
+        }
+    }
+
+    #[test]
     fn test_parse_tagged_rest_config() {
         let json = r#"{
             "catalog": {
@@ -585,6 +1166,251 @@ mod tests {
         assert_eq!(table_id.table, "table");
     }
 
+    /// A Direct location shallower than `bucket/…/ns/table` still yields an
+    /// identifier: a warehouse root one level under its bucket, or the bucket
+    /// itself, has to be registrable.
+    #[test]
+    fn direct_identifier_derives_from_a_shallow_location() {
+        let id = |location: &str| {
+            let config = IcebergGsConfig {
+                table: TableConfig::Identifier(String::new()),
+                ..aws_sdk_config(CatalogConfig::direct(location), "")
+            };
+            config.validate().unwrap();
+            let id = config.table_identifier().unwrap();
+            (id.namespace, id.table)
+        };
+        let pair = |ns: &str, table: &str| (ns.to_string(), table.to_string());
+        assert_eq!(id("s3://bucket/wh/lake"), pair("wh", "lake"));
+        assert_eq!(id("s3://bucket/lake"), pair("bucket", "lake"));
+        assert_eq!(id("s3://bucket/lake/"), pair("bucket", "lake"));
+        assert_eq!(id("s3://bucket"), pair("default", "bucket"));
+    }
+
+    // ── AWS Glue / S3 Tables ──
+
+    const S3TABLES_ARN: &str = "arn:aws:s3tables:us-east-1:123456789012:bucket/demo";
+
+    /// A Glue / S3 Tables source as the API builds one: vended credentials off.
+    fn aws_sdk_config(catalog: CatalogConfig, table: &str) -> IcebergGsConfig {
+        IcebergGsConfig {
+            catalog,
+            table: TableConfig::Identifier(table.to_string()),
+            io: IoConfig {
+                vended_credentials: false,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        }
+    }
+
+    #[test]
+    fn test_parse_tagged_glue_config() {
+        let json = r#"{
+            "catalog": { "type": "glue", "region": "us-east-1" },
+            "table": "sales.orders",
+            "io": { "vended_credentials": false }
+        }"#;
+        let config: IcebergGsConfig = serde_json::from_str(json).unwrap();
+        match &config.catalog {
+            CatalogConfig::Glue { region, catalog_id } => {
+                assert_eq!(region, &Some("us-east-1".to_string()));
+                assert_eq!(catalog_id, &None);
+            }
+            other => panic!("Expected Glue variant, got {other:?}"),
+        }
+        let table_id = config.table_identifier().unwrap();
+        assert_eq!(table_id.namespace, "sales");
+        assert_eq!(table_id.table, "orders");
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_parse_tagged_s3tables_config() {
+        let json = format!(
+            r#"{{
+            "catalog": {{ "type": "s3tables", "region": "us-east-1", "table_bucket_arn": "{S3TABLES_ARN}" }},
+            "table": "sales.orders",
+            "io": {{ "vended_credentials": false }}
+        }}"#
+        );
+        let config: IcebergGsConfig = serde_json::from_str(&json).unwrap();
+        match &config.catalog {
+            CatalogConfig::S3Tables {
+                region,
+                table_bucket_arn,
+            } => {
+                assert_eq!(region, &Some("us-east-1".to_string()));
+                assert_eq!(table_bucket_arn, S3TABLES_ARN);
+            }
+            other => panic!("Expected S3Tables variant, got {other:?}"),
+        }
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn test_aws_sdk_configs_roundtrip_with_their_tags() {
+        for (catalog, tag) in [
+            (CatalogConfig::glue(Some("us-east-1".into()), None), "glue"),
+            (CatalogConfig::s3_tables(None, S3TABLES_ARN), "s3tables"),
+        ] {
+            let config = aws_sdk_config(catalog.clone(), "sales.orders");
+            let json = config.to_json().unwrap();
+            assert!(json.contains(&format!("\"type\":\"{tag}\"")), "{json}");
+            assert_eq!(IcebergGsConfig::from_json(&json).unwrap().catalog, catalog);
+        }
+    }
+
+    #[test]
+    fn test_validate_aws_sdk_catalogs() {
+        let glue = || CatalogConfig::glue(Some("us-east-1".into()), None);
+        aws_sdk_config(glue(), "sales.orders").validate().unwrap();
+
+        // The table identifier must be `namespace.table`.
+        assert!(aws_sdk_config(glue(), "").validate().is_err());
+        // An S3 Tables source needs a table-bucket ARN.
+        let err = aws_sdk_config(CatalogConfig::s3_tables(None, "not-an-arn"), "ns.t")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("ARN"), "{err}");
+        // An empty catalog id is refused rather than sent to Glue.
+        let err = aws_sdk_config(CatalogConfig::glue(None, Some(" ".into())), "ns.t")
+            .validate()
+            .unwrap_err();
+        assert!(err.to_string().contains("catalog_id"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_sdk_catalogs_refuse_vended_credentials() {
+        // Neither catalog vends: a source that requires vended credentials could
+        // only be served by the ambient identity it asked not to use.
+        for catalog in [
+            CatalogConfig::glue(None, None),
+            CatalogConfig::s3_tables(None, S3TABLES_ARN),
+        ] {
+            let mut config = aws_sdk_config(catalog, "sales.orders");
+            config.io.vended_credentials = true;
+            let err = config.validate().unwrap_err().to_string();
+            assert!(
+                err.contains("Vended credentials are not supported"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_aws_regions_must_be_region_shaped() {
+        // The SDK puts the region into the service hostname, so anything that is
+        // not a plain region label is refused before a client is built.
+        for bad in [
+            "evil.com",
+            "us-east-1.evil.com",
+            "x/y",
+            "us-east-1:443",
+            "US-EAST-1",
+            "",
+            "-",
+        ] {
+            let config = aws_sdk_config(CatalogConfig::glue(Some(bad.into()), None), "ns.t");
+            assert!(config.validate().is_err(), "region {bad:?} must be refused");
+            let mut io_bad = aws_sdk_config(CatalogConfig::glue(None, None), "ns.t");
+            io_bad.io.s3_region = Some(bad.into());
+            assert!(
+                io_bad.validate().is_err(),
+                "s3_region {bad:?} must be refused"
+            );
+        }
+        for good in ["us-east-1", "eu-central-2", "us-gov-west-1", "cn-north-1"] {
+            validate_aws_region("region", Some(good)).unwrap();
+        }
+        validate_aws_region("region", None).unwrap();
+    }
+
+    #[test]
+    fn test_s3tables_bucket_arn_is_parsed_and_names_the_region() {
+        assert_eq!(
+            s3tables_bucket_arn_region(S3TABLES_ARN).unwrap(),
+            "us-east-1"
+        );
+        assert_eq!(
+            s3tables_bucket_arn_region("arn:aws-cn:s3tables:cn-north-1:123456789012:bucket/b")
+                .unwrap(),
+            "cn-north-1"
+        );
+        for bad in [
+            "not-an-arn",
+            "arn:aws:s3:us-east-1:123456789012:bucket/b",
+            "arn:aws:s3tables:us-east-1:1234:bucket/b",
+            "arn:aws:s3tables:us-east-1:123456789012:table/b",
+            "arn:aws:s3tables:us-east-1:123456789012:bucket/",
+            "arn:aws:s3tables:evil.com:123456789012:bucket/b",
+        ] {
+            assert!(
+                s3tables_bucket_arn_region(bad).is_err(),
+                "{bad} must be refused"
+            );
+        }
+
+        // With no catalog.region the ARN's region is the catalog's region...
+        let arn_only = CatalogConfig::s3_tables(None, S3TABLES_ARN);
+        assert_eq!(arn_only.aws_region(), Some("us-east-1"));
+        assert_eq!(
+            aws_sdk_config(arn_only, "ns.t")
+                .storage_io()
+                .s3_region
+                .as_deref(),
+            Some("us-east-1")
+        );
+        // ...and a region that contradicts the ARN is refused.
+        let err = aws_sdk_config(
+            CatalogConfig::s3_tables(Some("eu-west-1".into()), S3TABLES_ARN),
+            "ns.t",
+        )
+        .validate()
+        .unwrap_err();
+        assert!(err.to_string().contains("contradicts"), "{err}");
+    }
+
+    #[test]
+    fn test_aws_region_resolution_falls_back_both_ways() {
+        let io_with = |s3_region: Option<&str>| IoConfig {
+            vended_credentials: false,
+            s3_region: s3_region.map(str::to_string),
+            ..Default::default()
+        };
+        // Catalog call: the mode's region, else io.s3_region, else the SDK chain.
+        let glue = CatalogConfig::glue(Some("us-west-2".into()), None);
+        assert_eq!(
+            glue.aws_catalog_region(&io_with(Some("eu-west-1"))),
+            Some("us-west-2")
+        );
+        let glue_bare = CatalogConfig::glue(None, None);
+        assert_eq!(
+            glue_bare.aws_catalog_region(&io_with(Some("eu-west-1"))),
+            Some("eu-west-1")
+        );
+        assert_eq!(glue_bare.aws_catalog_region(&io_with(None)), None);
+        // REST / Direct call no AWS catalog API.
+        assert_eq!(
+            CatalogConfig::rest("https://c").aws_catalog_region(&io_with(Some("x"))),
+            None
+        );
+
+        // S3 reads: an explicit s3_region wins (data may live elsewhere), else the
+        // catalog's region.
+        let mut config = aws_sdk_config(glue, "ns.t");
+        assert_eq!(config.storage_io().s3_region.as_deref(), Some("us-west-2"));
+        config.io.s3_region = Some("eu-west-1".into());
+        assert_eq!(config.storage_io().s3_region.as_deref(), Some("eu-west-1"));
+        // Other modes read with io as configured.
+        let rest = aws_sdk_config(CatalogConfig::rest("https://c"), "ns.t");
+        assert_eq!(rest.storage_io().s3_region, None);
+    }
+
     // ── Validation ──
 
     #[test]
@@ -601,6 +1427,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -616,6 +1444,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         assert!(config.validate().is_err());
     }
@@ -634,6 +1464,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -652,6 +1484,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -680,6 +1514,8 @@ mod tests {
                 mapping: None,
                 delete: None,
                 order_by: None,
+                model: None,
+                default_allow: None,
             };
             if crate::local_guard::local_roots().is_none() {
                 let err = config
@@ -713,6 +1549,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         assert!(config.validate().is_err());
     }
@@ -729,6 +1567,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
         let result = config.validate();
         assert!(result.is_err());
@@ -830,6 +1670,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
 
         let json = original.to_json().unwrap();
@@ -850,6 +1692,8 @@ mod tests {
             mapping: None,
             delete: None,
             order_by: None,
+            model: None,
+            default_allow: None,
         };
 
         let json = original.to_json().unwrap();
@@ -884,5 +1728,294 @@ mod tests {
         let old_json = r#"{"uri": "https://polaris.example.com"}"#;
         let parsed: CatalogConfig = serde_json::from_str(old_json).unwrap();
         assert!(matches!(parsed, CatalogConfig::Rest { .. }));
+    }
+
+    // ── io.storage_auth ──
+
+    fn with_storage(
+        catalog: CatalogConfig,
+        vended_credentials: bool,
+        storage_auth: Option<StorageAuth>,
+    ) -> IcebergGsConfig {
+        IcebergGsConfig {
+            catalog,
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig {
+                vended_credentials,
+                storage_auth,
+                ..Default::default()
+            },
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        }
+    }
+
+    fn rest_with(auth: AuthConfig) -> CatalogConfig {
+        CatalogConfig::Rest {
+            catalog_type: "rest".to_string(),
+            uri: "https://biglake.googleapis.com/iceberg/v1/restcatalog".to_string(),
+            auth,
+            warehouse: Some("bq://lake-project/us".to_string()),
+        }
+    }
+
+    fn google_metadata() -> AuthConfig {
+        AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        }
+    }
+
+    #[test]
+    fn absent_storage_auth_is_derived_and_never_written() {
+        // Every stored record predates the field: it reads as before — the
+        // catalog's vended credentials on a REST catalog, ambient elsewhere,
+        // whatever `vended_credentials` says (it defaults to true).
+        let rest = CatalogConfig::Rest {
+            catalog_type: "rest".to_string(),
+            uri: "https://catalog.example".to_string(),
+            auth: AuthConfig::None,
+            warehouse: None,
+        };
+        let others = [
+            CatalogConfig::direct("s3://lake/t"),
+            CatalogConfig::glue(Some("us-east-1".to_string()), None),
+            CatalogConfig::s3_tables(
+                Some("us-east-1".to_string()),
+                "arn:aws:s3tables:us-east-1:000000000000:bucket/b".to_string(),
+            ),
+        ];
+        let io: IoConfig = serde_json::from_str(r#"{"vended_credentials": true}"#).unwrap();
+        assert_eq!(io.storage_auth, None);
+        assert_eq!(*io.effective_storage_auth(&rest), StorageAuth::Vended);
+        assert!(io.requests_vended_credentials(&rest));
+        for other in &others {
+            assert_eq!(*io.effective_storage_auth(other), StorageAuth::Ambient);
+            assert!(!io.requests_vended_credentials(other));
+        }
+        let io: IoConfig = serde_json::from_str(r#"{"vended_credentials": false}"#).unwrap();
+        assert_eq!(*io.effective_storage_auth(&rest), StorageAuth::Ambient);
+        assert!(!io.requests_vended_credentials(&rest));
+        // A stated identity is the identity, whatever the catalog.
+        let io = IoConfig::default().with_storage_auth(StorageAuth::Catalog);
+        assert_eq!(*io.effective_storage_auth(&rest), StorageAuth::Catalog);
+        assert!(!io.requests_vended_credentials(&rest));
+        let json = serde_json::to_string(&IoConfig::default()).unwrap();
+        assert!(!json.contains("storage_auth"), "{json}");
+    }
+
+    #[test]
+    fn every_storage_auth_round_trips() {
+        for stored in [
+            r#"{"type":"vended"}"#,
+            r#"{"type":"ambient"}"#,
+            r#"{"type":"catalog"}"#,
+            r#"{"type":"google","credentials":{"source":"metadata"}}"#,
+            r#"{"type":"google","credentials":{"source":"service_account","key":{"secret_ref":"vault://sa"}},"quota_project":"p"}"#,
+        ] {
+            let parsed: StorageAuth = serde_json::from_str(stored).unwrap();
+            assert_eq!(serde_json::to_string(&parsed).unwrap(), stored);
+        }
+        let io = IoConfig::default().with_storage_auth(StorageAuth::Catalog);
+        let json = serde_json::to_string(&io).unwrap();
+        let back: IoConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.storage_auth, Some(StorageAuth::Catalog));
+        assert!(
+            !back.vended_credentials,
+            "with_storage_auth keeps the flag agreeing"
+        );
+    }
+
+    #[test]
+    fn catalog_storage_needs_a_google_authenticated_rest_catalog() {
+        let catalog = Some(StorageAuth::Catalog);
+        with_storage(rest_with(google_metadata()), false, catalog.clone())
+            .validate()
+            .unwrap();
+        with_storage(
+            rest_with(AuthConfig::Google {
+                credentials: GoogleCredentials::ApplicationDefault,
+                scopes: None,
+                quota_project: None,
+            }),
+            false,
+            catalog.clone(),
+        )
+        .validate()
+        .unwrap();
+        for refused in [
+            with_storage(
+                rest_with(AuthConfig::Bearer {
+                    token: crate::ConfigValue::literal("t"),
+                }),
+                false,
+                catalog.clone(),
+            ),
+            with_storage(
+                CatalogConfig::direct("s3://b/wh/ns/t"),
+                false,
+                catalog.clone(),
+            ),
+            with_storage(CatalogConfig::glue(None, None), false, catalog.clone()),
+        ] {
+            let err = refused.validate().unwrap_err().to_string();
+            assert!(err.contains("`catalog`"), "{err}");
+        }
+    }
+
+    #[test]
+    fn vended_storage_needs_a_rest_catalog() {
+        with_storage(rest_with(AuthConfig::None), true, Some(StorageAuth::Vended))
+            .validate()
+            .unwrap();
+        let err = with_storage(
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            false,
+            Some(StorageAuth::Vended),
+        )
+        .validate()
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("needs a REST catalog"), "{err}");
+    }
+
+    #[test]
+    fn ambient_and_google_storage_are_valid_in_any_mode() {
+        let google = StorageAuth::Google {
+            credentials: GoogleCredentials::ServiceAccount {
+                key: crate::ConfigValue::from_env("SA_KEY"),
+            },
+            quota_project: Some("lake-project".to_string()),
+        };
+        for catalog in [
+            rest_with(AuthConfig::None),
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            CatalogConfig::glue(None, None),
+        ] {
+            for storage in [StorageAuth::Ambient, google.clone()] {
+                with_storage(catalog.clone(), false, Some(storage))
+                    .validate()
+                    .unwrap();
+            }
+        }
+    }
+
+    /// Nobody writes `vended_credentials` beside `storage_auth`: the
+    /// constructor sets it to agree, so only hand-written contradictory JSON
+    /// meets the both-directions check below.
+    #[test]
+    fn with_storage_auth_sets_vended_credentials_to_agree() {
+        let google = StorageAuth::Google {
+            credentials: GoogleCredentials::Metadata,
+            quota_project: None,
+        };
+        for (start, storage) in [
+            (false, StorageAuth::Vended),
+            (true, StorageAuth::Ambient),
+            (true, StorageAuth::Catalog),
+            (true, google),
+        ] {
+            let vended = matches!(storage, StorageAuth::Vended);
+            let mut config = with_storage(rest_with(google_metadata()), start, None);
+            config.io = config.io.with_storage_auth(storage);
+            assert_eq!(config.io.vended_credentials, vended);
+            config.validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn a_direct_gs_table_needs_an_identity_that_reads_gs() {
+        let direct = |io: IoConfig| IcebergGsConfig {
+            catalog: CatalogConfig::direct("gs://lake/warehouse/ns/orders"),
+            table: TableConfig::Identifier(String::new()),
+            io,
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        };
+        let ambient = IoConfig {
+            vended_credentials: false,
+            ..IoConfig::default()
+        };
+        // AWS without the interop endpoint would read gs:// as s3:// on AWS.
+        let err = direct(ambient.clone()).validate().unwrap_err().to_string();
+        assert!(err.contains("gs://"), "{err}");
+        let interop = IoConfig {
+            s3_endpoint: Some("https://storage.googleapis.com".to_string()),
+            ..ambient.clone()
+        };
+        assert!(direct(interop).validate().is_ok());
+        let google = ambient.with_storage_auth(StorageAuth::Google {
+            credentials: GoogleCredentials::Metadata,
+            quota_project: None,
+        });
+        let config = direct(google);
+        assert!(config.validate().is_ok());
+        assert_eq!(config.table_identifier().unwrap().table, "orders");
+    }
+
+    #[test]
+    fn storage_auth_and_vended_credentials_may_not_contradict() {
+        for (vended_credentials, storage) in [
+            (false, StorageAuth::Vended),
+            (true, StorageAuth::Ambient),
+            (true, StorageAuth::Catalog),
+        ] {
+            let err = with_storage(
+                rest_with(google_metadata()),
+                vended_credentials,
+                Some(storage),
+            )
+            .validate()
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("contradicts io.vended_credentials"), "{err}");
+        }
+    }
+
+    #[test]
+    fn google_storage_credentials_are_checked_where_they_can_be() {
+        let bad_wif = StorageAuth::Google {
+            credentials: GoogleCredentials::ExternalAccount {
+                config: crate::auth::ExternalAccountConfig::Inline(
+                    serde_json::json!({"type": "external_account", "credential_source": {"file": "/x"}})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            },
+            quota_project: None,
+        };
+        let err = with_storage(
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            false,
+            Some(bad_wif),
+        )
+        .validate()
+        .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::GoogleCredentialsInvalid(_)),
+            "{err:?}"
+        );
+        let bad_project = StorageAuth::Google {
+            credentials: GoogleCredentials::Metadata,
+            quota_project: Some("not a project".to_string()),
+        };
+        let err = with_storage(
+            CatalogConfig::direct("s3://b/wh/ns/t"),
+            false,
+            Some(bad_project),
+        )
+        .validate()
+        .unwrap_err();
+        assert!(
+            matches!(err, IcebergError::GoogleCredentialsInvalid(_)),
+            "{err:?}"
+        );
     }
 }

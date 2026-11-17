@@ -37,7 +37,6 @@
 
 pub mod cache;
 pub mod compile;
-pub mod datalog;
 pub mod error;
 pub mod execute;
 pub mod fixpoint;
@@ -51,22 +50,17 @@ pub mod types;
 
 // Re-exports for convenience
 pub use cache::{
-    ReasoningBudget, ReasoningCache, ReasoningCacheKey, ReasoningDiagnostics, ReasoningResult,
+    approx_flake_bytes, ReasoningBudget, ReasoningCache, ReasoningCacheKey, ReasoningDiagnostics,
+    ReasoningResult,
 };
 pub use compile::{compile, ClassRuleKind, CompiledRules, PropertyRuleKind};
-pub use datalog::{
-    execute_rule_with_bindings, instantiate_pattern, BindingValue, Bindings, CompareOp,
-    DatalogRule, DatalogRuleSet, RuleFilter, RuleTerm, RuleTriplePattern, RuleValue,
-};
 pub use error::{ReasonerError, Result};
 pub use overlay::{DerivedFactsBuilder, DerivedFactsOverlay};
 pub use owl::{find_owl_typed_entities, OwlSidRegistry};
-pub use rdf_list::{
-    collect_chain_elements, collect_list_elements, collect_list_values, resolve_property_expression,
-};
+pub use rdf_list::{collect_chain_elements, collect_list_elements, resolve_property_expression};
 pub use same_as::{FrozenSameAs, SameAsTracker};
 
-use fluree_db_core::GraphDbRef;
+use fluree_db_core::{GraphDbRef, QueryCancellation, Tracker};
 use std::sync::Arc;
 pub use types::{ChainElement, PropertyChain, PropertyExpression};
 
@@ -91,6 +85,12 @@ pub struct ReasoningOptions {
     /// `owl:sameAs` equality processing (`eq-*`) is canonicalization
     /// infrastructure and always runs.
     pub enabled_rules: Vec<String>,
+    /// The cancellation handle of the request the closure is computed for.
+    /// Once it reports cancellation, the run stops and fails.
+    pub cancellation: QueryCancellation,
+    /// The request's tracker: each fact a round processes is charged as its
+    /// fuel.
+    pub tracker: Tracker,
 }
 
 /// All rule identifiers accepted in [`ReasoningOptions::enabled_rules`]: the
@@ -149,7 +149,7 @@ impl ReasoningOptions {
     pub fn with_budget(budget: ReasoningBudget) -> Self {
         Self {
             budget,
-            enabled_rules: Vec::new(),
+            ..Self::default()
         }
     }
 
@@ -202,8 +202,10 @@ impl ReasoningOptions {
 ///
 /// # Cache Behavior
 ///
-/// Results are cached by (ledger_id, db_epoch, to_t, overlay_epoch, ontology_epoch, config).
-/// Cache hits return immediately without recomputation.
+/// Results are cached by (ledger_id, db_epoch, to_t, overlay content version,
+/// ontology_epoch, config). Cache hits return immediately without
+/// recomputation. An overlay that cannot vouch for a content version is
+/// materialized fresh and never cached.
 pub async fn reason_owl2rl(
     db: GraphDbRef<'_>,
     opts: &ReasoningOptions,
@@ -215,17 +217,20 @@ pub async fn reason_owl2rl(
     let ontology_epoch = db.snapshot.schema_epoch().unwrap_or(0);
 
     // Build cache key with real values from snapshot and execution context
-    let key = ReasoningCacheKey {
-        ledger_id: db.snapshot.ledger_id.as_str().into(),
-        db_epoch: db.snapshot.t as u64,
-        to_t: db.t,
-        overlay_epoch: db.overlay.epoch(),
-        ontology_epoch,
-        rule_config_hash: opts.config_hash(),
-    };
+    let key = db
+        .overlay
+        .content_version()
+        .map(|overlay_version| ReasoningCacheKey {
+            ledger_id: db.snapshot.ledger_id.as_str().into(),
+            db_epoch: db.snapshot.t as u64,
+            to_t: db.t,
+            overlay_version,
+            ontology_epoch,
+            rule_config_hash: opts.config_hash(),
+        });
 
     // Check cache
-    if let Some(cached) = cache.get(&key) {
+    if let Some(cached) = key.as_ref().and_then(|key| cache.get(key)) {
         return Ok(cached);
     }
 
@@ -242,7 +247,9 @@ pub async fn reason_owl2rl(
     let result = Arc::new(ReasoningResult::new(derived_overlay, diagnostics));
 
     // Store in cache
-    cache.insert(key, result.clone());
+    if let Some(key) = key {
+        cache.insert(key, result.clone());
+    }
 
     Ok(result)
 }

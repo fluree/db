@@ -29,7 +29,7 @@ WHERE {
 ```
 
 The specifier can be a transaction number (`@t:100`), an ISO datetime
-(`@iso:2024-01-15T10:30:00Z`), a commit id (`@commit:bafy…`), or `@t:latest` for
+(`@time:2024-01-15T10:30:00Z`), a commit id (`@commit:bafy…`), or `@t:latest` for
 the current head. Everything else about the query is unchanged — you're just
 reading an earlier snapshot.
 
@@ -54,12 +54,13 @@ ORDER BY ?t
 
 Each row is one change to Alice's salary over the range. Filter to just the
 retractions with `FILTER(?op = false)`, or bound the window with ISO datetimes
-(`FROM <mydb:main@iso:2024-01-01T00:00:00Z> TO <mydb:main@iso:2024-12-31T23:59:59Z>`).
+(`FROM <mydb:main@time:2024-01-01T00:00:00Z> TO <mydb:main@time:2024-12-31T23:59:59Z>`).
 
-> **Two `<<` forms, different jobs.** The bare `<< s p o >>` above is Fluree's
-> flake-metadata term for `f:t` / `f:op`. The parenthesized `<<( s p o )>>` is
-> the RDF 1.2 *triple term* used with `rdf:reifies` (next section). They don't
-> compose.
+> **Two `<<` forms, different jobs.** The bare `<< s p o >>` above, paired with
+> `f:t` / `f:op`, is Fluree's flake-metadata term. With any other predicate, or
+> with a `~ reifier`, it is the RDF 1.2 *reified triple* and denotes the
+> reifier node — the same thing `rdf:reifies <<( s p o )>>` (next section)
+> binds. The two readings don't compose in one pattern.
 
 ## Annotate an edge
 
@@ -139,9 +140,12 @@ WHERE  {
 
 ## Add annotations to data you already ingested
 
-Turtle / N-Triples / TriG / N-Quads ingest paths don't parse annotation tails.
-Load the plain edges first, then layer provenance onto the edges they already
-created with a SPARQL UPDATE that repeats the same `(s, p, o)`:
+A Turtle file that already carries its annotations needs no follow-up: every
+Turtle write path parses the RDF 1.2 tail (see
+[Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)).
+Use this when the provenance arrives separately from the edges — layer it onto
+edges that already exist with a SPARQL UPDATE that repeats the same
+`(s, p, o)`:
 
 ```sparql
 PREFIX ex: <http://example.org/>

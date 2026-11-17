@@ -401,6 +401,23 @@ impl TokenStream {
         }
     }
 
+    /// Consume and return an `xsd:integer` too large for `i64` if the current
+    /// token is one. The lexeme is carried verbatim; `BigInt` promotion happens
+    /// in lowering.
+    pub fn consume_big_integer(&mut self) -> Option<(Arc<str>, SourceSpan)> {
+        match &self.peek().kind {
+            TokenKind::BigInteger(_) => {
+                let token = self.consume();
+                if let TokenKind::BigInteger(s) = token.kind {
+                    Some((s, token.span))
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Consume and return a string if the current token is one.
     pub fn consume_string(&mut self) -> Option<(Arc<str>, SourceSpan)> {
         match &self.peek().kind {

@@ -55,18 +55,28 @@ fluree sql map <NAME> --endpoint <URL> --r2rml <PATH> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--auth-bearer <TOKEN>` | Static bearer token |
+| `--auth-bearer <TOKEN>` | Static bearer token. Stored with the graph source; prefer the option below |
+| `--auth-bearer-env <VAR>` | Environment variable holding the bearer token, read by the process that queries the endpoint; the token is not stored. With `--remote`, the server must list it in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
 | `--oauth2-token-url <URL>` | OAuth2 client-credentials token endpoint |
 | `--oauth2-client-id <ID>` | OAuth2 client ID |
-| `--oauth2-client-secret <SECRET>` | OAuth2 client secret |
+| `--oauth2-client-secret <SECRET>` | OAuth2 client secret. Stored; prefer the option below |
+| `--oauth2-client-secret-env <VAR>` | Environment variable holding the client secret; as `--auth-bearer-env` |
 | `--oauth2-scope <SCOPE>` | OAuth2 scope |
 | `--oauth2-audience <AUD>` | OAuth2 audience |
+| `--auth-google-metadata`, `--auth-google-adc`, `--auth-google-service-account-env <VAR>`, `--auth-google-wif-config <FILE>`, `--auth-google-quota-project <PROJECT>`, `--auth-google-scopes <SCOPES>` | A Google identity, as for [`fluree iceberg map`](iceberg.md#options) |
+
+Give one way to authenticate. A bearer token beside OAuth2, two Google sources, and OAuth2 without both `--oauth2-token-url` and a client secret are refused. With `--remote`, the CLI sends a bearer token or OAuth2 client credentials as the flat fields and a Google identity as the structured `auth`. A server older than the structured `auth` reads the literal flat fields (`--auth-bearer`, `--oauth2-client-secret` and the other OAuth2 options), but not the `_env` forms or a Google identity, which it ignores, registering the source with no auth.
+
+A Google identity's token goes to the SQL endpoint, but a **host** identity's token (the metadata server's, the host's application-default credentials, WIF signed with the host's own AWS identity) is sent only to Google's APIs (`https` on `googleapis.com`) and the hosts the operator lists in `FLUREE_GOOGLE_TOKEN_HOSTS`. Against an ordinary Trino endpoint, then, only a service-account key (`--auth-google-service-account-env`) works unless the operator lists the endpoint's host; `--auth-google-metadata`, `--auth-google-adc` and a WIF configuration signed with the host's AWS identity are refused with `403` (`err:auth/HostIdentityRefused`) before a token is minted.
 
 **General:**
 
 | Option | Description |
 |--------|-------------|
 | `--branch <BRANCH>` | Branch name (defaults to `main`) |
+| `--model <LEDGER>` | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must exist. See [Access policy](../graph-sources/iceberg.md#access-policy) |
+| `--default-allow <BOOL>` | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny) |
+| `--allow-duplicate-subjects` | Skip the duplicate-subject probe: no table is refused, and queries answer with set semantics (removing repeated solutions) wherever no key declared in the mapping proves a map's subjects unique. Without it, the pushdown lane refuses statements over tables the probe finds repeated. See [Repeated rows and subject keys](../graph-sources/sql.md#repeated-rows-and-subject-keys) |
 | `--remote <NAME>` | Execute against a remote server |
 
 ### Examples
@@ -100,6 +110,26 @@ Mapped SQL endpoint as graph source 'orders-db:main'
 
 `Connection: not tested` means the `SELECT 1` probe failed; the source is
 still registered and the first query reports the underlying error.
+
+A `Warning:` line per finding of the subject-key uniqueness probe follows
+(a table whose subject key repeats, or a table that could not be probed).
+Then an `advisory:` line on standard error for each triples map that neither
+the key the probe verified nor an `f:key` proves subject-unique, naming the
+`f:key` that would: the lane deduplicates such a map (see
+[R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)).
+
+## fluree sql check
+
+```bash
+fluree sql check orders-db
+```
+
+Re-runs the subject-key uniqueness probe against the live tables and stores
+the result on the source: the tables whose keys repeat, and the key verified
+for every other table, which the pushdown lane then trusts. Run it after the
+endpoint was unreachable at registration, or after the tables change.
+It prints the probe's findings and the `advisory:` lines `map` prints, under
+the keys it verified. Local only (no `--remote`).
 
 ## fluree sql list / info / drop
 

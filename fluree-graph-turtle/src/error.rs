@@ -23,6 +23,12 @@ pub enum TurtleError {
     #[error("Invalid escape sequence: {0}")]
     InvalidEscape(String),
 
+    /// A construct the document expresses but this ingest path cannot carry
+    /// (e.g. an annotation on an `rdf:type` edge on the JSON-LD-converted
+    /// path). Distinct from a parse error: the Turtle is valid.
+    #[error("Unsupported on this ingest path: {0}")]
+    Unsupported(String),
+
     /// The sink refused an emitted event, or its downstream writer failed.
     ///
     /// Parsing stops at the first such error — a writer sink whose pipe has

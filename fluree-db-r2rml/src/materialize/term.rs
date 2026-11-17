@@ -20,6 +20,7 @@ use regex::Regex;
 
 use crate::error::{R2rmlError, R2rmlResult};
 use crate::mapping::{ConstantValue, GraphMap, ObjectMap, PredicateMap, SubjectMap, TermType};
+use crate::vocab::R2RML;
 
 /// Materialized RDF term
 ///
@@ -212,6 +213,39 @@ fn is_always_escaped(c: char) -> bool {
         | ':' | '@')
 }
 
+/// Whether `c` never appears in the output of [`iri_escape`]: it is always
+/// percent-encoded, and it is not `%`, which starts every encoding the escape
+/// writes. A template's literal text holding one between two placeholders
+/// marks exactly where the first value's encoding ends.
+fn is_hard_separator(c: char) -> bool {
+    is_always_escaped(c) && c != '%'
+}
+
+/// Whether distinct values of a template's columns always expand to distinct
+/// strings ([`expand_template`], [`expand_template_from_batch`]).
+///
+/// The escape is injective on each value, so the template is injective when
+/// every value's encoding can be delimited: the literal text between each
+/// pair of adjacent placeholders holds at least one character the escape
+/// never writes ([`is_hard_separator`]). The first such character after a
+/// value's start then lies in that literal text, which fixes the value's
+/// length. Adjacent placeholders (`{a}{b}`) and separators the escape can
+/// also write inside a value (`-`, `.`, `_`, `~`, the sub-delimiters, `:`,
+/// `@`, and `%`) are not injective: `{a}-{b}` expands `("x-y", "z")` and
+/// `("x", "y-z")` alike. A template with at most one placeholder is
+/// injective.
+pub fn template_is_injective(template: &str) -> bool {
+    static PLACEHOLDER_RE: Lazy<Regex> =
+        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+    let spans: Vec<(usize, usize)> = PLACEHOLDER_RE
+        .find_iter(template)
+        .map(|m| (m.start(), m.end()))
+        .collect();
+    spans
+        .windows(2)
+        .all(|w| template[w[0].1..w[1].0].chars().any(is_hard_separator))
+}
+
 /// Percent-decode a value produced by [`iri_escape`] back to its raw bytes.
 /// Inverse of the `%XX` encoding; returns `None` on a malformed escape or on
 /// bytes that are not valid UTF-8.
@@ -243,81 +277,122 @@ fn percent_decode(s: &str) -> Option<String> {
 ///
 /// Returns `None` — and the caller falls back to a full scan, which is always
 /// correct — when the IRI does not match the template, or when the template shape
-/// is not *unambiguously* reversible. Reversal is unambiguous only when every
-/// placeholder is either the final token at end-of-template, or is followed by a
-/// literal separator whose first character is always percent-encoded by
-/// `iri_escape` (a "hard" delimiter that can never appear literally inside an
-/// encoded value). This admits the common `.../{key}` and `.../{a}/{b}` shapes
-/// and rejects ambiguous ones like `.../{a};{b}` (`;` is not escaped) or
-/// `.../{a}{b}` (adjacent placeholders).
+/// is not *unambiguously* reversible (see [`TemplateReverser`]). A caller that
+/// needs to tell those two apart builds a [`TemplateReverser`].
 pub fn reverse_subject_template(template: &str, iri: &str) -> Option<Vec<(String, String)>> {
-    static PLACEHOLDER_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
+    TemplateReverser::new(template)?.reverse(iri)
+}
 
-    // Placeholder columns with their byte spans in the template.
-    let cols: Vec<(String, usize, usize)> = PLACEHOLDER_RE
-        .captures_iter(template)
-        .map(|cap| {
-            let m = cap.get(0).unwrap();
-            (cap[1].to_string(), m.start(), m.end())
-        })
-        .collect();
-    if cols.is_empty() {
-        return None; // constant subject — nothing to reverse
-    }
+/// The inverse of a template's expansion ([`expand_template`] +
+/// [`iri_escape`]), for a template whose shape is *unambiguously* reversible.
+///
+/// Reversal is unambiguous only when every placeholder is either the final
+/// token at end-of-template, or is followed by a literal separator whose first
+/// character is always percent-encoded by `iri_escape` (a "hard" delimiter that
+/// can never appear literally inside an encoded value). This admits the common
+/// `.../{key}` and `.../{a}/{b}` shapes and rejects ambiguous ones like
+/// `.../{a};{b}` (`;` is not escaped) or `.../{a}{b}` (adjacent placeholders).
+///
+/// Building one decides the template once, and [`Self::reverse`] then decides
+/// each IRI. The split is what lets a caller conclude anything from an IRI that
+/// does not reverse: through a reverser, every IRI the template expands to
+/// reverses (the expander writes the literal text verbatim and each value
+/// escaped, so a value never contains a separator's first character), so an
+/// IRI that does not is one the template cannot produce. No reverser exists for
+/// a template where that would not hold.
+#[derive(Debug, Clone)]
+pub struct TemplateReverser {
+    /// The literal text before the first placeholder.
+    prefix: String,
+    /// Each placeholder's column and the literal text after it, up to the next
+    /// placeholder or the end (empty only for a final placeholder at the end).
+    parts: Vec<(String, String)>,
+}
 
-    // The leading literal (prefix) must anchor the IRI.
-    let prefix = &template[..cols[0].1];
-    let mut rest = iri.strip_prefix(prefix)?;
+impl TemplateReverser {
+    /// The reverser of `template`, or `None` when it has no placeholder or its
+    /// shape is not unambiguously reversible.
+    pub fn new(template: &str) -> Option<Self> {
+        static PLACEHOLDER_RE: Lazy<Regex> =
+            Lazy::new(|| Regex::new(r"\{([^}]+)\}").expect("valid regex"));
 
-    let mut out = Vec::with_capacity(cols.len());
-    for i in 0..cols.len() {
-        let (col, _start, end) = &cols[i];
-        // Literal between this placeholder and the next one (or end of template).
-        let sep_end = if i + 1 < cols.len() {
-            cols[i + 1].1
-        } else {
-            template.len()
-        };
-        let sep = &template[*end..sep_end];
+        // Placeholder columns with their byte spans in the template.
+        let cols: Vec<(String, usize, usize)> = PLACEHOLDER_RE
+            .captures_iter(template)
+            .map(|cap| {
+                let m = cap.get(0).unwrap();
+                (cap[1].to_string(), m.start(), m.end())
+            })
+            .collect();
+        if cols.is_empty() {
+            return None; // constant subject — nothing to reverse
+        }
 
-        let value_enc = if sep.is_empty() {
-            // Only the final placeholder may run to end-of-string; two adjacent
-            // placeholders have no boundary and are ambiguous.
-            if i + 1 < cols.len() {
-                return None;
-            }
-            let v = rest;
-            rest = "";
-            v
-        } else {
-            // The separator must begin with a hard (always-escaped) char so the
-            // value's right boundary is unambiguous — EXCEPT `%`, which is
-            // always-escaped yet also introduces every `%XX` byte *inside* an
-            // encoded value, so a `%`-led separator (e.g. `%20`) can match a
-            // false boundary within a value. `%` is the only always-escaped char
-            // in `iri_escape`'s output, so excluding it fully closes the hole
-            // (such templates fall back to a full scan — correct, just unpruned).
-            if !sep
+        let mut parts = Vec::with_capacity(cols.len());
+        for i in 0..cols.len() {
+            let (col, _start, end) = &cols[i];
+            let sep_end = if i + 1 < cols.len() {
+                cols[i + 1].1
+            } else {
+                template.len()
+            };
+            let sep = &template[*end..sep_end];
+            if sep.is_empty() {
+                // Only the final placeholder may run to end-of-string; two
+                // adjacent placeholders have no boundary and are ambiguous.
+                if i + 1 < cols.len() {
+                    return None;
+                }
+            } else if !sep
                 .chars()
                 .next()
                 .is_some_and(|c| is_always_escaped(c) && c != '%')
             {
+                // The separator must begin with a hard (always-escaped) char so
+                // the value's right boundary is unambiguous — EXCEPT `%`, which
+                // is always-escaped yet also introduces every `%XX` byte
+                // *inside* an encoded value, so a `%`-led separator (e.g. `%20`)
+                // can match a false boundary within a value. `%` is the only
+                // always-escaped char in `iri_escape`'s output, so excluding it
+                // fully closes the hole (such templates fall back to a full
+                // scan — correct, just unpruned).
                 return None;
             }
-            let idx = rest.find(sep)?;
-            let v = &rest[..idx];
-            rest = &rest[idx + sep.len()..];
-            v
-        };
-        out.push((col.clone(), percent_decode(value_enc)?));
+            parts.push((col.clone(), sep.to_string()));
+        }
+        Some(Self {
+            prefix: template[..cols[0].1].to_string(),
+            parts,
+        })
     }
 
-    // The whole IRI must be consumed — no trailing residue.
-    if rest.is_empty() {
-        Some(out)
-    } else {
-        None
+    /// The template's columns, in placeholder order (a column used twice is
+    /// listed twice).
+    pub fn columns(&self) -> impl Iterator<Item = &str> {
+        self.parts.iter().map(|(col, _)| col.as_str())
+    }
+
+    /// The raw value of each placeholder's column in `iri`, in placeholder
+    /// order, or `None` when `iri` is not one this template can produce.
+    pub fn reverse(&self, iri: &str) -> Option<Vec<(String, String)>> {
+        // The leading literal (prefix) must anchor the IRI.
+        let mut rest = iri.strip_prefix(self.prefix.as_str())?;
+        let mut out = Vec::with_capacity(self.parts.len());
+        for (col, sep) in &self.parts {
+            let value_enc = if sep.is_empty() {
+                let v = rest;
+                rest = "";
+                v
+            } else {
+                let idx = rest.find(sep.as_str())?;
+                let v = &rest[..idx];
+                rest = &rest[idx + sep.len()..];
+                v
+            };
+            out.push((col.clone(), percent_decode(value_enc)?));
+        }
+        // The whole IRI must be consumed — no trailing residue.
+        rest.is_empty().then_some(out)
     }
 }
 
@@ -574,14 +649,31 @@ pub fn column_is_orderable(batch: &ColumnBatch, column_name: &str) -> bool {
     )
 }
 
+/// A whole column as the lexical forms [`materialize_object_from_batch`] gives
+/// its cells: a `String` column of what an un-annotated `rr:column` renders
+/// (`10`, `-0`, `0.050000000`, `2024-01-01T00:00:00Z`, hex bytes), nulls kept.
+/// A string column comes back borrowed. For a lane that keys or compares an
+/// un-annotated column by its `xsd:string` value without materializing terms:
+/// the rendering is this module's own, so the lane cannot drift from it.
+pub fn lexical_column(col: &Column) -> std::borrow::Cow<'_, Column> {
+    match col {
+        Column::String(_) => std::borrow::Cow::Borrowed(col),
+        _ => std::borrow::Cow::Owned(Column::String(
+            (0..col.len())
+                .map(|row| column_to_string(col, row))
+                .collect(),
+        )),
+    }
+}
+
 /// Convert a Column value at a row index to a String
 fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
     match col {
         Column::Boolean(v) => v.get(row_idx).and_then(|v| *v).map(|b| b.to_string()),
         Column::Int32(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
         Column::Int64(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
-        Column::Float32(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
-        Column::Float64(v) => v.get(row_idx).and_then(|v| *v).map(|n| n.to_string()),
+        Column::Float32(v) => v.get(row_idx).and_then(|v| *v).map(float_lexical),
+        Column::Float64(v) => v.get(row_idx).and_then(|v| *v).map(float_lexical),
         Column::String(v) => v.get(row_idx).and_then(std::clone::Clone::clone),
         Column::Bytes(v) => v
             .get(row_idx)
@@ -595,6 +687,17 @@ fn column_to_string(col: &Column, row_idx: usize) -> Option<String> {
             .get(row_idx)
             .and_then(|v| *v)
             .map(|n| format_decimal(n, *scale)),
+    }
+}
+
+/// The lexical form of a floating-point cell. Finite values keep Rust's
+/// shortest round-trip form; NaN and the infinities take their XSD spellings
+/// (`NaN`, `INF`, `-INF`), since Rust's own `inf` / `-inf` are not
+/// `xsd:double` lexical forms and would not read back as numbers.
+fn float_lexical<F: fluree_graph_ir::XsdFloat + std::fmt::Display>(n: F) -> String {
+    match n.nonfinite_xsd() {
+        Some(special) => special.to_string(),
+        None => n.to_string(),
     }
 }
 
@@ -618,14 +721,17 @@ fn format_date(days: i32) -> String {
     format!("{year:04}-{month:02}-{day:02}")
 }
 
-/// Format timestamp (microseconds since epoch) as ISO 8601
+/// Format timestamp (microseconds since epoch) as ISO 8601, with six
+/// fractional digits when the microseconds are not zero. Divisions round
+/// down, so an instant before 1970 falls in the second and the day at or
+/// before it: -1 µs is `1969-12-31T23:59:59.999999Z`.
 fn format_timestamp(micros: i64) -> String {
-    let seconds = micros / 1_000_000;
-    let micros_part = (micros % 1_000_000).abs();
+    let seconds = micros.div_euclid(1_000_000);
+    let micros_part = micros.rem_euclid(1_000_000);
 
     // Days since epoch
-    let days_since_epoch = seconds / 86400;
-    let time_of_day = (seconds % 86400 + 86400) % 86400; // Handle negative
+    let days_since_epoch = seconds.div_euclid(86_400);
+    let time_of_day = seconds.rem_euclid(86_400);
 
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
@@ -821,32 +927,30 @@ pub fn materialize_subject_from_batch(
 
 /// Materialize the named-graph IRI for a row from a [`GraphMap`].
 ///
-/// Returns `Some(graph_iri)` when the graph map yields a value, or `None` when
-/// the source value is null / the template can't expand — in which case the
-/// caller falls back to the default graph. A graph term is always an IRI (no
-/// blank-node / literal graphs), so there is no term-type branch. Reuses the
-/// exact template/column expansion the subject materializer uses, so a graph
-/// template and a subject template resolve column values identically.
+/// Returns `Some(graph_iri)` when the graph map yields a named graph, or `None`
+/// for the default graph: the source value is null, the template can't expand,
+/// or the value is `rr:defaultGraph`, which R2RML defines as naming the default
+/// graph. A graph term is always an IRI (no blank-node / literal graphs), so
+/// there is no term-type branch. Reuses the exact template/column expansion the
+/// subject materializer uses, so a graph template and a subject template
+/// resolve column values identically.
 pub fn materialize_graph_from_batch(
     graph_map: &GraphMap,
     batch: &ColumnBatch,
     row_idx: usize,
 ) -> R2rmlResult<Option<String>> {
-    if let Some(ref constant) = graph_map.constant {
-        return Ok(Some(constant.clone()));
-    }
-    if let Some(ref column) = graph_map.column {
+    let graph = if let Some(ref constant) = graph_map.constant {
+        Some(constant.clone())
+    } else if let Some(ref column) = graph_map.column {
         // A null graph column routes the row to the default graph.
-        return Ok(column_value_as_string(batch, column, row_idx));
-    }
-    if let Some(ref template) = graph_map.template {
-        return match expand_template_from_batch(template, batch, row_idx) {
-            Ok(expanded) => Ok(Some(expanded)),
-            // A null column in the template -> no graph IRI -> default graph.
-            Err(_) => Ok(None),
-        };
-    }
-    Ok(None)
+        column_value_as_string(batch, column, row_idx)
+    } else if let Some(ref template) = graph_map.template {
+        // A null column in the template -> no graph IRI -> default graph.
+        expand_template_from_batch(template, batch, row_idx).ok()
+    } else {
+        None
+    };
+    Ok(graph.filter(|iri| iri != R2RML::DEFAULT_GRAPH))
 }
 
 /// Materialize an object term from an ObjectMap and a ColumnBatch row
@@ -997,6 +1101,26 @@ pub fn fill_join_key_from_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A timestamp renders on its own day, before 1970 too, and keeps the
+    /// sign of its fraction: the microsecond a nanosecond reader rounds
+    /// -500 ns down to is the last one of 1969. Later instants render as
+    /// they always have, six fractional digits or none.
+    #[test]
+    fn a_timestamp_before_1970_renders_on_its_own_day() {
+        assert_eq!(format_timestamp(-3_600_000_000), "1969-12-31T23:00:00Z");
+        assert_eq!(format_timestamp(-1), "1969-12-31T23:59:59.999999Z");
+        assert_eq!(format_timestamp(-86_400_000_000), "1969-12-31T00:00:00Z");
+        assert_eq!(
+            format_timestamp(-86_400_000_001),
+            "1969-12-30T23:59:59.999999Z"
+        );
+        assert_eq!(format_timestamp(0), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_timestamp(1_577_836_800_123_000),
+            "2020-01-01T00:00:00.123000Z"
+        );
+    }
 
     #[test]
     fn test_expand_template_simple() {
@@ -1379,6 +1503,65 @@ mod tests {
         .is_none());
     }
 
+    /// Through a reverser, every IRI the batch expander produces reverses to
+    /// the row's own values, whatever characters they hold, so an IRI that
+    /// does not reverse is one the template cannot produce. A template with no
+    /// such guarantee has no reverser.
+    #[test]
+    fn every_iri_a_reversible_template_expands_to_reverses() {
+        let values = [
+            "5", "", "west/5", "a b", "café", "50%off", "x;y", "a:b@c", "%2F", "{k}", "-._~",
+        ];
+        let schema = Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "a".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "b".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 2,
+            },
+        ]));
+        let column =
+            |vs: Vec<&str>| Column::String(vs.into_iter().map(|v| Some(v.into())).collect());
+        let a: Vec<&str> = values.iter().flat_map(|v| values.map(|_| *v)).collect();
+        let b: Vec<&str> = values.iter().flat_map(|_| values).collect();
+        let batch = ColumnBatch::new(schema, vec![column(a.clone()), column(b.clone())]).unwrap();
+        for template in [
+            "http://ex/{a}",
+            "http://ex/{a}/{b}",
+            "http://ex/{a}/x/{b}/detail",
+            "http://ex/{a}#{b}",
+        ] {
+            let reverser = TemplateReverser::new(template).expect("reversible");
+            for row in 0..batch.num_rows {
+                let iri = expand_template_from_batch(template, &batch, row).unwrap();
+                let reversed = reverser
+                    .reverse(&iri)
+                    .unwrap_or_else(|| panic!("{template}: {iri} does not reverse"));
+                for (column, raw) in reversed {
+                    let want = if column == "a" { a[row] } else { b[row] };
+                    assert_eq!(raw, want, "{template}: {iri}");
+                }
+            }
+        }
+        for template in [
+            "http://ex/{a};{b}",
+            "http://ex/{a}{b}",
+            "http://ex/static",
+            "http://ex/{a}%20{b}",
+        ] {
+            assert!(TemplateReverser::new(template).is_none(), "{template}");
+        }
+        let reverser = TemplateReverser::new("http://ex/{a}/{b}").unwrap();
+        assert_eq!(reverser.columns().collect::<Vec<_>>(), ["a", "b"]);
+        assert!(reverser.reverse("http://ex/only-one").is_none());
+    }
+
     #[test]
     fn reverse_template_rejects_non_matching_iri() {
         // Wrong prefix.
@@ -1387,5 +1570,193 @@ mod tests {
         assert!(
             reverse_subject_template("http://ex/store/{k}/detail", "http://ex/store/5").is_none()
         );
+    }
+
+    #[test]
+    fn graph_map_default_graph_value_routes_to_the_default_graph() {
+        // R2RML: a graph map producing rr:defaultGraph targets the default
+        // graph, whichever value source produced it. Read as an ordinary IRI it
+        // would mint a named graph called 'http://www.w3.org/ns/r2rml#defaultGraph'.
+        let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+            name: "graph".to_string(),
+            field_type: FieldType::String,
+            nullable: true,
+            field_id: 1,
+        }]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![Column::String(vec![
+                Some("http://www.w3.org/ns/r2rml#defaultGraph".to_string()),
+                Some("http://example.org/g1".to_string()),
+                None,
+            ])],
+        )
+        .unwrap();
+
+        let by_column = GraphMap::column("graph");
+        assert_eq!(
+            materialize_graph_from_batch(&by_column, &batch, 0).unwrap(),
+            None
+        );
+        assert_eq!(
+            materialize_graph_from_batch(&by_column, &batch, 1).unwrap(),
+            Some("http://example.org/g1".to_string())
+        );
+        // A null graph value is the default graph too.
+        assert_eq!(
+            materialize_graph_from_batch(&by_column, &batch, 2).unwrap(),
+            None
+        );
+
+        let constant = GraphMap::constant("http://www.w3.org/ns/r2rml#defaultGraph");
+        assert_eq!(
+            materialize_graph_from_batch(&constant, &batch, 0).unwrap(),
+            None
+        );
+        let named = GraphMap::constant("http://example.org/g1");
+        assert_eq!(
+            materialize_graph_from_batch(&named, &batch, 0).unwrap(),
+            Some("http://example.org/g1".to_string())
+        );
+    }
+
+    #[test]
+    fn float_cells_render_xsd_lexical_forms() {
+        let doubles = Column::Float64(vec![
+            Some(1.5),
+            Some(f64::INFINITY),
+            Some(f64::NEG_INFINITY),
+            Some(f64::NAN),
+        ]);
+        let floats = Column::Float32(vec![
+            Some(1.5),
+            Some(f32::INFINITY),
+            Some(f32::NEG_INFINITY),
+            Some(f32::NAN),
+        ]);
+        for col in [doubles, floats] {
+            let rendered: Vec<String> = (0..4)
+                .map(|row| column_to_string(&col, row).unwrap())
+                .collect();
+            assert_eq!(rendered, ["1.5", "INF", "-INF", "NaN"]);
+            for lexical in &rendered {
+                assert!(
+                    fluree_graph_ir::parse_xsd_double(lexical).is_some(),
+                    "{lexical} reads back as an xsd:double"
+                );
+            }
+        }
+    }
+
+    /// `lexical_column` gives every cell the lexical form the object
+    /// materializer gives it, for every physical type, nulls included.
+    #[test]
+    fn lexical_column_matches_the_object_materializer() {
+        let columns = [
+            Column::Boolean(vec![Some(true), None, Some(false)]),
+            Column::Int32(vec![Some(10), None, Some(-3)]),
+            Column::Int64(vec![Some(9_007_199_254_740_993), None, Some(9)]),
+            Column::Float32(vec![Some(-0.0), None, Some(0.1)]),
+            Column::Float64(vec![Some(f64::NAN), None, Some(1e21)]),
+            Column::String(vec![Some("b".into()), None, Some(String::new())]),
+            Column::Bytes(vec![Some(vec![0, 1]), None, Some(vec![])]),
+            Column::Date(vec![Some(-1), None, Some(19_731)]),
+            Column::Timestamp(vec![Some(-1), None, Some(1)]),
+            Column::TimestampTz(vec![Some(500_000), None, Some(0)]),
+            Column::Decimal {
+                values: vec![Some(50_000_000), None, Some(-500_000_000)],
+                precision: 38,
+                scale: 9,
+            },
+        ];
+        for col in columns {
+            let schema = Arc::new(BatchSchema::new(vec![FieldInfo {
+                name: "c".to_string(),
+                field_type: FieldType::String,
+                nullable: true,
+                field_id: 1,
+            }]));
+            let batch = ColumnBatch::new(schema, vec![col.clone()]).unwrap();
+            let Column::String(lexical) = lexical_column(&col).into_owned() else {
+                panic!("not a string column: {col:?}");
+            };
+            let om = ObjectMap::column("c");
+            for (row, lex) in lexical.iter().enumerate() {
+                let term = materialize_object_from_batch(&om, &batch, row).unwrap();
+                assert_eq!(term, lex.clone().map(RdfTerm::string), "{col:?} row {row}");
+            }
+        }
+    }
+
+    /// `template_is_injective` against the expansion itself: over every pair
+    /// of short values from an alphabet holding the characters the escape
+    /// treats differently, a template it calls injective never expands two
+    /// distinct pairs to one string, and each one it refuses here does.
+    #[test]
+    fn template_injectivity_matches_the_expansion() {
+        let alphabet = ['a', '1', '-', '.', ':', ';', '%', '/', ' ', '\u{e9}'];
+        let mut values = vec![String::new()];
+        for &c in &alphabet {
+            values.push(c.to_string());
+            for &d in &alphabet {
+                values.push(format!("{c}{d}"));
+            }
+        }
+        let expand = |template: &str, a: &str, b: &str| {
+            let row: HashMap<String, Option<String>> = [
+                ("a".to_string(), Some(a.to_string())),
+                ("b".to_string(), Some(b.to_string())),
+            ]
+            .into_iter()
+            .collect();
+            expand_template(template, &row).expect("both columns bound")
+        };
+        // Values for `b` only when the template reads it: a column the
+        // template does not read would "collide" with itself.
+        let collides = |template: &str| {
+            let bs: &[String] = if template.contains("{b}") {
+                &values
+            } else {
+                &values[..1]
+            };
+            let mut seen: HashMap<String, (&str, &str)> = HashMap::new();
+            for a in &values {
+                for b in bs {
+                    let out = expand(template, a, b);
+                    if let Some(prev) = seen.insert(out, (a, b)) {
+                        if prev != (a.as_str(), b.as_str()) {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        };
+        let injective = [
+            "http://ex/{a}/{b}",
+            "http://ex/{a}-/{b}",
+            "http://ex/{a}#{b}",
+            "http://ex/{a} {b}",
+            "http://ex/{a}\u{e9}{b}",
+            "http://ex/{a}",
+            "http://ex/{a}/x",
+        ];
+        for t in injective {
+            assert!(template_is_injective(t), "{t}");
+            assert!(!collides(t), "{t} called injective but two pairs collide");
+        }
+        let merging = [
+            "http://ex/{a}{b}",
+            "http://ex/{a}-{b}",
+            "http://ex/{a}.{b}",
+            "http://ex/{a}:{b}",
+            "http://ex/{a};{b}",
+            "http://ex/{a}%2F{b}",
+            "http://ex/{a}a{b}",
+        ];
+        for t in merging {
+            assert!(!template_is_injective(t), "{t}");
+            assert!(collides(t), "{t} refused, and two pairs do collide");
+        }
     }
 }

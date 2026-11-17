@@ -81,14 +81,62 @@ pub const NOVELTY_DELTA_TOO_LARGE: &str = "err:db/NoveltyDeltaTooLarge";
 /// or raise `reindex_max_bytes` there).
 pub const PAYLOAD_TOO_LARGE: &str = "err:db/PayloadTooLarge";
 
+/// The write would bring the ledger past the number of distinct datatypes
+/// its index can store.
+///
+/// A permanent refusal, surfaced as HTTP 422 with no `Retry-After`.
+/// Datatype IDs are never released, so neither retrying nor waiting for the
+/// indexer admits the write. The ledger is left unchanged.
+pub const DATATYPE_LIMIT_EXCEEDED: &str = "err:db/DatatypeLimitExceeded";
+
 /// Commit conflict (concurrent modification)
 pub const COMMIT_CONFLICT: &str = "err:db/CommitConflict";
+
+/// Every commit attempt the server made lost its race with other writers to
+/// the same ledger.
+///
+/// Retryable contention, surfaced as HTTP 503 with `Retry-After`: nothing was
+/// committed, and the same request can succeed once the other writers ease
+/// off. Distinct from [`COMMIT_CONFLICT`], which the server returns without
+/// having retried.
+pub const COMMIT_CONTENTION: &str = "err:db/CommitContention";
+
+/// The server has not loaded the ledger's index: it failed to load, or the
+/// one the server holds is older than the ledger's.
+///
+/// Retryable, surfaced as HTTP 503 with `Retry-After`: the write was refused
+/// before it read or committed anything, and the same request can succeed
+/// once the index loads.
+pub const INDEX_NOT_LOADED: &str = "err:db/IndexNotLoaded";
 
 /// Empty transaction (no flakes)
 pub const EMPTY_TRANSACTION: &str = "err:db/EmptyTransaction";
 
 /// Graph source not found
 pub const GRAPH_SOURCE_NOT_FOUND: &str = "err:db/GraphSourceNotFound";
+
+/// The graph source was dropped, so it can no longer be synced (HTTP 409)
+pub const GRAPH_SOURCE_RETRACTED: &str = "err:db/GraphSourceRetracted";
+
+/// The graph source has no R2RML mapping, so it has nothing to answer a query
+/// from (HTTP 409). Registering it again with a mapping clears it.
+pub const GRAPH_SOURCE_UNMAPPED: &str = "err:db/GraphSourceUnmapped";
+
+/// The graph source is of a family this build was compiled without (an
+/// Iceberg / R2RML source without the `iceberg` feature, SQL without `sql`,
+/// Delta without `delta`), so nothing here can read it (HTTP 501).
+pub const GRAPH_SOURCE_UNSUPPORTED: &str = "err:db/GraphSourceUnsupported";
+
+/// The graph source is an index (BM25, vector, geo), which has no triples, named
+/// where a graph is read: as the query target, in `FROM` / `FROM NAMED`, or in
+/// `GRAPH` (HTTP 400). Its searches name it in their own pattern instead.
+pub const GRAPH_SOURCE_NOT_A_GRAPH: &str = "err:db/GraphSourceNotAGraph";
+
+/// A graph the target ledger does not have
+pub const GRAPH_NOT_FOUND: &str = "err:db/GraphNotFound";
+
+/// A commit reference that names no commit of the ledger
+pub const COMMIT_NOT_FOUND: &str = "err:db/CommitNotFound";
 
 /// Graph source index stale
 pub const GRAPH_SOURCE_STALE: &str = "err:db/GraphSourceStale";
@@ -117,6 +165,15 @@ pub const NOT_FOUND: &str = "err:api/NotFound";
 
 /// Not acceptable (content negotiation failure)
 pub const NOT_ACCEPTABLE: &str = "err:api/NotAcceptable";
+
+/// Unsupported media type (request body format not accepted)
+pub const UNSUPPORTED_MEDIA_TYPE: &str = "err:api/UnsupportedMediaType";
+
+/// A graph source's connection, auth or storage-identity input was refused
+/// before anything was built (HTTP 400): an unknown field, auth given two ways
+/// or only partly, flat and structured fields mixed, or a secret the surface
+/// may not name. The message names the field, never its value.
+pub const INVALID_GRAPH_SOURCE_CONFIG: &str = "err:api/InvalidGraphSourceConfig";
 
 // =============================================================================
 // Parsing Errors (parse)
@@ -165,12 +222,33 @@ pub const STORAGE_WRITE: &str = "err:storage/WriteFailure";
 /// credentials lack access **or** the object was moved/removed.
 pub const STORAGE_ACCESS_DENIED: &str = "err:storage/AccessDenied";
 
+/// A graph source's storage identity was asked to read a path whose scheme it
+/// does not serve (HTTP 400): `gs://` on an AWS identity without a GCS interop
+/// endpoint, `s3://` on a Google identity. The identity is decided by the
+/// source's `io.storage_auth`, never by the path, so this is refused rather
+/// than read with whatever client accepts the scheme.
+pub const STORAGE_SCHEME_NOT_SERVED: &str = "err:storage/SchemeNotServed";
+
 /// The catalog authorized the table but vended no storage credentials while the
 /// source is configured to require them (`vended_credentials = true`).
 ///
 /// Fail-closed signal: the query/preview is refused rather than silently
 /// downgrading to ambient (process-default) AWS credentials.
 pub const CATALOG_CREDENTIALS_NOT_VENDED: &str = "err:catalog/CredentialsNotVended";
+
+/// A catalog refused access to a table (HTTP 401/403 from the catalog), e.g. a
+/// Unity Catalog principal lacking `SELECT` or `EXTERNAL USE SCHEMA`.
+///
+/// Distinct from [`STORAGE_ACCESS_DENIED`] (the object store refused a read)
+/// and from the policy-layer [`ACCESS_DENIED`].
+pub const CATALOG_ACCESS_DENIED: &str = "err:catalog/AccessDenied";
+
+/// A Google catalog refused the request because it names no quota project
+/// (`USER_PROJECT_DENIED`, or BigLake's "missing `x-goog-user-project`
+/// header"): BigLake bills every request, whatever the identity, to the
+/// project the request names. The fix is the source's `quota_project`, not a
+/// broader grant.
+pub const CATALOG_QUOTA_PROJECT_REQUIRED: &str = "err:catalog/QuotaProjectRequired";
 
 /// Connection error
 pub const CONNECTION: &str = "err:storage/ConnectionError";
@@ -191,6 +269,34 @@ pub const CONNECTION: &str = "err:storage/ConnectionError";
 /// message. Mirrors the distinct-code precedent of [`STORAGE_ACCESS_DENIED`] /
 /// [`CATALOG_CREDENTIALS_NOT_VENDED`], but keeps the 400 status.
 pub const R2RML_UNSUPPORTED_PATTERN: &str = "err:r2rml/UnsupportedPattern";
+
+// =============================================================================
+// Iceberg Errors (iceberg)
+// =============================================================================
+
+/// The Iceberg table carries merge-on-read delete files, which the reader
+/// does not apply (HTTP 409). The table is correctly configured; its current
+/// state is what is refused.
+pub const MERGE_ON_READ_DELETES: &str = "err:iceberg/MergeOnReadDeletes";
+
+// =============================================================================
+// Graph-source identity Errors (auth)
+// =============================================================================
+
+/// A Google token exchange for a graph source's identity was refused (HTTP 401,
+/// or 403 when Google said `PERMISSION_DENIED`) or got no usable answer (502).
+/// Carries Google's error code, never a response body.
+pub const GOOGLE_TOKEN_EXCHANGE: &str = "err:auth/GoogleTokenExchange";
+
+/// A graph source's Google credential configuration was refused (HTTP 400): a
+/// field outside the accepted subset, or a malformed key. Names the field,
+/// never its value.
+pub const GOOGLE_CREDENTIALS_INVALID: &str = "err:auth/GoogleCredentialsInvalid";
+
+/// A graph source asked for a host-derived identity (ambient AWS, the GCE
+/// metadata server, host ADC, host-signed WIF) that the instance's
+/// host-identity policy does not allow (HTTP 403).
+pub const HOST_IDENTITY_REFUSED: &str = "err:auth/HostIdentityRefused";
 
 // =============================================================================
 // Policy/Auth Errors (policy)
@@ -249,6 +355,9 @@ pub const INDEXING_DISABLED: &str = "err:system/IndexingDisabled";
 
 /// Reindex conflict
 pub const REINDEX_CONFLICT: &str = "err:system/ReindexConflict";
+
+/// The file storage root is held by another open instance
+pub const STORAGE_IN_USE: &str = "err:system/StorageInUse";
 
 /// Cross-ledger model dependency could not be resolved or used.
 ///

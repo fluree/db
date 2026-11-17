@@ -15,6 +15,11 @@
 //!   involves the ledger cache. Control group.
 //! - `clonebench` — grow the dictionaries on the owned path and time an
 //!   explicit deep clone of exactly what `Arc::make_mut` copies.
+//! - `mixed`      — the cached path with `READERS` query tasks running
+//!   alongside the writer, each holding a ledger view for the length of one
+//!   query, as a server under a read/write mix does. Prints one summary row
+//!   per `WINDOW` commits: how many commits found the dictionaries shared,
+//!   and what that cost in latency.
 //!
 //! ```bash
 //! MODE=cached INDEXING=off N=1500 NODES=20 \
@@ -28,8 +33,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
-use fluree_db_api::{Fluree, FlureeBuilder};
+use fluree_db_api::{Fluree, FlureeBuilder, GraphDb};
 use serde_json::json;
+use std::sync::atomic::AtomicBool;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
@@ -231,6 +237,81 @@ async fn main() {
                     );
                 }
             }
+        }
+        "mixed" => {
+            let handle = fluree.ledger_cached(alias).await.expect("ledger_cached");
+            drop(genesis);
+            let readers = env_usize("READERS", 4);
+            let window = env_usize("WINDOW", 100);
+            let stop = Arc::new(AtomicBool::new(false));
+            let mut tasks = Vec::with_capacity(readers);
+            for _ in 0..readers {
+                let fluree = fluree.clone();
+                let handle = handle.clone();
+                let stop = Arc::clone(&stop);
+                tasks.push(tokio::spawn(async move {
+                    let query = json!({
+                        "@context": {"ex": "http://example.org/"},
+                        "select": ["?p", "?n"],
+                        "where": {"@id": "?p", "ex:name": "?n"},
+                        "limit": 50
+                    });
+                    let mut reads = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        // The server's query route: the cached handle's
+                        // snapshot, sharing the dictionaries with the writer.
+                        let state = handle.snapshot().await.to_ledger_state();
+                        let db = GraphDb::from_ledger_state(&state);
+                        let _ = fluree.query(&db, &query).await.expect("query");
+                        reads += 1;
+                        tokio::task::yield_now().await;
+                    }
+                    reads
+                }));
+            }
+            println!("# window,commits,mean_ms,max_ms,shared_dict_commits,novelty_bytes");
+            let (mut sum, mut max, mut shared) = (0f64, 0f64, 0usize);
+            for i in 0..n {
+                let data = payload(i, nodes);
+                let started = Instant::now();
+                let res = fluree
+                    .stage(&handle)
+                    .insert(&data)
+                    .execute()
+                    .await
+                    .expect("execute");
+                let ms = started.elapsed().as_secs_f64() * 1e3;
+                sum += ms;
+                max = max.max(ms);
+                if LAST_DICT.load(Ordering::Relaxed) > 1 || LAST_RSD.load(Ordering::Relaxed) > 1 {
+                    shared += 1;
+                }
+                if (i + 1) % window == 0 || i + 1 == n {
+                    let count = if (i + 1) % window == 0 {
+                        window
+                    } else {
+                        (i + 1) % window
+                    };
+                    println!(
+                        "{},{},{:.2},{:.2},{},{}",
+                        (i + 1) / window,
+                        i + 1,
+                        sum / count as f64,
+                        max,
+                        shared,
+                        res.indexing.novelty_size
+                    );
+                    sum = 0.0;
+                    max = 0.0;
+                    shared = 0;
+                }
+            }
+            stop.store(true, Ordering::Relaxed);
+            let mut reads = 0usize;
+            for task in tasks {
+                reads += task.await.expect("reader");
+            }
+            println!("# readers={readers} reads={reads}");
         }
         other => panic!("unknown MODE={other}"),
     }

@@ -1,11 +1,13 @@
 //! Builder for DataSetDb from DatasetSpec
 //!
 //! Provides utilities to construct `DataSetDb` from query dataset
-//! specifications, applying time travel, policy, and reasoning wrappers.
+//! specifications, applying time travel and policy wrappers. Config-graph
+//! defaults are applied later, at the query-preparation choke point
+//! (`Fluree::complete_config_defaults`).
 
 use crate::view::{DataSetDb, GraphDb};
 use crate::{dataset, time_resolve, ApiError, DatasetSpec, Fluree, GovernanceOptions, Result};
-use chrono::DateTime;
+use fluree_db_core::VerifiedIdentity;
 
 macro_rules! build_dataset_view_from_spec {
     (
@@ -21,23 +23,23 @@ macro_rules! build_dataset_view_from_spec {
         // In this mode, the "from" array specifies a (from,to) range on ONE ledger,
         // not two distinct default graphs.
         if let Some(range) = spec.history_range() {
-            let ledger = $self.ledger(&range.identifier).await?;
-            let latest_t = ledger.t();
+            let ledger = $self.ledger(&range.ledger).await?;
 
-            let from_t = resolve_history_endpoint_t(&ledger, &range.from, latest_t).await?;
-            let to_t = resolve_history_endpoint_t(&ledger, &range.to, latest_t).await?;
+            let from_t = time_resolve::resolve_time_spec(&ledger, &range.from).await?;
+            let to_t = time_resolve::resolve_time_spec(&ledger, &range.to).await?;
 
             let view = GraphDb::from_ledger_state(&ledger);
             let view = ($history_transform)(view).await?;
             Ok(DataSetDb::single(view).with_history_range(from_t, to_t))
         } else {
             let mut dataset_db = DataSetDb::new();
+            let mut members = Vec::with_capacity(spec.default_graphs.len());
 
-            // Load default graphs, applying per-source policy and config reasoning
+            // Load default graphs, applying per-source policy
             for source in &spec.default_graphs {
                 let view = ($load_view)(source).await?;
                 let view = ($apply_policy)(view, source).await?;
-                let view = $self.apply_config_defaults(view, None);
+                members.push(view.graph_source_id.clone());
                 // If this is a graph source, also register as a named graph
                 // so GRAPH <gs_id> patterns can resolve it during execution.
                 if let Some(ref gs_id) = view.graph_source_id {
@@ -46,24 +48,45 @@ macro_rules! build_dataset_view_from_spec {
                 dataset_db = dataset_db.with_default(view);
             }
 
-            // Load named graphs, applying per-source policy and config reasoning
+            // A graph source is read by its own scan, which a default graph shared
+            // with other sources does not union in: refuse rather than silently
+            // answer from only some of them.
+            if let Some(gs_id) = members.iter().flatten().next() {
+                if members.iter().any(|m| m.as_ref() != Some(gs_id)) {
+                    return Err(ApiError::invalid_query(format!(
+                        "graph source {gs_id} cannot share the default graph with other \
+                         sources; name it with FROM NAMED and read it inside \
+                         GRAPH <{gs_id}> {{ ... }} (JSON-LD: \"fromNamed\" and \
+                         [\"graph\", \"{gs_id}\", ...])"
+                    )));
+                }
+            }
+
+            // Load named graphs, applying per-source policy
             for source in &spec.named_graphs {
                 let view = ($load_view)(source).await?;
                 let view = ($apply_policy)(view, source).await?;
-                let view = $self.apply_config_defaults(view, None);
-                // Register under exactly ONE key: the dataset-local name the user
-                // wrote. When an alias is present it IS that name, and the
-                // identifier is only how we load the source — on the ledger-scoped
-                // SPARQL path the identifier is the ledger id, so registering it
-                // too injected the ledger alias into the named-graph map, pointing
-                // at the named graph's view. `GRAPH ?g` enumerates the map's keys
-                // (fluree-db-query/src/graph.rs), so every solution came back twice
-                // and `GRAPH <ledger-alias>` resolved to the wrong graph's triples
-                // (azure-chat#50). Sources without an alias keep identifier keying.
-                match &source.source_alias {
-                    Some(alias) => dataset_db = dataset_db.with_named(alias.as_str(), view),
-                    None => {
-                        dataset_db = dataset_db.with_named(source.identifier.as_str(), view);
+                // Register under exactly ONE enumerable key: the name the user
+                // gave the member (its alias, else its text as written, pin
+                // included). A second key onto the same view would make
+                // `GRAPH ?g` bind every solution twice (azure-chat#50).
+                dataset_db = dataset_db.with_named(source.name(), view);
+            }
+
+            // A pinned member written `L@t:2` was once known as `L`; that name
+            // still answers `GRAPH <L>` as a non-enumerated alias, when exactly
+            // one member claims it and no member is named it outright.
+            let mut claims: std::collections::HashMap<String, Vec<&str>> =
+                std::collections::HashMap::new();
+            for source in spec.named_graphs.iter().filter(|s| s.alias().is_none()) {
+                if let Some(unpinned) = source.unpinned_name() {
+                    claims.entry(unpinned).or_default().push(source.name());
+                }
+            }
+            for (alias, names) in claims {
+                if let [name] = names.as_slice() {
+                    if !dataset_db.named.contains_key(alias.as_str()) {
+                        dataset_db = dataset_db.with_named_alias(alias, *name);
                     }
                 }
             }
@@ -117,12 +140,29 @@ impl Fluree {
     /// let result = fluree.query_dataset(&dataset, &query).await?;
     /// ```
     pub async fn build_dataset_view(&self, spec: &DatasetSpec) -> Result<DataSetDb> {
+        self.build_dataset_view_as(spec, None).await
+    }
+
+    /// [`Fluree::build_dataset_view`] on behalf of an auth-layer-verified
+    /// caller.
+    ///
+    /// No request-level policy is applied, but a per-source `policy_override`
+    /// still consults the ledger's `f:overrideControl`, and that check gates on
+    /// `server_identity`. Pass the same verified identity a server route would
+    /// place in `GovernanceOptions::server_identity`; `None` means anonymous,
+    /// which `f:IdentityRestricted` denies.
+    pub async fn build_dataset_view_as(
+        &self,
+        spec: &DatasetSpec,
+        server_identity: Option<&VerifiedIdentity>,
+    ) -> Result<DataSetDb> {
         build_dataset_view_from_spec!(
             self,
             spec,
-            history_transform = |view| async { Ok::<GraphDb, ApiError>(view) },
+            history_transform = |view| self.wrap_policy_defaults(view),
             load_view = |source| self.load_view_from_source(source),
-            apply_policy = |view, source| self.maybe_apply_source_policy(view, source),
+            apply_policy =
+                |view, source| self.maybe_apply_source_policy(view, source, server_identity),
         )
     }
 
@@ -145,30 +185,31 @@ impl Fluree {
         build_dataset_view_from_spec!(
             self,
             spec,
-            history_transform = |view| async {
-                let view = self.wrap_policy(view, opts, None).await?;
-                Ok::<GraphDb, ApiError>(self.apply_config_defaults(view, None))
-            },
+            history_transform = |view| async { self.wrap_policy(view, opts).await },
             load_view = |source| self.load_view_from_source(source),
             apply_policy = |view, source| self.apply_policy_with_override(view, source, opts),
         )
     }
 
-    /// Apply per-source policy if present, otherwise no policy.
+    /// Apply per-source policy if present, otherwise configured defaults.
     ///
     /// This is used by `build_dataset_view` when no global policy is provided.
     async fn maybe_apply_source_policy(
         &self,
         view: GraphDb,
         source: &dataset::GraphSource,
+        server_identity: Option<&VerifiedIdentity>,
     ) -> Result<GraphDb> {
-        if let Some(policy_override) = &source.policy_override {
+        if let Some(policy_override) = source.policy_override() {
             if policy_override.has_policy() {
-                let opts = policy_override.to_query_connection_options();
-                return self.wrap_policy(view, &opts, None).await;
+                let mut opts = policy_override.to_query_connection_options();
+                // The override comes from the request body; the verified
+                // identity that gates config overrides is request-level.
+                opts.server_identity = server_identity.cloned();
+                return self.wrap_policy(view, &opts).await;
             }
         }
-        Ok(view)
+        self.wrap_policy_defaults(view).await
     }
 
     /// Apply policy with per-source override taking precedence over global.
@@ -182,94 +223,86 @@ impl Fluree {
         global_opts: &GovernanceOptions,
     ) -> Result<GraphDb> {
         // Per-source policy override takes precedence
-        if let Some(policy_override) = &source.policy_override {
+        if let Some(policy_override) = source.policy_override() {
             if policy_override.has_policy() {
-                let opts = policy_override.to_query_connection_options();
-                return self.wrap_policy(view, &opts, None).await;
+                let mut opts = policy_override.to_query_connection_options();
+                // The override comes from the request body; the verified
+                // identity that gates config overrides is request-level.
+                opts.server_identity = global_opts.server_identity.clone();
+                return self.wrap_policy(view, &opts).await;
             }
         }
         // Fall back to global policy
-        self.wrap_policy(view, global_opts, None).await
+        self.wrap_policy(view, global_opts).await
     }
 
-    /// Build a single `GraphDb` from a `GraphSource`.
+    /// Build a single `GraphDb` from a `GraphSource`, on a connection surface:
+    /// the member must name a ledger (or graph source) by address.
     ///
-    /// Tries to resolve as a ledger first. If not found, checks if the
-    /// identifier is a graph source (Iceberg/R2RML) and creates a minimal
-    /// genesis context tagged with the graph source ID.
+    /// The address is loaded as a ledger first; if no ledger has that id, as a
+    /// graph source (Iceberg/R2RML), which yields a minimal genesis context
+    /// tagged with the graph source id. Then the address's graph is selected,
+    /// and config is resolved for that graph so per-graph overrides match the
+    /// graph actually queried.
     ///
-    /// For sources with a time spec, time travel on graph sources is
-    /// explicitly rejected with a clear error.
+    /// For sources with a time spec, a graph source reads the pinned table
+    /// state (`@time:` / `@recorded:` / `@snapshot:`); `@t:` and `@commit:`
+    /// are rejected with a clear error.
     ///
-    /// If `graph_selector` is set, it is applied after resolution
-    /// (the parser rejects the ambiguous case where both fragment and
-    /// graph_selector are present).
+    /// A bare graph IRI or a graph keyword names a graph of *some* ledger, and
+    /// a connection surface has no ledger to find it in: that is a 400 naming
+    /// the fix, never a nameservice lookup of the IRI as if it were a ledger.
     pub(crate) async fn load_view_from_source(
         &self,
         source: &dataset::GraphSource,
     ) -> Result<GraphDb> {
-        let view = match &source.time_spec {
-            None => {
-                // Box the ledger-load future: the load chain (get_or_load →
-                // load → load_novelty → bulk_apply_commits) is deep, and in
-                // debug builds its inline future would balloon this frame — and
-                // every dispatcher frame above it that materializes this future
-                // before awaiting — pushing the plain `select *` connection
-                // query past the default ~2 MB worker stack (fluree/db#1408).
-                // Boxing keeps the load future's state on the heap so it costs
-                // O(1) stack here and in the callers above.
-                let result = Box::pin(self.db(&source.identifier)).await;
-                match result {
-                    Ok(v) => v,
-                    Err(ref e) if e.is_not_found() => {
-                        Box::pin(self.resolve_as_graph_source(&source.identifier)).await?
-                    }
-                    Err(e) => {
-                        return Err(e);
-                    }
-                }
+        use fluree_db_core::{DatasetRef, MemberRef};
+        let address = match source.reference() {
+            MemberRef::Dataset(
+                DatasetRef::Address(address) | DatasetRef::Ambiguous { address, .. },
+            ) => address,
+            MemberRef::Dataset(DatasetRef::GraphIri(iri)) => {
+                return Err(ApiError::invalid_query(format!(
+                    "'{iri}' is a graph IRI, not a ledger, and this query has no target \
+                     ledger to find it in. Name the ledger too ('<ledger>#{iri}'), or \
+                     query that ledger's own endpoint"
+                )));
             }
-            Some(time_spec) => {
-                let ts = convert_time_spec(time_spec)?;
-                match Box::pin(self.db_at(&source.identifier, ts)).await {
-                    Ok(v) => v,
-                    Err(ref e) if e.is_not_found() => {
-                        // Check if it's a graph source — reject time travel explicitly
-                        let gs_id = fluree_db_core::normalize_ledger_id(&source.identifier)
-                            .unwrap_or_else(|_| source.identifier.clone());
-
-                        if self
-                            .nameservice()
-                            .lookup_graph_source(&gs_id)
-                            .await
-                            .map_err(|e| ApiError::internal(e.to_string()))?
-                            .is_some()
-                        {
-                            return Err(ApiError::query(
-                                "Time travel is not supported for graph sources. \
-                                 Remove the time specification to query at latest.",
-                            ));
-                        }
-                        return Err(ApiError::NotFound(source.identifier.clone()));
-                    }
-                    Err(e) => return Err(e),
-                }
+            MemberRef::Keyword(sel) => {
+                return Err(ApiError::invalid_query(format!(
+                    "'{sel}' names a graph of a ledger, and this query has no target \
+                     ledger. Name the ledger too ('<ledger>#{sel}'), or query that \
+                     ledger's own endpoint"
+                )));
             }
         };
+        let time_spec = source.time_spec();
 
-        // Apply explicit graph selector if set.
-        // Note: If the identifier contained a fragment like #txn-meta, that was
-        // already applied by view()/view_at(). The parser rejects the ambiguous
-        // case where both fragment and graph_selector are present.
-        //
-        // After re-selecting the graph, re-resolve config for the new graph
-        // target so per-graph overrides match the actual graph being queried.
-        match &source.graph_selector {
-            Some(selector) => {
-                let view = Self::apply_graph_selector(view, selector)?;
+        // Box the ledger-load future: the load chain (get_or_load → load →
+        // load_novelty → bulk_apply_commits) is deep, and in debug builds its
+        // inline future would balloon this frame — and every dispatcher frame
+        // above it that materializes this future before awaiting — pushing the
+        // plain `select *` connection query past the default ~2 MB worker stack
+        // (fluree/db#1408). Boxing keeps the load future's state on the heap so
+        // it costs O(1) stack here and in the callers above.
+        let loaded = match time_spec {
+            None => Box::pin(self.load_graph_db(address.id())).await,
+            Some(spec) => Box::pin(self.load_graph_db_at(address.id(), spec.clone())).await,
+        };
+        match loaded {
+            Ok(view) => {
+                let view = Self::apply_graph_selector(view, address.graph())?;
                 self.resolve_and_attach_config(view).await
             }
-            None => Ok(view),
+            Err(ref e) if e.is_not_found() => {
+                // A graph source reads the pinned table state; the pin rides the
+                // view to the R2RML provider, or is refused.
+                let spec = time_spec.cloned().unwrap_or(dataset::TimeSpec::Latest);
+                Box::pin(self.resolve_graph_source_address(address, &spec))
+                    .await?
+                    .ok_or_else(|| ApiError::NotFound(address.id().to_string()))
+            }
+            Err(e) => Err(e),
         }
     }
 
@@ -282,85 +315,6 @@ impl Fluree {
             load_view = |source| self.load_view_from_source(source),
         )
     }
-
-    /// Check if spec qualifies for single-ledger fast path (no time override).
-    ///
-    /// This is used to decide whether to take the optimized single-ledger path
-    /// in query_connection.
-    pub fn is_single_ledger_fast_path(spec: &DatasetSpec) -> bool {
-        spec.default_graphs.len() == 1
-            && spec.named_graphs.is_empty()
-            && spec.default_graphs[0].time_spec.is_none()
-    }
-
-    /// Resolve an identifier as a graph source, creating a minimal genesis context.
-    async fn resolve_as_graph_source(&self, identifier: &str) -> Result<GraphDb> {
-        self.resolve_graph_source(identifier)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(identifier.to_string()))
-    }
-}
-
-async fn resolve_history_endpoint_t(
-    ledger: &fluree_db_ledger::LedgerState,
-    spec: &dataset::TimeSpec,
-    latest_t: i64,
-) -> Result<i64> {
-    match spec {
-        dataset::TimeSpec::AtT(t) => Ok(*t),
-        dataset::TimeSpec::Latest => Ok(latest_t),
-        dataset::TimeSpec::AtTime(iso) => {
-            let dt = DateTime::parse_from_rfc3339(iso).map_err(|e| {
-                ApiError::internal(format!(
-                    "Invalid ISO-8601 timestamp for time travel: {iso} ({e})"
-                ))
-            })?;
-            // See `Fluree::load_view_at` for rationale: `ledger#time` is epoch-ms and we
-            // ceiling sub-ms ISO inputs to avoid truncation off-by-one.
-            let mut target_epoch_ms = dt.timestamp_millis();
-            if dt.timestamp_subsec_nanos() % 1_000_000 != 0 {
-                target_epoch_ms += 1;
-            }
-
-            time_resolve::datetime_to_t(
-                &ledger.snapshot,
-                Some(ledger.novelty.as_ref()),
-                target_epoch_ms,
-                latest_t,
-            )
-            .await
-        }
-        dataset::TimeSpec::AtRecorded(iso) => {
-            let target_epoch_ms = time_resolve::iso_to_target_epoch_ms(iso)?;
-            time_resolve::recorded_to_t(
-                &ledger.snapshot,
-                Some(ledger.novelty.as_ref()),
-                target_epoch_ms,
-                latest_t,
-            )
-            .await
-        }
-        dataset::TimeSpec::AtCommit(commit_prefix) => {
-            time_resolve::commit_to_t(
-                &ledger.snapshot,
-                Some(ledger.novelty.as_ref()),
-                commit_prefix,
-                latest_t,
-            )
-            .await
-        }
-    }
-}
-
-/// Convert dataset::TimeSpec to crate::TimeSpec
-fn convert_time_spec(ts: &dataset::TimeSpec) -> Result<crate::TimeSpec> {
-    match ts {
-        dataset::TimeSpec::AtT(t) => Ok(crate::TimeSpec::AtT(*t)),
-        dataset::TimeSpec::AtTime(iso) => Ok(crate::TimeSpec::AtTime(iso.clone())),
-        dataset::TimeSpec::AtRecorded(iso) => Ok(crate::TimeSpec::AtRecorded(iso.clone())),
-        dataset::TimeSpec::AtCommit(sha) => Ok(crate::TimeSpec::AtCommit(sha.clone())),
-        dataset::TimeSpec::Latest => Ok(crate::TimeSpec::Latest),
-    }
 }
 
 #[cfg(test)]
@@ -369,12 +323,16 @@ mod tests {
     use crate::dataset::GraphSource;
     use crate::FlureeBuilder;
 
+    fn source(s: &str) -> GraphSource {
+        GraphSource::parse(s).unwrap()
+    }
+
     #[tokio::test]
     async fn test_build_dataset_view_single() {
         let fluree = FlureeBuilder::memory().build_memory();
         let _ledger = fluree.create_ledger("testdb").await.unwrap();
 
-        let spec = DatasetSpec::new().with_default(GraphSource::new("testdb:main"));
+        let spec = DatasetSpec::new().with_default(source("testdb:main"));
         let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
         assert!(dataset.is_single_ledger());
@@ -388,8 +346,8 @@ mod tests {
         let _ledger2 = fluree.create_ledger("db2").await.unwrap();
 
         let spec = DatasetSpec::new()
-            .with_default(GraphSource::new("db1:main"))
-            .with_named(GraphSource::new("db2:main"));
+            .with_default(source("db1:main"))
+            .with_named(source("db2:main"));
 
         let dataset = fluree.build_dataset_view(&spec).await.unwrap();
 
@@ -403,32 +361,30 @@ mod tests {
         let _ledger = fluree.create_ledger("testdb").await.unwrap();
 
         // Single default, no time spec - should return Some
-        let spec = DatasetSpec::new().with_default(GraphSource::new("testdb:main"));
+        let spec = DatasetSpec::new().with_default(source("testdb:main"));
         let result = fluree.try_single_view_from_spec(&spec).await.unwrap();
         assert!(result.is_some());
 
         // Single default with time spec - should still return Some (single ledger)
         let spec = DatasetSpec::new()
-            .with_default(GraphSource::new("testdb:main").with_time(dataset::TimeSpec::AtT(0)));
+            .with_default(source("testdb:main").with_time(dataset::TimeSpec::AtT(0)));
         let result = fluree.try_single_view_from_spec(&spec).await.unwrap();
         assert!(result.is_some());
     }
 
+    /// A bare graph IRI names no ledger: on a connection surface it is refused
+    /// as a caller mistake, not looked up in the nameservice as a ledger.
     #[tokio::test]
-    async fn test_is_single_ledger_fast_path() {
-        // No time spec - fast path
-        let spec = DatasetSpec::new().with_default(GraphSource::new("testdb:main"));
-        assert!(Fluree::is_single_ledger_fast_path(&spec));
-
-        // With time spec - not fast path (needs time resolution)
-        let spec = DatasetSpec::new()
-            .with_default(GraphSource::new("testdb:main").with_time(dataset::TimeSpec::AtT(5)));
-        assert!(!Fluree::is_single_ledger_fast_path(&spec));
-
-        // Multiple graphs - not fast path
-        let spec = DatasetSpec::new()
-            .with_default(GraphSource::new("db1:main"))
-            .with_default(GraphSource::new("db2:main"));
-        assert!(!Fluree::is_single_ledger_fast_path(&spec));
+    async fn a_bare_graph_iri_is_refused_without_a_target_ledger() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let _ledger = fluree.create_ledger("testdb").await.unwrap();
+        for iri in ["http://ex.org/g", "urn:ex:doc:1", "txn-meta"] {
+            let spec = DatasetSpec::new()
+                .with_default(source("testdb:main"))
+                .with_named(source(iri));
+            let err = fluree.build_dataset_view(&spec).await.unwrap_err();
+            assert_eq!(err.status_code(), 400, "{iri}: {err}");
+            assert!(err.to_string().contains("no target"), "{iri}: {err}");
+        }
     }
 }

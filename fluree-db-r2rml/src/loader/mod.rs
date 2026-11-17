@@ -53,6 +53,19 @@ impl R2rmlLoader {
         let mut sink = GraphCollectorSink::new();
         parse_turtle(content, &mut sink).map_err(|e| R2rmlError::Parse(e.to_string()))?;
         let graph = sink.into_graph();
+        // The collector accepts RDF 1.2 reifiers and records them as
+        // `Graph::reifications` for the Turtle-to-JSON-LD adapter. Nothing in
+        // R2RML reads them, so a mapping file containing `~ r` or `{| … |}`
+        // would load with its attachments silently discarded. Refuse instead:
+        // a mapping that quietly means something other than what it says is
+        // worse than one that fails to load.
+        if let Some(r) = graph.reifications().first() {
+            return Err(R2rmlError::Unsupported(format!(
+                "RDF 1.2 reifier attachments are not supported in R2RML mapping files \
+                 (found one on <{}>); remove the annotation syntax from the mapping",
+                r.reifier
+            )));
+        }
         Ok(Self { graph })
     }
 
@@ -280,6 +293,33 @@ mod sql_query_tests {
             rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
     "#;
 
+    /// A table whose name begins with the alias prefix would be read as an
+    /// `rr:sqlQuery` map's alias by every reader, so the loader refuses it.
+    #[test]
+    fn a_table_name_with_the_alias_prefix_is_refused() {
+        let ttl = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "sqlQuery:0123456789abcdef" ] ;
+                rr:subjectMap [ rr:template "http://example.org/t/{id}" ] .
+        "#;
+        let err = R2rmlLoader::from_turtle(ttl)
+            .unwrap()
+            .compile()
+            .expect_err("the alias prefix is reserved");
+        let message = err.to_string();
+        assert!(
+            message.contains("rr:tableName") && message.contains("reserved"),
+            "{message}"
+        );
+        // Not a prefix of the name: an ordinary table.
+        let ok = ttl.replace("\"sqlQuery:0123456789abcdef\"", "\"crm.sqlQuery:x\"");
+        R2rmlLoader::from_turtle(&ok)
+            .unwrap()
+            .compile()
+            .expect("an ordinary table");
+    }
+
     #[test]
     fn sql_query_compiles_to_a_stable_alias_that_resolves_back_to_the_query() {
         let compiled = R2rmlLoader::from_turtle(MAPPING)
@@ -332,5 +372,106 @@ mod sql_query_tests {
             .compile()
             .unwrap_err();
         assert!(err.to_string().contains("rr:sqlQuery"), "{err}");
+    }
+
+    #[test]
+    fn a_reifier_attachment_in_a_mapping_is_refused_rather_than_dropped() {
+        // The shared Turtle collector accepts RDF 1.2 reifiers so the
+        // Turtle-to-JSON-LD adapter can re-emit them. R2RML never reads that
+        // list, so without this check the mapping below would load as though
+        // the annotation had not been written.
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://example.org/> .
+            <http://example.org/m#T> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "orders" ] ;
+                rr:subjectMap [ rr:template "http://example.org/{id}" ] .
+            ex:a ex:b ex:c {| ex:note "dropped" |} .
+        "#;
+        let err = match R2rmlLoader::from_turtle(mapping) {
+            Err(e) => e,
+            Ok(_) => panic!("a mapping carrying an attachment must not load silently"),
+        };
+        assert!(
+            err.to_string()
+                .contains("reifier attachments are not supported"),
+            "{err}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "turtle"))]
+mod document_order_tests {
+    use super::R2rmlLoader;
+
+    /// Sixteen maps of one class, written in an order that is neither sorted
+    /// nor any hash order a run is likely to produce (16! orders).
+    const NAMES: [&str; 16] = [
+        "Pear",
+        "Fig",
+        "Apple",
+        "Quince",
+        "Lime",
+        "Date",
+        "Kiwi",
+        "Banana",
+        "Mango",
+        "Cherry",
+        "Olive",
+        "Grape",
+        "Nectarine",
+        "Elder",
+        "Jujube",
+        "Hazel",
+    ];
+
+    fn mapping() -> String {
+        let mut m = String::from(
+            "@prefix rr: <http://www.w3.org/ns/r2rml#> .\n@prefix ex: <http://example.org/> .\n",
+        );
+        for name in NAMES {
+            m.push_str(&format!(
+                "<http://example.org/m#{name}> a rr:TriplesMap ;\n\
+                 rr:logicalTable [ rr:tableName \"fruit.{name}\" ] ;\n\
+                 rr:subjectMap [ rr:template \"http://example.org/{name}/{{id}}\" ; rr:class ex:Fruit ] ;\n\
+                 rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"name\" ] ] .\n"
+            ));
+        }
+        m
+    }
+
+    fn expected() -> Vec<String> {
+        NAMES
+            .iter()
+            .map(|n| format!("http://example.org/m#{n}"))
+            .collect()
+    }
+
+    /// A pattern several maps answer scans them in `triples_maps` order, so that
+    /// order must be the document's, the same in every process, and survive the
+    /// serialized form a compiled mapping is cached in.
+    #[test]
+    fn triples_maps_iterate_in_document_order() {
+        let compiled = R2rmlLoader::from_turtle(&mapping())
+            .unwrap()
+            .compile()
+            .unwrap();
+        let order: Vec<String> = compiled.triples_maps.keys().cloned().collect();
+        assert_eq!(order, expected(), "maps in document order");
+        let by_class: Vec<String> = compiled
+            .find_maps_for_class("http://example.org/Fruit")
+            .into_iter()
+            .map(|tm| tm.iri.clone())
+            .collect();
+        assert_eq!(by_class, expected(), "class lookup in document order");
+
+        let json = serde_json::to_string(&compiled).unwrap();
+        let back: crate::mapping::CompiledR2rmlMapping = serde_json::from_str(&json).unwrap();
+        let order: Vec<String> = back
+            .triples_maps
+            .values()
+            .map(|tm| tm.iri.clone())
+            .collect();
+        assert_eq!(order, expected(), "order survives a serde round trip");
     }
 }

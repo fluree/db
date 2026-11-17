@@ -30,7 +30,7 @@ These predicates appear on commit subjects in the txn-meta graph. Each commit pr
 | `f:alias` | `https://ns.flur.ee/db#alias` | `xsd:string` | Ledger ID (e.g. `mydb:main`) |
 | `f:v` | `https://ns.flur.ee/db#v` | `xsd:int` | Commit format version |
 | `f:time` | `https://ns.flur.ee/db#time` | `xsd:long` | Commit timestamp (epoch milliseconds) |
-| `f:t` | `https://ns.flur.ee/db#t` | `xsd:int` | Transaction number (watermark) |
+| `f:t` | `https://ns.flur.ee/db#t` | `xsd:integer` | Transaction number (watermark) |
 | `f:size` | `https://ns.flur.ee/db#size` | `xsd:long` | Cumulative data size in bytes |
 | `f:flakes` | `https://ns.flur.ee/db#flakes` | `xsd:long` | Cumulative flake count |
 | `f:previous` | `https://ns.flur.ee/db#previous` | `@id` (ref) | Reference to previous commit (optional) |
@@ -38,8 +38,8 @@ These predicates appear on commit subjects in the txn-meta graph. Each commit pr
 | `f:author` | `https://ns.flur.ee/db#author` | `xsd:string` | Author claim — user-supplied via `f:author` in the transaction body (optional). Distinct from `f:identity`. |
 | `f:txn` | `https://ns.flur.ee/db#txn` | `xsd:string` | Transaction ContentId (CID string, optional) |
 | `f:message` | `https://ns.flur.ee/db#message` | `xsd:string` | Commit message — user-supplied via `f:message` in the transaction body (optional). |
-| `f:asserts` | `https://ns.flur.ee/db#asserts` | `xsd:long` | Assertion count in this commit |
-| `f:retracts` | `https://ns.flur.ee/db#retracts` | `xsd:long` | Retraction count in this commit |
+| `f:asserts` | `https://ns.flur.ee/db#asserts` | `xsd:integer` | Assertion count in this commit |
+| `f:retracts` | `https://ns.flur.ee/db#retracts` | `xsd:integer` | Retraction count in this commit |
 
 ### Querying commit metadata
 
@@ -48,9 +48,10 @@ Commit metadata lives in the `#txn-meta` named graph within each ledger. To quer
 ```json
 {
   "@context": { "f": "https://ns.flur.ee/db#" },
+  "from": "mydb:main#txn-meta",
   "select": ["?t", "?time", "?author"],
   "where": {
-    "@graph": "mydb:main#txn-meta",
+    "@id": "?commit",
     "f:t": "?t",
     "f:time": "?time",
     "f:author": "?author"
@@ -86,7 +87,7 @@ These seven predicates encode the edge that an [edge annotation](../concepts/edg
 | `f:reifiesLang` | `https://ns.flur.ee/db#reifiesLang` | `xsd:string` | BCP-47 language tag, present only when the object is a language-tagged string. **Optional.** |
 | `f:reifiesListIndex` | `https://ns.flur.ee/db#reifiesListIndex` | `xsd:int` | List-occurrence index. **Reserved/deferred** — always omitted in this release. |
 
-**These predicates are reserved.** User-authored mention of any `f:reifies*` IRI (compact or full form) is rejected at parse time on every write surface (JSON-LD insert/upsert/update, SPARQL UPDATE, Turtle/raw ingest), and they are filtered out of variable-predicate (`?p`) scans and wildcard (`select: "*"`) hydration so they never surface as ordinary RDF. Mint and manage annotations only through `@annotation` / `@edge` (JSON-LD) or the annotation tail (`{| ... |}` / `~` / `rdf:reifies`) in SPARQL 1.2. See [Edge annotations](../concepts/edge-annotations.md) for the full surface and the [storage-internals design doc](../design/edge-annotations.md) for the bundle encoding and invariants.
+**These predicates are reserved.** User-authored mention of any `f:reifies*` IRI (compact or full form) is rejected on every transaction write surface (JSON-LD insert/upsert/update, SPARQL UPDATE, Turtle insert/upsert), and they are filtered out of variable-predicate (`?p`) scans and wildcard (`select: "*"`) hydration so they never surface as ordinary RDF. Mint and manage annotations only through `@annotation` / `@edge` (JSON-LD) or the annotation tail (`{| ... |}` / `~` / `rdf:reifies`) in SPARQL 1.2 and Turtle. Bulk `import` is the one administrative exception: it ingests already-lowered bundles without this firewall. See [Edge annotations](../concepts/edge-annotations.md) for the full surface and the [storage-internals design doc](../design/edge-annotations.md) for the bundle encoding and invariants.
 
 ---
 
@@ -352,6 +353,7 @@ These predicates define ledger-level configuration stored in the config graph. S
 | `f:reasoningDefaults` | `https://ns.flur.ee/db#reasoningDefaults` | OWL/RDFS reasoning defaults |
 | `f:datalogDefaults` | `https://ns.flur.ee/db#datalogDefaults` | Datalog rule defaults |
 | `f:transactDefaults` | `https://ns.flur.ee/db#transactDefaults` | Transaction constraint defaults |
+| `f:queryDefaults` | `https://ns.flur.ee/db#queryDefaults` | Query defaults (ledger-scoped: `f:LedgerConfig` only) |
 
 ### Policy fields
 
@@ -367,6 +369,7 @@ These predicates define ledger-level configuration stored in the config graph. S
 |-----------|----------|-------------|
 | `f:shaclEnabled` | `https://ns.flur.ee/db#shaclEnabled` | Enable/disable SHACL validation (boolean) |
 | `f:shapesSource` | `https://ns.flur.ee/db#shapesSource` | Graph containing SHACL shapes (GraphRef) |
+| `f:additionalDataSource` | `https://ns.flur.ee/db#additionalDataSource` | Graph read with the validated graph when SHACL checks its nodes (GraphRef, repeatable) |
 | `f:validationMode` | `https://ns.flur.ee/db#validationMode` | `f:ValidationReject` or `f:ValidationWarn` |
 
 ### Reasoning fields
@@ -393,6 +396,12 @@ These predicates define ledger-level configuration stored in the config graph. S
 | `f:uniqueEnabled` | `https://ns.flur.ee/db#uniqueEnabled` | Enable unique constraint enforcement (boolean) |
 | `f:constraintsSource` | `https://ns.flur.ee/db#constraintsSource` | Graph(s) containing constraint annotations (GraphRef) |
 | `f:enforceUnique` | `https://ns.flur.ee/db#enforceUnique` | Annotation on property IRIs: enforce value uniqueness (boolean) |
+
+### Query fields
+
+| Predicate | Full IRI | Description |
+|-----------|----------|-------------|
+| `f:unionDefaultGraph` | `https://ns.flur.ee/db#unionDefaultGraph` | A query that does not choose its own default graph reads the union of the default graph and all named graphs (boolean). See [Union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph) |
 
 ### Override control
 

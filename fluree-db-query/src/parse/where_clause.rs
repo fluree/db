@@ -48,6 +48,114 @@ fn parse_filter_value(value: &JsonValue) -> Result<super::ast::UnresolvedExpress
     super::parse_filter_value(value)
 }
 
+/// Parse a FILTER / BIND / UNWIND expression and resolve its unquoted
+/// `prefix:name` atoms against the query's `@context`.
+///
+/// The S-expression parser has no context, so it hands such atoms over as
+/// [`UnresolvedFilterValue::Curie`]. An atom whose prefix the context defines
+/// becomes an IRI operand (`(= ?p ex:knows)` compares by term identity, as in
+/// SPARQL); one whose prefix is undefined stays the plain string it always
+/// was, so `(= ?slot 12:30)` is unaffected.
+fn parse_expr_with_ctx(
+    value: &JsonValue,
+    ctx: &JsonLdParseCtx,
+) -> Result<super::ast::UnresolvedExpression> {
+    Ok(resolve_compact_iri_atoms(parse_filter_value(value)?, ctx))
+}
+
+/// Walk an expression tree, expanding [`UnresolvedFilterValue::Curie`] atoms
+/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`].
+pub(crate) fn resolve_compact_iri_atoms(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> super::ast::UnresolvedExpression {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    match expr {
+        E::Const(V::Curie(atom)) => match ctx.expand_iri(&atom) {
+            // Expansion changed the text *and* produced something that is
+            // actually an IRI: the prefix was defined and meant a namespace.
+            //
+            // A context may alias a JSON-LD keyword — `{"type": "@type"}` is
+            // ordinary — and expansion then turns `type:admin` into
+            // `@typeadmin`, which is not an IRI and matches nothing. The
+            // author meant the string. Requiring an absolute IRI keeps
+            // keyword aliases out of IRI operand position.
+            Ok(expanded)
+                if expanded.as_str() != atom.as_ref()
+                    && fluree_graph_json_ld::iri::is_absolute(expanded.as_str()) =>
+            {
+                E::Const(V::Iri(Arc::from(expanded.as_str())))
+            }
+            _ => E::Const(V::Curie(atom)),
+        },
+        E::And(items) => E::And(
+            items
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        ),
+        E::Or(items) => E::Or(
+            items
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        ),
+        E::Not(inner) => E::Not(Box::new(resolve_compact_iri_atoms(*inner, ctx))),
+        E::In {
+            expr,
+            values,
+            negated,
+        } => E::In {
+            expr: Box::new(resolve_compact_iri_atoms(*expr, ctx)),
+            values: values
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+            negated,
+        },
+        E::Call { func, args } => E::Call {
+            func,
+            args: args
+                .into_iter()
+                .map(|e| resolve_compact_iri_atoms(e, ctx))
+                .collect(),
+        },
+        other => other,
+    }
+}
+
+/// Resolve compact-IRI atoms in the expression positions that sit outside the
+/// WHERE clause: computed SELECT columns and HAVING.
+///
+/// Those two parse their expressions without the `@context`, so an unquoted
+/// `ex:knows` stayed a plain string there while the identical expression in a
+/// FILTER became an IRI operand. `(as (= ?p ex:knows) ?isKnows)` was therefore
+/// always false, and the same comparison in a filter matched. An absolute
+/// `http://…` was an IRI in both, which made the inconsistency easy to miss.
+pub(crate) fn resolve_atoms_outside_where(
+    query: &mut super::ast::UnresolvedQuery,
+    ctx: &JsonLdParseCtx,
+) {
+    use super::ast::{UnresolvedColumn as C, UnresolvedProjection as P};
+
+    let mut fix_column = |col: &mut C| {
+        if let C::Computation { expr, .. } = col {
+            let taken =
+                std::mem::replace(expr, super::ast::UnresolvedExpression::Var(Arc::from("")));
+            *expr = resolve_compact_iri_atoms(taken, ctx);
+        }
+    };
+    match &mut query.select {
+        P::Tuple(cols) => cols.iter_mut().for_each(&mut fix_column),
+        P::Scalar(col) => fix_column(col),
+        P::Wildcard => {}
+    }
+
+    if let Some(having) = query.options.having.take() {
+        query.options.having = Some(resolve_compact_iri_atoms(having, ctx));
+    }
+}
+
 /// Validate that a string looks like a variable (starts with ?)
 fn validate_var_name(name: &str) -> Result<()> {
     if !name.starts_with('?') {
@@ -201,7 +309,7 @@ pub fn parse_where_array_element(
                 })?;
                 validate_var_name(var)?;
 
-                let expr = parse_filter_value(&arr[i + 1])?;
+                let expr = parse_expr_with_ctx(&arr[i + 1], ctx)?;
                 query.patterns.push(UnresolvedPattern::Bind {
                     var: Arc::from(var),
                     expr,
@@ -226,7 +334,7 @@ pub fn parse_where_array_element(
                 ParseError::InvalidWhere("unwind var must be a string".to_string())
             })?;
             validate_var_name(var)?;
-            let expr = parse_filter_value(&arr[2])?;
+            let expr = parse_expr_with_ctx(&arr[2], ctx)?;
             query.patterns.push(UnresolvedPattern::Unwind {
                 var: Arc::from(var),
                 expr,
@@ -333,7 +441,7 @@ pub fn parse_where_array_element(
                         super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?
                     }
                     // Non-array values (strings, etc.) use the standard parser
-                    _ => parse_filter_value(expr_val)?,
+                    _ => parse_expr_with_ctx(expr_val, ctx)?,
                 };
                 super::filter_common::reject_constant_bool_expr(&filter_expr, "filter")?;
                 query.add_filter(filter_expr);
@@ -468,8 +576,15 @@ pub fn parse_where_array_element(
             // Parse the subquery as a full query, but reuse the parent counters so implicit vars
             // (?__sN/?__nN) cannot collide between parent and subquery scopes.
             // Subqueries inherit context from re-parsing; pass None for strict_override.
-            let (subquery, _select_mode) =
-                parse_query_ast_internal(&arr[1], subject_counter, nested_counter, None)?;
+            // The subquery is part of this where: it names graphs as this where does.
+            let (subquery, _select_mode) = parse_query_ast_internal(
+                &arr[1],
+                subject_counter,
+                nested_counter,
+                None,
+                Some(ctx),
+                &std::collections::HashSet::new(),
+            )?;
             query
                 .patterns
                 .push(UnresolvedPattern::Subquery(Box::new(subquery)));
@@ -488,16 +603,19 @@ pub fn parse_where_array_element(
                 ParseError::InvalidWhere("graph name must be a string".to_string())
             })?;
             // Remaining elements are patterns
-            let graph_patterns = parse_subquery_patterns(
-                &arr[2..],
-                ctx,
-                subject_counter,
-                nested_counter,
-                object_var_parsing,
-            )?;
-            query
-                .patterns
-                .push(UnresolvedPattern::graph(graph_name, graph_patterns));
+            let graph_patterns = ctx.in_graph_scope(|| {
+                parse_subquery_patterns(
+                    &arr[2..],
+                    ctx,
+                    subject_counter,
+                    nested_counter,
+                    object_var_parsing,
+                )
+            })?;
+            query.patterns.push(UnresolvedPattern::graph(
+                ctx.graph_name(graph_name),
+                graph_patterns,
+            ));
             Ok(())
         }
         _ => Err(ParseError::InvalidWhere(format!(
@@ -697,6 +815,208 @@ mod tests {
         });
         parse_where_test(&where_val, &context, &mut query).unwrap();
         assert!(!query.patterns.is_empty());
+    }
+
+    /// A node-level `@graph` selector in `where` is GRAPH sugar: the same
+    /// patterns as `["graph", <name>, {…}]`, nested nodes included. It used
+    /// to be parsed as a predicate named `@graph` and match nothing.
+    #[test]
+    fn node_level_graph_in_where_is_graph_sugar() {
+        let context = test_context();
+        let sugar = |where_val: JsonValue| {
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_test(&where_val, &context, &mut query).unwrap();
+            format!("{:?}", query.patterns)
+        };
+        let node_level = sugar(json!({
+            "@id": "?s", "@graph": "http://example.org/g",
+            "ex:p": "?o", "ex:child": {"ex:q": "?v"}
+        }));
+        let explicit = sugar(json!([[
+            "graph", "http://example.org/g",
+            {"@id": "?s", "ex:p": "?o", "ex:child": {"ex:q": "?v"}}
+        ]]));
+        assert_eq!(node_level, explicit);
+        assert!(node_level.contains("Graph"), "{node_level}");
+
+        // A variable graph and a context alias of `@graph` work the same way.
+        let aliased_ctx =
+            parse_context(&json!({"ex": "http://example.org/", "g": "@graph"})).unwrap();
+        let mut query = UnresolvedQuery::new(aliased_ctx.clone());
+        parse_where_test(
+            &json!({"@id": "?s", "g": "?graph", "ex:p": "?o"}),
+            &aliased_ctx,
+            &mut query,
+        )
+        .unwrap();
+        assert!(
+            matches!(&query.patterns[..], [UnresolvedPattern::Graph { name, .. }] if &**name == "?graph"),
+            "{:?}",
+            query.patterns
+        );
+
+        // Content is a named graph, not a pattern.
+        let mut query = UnresolvedQuery::new(context.clone());
+        assert!(parse_where_test(
+            &json!({"@id": "ex:G", "@graph": [{"@id": "?s", "ex:p": "?o"}]}),
+            &context,
+            &mut query
+        )
+        .is_err());
+    }
+
+    /// A node-level `@graph` in `where` names its graph exactly as the same
+    /// key does in an insert or delete: a compact IRI expands against the
+    /// `@context`, and in an update's `where` the keywords and `fromNamed`
+    /// aliases resolve as the templates resolve them. `default` is the
+    /// ledger's default graph, and cannot leave an enclosing graph.
+    #[test]
+    fn node_level_graph_in_where_resolves_names_like_templates() {
+        let context = test_context();
+        let env = crate::parse::GraphNameEnv {
+            ledger_id: Some("mydb:main".to_string()),
+            aliases: [("g1".to_string(), "http://example.org/one".to_string())].into(),
+            default_by_name: false,
+        };
+        let parse = |where_val: JsonValue, env: Option<&crate::parse::GraphNameEnv>| {
+            let mut ctx = test_parse_ctx(&context);
+            if let Some(env) = env {
+                ctx = ctx.with_graph_names(env.clone());
+            }
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_with_counters(&where_val, &ctx, &mut query, &mut 0, &mut 0, true)
+                .map(|()| query.patterns)
+        };
+        let graph_name = |where_val: JsonValue, env| match &parse(where_val, env).unwrap()[..] {
+            [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+            other => panic!("expected one GRAPH pattern, got {other:?}"),
+        };
+
+        // A compact name expands, in a query and in an update alike.
+        for env in [None, Some(&env)] {
+            assert_eq!(
+                graph_name(json!({"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}), env),
+                "http://example.org/g"
+            );
+            assert_eq!(
+                graph_name(json!({"@id": "?s", "@graph": "?g", "ex:p": "?o"}), env),
+                "?g"
+            );
+        }
+        // An update's keywords name this ledger's graphs; an alias stays the
+        // name the dataset resolves.
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "config", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "urn:fluree:mydb:main#config"
+        );
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "txn-meta", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "urn:fluree:mydb:main#txn-meta"
+        );
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "g1", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "g1"
+        );
+
+        // `default` is the where's default graph: the node's patterns as they
+        // are, with no GRAPH around them.
+        let plain = parse(json!({"@id": "?s", "ex:p": "?o"}), Some(&env)).unwrap();
+        let default = parse(
+            json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+            Some(&env),
+        )
+        .unwrap();
+        assert_eq!(format!("{plain:?}"), format!("{default:?}"));
+        // When the update's where reads another default graph, `default`
+        // still names the ledger's default graph: `GRAPH <urn:default>`.
+        let elsewhere = crate::parse::GraphNameEnv {
+            default_by_name: true,
+            ..env.clone()
+        };
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+                Some(&elsewhere)
+            ),
+            fluree_db_core::DEFAULT_GRAPH_IRI
+        );
+        // Inside another graph it would have to leave it, which a where
+        // pattern cannot do: refused, whichever form encloses it.
+        for enclosed in [
+            json!({"@id": "?s", "@graph": "ex:g", "ex:child": {"@graph": "default", "ex:q": "?v"}}),
+            json!([["graph", "http://example.org/g",
+                    {"@id": "?s", "ex:child": {"@graph": "default", "ex:q": "?v"}}]]),
+            json!([["graph", "http://example.org/g",
+                    {"@id": "?s", "@graph": "default", "ex:p": "?o"}]]),
+        ] {
+            for env in [&env, &elsewhere] {
+                let err = parse(enclosed.clone(), Some(env)).unwrap_err().to_string();
+                assert!(err.contains("\"default\""), "{enclosed}: {err}");
+            }
+        }
+    }
+
+    /// Reading `"default"` by name is recorded, so the update's WHERE dataset
+    /// carries `urn:default` when a pattern reads it. A `where` that writes
+    /// `urn:default` itself reads the same graph, as `GRAPH <urn:default>`,
+    /// and is no use of `"default"`.
+    #[test]
+    fn update_where_reads_default_by_name() {
+        let context = test_context();
+        let update = crate::parse::GraphNameEnv {
+            ledger_id: Some("mydb:main".to_string()),
+            default_by_name: true,
+            ..Default::default()
+        };
+        // The GRAPH name of a one-pattern where, and whether it read
+        // `"default"` by name.
+        let parse = |where_val: JsonValue, env: Option<&crate::parse::GraphNameEnv>| {
+            let mut ctx = test_parse_ctx(&context);
+            if let Some(env) = env {
+                ctx = ctx.with_graph_names(env.clone());
+            }
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_with_counters(&where_val, &ctx, &mut query, &mut 0, &mut 0, true).unwrap();
+            let name = match &query.patterns[..] {
+                [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+                other => panic!("expected one GRAPH pattern, got {other:?}"),
+            };
+            (name, ctx.reads_ledger_default())
+        };
+        assert_eq!(
+            parse(
+                json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+                Some(&update)
+            ),
+            (fluree_db_core::DEFAULT_GRAPH_IRI.to_string(), true)
+        );
+        assert_eq!(
+            parse(
+                json!({"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}),
+                Some(&update)
+            ),
+            ("http://example.org/g".to_string(), false)
+        );
+        for env in [Some(&update), None] {
+            for written in [
+                json!({"@id": "?s", "@graph": "urn:default", "ex:p": "?o"}),
+                json!([["graph", "urn:default", {"@id": "?s", "ex:p": "?o"}]]),
+            ] {
+                assert_eq!(
+                    parse(written, env),
+                    (fluree_db_core::DEFAULT_GRAPH_IRI.to_string(), false)
+                );
+            }
+        }
     }
 
     #[test]

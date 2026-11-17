@@ -76,8 +76,25 @@ Supported:
 - `defaults` (partial):
   - `defaults.indexing.reindexMinBytes` / `reindexMaxBytes` are applied as the default `IndexConfig` for writes
   - `defaults.indexing.indexingEnabled=false` suppresses background index triggers
-  - `defaults.indexing.maxOldIndexes` sets the maximum number of old index versions to retain before GC (default: 5)
-  - `defaults.indexing.gcMinTimeMins` sets the minimum age in minutes before an index can be garbage collected (default: 30)
+  - `defaults.indexing.gcMinTimeMins`: minutes a superseded index version is kept, so a query that started on it can finish (default: 15)
+  - `defaults.indexing.gcHardMaxOldIndexes`: past this many old index versions, a version is collected even inside `gcMinTimeMins` (default: 10)
+  - `defaults.indexing.maxOldIndexes`: old index versions always kept, whatever their age (default: 0)
+
+  The three retention keys apply only where this connection runs the indexer. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention) for how they combine.
+
+  ```json
+  {
+    "@id": "connection",
+    "@type": "Connection",
+    "indexStorage": {"@id": "fileStorage"},
+    "defaults": {
+      "indexing": {
+        "gcMinTimeMins": 30,
+        "gcHardMaxOldIndexes": 40
+      }
+    }
+  }
+  ```
 
 ### addressIdentifiers (read routing)
 
@@ -85,14 +102,21 @@ The `addressIdentifiers` field maps identifier strings to storage backends, enab
 
 ```json
 {
-  "@id": "connection",
-  "@type": "Connection",
-  "indexStorage": {"@id": "indexS3"},
-  "commitStorage": {"@id": "commitS3"},
-  "addressIdentifiers": {
-    "commit-storage": {"@id": "commitS3"},
-    "index-storage": {"@id": "indexS3"}
-  }
+  "@context": {"@vocab": "https://ns.flur.ee/system#"},
+  "@graph": [
+    {"@id": "indexS3", "@type": "Storage", "s3Bucket": "my-index-bucket"},
+    {"@id": "commitS3", "@type": "Storage", "s3Bucket": "my-commit-bucket"},
+    {
+      "@id": "connection",
+      "@type": "Connection",
+      "indexStorage": {"@id": "indexS3"},
+      "commitStorage": {"@id": "commitS3"},
+      "addressIdentifiers": {
+        "commit-storage": {"@id": "commitS3"},
+        "index-storage": {"@id": "indexS3"}
+      }
+    }
+  ]
 }
 ```
 
@@ -118,17 +142,31 @@ Not yet supported (parsed/ignored or absent):
 { "@id": "mem", "@type": "Storage" }
 ```
 
+Supported:
+- `AES256Key` (supports `ConfigurationValue`) — encrypts the in-memory blobs;
+  mainly useful for testing an encrypted configuration without a filesystem
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set; see
+  [Key Rotation](../security/encryption.md#key-rotation)
+
 ### File storage (requires `native`)
 
 Supported:
 - `filePath`
 - `AES256Key` (supports `ConfigurationValue`)
-- `durability` — `"sync"` (default) or `"page-cache"`
+- `AES256Keys` (list of `{keyId, AES256Key}` nodes) + `AES256CurrentKey` — a
+  rotation key set; mutually exclusive with `AES256Key`. See
+  [Key Rotation](../security/encryption.md#key-rotation)
+- `durability` — `"wal"` (default), `"sync"` or `"page-cache"`
 
 Notes:
-- Rust expects `AES256Key` to be **base64-encoded** and decode to exactly 32 bytes.
+- Rust expects `AES256Key` to be **base64-encoded** (standard or URL-safe) and decode to
+  exactly 32 bytes.
 - This encrypts the **index/commit blobs** written via the storage layer. The file-based
   nameservice remains plaintext, matching the existing builder behavior.
+- A key that is configured but does not resolve (an `envVar` that is unset or empty, with
+  no `defaultVal`) is a config error: the storage is never started unencrypted by accident.
+- Put the key on the `indexStorage` node. With a separate `commitStorage`, the
+  `indexStorage` key encrypts both; a `commitStorage` node with a different key is rejected.
 
 ```json
 {
@@ -142,34 +180,31 @@ Notes:
 
 #### durability
 
-When a write is reported complete. Both modes are atomic — a reader never sees a
-partially written file either way — so this is only about what survives the
-machine losing power.
+Filesystem syncing (FSYNC) is on by default. Leave this property unset for the
+default behavior, or use `"page-cache"` to turn syncing off in a storage config.
 
 | Value | Meaning |
 |---|---|
-| `sync` (default) | The bytes and the directory entry naming them are flushed to the device before the write is acknowledged. An acknowledged commit survives power loss. |
-| `page-cache` | Acknowledged once the bytes reach the OS page cache. Survives the process dying, but a power loss or kernel panic can lose acknowledged commits. |
+| `wal` (default) | FSYNC on. Acknowledged commits survive process crashes and power loss. |
+| `sync` | FSYNC on, flushing each file individually. Acknowledged commits survive process crashes and power loss. |
+| `page-cache` | FSYNC off. Writes reach the OS page cache, but a power loss or kernel panic can lose acknowledged commits. |
 
-An unrecognized value is rejected at config load rather than defaulting, so a
-typo fails loudly instead of quietly downgrading durability.
+Writes remain atomic with every setting. An unrecognized value is rejected at
+config load.
 
-Applies to content that is the source of truth — commits, transactions, ledger
-config, graph-source mappings — and to nameservice records. Content that can be
-rebuilt from the commit chain (index nodes, dictionaries, sketches, annotation
-arenas) is always written page-cache, in either mode: it is written at far higher
-volume than commits and is reproducible, so flushing it would put the cost on the
-path that can least afford it for no durability gain.
-
-`FLUREE_STORAGE_FSYNC` overrides this property, so an operator can change it for
-one run without editing a checked-in config file. See
-[Configuration](../operations/configuration.md).
+To turn FSYNC off without editing the config, set `FLUREE_STORAGE_FSYNC=0` before
+starting Fluree. Set `FLUREE_STORAGE_FSYNC=1` to turn it back on. This environment
+variable overrides the `durability` property. See
+[Storage durability](../operations/storage.md#durability).
 
 ### S3 storage (requires `aws`)
 
 Supported fields (parsed and **applied** by Rust):
 - `s3Bucket`
 - `s3Prefix`
+- `AES256Key` (supports `ConfigurationValue`; see the file storage notes — the
+  nameservice, whether DynamoDB or storage-backed, stays plaintext)
+- `AES256Keys` + `AES256CurrentKey` — a rotation key set, as for file storage
 - `s3Endpoint` (optional; recommended **only** for LocalStack/MinIO/custom endpoints)
 - `s3ForcePathStyle` (optional; `true` for MinIO-class endpoints without bucket-subdomain DNS)
 - `s3ReadTimeoutMs`, `s3WriteTimeoutMs`, `s3ListTimeoutMs`
@@ -291,37 +326,11 @@ rather than by two storage nodes.
 }
 ```
 
-### IPFS storage (requires `ipfs`)
+### IPFS storage (not available here)
 
-Supported:
-- `ipfsApiUrl` (default `http://127.0.0.1:5001`): Kubo HTTP RPC API base URL
-- `ipfsPinOnPut` (default `true`): pin blocks after writing
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": "http://127.0.0.1:5001",
-  "ipfsPinOnPut": true
-}
-```
-
-With env var indirection:
-
-```json
-{
-  "@id": "ipfsStorage",
-  "@type": "Storage",
-  "ipfsApiUrl": { "envVar": "FLUREE_IPFS_API_URL", "defaultVal": "http://127.0.0.1:5001" },
-  "ipfsPinOnPut": true
-}
-```
-
-Notes:
-- Requires a running Kubo node at the specified URL
-- Fluree's CIDs (SHA-256 + private-use multicodec) are stored directly into IPFS
-- No encryption support (`AES256Key` is not applicable)
-- See [IPFS Storage Guide](../operations/ipfs-storage.md) for Kubo setup and operational details
+A connection config cannot select IPFS storage: a storage node with `ipfsApiUrl` is rejected
+with an error. IPFS storage is experimental and available only through the Rust API
+(`FlureeBuilder::build_ipfs`); see the [IPFS Storage Guide](../operations/ipfs-storage.md).
 
 ## Publisher (nameservice) node fields
 

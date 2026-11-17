@@ -8,6 +8,8 @@ Unlike [background indexing](background-indexing.md) which incrementally updates
 
 Reindex publishes the new index root via `publish_index_allow_equal`, which means a reindex can produce a **new index root CID** even when `index_t` stays the same (same logical snapshot, different physical layout/config).
 
+After a successful publish, reindex evicts the calling instance's cached ledger. Subsequent loads use the rebuilt root and graph registry even when `index_t` is unchanged. Callers holding an existing ledger handle must reacquire it; caches in other serving instances must also reload the ledger.
+
 ## When to Reindex
 
 ### Common Use Cases
@@ -15,6 +17,8 @@ Reindex publishes the new index root via `publish_index_allow_equal`, which mean
 1. **Index corruption** - Query errors or unexpected results suggest corrupted indexes
 2. **Configuration changes** - Changing index parameters (leaf size, branch size)
 3. **Storage backend changes** - If you move a deployment between storage backends or adopt a new index strategy/type.
+4. **Merges indexed by an older build** - A ledger that took a general merge while indexed by a build from before branch operations stamped their flakes on the target's clock can hold index entries carrying the source branch's numbering. Head reads are correct, but `--at` reads served from that index stay wrong until a rebuild.
+5. **Deletes in a new graph, indexed by an older build** - On Fluree 4.2.4 and earlier, an incremental build could bring back a fact that was inserted and then deleted between two builds, in a graph the base index held nothing for (a named graph first written after the last build, or the default graph of a ledger whose indexed data all sat in named graphs). Such a fact reads as live until a full rebuild, which replays the deletion.
 
 ### Before You Reindex
 
@@ -36,7 +40,7 @@ use fluree_db_api::{FlureeBuilder, ReindexOptions, ReindexResult};
 
 // Create Fluree instance
 let fluree = FlureeBuilder::file("/path/to/data")
-    .build()
+    .build_async()
     .await?;
 
 // Reindex with default options
@@ -52,7 +56,7 @@ println!("Root ID: {}", result.root_id);
 use fluree_db_api::{FlureeBuilder, ReindexOptions};
 use fluree_db_indexer::IndexerConfig;
 
-let fluree = FlureeBuilder::file("/path/to/data").build().await?;
+let fluree = FlureeBuilder::file("/path/to/data").build_async().await?;
 
 let result = fluree.reindex("mydb:main", ReindexOptions::default()
     // Use custom index node sizes
@@ -83,8 +87,9 @@ ReindexOptions::default()
 
 // Custom configuration
 let config = IndexerConfig::default()
-    .with_gc_max_old_indexes(10)       // Keep more old index versions
-    .with_gc_min_time_mins(60)         // Retain for at least 60 minutes
+    .with_gc_max_old_indexes(10)       // Always keep 10 old index versions
+    .with_gc_min_time_mins(60)         // Keep a superseded version for 60 minutes
+    .with_gc_hard_max_old_indexes(Some(40)) // Past 40 old versions, collect even inside the age guard
     .with_run_budget_bytes(1 << 30)    // 1 GB memory budget for sort buffers
     .with_data_dir("/data/fluree");    // Directory for index artifacts
 
@@ -100,8 +105,9 @@ Key `IndexerConfig` fields:
 | `leaf_max_bytes` | 375,000 | Maximum bytes per leaf node (triggers split) |
 | `branch_target_children` | 100 | Target children per branch node |
 | `branch_max_children` | 200 | Maximum children per branch node |
-| `gc_max_old_indexes` | 5 | Old index versions to retain before GC |
-| `gc_min_time_mins` | 30 | Minimum age (minutes) before an index can be GC'd |
+| `gc_max_old_indexes` | 0 | Old index versions always kept, whatever their age |
+| `gc_min_time_mins` | 15 | Minutes a superseded index version is kept, so a query that started on it can finish |
+| `gc_hard_max_old_indexes` | `Some(10)` | Version ceiling past which the age guard is overridden; `None` removes it. Bounds versions, not bytes, and can release artifacts a still-running query needs — see [Index Retention](background-indexing.md#index-retention) |
 | `run_budget_bytes` | 256 MB | Memory budget for sort buffers (split across all sort orders) |
 | `data_dir` | System temp dir | Base directory for index artifacts |
 | `incremental_enabled` | true | Background indexing: attempt incremental updates before full rebuild |
@@ -167,7 +173,7 @@ The reindex operation:
    - **Phase F**: Uploads dictionaries and index artifacts to CAS, creates `IndexRoot` (FIR6)
 4. **Validates** that no new commits arrived during the build (conflict detection)
 5. **Publishes** the new index root via `publish_index_allow_equal`
-6. **Spawns** async garbage collection to clean up old index versions
+6. **Spawns** async garbage collection to clean up old index versions, under the same [retention settings](background-indexing.md#index-retention) as background indexing
 
 The published root links the index version it supersedes and carries a garbage manifest naming what that version replaced, so the new root participates in the GC chain like any incremental build. Roots published by Fluree **4.1.4 or earlier** did neither: they severed the chain, leaving every earlier root permanently unreachable for garbage collection. A ledger reindexed on one of those versions still holds those artifacts, and only a [storage sweep](background-indexing.md#reclaiming-orphaned-artifacts) reclaims them.
 

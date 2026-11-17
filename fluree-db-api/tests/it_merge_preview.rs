@@ -957,6 +957,8 @@ async fn preview_does_not_mutate_nameservice() {
 // 11. Source has no source_branch — same error as merge_branch
 // =============================================================================
 
+/// A branch with no branch point (main itself) has no target to infer,
+/// so previewing it without an explicit target is refused.
 #[tokio::test]
 async fn preview_main_as_source_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -1266,11 +1268,12 @@ async fn changes_fast_forward_basic() {
 }
 
 #[tokio::test]
-async fn changes_netting_cancels_churn() {
+async fn changes_show_the_net_op_for_churn() {
     let fluree = FlureeBuilder::memory().build_memory();
     setup_branch(&fluree).await;
 
-    // Create bob, then delete him again — the net diff must be empty.
+    // Create bob, then delete him again. The net op is the deletion, which
+    // is what the merge applies, so that is what the preview shows.
     let dev = fluree.ledger("mydb:dev").await.unwrap();
     let dev = fluree
         .insert(
@@ -1300,12 +1303,15 @@ async fn changes_netting_cancels_churn() {
         .unwrap();
 
     let changes = preview.changes.expect("include_changes was set");
-    assert_eq!(changes.assert_count, 0, "churn must cancel");
-    assert_eq!(changes.retract_count, 0);
-    assert_eq!(changes.subject_count, 0);
-    assert!(changes.entries.is_empty());
+    assert_eq!(changes.assert_count, 0);
+    assert_eq!(changes.retract_count, 1, "the deletion is the net op");
+    assert_eq!(changes.subject_count, 1);
+    assert_eq!(changes.entries.len(), 1);
+    let entry = &changes.entries[0];
+    assert_eq!(entry.subject, "http://example.org/ns/bob");
+    assert!(entry.asserts.is_empty());
+    assert_eq!(entry.retracts.len(), 1);
     assert!(!changes.truncated);
-    // The commits themselves are still visible — only the net diff is empty.
     assert!(preview.ahead.count >= 2);
 }
 
@@ -1608,4 +1614,62 @@ async fn changes_multi_value_predicate_nets_independently() {
         changes.retract_count, 1,
         "only the deleted value appears; the sibling value is untouched"
     );
+}
+
+/// A sync leaves the target's own changes out of the branch's change list.
+///
+/// dev commits first, so syncing main in writes a merge commit carrying
+/// main's changes. Previewing dev back into main must list dev's change
+/// alone: the rest came from main.
+#[tokio::test]
+async fn preview_after_sync_lists_only_the_branch_own_changes() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    let insert = |ledger: String, id: String| {
+        let fluree = &fluree;
+        async move {
+            let state = fluree.ledger(&ledger).await.unwrap();
+            fluree
+                .insert(
+                    state,
+                    &json!({
+                        "@context": {"ex": "http://example.org/ns/"},
+                        "@graph": [{"@id": format!("ex:{id}"), "ex:name": id}]
+                    }),
+                )
+                .await
+                .unwrap();
+        }
+    };
+
+    insert("mydb:main".into(), "a".into()).await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert("mydb:dev".into(), "d1".into()).await;
+    for n in 2..=4 {
+        insert("mydb:main".into(), format!("m{n}")).await;
+    }
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    let preview = fluree
+        .merge_preview_with(
+            "mydb",
+            "dev",
+            None,
+            MergePreviewOpts {
+                include_changes: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let changes = preview.changes.expect("changes were requested");
+    let subjects: Vec<&str> = changes.entries.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(subjects, ["http://example.org/ns/d1"]);
 }

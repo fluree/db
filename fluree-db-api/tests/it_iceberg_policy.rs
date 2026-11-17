@@ -1,0 +1,2058 @@
+//! View-policy enforcement on an Iceberg (R2RML) graph source.
+//!
+//! Drives the committed local fixture `tests/fixtures/iceberg/silver/people`
+//! (5 rows: alice..erin, `id`/`name`/`score`) through the same query builder
+//! the server uses, with inline policies in `opts`, and checks every static
+//! policy shape against the SAME policy on a native ledger holding identical
+//! data — the native scan is the oracle for what a virtual source must return.
+//!
+//! `f:query` is the deliberate exception: a virtual source has no graph to run
+//! a policy query against, so it fails closed where native would evaluate it.
+//!
+//! With the `sql` feature every parity shape also runs against a SQL source
+//! over a fake endpoint holding the same five rows, so the SQL pushdown lane
+//! (and the per-scan lane it declines to) is held to the same oracle.
+
+#![cfg(all(feature = "iceberg", feature = "native"))]
+
+#[cfg(feature = "sql")]
+#[path = "support/fake_sql.rs"]
+mod fake_sql;
+
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
+use fluree_db_api::{FlureeBuilder, R2rmlCreateConfig};
+use serde_json::{json, Value};
+
+const PEOPLE_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#PeopleMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+        rr:predicateObjectMap [ rr:predicate ex:score ; rr:objectMap [ rr:column "score" ] ] .
+"#;
+
+/// `rdf:type` derived from a column (one class per person), no `rr:class`.
+const KINDS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#KindMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate rdf:type ;
+            rr:objectMap [ rr:template "http://example.org/kind/{name}" ; rr:termType rr:IRI ]
+        ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+"#;
+
+const GS: &str = "local-people:main";
+const KINDS_GS: &str = "local-kinds:main";
+#[cfg(feature = "sql")]
+const SQL_GS: &str = "sql-people:main";
+#[cfg(feature = "sql")]
+const SQL_KINDS: &str = "sql-kinds:main";
+
+/// The same source twice: the Iceberg fixture, and (with `sql`) the fake
+/// SQL endpoint over identical rows.
+fn virtual_sources(iceberg: &'static str) -> Vec<&'static str> {
+    #[cfg(feature = "sql")]
+    {
+        let sql = if iceberg == GS { SQL_GS } else { SQL_KINDS };
+        vec![iceberg, sql]
+    }
+    #[cfg(not(feature = "sql"))]
+    {
+        vec![iceberg]
+    }
+}
+const NATIVE: &str = "native-people:main";
+
+fn table_location() -> String {
+    format!(
+        "file://{}/tests/fixtures/iceberg/silver/people",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+async fn setup() -> fluree_db_api::Fluree {
+    let loc = table_location();
+    std::env::set_var(
+        "FLUREE_ICEBERG_LOCAL_ROOTS",
+        loc.strip_prefix("file://").unwrap_or(&loc),
+    );
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, mapping) in [("local-people", PEOPLE_R2RML), ("local-kinds", KINDS_R2RML)] {
+        let cfg = R2rmlCreateConfig::new_direct(name, &loc, mapping)
+            .with_mapping_media_type("text/turtle");
+        fluree
+            .create_r2rml_graph_source(cfg)
+            .await
+            .expect("create graph source");
+    }
+
+    // The native twin of the fixture (same IRIs, classes, values) is the oracle.
+    let ledger = fluree.create_ledger(NATIVE).await.expect("ledger");
+    let people = [
+        (1, "alice", 90),
+        (2, "bob", 85),
+        (3, "carol", 70),
+        (4, "dave", 60),
+        (5, "erin", 95),
+    ];
+    #[cfg(feature = "sql")]
+    {
+        let rows = people
+            .iter()
+            .map(|(id, name, score)| vec![json!(id), json!(name), json!(score)])
+            .collect();
+        let server = fake_sql::FakeSql::new()
+            .table(fake_sql::Table::new(
+                "silver.people",
+                &[("id", "bigint"), ("name", "varchar"), ("score", "bigint")],
+                rows,
+            ))
+            .mount()
+            .await;
+        for (name, mapping) in [("sql-people", PEOPLE_R2RML), ("sql-kinds", KINDS_R2RML)] {
+            fluree
+                .create_sql_graph_source(fluree_db_api::SqlCreateConfig::new(
+                    name,
+                    server.uri(),
+                    mapping.to_string(),
+                ))
+                .await
+                .expect("create sql graph source");
+        }
+        // The server lives on this test's runtime; dropping it would stop it.
+        std::mem::forget(server);
+    }
+    let graph: Vec<Value> = people
+        .iter()
+        .map(|(id, name, score)| {
+            json!({
+                "@id": format!("http://example.org/person/{id}"),
+                "@type": "http://example.org/Person",
+                "http://example.org/name": name,
+                "http://example.org/score": score,
+            })
+        })
+        .collect();
+    fluree
+        .insert(ledger, &json!({ "@graph": graph }))
+        .await
+        .expect("seed native twin");
+    fluree
+}
+
+fn context() -> Value {
+    json!({
+        "ex": "http://example.org/",
+        "f": "https://ns.flur.ee/db#",
+        "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    })
+}
+
+fn deny(id: &str, targeting: Value) -> Value {
+    let mut p =
+        json!({ "@id": id, "@type": "f:AccessPolicy", "f:action": "f:view", "f:allow": false });
+    for (k, v) in targeting.as_object().unwrap() {
+        p[k] = v.clone();
+    }
+    p
+}
+
+fn allow(id: &str, targeting: Value) -> Value {
+    let mut p =
+        json!({ "@id": id, "@type": "f:AccessPolicy", "f:action": "f:view", "f:allow": true });
+    for (k, v) in targeting.as_object().unwrap() {
+        p[k] = v.clone();
+    }
+    p
+}
+
+fn on_property(iri: &str) -> Value {
+    json!({ "f:onProperty": [{ "@id": iri }] })
+}
+
+fn on_class(iri: &str) -> Value {
+    json!({ "f:onClass": [{ "@id": iri }] })
+}
+
+fn on_subject(iri: &str) -> Value {
+    json!({ "f:onSubject": [{ "@id": iri }] })
+}
+
+/// Run `where`/`select` against `from` under `policies`, returning the rows
+/// sorted so two sources can be compared regardless of scan order.
+async fn run(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    policies: Vec<Value>,
+    default_allow: bool,
+    select: Value,
+    r#where: Value,
+) -> Vec<String> {
+    let q = json!({
+        "@context": context(),
+        "from": from,
+        "opts": { "policy": policies, "default-allow": default_allow },
+        "select": select,
+        "where": r#where,
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("query against {from} failed: {e}"));
+    // The native formatter compacts IRIs against the query context; the
+    // virtual source emits them in full. Expand so row sets compare equal.
+    let mut out: Vec<String> = rows
+        .as_array()
+        .expect("array result")
+        .iter()
+        .map(|r| {
+            r.to_string()
+                .replace("\"ex:", "\"http://example.org/")
+                .replace("\"rdf:", "\"http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// Assert the virtual source and the native twin agree on a policy + query.
+async fn assert_parity(
+    fluree: &fluree_db_api::Fluree,
+    label: &str,
+    policies: Vec<Value>,
+    default_allow: bool,
+    select: Value,
+    r#where: Value,
+    expected_rows: usize,
+) {
+    let native = run(
+        fluree,
+        NATIVE,
+        policies.clone(),
+        default_allow,
+        select.clone(),
+        r#where.clone(),
+    )
+    .await;
+    for source in virtual_sources(GS) {
+        let virt = run(
+            fluree,
+            source,
+            policies.clone(),
+            default_allow,
+            select.clone(),
+            r#where.clone(),
+        )
+        .await;
+        assert_eq!(virt, native, "[{label}] {source} must match native twin");
+    }
+    assert_eq!(
+        native.len(),
+        expected_rows,
+        "[{label}] oracle row count: {native:?}"
+    );
+}
+
+fn name_query() -> (Value, Value) {
+    (
+        json!(["?s", "?name"]),
+        json!({ "@id": "?s", "ex:name": "?name" }),
+    )
+}
+
+#[tokio::test]
+async fn static_policies_match_native_twin() {
+    let fluree = setup().await;
+    let (sel, wh) = name_query();
+
+    // Baseline: no policy inputs => everything (the probe that found the gap).
+    let q = json!({ "@context": context(), "from": GS, "select": sel, "where": wh });
+    let rows = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .expect("baseline");
+    assert_eq!(rows.as_array().unwrap().len(), 5);
+
+    // f:onProperty
+    assert_parity(
+        &fluree,
+        "deny name, default deny",
+        vec![deny("ex:p", on_property("http://example.org/name"))],
+        false,
+        sel.clone(),
+        wh.clone(),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "deny name, default allow",
+        vec![deny("ex:p", on_property("http://example.org/name"))],
+        true,
+        sel.clone(),
+        wh.clone(),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "allow name only, default deny",
+        vec![allow("ex:p", on_property("http://example.org/name"))],
+        false,
+        sel.clone(),
+        wh.clone(),
+        5,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "allow name only, default deny: score hidden",
+        vec![allow("ex:p", on_property("http://example.org/name"))],
+        false,
+        json!(["?s", "?score"]),
+        json!({ "@id": "?s", "ex:score": "?score" }),
+        0,
+    )
+    .await;
+
+    // f:onClass — the class is static per triples map (rr:class), so the deny
+    // covers every predicate the map declares, with no per-row work.
+    assert_parity(
+        &fluree,
+        "deny Person, default allow",
+        vec![deny("ex:c", on_class("http://example.org/Person"))],
+        true,
+        sel.clone(),
+        wh.clone(),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "allow Person, default deny",
+        vec![allow("ex:c", on_class("http://example.org/Person"))],
+        false,
+        sel.clone(),
+        wh.clone(),
+        5,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "deny other class, default allow",
+        vec![deny("ex:c", on_class("http://example.org/Other"))],
+        true,
+        sel.clone(),
+        wh.clone(),
+        5,
+    )
+    .await;
+    // onClass + onProperty intersect.
+    assert_parity(
+        &fluree,
+        "allow Person.name only, default deny",
+        vec![allow("ex:cp", json!({ "f:onClass": [{ "@id": "http://example.org/Person" }], "f:onProperty": [{ "@id": "http://example.org/name" }] }))],
+        false,
+        sel.clone(),
+        wh.clone(),
+        5,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "allow Person.name only, default deny: score hidden",
+        vec![allow("ex:cp", json!({ "f:onClass": [{ "@id": "http://example.org/Person" }], "f:onProperty": [{ "@id": "http://example.org/name" }] }))],
+        false,
+        json!(["?s", "?score"]),
+        json!({ "@id": "?s", "ex:score": "?score" }),
+        0,
+    )
+    .await;
+
+    // f:onSubject — per-row subject IRI compare.
+    assert_parity(
+        &fluree,
+        "allow person/1 only",
+        vec![allow("ex:s", on_subject("http://example.org/person/1"))],
+        false,
+        sel.clone(),
+        wh.clone(),
+        1,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "deny person/1, default allow",
+        vec![deny("ex:s", on_subject("http://example.org/person/1"))],
+        true,
+        sel.clone(),
+        wh.clone(),
+        4,
+    )
+    .await;
+
+    // Untargeted / default-only.
+    assert_parity(
+        &fluree,
+        "no policies, default deny",
+        vec![],
+        false,
+        sel.clone(),
+        wh.clone(),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "no policies, default allow",
+        vec![],
+        true,
+        sel.clone(),
+        wh.clone(),
+        5,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "untargeted deny",
+        vec![deny("ex:d", json!({}))],
+        true,
+        sel.clone(),
+        wh.clone(),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "untargeted allow",
+        vec![allow("ex:a", json!({}))],
+        false,
+        sel.clone(),
+        wh.clone(),
+        5,
+    )
+    .await;
+
+    // f:required gates.
+    assert_parity(
+        &fluree,
+        "required deny beats allow",
+        vec![allow("ex:a", on_property("http://example.org/name")), {
+            let mut p = deny("ex:r", on_property("http://example.org/name"));
+            p["f:required"] = json!(true);
+            p
+        }],
+        true,
+        sel.clone(),
+        wh.clone(),
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn pattern_shapes_match_native_twin() {
+    let fluree = setup().await;
+    let deny_score = vec![deny("ex:p", on_property("http://example.org/score"))];
+
+    // Same-subject star: a row needs every member viewable.
+    assert_parity(
+        &fluree,
+        "star with hidden member",
+        deny_score.clone(),
+        true,
+        json!(["?s", "?name", "?score"]),
+        json!({ "@id": "?s", "ex:name": "?name", "ex:score": "?score" }),
+        0,
+    )
+    .await;
+    // OPTIONAL on the hidden member keeps the row, unbound.
+    assert_parity(
+        &fluree,
+        "optional hidden member",
+        deny_score.clone(),
+        true,
+        json!(["?s", "?name", "?score"]),
+        json!([{ "@id": "?s", "ex:name": "?name" }, ["optional", { "@id": "?s", "ex:score": "?score" }]]),
+        5,
+    )
+    .await;
+    // Class-selected subject scan.
+    assert_parity(
+        &fluree,
+        "class scan under class deny",
+        vec![deny("ex:c", on_class("http://example.org/Person"))],
+        true,
+        json!(["?s"]),
+        json!({ "@id": "?s", "@type": "ex:Person" }),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "class scan under property deny",
+        deny_score.clone(),
+        true,
+        json!(["?s"]),
+        json!({ "@id": "?s", "@type": "ex:Person" }),
+        5,
+    )
+    .await;
+    // Projected type var.
+    assert_parity(
+        &fluree,
+        "type projection under class deny",
+        vec![deny("ex:c", on_class("http://example.org/Person"))],
+        true,
+        json!(["?s", "?t"]),
+        json!({ "@id": "?s", "@type": "?t" }),
+        0,
+    )
+    .await;
+    // Constant object.
+    assert_parity(
+        &fluree,
+        "constant object under deny",
+        vec![deny("ex:p", on_property("http://example.org/name"))],
+        true,
+        json!(["?s"]),
+        json!({ "@id": "?s", "ex:name": "alice" }),
+        0,
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "constant object under allow",
+        vec![allow("ex:p", on_property("http://example.org/name"))],
+        false,
+        json!(["?s"]),
+        json!({ "@id": "?s", "ex:name": "alice" }),
+        1,
+    )
+    .await;
+    // Aggregates take the row-filtering path (the fused fold declines).
+    assert_parity(
+        &fluree,
+        "count under deny",
+        vec![deny("ex:p", on_property("http://example.org/name"))],
+        true,
+        json!(["(count ?s)"]),
+        json!({ "@id": "?s", "ex:name": "?name" }),
+        1,
+    )
+    .await;
+    for source in virtual_sources(GS) {
+        let counted = run(
+            &fluree,
+            source,
+            vec![allow("ex:s", on_subject("http://example.org/person/1"))],
+            false,
+            json!(["(count ?s)"]),
+            json!({ "@id": "?s", "ex:name": "?name" }),
+        )
+        .await;
+        assert_eq!(
+            counted,
+            vec!["[1]".to_string()],
+            "{source}: count sees only the allowed subject"
+        );
+    }
+}
+
+#[tokio::test]
+async fn wildcard_scan_hides_denied_predicates() {
+    let fluree = setup().await;
+    let sel = json!(["?p", "?o"]);
+    let wh = json!({ "@id": "http://example.org/person/1", "?p": "?o" });
+    assert_parity(
+        &fluree,
+        "wildcard under score deny",
+        vec![deny("ex:p", on_property("http://example.org/score"))],
+        true,
+        sel.clone(),
+        wh.clone(),
+        2, // rdf:type + ex:name
+    )
+    .await;
+    assert_parity(
+        &fluree,
+        "wildcard under class deny",
+        vec![deny("ex:c", on_class("http://example.org/Person"))],
+        true,
+        sel,
+        wh,
+        0,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn query_policies_fail_closed() {
+    let fluree = setup().await;
+    let (sel, wh) = name_query();
+    let gate = json!({
+        "@id": "ex:q", "@type": "f:AccessPolicy", "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/name" }],
+        "f:query": { "@type": "@json", "@value": {
+            "@context": { "ex": "http://example.org/" },
+            "where": [{ "@id": "?$this", "ex:name": "alice" }]
+        }}
+    });
+    // Native evaluates the query: alice's name is visible.
+    let native = run(
+        &fluree,
+        NATIVE,
+        vec![gate.clone()],
+        true,
+        sel.clone(),
+        wh.clone(),
+    )
+    .await;
+    assert_eq!(native.len(), 1, "oracle: {native:?}");
+    // The virtual source cannot run it: the targeted flakes are denied.
+    for source in virtual_sources(GS) {
+        let virt = run(
+            &fluree,
+            source,
+            vec![gate.clone()],
+            true,
+            sel.clone(),
+            wh.clone(),
+        )
+        .await;
+        assert!(
+            virt.is_empty(),
+            "f:query must fail closed on {source}: {virt:?}"
+        );
+    }
+    // A static allow ahead of it still grants (allow-overrides, in order), as
+    // native. (Listed after the gate, the failing query would deny first on
+    // both sides for every subject the query rejects.)
+    let both = vec![allow("ex:a", on_property("http://example.org/name")), gate];
+    assert_parity(&fluree, "static allow + query", both, false, sel, wh, 5).await;
+}
+
+#[tokio::test]
+async fn column_derived_classes_are_enforced_per_row() {
+    let fluree = setup().await;
+    for source in virtual_sources(KINDS_GS) {
+        let q = |policies: Vec<Value>, default_allow: bool| {
+            json!({
+                "@context": context(),
+                "from": source,
+                "opts": { "policy": policies, "default-allow": default_allow },
+                "select": ["?s", "?name"],
+                "where": { "@id": "?s", "ex:name": "?name" },
+            })
+        };
+        let count = |v: Value| v.as_array().map_or(0, Vec::len);
+
+        let all = fluree
+            .query_from()
+            .jsonld(&q(vec![], true))
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(count(all), 5, "{source}");
+        // Deny one row's class: only that row disappears.
+        let hidden = fluree
+            .query_from()
+            .jsonld(&q(
+                vec![deny("ex:c", on_class("http://example.org/kind/alice"))],
+                true,
+            ))
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(count(hidden.clone()), 4, "{source}: {hidden}");
+        assert!(!hidden.to_string().contains("alice"));
+        // Allow one row's class under default deny: only that row survives.
+        let only = fluree
+            .query_from()
+            .jsonld(&q(
+                vec![allow("ex:c", on_class("http://example.org/kind/bob"))],
+                false,
+            ))
+            .execute_formatted()
+            .await
+            .unwrap();
+        assert_eq!(count(only.clone()), 1, "{source}: {only}");
+        assert!(only.to_string().contains("bob"));
+    }
+}
+
+#[tokio::test]
+async fn dataset_mode_enforces_per_graph() {
+    let fluree = setup().await;
+    for source in virtual_sources(GS) {
+        // FROM NAMED + GRAPH over the virtual source, joined with the native twin.
+        let q = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "from-named": [source],
+            "opts": {
+                "policy": [deny("ex:p", on_property("http://example.org/score"))],
+                "default-allow": true
+            },
+            "select": ["?s", "?score"],
+            "where": [["graph", source, { "@id": "?s", "ex:score": "?score" }]],
+        });
+        let rows = fluree
+            .query_from()
+            .jsonld(&q)
+            .execute_formatted()
+            .await
+            .expect("dataset query");
+        assert_eq!(rows.as_array().unwrap().len(), 0, "{rows}");
+        let q_allowed = {
+            let mut q = q.clone();
+            q["opts"]["policy"] = json!([allow("ex:p", on_property("http://example.org/score"))]);
+            q["opts"]["default-allow"] = json!(false);
+            q
+        };
+        let rows = fluree
+            .query_from()
+            .jsonld(&q_allowed)
+            .execute_formatted()
+            .await
+            .expect("dataset query");
+        assert_eq!(rows.as_array().unwrap().len(), 5, "{source}: {rows}");
+    }
+}
+
+/// A source registered with `--model`: its policies and class hierarchy come
+/// from the model ledger's default graph, through the same cross-ledger
+/// resolver a native ledger's `f:policySource` / `f:schemaSource` use.
+#[tokio::test]
+async fn model_ledger_supplies_policies_and_hierarchy() {
+    let fluree = setup().await;
+    const MODEL: &str = "governance:main";
+    const GOVERNED: &str = "local-governed:main";
+
+    // M: Person ⊑ Agent; the baseline (f:AccessPolicy) rule hides Agents;
+    // a reader policy class grants Person.name; one identity holds it.
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class", "rdfs:subClassOf": { "@id": "ex:Agent" } },
+                    { "@id": "ex:Agent", "@type": "rdfs:Class" },
+                    { "@id": "ex:hideAgents", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Agent" }], "f:allow": false },
+                    { "@id": "ex:readNames", "@type": "ex:ReaderPolicy", "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:onProperty": [{ "@id": "ex:name" }],
+                      "f:allow": true },
+                    { "@id": "http://example.org/users/reader", "f:policyClass": { "@id": "ex:ReaderPolicy" } }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+
+    let cfg = R2rmlCreateConfig::new_direct("local-governed", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_model(MODEL);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("governed source");
+
+    let query = |opts: Value, select: Value, r#where: Value| {
+        let mut q =
+            json!({ "@context": context(), "from": GOVERNED, "select": select, "where": r#where });
+        if !opts.is_null() {
+            q["opts"] = opts;
+        }
+        q
+    };
+    let rows = |v: Value| v.as_array().map_or(0, Vec::len);
+    let (sel, wh) = name_query();
+
+    // Omitted request options still enforce the registered model defaults.
+    let r = fluree
+        .query_from()
+        .jsonld(&query(json!(null), sel.clone(), wh.clone()))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(rows(r), 0);
+
+    // Anonymous governed request: the baseline f:AccessPolicy rules apply, and
+    // `ex:Agent` reaches `ex:Person` through M's subclass hierarchy.
+    let r = fluree
+        .query_from()
+        .jsonld(&query(
+            json!({ "default-allow": true }),
+            sel.clone(),
+            wh.clone(),
+        ))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(
+        rows(r.clone()),
+        0,
+        "subclass-expanded deny from the model: {r}"
+    );
+
+    // Identity known to M: its f:policyClass (looked up in M) selects the rules.
+    let reader = json!({ "identity": "http://example.org/users/reader", "default-allow": false });
+    let r = fluree
+        .query_from()
+        .jsonld(&query(reader.clone(), sel.clone(), wh.clone()))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(rows(r.clone()), 5, "reader sees names: {r}");
+    let r = fluree
+        .query_from()
+        .jsonld(&query(
+            reader,
+            json!(["?s", "?score"]),
+            json!({ "@id": "?s", "ex:score": "?score" }),
+        ))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(rows(r.clone()), 0, "reader does not see scores: {r}");
+
+    // Explicit policy-class selects the same rules without an identity.
+    let r = fluree
+        .query_from()
+        .jsonld(&query(
+            json!({ "policy-class": ["http://example.org/ReaderPolicy"], "default-allow": false }),
+            sel.clone(),
+            wh.clone(),
+        ))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(rows(r.clone()), 5, "{r}");
+
+    // Identity unknown to M selects nothing; default-allow governs.
+    let nobody = json!({ "identity": "http://example.org/users/nobody", "default-allow": false });
+    let r = fluree
+        .query_from()
+        .jsonld(&query(nobody, sel, wh))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(rows(r.clone()), 0, "{r}");
+}
+
+/// `--model` is validated when the source is registered, and policies the
+/// source will never be able to evaluate are reported up front.
+#[tokio::test]
+async fn registration_validates_model_and_warns_on_query_policies() {
+    let fluree = setup().await;
+    let cfg = |name: &str, model: &str| {
+        R2rmlCreateConfig::new_direct(name, table_location(), PEOPLE_R2RML)
+            .with_mapping_media_type("text/turtle")
+            .with_model(model)
+    };
+
+    let err = fluree
+        .create_r2rml_graph_source(cfg("bad-model", "nope:main"))
+        .await
+        .expect_err("unknown model ledger must be refused");
+    assert!(err.to_string().contains("not found"), "{err}");
+
+    let err = fluree
+        .create_r2rml_graph_source(cfg("gs-model", GS))
+        .await
+        .expect_err("a graph source is not a model");
+    assert!(err.to_string().contains("graph source"), "{err}");
+
+    let ledger = fluree.create_ledger("gated:main").await.expect("model");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+                "@graph": [
+                    { "@id": "ex:owners", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }],
+                      "f:query": { "@type": "@json", "@value": { "where": [{ "@id": "?$this", "ex:owner": "?$identity" }] } } },
+                    { "@id": "ex:plain", "@type": "f:AccessPolicy", "f:action": { "@id": "f:view" },
+                      "f:onProperty": [{ "@id": "ex:name" }], "f:allow": true }
+                ]
+            }),
+        )
+        .await
+        .expect("seed gated model");
+    let created = fluree
+        .create_r2rml_graph_source(cfg("gated-people", "gated:main"))
+        .await
+        .expect("registers with warnings");
+    assert_eq!(
+        created.model_warnings.len(),
+        1,
+        "{:?}",
+        created.model_warnings
+    );
+    assert!(created.model_warnings[0].contains("http://example.org/owners"));
+    assert!(created.model_warnings[0].contains("f:query"));
+}
+
+/// The tracked response names the policies the virtual source could not
+/// evaluate, so a caller can tell a fail-closed `f:query` from an empty table.
+#[tokio::test]
+async fn tracked_response_lists_unevaluable_policies() {
+    let fluree = setup().await;
+    let (sel, wh) = name_query();
+    let gate = json!({
+        "@id": "ex:q", "@type": "f:AccessPolicy", "f:action": "f:view",
+        "f:onProperty": [{ "@id": "http://example.org/name" }],
+        "f:query": { "@type": "@json", "@value": { "where": [{ "@id": "?$this", "ex:name": "alice" }] } }
+    });
+    let q = json!({
+        "@context": context(),
+        "from": GS,
+        "opts": { "policy": [gate], "default-allow": true, "meta": { "policy": true } },
+        "select": sel,
+        "where": wh,
+    });
+    let response = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_tracked()
+        .await
+        .expect("tracked query");
+    assert_eq!(response.result.as_array().map_or(0, Vec::len), 0);
+    let enforcement = response.policy_enforcement.expect("enforced");
+    assert!(enforcement.enforced);
+    // Ids are reported as the policy wrote them (here the compact form).
+    assert_eq!(enforcement.unevaluable_policies, vec!["ex:q".to_string()]);
+}
+
+/// A source's own `default-allow` keeps it readable to authenticated callers
+/// that match no policy, without attaching a model.
+#[tokio::test]
+async fn source_default_allow_keeps_model_less_source_readable() {
+    let fluree = setup().await;
+    let cfg = R2rmlCreateConfig::new_direct("local-open", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_default_allow(true);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("open source");
+
+    let (sel, wh) = name_query();
+    let q = |from: &str| {
+        json!({
+            "@context": context(),
+            "from": from,
+            "opts": { "identity": "http://example.org/users/anyone" },
+            "select": sel,
+            "where": wh,
+        })
+    };
+    let open = fluree
+        .query_from()
+        .jsonld(&q("local-open:main"))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(open.as_array().map_or(0, Vec::len), 5, "{open}");
+    let closed = fluree
+        .query_from()
+        .jsonld(&q(GS))
+        .execute_formatted()
+        .await
+        .unwrap();
+    assert_eq!(closed.as_array().map_or(0, Vec::len), 0, "{closed}");
+}
+
+/// The graph-scoped builder (`fluree.graph(id).query()`, which the server's
+/// SPARQL graph-source fallback uses) must enforce a governed source's model,
+/// not just the `from`-driven builder.
+///
+/// Nothing downstream of `GraphQueryBuilder` wraps policy, so attaching the
+/// model's `resolved_config` alone left the source readable.
+#[tokio::test]
+async fn graph_scoped_builder_enforces_governed_source() {
+    let fluree = setup().await;
+    const MODEL: &str = "governance-gsb:main";
+    const GOVERNED: &str = "local-governed-gsb:main";
+
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class" },
+                    { "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+
+    let cfg = R2rmlCreateConfig::new_direct("local-governed-gsb", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_model(MODEL);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("governed source");
+
+    let (sel, wh) = name_query();
+    let governed = json!({
+        "@context": context(),
+        "opts": { "default-allow": true },
+        "select": sel.clone(),
+        "where": wh.clone(),
+    });
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+
+    let via_graph = fluree
+        .graph(GOVERNED)
+        .query()
+        .jsonld(&governed)
+        .execute_formatted()
+        .await
+        .expect("graph-scoped query");
+    assert_eq!(
+        rows(&via_graph),
+        0,
+        "the model's deny must apply through the graph-scoped builder: {via_graph}"
+    );
+
+    // Parity with the `from`-driven builder, which already enforced it.
+    let mut from_q = governed.clone();
+    from_q["from"] = json!(GOVERNED);
+    let via_from = fluree
+        .query_from()
+        .jsonld(&from_q)
+        .execute_formatted()
+        .await
+        .expect("from-driven query");
+    assert_eq!(rows(&via_from), 0, "{via_from}");
+
+    // A request selecting no policy is governed by the model all the same, which
+    // is what `apply_source_or_global_policy` has always done for the
+    // `from`-driven builder. This assertion used to expect 5: the graph-scoped
+    // builder returned the source unwrapped when the request carried no policy
+    // input, so a bare read bypassed the model entirely.
+    let open = json!({ "@context": context(), "select": sel.clone(), "where": wh.clone() });
+    let via_graph_open = fluree
+        .graph(GOVERNED)
+        .query()
+        .jsonld(&open)
+        .execute_formatted()
+        .await
+        .expect("bare graph-scoped query");
+    assert_eq!(rows(&via_graph_open), 0, "{via_graph_open}");
+
+    let mut open_from = open.clone();
+    open_from["from"] = json!(GOVERNED);
+    let via_from_open = fluree
+        .query_from()
+        .jsonld(&open_from)
+        .execute_formatted()
+        .await
+        .expect("bare from-driven query");
+    assert_eq!(rows(&via_from_open), 0, "{via_from_open}");
+
+    // Control: the same bare request against a source with no model stays
+    // readable. Without it the two assertions above could pass on a builder that
+    // denied every bare read rather than applying the model.
+    const UNGOVERNED: &str = "local-open-gsb:main";
+    let cfg = R2rmlCreateConfig::new_direct("local-open-gsb", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("model-less source");
+    let ungoverned = json!({ "@context": context(), "select": sel, "where": wh });
+    let via_graph_ungoverned = fluree
+        .graph(UNGOVERNED)
+        .query()
+        .jsonld(&ungoverned)
+        .execute_formatted()
+        .await
+        .expect("model-less graph-scoped query");
+    assert_eq!(rows(&via_graph_ungoverned), 5, "{via_graph_ungoverned}");
+}
+
+/// `ORDER BY … LIMIT k` must not push a scan-side top-k under a view policy.
+///
+/// The fixture spans two data files — alice/bob/carol (score 77.25..91.5) and
+/// dave/erin (64..99.9) — so a DESC top-k reads the dave/erin file first and
+/// takes its k-th bound from rows the policy has NOT yet removed. With erin
+/// denied and `k = 1` the bound rides at erin's 99.9, the alice file prunes
+/// away, and the query answers dave (64) instead of alice (91.5).
+///
+/// The scan prunes by a column's bounds only where they sort as its terms do
+/// (a `double` bound does not sort as the plain literals an un-annotated
+/// column maps to) and only over a map whose rows cannot repeat a triple, so
+/// `topk-people` declares the score's datatype and the table's key: it is
+/// the source the top-k would prune. `topk-people-keyless` declares the
+/// datatype alone and pins the decline over a map with no key.
+///
+/// Selects only `?s`: the fixture's scores differ from the native twin's, but
+/// the rank order is identical, so the top-k subject set must match.
+#[tokio::test]
+async fn topk_limit_is_declined_under_view_policy() {
+    const TOPK_GS: &str = "topk-people:main";
+    const TOPK_KEYLESS: &str = "topk-people-keyless:main";
+    let fluree = setup().await;
+    let typed = PEOPLE_R2RML.replace(
+        r#"rr:objectMap [ rr:column "score" ]"#,
+        r#"rr:objectMap [ rr:column "score" ; rr:datatype <http://www.w3.org/2001/XMLSchema#double> ]"#,
+    );
+    let keyed = typed.replace(
+        r#"rr:tableName "silver.people" ]"#,
+        r#"rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#,
+    );
+    assert_eq!(typed.matches("XMLSchema#double").count(), 1);
+    assert_eq!(keyed.matches("db#key").count(), 1);
+    for (name, mapping) in [("topk-people", keyed), ("topk-people-keyless", typed)] {
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, table_location(), mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+    }
+    let policies = vec![deny(
+        "ex:hide-top",
+        on_subject("http://example.org/person/5"),
+    )];
+    let select = json!(["?s"]);
+    let r#where = json!({ "@id": "?s", "ex:score": "?score" });
+
+    let run_topk = |from: &'static str, policies: Vec<Value>, k: usize| {
+        let fluree = &fluree;
+        let (select, r#where) = (select.clone(), r#where.clone());
+        async move {
+            let q = json!({
+                "@context": context(),
+                "from": from,
+                "opts": { "policy": policies, "default-allow": true },
+                "select": select,
+                "where": r#where,
+                "orderBy": "(desc ?score)",
+                "limit": k,
+            });
+            fluree
+                .query_from()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("query against {from} failed: {e}"))
+                .to_string()
+                .replace("\"ex:", "\"http://example.org/")
+        }
+    };
+
+    // k = 1 is the shape that prunes: the denied row alone fills the heap.
+    for k in [1usize, 2, 3] {
+        let native = run_topk(NATIVE, policies.clone(), k).await;
+        for source in virtual_sources(GS).into_iter().chain([TOPK_GS]) {
+            let virt = run_topk(source, policies.clone(), k).await;
+            assert_eq!(
+                virt, native,
+                "top-{k} under an f:onSubject deny on {source} must match the native twin"
+            );
+        }
+    }
+
+    // Control: with no policy the scan-side top-k still runs over
+    // `topk-people`, pruning the alice file, and still answers with the true
+    // top scorer, so the guard above cannot pass vacuously by having disabled
+    // the pushdown outright.
+    let (store, _guard) = span_capture::init_test_tracing();
+    let before = store.find_events("scan-side top-k prune").len();
+    assert_eq!(
+        run_topk(TOPK_GS, Vec::new(), 1).await,
+        "[[\"http://example.org/person/5\"]]",
+        "unpoliced top-1 must still be the highest scorer"
+    );
+    let prunes = &store.find_events("scan-side top-k prune")[before..];
+    assert!(
+        prunes
+            .iter()
+            .any(|e| e.fields.get("files_pruned").map(String::as_str) == Some("1")),
+        "unpoliced, the top-k must prune the alice file: {:?}",
+        prunes.iter().map(|e| &e.fields).collect::<Vec<_>>()
+    );
+    // The same typed map without the key declines the top-k even unpoliced:
+    // its rows could repeat a triple, which the bound would count twice.
+    let before = store.find_events("scan-side top-k prune").len();
+    assert_eq!(
+        run_topk(TOPK_KEYLESS, Vec::new(), 1).await,
+        "[[\"http://example.org/person/5\"]]",
+        "unpoliced top-1 over the keyless source"
+    );
+    assert!(
+        store.find_events("scan-side top-k prune")[before..].is_empty(),
+        "the keyless source must decline the top-k"
+    );
+}
+
+/// A graph source's system graphs (`#txn-meta`) are genuinely empty, and the
+/// view is deliberately not tagged as the virtual source. The model's
+/// `resolved_config` must not ride along either: `wrap_policy` would take the
+/// cross-ledger path with `virtual_source = false` and reject an identity that
+/// carries no explicit `f:policyClass`, turning an empty result into an error.
+#[tokio::test]
+async fn txn_meta_on_a_governed_source_is_empty_not_an_error() {
+    let fluree = setup().await;
+    const MODEL: &str = "governance-tm:main";
+
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/", "f": "https://ns.flur.ee/db#" },
+                "@graph": [{
+                    "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                    "f:action": { "@id": "f:view" },
+                    "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false
+                }]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+
+    let cfg = R2rmlCreateConfig::new_direct("local-gov-tm", table_location(), PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle")
+        .with_model(MODEL);
+    fluree
+        .create_r2rml_graph_source(cfg)
+        .await
+        .expect("governed source");
+
+    let (sel, wh) = name_query();
+    // An identity with no explicit policy-class: the shape the cross-ledger
+    // resolver rejects outright.
+    let q = |from: Value| {
+        json!({
+            "@context": context(),
+            "from": from,
+            "opts": { "identity": "http://example.org/users/someone", "default-allow": false },
+            "select": sel.clone(),
+            "where": wh.clone(),
+        })
+    };
+
+    for from in [
+        json!("local-gov-tm:main#txn-meta"),
+        json!({"@id": "local-gov-tm:main", "graph": "txn-meta"}),
+        json!({"@id": "local-gov-tm:main", "@graph": "txn-meta"}),
+    ] {
+        let meta = fluree
+            .query_from()
+            .jsonld(&q(from.clone()))
+            .execute_formatted()
+            .await
+            .expect("txn-meta on a governed source must not error");
+        assert_eq!(meta, json!([]), "from={from}");
+    }
+
+    // The default graph still resolves the model and denies, so the assertion
+    // above is not passing because governance was dropped everywhere.
+    let default_graph = fluree
+        .query_from()
+        .jsonld(&q(json!("local-gov-tm:main")))
+        .execute_formatted()
+        .await
+        .expect("default graph query");
+    assert_eq!(default_graph.as_array().map_or(1, Vec::len), 0);
+}
+
+#[tokio::test]
+async fn virtual_source_graph_selectors_preserve_routing_and_defaults() {
+    let fluree = setup().await;
+    for allow in [false, true] {
+        let name = format!("selector-policy-{allow}");
+        let source = format!("{name}:main");
+        let cfg = R2rmlCreateConfig::new_direct(&name, table_location(), PEOPLE_R2RML)
+            .with_mapping_media_type("text/turtle")
+            .with_default_allow(allow);
+        fluree.create_r2rml_graph_source(cfg).await.unwrap();
+
+        for (from, metadata) in [
+            (json!(source), false),
+            (json!({"@id": source, "graph": "default"}), false),
+            (json!({"@id": source, "@graph": "default"}), false),
+            (json!(format!("{source}#txn-meta")), true),
+            (json!({"@id": source, "graph": "txn-meta"}), true),
+            (json!({"@id": source, "@graph": "txn-meta"}), true),
+        ] {
+            for crawl in [false, true] {
+                let (select, wh) = name_query();
+                let query = json!({
+                    "@context": context(), "from": from,
+                    "select": if crawl { json!({"?s": ["*"]}) } else { select },
+                    "where": wh
+                });
+                let result = fluree
+                    .query_from()
+                    .jsonld(&query)
+                    .execute_formatted()
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    result.as_array().unwrap().len(),
+                    if metadata || !allow { 0 } else { 5 },
+                    "allow={allow}, crawl={crawl}, from={from}: {result}"
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn authorization_crawl_preserves_policy_across_formatting_terminals() {
+    use fluree_db_api::{GovernanceOptions, PolicyAuthorization};
+    let fluree = setup().await;
+    for source in virtual_sources(GS) {
+        for deny_all in [true, false] {
+            let auth = PolicyAuthorization::from_trusted_options(if deny_all {
+                GovernanceOptions::default()
+            } else {
+                GovernanceOptions {
+                    policy: Some(json!([deny(
+                        "ex:hideScore",
+                        on_property("http://example.org/score")
+                    )])),
+                    default_allow: Some(true),
+                    ..Default::default()
+                }
+            });
+            let flat = json!({
+                "@context": context(), "from": source, "select": ["?s"],
+                "where": {"@id": "?s", "@type": "ex:Person"}
+            });
+            let flat_result = fluree
+                .query_from()
+                .jsonld(&flat)
+                .authorization(&auth)
+                .execute_formatted()
+                .await
+                .unwrap();
+            assert_eq!(
+                flat_result.as_array().unwrap().len(),
+                if deny_all { 0 } else { 5 }
+            );
+            let crawl = json!({
+                "@context": context(), "from": source, "select": {"?s": ["*"]},
+                "where": {"@id": "?s", "@type": "ex:Person"}
+            });
+            let mut formatted = fluree
+                .query_from()
+                .jsonld(&crawl)
+                .authorization(&auth)
+                .execute_formatted()
+                .await
+                .unwrap();
+            let string = fluree
+                .query_from()
+                .jsonld(&crawl)
+                .authorization(&auth)
+                .execute_formatted_string()
+                .await
+                .unwrap();
+            let mut tracked = fluree
+                .query_from()
+                .jsonld(&crawl)
+                .authorization(&auth)
+                .execute_tracked()
+                .await
+                .unwrap()
+                .result;
+            let mut parsed_string = serde_json::from_str::<Value>(&string).unwrap();
+            // Independent unordered scans may finish reading the Parquet files in
+            // different orders. Normalize results without changing the query plan.
+            for result in [&mut formatted, &mut parsed_string, &mut tracked] {
+                result
+                    .as_array_mut()
+                    .unwrap()
+                    .sort_by(|a, b| a["@id"].as_str().unwrap().cmp(b["@id"].as_str().unwrap()));
+            }
+            assert_eq!(formatted, parsed_string);
+            assert_eq!(formatted, tracked);
+            assert_eq!(
+                formatted.as_array().unwrap().len(),
+                if deny_all { 0 } else { 5 }
+            );
+            if !deny_all {
+                assert!(formatted.to_string().contains("alice"));
+                assert!(
+                    !formatted.to_string().contains("score"),
+                    "{source}: {formatted}"
+                );
+            }
+        }
+    }
+}
+
+/// Graph sources governed by a model that hides every `ex:Person`: an
+/// Iceberg source and, with `sql`, a SQL source over the same rows.
+async fn graph_governed_sources(fluree: &fluree_db_api::Fluree) -> Vec<&'static str> {
+    const MODEL: &str = "governance-graph:main";
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class" },
+                    { "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("graph-governed", table_location(), PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle")
+                .with_model(MODEL),
+        )
+        .await
+        .expect("governed source");
+    #[allow(unused_mut)]
+    let mut sources = vec!["graph-governed:main"];
+    #[cfg(feature = "sql")]
+    {
+        let rows = (1..=5)
+            .map(|id| vec![json!(id), json!(format!("p{id}")), json!(50 + id)])
+            .collect();
+        let server = fake_sql::FakeSql::new()
+            .table(fake_sql::Table::new(
+                "silver.people",
+                &[("id", "bigint"), ("name", "varchar"), ("score", "bigint")],
+                rows,
+            ))
+            .mount()
+            .await;
+        let mut cfg = fluree_db_api::SqlCreateConfig::new(
+            "graph-governed-sql",
+            server.uri(),
+            PEOPLE_R2RML.to_string(),
+        );
+        cfg.model = Some(MODEL.to_string());
+        fluree
+            .create_sql_graph_source(cfg)
+            .await
+            .expect("governed sql source");
+        // The server lives on this test's runtime; dropping it would stop it.
+        std::mem::forget(server);
+        sources.push("graph-governed-sql:main");
+    }
+    sources
+}
+
+/// Rows of a formatted result, SPARQL or JSON-LD.
+fn result_len(v: &Value) -> usize {
+    v.as_array()
+        .map(Vec::len)
+        .or_else(|| v["results"]["bindings"].as_array().map(Vec::len))
+        .unwrap_or(usize::MAX)
+}
+
+/// Every query in `shapes` against `source` answers as many rows as the source
+/// queried directly under the same request options does (an error counts as
+/// a disagreement).
+async fn graph_scope_disagreements(
+    fluree: &fluree_db_api::Fluree,
+    source: &str,
+    shapes: Vec<(String, Result<Value, String>, Option<Value>)>,
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (label, got, opts) in shapes {
+        let mut direct = json!({
+            "@context": context(),
+            "from": source,
+            "select": ["?s", "?n"],
+            "where": { "@id": "?s", "ex:name": "?n" },
+        });
+        if let Some(opts) = opts {
+            direct["opts"] = opts;
+        }
+        let direct = fluree
+            .query_from()
+            .jsonld(&direct)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{source} direct: {e}"));
+        assert_eq!(
+            result_len(&direct),
+            0,
+            "{source}: the model hides every person"
+        );
+        match got {
+            Ok(v) if result_len(&v) == result_len(&direct) => {}
+            Ok(v) => wrong.push(format!(
+                "{source} {label}: {} rows where the source answers {}: {v}",
+                result_len(&v),
+                result_len(&direct)
+            )),
+            Err(e) => wrong.push(format!("{source} {label}: error {e}")),
+        }
+    }
+    wrong
+}
+
+/// A governed graph source that is a named graph of a dataset keeps its own
+/// view policy when the query reaches it through `GRAPH`, whatever the
+/// default graph's policy: none, or a request policy that would allow its
+/// rows. Its model hides every `ex:Person`, so each shape answers as the
+/// source queried directly with the same request does: no rows.
+#[tokio::test]
+async fn a_governed_source_in_a_dataset_keeps_its_own_policy() {
+    let fluree = setup().await;
+    let mut wrong = Vec::new();
+    for source in graph_governed_sources(&fluree).await {
+        let named = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "from-named": [source],
+            "select": ["?s", "?n"],
+            "where": [["graph", source, { "@id": "?s", "ex:name": "?n" }]],
+        });
+        let request_opts = json!({
+            "policy": [allow("ex:anyName", on_property("http://example.org/name"))],
+            "default-allow": true
+        });
+        let mut with_opts = named.clone();
+        with_opts["opts"] = request_opts.clone();
+        let sparql = format!(
+            "SELECT ?s ?n FROM <{NATIVE}> FROM NAMED <{source}> \
+             WHERE {{ GRAPH <{source}> {{ ?s <http://example.org/name> ?n }} }}"
+        );
+        let run_jsonld = |q: Value| {
+            let fluree = &fluree;
+            async move {
+                fluree
+                    .query_from()
+                    .jsonld(&q)
+                    .execute_formatted()
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let shapes = vec![
+            (
+                "JSON-LD from + from-named + graph".to_string(),
+                run_jsonld(named).await,
+                None,
+            ),
+            (
+                "JSON-LD from + from-named + graph, request policy".to_string(),
+                run_jsonld(with_opts).await,
+                Some(request_opts),
+            ),
+            (
+                "SPARQL FROM + FROM NAMED + GRAPH".to_string(),
+                fluree
+                    .query_from()
+                    .sparql(&sparql)
+                    .execute_formatted()
+                    .await
+                    .map_err(|e| e.to_string()),
+                None,
+            ),
+        ];
+        wrong.extend(graph_scope_disagreements(&fluree, source, shapes).await);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A graph source is read through a graph scope only as a named graph of the
+/// query's dataset. A query over one ledger that names one in a graph scope,
+/// or gives it to the scope's graph variable, without naming it in
+/// `from-named` / `FROM NAMED` does not read it, governed or not: JSON-LD
+/// refuses with a 400 that names the source and the remedy, and SPARQL, whose
+/// `FROM` builds a dataset with no such named graph, answers no rows.
+#[tokio::test]
+async fn a_source_named_by_graph_outside_the_dataset_is_not_read() {
+    let fluree = setup().await;
+    let mut sources = graph_governed_sources(&fluree).await;
+    sources.extend(virtual_sources(GS));
+    let pattern = json!({ "@id": "?s", "ex:name": "?n" });
+    let mut wrong = Vec::new();
+    for source in sources {
+        let remedy = format!(
+            "Name it in from-named (SPARQL: FROM NAMED <{source}>) and use GRAPH \
+             <{source}> or VALUES ?g {{ <{source}> }}"
+        );
+        let jsonld = [
+            (
+                "JSON-LD from + graph",
+                json!([["graph", source, pattern.clone()]]),
+            ),
+            (
+                "JSON-LD from + values ?g + graph ?g",
+                json!([
+                    ["values", ["?g", [source]]],
+                    ["graph", "?g", pattern.clone()]
+                ]),
+            ),
+        ];
+        for (label, wh) in jsonld {
+            let q = json!({
+                "@context": context(), "from": NATIVE, "select": ["?s", "?n"], "where": wh,
+            });
+            match fluree.query_from().jsonld(&q).execute_formatted().await {
+                Err(e) if e.status_code() == 400 && e.to_string().contains(&remedy) => {}
+                Err(e) => wrong.push(format!("{source} {label}: {} {e}", e.status_code())),
+                Ok(v) => wrong.push(format!("{source} {label}: answered {v}")),
+            }
+        }
+        let sparql = [
+            (
+                "SPARQL FROM + GRAPH",
+                format!("GRAPH <{source}> {{ ?s <http://example.org/name> ?n }}"),
+            ),
+            (
+                "SPARQL FROM + VALUES ?g + GRAPH ?g",
+                format!(
+                    "VALUES ?g {{ <{source}> }} GRAPH ?g {{ ?s <http://example.org/name> ?n }}"
+                ),
+            ),
+        ];
+        for (label, body) in sparql {
+            let q = format!("SELECT ?s ?n FROM <{NATIVE}> WHERE {{ {body} }}");
+            match fluree.query_from().sparql(&q).execute_formatted().await {
+                Ok(v) if result_len(&v) == 0 => {}
+                other => wrong.push(format!("{source} {label}: {other:?}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Graph sources over `silver.people` registered with `model`: an Iceberg
+/// source named `name` and, with `sql`, a SQL source `name-sql` over the same
+/// five rows.
+async fn sources_with_model(
+    fluree: &fluree_db_api::Fluree,
+    name: &str,
+    model: &str,
+) -> Vec<String> {
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct(name, table_location(), PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle")
+                .with_model(model),
+        )
+        .await
+        .expect("governed source");
+    #[allow(unused_mut)]
+    let mut sources = vec![format!("{name}:main")];
+    #[cfg(feature = "sql")]
+    {
+        let rows = (1..=5)
+            .map(|id| vec![json!(id), json!(format!("p{id}")), json!(50 + id)])
+            .collect();
+        let server = fake_sql::FakeSql::new()
+            .table(fake_sql::Table::new(
+                "silver.people",
+                &[("id", "bigint"), ("name", "varchar"), ("score", "bigint")],
+                rows,
+            ))
+            .mount()
+            .await;
+        let mut cfg = fluree_db_api::SqlCreateConfig::new(
+            format!("{name}-sql"),
+            server.uri(),
+            PEOPLE_R2RML.to_string(),
+        );
+        cfg.model = Some(model.to_string());
+        fluree
+            .create_sql_graph_source(cfg)
+            .await
+            .expect("governed sql source");
+        std::mem::forget(server);
+        sources.push(format!("{name}-sql:main"));
+    }
+    sources
+}
+
+/// `?s ex:name ?n` against `source` queried directly with `opts`, as rows.
+async fn direct_rows(fluree: &fluree_db_api::Fluree, source: &str, opts: &Option<Value>) -> usize {
+    let mut q = json!({
+        "@context": context(),
+        "from": source,
+        "select": ["?s", "?n"],
+        "where": { "@id": "?s", "ex:name": "?n" },
+    });
+    if let Some(o) = opts {
+        q["opts"] = o.clone();
+    }
+    let r = fluree
+        .query_from()
+        .jsonld(&q)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{source} direct: {e}"));
+    result_len(&r)
+}
+
+/// `?s ex:name ?n` reaching `source` through a graph scope from the native
+/// ledger, with the source a named graph of the dataset: JSON-LD naming it in
+/// the graph pattern, JSON-LD binding a graph variable with `values`, and
+/// SPARQL with `FROM NAMED` (its options as connection options). Each answers
+/// as many rows as the source queried directly with the same options does.
+async fn graph_scope_rows_match_direct(
+    fluree: &fluree_db_api::Fluree,
+    source: &str,
+    opts: Option<Value>,
+) -> Vec<String> {
+    let want = direct_rows(fluree, source, &opts).await;
+    let pattern = json!({ "@id": "?s", "ex:name": "?n" });
+    let mut shapes: Vec<(&str, Value)> = vec![
+        (
+            "JSON-LD from + from-named + graph",
+            json!({ "from": NATIVE, "from-named": [source],
+                    "where": [["graph", source, pattern.clone()]] }),
+        ),
+        (
+            "JSON-LD from + from-named + values ?g + graph ?g",
+            json!({ "from": NATIVE, "from-named": [source], "where": [
+                ["values", ["?g", [source]]],
+                ["graph", "?g", pattern.clone()]
+            ] }),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (label, q) in &mut shapes {
+        q["@context"] = context();
+        q["select"] = json!(["?s", "?n"]);
+        if let Some(o) = &opts {
+            q["opts"] = o.clone();
+        }
+        match fluree.query_from().jsonld(q).execute_formatted().await {
+            Ok(v) if result_len(&v) == want => {}
+            other => wrong.push(format!("{source} {label}: {other:?}, direct {want}")),
+        }
+    }
+    let sparql = format!(
+        "SELECT ?s ?n FROM <{NATIVE}> FROM NAMED <{source}> \
+         WHERE {{ GRAPH <{source}> {{ ?s <http://example.org/name> ?n }} }}"
+    );
+    let mut builder = fluree.query_from().sparql(&sparql);
+    if let Some(o) = &opts {
+        builder = builder.connection_opts(
+            fluree_db_api::GovernanceOptions::from_json(&json!({ "opts": o }))
+                .expect("governance options"),
+        );
+    }
+    match builder.execute_formatted().await {
+        Ok(v) if result_len(&v) == want => {}
+        other => wrong.push(format!(
+            "{source} SPARQL FROM NAMED + GRAPH: {other:?}, direct {want}"
+        )),
+    }
+    wrong
+}
+
+/// A source named in the dataset is read through a graph scope with its own
+/// policy, by name or through a graph variable bound with `values`: a governed
+/// one as it answers directly, an ungoverned one wholly.
+#[tokio::test]
+async fn a_source_in_the_dataset_is_read_through_a_graph_scope_under_its_own_policy() {
+    let fluree = setup().await;
+    let mut sources: Vec<String> = graph_governed_sources(&fluree)
+        .await
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    sources.extend(virtual_sources(GS).into_iter().map(str::to_string));
+    let mut wrong = Vec::new();
+    for source in &sources {
+        wrong.extend(graph_scope_rows_match_direct(&fluree, source, None).await);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A graph variable bound from data to a source's name reaches it outside the
+/// query's dataset, under the native ledger's policy: refused with a 400 that
+/// names the source and how to read it, governed or not.
+#[tokio::test]
+async fn a_graph_variable_bound_from_data_is_refused_with_the_remedy() {
+    let fluree = setup().await;
+    let mut sources: Vec<String> = graph_governed_sources(&fluree)
+        .await
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    sources.push(GS.to_string());
+    let ledger = fluree.ledger(NATIVE).await.expect("native ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({ "@graph": sources.iter().enumerate().map(|(i, s)| json!({
+                "@id": format!("http://example.org/pointer/{i}"),
+                "http://example.org/graph": s,
+            })).collect::<Vec<_>>() }),
+        )
+        .await
+        .expect("seed pointers");
+    let mut wrong = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        let q = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "select": ["?s", "?n"],
+            "where": [
+                { "@id": format!("http://example.org/pointer/{i}"), "ex:graph": "?g" },
+                ["graph", "?g", { "@id": "?s", "ex:name": "?n" }]
+            ],
+        });
+        match fluree.query_from().jsonld(&q).execute_formatted().await {
+            Err(e) => {
+                let text = e.to_string();
+                let remedy = format!(
+                    "Name it in from-named (SPARQL: FROM NAMED <{source}>) and use GRAPH \
+                     <{source}> or VALUES ?g {{ <{source}> }}"
+                );
+                if !text.contains(source.as_str()) || !text.contains(&remedy) {
+                    wrong.push(format!("{source}: {text}"));
+                }
+                if e.status_code() != 400 {
+                    wrong.push(format!("{source}: status {} for {text}", e.status_code()));
+                }
+            }
+            Ok(v) => wrong.push(format!("{source}: answered {v}")),
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An ungoverned source in a graph scope beside a native default graph under a
+/// request policy keeps every row the request leaves it, as a direct query
+/// with the same options does: the request's policy governs it, nothing else.
+#[tokio::test]
+async fn an_ungoverned_source_beside_a_governed_default_graph_keeps_its_rows() {
+    let fluree = setup().await;
+    let opts = json!({
+        "policy": [deny("ex:noScore", on_property("http://example.org/score"))],
+        "default-allow": true
+    });
+    let mut wrong = Vec::new();
+    for source in virtual_sources(GS) {
+        assert_eq!(direct_rows(&fluree, source, &Some(opts.clone())).await, 5);
+        wrong.extend(graph_scope_rows_match_direct(&fluree, source, Some(opts.clone())).await);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A root caller reads a governed source through a graph scope unfiltered, as
+/// a direct query with the root policy does, where the dataset names it.
+#[tokio::test]
+async fn a_root_caller_reads_a_governed_source_unfiltered_through_a_graph_scope() {
+    use fluree_db_api::{PolicyContext, PolicyWrapper};
+    let fluree = setup().await;
+    let mut wrong = Vec::new();
+    for source in graph_governed_sources(&fluree).await {
+        let run = |q: Value| {
+            let fluree = &fluree;
+            async move {
+                fluree
+                    .query_from()
+                    .jsonld(&q)
+                    .policy(PolicyContext::new(PolicyWrapper::root(), None))
+                    .execute_formatted()
+                    .await
+                    .map(|v| result_len(&v))
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let pattern = json!({ "@id": "?s", "ex:name": "?n" });
+        let direct = run(json!({ "@context": context(), "from": source,
+                                 "select": ["?s", "?n"], "where": pattern.clone() }))
+        .await;
+        let named = run(
+            json!({ "@context": context(), "from": NATIVE, "from-named": [source],
+                                "select": ["?s", "?n"],
+                                "where": [["graph", source, pattern.clone()]] }),
+        )
+        .await;
+        let graph = run(json!({ "@context": context(), "from": NATIVE,
+                                "select": ["?s", "?n"],
+                                "where": [["graph", source, pattern.clone()]] }))
+        .await;
+        // Outside the dataset the source is not read, whoever asks.
+        let refused = matches!(&graph, Err(e) if e.contains("Name it in from-named"));
+        if direct != Ok(5) || named != direct || !refused {
+            wrong.push(format!(
+                "{source}: direct {direct:?}, from-named {named:?}, graph {graph:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A request selecting policy by class reaches a governed source through a
+/// graph scope under both the request's options and the source's model, as a
+/// direct query with the same options: the model's reader class grants names,
+/// and a request policy hiding one person narrows that further.
+#[tokio::test]
+async fn a_request_policy_and_the_model_both_apply_through_a_graph_scope() {
+    let fluree = setup().await;
+    const MODEL: &str = "governance-reader:main";
+    let ledger = fluree.create_ledger(MODEL).await.expect("model ledger");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "f": "https://ns.flur.ee/db#",
+                    "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+                },
+                "@graph": [
+                    { "@id": "ex:Person", "@type": "rdfs:Class" },
+                    { "@id": "ex:hidePeople", "@type": "f:AccessPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }], "f:allow": false },
+                    { "@id": "ex:readNames", "@type": "ex:ReaderPolicy",
+                      "f:action": { "@id": "f:view" },
+                      "f:onClass": [{ "@id": "ex:Person" }],
+                      "f:onProperty": [{ "@id": "ex:name" }], "f:allow": true }
+                ]
+            }),
+        )
+        .await
+        .expect("seed model ledger");
+    let reader = json!({
+        "policy-class": ["http://example.org/ReaderPolicy"],
+        "default-allow": false
+    });
+    let narrowed = json!({
+        "policy-class": ["http://example.org/ReaderPolicy"],
+        "policy": [deny("ex:hideAlice", on_subject("http://example.org/person/1"))],
+        "default-allow": false
+    });
+    let mut wrong = Vec::new();
+    for source in sources_with_model(&fluree, "graph-reader", MODEL).await {
+        let all = direct_rows(&fluree, &source, &Some(reader.clone())).await;
+        let fewer = direct_rows(&fluree, &source, &Some(narrowed.clone())).await;
+        if !(all > 0 && fewer < all) {
+            wrong.push(format!(
+                "{source}: the oracle does not separate the options ({all}, {fewer})"
+            ));
+        }
+        wrong.extend(graph_scope_rows_match_direct(&fluree, &source, Some(reader.clone())).await);
+        wrong.extend(graph_scope_rows_match_direct(&fluree, &source, Some(narrowed.clone())).await);
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An unbound graph variable ranges over the dataset's named graphs, graph
+/// sources among them: each source answers under its own policy, with the
+/// graph variable bound to its name. A governed source hiding every person
+/// and an ungoverned one, on SPARQL and JSON-LD.
+#[tokio::test]
+async fn an_unbound_graph_variable_ranges_over_named_sources_under_their_own_policy() {
+    let fluree = setup().await;
+    let governed = graph_governed_sources(&fluree).await;
+    let mut wrong = Vec::new();
+    for (governed, ungoverned) in governed.iter().zip(virtual_sources(GS)) {
+        let sparql = format!(
+            "SELECT ?g ?s ?n FROM <{NATIVE}> FROM NAMED <{governed}> FROM NAMED <{ungoverned}> \
+             WHERE {{ GRAPH ?g {{ ?s <http://example.org/name> ?n }} }}"
+        );
+        let jsonld = json!({
+            "@context": context(),
+            "from": NATIVE,
+            "from-named": [governed, ungoverned],
+            "select": ["?g", "?s", "?n"],
+            "where": [["graph", "?g", { "@id": "?s", "ex:name": "?n" }]],
+        });
+        let graphs = |v: &Value| -> Vec<String> {
+            let mut g: Vec<String> = match v["results"]["bindings"].as_array() {
+                Some(b) => b
+                    .iter()
+                    .map(|r| r["g"]["value"].as_str().unwrap_or("").to_string())
+                    .collect(),
+                None => v
+                    .as_array()
+                    .map(|rows| {
+                        rows.iter()
+                            .map(|r| r[0].as_str().unwrap_or("").to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            };
+            g.sort();
+            g
+        };
+        for (label, got) in [
+            (
+                "SPARQL",
+                fluree
+                    .query_from()
+                    .sparql(&sparql)
+                    .execute_formatted()
+                    .await,
+            ),
+            (
+                "JSON-LD",
+                fluree
+                    .query_from()
+                    .jsonld(&jsonld)
+                    .execute_formatted()
+                    .await,
+            ),
+        ] {
+            match got {
+                Ok(v) => {
+                    let g = graphs(&v);
+                    if g.len() != 5 || g.iter().any(|g| !g.ends_with(ungoverned)) {
+                        wrong.push(format!("{label} {governed} + {ungoverned}: {g:?} from {v}"));
+                    }
+                }
+                Err(e) => wrong.push(format!("{label} {governed} + {ungoverned}: {e}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}

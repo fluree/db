@@ -13,9 +13,9 @@
 //! must use the *staged* `NamespaceRegistry`, not D's pre-staging
 //! snapshot. See that method's docs for why.
 
-use super::types::{ShapesArtifactWire, WireObject, WireOrigin, WireTriple};
+use super::types::{ModelHead, ShapesArtifactWire, WireObject, WireOrigin, WireTriple};
 use super::CrossLedgerError;
-use crate::Fluree;
+use super::ResolveCtx;
 use fluree_db_core::{
     FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeOptions, RangeTest, Sid,
 };
@@ -27,21 +27,22 @@ const OWL: &str = "http://www.w3.org/2002/07/owl#";
 #[tracing::instrument(
     name = "cross_ledger.shapes.materialize",
     level = "debug",
-    skip(fluree),
+    skip(ctx),
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
-        resolved_t = resolved_t,
+        resolved_t = head.t,
     ),
 )]
 pub(super) async fn materialize_shapes(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
-    fluree: &Fluree,
+    head: &ModelHead,
+    ctx: &ResolveCtx<'_>,
 ) -> Result<ShapesArtifactWire, CrossLedgerError> {
-    let m_db = fluree
-        .load_graph_db_at_t(canonical_model_ledger_id, resolved_t)
+    let resolved_t = head.t;
+    let m_db = ctx
+        .open_model_db(canonical_model_ledger_id, head)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
@@ -49,13 +50,14 @@ pub(super) async fn materialize_shapes(
             detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
-    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri)?.ok_or_else(|| {
-        CrossLedgerError::GraphMissingAtT {
-            ledger_id: canonical_model_ledger_id.to_string(),
-            graph_iri: graph_iri.to_string(),
-            resolved_t,
-        }
-    })?;
+    let g_id =
+        super::resolve_selector_g_id(&m_db.snapshot, graph_iri, m_db.t)?.ok_or_else(|| {
+            CrossLedgerError::GraphMissingAtT {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+            }
+        })?;
 
     // SHACL whitelist — mirrors fluree_db_shacl::ShapeCompiler::compile_from_dbs
     let shacl_predicate_names: &[&str] = &[
@@ -192,6 +194,7 @@ pub(super) async fn materialize_shapes(
             model_ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
+            commit_id: head.commit_id.clone(),
         },
         triples,
     })
@@ -294,7 +297,7 @@ fn flake_value_to_lexical(
         FlakeValue::String(s) => s.clone(),
         FlakeValue::Boolean(b) => b.to_string(),
         FlakeValue::Long(n) => n.to_string(),
-        FlakeValue::Double(f) => f.to_string(),
+        FlakeValue::Double(f) => fluree_graph_ir::canonical_xsd_double(*f),
         FlakeValue::BigInt(b) => b.to_string(),
         FlakeValue::Decimal(d) => d.to_string(),
         FlakeValue::DateTime(v) => v.to_string(),

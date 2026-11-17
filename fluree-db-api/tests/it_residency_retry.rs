@@ -22,6 +22,11 @@
 //!    execution round often never touches, so a query that completed can
 //!    still miss while being formatted.
 //!
+//! Formatting is NOT inside the production loop: late-materialized bindings
+//! resolve forward packs when the caller formats, after the query call has
+//! returned, so the harness recovers those misses around `to_jsonld` the
+//! same way it recovers ledger load.
+//!
 //! Every test asserts a positive "miss fired" marker; recovery is never
 //! inferred from the absence of an error.
 //!
@@ -36,9 +41,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_api::{FlureeBuilder, GraphDb, NameServiceMode, QueryResult};
+use fluree_db_api::{FlureeBuilder, GraphDb, LedgerId, NameServiceMode, QueryResult};
 use fluree_db_binary_index::read::need_fetch::fetch_wants;
-use fluree_db_core::storage::residency::{MissRegister, Want};
+use fluree_db_core::storage::residency::{FetchKind, MissRegister, Want};
 use fluree_db_core::storage::{
     ContentAddressedWrite, ContentStore, ContentWriteResult, MemoryStorage, StorageMethod,
     StorageRead, StorageWrite,
@@ -117,6 +122,18 @@ fn digest_hex_in(address: &str) -> Option<String> {
 
 #[async_trait]
 impl StorageRead for ResidencyStorage {
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.inner.encryption_admin()
+    }
+
     async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
         let bytes = self.inner.read_bytes(address).await?;
         // Fetch-pins contract: bytes served async become sync-resident.
@@ -299,10 +316,34 @@ fn rows_of(result: &QueryResult, ledger: &fluree_db_api::LedgerState) -> Vec<Jso
     normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"))
 }
 
+/// Format a residency-mode result, recovering the misses late
+/// materialization records. Returns the rows and the wants recovered.
+async fn rows_with_recovery(
+    result: &QueryResult,
+    ledger: &fluree_db_api::LedgerState,
+    storage: &ResidencyStorage,
+) -> (Vec<JsonValue>, Vec<Want>) {
+    let cs = recovery_store(storage);
+    let mut recovery = Recovery {
+        rounds: 0,
+        wants: Vec::new(),
+    };
+    loop {
+        match result.to_jsonld(&ledger.snapshot) {
+            Ok(json) => return (normalize_rows(&json), recovery.wants),
+            Err(e) => {
+                let recovered = recover_once(&cs, storage, &mut recovery, &e).await;
+                assert!(recovered, "non-residency formatting error: {e:?}");
+            }
+        }
+    }
+}
+
 // ============================================================================
 // 1. Operator (scan) path through the PRODUCTION loop: one direct query
-//    call completes — leaf misses consumed in-frame by the scan operator,
-//    forward-pack misses by the query-entry loop.
+//    call completes — leaf misses consumed in-frame by the scan operator.
+//    The selected strings stay encoded until formatting, so their forward
+//    pack is first needed after the call returns.
 // ============================================================================
 
 #[tokio::test(flavor = "multi_thread")]
@@ -345,7 +386,18 @@ async fn scan_query_completes_through_production_loop() {
         storage.register.is_empty(),
         "every recorded want must have been drained by a retry frame"
     );
-    assert_eq!(rows_of(&result, &ledger_b), expected, "identical results");
+
+    // A cold resident tier must miss the forward pack at formatting time;
+    // without this marker the test cannot tell recovery from a warm pack.
+    let (rows, format_wants) = rows_with_recovery(&result, &ledger_b, &storage).await;
+    assert!(
+        format_wants
+            .iter()
+            .any(|want| want.kind == FetchKind::ForwardPack),
+        "formatting must miss a forward pack (positive marker): {format_wants:?}"
+    );
+    assert!(storage.register.is_empty(), "formatting wants drained");
+    assert_eq!(rows, expected, "identical results");
 }
 
 // ============================================================================
@@ -640,8 +692,9 @@ async fn beyond_gap_head_change_reloads_at_record_watermarks() {
     let expected_t = record.commit_t;
 
     let mgr = fluree_b.ledger_manager().expect("manager");
+    let ledger_id = LedgerId::parse(LEDGER).expect("ledger id");
     let t_before = mgr
-        .current_t(LEDGER)
+        .current_t(&ledger_id)
         .await
         .expect("ledger cached before the gap");
     assert!(
@@ -651,7 +704,7 @@ async fn beyond_gap_head_change_reloads_at_record_watermarks() {
     );
     let result = mgr
         .notify(NsNotify {
-            ledger_id: LEDGER.to_string(),
+            ledger_id: ledger_id.clone(),
             record: Some(record),
         })
         .await
@@ -662,7 +715,7 @@ async fn beyond_gap_head_change_reloads_at_record_watermarks() {
         "beyond the incremental cap the fallback must be a full re-open"
     );
     assert_eq!(
-        mgr.current_t(LEDGER).await,
+        mgr.current_t(&ledger_id).await,
         Some(expected_t),
         "reloaded state must sit at the record's commit watermark"
     );
@@ -738,9 +791,10 @@ async fn catch_up_applies_commits_and_prefetches_translation() {
     let expected_t = record.commit_t;
 
     let mgr = fluree_b.ledger_manager().expect("manager");
+    let ledger_id = LedgerId::parse(LEDGER).expect("ledger id");
     let result = mgr
         .notify(NsNotify {
-            ledger_id: LEDGER.to_string(),
+            ledger_id: ledger_id.clone(),
             record: Some(record),
         })
         .await
@@ -750,7 +804,7 @@ async fn catch_up_applies_commits_and_prefetches_translation() {
         NotifyResult::CommitsApplied { count: 2 },
         "within the cap the head change must catch up incrementally"
     );
-    assert_eq!(mgr.current_t(LEDGER).await, Some(expected_t));
+    assert_eq!(mgr.current_t(&ledger_id).await, Some(expected_t));
 
     // The caught-up state serves persisted + novelty rows through the
     // production loop, with the register drained afterwards. (On this

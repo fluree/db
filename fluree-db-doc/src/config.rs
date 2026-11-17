@@ -1,0 +1,564 @@
+//! Model endpoints: where embeddings, entity extraction and crop reading go.
+//!
+//! Three slots, all speaking the OpenAI wire shape so one client covers
+//! OpenAI, Ollama, vLLM, LM Studio, Voyage's compatible route, and the
+//! Fluree AI gateway. Each is optional and independent; `vlm` falls back to
+//! `llm` because one multimodal model is often all a machine has.
+//!
+//! Read from the CLI config file's `[doc]` table:
+//!
+//! ```toml
+//! [doc.embedding]
+//! url = "http://localhost:11434/v1"
+//! model = "nomic-embed-text"
+//!
+//! [doc.llm]
+//! url = "https://api.openai.com/v1"
+//! model = "gpt-5-mini"
+//! api_key = "$OPENAI_API_KEY"
+//! ```
+//!
+//! Environment variables override the file, slot by slot:
+//! `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
+
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ModelEndpoint {
+    /// Base URL of an OpenAI-compatible API, up to and including `/v1`.
+    pub url: String,
+    /// Model name, passed through unchanged.
+    pub model: String,
+    /// Bearer token. A value starting with `$` names an environment variable
+    /// holding the real key, so the config file need not contain it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// Requested output dimensions, for embedding models that accept a
+    /// `dimensions` parameter. Absent means the model's default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimensions: Option<usize>,
+    /// Wire shape for generation calls: `chat` (`/chat/completions`, the
+    /// default) or `responses` (`/responses`, what the Fluree AI gateway
+    /// serves). Embeddings use `/embeddings` either way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api: Option<WireApi>,
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WireApi {
+    #[default]
+    Chat,
+    Responses,
+}
+
+/// Hand-written so the bearer token cannot be printed.
+///
+/// Nothing formats a `ModelEndpoint` today, but a derived `Debug` means one
+/// future `{:?}` in a `tracing` call, an error message or a panic puts a
+/// live API key wherever that goes — and this struct is reachable from
+/// `DocConfig` and `EmbeddingClient`, both of which do derive `Debug`, so a
+/// caller need never name `ModelEndpoint` to leak one. `LlmClient` already
+/// has the hand-written version of this (`llm.rs`); the type holding the
+/// secret is the right place for it.
+impl std::fmt::Debug for ModelEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ModelEndpoint")
+            .field("url", &self.url)
+            .field("model", &self.model)
+            // Whether a key is configured is useful and safe; a `$NAME`
+            // indirection is not a secret either, but the resolved value
+            // it stands for is, and the two are the same field.
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("dimensions", &self.dimensions)
+            .field("api", &self.api)
+            .finish()
+    }
+}
+
+impl ModelEndpoint {
+    /// `{url}{path}` with exactly one slash between them.
+    pub fn route(&self, path: &str) -> String {
+        format!(
+            "{}/{}",
+            self.url.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+
+    /// The bearer token to send, with `$VAR` indirection resolved.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        let key = self.api_key.as_deref()?.trim();
+        if key.is_empty() {
+            return None;
+        }
+        if let Some(var) = key.strip_prefix('$') {
+            return std::env::var(var).ok().filter(|v| !v.is_empty());
+        }
+        Some(key.to_string())
+    }
+
+    pub fn wire_api(&self) -> WireApi {
+        self.api.unwrap_or_default()
+    }
+
+    fn apply_env(&mut self, slot: &str) {
+        let var = |field: &str| std::env::var(format!("FLUREE_DOC_{slot}_{field}")).ok();
+        if let Some(v) = var("URL") {
+            self.url = v;
+        }
+        if let Some(v) = var("MODEL") {
+            self.model = v;
+        }
+        if let Some(v) = var("API_KEY") {
+            self.api_key = Some(v);
+        }
+        if let Some(v) = var("DIMENSIONS").and_then(|d| d.parse().ok()) {
+            self.dimensions = Some(v);
+        }
+        match var("API")
+            .as_deref()
+            .map(str::to_ascii_lowercase)
+            .as_deref()
+        {
+            Some("chat") => self.api = Some(WireApi::Chat),
+            Some("responses") => self.api = Some(WireApi::Responses),
+            _ => {}
+        }
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.url.trim().is_empty() && !self.model.trim().is_empty()
+    }
+}
+
+/// An extraction model reached over HTTP that reads a whole document in one
+/// request: the body is an RDF dataset (the document's text and structure,
+/// the ontology, the catalog) and the answer is an RDF graph anchored to the
+/// text's offsets. Not OpenAI-shaped, so it has a slot of its own.
+///
+/// ```toml
+/// [doc.reader]
+/// url = "https://reader.example/extract"
+/// api_key = "$READER_API_KEY"
+/// auth_header = "X-Api-Key"        # default: Authorization: Bearer <key>
+/// models = ["reader-small", "reader-large"]
+/// ```
+///
+/// With `account = true` the credential is this machine's `fluree login`
+/// instead of `api_key` (a reader with both is refused), and `url`
+/// defaults to the account's own reader (`<api base>/grounding`).
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ReaderEndpoint {
+    /// The URL a request is POSTed to. May be left out with `account`,
+    /// whose API supplies it.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub url: String,
+    /// The credential. A value starting with `$` names an environment
+    /// variable holding it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
+    /// The header the credential goes in. `Authorization` (the default)
+    /// sends `Bearer <key>`; any other header sends the key as is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_header: Option<String>,
+    /// The model ids this endpoint serves, as `--model` names them. Sent
+    /// with each request as `X-Fluree-Model`. A list, or one string of
+    /// comma-separated ids (what `fluree config set` writes, and what
+    /// `FLUREE_DOC_READER_MODELS` takes).
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "string_or_list"
+    )]
+    pub models: Vec<String>,
+    /// What the endpoint may keep between requests that share a prefix
+    /// (`ontology`, `catalog`), sent as `X-Fluree-Cache`; `--cache` wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache: Option<String>,
+    /// Use the signed-in account (`fluree login`) as the credential, and
+    /// its API as the default `url`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub account: bool,
+}
+
+/// A yes-or-no environment variable: `1`, `true` or `yes`, or `0`, `false`
+/// or `no`, in any case. Anything else is an error rather than a quiet
+/// `false`, since a value overrides the file: a typo would turn off what
+/// the file turned on.
+fn env_flag(name: &str, value: &str) -> crate::Result<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" => Ok(true),
+        "0" | "false" | "no" => Ok(false),
+        _ => Err(crate::DocError::Config(format!(
+            "{name}={value:?}: expected 1, true or yes, or 0, false or no"
+        ))),
+    }
+}
+
+/// `["a", "b"]` or `"a, b"`, as a list of trimmed, non-empty ids.
+fn string_or_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Models {
+        One(String),
+        Many(Vec<String>),
+    }
+    let split = |s: &str| {
+        s.split(',')
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    };
+    Ok(match Models::deserialize(d)? {
+        Models::One(s) => split(&s),
+        Models::Many(v) => v.iter().flat_map(|s| split(s)).collect(),
+    })
+}
+
+/// Hand-written for the same reason as [`ModelEndpoint`]'s.
+impl std::fmt::Debug for ReaderEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReaderEndpoint")
+            .field("url", &self.url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("auth_header", &self.auth_header)
+            .field("models", &self.models)
+            .field("cache", &self.cache)
+            .field("account", &self.account)
+            .finish()
+    }
+}
+
+impl ReaderEndpoint {
+    /// The credential to send, with `$VAR` indirection resolved.
+    pub fn resolved_api_key(&self) -> Option<String> {
+        let key = self.api_key.as_deref()?.trim();
+        if key.is_empty() {
+            return None;
+        }
+        if let Some(var) = key.strip_prefix('$') {
+            return std::env::var(var).ok().filter(|v| !v.is_empty());
+        }
+        Some(key.to_string())
+    }
+
+    /// Whether `--model <id>` names a model this endpoint serves.
+    pub fn serves(&self, model: &str) -> bool {
+        self.models.iter().any(|m| m.eq_ignore_ascii_case(model))
+    }
+
+    fn apply_env(&mut self) -> crate::Result<()> {
+        let var = |field: &str| std::env::var(format!("FLUREE_DOC_READER_{field}")).ok();
+        if let Some(v) = var("URL") {
+            self.url = v;
+        }
+        if let Some(v) = var("API_KEY") {
+            self.api_key = Some(v);
+        }
+        if let Some(v) = var("AUTH_HEADER") {
+            self.auth_header = Some(v);
+        }
+        if let Some(v) = var("MODELS") {
+            self.models = v
+                .split(',')
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Some(v) = var("CACHE") {
+            self.cache = Some(v);
+        }
+        if let Some(v) = var("ACCOUNT") {
+            self.account = env_flag("FLUREE_DOC_READER_ACCOUNT", &v)?;
+        }
+        Ok(())
+    }
+
+    fn is_usable(&self) -> bool {
+        !self.url.trim().is_empty() || self.account
+    }
+}
+
+/// How extraction is asked and what is kept, per project, so every run
+/// over a corpus makes the same ask. Paths are relative to the project.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ExtractionConfig {
+    /// A file of project priorities, rendered into the system prompt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+    /// A file replacing the whole system prompt template; keeps the
+    /// `{model}` and `{guidance}` slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    /// A file replacing the whole user prompt template; keeps the
+    /// `{existing}` and `{document}` slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_prompt: Option<String>,
+    /// Chunks asked about at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub concurrency: Option<usize>,
+    /// Drop new entities whose class is not in the ontology instead of
+    /// keeping them flagged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub drop_off_model: Option<bool>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct DocConfig {
+    /// A configured CLI remote (a Fluree AI stack) whose URL and stored
+    /// login supply every slot not set explicitly below. The CLI resolves
+    /// it; this crate only sees the filled slots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub embedding: Option<ModelEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub llm: Option<ModelEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vlm: Option<ModelEndpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extraction: Option<ExtractionConfig>,
+    /// An HTTP reader serving the extraction models it lists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reader: Option<ReaderEndpoint>,
+    /// The extraction model `--model` defaults to: one the reader serves,
+    /// or a language model name for `[doc.llm]`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl DocConfig {
+    /// Layer `FLUREE_DOC_*` environment variables over the file values. A
+    /// slot absent from the file is created when the environment names its
+    /// URL and model. A value that can't be read is an error.
+    pub fn with_env(mut self) -> crate::Result<Self> {
+        for (slot, field) in [
+            ("EMBEDDING", &mut self.embedding),
+            ("LLM", &mut self.llm),
+            ("VLM", &mut self.vlm),
+        ] {
+            let mut ep = field.take().unwrap_or_default();
+            ep.apply_env(slot);
+            *field = ep.is_usable().then_some(ep);
+        }
+        let mut reader = self.reader.take().unwrap_or_default();
+        reader.apply_env()?;
+        self.reader = reader.is_usable().then_some(reader);
+        if let Ok(model) = std::env::var("FLUREE_DOC_MODEL") {
+            self.model = Some(model).filter(|m| !m.trim().is_empty());
+        }
+        Ok(self)
+    }
+
+    /// The reader for document crops: `vlm`, or `llm` when no separate
+    /// vision endpoint is configured.
+    pub fn crop_reader(&self) -> Option<&ModelEndpoint> {
+        self.vlm.as_ref().or(self.llm.as_ref())
+    }
+
+    /// Fill every slot from a Fluree AI gateway at `base_url` (up to and
+    /// including `/v1`) authenticated by `token`. Explicit per-slot values
+    /// win; only what is missing is supplied.
+    pub fn fill_from_gateway(mut self, base_url: &str, token: &str) -> Self {
+        let fill = |slot: &mut Option<ModelEndpoint>, model: &str, api: WireApi| {
+            let ep = slot.get_or_insert_with(ModelEndpoint::default);
+            if ep.url.trim().is_empty() {
+                ep.url = base_url.to_string();
+            }
+            if ep.model.trim().is_empty() {
+                ep.model = model.to_string();
+            }
+            if ep.resolved_api_key().is_none() {
+                ep.api_key = Some(token.to_string());
+            }
+            if ep.api.is_none() {
+                ep.api = Some(api);
+            }
+        };
+        fill(&mut self.embedding, GATEWAY_EMBEDDING_MODEL, WireApi::Chat);
+        fill(&mut self.vlm, "auto", WireApi::Responses);
+        fill(&mut self.llm, "auto", WireApi::Responses);
+        self
+    }
+}
+
+/// What the Fluree AI gateway forwards embeddings to when no model is named
+/// locally: its embeddings route passes through to the account's OpenAI-type
+/// provider.
+pub const GATEWAY_EMBEDDING_MODEL: &str = "text-embedding-3-small";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embed::EmbeddingClient;
+
+    #[test]
+    fn route_joins_with_single_slash() {
+        let ep = ModelEndpoint {
+            url: "http://localhost:11434/v1/".into(),
+            model: "m".into(),
+            api_key: None,
+            dimensions: None,
+            api: None,
+        };
+        assert_eq!(
+            ep.route("/embeddings"),
+            "http://localhost:11434/v1/embeddings"
+        );
+        assert_eq!(
+            ep.route("embeddings"),
+            "http://localhost:11434/v1/embeddings"
+        );
+    }
+
+    #[test]
+    fn dollar_key_reads_environment() {
+        std::env::set_var("FLUREE_DOC_TEST_KEY", "sk-test");
+        let ep = ModelEndpoint {
+            url: "u".into(),
+            model: "m".into(),
+            api_key: Some("$FLUREE_DOC_TEST_KEY".into()),
+            dimensions: None,
+            api: None,
+        };
+        assert_eq!(ep.resolved_api_key().as_deref(), Some("sk-test"));
+    }
+
+    /// A literal key, a `$NAME` indirection, and the same endpoint reached
+    /// through the two containers that do derive `Debug`. None of them may
+    /// print the secret.
+    #[test]
+    fn debug_never_prints_a_secret() {
+        std::env::set_var("FLUREE_DOC_SECRET_TEST_KEY", "sk-from-the-environment");
+        for key in ["sk-literal-secret", "$FLUREE_DOC_SECRET_TEST_KEY"] {
+            let ep = ModelEndpoint {
+                url: "https://api.openai.com/v1".into(),
+                model: "gpt-5-mini".into(),
+                api_key: Some(key.into()),
+                dimensions: None,
+                api: None,
+            };
+            assert_eq!(
+                ep.resolved_api_key().as_deref(),
+                Some(if key.starts_with('$') {
+                    "sk-from-the-environment"
+                } else {
+                    key
+                }),
+                "the key must still be usable"
+            );
+            for rendered in [
+                format!("{ep:?}"),
+                format!("{:?}", EmbeddingClient::new(ep.clone()).ok()),
+                format!(
+                    "{:?}",
+                    DocConfig {
+                        llm: Some(ep.clone()),
+                        ..Default::default()
+                    }
+                ),
+            ] {
+                assert!(
+                    !rendered.contains("sk-literal-secret")
+                        && !rendered.contains("sk-from-the-environment")
+                        && !rendered.contains("FLUREE_DOC_SECRET_TEST_KEY"),
+                    "a secret reached a Debug rendering: {rendered}"
+                );
+                assert!(
+                    rendered.contains("<redacted>"),
+                    "the key should still be visibly present-but-hidden: {rendered}"
+                );
+            }
+        }
+    }
+
+    /// A yes-or-no variable takes three spellings of each, in any case, and
+    /// refuses anything else (`on`, a typo) rather than read it as no.
+    #[test]
+    fn a_flag_variable_is_yes_no_or_an_error() {
+        for v in ["1", "true", "YES", " True "] {
+            assert!(env_flag("X", v).unwrap(), "{v}");
+        }
+        for v in ["0", "false", "No", "FALSE"] {
+            assert!(!env_flag("X", v).unwrap(), "{v}");
+        }
+        for v in ["on", "off", "ture", "", "2"] {
+            let err = env_flag("FLUREE_DOC_READER_ACCOUNT", v).unwrap_err();
+            assert!(
+                err.to_string().contains("FLUREE_DOC_READER_ACCOUNT="),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_account_reader_needs_no_url() {
+        // `[doc.reader] account = true` as the docs show it, with no `url`.
+        let cfg: DocConfig = serde_json::from_value(serde_json::json!({
+            "reader": { "account": true, "models": ["reader-small"] }
+        }))
+        .unwrap();
+        let reader = cfg.reader.unwrap();
+        assert!(reader.account && reader.url.is_empty());
+        assert!(!serde_json::to_value(&reader).unwrap()["url"].is_string());
+    }
+
+    #[test]
+    fn reader_models_take_a_list_or_a_comma_separated_string() {
+        let list: ReaderEndpoint =
+            serde_json::from_str(r#"{"url":"u","models":["a"," b "]}"#).unwrap();
+        assert_eq!(list.models, vec!["a", "b"]);
+        let one: ReaderEndpoint = serde_json::from_str(r#"{"url":"u","models":"a, b,"}"#).unwrap();
+        assert_eq!(one.models, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn crop_reader_falls_back_to_llm() {
+        let llm = ModelEndpoint {
+            url: "u".into(),
+            model: "m".into(),
+            api_key: None,
+            dimensions: None,
+            api: None,
+        };
+        let cfg = DocConfig {
+            remote: None,
+            embedding: None,
+            llm: Some(llm.clone()),
+            vlm: None,
+            extraction: None,
+            ..Default::default()
+        };
+        assert_eq!(cfg.crop_reader(), Some(&llm));
+    }
+
+    #[test]
+    fn gateway_fills_only_missing_values() {
+        let cfg = DocConfig {
+            remote: Some("acct".into()),
+            embedding: Some(ModelEndpoint {
+                url: String::new(),
+                model: "nomic-embed-text".into(),
+                api_key: None,
+                dimensions: None,
+                api: None,
+            }),
+            llm: None,
+            vlm: None,
+            extraction: None,
+            ..Default::default()
+        }
+        .fill_from_gateway("https://stack/v1", "tok");
+        let emb = cfg.embedding.unwrap();
+        assert_eq!(emb.url, "https://stack/v1");
+        assert_eq!(emb.model, "nomic-embed-text");
+        assert_eq!(emb.api_key.as_deref(), Some("tok"));
+        let vlm = cfg.vlm.unwrap();
+        assert_eq!(vlm.model, "auto");
+        assert_eq!(vlm.api, Some(WireApi::Responses));
+        assert_eq!(vlm.route("responses"), "https://stack/v1/responses");
+    }
+}

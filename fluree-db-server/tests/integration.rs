@@ -2,9 +2,9 @@ use axum::body::Body;
 use fluree_db_api::{
     ExportCommitsRequest, ExportCommitsResponse, NamespaceRegistry, PushCommitsRequest,
 };
-use fluree_db_core::{ContentId, Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_db_core::{ContentId, ContentKind, Flake, FlakeMeta, FlakeValue, Sid};
 use fluree_db_novelty::Commit;
-use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode};
+use fluree_db_server::config::{AdminAuthMode, DataAuthMode, EventsAuthMode, ServerRole};
 use fluree_db_server::{routes::build_router, AppState, ServerConfig, TelemetryConfig};
 use fluree_vocab::namespaces::{FLUREE_DB, XSD};
 use fluree_vocab::xsd_names;
@@ -28,6 +28,165 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
     (tmp, state)
 }
 
+fn locking_config(root: &std::path::Path) -> ServerConfig {
+    ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(root.to_path_buf()),
+        storage_lock: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_transaction_server_on_a_locked_root_is_refused() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = locking_config(tmp.path());
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let _first = AppState::new(cfg.clone(), telemetry.clone())
+        .await
+        .expect("first server");
+
+    let refused = AppState::new(cfg, telemetry)
+        .await
+        .err()
+        .expect("second server on the root");
+
+    assert!(
+        matches!(refused, fluree_db_api::ApiError::StorageInUse { .. }),
+        "{refused}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_shared_storage_peer_reads_a_locked_root() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = locking_config(tmp.path());
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let _transactor = AppState::new(cfg.clone(), telemetry.clone())
+        .await
+        .expect("transaction server");
+
+    let peer = ServerConfig {
+        server_role: ServerRole::Peer,
+        tx_server_url: Some("http://127.0.0.1:9".to_string()),
+        peer_subscribe_all: true,
+        ..cfg
+    };
+    AppState::new(peer, telemetry)
+        .await
+        .expect("a peer opens its transaction server's root");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn http_queries_use_fast_paths_after_background_index_publication() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: true,
+        storage_path: Some(tmp.path().to_path_buf()),
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("server state"));
+    let app = build_router(state.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(r#"{"ledger":"index-adoption"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let handle = state
+        .fluree
+        .ledger_cached("index-adoption:main")
+        .await
+        .unwrap();
+
+    let mut turtle = String::from("@prefix ex: <http://example.org/> .\n");
+    for i in 0..2000 {
+        use std::fmt::Write as _;
+        writeln!(turtle, "ex:p{i} a ex:Person ; ex:name \"Person {i}\" .").unwrap();
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/insert/index-adoption:main")
+                .header("content-type", "text/turtle")
+                .body(Body::from(turtle))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "insert: {body}");
+
+    // Keep the original handle: reloading or explicit reindexing would mask
+    // the distinction between a drained overlay and a never-written overlay.
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            if handle.snapshot().await.snapshot.t == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("background index installed on the original handle");
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/query/index-adoption:main")
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .header("fluree-track-fuel", "true")
+                .body(Body::from(
+                    "SELECT ?p WHERE { ?p a <http://example.org/Person> } LIMIT 10",
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "query: {body}");
+    assert_eq!(
+        body["result"]["results"]["bindings"]
+            .as_array()
+            .unwrap()
+            .len(),
+        10
+    );
+    let fuel = body["fuel"].as_f64().expect("tracked fuel");
+    // One index batch costs ~3 fuel. Eagerly decoding all 2,000 subjects
+    // despite LIMIT 10 used ~23 fuel on this same cached state.
+    assert!(fuel < 4.0, "cached indexed query used {fuel} fuel");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/v1/fluree/info/index-adoption:main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, body) = json_body(response).await;
+    assert_eq!(status, StatusCode::OK, "info: {body}");
+    assert_eq!(body["ledger"]["commit-t"], 1);
+    assert_eq!(body["ledger"]["index-t"], 1);
+}
+
 // Regression for #1369: querying a registered Iceberg/R2RML graph source by
 // alias (SPARQL `POST /query/<alias>`, the `execute_sparql_ledger` path) must
 // route to the graph-source engine, not load it as a ledger (which deserialized
@@ -35,8 +194,8 @@ async fn test_state() -> (TempDir, Arc<AppState>) {
 // `f:ledger` field with a 500) nor 404 as a missing ledger. The bogus catalog
 // (`s3://nonexistent`) means execution can't return rows, but the response must
 // prove the alias resolved AND reached the source engine: the error is the
-// engine's own "Iceberg graph source config" failure, never `f:ledger` and
-// never a not-found. (A readable in-tree source — which needs Iceberg test
+// engine's own failure on the mapping's table (`actor` names no namespace),
+// never `f:ledger` and never a not-found. (A readable in-tree source — which needs Iceberg test
 // infra — would additionally assert returned rows.)
 #[cfg(feature = "iceberg")]
 #[tokio::test]
@@ -60,9 +219,14 @@ async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
         "rr:subjectMap [ rr:template \"https://ex/{id}\" ] ; ",
         "rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column \"as_name\" ] ] ."
     );
-    let create =
-        fluree_db_api::R2rmlCreateConfig::new_direct("actor", "s3://nonexistent/actor", mapping)
-            .with_mapping_media_type("text/turtle");
+    // Three segments: registration validates the stored config as a query
+    // does, and a Direct location must name its `namespace/table`.
+    let create = fluree_db_api::R2rmlCreateConfig::new_direct(
+        "actor",
+        "s3://nonexistent/films/actor",
+        mapping,
+    )
+    .with_mapping_media_type("text/turtle");
     state
         .fluree
         .create_r2rml_graph_source(create)
@@ -100,7 +264,7 @@ async fn graph_source_alias_query_does_not_deserialize_as_ledger() {
         "graph-source alias should resolve and route to the engine, not 404; body={body}"
     );
     assert!(
-        err.contains("graph source") || err.contains("iceberg"),
+        err.contains("graph source") || err.contains("iceberg") || err.contains("table identifier"),
         "alias query should reach the graph-source engine (expected an Iceberg/graph-source config error); status={status} body={body}"
     );
 }
@@ -126,6 +290,13 @@ fn json_contains_string(v: &JsonValue, needle: &str) -> bool {
         JsonValue::Array(a) => a.iter().any(|x| json_contains_string(x, needle)),
         JsonValue::Object(o) => o.values().any(|x| json_contains_string(x, needle)),
     }
+}
+
+/// A merge commit at `t`. `parents` is first parent first.
+fn make_merge_commit_bytes(t: i64, parents: Vec<ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
+    let c = Commit::new(t, flakes).with_merge_parents(parents);
+    let res = fluree_db_core::commit::codec::write_commit(&c, true, None).expect("write_commit");
+    res.bytes
 }
 
 fn make_commit_bytes(t: i64, previous: Option<&ContentId>, flakes: Vec<Flake>) -> Vec<u8> {
@@ -475,6 +646,206 @@ async fn create_branch_at_historical_t() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// `at` takes a point in time, as a query's `@time:` does. Event times are
+/// pinned through `opts.eventTime` so the instants between commits are exact.
+#[tokio::test]
+async fn create_branch_at_time() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "dated:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (i, event_time) in [
+        "2020-01-01T00:00:00Z",
+        "2021-01-01T00:00:00Z",
+        "2022-01-01T00:00:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let body = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [{"@id": format!("ex:item{i}"), "ex:val": i}],
+            "opts": {"eventTime": event_time},
+        });
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert")
+                    .header("content-type", "application/json")
+                    .header("fluree-ledger", "dated:main")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "insert {i} failed: {json}");
+    }
+
+    let branch = |name: &str, at: &str| {
+        Request::builder()
+            .method("POST")
+            .uri("/v1/fluree/branch")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({"ledger": "dated", "branch": name, "at": at}).to_string(),
+            ))
+            .unwrap()
+    };
+
+    for (name, at, expected_t) in [
+        ("q2020", "time:2020-06-01T00:00:00Z", 1),
+        ("q2021", "iso:2021-06-01T00:00:00Z", 2),
+    ] {
+        let resp = app.clone().oneshot(branch(name, at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::CREATED, "{at}: {json}");
+        assert_eq!(
+            json.get("t").and_then(serde_json::Value::as_i64),
+            Some(expected_t),
+            "{at}: {json}"
+        );
+    }
+
+    for (at, expect) in [
+        ("time:2019-01-01T00:00:00Z", "no data as of"),
+        ("time:2021-13-45T00:00:00Z", "Invalid ISO-8601 timestamp"),
+        ("t:0", "must be >= 1"),
+        ("0", "must be >= 1"),
+        ("-3", "must be >= 1"),
+        ("snapshot:7", "@snapshot:"),
+        ("time:", "Missing value after 'time:'"),
+    ] {
+        let resp = app.clone().oneshot(branch("nowhere", at)).await.unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{at}: {json}");
+        // A branch request, so not reported as an invalid query.
+        assert_eq!(json["@type"], "err:api/BadRequest", "{at}: {json}");
+        assert!(json.to_string().contains(expect), "{at}: {json}");
+    }
+}
+
+#[tokio::test]
+async fn create_branch_from_empty_ledger_is_bad_request() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/branch")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "empty", "branch": "dev"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+    assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+    assert!(
+        json.to_string().contains("no commits yet"),
+        "expected the empty-source message, got: {json}"
+    );
+}
+
+/// Merge-preview returns the API error typed; merge reaches the HTTP layer
+/// through the committer, flattened to a bare status. Both answer alike.
+#[tokio::test]
+async fn merging_a_root_branch_is_bad_request_on_both_routes() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root:main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let preview = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/v1/fluree/merge-preview/root?source=main")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let merge = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/merge")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({"ledger": "root", "source": "main"}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    for resp in [preview, merge] {
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "got: {json}");
+        assert_eq!(json["@type"], "err:api/BadRequest", "{json}");
+        assert!(
+            json["error"]
+                .as_str()
+                .is_some_and(|m| m.contains("no source branch")),
+            "expected the root-branch message, got: {json}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn merge_preview_include_changes() {
     let (_tmp, state) = test_state().await;
@@ -756,6 +1127,7 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
 
     let resp = app
@@ -805,6 +1177,135 @@ async fn push_endpoint_accepts_single_commit_and_advances_head() {
     );
 }
 
+/// Build a ledger at t=1 and the pieces of a push that merges a side
+/// commit into it: the merge commit's bytes and the side commit's bytes.
+async fn merge_push_fixture(ledger: &str) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
+    merge_push_fixture_on(test_state().await, ledger).await
+}
+
+/// [`merge_push_fixture`] on a server the caller configured.
+async fn merge_push_fixture_on(
+    (tmp, state): (TempDir, Arc<AppState>),
+    ledger: &str,
+) -> (TempDir, Arc<AppState>, PushCommitsRequest) {
+    let app = build_router(state.clone());
+
+    let create_body = serde_json::json!({ "ledger": ledger });
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(create_body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let name = Sid::new(FLUREE_DB, "name");
+    let dt = Sid::new(XSD, xsd_names::STRING);
+    let flake = |subject: &str, value: &str, t: i64| {
+        Flake::new(
+            Sid::new(FLUREE_DB, subject),
+            name.clone(),
+            FlakeValue::String(value.to_string()),
+            dt.clone(),
+            t,
+            true,
+            None,
+        )
+    };
+
+    // t=1 on the branch, which the merge commit descends from.
+    let base = make_commit_bytes(1, None, vec![flake("alice", "Alice", 1)]);
+    let base_cid = ContentId::new(ContentKind::Commit, &base);
+    let push_req = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(base.clone())],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
+    };
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // A side branch forked from t=1, and the merge of it at t=2. The side
+    // commit's own `t` comes from that branch's clock.
+    let side = make_commit_bytes(2, Some(&base_cid), vec![flake("bob", "Bob", 2)]);
+    let side_cid = ContentId::new(ContentKind::Commit, &side);
+    let merge = make_merge_commit_bytes(2, vec![base_cid, side_cid], vec![flake("bob", "Bob", 2)]);
+
+    let request = PushCommitsRequest {
+        commits: vec![fluree_db_api::Base64Bytes(merge)],
+        blobs: std::collections::HashMap::new(),
+        missing_blobs: Vec::new(),
+        merged_commits: vec![fluree_db_api::Base64Bytes(side)],
+    };
+    (tmp, state, request)
+}
+
+#[tokio::test]
+async fn push_merges_endpoint_accepts_a_merge_and_its_commits() {
+    let ledger = "push-merge:main";
+    let (_tmp, state, push_req) = merge_push_fixture(ledger).await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        json.pointer("/head/t").and_then(serde_json::Value::as_i64),
+        Some(2)
+    );
+}
+
+#[tokio::test]
+async fn push_endpoint_refuses_merged_commits() {
+    let ledger = "push-merge-wrong-route:main";
+    let (_tmp, state, push_req) = merge_push_fixture(ledger).await;
+
+    let resp = build_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let (status, json) = json_body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(
+        json.to_string().contains("push-merges"),
+        "the error should name the endpoint that takes them: {json}"
+    );
+}
+
 #[tokio::test]
 async fn push_rejects_first_commit_t_mismatch_with_409() {
     let (_tmp, state) = test_state().await;
@@ -835,6 +1336,7 @@ async fn push_rejects_first_commit_t_mismatch_with_409() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
 
     let resp = app
@@ -882,6 +1384,7 @@ async fn push_rejects_retraction_without_existing_assertion_with_422() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
 
     let resp = app
@@ -941,6 +1444,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
     let resp = app
         .clone()
@@ -970,6 +1474,7 @@ async fn push_rejects_list_retraction_missing_meta_with_422() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
     let resp = app
         .oneshot(
@@ -1677,6 +2182,7 @@ async fn sparql_update_templates_support_graph_iri_blocks() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -1784,6 +2290,7 @@ async fn sparql_update_with_clause_scopes_default_templates_and_where() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -1888,6 +2395,7 @@ async fn sparql_update_using_clause_scopes_where_default_graph() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2011,6 +2519,7 @@ async fn sparql_update_multiple_using_clauses_merge_default_graph_for_where() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2121,6 +2630,7 @@ async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2176,6 +2686,7 @@ async fn sparql_update_using_named_clause_restricts_where_named_graphs() {
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2290,6 +2801,7 @@ async fn sparql_update_multiple_using_named_clauses_allow_multiple_named_graphs_
                 cursor: None,
                 cursor_id: None,
                 limit: Some(1),
+                ..Default::default()
             },
         )
         .await
@@ -2941,6 +3453,15 @@ async fn get_discovery(state: Arc<AppState>) -> (StatusCode, JsonValue) {
 }
 
 #[tokio::test]
+async fn discovery_advertises_pushing_merged_commits() {
+    let (_tmp, state) = test_state().await;
+    let (status, json) = get_discovery(state).await;
+
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["push"]["merged_commits"], true);
+}
+
+#[tokio::test]
 async fn discovery_no_auth_omits_auth_block() {
     let (_tmp, state) = test_state().await; // all auth modes None
     let (status, json) = get_discovery(state).await;
@@ -3122,6 +3643,7 @@ async fn create_and_push_commits(
             commits: vec![fluree_db_api::Base64Bytes(bytes)],
             blobs: std::collections::HashMap::new(),
             missing_blobs: Vec::new(),
+            merged_commits: Vec::new(),
         };
 
         let resp = app
@@ -3265,6 +3787,7 @@ async fn commits_endpoint_cursor_stability() {
         commits: vec![fluree_db_api::Base64Bytes(bytes)],
         blobs: std::collections::HashMap::new(),
         missing_blobs: Vec::new(),
+        merged_commits: Vec::new(),
     };
     let resp = app
         .clone()
@@ -3288,6 +3811,79 @@ async fn commits_endpoint_cursor_stability() {
     assert_eq!(page2.newest_t, 2, "cursor should resume at t=2");
     assert_eq!(page2.oldest_t, 1, "should reach genesis");
     assert!(page2.next_cursor_id.is_none(), "genesis reached");
+}
+
+/// Lineage mode over HTTP: the query parameters reach the export, and the
+/// response carries the line and the merged-in commits separately.
+#[tokio::test]
+async fn commits_endpoint_exports_the_line_in_lineage_mode() {
+    let ledger = "export-lineage:main";
+    let (_tmp, state, push_req) =
+        merge_push_fixture_on(test_state_with_storage_proxy().await, ledger).await;
+    let app = build_router(state);
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/v1/fluree/push-merges/{ledger}"))
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_string(&push_req).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let token = storage_auth::storage_all_token();
+    let export = |query: String| {
+        let app = app.clone();
+        let token = token.clone();
+        async move {
+            let resp = app
+                .oneshot(
+                    Request::builder()
+                        .method("GET")
+                        .uri(format!("/v1/fluree/commits/{ledger}?{query}"))
+                        .header("authorization", format!("Bearer {token}"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            json_body(resp).await
+        }
+    };
+
+    // Down to genesis: the base commit and the merge, plus the side commit.
+    let (status, json) = export("lineage=true".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert!(page.lineage);
+    assert_eq!(page.commits.len(), 2);
+    assert_eq!(page.merged_commits.len(), 1);
+    assert_eq!(page.next_cursor_id, None);
+
+    // Above the base: only the merge, plus the side commit.
+    let base_cid = ContentId::new(ContentKind::Commit, &page.commits[1].0);
+    let (status, json) = export(format!("lineage=true&base_id={base_cid}")).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    let page: ExportCommitsResponse = serde_json::from_value(json).unwrap();
+    assert_eq!(page.commits.len(), 1);
+    assert_eq!(page.newest_t, 2);
+    assert_eq!(page.merged_commits.len(), 1);
+
+    // A base off the line: the side commit.
+    let side_cid = ContentId::new(ContentKind::Commit, &page.merged_commits[0].0);
+    let (status, _json) = export(format!("lineage=true&base_id={side_cid}")).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+
+    // Without the flag, the default format: no `lineage`, no split.
+    let (status, json) = export("limit=10".to_string()).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert!(json.get("lineage").is_none(), "{json}");
+    assert!(json.get("merged_commits").is_none(), "{json}");
 }
 
 #[tokio::test]
@@ -3640,6 +4236,79 @@ async fn sparql_graph_pattern_named_graph_without_from_named() {
     );
 }
 
+/// `/insert` accepts TriG under either content type (#1849): the API reads a
+/// body with graph blocks as TriG whatever it was labeled.
+#[tokio::test]
+async fn trig_insert_lands_named_graphs() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "triginsert:main" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    for (content_type, graph, value) in [
+        ("application/trig", "urn:g:trig", "via-trig"),
+        ("text/turtle", "urn:g:turtle", "via-turtle"),
+    ] {
+        let body = format!(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:label \"{value}\" .\n\
+             GRAPH <{graph}> {{ ex:a ex:q \"{value}\" . }}\n"
+        );
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/insert/triginsert:main")
+                    .header("content-type", content_type)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{content_type} insert failed: {json}"
+        );
+
+        let sparql = format!("SELECT ?o WHERE {{ GRAPH <{graph}> {{ ?s ?p ?o }} }}");
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/query/triginsert:main")
+                    .header("content-type", "application/sparql-query")
+                    .body(Body::from(sparql))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let (status, json) = json_body(resp).await;
+        assert_eq!(status, StatusCode::OK, "graph query failed: {json}");
+        assert!(
+            json_contains_string(&json, value),
+            "{content_type}: expected the block's triple in <{graph}>, got: {json}"
+        );
+    }
+}
+
 /// `/sync` HTTP contract (what `fluree sync --remote` depends on): delta
 /// commit, no-op resync, dry-run report shape, and the 400 guards.
 #[tokio::test]
@@ -3757,28 +4426,24 @@ async fn sync_route_contract() {
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(2));
 
-    // Guards: missing graph, empty payload without allowEmpty, malformed
-    // graph IRI, and a Turtle body are all 400s.
+    // Guards: empty payload without allowEmpty and a malformed graph IRI
+    // are 400s. (A missing `graph` targets the default graph; see
+    // `sync_route_targets_the_default_graph`.)
     for (uri, body, ct) in [
-        (
-            "/v1/fluree/sync/sync:test".to_string(),
-            v1.clone(),
-            "application/json",
-        ),
         (
             format!("/v1/fluree/sync/sync:test?graph={graph}"),
             serde_json::json!({ "@graph": [] }).to_string(),
             "application/json",
         ),
         (
-            "/v1/fluree/sync/sync:test?graph=relative%2Fgraph".to_string(),
-            v1.clone(),
+            format!("/v1/fluree/sync/sync:test?graph={graph}"),
+            "[]".to_string(),
             "application/json",
         ),
         (
-            format!("/v1/fluree/sync/sync:test?graph={graph}"),
-            "@prefix ex: <http://example.org/> . ex:a ex:b \"c\" .".to_string(),
-            "text/turtle",
+            "/v1/fluree/sync/sync:test?graph=relative%2Fgraph".to_string(),
+            v1.clone(),
+            "application/json",
         ),
     ] {
         let (status, json) = json_body(
@@ -3805,6 +4470,173 @@ async fn sync_route_contract() {
     .await;
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(json.get("t").and_then(serde_json::Value::as_i64), Some(3));
+}
+
+/// `/sync` with Turtle, N-Triples and TriG bodies: the same delta contract as
+/// JSON-LD, one graph per request, and the RDF-specific 400s.
+#[tokio::test]
+async fn sync_route_accepts_rdf_bodies() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+
+    let resp = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/fluree/create")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "ledger": "sync:rdf" }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let graph = "urn:example:tools";
+    let sync = |query: &str, body: String, ct: &'static str| {
+        let app = app.clone();
+        let uri = format!("/v1/fluree/sync?ledger=sync:rdf&graph={graph}{query}");
+        async move {
+            json_body(
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri(uri)
+                        .header("content-type", ct)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+    let prefixes = "@prefix ex: <http://example.org/> .\n";
+    let spec = "ex:search ex:name \"search\" ;\n  \
+                ex:param [ ex:name \"q\" ; ex:required true ] .\n";
+    let turtle = format!("{prefixes}{spec}");
+    let t_of = |json: &serde_json::Value| json.get("t").and_then(serde_json::Value::as_i64);
+
+    let (status, json) = sync("", turtle.clone(), "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(t_of(&json), Some(1));
+
+    // The same graph as TriG is identical, so it does not commit.
+    let trig = format!("{prefixes}GRAPH <{graph}> {{\n{spec}}}\n");
+    let (status, json) = sync("", trig.clone(), "application/trig").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(
+        t_of(&json),
+        Some(1),
+        "identical TriG must not commit: {json}"
+    );
+
+    // N-Triples keeping only the name drops the param link and the param
+    // node's two triples.
+    let nt = "<http://example.org/search> <http://example.org/name> \"search\" .\n";
+    let (status, json) = sync("&dryRun=true", nt.to_string(), "application/n-triples").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json["asserted"], 0);
+    assert_eq!(json["retracted"], 3, "{json}");
+    assert_eq!(json["committed"], false);
+    assert_eq!(json["t"], 1);
+
+    // Refusals, none of which commits.
+    let other_block = format!("{prefixes}GRAPH <urn:example:other> {{ {spec} }}\n");
+    let mixed = format!("{prefixes}ex:stray ex:p \"x\" .\nGRAPH <{graph}> {{ {spec} }}\n");
+    for (body, ct, expect) in [
+        (other_block, "application/trig", "urn:example:other"),
+        (mixed, "application/trig", "not both"),
+        (prefixes.to_string(), "text/turtle", "allowEmpty"),
+        (format!("{prefixes}ex:a ex:b"), "text/turtle", ""),
+    ] {
+        let (status, json) = sync("", body.clone(), ct).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {json}");
+        assert!(json.to_string().contains(expect), "{body}: {json}");
+    }
+
+    let (status, json) = sync("&allowEmpty=true", prefixes.to_string(), "text/turtle").await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(t_of(&json), Some(2), "allowEmpty clears the graph: {json}");
+}
+
+/// `/sync` without `graph` replaces the default graph, as does an explicit
+/// `?default`; naming both is a 400.
+#[tokio::test]
+async fn sync_route_targets_the_default_graph() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state.clone());
+    let post = |uri: String, body: String, ct: &'static str| {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", ct)
+            .body(Body::from(body))
+            .unwrap()
+    };
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/create".to_string(),
+            serde_json::json!({ "ledger": "sync:default" }).to_string(),
+            "application/json",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let seed = "@prefix ex: <http://example.org/> .\n\
+                ex:old ex:name \"Old\" .\n\
+                <urn:example:g> { ex:kept ex:name \"Kept\" . }\n";
+    let resp = app
+        .clone()
+        .oneshot(post(
+            "/v1/fluree/upsert/sync:default".to_string(),
+            seed.to_string(),
+            "application/trig",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let body = "@prefix ex: <http://example.org/> .\nex:new ex:name \"New\" .\n";
+    for query in ["?dryRun=true", "?default&dryRun=true"] {
+        let (status, json) = json_body(
+            app.clone()
+                .oneshot(post(
+                    format!("/v1/fluree/sync/sync:default{query}"),
+                    body.to_string(),
+                    "text/turtle",
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{query}: {json}");
+        // Replaces the default graph's one triple; the named graph's is kept.
+        assert_eq!(
+            (json["asserted"].as_i64(), json["retracted"].as_i64()),
+            (Some(1), Some(1)),
+            "{query}: {json}"
+        );
+        assert_eq!(json["graph"], serde_json::Value::Null);
+    }
+
+    let (status, json) = json_body(
+        app.clone()
+            .oneshot(post(
+                "/v1/fluree/sync/sync:default?graph=urn:example:g&default".to_string(),
+                body.to_string(),
+                "text/turtle",
+            ))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }
 
 // ============================================================================

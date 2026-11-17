@@ -81,9 +81,51 @@ Every modification path runs the same `f:modify` policy check on its staged flak
 
 Crucially, the policy is checked against the **flakes**, not the operation type. A transaction that retracts a flake the identity can't modify is rejected just like an insert that asserts one.
 
+A write that restates a stored value as it is stages nothing: an upsert of an unchanged value, a DELETE and INSERT of the same value, or an `ADD`, `COPY` or `MOVE` of a fact the destination graph already holds. When the identity cannot view that value, the restatement is still checked against `f:modify`, so it is refused unless the identity may modify the value, whether or not the value is stored. Restating a value the identity can view commits nothing, with no modify check.
+
+**Modify without view.** Granting `f:modify` on a value without `f:view` does not keep that value confidential from the identity: an identity that may modify a property can tell whether a given value is stored by writing it. Configure such policies with care.
+
 Enforcement is also independent of the **wire format**: the check runs on the staged flakes, so JSON-LD, SPARQL UPDATE, and Turtle / TriG / N-Triples writes are all governed by the same `f:modify` policy. Sending data as Turtle is not a way to bypass write policy.
 
 Class targeting on the write side is **exact**: an `f:onClass` modify policy governs *every* flake whose subject is an instance of the class — including properties the class has never carried before. (Read-side class targeting uses the committed class→property index; write-side targeting matches by the subject's classes directly, since a write may introduce class/property combinations no committed data predicts.)
+
+### Schema writes
+
+Schema triples — `rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property — are checked against `f:modify` like any other flake. A policy on a class or property also covers its subclasses or subproperties, so the hierarchy is part of what policy protects. Every identity can still read the schema; view policy lets it through.
+
+An identity with `f:defaultAllow` needs nothing more. A restricted identity that maintains the ontology needs a grant for the schema triples it writes: the four schema properties, and `rdf:type` whose value is a class or property type.
+
+```json
+[
+  {
+    "@id": "ex:ontologyEdges",
+    "f:action": {"@id": "f:modify"},
+    "f:allow": true,
+    "f:onProperty": [
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#subClassOf"},
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#subPropertyOf"},
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#domain"},
+      {"@id": "http://www.w3.org/2000/01/rdf-schema#range"}
+    ]
+  },
+  {
+    "@id": "ex:ontologyTerms",
+    "f:action": {"@id": "f:modify"},
+    "f:onProperty": [{"@id": "http://www.w3.org/1999/02/22-rdf-syntax-ns#type"}],
+    "f:query": {
+      "@type": "https://ns.flur.ee/db#sparql",
+      "@value": "PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX owl: <http://www.w3.org/2002/07/owl#> ASK { FILTER($value IN (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty)) }"
+    }
+  }
+]
+```
+
+The holder can declare a class or property, new or existing, and write its hierarchy, domain and range. It cannot give a subject any other type, or write any other property. Two grants that look close don't do this:
+
+- `f:onProperty rdf:type` without the condition lets its holder retype any data subject.
+- An `f:onClass rdfs:Class` grant covers every property of a class subject, not only its schema triples, and as bare `f:modify` it never covers a class being declared, since bare class targeting reads the subject's classes before the transaction.
+
+A grant on `rdfs:subPropertyOf` or `rdfs:subClassOf` lets its holder put any property or class under any other, `ex:ssn rdfs:subPropertyOf ex:name` included, and so widen what a policy on the parent lets others read. Give it only to an identity trusted with what policies allow.
 
 ## Write verbs
 
@@ -123,7 +165,7 @@ Verb policies get **exact** semantics on two axes where bare `f:modify` keeps it
 }
 ```
 
-With `default-allow: false`, the holder can insert new `ex:Lead` subjects (any of their properties — typing the new subject as `ex:Lead` in the same transaction is what brings it under the grant) and nothing else: no other class can be minted, existing Leads can't be edited or removed. Pair with a SHACL shape (`sh:closed`, required properties) to constrain *what a valid Lead looks like* — the shape is identity-invariant; the policy is who may create.
+With `default-allow: false`, the holder can insert new `ex:Lead` subjects (any of their properties — typing the new subject as `ex:Lead` in the same transaction is what brings it under the grant) and nothing else: no other class can be minted, existing Leads can't be edited or removed. Pair with a SHACL shape (`sh:closed`, required properties) to constrain *what a valid Lead looks like* — the shape is identity-invariant; the policy is who may create. Because of that, SHACL reads the written graph, the shapes graph and any [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graph in full, whatever the writer's policy allows, so a violation can show a writer a value their policy hides. List only graphs every writer may see, or accept that.
 
 ### Lifecycle edge cases
 
@@ -313,13 +355,11 @@ fluree insert --as ex:readOnlyIdentity --policy-class ex:CorpPolicy -f new-data.
 fluree insert --as ex:writerIdentity --policy-class ex:CorpPolicy -f new-data.ttl
 ```
 
-The flags work locally and against remote servers. On remote, the CLI sends the policy options as HTTP headers (`fluree-identity`, `fluree-policy-class`, `fluree-default-allow`) and, for JSON-LD bodies, also injects them into `opts`. The server applies the **root-impersonation gate**: your bearer identity may delegate to `--as <iri>` only when the bearer identity itself has no `f:policyClass` on the target ledger. Restricted bearers have `--as` force-overridden back to their own identity (and writes only what their own policies permit).
-
-This is the standard service-account pattern — see [Policy in queries → Remote impersonation](policy-in-queries.md#remote-impersonation-how-its-authorized) for the full authorization rules and audit-log format.
+The CLI transports these options locally or through HTTP headers/body opts. Authenticated servers bind them to verified policy selection. Application-selected policies require explicit [trusted authorization](policy-authorization.md); policy-free identities do not confer impersonation privileges.
 
 ### Transaction enforcement is end-to-end
 
-Unsigned bearer-authenticated transactions build a `PolicyContext` from the (post-header-merge) opts and route through the policy-enforcing `transact_tracked_with_policy` path. A non-root bearer's `f:modify` constraints apply to their writes, matching the long-standing query-side behavior. SPARQL UPDATE inherits the same enforcement, with identity sourced from either the bearer or the `fluree-identity` header (impersonation-gated).
+JSON-LD transaction options are bound after header merging, then carried into consensus as governance. SPARQL UPDATE, Cypher, Turtle/TriG, and push ingestion use the same verified selection. Malformed JSON policy options are rejected rather than falling back to unrestricted governance. The resulting policy context enforces modify restrictions while staging the transaction.
 
 ## Related documentation
 

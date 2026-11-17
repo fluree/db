@@ -24,7 +24,7 @@
 
 use std::sync::Mutex;
 
-use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle, RefreshOpts, ReindexOptions};
+use fluree_db_api::{Fluree, FlureeBuilder, LedgerHandle, ReindexOptions};
 use serde_json::json;
 use tracing::field::{Field, Visit};
 use tracing_subscriber::layer::Context;
@@ -179,15 +179,19 @@ async fn cached_handle_commits_uniquely_own_the_dictionaries() {
     assert_eq!(pre_index.len(), 5, "expected one probe per commit");
     assert_uniquely_owned(&pre_index, "before any index");
 
-    // --- Phase 2: publish an index and install it on the cached handle ----
+    // --- Phase 2: publish an index and reload the cached handle -----------
+    // Reindex evicts the cached ledger, including for same-t root repairs.
+    // Existing caller-held handles are not updated by that eviction; drop
+    // ours and reacquire the handle that subsequent cached writes use.
+    drop(handle);
     fluree
         .reindex(ledger_id, ReindexOptions::default())
         .await
         .expect("reindex");
-    fluree
-        .refresh(ledger_id, RefreshOpts::default())
+    let handle = fluree
+        .ledger_cached(ledger_id)
         .await
-        .expect("refresh the cached handle onto the new index");
+        .expect("reload the cached handle from the rebuilt index");
     // Hard assert, not a skip: if the index never reached the cached handle,
     // the phases below would silently re-test the pre-index case.
     assert!(
@@ -219,11 +223,11 @@ async fn cached_handle_commits_uniquely_own_the_dictionaries() {
     );
     assert_uniquely_owned(&steady, "post-index steady state");
 
-    // --- Phase 5: the lock-held path -------------------------------------
-    // Everything above goes through the optimistic path, which stages against
-    // a snapshot taken before the lock. A SPARQL UPDATE instead holds the
-    // write lock across stage and commit and clones the state through
-    // `clone_state()`; it shares the commit tail, so it must own its
+    // --- Phase 5: SPARQL UPDATE -------------------------------------------
+    // Everything above goes through the optimistic path with a JSON-LD
+    // payload. A SPARQL UPDATE takes the same path through its own lowering
+    // (and, when the ledger moved, a re-base over a `clone_state()` of the
+    // locked state); it shares the commit tail, so it must own its
     // dictionaries too.
     fluree
         .stage(&handle)

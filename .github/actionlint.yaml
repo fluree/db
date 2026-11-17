@@ -1,0 +1,7 @@
+# Organization-managed GitHub larger runners: ci-cd-large for CI and
+# benchmarks; the others build release artifacts (dist-workspace.toml).
+self-hosted-runner:
+  labels:
+    - ci-cd-large
+    - asset-publisher-8-core
+    - standalone-release-windows-x64

@@ -3,17 +3,15 @@
 //! - [`GraphTransactBuilder`] — lazy transaction from a [`Graph`] handle
 //! - [`StagedGraph`] — staged (uncommitted) transaction queryable via [`GraphSnapshotQueryBuilder`]
 
+use fluree_db_core::VerifiedIdentity;
 use serde_json::Value as JsonValue;
 
 use crate::error::BuilderErrors;
 use crate::graph::Graph;
 use crate::graph_query_builder::GraphSnapshotQueryBuilder;
-use crate::tx_builder::{parse_and_lower_sparql_update, Staged, TransactCore, TransactOperation};
+use crate::tx_builder::{Staged, TransactCore, TransactOperation};
 use crate::view::GraphDb;
-use crate::{
-    ApiError, Fluree, PolicyContext, Result, TrackedErrorResponse, TrackedTransactionInput,
-    Tracker, TrackingOptions, TransactResultRef,
-};
+use crate::{ApiError, Fluree, PolicyContext, Result, Tracker, TrackingOptions, TransactResultRef};
 use fluree_db_ledger::IndexConfig;
 use fluree_db_transact::{CommitOpts, Txn, TxnOpts};
 
@@ -99,7 +97,18 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// registry. This avoids the namespace-conflict retry that pre-lowering
     /// against an unlocked snapshot would require.
     pub fn sparql_update(mut self, sparql: &'g str) -> Self {
-        self.core.set_sparql_update(sparql);
+        self.core.set_sparql_update(sparql, None);
+        self
+    }
+
+    /// [`Self::sparql_update`] with variables bound to values; see
+    /// [`fluree_db_sparql::substitute_params`].
+    pub fn sparql_update_with_params(
+        mut self,
+        sparql: &'g str,
+        params: &'g fluree_db_sparql::ParamMap,
+    ) -> Self {
+        self.core.set_sparql_update(sparql, Some(params));
         self
     }
 
@@ -147,9 +156,11 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
 
     // -- Option setters --
 
-    /// Set transaction options (author, context, etc.).
+    /// Set transaction options (author, context, etc.). A verified identity
+    /// recorded earlier with [`Self::server_identity`] is kept unless `opts`
+    /// carries its own.
     pub fn txn_opts(mut self, opts: TxnOpts) -> Self {
-        self.core.txn_opts = opts;
+        self.core.set_txn_opts(opts);
         self
     }
 
@@ -177,11 +188,50 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
         self
     }
 
+    /// Record the auth-layer-verified caller identity, the value the SHACL
+    /// group's `f:overrideControl` gates `opts.validationMode` on. See
+    /// `TransactBuilder::server_identity`.
+    pub fn server_identity(mut self, identity: Option<VerifiedIdentity>) -> Self {
+        self.core.set_server_identity(identity);
+        self
+    }
+
     // -- Terminal operations --
 
     /// Validate the builder configuration without executing.
     pub fn validate(&self) -> std::result::Result<(), BuilderErrors> {
         self.core.validate()
+    }
+
+    /// The ledger a write applies to: the handle's whole ledger, at HEAD. A
+    /// handle that pins a time (`graph_at`, or `ledger@t:5`) names a past state,
+    /// and one that names a graph (`ledger#graph`) names part of the ledger, so
+    /// transacting through either would silently write somewhere other than
+    /// what the handle names.
+    fn write_target(&self) -> Result<fluree_db_core::LedgerId> {
+        let address = self.graph.address()?;
+        if !matches!(self.graph.time_spec()?, crate::dataset::TimeSpec::Latest) {
+            return Err(ApiError::http(
+                400,
+                format!(
+                    "cannot transact through a time-pinned graph handle for '{}'; \
+                     use graph(..) (HEAD) for writes",
+                    self.graph.ledger_id
+                ),
+            ));
+        }
+        if !address.graph().is_default() {
+            return Err(ApiError::http(
+                400,
+                format!(
+                    "cannot transact through the graph-qualified handle '{}'; transact \
+                     through graph(\"{}\") and name the graph in the transaction",
+                    self.graph.ledger_id,
+                    address.id()
+                ),
+            ));
+        }
+        Ok(address.id().clone())
     }
 
     /// Stage + commit the transaction against the latest ledger head.
@@ -200,11 +250,8 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     ///     .await?;
     /// ```
     pub async fn commit(self) -> Result<TransactResultRef> {
-        let handle = self
-            .graph
-            .fluree
-            .ledger_cached(&self.graph.ledger_id)
-            .await?;
+        let ledger_id = self.write_target()?;
+        let handle = self.graph.fluree.ledger_cached(ledger_id.as_str()).await?;
         self.graph
             .fluree
             .commit_with_handle(&handle, self.core)
@@ -228,6 +275,7 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
     /// let preview = staged.query().jsonld(&q).execute().await?;
     /// ```
     pub async fn stage(self) -> Result<StagedGraph<'a>> {
+        let ledger_id = self.write_target()?;
         self.core.validate().map_err(ApiError::Builder)?;
 
         let index_config = self
@@ -236,70 +284,21 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
             .clone()
             .unwrap_or_else(crate::server_defaults::default_index_config);
 
-        // Load the current ledger state
-        let ledger_state = self.graph.fluree.ledger(&self.graph.ledger_id).await?;
+        let ledger_state = self.graph.fluree.ledger(ledger_id.as_str()).await?;
+        let tracker = self
+            .core
+            .tracking
+            .clone()
+            .map(Tracker::new)
+            .unwrap_or_else(Tracker::disabled);
 
-        // Stage
-        // TODO: Add trig_meta support to tracked+policy path
-        let stage_result = if let Some(sparql) = self.core.pending_sparql {
-            let txns =
-                parse_and_lower_sparql_update(sparql, &ledger_state.snapshot, self.core.txn_opts)?;
-            let tracker = self
-                .core
-                .tracking
-                .map(Tracker::new)
-                .unwrap_or_else(Tracker::disabled);
-            self.graph
-                .fluree
-                .stage_transaction_from_txns(
-                    ledger_state,
-                    txns,
-                    Some(&index_config),
-                    self.core.policy.as_ref(),
-                    Some(&tracker),
-                )
-                .await?
-        } else {
-            let op = self.core.operation.unwrap();
-            let txn_type = op.txn_type();
-            // Parse transaction, extracting TriG metadata for Turtle inputs
-            let parsed = op.to_json_with_trig_meta()?;
-            let txn_json = parsed.json;
-            let trig_meta = parsed.trig_meta;
-
-            if let Some(policy) = &self.core.policy {
-                let tracker = Tracker::new(self.core.tracking.unwrap_or(TrackingOptions {
-                    track_time: true,
-                    track_fuel: true,
-                    track_policy: true,
-                    max_fuel: None,
-                }));
-                let input =
-                    TrackedTransactionInput::new(txn_type, &txn_json, self.core.txn_opts, policy);
-                self.graph
-                    .fluree
-                    .stage_transaction_tracked_with_policy(
-                        ledger_state,
-                        input,
-                        Some(&index_config),
-                        &tracker,
-                    )
-                    .await
-                    .map_err(|e: TrackedErrorResponse| ApiError::http(e.status, e.error))?
-            } else {
-                self.graph
-                    .fluree
-                    .stage_transaction_with_trig_meta(
-                        ledger_state,
-                        txn_type,
-                        &txn_json,
-                        self.core.txn_opts,
-                        Some(&index_config),
-                        trig_meta.as_ref(),
-                    )
-                    .await?
-            }
-        };
+        // Staged as the commit paths stage. No commit follows, so there is no
+        // raw transaction to upload.
+        let (stage_result, ..) = self
+            .graph
+            .fluree
+            .stage_core(ledger_state, self.core, &tracker, &index_config, false)
+            .await?;
 
         // Pre-build the GraphDb from staged so query() can borrow it
         let staged = Staged {
@@ -323,8 +322,8 @@ impl<'a, 'g> GraphTransactBuilder<'a, 'g> {
 
 /// A staged (uncommitted) transaction bound to an executor.
 ///
-/// Queries against this type see the staged changes.
-/// Stage-on-stage and commit-from-staged are TBD.
+/// Queries against this type see the staged changes. To stage several
+/// writes and commit them as one, use [`crate::Transaction`].
 ///
 /// # Example
 ///

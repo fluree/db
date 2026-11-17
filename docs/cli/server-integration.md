@@ -50,6 +50,8 @@ Fallbacks (strongly recommended):
 - `GET {api_base_url}/commits/*ledger` (paginated export of commit + txn blobs)
 - `GET {api_base_url}/storage/objects/:cid?ledger=:ledger-id` (per-object fetch by CID)
 
+The CLI requests the `/commits` export in [lineage mode](../api/endpoints.md#get-commitsledger) (`lineage=true`, with `base_id` set to the local head on pull). Without lineage mode, the fallback cannot transfer a history containing a merge. The CLI detects a server without it because the response does not include `lineage`. It then uses the default format.
+
 ### `fluree track add --mode peer` (local query execution over served blocks)
 
 Peer mode runs the consumer's queries **locally** over index blocks fetched
@@ -120,8 +122,16 @@ Optional:
 ### `fluree push` (commit ingestion)
 
 - `POST {api_base_url}/push/*ledger`
+- `POST {api_base_url}/push-merges/*ledger` (a push whose history contains a merge)
+- `GET /.well-known/fluree.json` with `"push": {"merged_commits": true}`, if you implement `push-merges`
 
 This is not storage-proxy replication; it is a transaction operation and should be authorized like normal transactions.
+
+The CLI pushes the branch's first-parent line as `commits`. When a commit on that line is a merge, the CLI also sends the commits the merge brought in, as `merged_commits`, to `push-merges` instead of `push`. It does so only when discovery advertises `push.merged_commits`. Otherwise it refuses the push before sending anything. See [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger) for the rules the server enforces.
+
+Merged commits are stored as history and never replayed, so policy and SHACL never run on them. What a merge brings into the branch's state travels in the merge commit, which is validated like any other commit, so a receiver still only takes checked data into its state.
+
+`push-merges` is a separate endpoint so that a server without it fails with `404`. The same body on `push` would be accepted by such a server with the merged commits dropped. For that reason `push` must refuse a body carrying `merged_commits`.
 
 The CLI sends an `Idempotency-Key` header derived from the pushed commit bytes so servers can safely replay a successful push result if the client retries after a timeout.
 
@@ -193,14 +203,16 @@ Required endpoints:
 - `POST {api_base_url}/create` (create empty ledger if not exists)
 - `GET {api_base_url}/info/*ledger` (check remote head when ledger exists)
 - `POST {api_base_url}/push/*ledger` (push all commits)
+- `POST {api_base_url}/push-merges/*ledger` and its discovery flag, when the history contains a merge (see [`fluree push`](#fluree-push-commit-ingestion))
 
 **Workflow:**
 
-1. CLI calls `GET /exists?ledger=mydb:main`
-2. If `exists: false`, CLI calls `POST /create` with `{"ledger": "mydb:main"}`
-3. If `exists: true`, CLI calls `GET /info/mydb:main` and rejects if `t > 0` (remote already has data)
-4. CLI walks the full local commit chain (oldest → newest) and sends all commits via `POST /push/mydb:main`
-5. CLI configures upstream tracking locally
+1. CLI plans the push from genesis. If the history contains a merge and discovery does not advertise `push.merged_commits`, it stops here, before touching the remote.
+2. CLI calls `GET /exists?ledger=mydb:main`
+3. If `exists: false`, CLI calls `POST /create` with `{"ledger": "mydb:main"}`
+4. If `exists: true`, CLI calls `GET /info/mydb:main` and rejects if `t > 0` (remote already has data)
+5. CLI sends the first-parent line (oldest → newest) via `POST /push/mydb:main`, or via `POST /push-merges/mydb:main` with the merged-in commits
+6. CLI configures upstream tracking locally
 
 The `--remote-name` flag allows publishing under a different name on the remote (e.g., `fluree publish origin mydb --remote-name production-db`).
 
@@ -265,16 +277,22 @@ CLI-compatible, your server must implement the contract in
 [Policy Enforcement Contract](#policy-enforcement-contract).
 
 **Remote time travel (`--at`)** routes through the **ledger-scoped** endpoints
-(`POST /query/{ledger}`, etc.): the URL path drives the bearer's
-`can_read` check (so a token scoped to `mydb:main` matches), and the
-time-travel suffix rides in the body's `from` (`mydb:main@t:N` for JSON-LD)
-or in an injected `FROM <mydb:main@t:N>` clause (for SPARQL). Posting to
-the connection-level endpoint instead would force auth to derive the
-ledger ID from `from` and reject scoped tokens.
+with the time in the path (`POST /query/{ledger}@t:N`,
+`POST /explain/{ledger}@t:N`): the URL path drives the bearer's `can_read`
+check (so a token scoped to `mydb:main` matches), and the query is sent as
+written, so its own `FROM` / `from` keeps what it names and is read at that
+time, and a query with no dataset clause reads the ledger's named graphs too.
+A server that predates path pins (before v4.2.2) refuses the pinned path as an
+invalid ledger id (v4.1 and v4.2.1 answer with a 500 that names it); the CLI
+then falls back to the older form, which rides the time in
+the body's `from` (`mydb:main@t:N` for JSON-LD) or in an injected
+`FROM <mydb:main@t:N>` clause (for SPARQL). NDJSON (`--format ndjson`) and
+TSV/CSV still use that older form. Posting to the connection-level endpoint
+instead would force auth to derive the ledger ID from `from` and reject scoped
+tokens.
 
-**Remote `--at --explain` flows through the same ledger-scoped path.** The
-CLI injects the time-travel suffix into `from` (JSON-LD) or as a `FROM
-<ledger@t:N>` clause (SPARQL), then POSTs to `POST /explain/{ledger}`.
+**Remote `--at --explain` flows through the same ledger-scoped path**, as
+`POST /explain/{ledger}@t:N`.
 The server's explain handlers route those requests through a
 dataset-aware path so the request is processed against a view at the
 requested `t`. Note that Fluree maintains one set of index stats
@@ -335,10 +353,16 @@ MATCH (n:Person {id: 7}) RETURN n
 
 - `POST {api_base_url}/sync/*ledger?graph=<iri>[&dryRun=true][&allowEmpty=true]`
 
-Makes one named graph's contents exactly the JSON-LD payload, committing
-only the delta. Data-bearer auth (same bracket as `/insert` / `/upsert`),
-not admin. The CLI converts Turtle to JSON-LD client-side, so the endpoint
-only ever sees `application/json`. A dry run answers with a delta report and
+Makes one named graph's contents exactly the payload, committing only the
+delta. Data-bearer auth (same bracket as `/insert` / `/upsert`), not admin.
+The CLI sends RDF text as written: Turtle as `text/turtle`, TriG as
+`application/trig`, JSON-LD as `application/json`. A server from before
+`/sync` read RDF bodies refuses a Turtle body, with `415 Unsupported Media
+Type` or (v4.2.0 and v4.2.1) a `400` whose message ends `convert Turtle
+payloads client-side`; for that server the CLI converts the Turtle to
+JSON-LD client-side, sends it again, and prints a warning. Any other `400`
+is reported as is, and TriG is never
+converted. A dry run answers with a delta report and
 must commit nothing; a real run answers with the standard transact response.
 Designed so the CLI's source of desired contents (today RDF text; later
 R2RML-mapped Iceberg / CSV / spreadsheet data) is invisible to the server —
@@ -468,7 +492,7 @@ when the bearer cannot read it). See
 
 ### `fluree branch create --remote <name>` (admin-protected)
 
-- `POST {api_base_url}/branch` with `{ ledger, branch, source? }`
+- `POST {api_base_url}/branch` with `{ ledger, branch, source?, at? }`
 
 Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 [Branch Create Contract](#branch-create-contract).
@@ -484,11 +508,11 @@ Same admin auth bracket as `/create`, `/drop`, `/reindex`. See
 
 - `POST {api_base_url}/drop-graph` with `{ ledger, graph }`
 
-Drops a single named graph from one branch of a ledger by transactionally
-retracting every triple currently asserted in it. History is preserved —
-queries `as-of` an earlier `t` still see the graph populated. The graph IRI
-remains registered so it can be re-populated by a later insert. Refuses the
-default graph and the system `txn-meta` / `config` graphs. Same admin auth
+Drops a single named graph, and its history, from one branch of a ledger:
+SPARQL `DROP GRAPH`, one commit that retracts nothing. A query naming the
+graph as of an earlier `t` is refused afterwards; a later write to the IRI
+starts the graph afresh. Refuses the default graph and the system
+`txn-meta` / `config` graphs. Same admin auth
 bracket as `/create`, `/drop`, `/reindex`. See
 [Drop Named Graph Contract](#drop-named-graph-contract).
 
@@ -579,8 +603,9 @@ injects each field into the request body's `opts` object using the same names
 should treat header values as defaults that body values override.
 
 For SPARQL requests (`Content-Type: application/sparql-query`,
-`application/sparql-update`), headers are the only transport — the SPARQL body
-has no opts block.
+`application/sparql-update`), the CLI sends headers only. A SPARQL body can also
+carry the same options as [`# PRAGMA` comments](../query/sparql.md#request-options--pragma),
+which win over the headers, as body `opts` do for JSON-LD.
 
 For `POST /multi-query`, the CLI **does not** inject policy fields into the
 envelope body — it sends headers only. The server folds the headers into the
@@ -824,6 +849,7 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
    &max_commits={n}&max_conflict_keys={n}&include_conflicts={bool}
    &include_conflict_details={bool}&strategy={strategy}
    &include_changes={bool}&max_changes={n}&changes_after_subject={iri}
+   &include_validation={bool}
 ```
 
 | Parameter | Type | Required | Server default | Description |
@@ -839,6 +865,7 @@ GET {api_base_url}/merge-preview/{ledger}?source={source}&target={target}
 | `include_changes` | bool | No | `false` | When `true`, include the aggregate netted change set as `changes` |
 | `max_changes` | integer | No | `500` | Cap on `changes.entries`, counted in flakes, cut at subject boundaries. `0` = stats-only mode |
 | `changes_after_subject` | string | No | — | Pagination cursor (full subject IRI); requires `include_changes=true` |
+| `include_validation` | bool | No | `true` | When `true`, stage the strategy-resolved change set on the target and validate it against the target's SHACL shapes; report as `validation` and fold into `mergeable` |
 
 Auth follows the same pattern as `GET /branch/*ledger` (read-only): require
 a Bearer when `data_auth.mode == required`; gate on `can_read(ledger)`;
@@ -848,37 +875,57 @@ return `404` (not `403`) when the bearer cannot read it.
 
 These rules are not negotiable; the CLI and other clients depend on them:
 
-1. **Source resolution.** `source` must be a branch — its nameservice record
-   must have `source_branch != null`. Otherwise respond `400` with a message
-   containing `"no source branch"` so the CLI's error matcher works.
-2. **Target defaulting.** When `target` is omitted, resolve to
-   `source.source_branch`.
-3. **Self-merge.** If `source == resolved_target`, respond `400` with a
+1. **Target defaulting.** When `target` is omitted, resolve to
+   `source.source_branch`. A source whose nameservice record has
+   `source_branch == null` then has no target to resolve: respond `400` with
+   a message containing `"no source branch"` so the CLI's error matcher
+   works. With an explicit `target`, any branch may be the source, `main`
+   included.
+2. **Self-merge.** If `source == resolved_target`, respond `400` with a
    message containing `"itself"`.
-4. **Cross-branch ancestor lookup.** `ancestor` is the most recent common
-   commit between `source` HEAD and `target` HEAD. The walk **must** be able
-   to load commit envelopes from both branches' namespaces — sibling
-   branches off `main` must work. The reference implementation builds a
-   union view that fans out through both `BranchedContentStore` ancestries;
-   equivalents are fine.
-5. **Fast-forward predicate.**
-   `fast_forward = (ancestor.commit_id == target_head)` when both heads
-   exist; `true` when both heads are absent; `false` otherwise.
-6. **Per-side walks.** `ahead.count` is the total number of commits on
-   `source` since `ancestor.t` (uncapped). `ahead.commits` is the same set,
-   capped at `max_commits`, **strictly newest-first by `t`**.
-   `truncated = count > commits.len()`. Same shape for `behind`.
-7. **Conflict computation.** When
+3. **Divergence by commit identity.** Each branch numbers its commits from
+   its own fork point, so `t` values from two branches are not comparable.
+   Compute each side's commits by identity: its line of first parents down
+   to the first commit the other side already holds. A side "holds" a commit
+   when it is on its own line, or when one of its merges brought that commit
+   in.
+
+   A merge commit whose merged-in history the other side already holds is
+   not one of the side's own changes. Keep only its flakes on keys the side
+   changed in an earlier commit of its own, which are how that merge
+   resolved the overlap. Its other flakes copy the other side's changes.
+   Applying them again brings back values that side has since replaced, and
+   comparing them reports conflicts on keys this side never touched.
+
+   `ancestor` is the most recent commit both sides hold. It lies on one
+   side's line, and reached the other through a merge; without such a merge
+   it is the fork point.
+
+   The walk **must** be able to load commit envelopes from both branches'
+   namespaces, so a merge between two branches off `main` works in either
+   direction. The reference implementation builds a union view that fans out
+   through both `BranchedContentStore` ancestries; equivalents are fine.
+4. **Fast-forward predicate.** `fast_forward` is `true` when the target's
+   head is on the source's line of first parents, which means the source
+   continues where the target left off. It is also `true` when both heads
+   are absent, and `false` otherwise. A target head the source holds only
+   through a merge is **not** a fast-forward: adopting the source's head
+   would replace the target's line with one on another clock, and the
+   target's `t` would fall.
+5. **Per-side walks.** `ahead.count` is the total number of commits rule 3
+   gives for `source` (uncapped). `ahead.commits` is the same set, capped at
+   `max_commits`, **newest-first**. `truncated = count > commits.len()`.
+   Same shape for `behind`.
+6. **Conflict computation.** When
    `include_conflicts == true && !fast_forward` and both heads exist:
-   - Walk both deltas: `(s, p, g)` tuples touched on each side since
-     `ancestor.t`.
+   - Take the `(s, p, g)` tuples each side's commits from rule 3 touched.
    - `conflicts.keys` is the intersection.
    - **Sort the intersection before truncating** — `HashSet::intersection`
      order is unspecified, and stable ordering matters for paginated UIs.
      Lexicographic by `(s, p, g)` is fine; what matters is that two
      requests against the same state return the same prefix.
    - `count` is the unbounded intersection size; `truncated = count > cap`.
-8. **Conflict details.** When `include_conflict_details == true`, populate
+7. **Conflict details.** When `include_conflict_details == true`, populate
    `conflicts.details` for the keys returned in `conflicts.keys` after
    truncation. Each detail includes `key`, `source_values`, `target_values`,
    and a `resolution` annotation for the requested `strategy`. The values are
@@ -886,10 +933,10 @@ These rules are not negotiable; the CLI and other clients depend on them:
    not apply the strategy. Use the same
    resolved flake tuple shape as `/show` (`[s, p, o, dt, op]`, optional
    metadata as a 6th item).
-9. **No mutations.** Implementations must not write to the nameservice,
+8. **No mutations.** Implementations must not write to the nameservice,
    advance any HEAD, copy commits between namespaces, or update any cache
    that downstream operations depend on.
-10. **Server-side cap is mandatory.** Even if a client sends
+9. **Server-side cap is mandatory.** Even if a client sends
    `max_commits=10000000`, clamp to a defensive limit. The reference
    server applies two layers: when no query param is present, it falls
    back to the recommended defaults (`500` for commits, `200` for
@@ -906,19 +953,23 @@ These rules are not negotiable; the CLI and other clients depend on them:
    and the per-summary `load_commit_by_id` reads (one full commit blob
    per summary). It does *not* bound the underlying divergence walk:
    `count` on each side reflects the unbounded divergence and is computed
-   by walking every commit envelope between HEAD and the ancestor.
+   by walking every commit envelope down to the commit the other side
+   holds.
    Likewise, conflict computation walks the full per-side delta when
    `include_conflicts=true`. If you need to refuse expensive previews,
    add a separate operational guard before invoking the walk (for
-   example, reject when `target.t - ancestor.t` exceeds some threshold)
+   example, reject when either side is more than some number of commits
+   ahead)
    or document that clients should pass `include_conflicts=false` for a
    cheaper preview.
-11. **Aggregate change set.** When `include_changes == true`, populate
+10. **Aggregate change set.** When `include_changes == true`, populate
    `changes` with the source side's `ancestor..source_head` flakes **netted
    per fact** — full fact identity is `(subject, predicate, object,
-   datatype, graph, language tag, list index)`; a fact survives only when
-   its oldest and newest in-range ops agree (net op = newest op), so
-   create-then-delete and delete-then-restore churn never appears. The set
+   datatype, graph, language tag, list index)`; each touched fact keeps its
+   **newest** in-range op, which is its state at the source head and what
+   the merge applies. Do not drop facts whose ops differ across the range:
+   a range that re-asserts a value it inherited and then deletes it must
+   report the deletion. The set
    is strategy-independent (raw source-vs-ancestor delta, before conflict
    resolution). `assert_count` / `retract_count` / `subject_count` are
    exact and unaffected by the cap. `entries` groups changes by subject,
@@ -935,6 +986,26 @@ These rules are not negotiable; the CLI and other clients depend on them:
    `include_changes=true` is a `400`. The source-side commit replay is
    shared with the conflict walk when both are requested; each pagination
    page re-pays the replay cost.
+11. **Validation.** When `include_validation == true` (the default) and
+   `!fast_forward`, stage the change set from rule 10, resolved under
+   `strategy` against the **uncapped** conflict set, onto the target's
+   current state and run the same validation (SHACL, uniqueness and the
+   config-group checks) `POST /merge` runs for that strategy. Report `validation: { conforms, report? }`, where
+   `report` is present only when `conforms == false` and is the message
+   the merge would fail with. `mergeable` is then
+   `strategy-applies && validation.conforms`; with
+   `include_validation=false` it is the strategy signal alone and
+   `validation` is absent. A fast-forward preview carries `validation`
+   only when the target's config enables SHACL or uniqueness, or the
+   commits it adopts carry config settings (a field the config reader reads, or a write to a config or txn-meta graph of this ledger), as only
+   then does the merge check them. Under
+   `strategy=abort` with conflicts the merge never reaches validation, so
+   `validation` is absent there too. This rule is what makes
+   `mergeable=true` mean "neither the strategy nor the shapes reject it"
+   rather than "no conflicts were reported"; commit-time conditions such
+   as novelty backpressure are outside it. Warn-mode graphs log and count
+   as conforming, matching transactions. This is still read-only
+   (rule 8).
 
 ### Response (`200 OK`)
 
@@ -962,6 +1033,7 @@ These rules are not negotiable; the CLI and other clients depend on them:
   "behind": { "count": 1, "commits": [], "truncated": false },
   "fast_forward": false,
   "mergeable": true,
+  "validation": { "conforms": true },
   "conflicts": {
     "count": 1,
     "keys": [{ "s": [100, "alice"], "p": [100, "status"], "g": null }],
@@ -1022,19 +1094,36 @@ When `include_conflict_details=false`, `conflicts.details` is omitted. When it
 is true, `source_values` and `target_values` are resolved flake tuples for the
 current asserted values in the same shape returned by `GET /show/*ledger`;
 `resolution` is a label only. `mergeable` is `false` when the chosen strategy
-would abort (currently `strategy=abort` with one or more conflicts). It is not
-full transaction validation for constraints that might fail during the real
-merge commit. `mergeable=true` does not guarantee a subsequent `POST /merge`
-will succeed; it only reflects the conflict/strategy interaction at preview
-time.
+would abort (currently `strategy=abort` with one or more conflicts) or, when
+`validation` is present, when the merged state fails the target's SHACL
+shapes (rule 11). With validation on, `mergeable=true` means neither the
+strategy nor the target's shapes will reject a subsequent `POST /merge`
+with the same strategy. It is not a promise the commit lands: novelty
+backpressure and other commit-time conditions still apply. With
+`include_validation=false` it reflects only the conflict/strategy
+interaction.
+
+### Response headers
+
+A successful export reports what it left out, so a client is not left inferring
+completeness from a `200`. Each header is present only when its count is
+non-zero, so a clean export carries none of them.
+
+| Header | Meaning |
+|--------|---------|
+| `x-fluree-export-named-graphs-omitted` | User-visible named graphs the ledger holds that this export did not cover — set when a dataset format ran without `all_graphs`. |
+| `x-fluree-export-annotations-unresolved` | Edge annotations that could not be represented and are **not** in the body. Re-request with `raw_reifies` to get them as `f:reifies*` triples. |
+| `x-fluree-export-annotations-out-of-scope` | Reifiers the body names with a `~ <r>` marker whose own properties this export does not contain. The annotation is usable only against a wider export. |
+| `x-fluree-export-rows-skipped` | Rows the writer could not represent (unresolvable predicate id, or a value that decoded to null). |
 
 ### Error responses
 
 | Status | When |
 |--------|------|
-| `400` | Source has no parent (e.g., `main`); `source == target`; unknown strategy; unsupported strategy; `include_conflict_details=true` with `include_conflicts=false`; `strategy=abort` with `include_conflicts=false`. Body must include `"no source branch"` or `"itself"` for the first two cases so the CLI's matcher works. |
+| `400` | Source has no parent (e.g., `main`) and `target` is omitted; `source == target`; unknown strategy; unsupported strategy; `include_conflict_details=true` with `include_conflicts=false`; `strategy=abort` with `include_conflicts=false`. Body must include `"no source branch"` or `"itself"` for the first two cases so the CLI's matcher works. |
 | `401` | Bearer required and absent/invalid. |
 | `404` | Ledger or branch does not exist; or the bearer cannot `can_read`. |
+| `409` | `BranchConflict` — the source's namespace allocations conflict with the target's. |
 | `5xx` | Storage / nameservice errors. |
 
 ### Reference implementation
@@ -1043,9 +1132,9 @@ time.
 |---------|-------------------|
 | HTTP route + auth | `fluree-db-server/src/routes/ledger.rs::merge_preview` |
 | Orchestration | `fluree-db-api/src/merge_preview.rs::merge_preview_with` |
-| Per-commit summary + DAG walk | `fluree-db-core/src/commit.rs::walk_commit_summaries` |
-| Common ancestor (dual-frontier BFS) | `fluree-db-core/src/commit.rs::find_common_ancestor` |
-| Delta-key computation | `fluree-db-novelty/src/delta.rs::compute_delta_keys` |
+| Per-commit summary | `fluree-db-core/src/commit.rs::commit_to_summary` |
+| Divergence by commit identity | `fluree-db-core/src/commit.rs::diff_branches` |
+| Delta-key computation | `fluree-db-novelty/src/delta.rs::delta_keys_of` |
 
 Validate compatibility by running `fluree branch diff dev --target feature
 --remote your-remote --json` against your server and diffing the response
@@ -1136,6 +1225,7 @@ The body type mirrors `fluree-db-server::routes::ledger::CreateBranchRequest`.
 | `ledger` | string | Yes | — | Ledger name without branch suffix. |
 | `branch` | string | Yes | — | New branch name. Must pass `validate_branch_name`. |
 | `source` | string | No | `"main"` | Parent branch to fork from. The source must already exist and have at least one commit. |
+| `at` | string | No | source HEAD | Point on the source to branch at, sent as typed to `--at`. The server parses it with `TimeSpec::parse_at`, the grammar local `--at` uses: `t:<N>`, `time:<ISO-8601>` / `iso:`, `recorded:<ISO-8601>`, `commit:<prefix>`, `latest`, or a bare transaction number, timestamp, hex prefix or CID. |
 
 ### Auth
 
@@ -1169,9 +1259,9 @@ The CLI's pretty-printer (`print_branch_created` in
 
 | Status | When |
 |--------|------|
-| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body. |
+| `400` | Invalid branch name (per `validate_branch_name`); malformed JSON body; malformed `at`; the source branch has no commits yet (`ApiError::InvalidBranch`); `at` names no commit on the source (a time before its first commit, a malformed timestamp, a transaction number below 1, `snapshot:<id>`). |
 | `401` / `403` | Admin token required and absent/invalid (see admin-auth middleware). |
-| `404` | Source branch does not exist. |
+| `404` | Source branch does not exist, or `at` names a commit that is not on the source's line. |
 | `409` | A branch with this name already exists (`ApiError::LedgerExists` → 409). |
 | `5xx` | Nameservice / storage / index-copy errors. |
 
@@ -1360,24 +1450,21 @@ The reference server's `Fluree::drop_named_graph`:
    - the default graph (empty / `g_id == 0`),
    - the `txn-meta` graph (`urn:fluree:{ledger_id}#txn-meta`, `g_id == 1`),
    - the `config` graph (`urn:fluree:{ledger_id}#config`, `g_id == 2`).
-3. **Resolves** `graph` against the snapshot's `GraphRegistry`. An unknown
-   IRI returns `404` rather than silently registering a new graph slot.
-4. **Stages and commits** a SPARQL UPDATE equivalent to
-   `DELETE { GRAPH <iri> { ?s ?p ?o } } WHERE { GRAPH <iri> { ?s ?p ?o } }`
-   through the same pipeline used by user updates. This produces one new
-   commit at `t = current_t + 1` whose flakes are retractions only.
-5. **Reports a no-op** (`committed: false`, `retracted: 0`) when the graph
-   was already empty — no new commit is created.
+3. **Resolves** `graph` against the snapshot's `GraphRegistry`. A graph
+   that does not exist, a dropped one included, returns `404`.
+4. **Stages and commits** SPARQL `DROP GRAPH <iri>` through the same
+   pipeline used by user updates: one new commit at `t = current_t + 1`
+   that records the drop and retracts nothing.
 
 Key properties:
 
-- **History preserving.** A query `as-of` an earlier `t` still sees every
-  triple that was previously asserted in the graph.
+- **Takes the history.** Nothing the graph held is queryable afterwards; a
+  query naming it as of a `t` before the drop is refused. The commits keep
+  the facts, so a branch created before the drop has them.
 - **Per-branch scope.** Drops only affect the branch in `ledger`. Sibling
   branches that share the same graph IRI are not touched.
-- **Registry stable.** The graph IRI keeps its `g_id`; a subsequent
-  insert into the same IRI lands in the same logical graph rather than a
-  new slot.
+- **Same IRI, fresh graph.** A later write to the IRI starts the graph
+  afresh, holding only what is written from then on.
 
 ### Response (`200 OK`)
 
@@ -1385,7 +1472,7 @@ Key properties:
 {
   "ledger_id": "mydb:main",
   "graph_iri": "urn:example:org/payroll",
-  "retracted": 42,
+  "retracted": 0,
   "committed": true,
   "t": 18
 }
@@ -1395,13 +1482,12 @@ Key properties:
 |-------|------|-------|
 | `ledger_id` | string | Normalized `ledger:branch` identifier the drop targeted. |
 | `graph_iri` | string | Graph IRI that was dropped (echoed). |
-| `retracted` | integer | Number of flakes retracted by the drop commit. `0` when the graph was already empty. |
-| `committed` | bool | `true` when a new commit was produced; `false` for a no-op drop on an empty graph. |
-| `t` | integer | Current commit `t` for the branch after the drop. Equal to the pre-drop `t` when `committed` is `false`. |
+| `retracted` | integer | Always `0`: a drop retracts nothing. Kept for clients that read it. |
+| `committed` | bool | `true`: the drop commits. A server whose drop retracts the graph's facts reports `false` for an empty graph, and the CLI prints that as a no-op. |
+| `t` | integer | Commit `t` of the drop. |
 
 The CLI's `fluree graph drop` printer (`commands/graph.rs`) reads
-`ledger_id`, `graph_iri`, `retracted`, `committed`, and `t` — populate
-them all.
+`ledger_id`, `graph_iri`, `committed`, and `t` — populate them all.
 
 ### Error responses
 
@@ -1409,8 +1495,8 @@ them all.
 |--------|------|
 | `400` | `graph` is empty, has whitespace or any IRI-excluded character, lacks a `<scheme>:<rest>` head (relative reference), or names a system graph (default, `txn-meta`, `config`); malformed JSON body. |
 | `401` / `403` | Admin token required and absent/invalid. |
-| `404` | Ledger does not exist; or `graph` is not registered in the ledger's graph registry. |
-| `5xx` | Storage / nameservice / commit-write errors during the retract commit. |
+| `404` | Ledger does not exist; or `graph` does not exist in it. |
+| `5xx` | Storage / nameservice / commit-write errors during the drop commit. |
 
 ### Reference implementation
 
@@ -1437,10 +1523,11 @@ Content-Type: application/json
 
 | Parameter | Required | Description |
 |-----------|----------|-------------|
-| `graph` (query) | Yes | Full **absolute** IRI of the target named graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address named graphs itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `graph` (query) | No | Full **absolute** IRI of the target named graph; absent means the default graph (same validation rules as `/drop-graph`'s `graph`). The sync scope is exactly this graph — the payload must not address any other graph itself, and the ledger's `txn-meta` / `config` system graphs are rejected. |
+| `default` (query) | No | Bare key: sync the default graph, said explicitly. Passing it with `graph` is a `400`. The CLI omits `graph` for the default graph. |
 | `dryRun` (query) | No | `true` → stage and report the delta; commit nothing. |
-| `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
-| body | Yes | Insert-shaped JSON-LD describing the graph's desired full contents. The CLI always sends JSON-LD (Turtle is converted client-side). Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
+| `allowEmpty` (query) | No | `true` → accept an explicitly empty payload (`[]` or `"@graph": []`), which clears the graph. Without it an empty payload is a `400`. |
+| body | Yes | The graph's desired full contents: insert-shaped JSON-LD, or Turtle / N-Triples / TriG by `Content-Type` (see [Payload formats](../transactions/sync.md#payload-formats)). The CLI sends Turtle as `text/turtle` and TriG as `application/trig`, converting Turtle to JSON-LD client-side only when a server that predates RDF bodies refuses it (a `415`, or v4.2.0 / v4.2.1's `400`). Policy headers / `opts` injection follow the [Policy Enforcement Contract](#policy-enforcement-contract). |
 
 ### Auth
 
@@ -1491,7 +1578,7 @@ runs, so scripts consume either path identically.
 
 | Status | When |
 |--------|------|
-| `400` | missing `graph`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; payload addressing named graphs; non-JSON body (Turtle/TriG are not accepted here) |
+| `400` | both `graph` and `default`; malformed / relative graph IRI; system-graph target; empty payload without `allowEmpty`; JSON-LD payload addressing named graphs; TriG block naming a graph other than `graph`; TriG default-graph triples beside a block; unparseable body |
 | `401` / `403` | per the policy contract |
 | `404` | unknown ledger |
 
@@ -1533,9 +1620,12 @@ HEAD, detecting and resolving conflicts according to `strategy`. The branch's
 own `source_branch` (from its nameservice record) is the rebase target — there
 is no `target` field in the request.
 
-- If the branch is already up-to-date with its source (`branch_head == ancestor`),
-  the operation is a fast-forward: the branch's HEAD is advanced to the source
-  HEAD with no replay, and `fast_forward: true` is returned.
+- If the branch has no commits of its own to replay, the operation is a
+  fast-forward: the branch's HEAD is advanced to the source HEAD with no
+  replay, and `fast_forward: true` is returned. A branch that merged its
+  source in earlier still has commits of its own, so it is not a
+  fast-forward. That merge is replayed among them, carrying only its
+  resolution, per the divergence rules under `POST /merge`.
 - If `strategy == "abort"` and **any** branch commit conflicts with the source
   delta, the rebase aborts up-front with `409 BranchConflict`. No commits are
   written.
@@ -1612,8 +1702,8 @@ Content-Type: application/json
 | Field | Type | Required | Server default | Description |
 |-------|------|----------|----------------|-------------|
 | `ledger` | string | Yes | — | Ledger name without branch suffix. |
-| `source` | string | Yes | — | Branch to merge **from**. Must have at least one commit and a `source_branch`. |
-| `target` | string | No | `source.source_branch` | Branch to merge **into**. Defaults to the source's parent branch. Must not equal `source`. |
+| `source` | string | Yes | — | Branch to merge **from**. Must have at least one commit. It needs a `source_branch` only when `target` is omitted. |
+| `target` | string | No | `source.source_branch` | Branch to merge **into**. Defaults to the branch the source was created from. Any branch may be the target, `main` included, and any branch may be the source when this is given. Must not equal `source`. |
 | `strategy` | string | No | `"take-both"` | One of `take-both`, `abort`, `take-source`, `take-branch`. Parsed by `ConflictStrategy::from_str_name`. |
 
 ### Auth
@@ -1623,14 +1713,21 @@ Admin-protected (same bracket as `/branch`, `/drop-branch`, `/rebase`,
 
 ### Behavior
 
-- Computes the common ancestor between `source` HEAD and `target` HEAD using
-  a `BranchedContentStore` so sibling branches off `main` work.
-- If `target` HEAD == ancestor, performs a **fast-forward merge**: copies the
-  source's unique commit blobs into the target's namespace and advances the
-  target HEAD. No conflict resolution runs. `fast_forward: true` is reported.
-- Otherwise, performs a **general merge**: stages the union of source and
-  target deltas, resolves overlapping `(s, p, g)` keys via `strategy`, and
-  writes a single new commit on the target. `fast_forward: false` is
+- Diffs the two branches by commit identity, reading through both branches'
+  namespaces so a merge in any direction works. See rules 3 and 4 of the
+  [merge preview contract](#merge-preview-contract), which `/merge` and
+  `/merge-preview` share.
+- If the target's HEAD is on the source's line of first parents, performs a
+  **fast-forward merge**: copies the source's commits the target lacks into
+  the target's namespace and advances the target HEAD. No conflict
+  resolution runs. `fast_forward: true` is reported. A target HEAD the
+  source holds only through a merge is not a fast-forward.
+- Otherwise, performs a **general merge**: folds the source's commits since
+  the divergence, resolves keys both sides changed via `strategy`, and
+  writes a single new commit on the target. The fold includes merges the
+  source itself made, because such a commit carries how that merge was
+  resolved. A merge that brought the target in contributes only that
+  resolution, since its other flakes copy the target's own changes. `fast_forward: false` is
   reported. If `strategy == "abort"` and conflicts exist, the merge fails
   with `409 BranchConflict` and the target is rolled back to its
   pre-merge nameservice snapshot.
@@ -1894,10 +1991,20 @@ The same handshake optionally accepts **raw source data** — the formats `flure
 
 - **Discovery:** add `"source-upload"` to `import.modes` and advertise `import.source_formats` (the reference server lists `ttl/nt/nq/trig/jsonld/json/jsonl/ndjson` — each optionally `.gz`/`.zst` — plus `csv/cypher/cyp/cql`). The CLI checks `source-upload` before attempting; absent it, `--remote --from <non-flpack>` errors with a `.flpack` fallback hint.
 - **Mint:** `"source_kind": "source"` (default `"flpack"`) plus `"filename"` (its extension drives format detection; the staged object must keep it). CSV/Cypher uploads may also send `"edge_properties": "annotated"|"plain"|"nary"` and `"base_iri"`; the CLI forwards its corresponding create flags. Reject unsupported extensions, option values, and missing filenames with `400`.
+- **Blank nodes:** a single-file import mints blank-node ids from a salt (the ledger id by default) and the file's name. Import the staged file under the last component of `"filename"` so the ids match a direct import of the same file. A mint may carry `"skolem_namespace"` to replace the salt, as `--skolem-namespace` does; advertise `"source-upload-skolem"` when you honor it. The CLI refuses to send the option to a server without that mode, since an ignored salt changes every blank node's id.
 - **Complete:** run the bulk-import pipeline over the staged file (converting CSV/Cypher to JSON-LD shards first) in the same async worker slot as a restore. On success, `result` is `{ kind: "bulk-import", ledger_id, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`.
 - **Raft caveat:** the pipeline publishes nameservice heads directly and repeatedly, outside any replicated write log — do not offer `source-upload` on consensus-replicated deployments (the reference server omits the mode and 400s the mint).
 
-Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::run_remote_source_import`.
+#### Into a new graph of an existing ledger
+
+A source upload may instead fill a new named graph of an existing ledger, which backs `fluree graph import <iri> --from <file>` against a server.
+
+- **Discovery:** add `"source-upload-graph"` to `import.modes` alongside `"source-upload"`. The CLI checks it before uploading: a server that ignores an unknown `"graph"` field would create a ledger instead.
+- **Mint:** `"graph": "<iri>"` with `"source_kind": "source"`; `"ledger"` names the existing ledger. Reject `"graph"` on a `.flpack` mint, the default graph and the ledger's system graphs with `400`, and a ledger that does not exist with `404`, before the upload.
+- **Complete:** run `Fluree::import_into_graph(ledger, graph).import(path)` rather than `create`. On success, `result` is `{ kind: "graph-import", ledger_id, graph: { iri, g_id, base_t }, t, flake_count, commit_head_id, root_id, index_t, has_annotations }`, where the import's commits run from `base_t + 1` to `t`. A graph the ledger already has, or a source that names graphs of its own (TriG, N-Quads), fails the job with nothing written; a graph the ledger dropped is filled afresh. One failure leaves the import in the ledger: `ImportError::PublishedWithoutIndex`, an index publish that failed after the import's commits were published. Its message says so; report it as is, not as an import that wrote nothing.
+- No reindex follows an annotated graph: it would rebuild the whole ledger's index. `has_annotations: true` tells the client the ledger's annotation index waits for one.
+
+Canonical locations: conversion helpers `fluree-db-api/src/import_source.rs`; the `complete` branch `fluree-db-server/src/routes/import.rs::run_source_import`; CLI side `fluree-db-cli/src/commands/create.rs::upload_source_import`, called by `run_remote_source_import` and `fluree-db-cli/src/commands/graph.rs`.
 
 ## Storage Proxy Contract
 
@@ -2011,6 +2118,7 @@ Content-Type: application/json
 {
   "format": "turtle",
   "all_graphs": false,
+  "system_graphs": false,
   "graph": "http://example.org/people",
   "context": { "ex": "http://example.org/" },
   "at": "t:42"
@@ -2020,12 +2128,16 @@ Content-Type: application/json
 | Field | Type | Required | Server default | Description |
 |-------|------|----------|----------------|-------------|
 | `format` | string | No | `"turtle"` | One of: `turtle`/`ttl`, `ntriples`/`nt`, `nquads`/`n-quads`, `trig`, `jsonld`/`json-ld`/`json`. Case-insensitive. |
-| `all_graphs` | bool | No | `false` | Export every named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. |
+| `all_graphs` | bool | No | `false` | Export every user-visible named graph as a dataset. Requires `format` ∈ `trig` / `nquads`. Mutually exclusive with `graph`. The ledger's system graphs (`#txn-meta`, `#config`) are excluded. |
+| `system_graphs` | bool | No | `false` | Also emit the system graphs under `all_graphs`. Diagnostic only — the result is named for the source ledger and does not re-import cleanly. |
+| `raw_reifies` | bool | No | `false` | Emit edge annotations as raw `f:reifies*` triples instead of RDF 1.2 annotation syntax. The escape hatch the `x-fluree-export-annotations-unresolved` header points at, and the way to keep pre-4.2 bytes. |
 | `graph` | string | No | — | IRI of a single named graph to export. Mutually exclusive with `all_graphs`. |
 | `context` | object | No | ledger default | Prefix map for Turtle/TriG/JSON-LD output. Either a bare object (`{ "ex": "..." }`) or `{ "@context": {...} }`. Falls back to the ledger's stored default context when absent. |
-| `at` | string | No | latest | Time spec — integer (`"42"`), ISO-8601 datetime (`"2026-01-15T10:30:00Z"`), or commit CID prefix (`"bafy…"`). Identical to the local `--at` flag. |
+| `at` | string | No | latest | Time spec — `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time; `iso:<ISO-8601>` is an alias, and the spelling the CLI sends), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. Identical to the local `--at` flag. |
 
 An empty body is accepted and treated as all-default (Turtle export at HEAD).
+
+**Breaking change in 4.2.** Response bodies now carry RDF 1.2 annotation syntax for edge annotations — `s p o ~ <r>` in Turtle and TriG, a triple term under `rdf:reifies` in N-Triples and N-Quads, `@annotation` in JSON-LD — where previous versions emitted the underlying `f:reifies*` triples. A consumer that parsed those triples directly will not find them. Set `raw_reifies` to keep the old bytes.
 
 ### Auth
 
@@ -2062,24 +2174,38 @@ stream chunked bodies; clients MUST be prepared to read until EOF.
 2. **Dataset/format coupling.** When `all_graphs == true`, `format` must be
    `trig` or `nquads`; otherwise return `400` with a message that mentions
    the dataset format requirement (the local CLI surfaces the same error).
-3. **Time spec parsing.** Same rules as the merge-preview / show
-   contracts: parse as integer first (`t`), then as ISO-8601 if it
-   contains both `-` and `:`, else as a commit CID prefix.
+   `system_graphs == true` without `all_graphs` is also a `400`: it selects
+   nothing on its own.
+3. **Time spec parsing.** Accept the tagged forms `t:<N>`, `t:latest`,
+   `time:<ISO-8601>`, `iso:<ISO-8601>` (an alias of `time:`, and the spelling
+   the CLI sends, so servers that predate `time:` keep working),
+   `recorded:<ISO-8601>` and `commit:<hex-prefix>` (min 6 characters) — the
+   same grammar a ledger address carries after `@`, minus the `@`. For
+   compatibility also accept three untagged forms, tried in this order:
+   `latest`; a bare integer (a `t`); a string containing `-` (an ISO-8601
+   timestamp or date); anything else as a commit hex-digest prefix.
+   A string beginning with a tag is never reinterpreted as an untagged form —
+   `"t:abc"` is a malformed `t:`, so return `400` rather than looking up a
+   commit prefix named `t:abc`. Note that a bare integer resolves to a `t`
+   even when it is also a valid hex prefix; `commit:` forces the other
+   reading. The merge-preview / show contracts take the same spellings
+   wherever the two grammars overlap, but name a *commit*, so they have no
+   `time:`, `recorded:` or `latest` forms.
 4. **Graph IRI resolution.** When `graph` is set, resolve via the ledger's
    graph registry; an unknown IRI is a `400` (or `5xx` if you treat it as
    a config error — the reference returns `400` via `ApiError::Config`).
-5. **Index requirement.** Export reads from the binary index. If the
-   ledger has no index, the reference server surfaces `ApiError::Config`
-   ("no binary index available for export (is the ledger indexed?)"),
-   which the error mapper returns as `400 Bad Request`. Document that
-   shape if you implement equivalently — the CLI surfaces the message
-   verbatim.
+5. **Index requirement.** None. Export reads the binary index where one
+   exists and the novelty overlay for everything committed since, so a
+   never-indexed ledger exports the same triples. Earlier reference
+   servers returned `ApiError::Config` ("no binary index available for
+   export (is the ledger indexed?)") as `400 Bad Request` in that case;
+   that response no longer occurs and a client must not depend on it.
 
 ### Error responses
 
 | Status | When |
 |--------|------|
-| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; unknown graph IRI; malformed JSON; ledger not indexed. |
+| `400` | Unknown format; conflicting `all_graphs` + `graph`; `all_graphs` with non-dataset format; `system_graphs` without `all_graphs`; unknown graph IRI; malformed JSON. |
 | `401` / `403` | Admin token required and absent/invalid. |
 | `404` | Ledger does not exist. |
 | `5xx` | Storage / nameservice / encoding errors during walk. |
@@ -2262,22 +2388,45 @@ Existing endpoint, extended with graph source fallback. Request body is unchange
 
 Creates an Iceberg graph source with an R2RML mapping that defines how table rows become RDF triples. This is a write operation and should be admin-protected (same middleware as `/create` and `/drop`).
 
-**Request body fields:**
+The CLI sends the connection **structured**: `catalog` and `io` objects exactly as the stored config spells them (see [Iceberg connection](../api/endpoints.md#iceberg-connection)), built by the same conversion its local `map` uses, so a remote and a local map store the same record. A server must also keep accepting the legacy flat fields below from other clients, through one converter, and must refuse a body that mixes the two forms. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+
+```json
+{
+  "name": "warehouse-orders",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://polaris.example.com/api/catalog",
+    "catalog_type": "polaris",
+    "warehouse": "my-warehouse",
+    "auth": { "type": "bearer", "token": { "env_var": "POLARIS_TOKEN" } }
+  },
+  "io": { "vended_credentials": true, "s3_path_style": false }
+}
+```
+
+**Legacy flat request body fields:**
 
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `name` | string | Yes | Graph source name (no colons) |
-| `mode` | string | No | `"rest"` (default) or `"direct"` |
+| `mode` | string | No | `"rest"` (default), `"direct"`, `"glue"` (AWS Glue Data Catalog), or `"s3tables"` (AWS S3 Tables); case-insensitive |
 | `catalog_uri` | string | REST mode | REST catalog URI |
-| `table` | string | No | Table identifier (`namespace.table`); required for REST mode if not specified in R2RML mapping |
-| `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`) |
-| `r2rml` | string | Yes | R2RML mapping source (storage address or path) |
-| `r2rml_type` | string | No | Mapping media type (e.g., `"text/turtle"`); inferred from extension |
+| `table` | string | No | Table identifier (`namespace.table`; for Glue, `<database>.<table>`). The R2RML mapping's `rr:tableName` entries name the tables |
+| `table_location` | string | Direct mode | S3 URI (`s3://bucket/path/to/table`), or a `file://` URI / absolute local path under `FLUREE_ICEBERG_LOCAL_ROOTS` |
+| `region` | string | No | AWS region of the Glue / S3 Tables API (Glue and S3 Tables modes) |
+| `catalog_id` | string | No | Glue catalog id for cross-account access (Glue mode; default: the caller's account) |
+| `table_bucket_arn` | string | S3 Tables mode | S3 Tables table-bucket ARN (`arn:aws:s3tables:<region>:<account>:bucket/<name>`) |
+| `r2rml` | string | Yes | Inline R2RML mapping content (Turtle). A request without it is a 400 and registers nothing |
+| `r2rml_type` | string | No | Mapping media type; default `"text/turtle"` (JSON-LD mappings are not supported yet) |
 | `branch` | string | No | Branch name (default: `"main"`) |
-| `auth_bearer` | string | No | Bearer token for REST catalog auth |
+| `auth_bearer` / `auth_bearer_env` | string | No | Bearer token for REST catalog auth, or the name of a listed server environment variable holding it |
 | `oauth2_token_url` | string | No | OAuth2 token endpoint |
-| `oauth2_client_id` | string | No | OAuth2 client ID |
-| `oauth2_client_secret` | string | No | OAuth2 client secret |
+| `oauth2_client_id` | string | No | OAuth2 client ID (default: empty) |
+| `oauth2_client_secret` / `oauth2_client_secret_env` | string | No | OAuth2 client secret, or a listed variable holding it |
+| `oauth2_scope`, `oauth2_audience` | string | No | OAuth2 scope and audience |
+| `auth_google_metadata`, `auth_google_scopes` | boolean, string | No | The GCE/GKE metadata server's identity, and its scopes |
 | `warehouse` | string | No | Warehouse identifier (REST mode) |
 | `no_vended_credentials` | boolean | No | Disable vended credentials (default: `false`) |
 | `s3_region` | string | No | S3 region override |
@@ -2286,10 +2435,27 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 
 **Validation rules:**
 - `name` must not be empty or contain `:`
-- `r2rml` is required (defines how table rows become RDF triples)
+- `r2rml` must parse and compile as an R2RML mapping (it defines how table rows become RDF triples); its table and column names are not checked against the tables here (see [Iceberg → Schema Mismatch](../graph-sources/iceberg.md#schema-mismatch))
+- `mode` must be one of `rest`, `direct`, `glue`, `s3tables` (any case)
 - REST mode requires `catalog_uri`; requires `table` unless specified in R2RML mapping's `rr:tableName`
-- Direct mode requires `table_location` (must start with `s3://` or `s3a://`)
-- OAuth2 fields must all be provided together (url + id + secret)
+- Direct mode requires `table_location`: an `s3://` / `s3a://` URI, or a `file://` URI or absolute local path, which is accepted only under a root listed in `FLUREE_ICEBERG_LOCAL_ROOTS` (see [Enabling local tables](../graph-sources/iceberg.md#enabling-local-tables))
+- Glue mode requires `table` unless specified in R2RML mapping's `rr:tableName`; `region` and `catalog_id` are optional
+- S3 Tables mode requires `table_bucket_arn` (a well-formed S3 Tables bucket ARN, any AWS partition) and `table` unless specified in R2RML mapping's `rr:tableName`; a `region` that contradicts the ARN's region is refused
+- `region` and `s3_region` must be AWS region codes (e.g. `us-east-1`) in Glue and S3 Tables modes
+- Glue and S3 Tables modes read with the server's ambient AWS credentials; vended credentials are turned off for them
+- OAuth2 needs `oauth2_token_url` and the client secret; any OAuth2 field without both is refused (400), not ignored
+- One way to authenticate: a bearer beside OAuth2 or a Google identity is refused (400), as is a literal beside its `_env` variable
+- An unknown field, inside the structured objects too, is refused (400, `err:api/InvalidGraphSourceConfig`), as is a variable not listed in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`
+
+**Stored connections and mappings (optional):** a remote that stores catalog connections and R2RML mappings under ids of its own can take them by reference. With `--stored-catalog <ID>` / `--stored-mapping <ID>`, the CLI sends `stored_catalog_id` / `stored_mapping_id` in place of the connection (and, for a stored mapping, of `r2rml` / `r2rml_type`). Beside a reference the body carries only `name`, `table`, `branch`, `model`, `default_allow`, and `r2rml` / `r2rml_type` when the mapping is not stored. It never carries `catalog`, `io`, `mode` or any flat connection or auth field:
+
+```json
+{ "name": "warehouse-orders", "stored_mapping_id": "<mapping-id>" }
+{ "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "table": "sales.orders", "r2rml": "@prefix rr: ...", "r2rml_type": "text/turtle" }
+{ "name": "warehouse-orders", "stored_catalog_id": "<catalog-id>", "stored_mapping_id": "<mapping-id>", "table": "sales.orders" }
+```
+
+A stored mapping implies its connection, and `table` defaults to its first table. With `stored_catalog_id` and an inline `r2rml`, `table` is required. As with an inline connection, a mapping is required: the CLI refuses `stored_catalog_id` without `r2rml` or `stored_mapping_id`. The CLI does not ask whether a server supports references. A server that does not, such as the Fluree server, refuses the request and registers nothing: a body without `r2rml` lacks the mapping it requires, and one with `r2rml` carries a field it does not know. A `400`, `404` or `422` to a by-reference request is shown with the server's message and a hint that covers both causes: a remote without stored connections or mappings, or an id that names nothing it has. Ids are trimmed before they are sent.
 
 **Example — REST catalog with R2RML:**
 
@@ -2299,7 +2465,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
   "mode": "rest",
   "catalog_uri": "https://polaris.example.com/api/catalog",
   "table": "sales.orders",
-  "r2rml": "mappings/orders.ttl",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "auth_bearer": "my-token",
   "warehouse": "my-warehouse"
 }
@@ -2312,7 +2478,7 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
   "name": "airlines",
   "mode": "rest",
   "catalog_uri": "https://polaris.example.com/api/catalog",
-  "r2rml": "mappings/airlines.ttl",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "auth_bearer": "my-token"
 }
 ```
@@ -2324,8 +2490,20 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
   "name": "execution-log",
   "mode": "direct",
   "table_location": "s3://bucket/warehouse/logs/execution_log",
-  "r2rml": "mappings/execution_log.ttl",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ...",
   "s3_region": "us-east-1"
+}
+```
+
+**Example — AWS Glue Data Catalog:**
+
+```json
+{
+  "name": "warehouse-orders",
+  "mode": "glue",
+  "region": "us-east-1",
+  "table": "sales.orders",
+  "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . ..."
 }
 ```
 
@@ -2335,16 +2513,22 @@ Creates an Iceberg graph source with an R2RML mapping that defines how table row
 |-------|------|---------|-------------|
 | `graph_source_id` | string | Always | Created ID (e.g., `"warehouse-orders:main"`) |
 | `table_identifier` | string | Always | Table identifier or derived from location |
-| `catalog_uri` | string | Always | Catalog URI or S3 location |
-| `connection_tested` | boolean | Always | Whether catalog connection was verified (always `false` for direct mode) |
-| `mapping_source` | string | Always | R2RML mapping source |
+| `catalog_uri` | string | Always | REST catalog URI, Direct table location, Glue catalog id (`aws-glue` for the caller's own account), or S3 Tables bucket ARN |
+| `connection_tested` | boolean | Always | Whether every table the mapping names loaded at registration, the way a query loads it: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata (Direct) |
+| `connection_check` | object | Always | What that check found: an `outcome` (`verified`, `table_failed`, `catalog_unreachable`, `client_failed`, `timed_out`, `no_tables`) and its fields; see [`POST /iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) |
+| `mapping_source` | string | Always | Content address of the stored R2RML mapping |
 | `triples_map_count` | integer | Always | Number of TriplesMap definitions found |
+| `table_count` | integer | Always | Number of distinct tables the mapping reads |
+| `table_names` | string[] | Always | Those tables, sorted |
 | `mapping_validated` | boolean | Always | Whether mapping was parsed and compiled successfully |
+| `diagnostics` | object[] | When non-empty | Advisories about the mapping, each `{severity, code, table?, column?, message}`: a `keylessMap` per triples map no key proves subject-unique (see [`POST /iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap)). The CLI prints each on standard error |
 
 **Error responses:**
-- `400 Bad Request` — validation failures (missing fields, invalid mode, bad table identifier)
+- `400 Bad Request` — validation failures (missing fields, `r2rml` among them; invalid mode, bad table identifier, an `r2rml` that does not parse or compile, or that defines no `rr:TriplesMap`)
 - `409 Conflict` — graph source with this name already exists (if your nameservice enforces uniqueness)
-- `500 Internal Server Error` — catalog connection failure, mapping load failure, nameservice write failure
+- `500 Internal Server Error` — nameservice write failure
+
+The check reads table metadata only and stops after 10 s. A table that cannot be loaded in that time does not fail the request: the source is created and the response carries `connection_tested: false`. Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`).
 
 ### Querying graph sources
 
@@ -2410,7 +2594,7 @@ WHERE {
 
 **How it works:** When the `iceberg` feature is compiled, `query_from()` and `graph().query()` automatically call `.with_r2rml()`, which constructs a `FlureeR2rmlProvider` that can resolve graph source names to R2RML mappings and route triple patterns through the Iceberg scan engine. The `NameService` trait requires `GraphSourceLookup` (read-only graph source discovery), so graph source resolution is always available at the nameservice layer.
 
-**Known limitation:** `FROM <ledger>, <graph-source>` with bare WHERE patterns (no GRAPH wrapper) — the graph source participates in the dataset but bare triple patterns only scan native indexes. Use explicit `GRAPH <gs:main> { ... }` for the graph source part in mixed-source queries.
+A graph source cannot share the default graph with a ledger: `FROM <ledger> FROM <graph-source>` is refused with an error naming the form that works. Name the graph source with `FROM NAMED <gs:main>` and read it inside `GRAPH <gs:main> { ... }`.
 
 ### Authentication
 

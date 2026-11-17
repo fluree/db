@@ -16,14 +16,16 @@
 pub enum CollectionStyle {
     /// Object-position collections become indexed
     /// [`emit_list_item`](fluree_graph_ir::GraphSink::emit_list_item) events
-    /// on the enclosing subject/predicate, and an object-position `()` emits
-    /// nothing.
+    /// on the enclosing subject/predicate. An object-position `()` is the
+    /// IRI `rdf:nil` and emits that one triple, exactly as if `rdf:nil` had
+    /// been written out (issue #1694 — it used to emit nothing, silently
+    /// losing the statement).
     ///
     /// This is Fluree's storage shape — a list is metadata on the edge, not a
-    /// chain of blank nodes — and it is lossy as RDF: the W3C-defined three
-    /// triples of a one-item collection arrive as one event, and the empty
-    /// collection's `rdf:nil` triple is dropped entirely. Subject-position
-    /// collections are unaffected; they have always emitted a spine.
+    /// chain of blank nodes — and it is lossy as RDF for non-empty
+    /// collections: the W3C-defined three triples of a one-item collection
+    /// arrive as one event. Subject-position collections are unaffected;
+    /// they have always emitted a spine.
     #[default]
     IndexedItems,
 
@@ -33,9 +35,10 @@ pub enum CollectionStyle {
     /// Turtle suite tests.
     ///
     /// In this mode a collection has a single object term (the spine head),
-    /// so an RDF 1.2 annotation may follow one — the deferral that applies in
-    /// [`CollectionStyle::IndexedItems`] exists only because indexed items
-    /// leave nothing to reify.
+    /// so an RDF 1.2 annotation may follow one — the deferral that applies to
+    /// non-empty collections in [`CollectionStyle::IndexedItems`] exists only
+    /// because indexed items leave nothing to reify. (`()` is a single term —
+    /// `rdf:nil` — in both styles, and annotations on it work in both.)
     Spine,
 }
 
@@ -58,6 +61,21 @@ pub enum NumericStyle {
     PreserveLexical,
 }
 
+/// What a relative IRI reference means when no `@base` is in force.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RelativeIris {
+    /// Resolve against the base; with no base, a relative reference is a
+    /// parse error (RFC 3986 §5.1): it cannot identify a node on its own.
+    #[default]
+    Resolve,
+    /// With no base in force, keep a relative reference exactly as written.
+    /// Fluree names a ledger by its id, and an id such as
+    /// `org/governance:main` is a relative reference (the `/` comes before
+    /// the `:`), so ledger configuration (`f:ledger <org/governance:main>`)
+    /// writes one as an IRI. A base, when in force, still resolves.
+    Verbatim,
+}
+
 /// Conformance knobs for the Turtle parser.
 ///
 /// The default is today's ingest behavior in every field; opting in is
@@ -69,6 +87,8 @@ pub struct ParserOptions {
     pub collections: CollectionStyle,
     /// How numeric literals reach the sink.
     pub numerics: NumericStyle,
+    /// What a relative IRI reference means when no base is in force.
+    pub relative_iris: RelativeIris,
 }
 
 impl ParserOptions {
@@ -84,6 +104,7 @@ impl ParserOptions {
         Self {
             collections: CollectionStyle::Spine,
             numerics: NumericStyle::PreserveLexical,
+            relative_iris: RelativeIris::Resolve,
         }
     }
 
@@ -96,6 +117,12 @@ impl ParserOptions {
     /// Set the numeric style.
     pub fn with_numerics(mut self, numerics: NumericStyle) -> Self {
         self.numerics = numerics;
+        self
+    }
+
+    /// Set what a relative IRI reference means with no base in force.
+    pub fn with_relative_iris(mut self, relative_iris: RelativeIris) -> Self {
+        self.relative_iris = relative_iris;
         self
     }
 }

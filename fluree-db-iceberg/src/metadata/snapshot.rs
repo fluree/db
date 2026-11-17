@@ -160,15 +160,51 @@ pub fn select_snapshot<'a>(
         SnapshotSelection::SnapshotId(id) => metadata.snapshot(*id),
 
         SnapshotSelection::AsOfTime(timestamp_ms) => {
-            // Find the most recent snapshot with timestamp <= target
-            // This implements "as of time" semantics
-            metadata
-                .snapshots
-                .iter()
-                .filter(|s| s.timestamp_ms <= *timestamp_ms)
-                .max_by_key(|s| s.timestamp_ms)
+            // The latest state the table PRESENTED at or before the instant, not
+            // the latest-committed retained snapshot: a rolled-back or branch
+            // snapshot is retained but was never (or is no longer) the table's
+            // state, and `snapshots` alone cannot tell the two apart.
+            main_lineage(metadata)
+                .filter(|(became_current_ms, _)| *became_current_ms <= *timestamp_ms)
+                .max_by_key(|(became_current_ms, _)| *became_current_ms)
+                .and_then(|(_, id)| metadata.snapshot(id))
         }
     }
+}
+
+/// The instants at which the table's current snapshot changed, as
+/// `(became_current_ms, snapshot_id)`, oldest first — the timeline an "as of"
+/// instant is resolved against.
+///
+/// The snapshot log is that timeline by definition (a rollback appends a new
+/// entry for the old snapshot at the rollback time). A table without one falls
+/// back to the current snapshot's ancestor chain, using each snapshot's commit
+/// time; a table with no current snapshot has no timeline.
+pub fn main_lineage(metadata: &super::TableMetadata) -> impl Iterator<Item = (i64, i64)> + '_ {
+    let from_log = metadata
+        .snapshot_log
+        .iter()
+        .map(|e| (e.timestamp_ms, e.snapshot_id));
+    let mut next = if metadata.snapshot_log.is_empty() {
+        metadata.current_snapshot()
+    } else {
+        None
+    };
+    let from_ancestry = std::iter::from_fn(move || {
+        let s = next?;
+        next = s.parent_snapshot_id.and_then(|p| metadata.snapshot(p));
+        Some((s.timestamp_ms, s.snapshot_id))
+    })
+    .collect::<Vec<_>>()
+    .into_iter()
+    .rev();
+    from_log.chain(from_ancestry)
+}
+
+/// The earliest instant an "as of" selection can resolve, if the table has ever
+/// had a current snapshot.
+pub fn earliest_as_of_time_ms(metadata: &super::TableMetadata) -> Option<i64> {
+    main_lineage(metadata).map(|(ms, _)| ms).min()
 }
 
 #[cfg(test)]
@@ -337,6 +373,66 @@ mod tests {
         // Before all snapshots - no match
         let none = select_snapshot(&metadata, &SnapshotSelection::AsOfTime(500));
         assert!(none.is_none());
+    }
+
+    /// After a rollback, the retained newer snapshot is still selectable by id
+    /// but is no longer the state "as of" any instant after the rollback; and
+    /// an instant while it WAS current still resolves to it, as the snapshot
+    /// log records.
+    #[test]
+    fn as_of_time_follows_the_snapshot_log_not_all_retained_snapshots() {
+        let mut metadata = make_test_metadata();
+        // Rolled back to snapshot 1 at t=4000: 2 and 3 stay retained.
+        metadata.current_snapshot_id = Some(1);
+        metadata.snapshot_log = [(1000, 1), (2000, 2), (3000, 3), (4000, 1)]
+            .into_iter()
+            .map(
+                |(timestamp_ms, snapshot_id)| super::super::SnapshotLogEntry {
+                    snapshot_id,
+                    timestamp_ms,
+                },
+            )
+            .collect();
+
+        let at = |ms| select_snapshot(&metadata, &SnapshotSelection::AsOfTime(ms));
+        assert_eq!(at(2500).unwrap().snapshot_id, 2, "2 was current at 2500");
+        assert_eq!(at(3500).unwrap().snapshot_id, 3, "3 was current at 3500");
+        assert_eq!(at(4000).unwrap().snapshot_id, 1, "rolled back at 4000");
+        assert_eq!(
+            at(9000).unwrap().snapshot_id,
+            1,
+            "now = current, not max-ts"
+        );
+        assert!(at(500).is_none());
+        assert_eq!(earliest_as_of_time_ms(&metadata), Some(1000));
+        // By id, a retained rolled-back snapshot is still addressable.
+        assert_eq!(
+            select_snapshot(&metadata, &SnapshotSelection::SnapshotId(3))
+                .unwrap()
+                .snapshot_id,
+            3
+        );
+    }
+
+    /// No snapshot log (older writers): the current snapshot's ancestry is the
+    /// timeline, so an orphaned branch snapshot is never selected by time.
+    #[test]
+    fn as_of_time_without_a_log_walks_current_ancestry() {
+        let mut metadata = make_test_metadata();
+        assert!(metadata.snapshot_log.is_empty());
+        // Snapshot 3 is a branch off 1 that never became current.
+        metadata.current_snapshot_id = Some(2);
+        metadata.snapshots[2].parent_snapshot_id = Some(1);
+        let at = |m: &super::super::TableMetadata, ms| {
+            select_snapshot(m, &SnapshotSelection::AsOfTime(ms)).map(|s| s.snapshot_id)
+        };
+        assert_eq!(at(&metadata, 9000), Some(2));
+        assert_eq!(at(&metadata, 1500), Some(1));
+        assert_eq!(at(&metadata, 500), None);
+        assert_eq!(earliest_as_of_time_ms(&metadata), Some(1000));
+        metadata.current_snapshot_id = None;
+        assert_eq!(at(&metadata, 9000), None);
+        assert_eq!(earliest_as_of_time_ms(&metadata), None);
     }
 
     #[test]

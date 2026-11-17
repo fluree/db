@@ -137,6 +137,13 @@ pub struct IndexingFileConfig {
     pub indexer_catchup_interval_secs: Option<u64>,
     /// Keep BM25 full-text indexes current automatically.
     pub bm25_auto_sync: Option<bool>,
+    /// Old index versions to retain before GC.
+    pub gc_max_old_indexes: Option<u32>,
+    /// Minimum age in minutes before an index version can be collected.
+    pub gc_min_time_mins: Option<u32>,
+    /// Version ceiling past which the age guard is overridden. Unset means no
+    /// ceiling.
+    pub gc_hard_max_old_indexes: Option<u32>,
 }
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
@@ -170,6 +177,7 @@ pub struct AuthEndpointFileConfig {
 
 #[derive(Debug, Default, Clone, Deserialize, Serialize)]
 pub struct DataAuthFileConfig {
+    pub policy_authorities: Option<Vec<String>>,
     pub mode: Option<String>,
     pub audience: Option<String>,
     pub trusted_issuers: Option<Vec<String>>,
@@ -312,8 +320,9 @@ fn find_config_in_dir(dir: &Path) -> Option<PathBuf> {
 /// Returns `None` if no config file is found (this is not an error).
 pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
     if let Some(p) = explicit {
-        // Explicit path: could be a file or a directory containing config
-        if p.is_dir() {
+        // Explicit path: a file, a directory containing config, or the
+        // parent of a .fluree/ directory.
+        if p.is_file() {
             return Some(p.to_path_buf());
         }
         if p.is_dir() {
@@ -321,14 +330,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Option<PathBuf> {
                 return Some(found);
             }
         }
-        // Try as parent of a .fluree/ directory
-        let fluree_subdir = p.join(FLUREE_DIR);
-        if let Some(found) = find_config_in_dir(&fluree_subdir) {
-            return Some(found);
-        }
-        // Explicit path not found — warn and continue without file config
-        warn!(path = %p.display(), "Config file not found at specified path");
-        return None;
+        return find_config_in_dir(&p.join(FLUREE_DIR));
     }
 
     // Walk up from cwd looking for .fluree/config.{toml,jsonld}
@@ -443,12 +445,16 @@ pub const CONFIG_FILE_ARG_IDS: &[&str] = &[
     "reindex_min_bytes",
     "reindex_max_bytes",
     "indexer_catchup_interval_secs",
+    "gc_max_old_indexes",
+    "gc_min_time_mins",
+    "gc_hard_max_old_indexes",
     "events_auth_mode",
     "events_auth_audience",
     "events_auth_trusted_issuers",
     "data_auth_mode",
     "data_auth_audience",
     "data_auth_trusted_issuers",
+    "data_auth_policy_authorities",
     "data_auth_default_policy_class",
     "admin_auth_mode",
     "admin_auth_trusted_issuers",
@@ -622,6 +628,21 @@ pub fn apply_to_server_config(
                 config.indexer_catchup_interval_secs = v;
             }
         }
+        if is_default("gc_max_old_indexes") {
+            if let Some(v) = idx.gc_max_old_indexes {
+                config.gc_max_old_indexes = Some(v);
+            }
+        }
+        if is_default("gc_min_time_mins") {
+            if let Some(v) = idx.gc_min_time_mins {
+                config.gc_min_time_mins = Some(v);
+            }
+        }
+        if is_default("gc_hard_max_old_indexes") {
+            if let Some(v) = idx.gc_hard_max_old_indexes {
+                config.gc_hard_max_old_indexes = Some(v);
+            }
+        }
     }
 
     // --- Auth: events ---
@@ -663,6 +684,11 @@ pub fn apply_to_server_config(
             if is_default("data_auth_trusted_issuers") {
                 if let Some(ref v) = data.trusted_issuers {
                     config.data_auth_trusted_issuers = v.clone();
+                }
+            }
+            if is_default("data_auth_policy_authorities") {
+                if let Some(ref v) = data.policy_authorities {
+                    config.data_auth_policy_authorities = v.clone();
                 }
             }
             if is_default("data_auth_default_policy_class") {
@@ -1004,7 +1030,64 @@ pub fn load_and_merge_config(
     config: &mut ServerConfig,
     matches: &ArgMatches,
 ) -> Result<(), ConfigFileError> {
+    let merged = merge_config_file(config, matches);
+    settle_memory_storage(config, matches);
+    merged
+}
+
+/// `--memory` and a storage path or connection config choose the same thing,
+/// so the higher-precedence source wins. Memory comes only from a flag or
+/// `FLUREE_MEMORY_STORAGE`; when both sides are flags they are left for
+/// [`ServerConfig::validate`] to reject. What memory displaces is recorded in
+/// [`ServerConfig::memory_displaced`]: this runs before logging starts, so the
+/// server warns about it at startup instead.
+fn settle_memory_storage(config: &mut ServerConfig, matches: &ArgMatches) {
+    use clap::parser::ValueSource;
+
+    if !config.memory {
+        return;
+    }
+    let from_flag = |id: &str| matches.value_source(id) == Some(ValueSource::CommandLine);
+    let other_from_flag = (config.storage_path.is_some() && from_flag("storage_path"))
+        || (config.connection_config.is_some() && from_flag("connection_config"));
+    match (from_flag("memory"), other_from_flag) {
+        (true, true) => {}
+        (false, true) => config.memory = false,
+        (_, false) => {
+            let displaced: Vec<String> = [
+                config
+                    .storage_path
+                    .take()
+                    .map(|p| format!("storage path {}", p.display())),
+                config
+                    .connection_config
+                    .take()
+                    .map(|p| format!("connection config {}", p.display())),
+            ]
+            .into_iter()
+            .flatten()
+            .collect();
+            if !displaced.is_empty() {
+                config.memory_displaced = Some(displaced.join(" and "));
+            }
+        }
+    }
+}
+
+fn merge_config_file(
+    config: &mut ServerConfig,
+    matches: &ArgMatches,
+) -> Result<(), ConfigFileError> {
     let config_path = resolve_config_path(config.config_file.as_deref());
+
+    // A config file the caller named but that isn't there is an error, not a
+    // silent fall-back to defaults (callers treat it as fatal).
+    if let (None, Some(explicit)) = (&config_path, &config.config_file) {
+        return Err(ConfigFileError::Io {
+            path: explicit.clone(),
+            source: std::io::Error::new(std::io::ErrorKind::NotFound, "no config file found"),
+        });
+    }
 
     let Some(path) = config_path else {
         debug!("No config file found, using CLI args and defaults only");
@@ -1047,6 +1130,157 @@ mod tests {
     use super::*;
 
     #[test]
+    fn policy_authorities_load_from_toml_and_cli_overrides_the_whole_list() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("fluree.toml");
+        std::fs::write(
+            &path,
+            r#"
+            [server.auth.data]
+            mode = "required"
+            audience = "file-audience"
+            trusted_issuers = ["did:key:file"]
+            policy_authorities = ["did:key:file"]
+        "#,
+        )
+        .unwrap();
+        let section = load_config(&path).unwrap().server.unwrap();
+        for (args, authorities, audience) in [
+            (vec!["fluree-server"], vec!["did:key:file"], "file-audience"),
+            (
+                vec![
+                    "fluree-server",
+                    "--data-auth-policy-authority",
+                    "did:key:cli-1",
+                    "--data-auth-policy-authority",
+                    "did:key:cli-2",
+                    "--data-auth-audience",
+                    "cli-audience",
+                ],
+                vec!["did:key:cli-1", "did:key:cli-2"],
+                "cli-audience",
+            ),
+        ] {
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            apply_to_server_config(&section, &mut config, &matches);
+            let data = config.data_auth();
+            assert_eq!(data.policy_authorities, authorities);
+            assert_eq!(data.audience.as_deref(), Some(audience));
+            assert_eq!(data.trusted_issuers, ["did:key:file"]);
+            assert!(data.validate().is_ok());
+        }
+    }
+
+    /// An explicit `--config-file` is loaded (it was once ignored with a
+    /// warning), and one that doesn't exist is an error.
+    #[test]
+    fn explicit_config_file_is_loaded_or_fails() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("custom.toml");
+        std::fs::write(&path, "[server]\nstorage_path = \"/from/file\"\n").unwrap();
+        let load = |file: &Path| {
+            let args = ["fluree-server", "--config-file", file.to_str().unwrap()];
+            let matches = ServerConfig::command().try_get_matches_from(args).unwrap();
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            load_and_merge_config(&mut config, &matches).map(|()| config.storage_path)
+        };
+        assert_eq!(load(&path).unwrap(), Some(PathBuf::from("/from/file")));
+        assert!(load(&tmp.path().join("missing.toml")).is_err());
+    }
+
+    /// `--memory` and a storage path or connection config settle by source:
+    /// flag, then environment, then config file.
+    #[test]
+    fn memory_settles_against_other_storage_by_source() {
+        use clap::{CommandFactory, FromArgMatches};
+
+        // Only this test reads these names, so setting them races nothing.
+        const MEMORY_ENV: &str = "FLUREE_TEST_SETTLE_MEMORY";
+        const PATH_ENV: &str = "FLUREE_TEST_SETTLE_STORAGE_PATH";
+
+        let tmp = tempfile::tempdir().unwrap();
+        let with_storage = tmp.path().join("storage.toml");
+        std::fs::write(
+            &with_storage,
+            "[server]\nstorage_path = \"/from/file\"\n\
+             connection_config = \"/from/file.jsonld\"\n",
+        )
+        .unwrap();
+        let empty = tmp.path().join("empty.toml");
+        std::fs::write(&empty, "[server]\n").unwrap();
+
+        let settle = |file: &Path, args: &[&str], env: &[(&str, &str)]| {
+            for (var, value) in env {
+                std::env::set_var(var, value);
+            }
+            let matches = ServerConfig::command()
+                .mut_arg("memory", |a| a.env(MEMORY_ENV))
+                .mut_arg("storage_path", |a| a.env(PATH_ENV))
+                .try_get_matches_from(
+                    ["fluree-server", "--config-file", file.to_str().unwrap()]
+                        .into_iter()
+                        .chain(args.iter().copied()),
+                )
+                .unwrap();
+            for (var, _) in env {
+                std::env::remove_var(var);
+            }
+            let mut config = ServerConfig::from_arg_matches(&matches).unwrap();
+            load_and_merge_config(&mut config, &matches).unwrap();
+            config
+        };
+        let memory_only = |c: &ServerConfig| {
+            c.memory && c.storage_path.is_none() && c.connection_config.is_none()
+        };
+
+        // The flag beats the file and the environment, and records what it
+        // displaced so startup can warn.
+        let over_file = settle(&with_storage, &["--memory"], &[]);
+        assert!(memory_only(&over_file));
+        assert_eq!(
+            over_file.memory_displaced.as_deref(),
+            Some("storage path /from/file and connection config /from/file.jsonld")
+        );
+        assert!(memory_only(&settle(
+            &empty,
+            &["--memory"],
+            &[(PATH_ENV, "/from/env")]
+        )));
+        // The environment beats the file, and ties with a storage path from
+        // the environment go to memory.
+        assert!(memory_only(&settle(
+            &with_storage,
+            &[],
+            &[(MEMORY_ENV, "true")]
+        )));
+        assert!(memory_only(&settle(
+            &empty,
+            &[],
+            &[(MEMORY_ENV, "true"), (PATH_ENV, "/from/env")]
+        )));
+        // Nothing configured, nothing displaced.
+        assert_eq!(settle(&empty, &["--memory"], &[]).memory_displaced, None);
+        // A storage path flag beats memory from the environment.
+        let flagged = settle(
+            &empty,
+            &["--storage-path", "/from/flag"],
+            &[(MEMORY_ENV, "true")],
+        );
+        assert!(!flagged.memory);
+        assert_eq!(flagged.memory_displaced, None);
+        assert_eq!(flagged.storage_path, Some(PathBuf::from("/from/flag")));
+        // Two flags are left in place for `validate` to reject.
+        let both = settle(&empty, &["--memory", "--storage-path", "/from/flag"], &[]);
+        assert!(both.memory && both.storage_path.is_some());
+        assert!(both.validate().is_err());
+    }
+
+    #[test]
     fn test_load_toml_with_server_section() {
         let toml = r#"
 [[remotes]]
@@ -1070,6 +1304,9 @@ ttl_ms = 200
 enabled = true
 reindex_min_bytes = 200000
 reindex_max_bytes = 2000000
+gc_max_old_indexes = 3
+gc_min_time_mins = 45
+gc_hard_max_old_indexes = 12
 
 [server.auth.events]
 mode = "required"
@@ -1097,6 +1334,9 @@ default_policy_class = "ex:DefaultPolicy"
         assert_eq!(idx.enabled, Some(true));
         assert_eq!(idx.reindex_min_bytes, Some(200_000));
         assert_eq!(idx.reindex_max_bytes, Some(2_000_000));
+        assert_eq!(idx.gc_max_old_indexes, Some(3));
+        assert_eq!(idx.gc_min_time_mins, Some(45));
+        assert_eq!(idx.gc_hard_max_old_indexes, Some(12));
 
         let auth = server.auth.unwrap();
         let events = auth.events.unwrap();
@@ -1154,6 +1394,9 @@ default_policy_class = "ex:DefaultPolicy"
                 indexer_catchup_interval_secs: None,
                 reindex_max_bytes: Some(1_000_000),
                 bm25_auto_sync: None,
+                gc_max_old_indexes: Some(5),
+                gc_min_time_mins: None,
+                gc_hard_max_old_indexes: None,
             }),
             ..Default::default()
         };
@@ -1166,6 +1409,9 @@ default_policy_class = "ex:DefaultPolicy"
                 indexer_catchup_interval_secs: None,
                 reindex_max_bytes: None, // should NOT override
                 bm25_auto_sync: None,
+                gc_max_old_indexes: None, // should NOT override
+                gc_min_time_mins: None,
+                gc_hard_max_old_indexes: Some(40),
             }),
             ..Default::default()
         };
@@ -1182,6 +1428,9 @@ default_policy_class = "ex:DefaultPolicy"
         // indexing thresholds NOT overridden (overlay had None)
         assert_eq!(idx.reindex_min_bytes, Some(100_000));
         assert_eq!(idx.reindex_max_bytes, Some(1_000_000));
+        // GC retention merges per field the same way
+        assert_eq!(idx.gc_max_old_indexes, Some(5));
+        assert_eq!(idx.gc_hard_max_old_indexes, Some(40));
     }
 
     #[test]

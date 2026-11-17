@@ -248,6 +248,9 @@ pub enum TokenKind {
     KwCosineSimilarity,
     KwEuclideanDistance,
 
+    // Full-text scoring (Fluree extension)
+    KwFulltext,
+
     // Prologue
     KwBase,
     KwPrefix,
@@ -497,6 +500,7 @@ impl TokenKind {
                 | TokenKind::KwDotProduct
                 | TokenKind::KwCosineSimilarity
                 | TokenKind::KwEuclideanDistance
+                | TokenKind::KwFulltext
         )
     }
 
@@ -633,6 +637,7 @@ impl TokenKind {
             TokenKind::KwDotProduct => Some("dotProduct"),
             TokenKind::KwCosineSimilarity => Some("cosineSimilarity"),
             TokenKind::KwEuclideanDistance => Some("euclideanDistance"),
+            TokenKind::KwFulltext => Some("fulltext"),
             _ => None,
         }
     }
@@ -796,6 +801,7 @@ pub fn keyword_from_str(s: &str) -> Option<TokenKind> {
         "EUCLIDEANDISTANCE" | "EUCLIDEAN_DISTANCE" | "EUCLIDIANDISTANCE" => {
             Some(TokenKind::KwEuclideanDistance)
         }
+        "FULLTEXT" | "FULL_TEXT" => Some(TokenKind::KwFulltext),
         // SPARQL 1.2 triple-term builtins are recognized as contextual
         // function-call identifiers, not reserved keywords: emit a generic
         // `TripleTermFn` carrying the canonical name so the expression parser

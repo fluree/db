@@ -78,8 +78,8 @@ impl IdPropertyHll {
     /// HLL: register-wise max. Counts: additive. last_modified_t: max.
     pub fn merge_from(&mut self, other: &IdPropertyHll) {
         self.count += other.count;
-        self.values_hll.merge_inplace(&other.values_hll);
-        self.subjects_hll.merge_inplace(&other.subjects_hll);
+        self.values_hll.merge(&other.values_hll);
+        self.subjects_hll.merge(&other.subjects_hll);
         self.last_modified_t = self.last_modified_t.max(other.last_modified_t);
         for (&dt, &delta) in &other.datatypes {
             *self.datatypes.entry(dt).or_insert(0) += delta;
@@ -96,6 +96,30 @@ impl IdPropertyHll {
     #[inline]
     fn note_historical_tag(&mut self, tag: u8) {
         self.historical_tag_bits[(tag >> 6) as usize] |= 1u64 << (tag & 63);
+    }
+
+    /// A record's monotone part: the NDV sketches (assertions only), the
+    /// last-modified `t` and the historical tag set.
+    #[inline]
+    fn observe(&mut self, rec: &StatsRecord) {
+        // HLL: only insert on assertions (NDV is monotone)
+        if rec.op {
+            self.values_hll.insert_hash(rec.o_hash);
+            self.subjects_hll.insert_hash(subject_hash(rec.s_id));
+        }
+        if rec.t > self.last_modified_t {
+            self.last_modified_t = rec.t;
+        }
+        // Historical tag set: every record's tag, regardless of op or delta.
+        self.note_historical_tag(rec.dt.as_u8());
+    }
+
+    /// A record's counted part: the property's count and its datatype's
+    /// count move by `delta`.
+    #[inline]
+    fn add_count(&mut self, rec: &StatsRecord, delta: i64) {
+        self.count += delta;
+        *self.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
     }
 
     /// Union prior historical tags into this entry (incremental seeding).
@@ -425,37 +449,50 @@ impl IdStatsHook {
         self.apply_record(rec, delta);
     }
 
+    /// Observe a record without counting it: the monotone accumulators (HLL
+    /// sketches, `last_modified_t`, historical datatype tags) see it, and
+    /// counts move only through [`Self::count_present`], so it touches no
+    /// count map. For a full rebuild,
+    /// whose event log can hold what an op's sign miscounts: a retraction
+    /// and an assertion of one fact at one `t` (which leave the fact
+    /// present), or a retraction of a fact never asserted.
+    pub fn observe_record(&mut self, rec: &StatsRecord) {
+        self.flake_count += 1;
+        self.property_mut(rec).observe(rec);
+    }
+
+    /// Count one fact the built index holds: its graph, property, datatype
+    /// and class counts each gain one. Only for an [`Self::new_hll_only`]
+    /// hook, whose per-subject maps are off; the monotone accumulators saw
+    /// the fact's records through [`Self::observe_record`].
+    pub fn count_present(&mut self, rec: &StatsRecord) {
+        debug_assert!(self.hll_only, "count_present is for HLL-only hooks");
+        *self.graph_flakes.entry(rec.g_id).or_insert(0) += 1;
+        self.property_mut(rec).add_count(rec, 1);
+        if self.rdf_type_p_id == Some(rec.p_id) && rec.o_kind == 0x05 {
+            *self.class_counts.entry((rec.g_id, rec.o_key)).or_insert(0) += 1;
+        }
+    }
+
+    #[inline]
+    fn property_mut(&mut self, rec: &StatsRecord) -> &mut IdPropertyHll {
+        self.properties
+            .entry(GraphPropertyKey {
+                g_id: rec.g_id,
+                p_id: rec.p_id,
+            })
+            .or_insert_with(IdPropertyHll::new)
+    }
+
     fn apply_record(&mut self, rec: &StatsRecord, delta: i64) {
         self.flake_count += 1;
 
         // Track per-graph flake count
         *self.graph_flakes.entry(rec.g_id).or_insert(0) += delta;
 
-        let key = GraphPropertyKey {
-            g_id: rec.g_id,
-            p_id: rec.p_id,
-        };
-        let hll = self
-            .properties
-            .entry(key)
-            .or_insert_with(IdPropertyHll::new);
-
-        hll.count += delta;
-
-        // HLL: only insert on assertions (NDV is monotone)
-        if rec.op {
-            hll.values_hll.insert_hash(rec.o_hash);
-            hll.subjects_hll.insert_hash(subject_hash(rec.s_id));
-        }
-
-        if rec.t > hll.last_modified_t {
-            hll.last_modified_t = rec.t;
-        }
-
-        // Track datatype usage
-        *hll.datatypes.entry(rec.dt.as_u8()).or_insert(0) += delta;
-        // Historical tag set: every record's tag, regardless of op or delta.
-        hll.note_historical_tag(rec.dt.as_u8());
+        let hll = self.property_mut(rec);
+        hll.add_count(rec, delta);
+        hll.observe(rec);
 
         // Track class membership and class→property attribution (graph-scoped).
         if let Some(rdf_type_pid) = self.rdf_type_p_id {
@@ -967,6 +1004,42 @@ mod tests {
         assert_eq!(props[&key].last_modified_t, 3);
     }
 
+    /// The indexer's own guard on the sketch it persists.
+    ///
+    /// `merge_from` is register-wise max, so merging a disjoint sketch
+    /// can only raise the estimate, and the merged estimate must be
+    /// near the true union cardinality. The kernel tests this too, but
+    /// the indexer had no test that would redden if the kernel's merge
+    /// regressed under it -- flipping that max to a min left all of the
+    /// indexer's tests green.
+    #[test]
+    fn merge_from_unions_the_sketches() {
+        // Fed the way the refresh path feeds it: `subject_hash`, not a
+        // raw counter. The sketch takes an already-mixed 64-bit hash,
+        // and a value with structure left in it (`i * odd`) inflates
+        // the estimate by most of a factor of two.
+        let mut a = IdPropertyHll::new();
+        let mut b = IdPropertyHll::new();
+        for i in 0..5_000u64 {
+            a.subjects_hll.insert_hash(subject_hash(i));
+        }
+        for i in 5_000..10_000u64 {
+            b.subjects_hll.insert_hash(subject_hash(i));
+        }
+        let (only_a, only_b) = (a.subjects_hll.estimate(), b.subjects_hll.estimate());
+
+        a.merge_from(&b);
+        let merged = a.subjects_hll.estimate();
+
+        assert!(
+            merged >= only_a && merged >= only_b,
+            "merge must not lower the estimate: {only_a} + {only_b} -> {merged}"
+        );
+        // 256 registers is about 6.5% relative error; allow three sigma.
+        let err = (merged as f64 - 10_000.0).abs() / 10_000.0;
+        assert!(err < 0.20, "merged estimate {merged} is not near 10,000");
+    }
+
     fn record(op: bool, t: i64) -> StatsRecord {
         StatsRecord {
             g_id: 0,
@@ -1067,5 +1140,25 @@ mod tests {
         hook.on_record(&record(true, 2));
         hook.on_record(&record(false, 3));
         assert_eq!(property_count(&hook), 1);
+    }
+
+    /// A rebuild observes every record for the sketches but counts only the
+    /// facts the index holds: a same-`t` retraction and assertion of a fact
+    /// absent before them count once, where their op signs net to zero.
+    #[test]
+    fn observed_records_count_nothing_and_present_facts_count_once() {
+        let mut hook = IdStatsHook::new_hll_only();
+        hook.observe_record(&record(false, 5));
+        hook.observe_record(&record(true, 5));
+        assert_eq!(property_count(&hook), 0, "observing counts nothing");
+        let key = GraphPropertyKey { g_id: 0, p_id: 1 };
+        assert_eq!(
+            hook.properties()[&key].last_modified_t,
+            5,
+            "but the sketch saw it"
+        );
+        hook.count_present(&record(true, 5));
+        assert_eq!(property_count(&hook), 1);
+        assert_eq!(hook.graph_flakes_mut()[&0], 1);
     }
 }

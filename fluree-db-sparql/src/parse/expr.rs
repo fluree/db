@@ -321,6 +321,12 @@ fn try_parse_literal(tokens: &mut TokenStream) -> Result<Option<Expression>, Str
         return Ok(Some(Expression::Literal(Literal::integer(value, span))));
     }
 
+    // Integer literal past i64. A distinct token from the lexer, so it needs
+    // its own arm here; the sign, if any, is the unary operator above.
+    if let Some((value, span)) = tokens.consume_big_integer() {
+        return Ok(Some(Expression::Literal(Literal::big_integer(value, span))));
+    }
+
     // Decimal literal
     if let Some((value, span)) = tokens.consume_decimal() {
         return Ok(Some(Expression::Literal(Literal::decimal(value, span))));
@@ -744,6 +750,9 @@ fn check_builtin_function_keyword(tokens: &TokenStream) -> Option<FunctionName> 
     if tokens.check_keyword(TokenKind::KwEuclideanDistance) {
         return Some(FunctionName::EuclideanDistance);
     }
+    if tokens.check_keyword(TokenKind::KwFulltext) {
+        return Some(FunctionName::Fulltext);
+    }
 
     None
 }
@@ -1046,6 +1055,54 @@ mod tests {
     }
 
     #[test]
+    fn test_big_integer_literal() {
+        // xsd:integer is unbounded. The lexer emits a distinct BigInteger token
+        // past i64, which the expression parser used to reject outright even
+        // though term position and lowering both accepted it.
+        let big = "100000000000000000000";
+        match parse_expr_str(big).unwrap() {
+            Expression::Literal(Literal {
+                value: LiteralValue::BigInteger(s),
+                ..
+            }) => assert_eq!(s.as_ref(), big),
+            other => panic!("expected BigInteger literal, got {other:?}"),
+        }
+
+        // The sign is the unary operator, as for any other numeric literal.
+        match parse_expr_str(&format!("-{big}")).unwrap() {
+            Expression::Unary { op, operand, .. } => {
+                assert_eq!(op, UnaryOp::Neg);
+                assert!(matches!(
+                    *operand,
+                    Expression::Literal(Literal {
+                        value: LiteralValue::BigInteger(_),
+                        ..
+                    })
+                ));
+            }
+            other => panic!("expected unary negation, got {other:?}"),
+        }
+
+        // Still usable where an expression is expected.
+        assert!(parse_expr_str(&format!("?v > {big}")).is_ok());
+        // One past i64::MAX is already big; i64::MAX itself stays an Integer.
+        assert!(matches!(
+            parse_expr_str("9223372036854775807").unwrap(),
+            Expression::Literal(Literal {
+                value: LiteralValue::Integer(i64::MAX),
+                ..
+            })
+        ));
+        match parse_expr_str("9223372036854775808").unwrap() {
+            Expression::Literal(Literal {
+                value: LiteralValue::BigInteger(s),
+                ..
+            }) => assert_eq!(s.as_ref(), "9223372036854775808"),
+            other => panic!("expected BigInteger just past i64::MAX, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_unary_not() {
         let expr = parse_expr_str("!?bound").unwrap();
         match expr {
@@ -1233,5 +1290,25 @@ mod tests {
             }
             _ => panic!("Expected function call"),
         }
+    }
+
+    #[test]
+    fn fulltext_is_a_function_but_not_a_reserved_word() {
+        for input in ["fulltext(?text, \"rust\")", "FULL_TEXT(?text, \"rust\")"] {
+            match parse_expr_str(input).unwrap() {
+                Expression::FunctionCall { name, args, .. } => {
+                    assert_eq!(name, FunctionName::Fulltext);
+                    assert_eq!(args.len(), 2);
+                }
+                other => panic!("expected a function call, got {other:?}"),
+            }
+        }
+        assert!(matches!(
+            parse_expr_str("?fulltext").unwrap(),
+            Expression::Var(v) if v.name.as_ref() == "fulltext"
+        ));
+        let query = "PREFIX fulltext: <http://example.org/> \
+                     SELECT ?s WHERE { ?s fulltext:title ?fulltext }";
+        assert!(!crate::parse_sparql(query).has_errors());
     }
 }

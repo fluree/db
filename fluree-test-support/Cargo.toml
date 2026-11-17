@@ -1,0 +1,18 @@
+[package]
+name = "fluree-test-support"
+description = "Shared test tooling: the reachability guard for crates that group their integration tests, and thread-local tracing captures that see every event"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Internal test tooling — never a release artifact.
+[package.metadata.dist]
+dist = false
+
+[dependencies]
+toml = "0.8"
+tracing.workspace = true
+
+[lints]
+workspace = true

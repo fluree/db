@@ -46,6 +46,7 @@ mod cypher;
 pub mod cypher_typed;
 pub mod datatype;
 pub mod delimited;
+mod graph_text;
 mod hydration;
 pub mod iri;
 mod json_write;
@@ -53,36 +54,20 @@ mod jsonld;
 mod materialize;
 pub mod ndjson_stream;
 mod rdf_xml;
+mod service_description;
 pub(crate) mod sparql;
 mod sparql_xml;
 mod typed;
 
-/// Registry-name predicate: does this variable name belong to a
-/// non-projected internal / non-distinguished variable that should be
-/// hidden from `SELECT *` wildcard output?
-///
-/// Three categories are reserved:
-/// - `?__*` — planner / aggregate / property-path synthetics.
-/// - `?#*`  — annotation-reifier synthetics (the `#` is comment-start
-///   in the SPARQL lexer so users cannot lex this prefix).
-/// - `_:*`  — SPARQL blank nodes used in WHERE patterns. Per SPARQL
-///   §4.1.4 these are non-distinguished variables; they bind values
-///   but are not part of the SELECT scope, so they don't appear in
-///   `SELECT *` results. Hiding them here also covers
-///   blank-node-labelled reifiers (`~ _:ann`, `_:ann rdf:reifies …`)
-///   that the edge-annotation lowering registers under their literal
-///   blank-node label.
-///
-/// Every wildcard formatter (SPARQL JSON, SPARQL XML, JSON-LD, typed,
-/// agent-JSON, delimited) routes through this predicate so the rule
-/// stays consistent across output shapes.
-pub(crate) fn is_internal_var_name(name: &str) -> bool {
-    name.starts_with("?__") || name.starts_with("?#") || name.starts_with("_:")
-}
+// Every wildcard formatter (SPARQL JSON, SPARQL XML, JSON-LD, typed,
+// agent-JSON, delimited) routes through this predicate so the rule stays
+// consistent across output shapes.
+pub(crate) use fluree_db_query::var_registry::is_internal_var_name;
 mod xml_escape;
 
 pub use config::{AgentJsonContext, FormatterConfig, OutputFormat, QueryOutput};
 pub use iri::IriCompactor;
+pub use service_description::sparql_service_description;
 
 use crate::QueryResult;
 use fluree_db_core::LedgerSnapshot;
@@ -321,8 +306,9 @@ pub fn format_results(
     // Delimited-text formats produce bytes/String, not JsonValue. Reject early.
     if matches!(
         config.format,
-        OutputFormat::Tsv | OutputFormat::Csv | OutputFormat::SparqlXml | OutputFormat::RdfXml
-    ) {
+        OutputFormat::Tsv | OutputFormat::Csv | OutputFormat::SparqlXml
+    ) || config.is_graph_text()
+    {
         return Err(FormatError::InvalidBinding(format!(
             "{:?} format produces bytes/String, not JsonValue. \
              Use format_results_string() or QueryResult::to_tsv()/to_csv() instead.",
@@ -338,8 +324,9 @@ pub fn format_results(
     // sensible JSON rendering is JSON-LD. Any JSON-producing format request
     // (including the SPARQL default `SparqlJson`) is coerced to JSON-LD rather
     // than rejected — a graph has no SPARQL-results-JSON / TypedJson / AgentJson
-    // form. RDF/XML and the delimited formats never reach here: they are bytes
-    // formats handled (or rejected) earlier on the string path. See issue #1274.
+    // form. The graph text formats and the delimited formats never reach here:
+    // they are bytes formats handled (or rejected) earlier on the string path.
+    // See issue #1274.
     if result.output.construct_template().is_some() {
         return construct::format(result, &compactor);
     }
@@ -369,10 +356,14 @@ pub fn format_results(
             "SPARQL XML produces String, not JsonValue. Use format_results_string() instead."
                 .to_string(),
         )),
-        OutputFormat::RdfXml => Err(FormatError::InvalidBinding(
-            "RDF/XML produces String, not JsonValue. Use format_results_string() instead."
-                .to_string(),
-        )),
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => Err(FormatError::InvalidBinding(format!(
+            "{:?} produces String, not JsonValue. Use format_results_string() instead.",
+            config.format
+        ))),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -445,9 +436,13 @@ pub fn format_results_string(
                 .with_absolute_iris(config.absolute_iris);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(snapshot.shared_namespaces(), context);
-            return rdf_xml::format(result, &compactor, config);
+            return graph_text::format(result, &compactor, config);
         }
         _ => {}
     }
@@ -658,10 +653,14 @@ async fn format_results_async_inner(
             "SPARQL XML produces String, not JsonValue. Use format_results_string_async() instead."
                 .to_string(),
         )),
-        OutputFormat::RdfXml => Err(FormatError::InvalidBinding(
-            "RDF/XML produces String, not JsonValue. Use format_results_string_async() instead."
-                .to_string(),
-        )),
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => Err(FormatError::InvalidBinding(format!(
+            "{:?} produces String, not JsonValue. Use format_results_string_async() instead.",
+            config.format
+        ))),
         OutputFormat::Tsv | OutputFormat::Csv => {
             unreachable!("Delimited formats rejected before dispatch")
         }
@@ -776,9 +775,13 @@ pub async fn format_results_string_async(
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
-            return rdf_xml::format(result, &compactor, config);
+            return graph_text::format(result, &compactor, config);
         }
         _ => {}
     }
@@ -823,9 +826,13 @@ pub async fn format_results_string_async_dataset(
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
             return sparql_xml::format(result, &compactor, config);
         }
-        OutputFormat::RdfXml => {
+        OutputFormat::RdfXml
+        | OutputFormat::Turtle
+        | OutputFormat::NTriples
+        | OutputFormat::TriG
+        | OutputFormat::NQuads => {
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
-            return rdf_xml::format(result, &compactor, config);
+            return graph_text::format(result, &compactor, config);
         }
         _ => {}
     }
@@ -863,6 +870,7 @@ mod tests {
             batches: vec![],
             binary_graph: None,
             from_graph_source: false,
+            advisories: Vec::new(),
         }
     }
 
@@ -1029,6 +1037,7 @@ mod tests {
             batches: vec![batch],
             binary_graph: None,
             from_graph_source: false,
+            advisories: Vec::new(),
         }
     }
 

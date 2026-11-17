@@ -24,6 +24,10 @@ troubleshooting.
 
 The Fluree-specific SPARQL surface (the 1.1 basics assumed): time travel with `FROM @t:`, fact history via `<< s p o >> f:t/f:op`, RDF 1.2 edge annotations (`{| |}`, `~`, `rdf:reifies`), cross-ledger `FROM`/`GRAPH` queries, and cross-surface round-trips.
 
+### [Unstructured documents into a graph](../unstructured/README.md)
+
+`fluree doc ingest` turns a folder of PDFs, Office files, Markdown and scans into a searchable, citable graph. Fluree Unstructured has its own section: tiers, connecting a Fluree AI account, what gets built, and publishing the result.
+
 ### [Full-Text and Vector Search](cookbook-search.md)
 
 Set up BM25 full-text search and vector similarity. Insert searchable data, write relevance-ranked queries, combine search with graph patterns, and build hybrid text+vector search.
@@ -51,3 +55,7 @@ Define data quality constraints: required properties, datatype validation, value
 ### [Edge Annotations](cookbook-edge-annotations.md)
 
 Attach properties to a relationship: model property-graph edges, record statement-level provenance, represent parallel relationships, query inline or annotation-rooted, and understand the retract cascade — in JSON-LD and SPARQL 1.2.
+
+### [Custom Stages in Python](custom-stages-python.md)
+
+Run model calls and versioned decision procedures in Python against pinned ledger state, and publish each stage's result into a named graph it owns: a generation record, replay under a new version, failed and stale runs, and datalog rules that build on the result.

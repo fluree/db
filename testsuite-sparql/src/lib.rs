@@ -2,6 +2,7 @@ pub mod evaluator;
 pub mod files;
 pub mod manifest;
 pub mod query_handler;
+pub mod rdf_handlers;
 pub mod rdfxml;
 pub mod report;
 pub mod result_comparison;
@@ -33,6 +34,7 @@ use sparql_handlers::register_sparql_tests;
 pub fn check_testsuite(manifest_url: &str, ignored_tests: &[&str]) -> Result<()> {
     let mut evaluator = TestEvaluator::default();
     register_sparql_tests(&mut evaluator);
+    rdf_handlers::register_rdf_tests(&mut evaluator);
 
     let manifest = TestManifest::new([manifest_url]);
     let results = evaluator.evaluate(manifest)?;

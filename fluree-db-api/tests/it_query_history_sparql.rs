@@ -161,6 +161,54 @@ ORDER BY ?t ?op"
     assert_eq!(got, want, "rows: {rows:#?}");
 }
 
+/// Config reasoning defaults must not reject a SPARQL FROM/TO history query.
+/// Regression for fluree/db#1806 through the SPARQL query surface.
+#[tokio::test]
+async fn sparql_history_ignores_config_reasoning_defaults() {
+    let (_tmp, fluree, ledger_id) = alice_ledger("reasoning-defaults").await;
+    let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+    let trig = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig .
+            <urn:config:main> f:reasoningDefaults <urn:cfg:reason> .
+            <urn:cfg:reason> f:reasoningModes f:rdfs .
+        }}
+    "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .expect("config write");
+
+    let sparql = format!(
+        r"PREFIX ex: <http://example.org/>
+PREFIX f: <https://ns.flur.ee/db#>
+SELECT ?name ?t ?op
+FROM <{ledger_id}@t:1>
+TO <{ledger_id}@t:latest>
+WHERE {{ << ex:alice ex:name ?name >> f:t ?t ; f:op ?op . }}
+ORDER BY ?t ?op"
+    );
+
+    let rows = run_sparql(&fluree, &sparql).await;
+    let got: Vec<(String, i64, bool)> = rows
+        .as_array()
+        .expect("rows")
+        .iter()
+        .map(row_name_t_op)
+        .collect();
+    let want: Vec<(String, i64, bool)> = EXPECTED
+        .iter()
+        .map(|(n, t, o)| (n.to_string(), *t, *o))
+        .collect();
+    assert_eq!(got, want, "rows: {rows:#?}");
+}
+
 /// The `;`-continued form binds one inner triple, not two. Same results.
 #[tokio::test]
 async fn rdf_star_history_semicolon_form() {

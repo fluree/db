@@ -43,7 +43,8 @@ const MAX_TXN_RETRIES: usize = 16;
 /// `tx_builder` deliberately excludes `NamespaceConflict` from its
 /// internal retry — re-staging would consume the already-built
 /// `stage_result`. The consensus layer (this loop) preserves the
-/// request body across attempts, so it's the right altitude.
+/// request body across attempts, so it's the right altitude. For the
+/// same reason it retries a builder whose own attempts all conflicted.
 fn is_retryable_txn_conflict(e: &ApiError) -> bool {
     matches!(
         e,
@@ -51,7 +52,7 @@ fn is_retryable_txn_conflict(e: &ApiError) -> bool {
             TransactError::CommitConflict { .. }
                 | TransactError::PublishLostRace { .. }
                 | TransactError::NamespaceConflict(_)
-        )
+        ) | ApiError::CommitContention { .. }
     )
 }
 
@@ -98,6 +99,8 @@ impl Committer for LocalCommitter {
             governance,
         } = request;
 
+        let ledger_id = fluree_db_core::LedgerId::expect_canonical(&ledger_id, "LocalTransactor")
+            .map_err(|e| execution_failure(e.into()))?;
         let ledger_handle = self
             .ledger_manager()?
             .get_or_load(&ledger_id)
@@ -111,8 +114,9 @@ impl Committer for LocalCommitter {
         // builder from scratch — the body is borrowed, so the
         // per-iteration cost is one extra clone of `TxnOpts` /
         // `CommitOpts` / `TrackingOptions`.
-        let mut last_error: Option<ApiError> = None;
-        for attempt in 1..=MAX_TXN_RETRIES {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
             let policy_ctx =
                 build_policy_context(&self.fluree, &ledger_handle, &governance).await?;
 
@@ -149,8 +153,26 @@ impl Committer for LocalCommitter {
                 TransactionBody::JsonLdInsert(json) => staged.insert(json),
                 TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
                 TransactionBody::JsonLdUpdate(json) => staged.update(json),
-                TransactionBody::JsonLdGraphSync { graph_iri, body } => {
-                    staged.sync_graph(graph_iri.as_str(), body)
+                TransactionBody::JsonLdGraphSync { graph_iri, body } => staged.sync_graph_payload(
+                    crate::graph_sel(graph_iri),
+                    fluree_db_api::GraphPayload::JsonLd(body),
+                    false,
+                ),
+                TransactionBody::RdfGraphSync {
+                    graph_iri,
+                    text,
+                    allow_empty,
+                } => staged.sync_graph_payload(
+                    crate::graph_sel(graph_iri),
+                    fluree_db_api::GraphPayload::Rdf(text),
+                    *allow_empty,
+                ),
+                TransactionBody::GraphInsert { graph_iri, payload } => {
+                    let payload = match payload {
+                        crate::GraphBody::JsonLd(json) => fluree_db_api::GraphPayload::JsonLd(json),
+                        crate::GraphBody::Rdf(text) => fluree_db_api::GraphPayload::Rdf(text),
+                    };
+                    staged.insert_graph_payload(crate::graph_sel(graph_iri), payload)
                 }
                 TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
                 TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
@@ -180,6 +202,9 @@ impl Committer for LocalCommitter {
             if let Some(policy) = policy_ctx {
                 builder = builder.policy(policy);
             }
+            // The verified identity rides governance from the route; the
+            // SHACL override gate reads it from here, not from the policy.
+            builder = builder.server_identity(governance.server_identity.clone());
 
             match builder.execute().await {
                 Ok(result) => {
@@ -190,7 +215,13 @@ impl Committer for LocalCommitter {
                         cypher_return: result.cypher_return,
                     });
                 }
-                Err(e) if attempt < MAX_TXN_RETRIES && is_retryable_txn_conflict(&e) => {
+                Err(e) if is_retryable_txn_conflict(&e) => {
+                    if attempt == MAX_TXN_RETRIES {
+                        return Err(execution_failure(ApiError::commit_contention(
+                            MAX_TXN_RETRIES,
+                            e,
+                        )));
+                    }
                     tracing::warn!(
                         attempt,
                         max_attempts = MAX_TXN_RETRIES,
@@ -208,16 +239,10 @@ impl Committer for LocalCommitter {
                             "refresh during commit-conflict retry failed; retrying anyway"
                         );
                     }
-                    last_error = Some(e);
-                    continue;
                 }
                 Err(e) => return Err(execution_failure(e)),
             }
         }
-
-        Err(execution_failure(last_error.unwrap_or_else(|| {
-            ApiError::internal("transaction failed after retries with no captured error")
-        })))
     }
 
     async fn revert(&self, request: RevertRequest) -> Result<RevertReceipt, SubmissionError> {
@@ -325,6 +350,7 @@ impl Committer for LocalCommitter {
             ledger_id,
             commits,
             blobs,
+            merged_commits,
             governance,
         } = request;
 
@@ -337,6 +363,7 @@ impl Committer for LocalCommitter {
             // The staged bundle carries every blob it resolved; a gap it
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
+            merged_commits: merged_commits.into_iter().map(Base64Bytes).collect(),
         };
 
         let response = self
@@ -379,7 +406,12 @@ impl SubmissionLookup for LocalCommitter {
 /// answer 503 + `err:db/NoveltyAtMax` + `Retry-After` for the drainable
 /// cases and 413 + `err:db/NoveltyDeltaTooLarge` for a delta that can never
 /// fit. The split mirrors the commit check (`current + delta >= max`): a
-/// delta at or above the ceiling fails even against drained novelty.
+/// delta at or above the ceiling fails even against drained novelty. The
+/// datatype limit keeps its identity for the same reason: 422 +
+/// `err:db/DatatypeLimitExceeded`, a commit reference that names no commit
+/// (404 + `err:db/CommitNotFound`), and commit contention (503 +
+/// `err:db/CommitContention`, which an `Execution` status would leave
+/// unsettled).
 pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
     match &err {
         ApiError::Transact(fluree_db_api::TransactError::NoveltyWouldExceed {
@@ -395,6 +427,28 @@ pub(crate) fn execution_failure(err: ApiError) -> SubmissionError {
         ) => SubmissionError::NoveltyBackpressure {
             message: err.to_string(),
         },
+        ApiError::Transact(fluree_db_api::TransactError::DatatypeLimitExceeded { .. }) => {
+            SubmissionError::DatatypeLimitExceeded {
+                message: err.to_string(),
+            }
+        }
+        ApiError::CommitNotFound(message) => SubmissionError::CommitNotFound {
+            message: message.clone(),
+        },
+        ApiError::ConfigUnavailable(_)
+        | ApiError::Transact(fluree_db_api::TransactError::ConfigUnavailable(_)) => {
+            SubmissionError::ConfigUnavailable {
+                message: err.to_string(),
+            }
+        }
+        ApiError::CommitContention { .. } => SubmissionError::CommitContention {
+            message: err.to_string(),
+        },
+        ApiError::Transact(fluree_db_api::TransactError::IndexNotLoaded(_)) => {
+            SubmissionError::IndexNotLoaded {
+                message: err.to_string(),
+            }
+        }
         _ => SubmissionError::Execution {
             status: err.status_code(),
             message: err.to_string(),
@@ -492,7 +546,7 @@ pub(crate) async fn resolve_cypher_under_lock(
             let probe_state = ledger_handle.snapshot().await.to_ledger_state();
             let probe = GraphDb::from_ledger_state(&probe_state);
             let probe = if governance.has_any_policy_inputs() {
-                fluree.wrap_policy(probe, governance, None).await?
+                fluree.wrap_policy(probe, governance).await?
             } else {
                 probe
             };

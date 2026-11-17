@@ -1,3 +1,8 @@
+// Shared by both W3C test binaries (`w3c_sparql.rs`, `w3c_rdf.rs`); each one
+// uses only its own suites' registers, so the others are dead code in that
+// binary by construction.
+#![allow(dead_code)]
+
 //! Per-suite skip registers for the W3C SPARQL test suites.
 //!
 //! Each entry is a test that currently FAILS for a known reason. The suites
@@ -177,31 +182,31 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // docs/audit/burn-down/ROADMAP.md §6.1 (absolute count omitted — it went
     // stale after the wave-2 register prune; the subgroup counts below are live)
     //
-    // W-1 algebra cluster (3): join-combo-2 = GRAPH ?g default-graph
-    // enumeration (PR-G1); nested-opt-1/2 = correlated-OPTIONAL independence
+    // W-1 algebra cluster (2): join-combo-2 = GRAPH ?g default-graph
+    // enumeration (PR-G1); nested-opt-1 = correlated-OPTIONAL independence
     // (PR-W1-OPT). filter-nested-2 (nested-group FILTER scope) and join-scope-1
     // (sub-SELECT merge of an OPTIONAL-produced correlation var) are fixed
-    // (PR-W1 Families A/B).
+    // (PR-W1 Families A/B). nested-opt-2 passes since #1734 (an unmatched
+    // OPTIONAL leaves its variables Unbound, not Poisoned), but partly by
+    // coincidence: its first OPTIONAL shares no variable with the required
+    // pattern, and the planner still evaluates it AFTER the second — an
+    // unsound reorder of left joins that this data happens not to expose.
     //
-    // nested-opt-1/2 are about WHERE the right operand is evaluated, not how it
+    // nested-opt-1 is about WHERE the right operand is evaluated, not how it
     // merges: §18.2.4 evaluates it independently and unifies afterwards, while
     // every OptionalBuilder here seeds it from the required row. nested-opt-1
     // wants `{ :x3 :q ?w . OPTIONAL { :x2 :p ?v } }` to bind ?v=2 on its own and
     // so match nothing against ?v=1 (1 solution); correlating substitutes ?v=1,
     // the inner OPTIONAL finds nothing and passes ?w=3/4 through, and we answer
-    // 2. #1713's unbound-merge fix does not move either one — verified, output
+    // 2. #1713's unbound-merge fix does not move it — verified, output
     // byte-identical before and after.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#join-combo-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-1",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/algebra/manifest#nested-opt-2",
     // PR-BASE: relative-IRI/BASE resolution in query output (2)
-    // list-1..4: the SPARQL parser now desugars `( ... )` patterns to
-    // rdf:first/rest/nil triples, but Fluree's Turtle ingest emits
-    // OBJECT-position collections as Fluree list_index items (and drops
-    // `()` objects entirely) — `parse_collection_as_list`,
-    // fluree-graph-turtle/src/parser.rs — so the first/rest triples the
-    // query needs are never stored. Eval-side ingest/model gap, not parser.
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-1",
+    // list-2..4: SPARQL reads a list's members as values of the property that
+    // holds it, as JSON-LD does, not as `rdf:first`/`rdf:rest` cells
+    // (docs/query/sparql.md#lists), so a `( … )` pattern matches nothing.
+    // By design; list-1 passes because `()` is the `rdf:nil` it denotes.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-2",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-3",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/basic/manifest#list-4",
@@ -265,13 +270,6 @@ pub const SPARQL10_QUERY_EVAL: &[&str] = &[
     // consistent. With the datatype emitted, the isomorphism resolves.
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-05",
     "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/open-world/manifest#open-eq-06",
-    // optional cluster (3): all three optional-complex-* use GRAPH ?x/?g and
-    // are gated on PR-G1 (GRAPH-variable semantics). dawg-optional-filter-005's
-    // doubly-nested `OPTIONAL { { ... FILTER } }` scope leak is fixed (PR-W1
-    // Family A).
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-2",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-3",
-    "http://www.w3.org/2001/sw/DataAccess/tests/data-r2/optional/manifest#dawg-optional-complex-4",
     // type-promotion-03/04/05/21 (double∘decimal, float-float/decimal/short
     // promotion) and the tP-29/30 "-fail" ASKs (double+decimal is double not
     // decimal; float+decimal is float not decimal) — D4 numeric promotion, PR-X2
@@ -386,53 +384,61 @@ pub const SPARQL12_SYNTAX_TRIPLE_TERMS_POSITIVE: &[&str] = &[];
 // entries double-counted across clusters); attribution below re-verified
 // empirically by unregistering and reading the harness's failure reasons.
 pub const SPARQL12_EVAL_TRIPLE_TERMS: &[&str] = &[
-    // data load: Turtle-star data won't parse (11)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
-    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) — 'expected subject, found KwGraph' on data-4.trig (3)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
-    // data load: blocked on TriG GRAPH-block parsing, orthogonal to star
-    // (D-8) (2)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
-    // D-1 triple-terms-as-values: qt:data uses `<<( … )>>`, rejected by
+    // data load: qt:data uses `<<( … )>>` triple-term VALUES, rejected by
     // ingest with the specific deferred error — Option-1 epic (10)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-8",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-9",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-10",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-11",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1j",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-tripleterms-1x",
-    // harness: the expected-result TriG-star graph fails to parse — the
-    // `{| |}` INSERT DATA itself already executes (1)
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
-    // query execution error (5). (expr-1/graphs-1/graphs-2 also error at
-    // execution, but each is registered once, above, under its data-load blocker.)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#op-2",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#order-2",
+    // results not isomorphic: the star data now LOADS (the collector sink
+    // accepts `<< >>` / `{| |}` / `~`; TriG graph blocks load since RDF text
+    // is parsed once on every write lane), but Fluree's model asserts the base
+    // triple of every `<< s p o >>` and binds reifiers, not triple terms —
+    // RDF 1.2's non-asserting reified triples and `?t` triple-term bindings
+    // are the Option-1 epic (10)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#graphs-2",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-2",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-3",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#basic-7",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-2",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#pattern-8-nomatch",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1j",
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#results-reifiedtriples-1x",
-    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
+    // SPARQL lowering: "RDF-star quoted triples in this position lowering is
+    // not yet implemented" (CONSTRUCT templates) (2)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-1",
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-3",
     // D-4 CONSTRUCT annotation projection: lowering returns "CONSTRUCT
     // projection of edge-annotation metadata is not supported in v1" (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-4",
-    // harness EXPECTED-graph parsing: the expected .ttl embeds `<<( … )>>`
-    // triple-term values the collector sink can't parse (secondary blockers
-    // for update-3 above are the same class). Option-1 epic scoping intel,
-    // roadmap §1.1-11. (1)
+    // results not isomorphic: the expected graph (`r rdf:reifies <<( … )>>`)
+    // now parses, but CONSTRUCT emits the annotation body without the
+    // reifier's attachment — D-4 annotation projection (1)
     "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#construct-5",
+    // SPARQL lowering: triple-term values in VALUES data not implemented (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-2",
+    // SPARQL lowering: the TRIPLE/SUBJECT/PREDICATE/OBJECT/isTRIPLE
+    // functions are accepted but not lowered — Option-1 epic (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#expr-1",
+    // SPARQL UPDATE lowering: "RDF-star quoted triple is not yet supported in
+    // SPARQL UPDATE lowering" (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-1",
+    // SPARQL UPDATE: an annotation whose value is the `GRAPH ?g` binding —
+    // "Raw IRI from graph source cannot be used as object for flake
+    // generation" (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-2",
+    // update-3: the `{| |}` INSERT DATA executes, but the expected post-update
+    // TriG-star graph carries reifier semantics the harness comparison does
+    // not model (expected 2 triples, got 0 in the default graph) (1)
+    "https://w3c.github.io/rdf-tests/sparql/sparql12/eval-triple-terms/manifest#update-3",
 ];
 
 pub const SPARQL12_EXPRESSION: &[&str] = &[
@@ -472,14 +478,7 @@ pub const SPARQL12_VERSION: &[&str] = &[
     // parser rejects valid input (3)
 ];
 
-// Not path-cardinality defects: pp34/pp35 are graph-cluster tests mis-filed
-// under property-path (`GRAPH <ng-01.ttl> { ?s :p1* ?t }` — constant GRAPH IRI
-// base-expansion vs exact-key registry miss, and `?g` bound as a literal).
-// Owner: PR-BASE + PR-G1 (burn-down ROADMAP §6.1); the path closure itself
-// already produces the expected `[a,b,b]` bag once the GRAPH block matches
-// (residual-eval.md §2.2).
-pub const SPARQL11_PROPERTY_PATH: &[&str] =
-    &["http://www.w3.org/2009/sparql/docs/tests/data-sparql11/property-path/manifest#pp35"];
+pub const SPARQL11_PROPERTY_PATH: &[&str] = &[];
 
 // SERVICE evaluation requires live external SPARQL endpoints, which a unit
 // test environment cannot provide. Revisit with an in-process mock endpoint
@@ -533,7 +532,9 @@ pub const SPARQL11_PROTOCOL: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/protocol/manifest#update_post_form",
 ];
 
-// Requires a running SPARQL server to introspect (audit §4.4).
+// Requires a running SPARQL server to introspect (audit §4.4). The server
+// serves the description; `fluree-db-server/tests/sparql_service_description.rs`
+// covers what these check (RDF returned, a matching `sd:endpoint`).
 pub const SPARQL11_SERVICE_DESCRIPTION: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service-description/manifest#conforms-to-schema",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/service-description/manifest#has-endpoint-triple",
@@ -561,4 +562,57 @@ pub const SPARQL11_HTTP_RDF_UPDATE: &[&str] = &[
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/http-rdf-update/manifest#put__graph_already_in_store",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/http-rdf-update/manifest#put__initial_state",
     "http://www.w3.org/2009/sparql/docs/tests/data-sparql11/http-rdf-update/manifest#put__mismatched_payload",
+];
+
+// =============================================================================
+// W3C RDF (Turtle) suites — `tests/w3c_rdf.rs`
+// =============================================================================
+
+// The RDF suites run the Turtle parser on the `GraphCollectorSink` path —
+// the conversion behind upsert, graph sync and memory import. Evaluation
+// tests compare the parsed graph with the expected N-Triples up to blank-node
+// isomorphism (Fluree's `list_index` collections are re-expanded to
+// `rdf:first`/`rdf:rest` chains, and reifier attachments are compared as
+// well, by the handler).
+
+pub const RDF11_TURTLE: &[&str] = &[
+    // numeric literals are canonicalized on ingest (value semantics: `+1`,
+    // `01`, `1E0`, `1.0e0` become `1` / `1.0E0`); the expected graphs keep the
+    // source lexical form, which Fluree does not preserve (7)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#bareword_double",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#double_lower_case_e",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#positive_numeric",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#numeric_with_leading_0",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-subm-11",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-subm-19",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-subm-20",
+    // lexer: `\u` escapes in IRIREF that decode to characters IRIREF forbids
+    // (space, `<`, `>`) are accepted instead of rejected (3)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-01",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-02",
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-eval-bad-03",
+    // lexer: PN_LOCAL with interior dots (`:s.1`, `:s..2`, `:3.s`) (1)
+    "https://w3c.github.io/rdf-tests/rdf/rdf11/rdf-turtle/manifest.ttl#turtle-syntax-ln-dots",
+];
+
+pub const RDF12_TURTLE_SYNTAX: &[&str] = &[
+    // triple terms as values (`<<( s p o )>>` anywhere but the object of
+    // `rdf:reifies`, and nested triple terms) are deferred: the graph IR has
+    // no triple-term Term, so ingest rejects them with the specific error (5)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-7",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#turtle12-8",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-3",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/syntax#nt-ttl12-nested-1",
+];
+
+pub const RDF12_TURTLE_EVAL: &[&str] = &[
+    // action rejected: nested triple terms (`<<( s p <<( … )>> )>>`) are
+    // deferred (2)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-03",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-tt-04",
+    // action rejected: annotation-of-annotation (a `{| |}` or `<< >>` inside an
+    // annotation body) is the deferred v1 shape, mirroring JSON-LD (2)
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-annotation-04",
+    "https://w3c.github.io/rdf-tests/rdf/rdf12/rdf-turtle/eval#turtle12-reified-triples-annotation-01",
 ];

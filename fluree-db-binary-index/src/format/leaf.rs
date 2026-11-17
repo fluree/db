@@ -43,6 +43,7 @@ use super::run_record::RunSortOrder;
 use super::run_record_v2::{
     cmp_v2_for_order, write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
 };
+use super::transitions::resolve_transitions;
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -270,6 +271,33 @@ impl LeafWriter {
         self.flush_leaf_if_target_reached()?;
 
         Ok(())
+    }
+
+    /// Write one fact identity's complete event log, for a branch with no
+    /// prior state for it: the events resolve from absent (see
+    /// [`resolve_transitions`]), the transitions go to the sidecar, and the
+    /// final assert, if any, becomes the row. Returns whether a row was
+    /// written.
+    ///
+    /// `events` holds `(record, op)` pairs (1 = assert, 0 = retract) in any
+    /// order and is left holding the sidecar transitions.
+    pub fn push_lifecycle(&mut self, events: &mut Vec<(RunRecordV2, u8)>) -> io::Result<bool> {
+        let row = resolve_transitions(events, false);
+        for &(rec, op) in events.iter() {
+            self.push_history_entry(HistEntryV2 {
+                s_id: rec.s_id,
+                p_id: rec.p_id,
+                o_type: rec.o_type,
+                o_key: rec.o_key,
+                o_i: rec.o_i,
+                t: rec.t,
+                op,
+            });
+        }
+        match row {
+            Some(row) => self.push_record(row).map(|()| true),
+            None => Ok(false),
+        }
     }
 
     /// Push a history entry for the fact whose row (if any) comes next.
@@ -848,6 +876,38 @@ pub struct LeafletDirEntryV3 {
     pub history_len: u32,
     pub history_min_t: u32,
     pub history_max_t: u32,
+}
+
+impl LeafletDirEntryV3 {
+    /// Whether a read replaying to `replay_to` takes rows from this leaflet's
+    /// history sidecar, which holds events newer than that `t`. `None` is a
+    /// read at the index's own `t`, which replays nothing.
+    ///
+    /// Such a read cannot go by what the directory says of the rows alone:
+    /// their count, their key range, their type constant, or their flags
+    /// (`HAS_O_I`).
+    #[inline]
+    pub fn replays_history(&self, replay_to: Option<i64>) -> bool {
+        replay_to.is_some_and(|to_t| {
+            self.history_len > 0 && self.history_max_t > u32::try_from(to_t).unwrap_or(u32::MAX)
+        })
+    }
+
+    /// `o_type_const` as far as a reader may apply it to the rows it reads.
+    ///
+    /// The constant is taken over the leaflet's rows alone, and a retracted
+    /// fact keeps its own type in the history sidecar: once every ref of a
+    /// predicate is retracted, its POST/PSOT leaflet reports the type of the
+    /// literals left behind. A reader that also takes rows from the sidecar
+    /// (`reads_history`) therefore has no constant to skip or label by.
+    #[inline]
+    pub fn o_type_const_for(&self, reads_history: bool) -> Option<u16> {
+        if reads_history {
+            None
+        } else {
+            self.o_type_const
+        }
+    }
 }
 
 /// Decode a V3 leaf header. Validates magic bytes.

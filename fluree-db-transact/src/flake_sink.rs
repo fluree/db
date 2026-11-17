@@ -5,12 +5,14 @@
 
 use crate::error::TransactError;
 use crate::generate::{infer_datatype, validate_value_dt_pair};
+use crate::lists::PendingList;
 use crate::namespace::{NamespaceRegistry, NsAllocator};
 use crate::value_convert::{convert_native_literal, convert_string_literal};
 #[cfg(test)]
 use fluree_db_core::edge::EdgeKey;
 use fluree_db_core::DatatypeConstraint;
 use fluree_db_core::{Flake, FlakeMeta, FlakeValue, Sid};
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_graph_ir::{Datatype, GraphSink, LiteralValue, SinkResult, TermId};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -59,6 +61,11 @@ pub struct FlakeSink<'a> {
     blank_counter: u32,
     /// Accumulated assertion flakes
     flakes: Vec<Flake>,
+    /// Lists in the order begun: their members, compact, and the label
+    /// their chain's cells would be minted under.
+    lists: Vec<(Vec<Flake>, String)>,
+    /// The list each subject and predicate is adding items to.
+    open_lists: HashMap<(Sid, Sid), usize>,
     /// Namespace registry for IRI → Sid conversion and code allocation
     ns_registry: &'a mut NamespaceRegistry,
     /// Transaction time stamp for all generated flakes
@@ -84,6 +91,8 @@ impl<'a> FlakeSink<'a> {
             blank_labels: HashMap::new(),
             blank_counter: 0,
             flakes: Vec::new(),
+            lists: Vec::new(),
+            open_lists: HashMap::new(),
             ns_registry,
             t,
             txn_id,
@@ -101,11 +110,45 @@ impl<'a> FlakeSink<'a> {
     /// this is the sink's *product*. Deferred-error semantics are unchanged
     /// by the fallible protocol — `emit_*` still records the first violation
     /// and keeps going, and this method is where it becomes a hard error.
+    ///
+    /// The document's lists are stored as a document no ledger holds would
+    /// store them ([`crate::lists::store_new_lists`]); a write to a ledger
+    /// takes them from [`Self::into_flakes_and_lists`] instead.
     pub fn into_flakes(self) -> Result<Vec<Flake>, TransactError> {
+        let (mut flakes, lists) = self.into_flakes_and_lists()?;
+        flakes.extend(crate::lists::store_new_lists(lists));
+        Ok(flakes)
+    }
+
+    /// The flakes and, separately, the lists the document writes, for
+    /// [`crate::lists::store_lists`] to store against the ledger.
+    ///
+    /// A list written out as a chain of the document's blank nodes is one of
+    /// them, as a `( … )` is ([`crate::lists::chain_lists`]).
+    pub fn into_flakes_and_lists(self) -> Result<(Vec<Flake>, Vec<PendingList>), TransactError> {
         if let Some(err) = self.invariant_error {
             return Err(err);
         }
-        Ok(self.flakes)
+        let mut lists: Vec<PendingList> = self
+            .lists
+            .into_iter()
+            .map(|(members, cells)| PendingList::new(members, cells))
+            .collect();
+        let minted = self
+            .ns_registry
+            .blank_node_sid(&format!("{}-", self.txn_id))
+            .name;
+        let (flakes, chained) = crate::lists::chain_lists(self.flakes, |sid| {
+            sid.namespace_code == fluree_vocab::namespaces::BLANK_NODE
+                && sid.name.starts_with(minted.as_ref())
+        });
+        lists.extend(
+            chained
+                .into_iter()
+                .enumerate()
+                .map(|(i, members)| PendingList::new(members, format!("{}--x{i}-", self.txn_id))),
+        );
+        Ok((flakes, lists))
     }
 
     // -- helpers -------------------------------------------------------------
@@ -152,6 +195,32 @@ impl<'a> FlakeSink<'a> {
     ) -> Option<Flake> {
         let s = self.resolve_sid(subject)?;
         let p = self.resolve_sid(predicate)?;
+
+        // Reserved-predicate firewall (mirrors the JSON-LD and SPARQL UPDATE
+        // surfaces): a user-authored `f:reifies*` statement must not reach
+        // stage. Annotations are minted only through the RDF 1.2 annotation
+        // syntax (`~` / `{| |}` / `<< >>`), which arrives via
+        // `emit_reified_triple` and builds a complete, validated bundle.
+        // Bulk import (`ImportSink`) is the administrative bootstrap path and
+        // deliberately stays permissive so an export round-trips.
+        if fluree_db_core::is_reserved_reifies_predicate(&p) {
+            let iri = format!(
+                "{}{}",
+                self.ns_registry.get_prefix(p.namespace_code).unwrap_or(""),
+                p.name
+            );
+            let e = TransactError::UnsupportedFeature(format!(
+                "'{iri}' is a system-controlled predicate; use the RDF 1.2 annotation \
+                 syntax (`~ <reifier> {{| ... |}}` or `<< s p o >>`) instead of \
+                 writing f:reifies* triples by hand"
+            ));
+            tracing::error!("FlakeSink: reserved predicate, aborting — {e}");
+            if self.invariant_error.is_none() {
+                self.invariant_error = Some(e);
+            }
+            return None;
+        }
+
         let (o, dtc) = self.resolve_object(object)?;
 
         let dt = dtc.datatype().clone();
@@ -212,16 +281,9 @@ impl GraphSink for FlakeSink<'_> {
             }
             None => {
                 // Anonymous blank node (`[]`, bare `~` reifiers, `{| … |}`
-                // blocks) — unique counter-based label. The leading '-'
-                // keeps the minted namespace disjoint from every
-                // user-written label: BLANK_NODE_LABEL must start with
-                // PN_CHARS_U | [0-9], so `_:-b1` can never lex (`_:b1` +
-                // an anonymous mint used to skolemize identically and
-                // silently merge). '-' stays legal medially, so the full
-                // skolemized `fdb-{txn}--b{N}` label still serializes and
-                // re-imports as the same stored node.
+                // blocks): a counter-based reserved label.
                 self.blank_counter += 1;
-                let label = format!("-b{}", self.blank_counter);
+                let label = reserved_blank_label("b", self.blank_counter);
                 let sid = self.skolemize(&label);
                 self.add_term(ResolvedTerm::Sid(sid))
             }
@@ -272,9 +334,21 @@ impl GraphSink for FlakeSink<'_> {
         object: TermId,
         index: i32,
     ) -> SinkResult {
-        if let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) {
-            self.flakes.push(flake);
-        }
+        let Some(flake) = self.build_flake(subject, predicate, object, Some(index)) else {
+            return Ok(());
+        };
+        let owner = (flake.s.clone(), flake.p.clone());
+        let list = match self.open_lists.get(&owner) {
+            Some(&list) if index != 0 => list,
+            _ => {
+                let cells = format!("{}--l{}-", self.txn_id, self.lists.len());
+                self.lists.push((Vec::new(), cells));
+                let list = self.lists.len() - 1;
+                self.open_lists.insert(owner, list);
+                list
+            }
+        };
+        self.lists[list].0.push(flake);
         Ok(())
     }
 
@@ -307,7 +381,7 @@ impl GraphSink for FlakeSink<'_> {
             return Ok(());
         };
 
-        match crate::generate::flakes::reified_triple_bundle(s, p, o, &dtc, &ann, self.t) {
+        match crate::generate::flakes::reified_triple_bundle(None, s, p, o, &dtc, &ann, self.t) {
             Ok(bundle) => self.flakes.extend(bundle),
             Err(e) => {
                 tracing::error!("FlakeSink: invariant violation in reifier bundle, aborting — {e}");
@@ -545,6 +619,29 @@ mod tests {
         // dt must be xsd:long (declared), not xsd:integer (inferred)
         let expected_dt = ns.sid_for_iri(xsd::LONG);
         assert_eq!(flakes[0].dt, expected_dt);
+    }
+
+    #[test]
+    fn user_authored_reifies_predicate_is_rejected() {
+        // The reserved-predicate firewall: a Turtle statement that names an
+        // `f:reifies*` predicate directly must fail the whole transaction,
+        // exactly like the JSON-LD and SPARQL UPDATE surfaces. Only the
+        // parser's reifier path (`emit_reified_triple`) may mint bundles.
+        let (mut ns, t, txn_id) = make_sink();
+        let mut sink = FlakeSink::new(&mut ns, t, txn_id);
+
+        let claim = sink.term_iri("http://example.org/claim1");
+        let p = sink.term_iri("https://ns.flur.ee/db#reifiesSubject");
+        let alice = sink.term_iri("http://example.org/alice");
+        sink.emit_triple(claim, p, alice).unwrap();
+
+        let err = sink
+            .into_flakes()
+            .expect_err("a hand-written f:reifiesSubject triple must be rejected");
+        assert!(
+            matches!(&err, TransactError::UnsupportedFeature(m) if m.contains("reifiesSubject")),
+            "expected the reserved-predicate error naming the predicate, got {err:?}"
+        );
     }
 
     #[test]

@@ -238,6 +238,18 @@ impl ImportCapability {
         self.modes.iter().any(|m| m == "source-upload")
     }
 
+    /// Whether a source upload may name a new graph of an existing ledger
+    /// to import into. A server without it would create a ledger instead.
+    pub fn supports_graph_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload-graph")
+    }
+
+    /// Whether a source upload may salt its blank-node ids. A server without
+    /// it would ignore the namespace and mint different ids.
+    pub fn supports_skolem_source_upload(&self) -> bool {
+        self.modes.iter().any(|m| m == "source-upload-skolem")
+    }
+
     /// Whether an archive of `size` bytes should take the negotiated upload
     /// path: a negotiated mode must be offered, and either direct isn't offered
     /// at all or the archive exceeds the advertised direct cap.
@@ -290,8 +302,9 @@ pub enum RemoteLedgerError {
     Network(String),
     /// 401 Unauthorized
     Unauthorized,
-    /// 403 Forbidden
-    Forbidden,
+    /// 403 Forbidden (includes server message if any, such as the reason a
+    /// policy gives for denying a write)
+    Forbidden(String),
     /// 404 Not Found (includes server message if any)
     NotFound(String),
     /// 400 Bad Request (includes server error message)
@@ -300,6 +313,8 @@ pub enum RemoteLedgerError {
     Conflict(String),
     /// 422 Unprocessable Entity / validation error
     ValidationError(String),
+    /// 415 Unsupported Media Type: the server does not read this body format
+    UnsupportedMediaType(String),
     /// 5xx Server Error (includes server error message)
     ServerError(String),
     /// Request could not be serialized (client-side bug)
@@ -318,11 +333,15 @@ impl fmt::Display for RemoteLedgerError {
                  Run `fluree auth login` to store a new token, or \
                  `fluree auth status` to check expiry."
             ),
-            RemoteLedgerError::Forbidden => write!(f, "access denied (403)"),
+            RemoteLedgerError::Forbidden(msg) if msg.is_empty() => write!(f, "access denied (403)"),
+            RemoteLedgerError::Forbidden(msg) => write!(f, "access denied (403): {msg}"),
             RemoteLedgerError::NotFound(msg) => write!(f, "not found: {msg}"),
             RemoteLedgerError::BadRequest(msg) => write!(f, "bad request: {msg}"),
             RemoteLedgerError::Conflict(msg) => write!(f, "conflict (409): {msg}"),
             RemoteLedgerError::ValidationError(msg) => write!(f, "validation error (422): {msg}"),
+            RemoteLedgerError::UnsupportedMediaType(msg) => {
+                write!(f, "unsupported media type (415): {msg}")
+            }
             RemoteLedgerError::ServerError(msg) => write!(f, "server error: {msg}"),
             RemoteLedgerError::InvalidRequest(msg) => write!(f, "invalid request: {msg}"),
             RemoteLedgerError::InvalidResponse(msg) => write!(f, "invalid response: {msg}"),
@@ -396,6 +415,16 @@ impl RemoteLedgerClient {
         self.refreshed.lock().take()
     }
 
+    /// The bearer token requests currently carry — the refreshed one once a
+    /// refresh has happened.
+    pub fn current_token(&self) -> Option<String> {
+        self.token.lock().clone()
+    }
+
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     fn add_auth(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         let token = self.token.lock();
         if let Some(ref t) = *token {
@@ -413,7 +442,7 @@ impl RemoteLedgerClient {
 
         match status {
             StatusCode::UNAUTHORIZED => RemoteLedgerError::Unauthorized,
-            StatusCode::FORBIDDEN => RemoteLedgerError::Forbidden,
+            StatusCode::FORBIDDEN => RemoteLedgerError::Forbidden(message),
             StatusCode::NOT_FOUND => RemoteLedgerError::NotFound(if message.is_empty() {
                 "resource not found".to_string()
             } else {
@@ -432,6 +461,13 @@ impl RemoteLedgerClient {
             StatusCode::UNPROCESSABLE_ENTITY => {
                 RemoteLedgerError::ValidationError(if message.is_empty() {
                     "validation error".to_string()
+                } else {
+                    message
+                })
+            }
+            StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+                RemoteLedgerError::UnsupportedMediaType(if message.is_empty() {
+                    "unsupported media type".to_string()
                 } else {
                     message
                 })
@@ -480,34 +516,15 @@ impl RemoteLedgerClient {
             );
         }
 
-        let body = serde_json::json!({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token
-        });
-
-        let resp = match self.client.post(&exchange_url).json(&body).send().await {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-
-        if !resp.status().is_success() {
+        let answer =
+            match crate::account::post_refresh(&self.client, &exchange_url, &refresh_token).await {
+                Ok(a) if a.status.is_success() => a,
+                _ => return false,
+            };
+        let Some(new_access) = answer.access_token().map(str::to_string) else {
             return false;
-        }
-
-        let resp_body: serde_json::Value = match resp.json().await {
-            Ok(b) => b,
-            Err(_) => return false,
         };
-
-        let new_access = match resp_body.get("access_token").and_then(|v| v.as_str()) {
-            Some(t) => t.to_string(),
-            None => return false,
-        };
-
-        let new_refresh = resp_body
-            .get("refresh_token")
-            .and_then(|v| v.as_str())
-            .map(String::from);
+        let new_refresh = answer.refresh_token().map(String::from);
 
         // Update the token
         *self.token.lock() = Some(new_access.clone());
@@ -1240,29 +1257,21 @@ impl RemoteLedgerClient {
     // Sync (graph synchronization)
     // =========================================================================
 
-    /// Synchronize a named graph: make its contents exactly `body`,
-    /// committing only the delta.
+    /// Synchronize a graph: make its contents exactly `body`, committing
+    /// only the delta. `graph: None` is the default graph.
     ///
-    /// `POST {base}/sync/{ledger}?graph=<iri>[&dryRun=true][&allowEmpty=true]`
+    /// `POST {base}/sync/{ledger}[?graph=<iri>][&dryRun=true][&allowEmpty=true]`
     /// with a JSON-LD body. A dry run answers with the delta report; a real
     /// run with the standard transact response.
     pub async fn sync_jsonld(
         &self,
         ledger: &str,
-        graph: &str,
+        graph: Option<&str>,
         body: &serde_json::Value,
         dry_run: bool,
         allow_empty: bool,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
-        let mut url = self.op_url("sync", ledger);
-        url.push_str("?graph=");
-        url.push_str(&urlencoding::encode(graph));
-        if dry_run {
-            url.push_str("&dryRun=true");
-        }
-        if allow_empty {
-            url.push_str("&allowEmpty=true");
-        }
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
         self.send_json(
             reqwest::Method::POST,
             &url,
@@ -1270,6 +1279,78 @@ impl RemoteLedgerClient {
             Some(RequestBody::Json(body)),
         )
         .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with a TriG body, sent as
+    /// `application/trig`. Its graph blocks must name `graph`.
+    pub async fn sync_trig(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        self.sync_rdf(
+            ledger,
+            graph,
+            body,
+            "application/trig",
+            dry_run,
+            allow_empty,
+        )
+        .await
+    }
+
+    /// [`sync_jsonld`](Self::sync_jsonld) with an RDF text body sent as
+    /// `content_type` (`text/turtle`, `application/n-triples`,
+    /// `application/trig`). A server that does not read RDF bodies on
+    /// `/sync` refuses before staging anything, so the caller may retry in
+    /// another format: 415 ([`RemoteLedgerError::UnsupportedMediaType`]), or
+    /// on v4.2.0 and v4.2.1 a 400 ([`RemoteLedgerError::BadRequest`]) asking
+    /// for JSON-LD.
+    pub async fn sync_rdf(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        body: &str,
+        content_type: &str,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.sync_url(ledger, graph, dry_run, allow_empty);
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            content_type,
+            Some(RequestBody::Text(body)),
+        )
+        .await
+    }
+
+    fn sync_url(
+        &self,
+        ledger: &str,
+        graph: Option<&str>,
+        dry_run: bool,
+        allow_empty: bool,
+    ) -> String {
+        let mut params = Vec::new();
+        if let Some(graph) = graph {
+            params.push(format!("graph={}", urlencoding::encode(graph)));
+        }
+        if dry_run {
+            params.push("dryRun=true".to_string());
+        }
+        if allow_empty {
+            params.push("allowEmpty=true".to_string());
+        }
+        let mut url = self.op_url("sync", ledger);
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        url
     }
 
     // =========================================================================
@@ -1548,21 +1629,41 @@ impl RemoteLedgerClient {
     // Negotiated upload import (for size-capped servers)
     // ========================================================================
 
+    /// Fetch the server's discovery document, or `None` when it cannot be
+    /// read or parsed.
+    async fn fetch_discovery(&self) -> Option<serde_json::Value> {
+        let disco_url = reqwest::Url::parse(&self.base_url)
+            .and_then(|u| u.join("/.well-known/fluree.json"))
+            .ok()?;
+        let resp = self
+            .add_auth(self.client.get(disco_url))
+            .send()
+            .await
+            .ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        resp.json::<serde_json::Value>().await.ok()
+    }
+
+    /// Whether the server takes the commits a push's merges brought in, on
+    /// `POST /push-merges`.
+    ///
+    /// A server that does not advertise it is treated as unable to. That
+    /// includes one whose discovery document cannot be read.
+    pub async fn supports_push_merges(&self) -> bool {
+        self.fetch_discovery()
+            .await
+            .and_then(|doc| doc["push"]["merged_commits"].as_bool())
+            .unwrap_or(false)
+    }
+
     /// Read the server's `.flpack` import capabilities from discovery.
     ///
     /// Best-effort: any failure (old server, no discovery, parse error) yields
     /// the back-compatible default — direct streaming only.
     pub async fn fetch_import_capability(&self) -> ImportCapability {
-        let Ok(disco_url) =
-            reqwest::Url::parse(&self.base_url).and_then(|u| u.join("/.well-known/fluree.json"))
-        else {
-            return ImportCapability::direct_only();
-        };
-        let resp = match self.add_auth(self.client.get(disco_url)).send().await {
-            Ok(r) if r.status().is_success() => r,
-            _ => return ImportCapability::direct_only(),
-        };
-        let Ok(doc) = resp.json::<serde_json::Value>().await else {
+        let Some(doc) = self.fetch_discovery().await else {
             return ImportCapability::direct_only();
         };
         let import = &doc["import"];
@@ -1608,7 +1709,9 @@ impl RemoteLedgerClient {
 
     /// Mint a raw source-data upload slot. The server keeps the filename's
     /// extension, applies the CSV/Cypher conversion options, and runs the
-    /// bulk-import pipeline on `complete`.
+    /// bulk-import pipeline on `complete`: creating `ledger`, or with `graph`
+    /// filling that new graph of it.
+    #[allow(clippy::too_many_arguments)]
     pub async fn mint_source_import_upload(
         &self,
         ledger: &str,
@@ -1616,6 +1719,8 @@ impl RemoteLedgerClient {
         filename: &str,
         edge_policy: fluree_db_api::csv_import::EdgePolicy,
         base_iri: Option<&str>,
+        graph: Option<&str>,
+        skolem_namespace: Option<&str>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let url = self.op_url_root("import-upload");
         let edge_properties = match edge_policy {
@@ -1634,6 +1739,12 @@ impl RemoteLedgerClient {
         }
         if let Some(base_iri) = base_iri {
             body["base_iri"] = serde_json::Value::from(base_iri);
+        }
+        if let Some(graph) = graph {
+            body["graph"] = serde_json::Value::from(graph);
+        }
+        if let Some(namespace) = skolem_namespace {
+            body["skolem_namespace"] = serde_json::Value::from(namespace);
         }
         self.send_json(
             reqwest::Method::POST,
@@ -2055,6 +2166,68 @@ impl RemoteLedgerClient {
     }
 
     // =========================================================================
+    // Encryption key rotation
+    // =========================================================================
+
+    /// Key ids the server holds: `GET {base_url}/encryption`.
+    pub async fn encryption_keys(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// The rotation progress record: `GET {base_url}/encryption/rotate/status`.
+    pub async fn encryption_rotate_status(&self) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/status");
+        self.send_json(reqwest::Method::GET, &url, "application/json", None)
+            .await
+    }
+
+    /// Start or resume a rotation: `POST {base_url}/encryption/rotate`.
+    pub async fn encryption_rotate(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// Pause or cancel the sweep on the node that holds it:
+    /// `POST {base_url}/encryption/rotate/{signal}`.
+    pub async fn encryption_rotate_signal(
+        &self,
+        signal: &str,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("encryption/rotate/{signal}"));
+        self.send_json(reqwest::Method::POST, &url, "application/json", None)
+            .await
+    }
+
+    /// Verify a rotation: `POST {base_url}/encryption/rotate/verify`. Shares
+    /// `REINDEX_TIMEOUT`: it reads every blob's header in the store.
+    pub async fn encryption_rotate_verify(
+        &self,
+        retire_key_id: u32,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("encryption/rotate/verify");
+        let body = serde_json::json!({ "retire_key_id": retire_key_id });
+        self.send_json_with_timeout(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(&body)),
+            Self::REINDEX_TIMEOUT,
+        )
+        .await
+    }
+
+    // =========================================================================
     // List ledgers
     // =========================================================================
 
@@ -2075,8 +2248,9 @@ impl RemoteLedgerClient {
     /// Create a new branch on the remote server.
     ///
     /// Calls `POST {base_url}/branch` with a JSON body. `at` optionally
-    /// specifies a historical commit to branch from (as accepted by
-    /// `CommitRef::parse`, e.g. `"t:5"` or a hex digest / full CID).
+    /// specifies the point on the source to branch from, passed through
+    /// unparsed: the server reads it with `TimeSpec::parse_at`, as the local
+    /// path does (e.g. `"t:5"`, `"time:2026-01-01T00:00:00Z"`, a hex digest).
     pub async fn create_branch(
         &self,
         ledger: &str,
@@ -2266,6 +2440,7 @@ impl RemoteLedgerClient {
         branch: &str,
         payload: &RevertPayload,
         strategy: Option<&str>,
+        include_validation: Option<bool>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("revert-preview", ledger);
         let mut sep = '?';
@@ -2323,6 +2498,10 @@ impl RemoteLedgerClient {
                 urlencoding::encode(s).into_owned(),
             );
         }
+        if let Some(b) = include_validation {
+            push(&mut url, &mut sep, "include_validation", b.to_string());
+        }
+
         self.send_json(reqwest::Method::GET, &url, "application/json", None)
             .await
     }
@@ -2358,6 +2537,7 @@ impl RemoteLedgerClient {
         include_changes: Option<bool>,
         max_changes: Option<usize>,
         changes_after_subject: Option<&str>,
+        include_validation: Option<bool>,
     ) -> Result<serde_json::Value, RemoteLedgerError> {
         let mut url = self.op_url("merge-preview", ledger);
         let mut sep = '?';
@@ -2421,6 +2601,9 @@ impl RemoteLedgerClient {
                 urlencoding::encode(c).into_owned(),
             );
         }
+        if let Some(b) = include_validation {
+            push(&mut url, &mut sep, "include_validation", b.to_string());
+        }
 
         self.send_json(reqwest::Method::GET, &url, "application/json", None)
             .await
@@ -2436,7 +2619,14 @@ impl RemoteLedgerClient {
         ledger: &str,
         request: &fluree_db_api::PushCommitsRequest,
     ) -> Result<PushCommitsResponse, RemoteLedgerError> {
-        let url = self.op_url("push", ledger);
+        // Merged commits go only to `push-merges`. A server predating that
+        // endpoint answers 404 there, where `push` would drop them.
+        let op = if request.merged_commits.is_empty() {
+            "push"
+        } else {
+            "push-merges"
+        };
+        let url = self.op_url(op, ledger);
         let body = serde_json::to_value(request)
             .map_err(|e| RemoteLedgerError::InvalidRequest(e.to_string()))?;
 
@@ -2573,16 +2763,28 @@ impl RemoteLedgerClient {
     /// Uses address-cursor pagination. Pass `cursor: None` for the first page
     /// (starts from head). Each response includes `next_cursor` for the next page,
     /// or `None` when genesis has been reached.
+    ///
+    /// Requests `lineage` mode: the first-parent line as `commits`, and the
+    /// commits its merges brought in as `merged_commits`. The export stops
+    /// above `base`, or runs to genesis when it is `None`. A server predating
+    /// that mode ignores the request and answers with `lineage` unset.
     pub async fn fetch_commits(
         &self,
         ledger: &str,
         cursor: Option<&str>,
+        base: Option<&fluree_db_core::ContentId>,
         limit: usize,
     ) -> Result<ExportCommitsResponse, RemoteLedgerError> {
         let mut url = self.op_url("commits", ledger);
-        url.push_str(&format!("?limit={limit}"));
+        url.push_str(&format!("?limit={limit}&lineage=true"));
         if let Some(c) = cursor {
             url.push_str(&format!("&cursor={}", urlencoding::encode(c)));
+        }
+        if let Some(base) = base {
+            url.push_str(&format!(
+                "&base_id={}",
+                urlencoding::encode(&base.to_string())
+            ));
         }
 
         let resp = self
@@ -2780,6 +2982,41 @@ impl RemoteLedgerClient {
         .await
     }
 
+    /// Map Delta tables as a graph source on the remote server.
+    ///
+    /// Calls `POST {base_url}/delta/map`.
+    pub async fn delta_map(
+        &self,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root("delta/map");
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
+    /// One of the read-only Delta endpoints: `catalog/browse`, `r2rml/generate`, ….
+    ///
+    /// Calls `POST {base_url}/delta/{route}`.
+    pub async fn delta_read(
+        &self,
+        route: &str,
+        body: &serde_json::Value,
+    ) -> Result<serde_json::Value, RemoteLedgerError> {
+        let url = self.op_url_root(&format!("delta/{route}"));
+        self.send_json(
+            reqwest::Method::POST,
+            &url,
+            "application/json",
+            Some(RequestBody::Json(body)),
+        )
+        .await
+    }
+
     /// Map an Iceberg table as a graph source on the remote server.
     ///
     /// Calls `POST {base_url}/iceberg/map`.
@@ -2860,6 +3097,16 @@ fn push_idempotency_key(ledger: &str, request: &fluree_db_api::PushCommitsReques
         hasher.update([0u8]);
         hasher.update((v.0.len() as u64).to_be_bytes());
         hasher.update(&v.0);
+    }
+
+    // Hashed only when present, so a push without merges keeps the key it
+    // had before this field existed.
+    if !request.merged_commits.is_empty() {
+        hasher.update(b"merged\0");
+        for commit in &request.merged_commits {
+            hasher.update((commit.0.len() as u64).to_be_bytes());
+            hasher.update(&commit.0);
+        }
     }
 
     format!("sha256:{}", hex::encode(hasher.finalize()))
@@ -3214,6 +3461,152 @@ mod tests {
         );
     }
 
+    /// Serve one HTTP request with a 200 JSON `body`. Returns the base URL
+    /// and a handle yielding the request line the client sent.
+    async fn serve_once(body: &'static str) -> (String, tokio::task::JoinHandle<String>) {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut tmp = [0u8; 4096];
+            let header_end = loop {
+                let n = sock.read(&mut tmp).await.unwrap();
+                buf.extend_from_slice(&tmp[..n]);
+                if let Some(pos) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+                if n == 0 {
+                    break buf.len();
+                }
+            };
+            let headers = String::from_utf8_lossy(&buf[..header_end]).to_string();
+            let content_length: usize = headers
+                .to_lowercase()
+                .lines()
+                .find_map(|l| l.strip_prefix("content-length:"))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0);
+            while buf.len() < header_end + content_length {
+                let n = sock.read(&mut tmp).await.unwrap();
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&tmp[..n]);
+            }
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            sock.write_all(resp.as_bytes()).await.unwrap();
+            sock.flush().await.unwrap();
+            headers.lines().next().unwrap_or_default().to_string()
+        });
+        (format!("http://{addr}/v1/fluree"), server)
+    }
+
+    const PUSH_RESPONSE: &str = r#"{"ledger":"mydb:main","accepted":1,
+        "head":{"t":2,"commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"},
+        "indexing":{"enabled":false,"needed":false,"novelty_size":0,"index_t":0,"commit_t":2}}"#;
+
+    /// Merged commits go only to `push-merges`. A push without them keeps
+    /// using `push`, which every server accepts.
+    #[tokio::test]
+    async fn push_commits_picks_the_endpoint_by_content() {
+        for (merged_commits, expected) in [
+            (Vec::new(), "POST /v1/fluree/push/mydb:main "),
+            (
+                vec![fluree_db_api::Base64Bytes(b"merged".to_vec())],
+                "POST /v1/fluree/push-merges/mydb:main ",
+            ),
+        ] {
+            let (base_url, server) = serve_once(PUSH_RESPONSE).await;
+            let request = fluree_db_api::PushCommitsRequest {
+                commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+                merged_commits,
+                ..Default::default()
+            };
+            RemoteLedgerClient::new(&base_url, None)
+                .push_commits("mydb:main", &request)
+                .await
+                .expect("push should succeed");
+            let request_line = server.await.unwrap();
+            assert!(
+                request_line.starts_with(expected),
+                "expected {expected:?}, got {request_line:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn supports_push_merges_reads_discovery() {
+        for (doc, expected) in [
+            (r#"{"version":1,"push":{"merged_commits":true}}"#, true),
+            (r#"{"version":1}"#, false),
+        ] {
+            let (base_url, server) = serve_once(doc).await;
+            assert_eq!(
+                RemoteLedgerClient::new(&base_url, None)
+                    .supports_push_merges()
+                    .await,
+                expected,
+                "discovery document: {doc}"
+            );
+            assert!(server
+                .await
+                .unwrap()
+                .starts_with("GET /.well-known/fluree.json "));
+        }
+    }
+
+    /// Pull asks for the first-parent line, stopping above the local head.
+    #[tokio::test]
+    async fn fetch_commits_requests_the_line_above_the_base() {
+        let page = r#"{"ledger":"mydb:main",
+            "head_commit_id":"bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi",
+            "head_t":2,"commits":[],"newest_t":0,"oldest_t":0,"next_cursor_id":null,
+            "count":0,"effective_limit":100,"lineage":true}"#;
+        let (base_url, server) = serve_once(page).await;
+        let base: fluree_db_core::ContentId =
+            "bafybeigdyrzt5sfp7udm7hu76uh7y26nf3efuylqabf3oclgtqy55fbzdi"
+                .parse()
+                .unwrap();
+        let response = RemoteLedgerClient::new(&base_url, None)
+            .fetch_commits("mydb:main", None, Some(&base), 100)
+            .await
+            .expect("fetch should succeed");
+        assert!(response.lineage);
+
+        let request_line = server.await.unwrap();
+        assert!(request_line.contains("lineage=true"), "{request_line}");
+        assert!(
+            request_line.contains(&format!("base_id={base}")),
+            "{request_line}"
+        );
+    }
+
+    /// Two pushes that differ only in their merged commits must not share
+    /// an idempotency key. A server would replay the first one's response.
+    #[test]
+    fn push_idempotency_key_covers_merged_commits() {
+        let plain = fluree_db_api::PushCommitsRequest {
+            commits: vec![fluree_db_api::Base64Bytes(b"line".to_vec())],
+            ..Default::default()
+        };
+        let with_merges = fluree_db_api::PushCommitsRequest {
+            merged_commits: vec![fluree_db_api::Base64Bytes(b"merged".to_vec())],
+            ..plain.clone()
+        };
+        assert_ne!(
+            push_idempotency_key("mydb:main", &plain),
+            push_idempotency_key("mydb:main", &with_merges)
+        );
+    }
+
     #[test]
     fn test_error_display() {
         let err = RemoteLedgerError::Unauthorized;
@@ -3223,6 +3616,30 @@ mod tests {
 
         let err = RemoteLedgerError::BadRequest("invalid query syntax".to_string());
         assert_eq!(format!("{err}"), "bad request: invalid query syntax");
+    }
+
+    /// A write a modify policy denies is a 403 whose body carries the
+    /// policy's reason; the error shows it.
+    #[tokio::test]
+    async fn test_forbidden_keeps_the_server_message() {
+        let response = |body: &'static str| {
+            reqwest::Response::from(
+                http::Response::builder()
+                    .status(403)
+                    .body(body)
+                    .expect("response"),
+            )
+        };
+        let err = RemoteLedgerClient::map_error(response(
+            r#"{"error":"Employees may not modify document content.","status":403}"#,
+        ))
+        .await;
+        assert_eq!(
+            err.to_string(),
+            "access denied (403): Employees may not modify document content."
+        );
+        let err = RemoteLedgerClient::map_error(response("")).await;
+        assert_eq!(err.to_string(), "access denied (403)");
     }
 
     #[test]
@@ -3309,7 +3726,7 @@ mod tests {
     use futures::stream;
 
     fn sample_ns_record() -> NsRecord {
-        let mut record = NsRecord::new("mydb".to_string(), "main".to_string());
+        let mut record = NsRecord::new("mydb:main");
         record.commit_head_id = Some(ContentId::new(ContentKind::Commit, b"head"));
         record.commit_t = 7;
         record.index_head_id = Some(ContentId::new(ContentKind::IndexRoot, b"idx"));

@@ -134,6 +134,23 @@ fn group_terms(stmt: &[&Token]) -> Result<Vec<(usize, usize)>> {
             TokenKind::String | TokenKind::LongString | TokenKind::StringEscaped(_)
         );
         i += 1;
+        // An RDF 1.2 triple term `<<( s p o )>>` (possibly nested) is one
+        // object term spanning up to its matching `)>>`.
+        if matches!(stmt[i - 1].kind, TokenKind::TripleTermStart) {
+            let mut depth = 1usize;
+            while depth > 0 {
+                let tok = stmt.get(i).ok_or_else(|| {
+                    TransactError::Parse("n-quads: unterminated '<<(' triple term".to_string())
+                })?;
+                match tok.kind {
+                    TokenKind::TripleTermStart => depth += 1,
+                    TokenKind::TripleTermEnd => depth -= 1,
+                    _ => {}
+                }
+                end = tok.end as usize;
+                i += 1;
+            }
+        }
         if is_string && i < stmt.len() {
             match stmt[i].kind {
                 TokenKind::DoubleCaret => {
@@ -213,6 +230,26 @@ mod tests {
         assert!(
             trig.contains("@fr ."),
             "escaped string must keep its language tag; got: {trig}"
+        );
+    }
+
+    #[test]
+    fn triple_term_object_is_one_term() {
+        // RDF 1.2 N-Quads: `<<( s p o )>>` is a single object term, in the
+        // default graph and under a graph label alike.
+        let nq = "_:r <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://ex/a> <http://ex/b> \"c\"@en )>> .\n\
+                  _:r2 <http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies> <<( <http://ex/a> <http://ex/b> <<( <http://ex/x> <http://ex/y> 1 )>> )>> <http://ex/g> .\n";
+        let trig = nquads_to_trig(nq).unwrap();
+        assert!(
+            trig.contains("<<( <http://ex/a> <http://ex/b> \"c\"@en )>> ."),
+            "default-graph triple term kept intact; got: {trig}"
+        );
+        assert!(trig.contains("GRAPH <http://ex/g> {"));
+        assert!(
+            trig.contains(
+                "<<( <http://ex/a> <http://ex/b> <<( <http://ex/x> <http://ex/y> 1 )>> )>> ."
+            ),
+            "nested triple term grouped under its graph label; got: {trig}"
         );
     }
 

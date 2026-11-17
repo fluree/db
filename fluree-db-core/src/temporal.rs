@@ -29,14 +29,32 @@ use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::fmt;
 
-/// XSD dateTime, held as a UTC instant.
+/// XSD dateTime, held as a UTC instant to the microsecond.
 ///
 /// A source offset is applied and then discarded: `2010-12-21T15:38:02-08:00`
 /// and `2010-12-21T23:38:02Z` are the same value, render the same and hash the
 /// same. A lexical form with no offset is read as UTC. See the module docs.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+///
+/// Digits past the microsecond are dropped when the value is built
+/// ([`Self::from_instant`]), because a commit writes six and the index keys
+/// microseconds: a value written and the value stored are then one value,
+/// before a reload and after one, in a write and in a query constant.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct DateTime {
     instant: ChronoDateTime<Utc>,
+}
+
+/// The serialized form, `{ instant }`, read back through
+/// [`DateTime::from_instant`] like every other way in.
+impl<'de> Deserialize<'de> for DateTime {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "DateTime")]
+        struct Form {
+            instant: ChronoDateTime<Utc>,
+        }
+        Form::deserialize(deserializer).map(|form| Self::from_instant(form.instant))
+    }
 }
 
 impl DateTime {
@@ -67,8 +85,17 @@ impl DateTime {
         Err(format!("Cannot parse dateTime: {s}"))
     }
 
+    /// The value at `instant`, to the microsecond: digits past it are
+    /// dropped as a commit and the index drop them. Every constructor goes
+    /// through here.
     pub fn from_instant(instant: ChronoDateTime<Utc>) -> Self {
-        Self { instant }
+        let nanos = instant.nanosecond();
+        if nanos.is_multiple_of(1_000) {
+            return Self { instant };
+        }
+        Self {
+            instant: instant.with_nanosecond(to_micros(nanos)).unwrap_or(instant),
+        }
     }
 
     /// From the index key encoding (`ObjKey::encode_datetime`).
@@ -158,6 +185,19 @@ impl fmt::Display for DateTime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.canonical())
     }
+}
+
+/// `nanos` (a sub-second count, a leap second's included) with the digits past
+/// the microsecond dropped: the precision Fluree stores a temporal value at.
+fn to_micros(nanos: u32) -> u32 {
+    nanos - nanos % 1_000
+}
+
+/// Nanoseconds since the epoch held to the microsecond, rounded down as
+/// [`DateTime::from_instant`] rounds: to the microsecond at or before the
+/// instant, before 1970 too. For readers of nanosecond timestamps.
+pub fn micros_from_epoch_nanos(nanos: i64) -> i64 {
+    nanos.div_euclid(1_000)
 }
 
 /// Fractional-seconds suffix of a canonical lexical: empty when zero, else
@@ -294,16 +334,30 @@ impl fmt::Display for Date {
     }
 }
 
-/// XSD time, held as a wall-clock time of day.
+/// XSD time, held as a wall-clock time of day to the microsecond (digits past
+/// it are dropped when the value is built, as for [`DateTime`]).
 ///
 /// A source offset is validated and then discarded — it is *not* applied:
 /// `17:00:00-06:00` is read as `17:00:00`, not `23:00:00`. The index has only
 /// ever kept the wall clock (`micros_since_midnight`), so this is the reading
 /// both lanes agree on without re-encoding every stored time. See the module
 /// docs.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
 pub struct Time {
     time: NaiveTime,
+}
+
+/// The serialized form, `{ time }`, read back through [`Time::from_naive`]
+/// like every other way in.
+impl<'de> Deserialize<'de> for Time {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        #[serde(rename = "Time")]
+        struct Form {
+            time: NaiveTime,
+        }
+        Form::deserialize(deserializer).map(|form| Self::from_naive(form.time))
+    }
 }
 
 impl Time {
@@ -328,8 +382,16 @@ impl Time {
             .ok_or_else(err)
     }
 
+    /// The time of day `time`, to the microsecond (see [`DateTime::from_instant`]).
+    /// Every constructor goes through here.
     pub fn from_naive(time: NaiveTime) -> Self {
-        Self { time }
+        let nanos = time.nanosecond();
+        if nanos.is_multiple_of(1_000) {
+            return Self { time };
+        }
+        Self {
+            time: time.with_nanosecond(to_micros(nanos)).unwrap_or(time),
+        }
     }
 
     /// From the index key encoding (`ObjKey::encode_time`).
@@ -1713,6 +1775,37 @@ impl Date {
         let formatted = Utc::now().format("%Y-%m-%d").to_string();
         Self::parse(&formatted).expect("UTC date parses")
     }
+}
+
+/// The order of a temporal value and a plain string read as a lexical form
+/// of its kind, either way round: a value held as a string (a temporal
+/// lexical the index keeps in its string dictionary) against a typed
+/// constant, or a typed value against a string constant. The lexical is read
+/// as a value of the held kind, so a dateTime or time is held to the
+/// microsecond like every value. `None` when neither pairing applies or the
+/// string does not parse.
+pub fn cmp_with_lexical(
+    a: &crate::value::FlakeValue,
+    b: &crate::value::FlakeValue,
+) -> Option<Ordering> {
+    use crate::value::FlakeValue;
+    let (held, lexical, flipped) = match (a, b) {
+        (FlakeValue::String(s), held) => (held, s.as_str(), true),
+        (held, FlakeValue::String(s)) => (held, s.as_str(), false),
+        _ => return None,
+    };
+    let ord = match held {
+        FlakeValue::DateTime(v) => v.as_ref().cmp(&DateTime::parse(lexical).ok()?),
+        FlakeValue::Time(v) => v.as_ref().cmp(&Time::parse(lexical).ok()?),
+        FlakeValue::Date(v) => v.as_ref().cmp(&Date::parse(lexical).ok()?),
+        FlakeValue::GYear(v) => v.as_ref().cmp(&GYear::parse(lexical).ok()?),
+        FlakeValue::GYearMonth(v) => v.as_ref().cmp(&GYearMonth::parse(lexical).ok()?),
+        FlakeValue::GMonth(v) => v.as_ref().cmp(&GMonth::parse(lexical).ok()?),
+        FlakeValue::GDay(v) => v.as_ref().cmp(&GDay::parse(lexical).ok()?),
+        FlakeValue::GMonthDay(v) => v.as_ref().cmp(&GMonthDay::parse(lexical).ok()?),
+        _ => return None,
+    };
+    Some(if flipped { ord.reverse() } else { ord })
 }
 
 /// Fold a Cypher temporal constructor with a constant lexical argument into a
@@ -3397,5 +3490,60 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(err.contains("overflow"), "unexpected error: {err}");
+    }
+
+    /// Every way into a `DateTime` or `Time` holds it to the microsecond,
+    /// deserialization included, and the serialized form reads back as
+    /// itself.
+    #[test]
+    fn a_deserialized_temporal_is_held_to_the_microsecond() {
+        let dt: DateTime =
+            serde_json::from_str(r#"{"instant":"2020-01-01T00:00:00.123456789Z"}"#).unwrap();
+        assert_eq!(dt, DateTime::parse("2020-01-01T00:00:00.123456Z").unwrap());
+        assert_eq!(dt.canonical(), "2020-01-01T00:00:00.123456Z");
+        let back: DateTime = serde_json::from_str(&serde_json::to_string(&dt).unwrap()).unwrap();
+        assert_eq!(back, dt);
+        let t: Time = serde_json::from_str(r#"{"time":"12:00:00.123456789"}"#).unwrap();
+        assert_eq!(t, Time::parse("12:00:00.123456").unwrap());
+        let back: Time = serde_json::from_str(&serde_json::to_string(&t).unwrap()).unwrap();
+        assert_eq!(back, t);
+    }
+
+    /// A lexical form is read as a value, held to the microsecond like every
+    /// value: one with digits past it orders equal to the value it is held
+    /// as, either way round and before 1970 too.
+    #[test]
+    fn a_lexical_is_ordered_as_the_value_it_is_held_as() {
+        use crate::value::FlakeValue;
+        let held = FlakeValue::DateTime(Box::new(
+            DateTime::parse("2020-01-01T00:00:00.123456Z").unwrap(),
+        ));
+        let lexical = |s: &str| FlakeValue::String(s.to_string());
+        let cmp = |s: &str| cmp_with_lexical(&held, &lexical(s));
+        assert_eq!(cmp("2020-01-01T00:00:00.1234569Z"), Some(Ordering::Equal));
+        assert_eq!(cmp("2020-01-01T00:00:00.123456Z"), Some(Ordering::Equal));
+        assert_eq!(cmp("2020-01-01T00:00:00.1234559Z"), Some(Ordering::Greater));
+        assert_eq!(cmp("2020-01-01T00:00:00.123457Z"), Some(Ordering::Less));
+        assert_eq!(cmp("not a dateTime"), None);
+        assert_eq!(
+            cmp_with_lexical(&lexical("2020-01-01T00:00:00.1234559Z"), &held),
+            Some(Ordering::Less)
+        );
+        let old = FlakeValue::DateTime(Box::new(
+            DateTime::parse("1969-12-31T23:59:59.999999Z").unwrap(),
+        ));
+        assert_eq!(
+            cmp_with_lexical(&old, &lexical("1969-12-31T23:59:59.9999991Z")),
+            Some(Ordering::Equal)
+        );
+        let t = FlakeValue::Time(Box::new(Time::parse("12:00:00.123456").unwrap()));
+        assert_eq!(
+            cmp_with_lexical(&t, &lexical("12:00:00.1234561")),
+            Some(Ordering::Equal)
+        );
+        let year = FlakeValue::GYear(Box::new(GYear::parse("2020").unwrap()));
+        let later = lexical("2021");
+        assert_eq!(cmp_with_lexical(&year, &later), Some(Ordering::Less));
+        assert_eq!(cmp_with_lexical(&later, &later), None);
     }
 }

@@ -123,6 +123,10 @@ impl ContentStore for MeteredContentStore {
         self.inner.has(id).await
     }
 
+    async fn sync(&self) -> StorageResult<()> {
+        self.inner.sync().await
+    }
+
     async fn get(&self, id: &ContentId) -> StorageResult<Vec<u8>> {
         self.inner.get(id).await
     }
@@ -145,8 +149,24 @@ impl ContentStore for MeteredContentStore {
         self.inner.resolve_local_path(id)
     }
 
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.inner.resolve_cached_bytes(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     async fn release(&self, id: &ContentId) -> StorageResult<()> {
         self.inner.release(id).await
+    }
+
+    async fn release_many(&self, ids: &[ContentId]) -> Vec<(ContentId, fluree_db_core::Error)> {
+        self.inner.release_many(ids).await
     }
 
     async fn get_range(

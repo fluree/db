@@ -18,6 +18,8 @@
 //!   `RangeOptions::history_mode` — published parameters for the
 //!   `range_with_overlay` core API, below the planner.
 
+use crate::binding::UnmatchedOptional;
+
 /// Whether a query is evaluating current state or full history.
 ///
 /// History queries return the merged stream of assert + retract events
@@ -52,9 +54,7 @@ impl TemporalMode {
 /// Planning-time context threaded through the operator-tree builder.
 ///
 /// Carries decisions that must be made once at planning and captured at
-/// operator construction — never read again at runtime. Currently this
-/// is just [`TemporalMode`]; future planning inputs that want the same
-/// "decide once, capture at construction" discipline should land here.
+/// operator construction — never read again at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct PlanningContext {
     /// Temporal mode for this query.
@@ -80,6 +80,19 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
+    /// What an unmatched OPTIONAL binds its optional-only variables to — the
+    /// surface language's null semantics. Folded in from `Query` at the plan
+    /// root; defaults to SPARQL's `Unbound`.
+    pub unmatched_optional: UnmatchedOptional,
+    /// Desired output prefix of a streaming join block. This is a startup-cost
+    /// hint, never a cap on input or output rows. Unlike a source row budget,
+    /// it remains useful through DISTINCT and FILTER. Blocking query modifiers
+    /// must clear it because they need the complete input.
+    pub row_goal: Option<usize>,
+    /// The row order this query's graph-source table scans owe it. Deterministic
+    /// unless the query root has shown that no LIMIT or OFFSET anywhere in the
+    /// query can observe scan order (see `build_operator_tree`).
+    pub scan_order: crate::r2rml::ScanOrder,
 }
 
 impl PlanningContext {
@@ -90,6 +103,9 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
     }
 
@@ -100,6 +116,9 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
     }
 
@@ -122,6 +141,24 @@ impl PlanningContext {
     #[inline]
     pub const fn with_multi_default_graph(mut self, multi: bool) -> Self {
         self.multi_default_graph = multi && self.mode.is_current();
+        self
+    }
+
+    /// Set the surface language's OPTIONAL null semantics (see
+    /// [`Self::unmatched_optional`]).
+    #[inline]
+    pub const fn with_unmatched_optional(mut self, unmatched: UnmatchedOptional) -> Self {
+        self.unmatched_optional = unmatched;
+        self
+    }
+
+    pub(crate) const fn with_row_goal(mut self, goal: Option<usize>) -> Self {
+        self.row_goal = goal;
+        self
+    }
+
+    pub(crate) const fn with_scan_order(mut self, order: crate::r2rml::ScanOrder) -> Self {
+        self.scan_order = order;
         self
     }
 

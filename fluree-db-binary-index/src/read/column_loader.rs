@@ -196,9 +196,9 @@ pub fn load_leaflet_columns(
 ///
 /// Bundles the content-addressed key components (`leaf_id`, `leaflet_idx`, and
 /// the `decode_set` column bitmask), the leaf's sort order, and which columns to
-/// decode — keeping the loader signatures small. Distinct `decode_set`s cache
-/// under distinct keys, so a narrow batch is never served where a wider one is
-/// needed.
+/// decode — keeping the loader signatures small. A leaflet caches one batch
+/// whatever its columns: a read it covers is served projected, and a wider
+/// read decodes only the missing columns into it.
 #[derive(Clone, Copy)]
 pub struct LeafletDecodeSpec {
     /// `xxh3_128(leaf_cid)` — content-addressed, self-invalidating.
@@ -222,25 +222,24 @@ impl LeafletDecodeSpec {
             columns: self.decode_set.0,
         }
     }
+}
 
-    #[inline]
-    fn projection(&self) -> ColumnProjection {
-        ColumnProjection {
-            output: self.decode_set,
-            internal: ColumnSet::EMPTY,
-        }
+#[inline]
+fn decode_projection(columns: ColumnSet) -> ColumnProjection {
+    ColumnProjection {
+        output: columns,
+        internal: ColumnSet::EMPTY,
     }
 }
 
 /// Load columns from a V3 leaflet with `LeafletCache` support.
 ///
-/// On cache hit, returns the previously decoded `ColumnBatch` directly (zero
-/// decompress cost). On miss, decodes only `spec.decode_set`, inserts the
-/// result, and returns it. The per-column `ColumnData::Block` values are
-/// `Arc<[T]>` and cheap to clone. The cache key carries the column set, so a
-/// query needing more columns misses and decodes its own wider entry rather
-/// than being served a narrow batch. Overlay merge and time-travel replay are
-/// applied downstream (callers must widen `decode_set` accordingly).
+/// On cache hit, returns the previously decoded `ColumnBatch` (zero decompress
+/// cost), projected to `spec.decode_set`. On miss, decodes only the columns of
+/// `spec.decode_set` the leaflet's cache entry lacks. The per-column
+/// `ColumnData::Block` values are `Arc<[T]>` and cheap to clone. Overlay merge
+/// and time-travel replay are applied downstream (callers must widen
+/// `decode_set` accordingly).
 pub fn load_leaflet_columns_cached(
     leaf_bytes: &[u8],
     entry: &LeafletDirEntryV3,
@@ -248,12 +247,12 @@ pub fn load_leaflet_columns_cached(
     cache: &super::leaflet_cache::LeafletCache,
     spec: LeafletDecodeSpec,
 ) -> io::Result<ColumnBatch> {
-    cache.try_get_or_decode_v3_batch(spec.key(), || {
+    cache.try_get_or_decode_v3_batch(spec.key(), |columns| {
         load_leaflet_columns(
             leaf_bytes,
             entry,
             payload_base,
-            &spec.projection(),
+            &decode_projection(columns),
             spec.order,
         )
     })
@@ -271,8 +270,12 @@ pub fn load_columns_cached_via_handle(
     cache: &super::leaflet_cache::LeafletCache,
     spec: LeafletDecodeSpec,
 ) -> io::Result<ColumnBatch> {
-    cache.try_get_or_decode_v3_batch(spec.key(), || {
-        handle.load_columns(spec.leaflet_idx as usize, &spec.projection(), spec.order)
+    cache.try_get_or_decode_v3_batch(spec.key(), |columns| {
+        handle.load_columns(
+            spec.leaflet_idx as usize,
+            &decode_projection(columns),
+            spec.order,
+        )
     })
 }
 

@@ -2099,6 +2099,49 @@ async fn opts_include_system_facts_surfaces_f_reifies() {
     );
 }
 
+/// SPARQL twin of `opts_include_system_facts_surfaces_f_reifies`.
+#[tokio::test]
+async fn pragma_include_system_facts_surfaces_f_reifies() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/edge-annotations:pragma-include-system-facts");
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = "SELECT ?p WHERE { <http://example.org/emp/alice-acme> ?p ?o }";
+    let reifies = |rows: &JsonValue| {
+        rows.to_string()
+            .matches("https://ns.flur.ee/db#reifies")
+            .count()
+    };
+
+    let hidden = support::query_sparql_formatted(&fluree, &committed.ledger, query)
+        .await
+        .expect("query without the pragma");
+    assert_eq!(reifies(&hidden), 0, "hidden without the pragma: {hidden}");
+
+    let shown = support::query_sparql_formatted(
+        &fluree,
+        &committed.ledger,
+        &format!("# PRAGMA include-system-facts: true\n{query}"),
+    )
+    .await
+    .expect("query with the pragma");
+    assert!(
+        reifies(&shown) >= 3,
+        "the pragma must surface the f:reifies* bundle: {shown}"
+    );
+}
+
 #[tokio::test]
 async fn opts_include_system_facts_propagates_through_dataset_path() {
     // The dataset/connection query path
@@ -4075,6 +4118,184 @@ async fn turtle_star_reified_triple_matches_jsonld_annotation() {
 }
 
 #[tokio::test]
+async fn turtle_rdf_reifies_triple_term_matches_jsonld_annotation() {
+    // The RDF 1.2 spelling every asserting form desugars to, and the only
+    // star construct N-Triples has: `r rdf:reifies <<( s p o )>>` plus the
+    // reifier's own property.
+    assert_turtle_star_matches_jsonld(
+        "it/turtle-star:rdf-reifies-triple-term",
+        json!({
+            "@context": ctx(),
+            "@id": "ex:alice",
+            "ex:worksFor": {
+                "@id": "ex:acme",
+                "@annotation": { "ex:q": { "@id": "ex:z" } }
+            }
+        }),
+        "@prefix ex: <http://example.org/> .\n\
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         ex:r rdf:reifies <<( ex:alice ex:worksFor ex:acme )>> .\n\
+         ex:r ex:q ex:z .\n",
+        "http://example.org/alice",
+        "http://example.org/worksFor",
+    )
+    .await;
+}
+
+/// TriG-star inside a `GRAPH { }` block ↔ JSON-LD `@graph` + `@annotation`:
+/// same named-graph bundle (f:reifiesGraph present, flakes in the graph),
+/// and the annotation is visible to a named-graph-scoped query.
+#[tokio::test]
+async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::edge::EdgeKey;
+    use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
+    use fluree_db_core::value::FlakeValue;
+    use fluree_vocab::reifies_iris;
+    use std::collections::BTreeMap;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/trig-star:named-graph";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let graph_iri = "http://example.org/hr-graph";
+
+    let jsonld_committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@id": "ex:alice",
+                "@graph": "ex:hr-graph",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:q": { "@id": "ex:z" } }
+                }
+            }),
+        )
+        .await
+        .expect("JSON-LD named-graph @annotation insert");
+    let t_jsonld = jsonld_committed.ledger.t();
+
+    let trig = "@prefix ex: <http://example.org/> .\n\
+                GRAPH ex:hr-graph { ex:alice ex:worksFor ex:acme {| ex:q ex:z |} . }\n";
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .upsert_turtle(trig)
+        .commit()
+        .await
+        .expect("TriG-star upsert inside a GRAPH block");
+    let ledger = fluree.ledger(ledger_id).await.expect("reload ledger");
+    let t_trig = ledger.t();
+    assert!(t_trig > t_jsonld);
+
+    // Both bundles live in the named graph: scan under its g_id.
+    let g_id = ledger
+        .snapshot
+        .graph_registry
+        .assigned_graph_id(graph_iri)
+        .expect("named graph registered");
+    let graph_sid = ledger.snapshot.encode_iri(graph_iri).expect("graph sid");
+    let subject_sid = ledger
+        .snapshot
+        .encode_iri("http://example.org/alice")
+        .expect("subject sid");
+    let reifies_subject_pid = ledger
+        .snapshot
+        .encode_iri(reifies_iris::SUBJECT)
+        .expect("f:reifiesSubject sid");
+    let pointers = range_with_overlay(
+        &ledger.snapshot,
+        g_id,
+        ledger.novelty.as_ref(),
+        IndexType::Post,
+        RangeTest::Eq,
+        RangeMatch::predicate_object(reifies_subject_pid, FlakeValue::Ref(subject_sid.clone())),
+        RangeOptions::new().with_to_t(t_trig),
+    )
+    .await
+    .expect("scan named-graph f:reifiesSubject pointers");
+    let mut bundles: BTreeMap<(fluree_db_core::Sid, i64), Vec<fluree_db_core::Flake>> =
+        BTreeMap::new();
+    for ptr in &pointers {
+        let ann_flakes = range_with_overlay(
+            &ledger.snapshot,
+            g_id,
+            ledger.novelty.as_ref(),
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch::subject(ptr.s.clone()),
+            RangeOptions::new().with_to_t(t_trig),
+        )
+        .await
+        .expect("scan annotation subject");
+        for f in ann_flakes {
+            if fluree_db_core::is_reserved_reifies_predicate(&f.p) {
+                bundles.entry((ptr.s.clone(), f.t)).or_default().push(f);
+            }
+        }
+    }
+    let mut jl: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_jsonld)
+        .map(|(_, b)| bundle_body(b))
+        .collect();
+    let mut tt: Vec<_> = bundles
+        .iter()
+        .filter(|((_, t), _)| *t == t_trig)
+        .map(|(_, b)| bundle_body(b))
+        .collect();
+    assert_eq!(
+        jl.len(),
+        1,
+        "one JSON-LD bundle in the named graph: {bundles:#?}"
+    );
+    assert_eq!(
+        tt.len(),
+        1,
+        "one TriG-star bundle in the named graph: {bundles:#?}"
+    );
+    jl.sort();
+    tt.sort();
+    assert_eq!(
+        jl, tt,
+        "TriG-star bundle must be bit-identical to the JSON-LD @graph/@annotation bundle"
+    );
+    for ((ann, _), bundle) in &bundles {
+        let key = EdgeKey::from_reifies_facts(bundle)
+            .unwrap_or_else(|e| panic!("bundle for {ann:?} failed to decode: {e:?}"));
+        assert_eq!(
+            key.g.as_ref(),
+            Some(&graph_sid),
+            "bundle for {ann:?} is graph-anchored"
+        );
+        assert_eq!(key.s, subject_sid);
+    }
+
+    // User-visible: a query scoped to the named graph hydrates both.
+    let query = json!({
+        "@context": ctx(),
+        "from": format!("{ledger_id}#{graph_iri}"),
+        "select": ["?q"],
+        "where": {
+            "@id": "ex:alice",
+            "ex:worksFor": { "@id": "ex:acme", "@annotation": { "ex:q": "?q" } }
+        }
+    });
+    let result = fluree
+        .query_connection(&query)
+        .await
+        .expect("named-graph annotation query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    let rows = rows.as_array().expect("array");
+    assert_eq!(
+        rows.len(),
+        2,
+        "one row per annotation (JSON-LD + TriG): {rows:?}"
+    );
+}
+
+#[tokio::test]
 async fn turtle_star_lang_tagged_literal_matches_jsonld_annotation() {
     // Language-tagged base object: both surfaces must emit f:reifiesLang
     // and carry m.lang on the f:reifiesObject flake (BUGS-2 symmetry).
@@ -5367,7 +5588,7 @@ fn graph_id(ledger: &MemoryLedger, iri: &str) -> fluree_db_core::GraphId {
     ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .unwrap_or_else(|| panic!("graph {iri} must be registered"))
 }
 
@@ -5839,6 +6060,950 @@ async fn copy_with_explicit_reifier_reads_scoped_per_graph() {
             extract_role_from_hydration(&rows).as_deref(),
             Some("Engineer"),
             "hydration in {g} must surface the annotation (not Duplicate-drop it): {rows}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn count_shapes_read_only_the_reifies_lookups_they_need() {
+    // Without a sealed arena the wrapper runs the generic `f:reifies*`
+    // chain, which drops the base-edge check and every lookup whose
+    // position nothing reads (`elide_redundant_chain`). The answers must
+    // not move: a plain subject that merely carries the body predicate
+    // (`ex:carol ex:source`) is not a reifier, endpoints that are read
+    // still bind, and a constant endpoint still constrains.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:elided-count";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@graph": [
+            {
+                "@id": "ex:alice",
+                "ex:worksFor": {
+                    "@id": "ex:acme",
+                    "@annotation": { "ex:source": "hr" }
+                },
+                "ex:score": {
+                    "@value": 42,
+                    "@annotation": { "ex:source": "exam" }
+                }
+            },
+            { "@id": "ex:bob", "ex:worksFor": { "@id": "ex:acme" } },
+            { "@id": "ex:carol", "ex:source": "manual" }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    let ledger = committed.ledger;
+
+    let count = |sparql: &'static str| {
+        let fluree = &fluree;
+        let ledger = &ledger;
+        async move {
+            let rows = support::query_sparql_formatted(fluree, ledger, sparql)
+                .await
+                .expect("count query");
+            rows.as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|row| row.as_array())
+                .and_then(|cols| cols.first())
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_else(|| panic!("count row: {rows}"))
+        }
+    };
+
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ?p ?o >> ex:source ?src }"
+        )
+        .await,
+        2,
+        "two reified edges; ex:carol's ex:source is not an annotation"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        1,
+        "only alice's worksFor edge is reified"
+    );
+    assert_eq!(
+        count(
+            "PREFIX ex: <http://example.org/>
+             SELECT (COUNT(*) AS ?n) WHERE { << ex:bob ex:worksFor ?o >> ex:source ?src }"
+        )
+        .await,
+        0,
+        "bob's edge exists but carries no annotation"
+    );
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?s ?o ?src WHERE { << ?s ex:worksFor ?o >> ex:source ?src }",
+    )
+    .await
+    .expect("projected query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let cols = arr[0].as_array().expect("row");
+    assert!(
+        iri_matches(&cols[0], "ex:alice", "http://example.org/alice"),
+        "subject still binds when read: {rows}"
+    );
+    assert!(
+        iri_matches(&cols[1], "ex:acme", "http://example.org/acme"),
+        "object still binds when read: {rows}"
+    );
+    assert_eq!(cols[2].as_str(), Some("hr"), "{rows}");
+}
+
+/// An annotated `ex:worksFor` edge plus two annotated `ex:knows` edges, one of
+/// them a self-loop, for the elided-chain tests below.
+async fn seed_elided_chain_edges(ledger_id: &str) -> (MemoryFluree, MemoryLedger) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "ex:source": "hr" }
+        },
+        "ex:knows": [
+            { "@id": "ex:alice", "@annotation": { "ex:source": "self" } },
+            { "@id": "ex:bob", "@annotation": { "ex:source": "crm" } }
+        ]
+    });
+    let committed = fluree.insert(ledger0, &txn).await.expect("seed insert");
+    (fluree, committed.ledger)
+}
+
+/// SPARQL solutions as one `var -> lexical value` map per row.
+async fn sparql_solutions(
+    fluree: &MemoryFluree,
+    ledger: &MemoryLedger,
+    sparql: &str,
+) -> Vec<std::collections::BTreeMap<String, String>> {
+    let result = support::query_sparql(fluree, ledger, sparql)
+        .await
+        .expect("sparql query");
+    let json = result
+        .to_sparql_json(&ledger.snapshot)
+        .expect("sparql json");
+    json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            row.as_object()
+                .expect("binding row")
+                .iter()
+                .map(|(var, term)| {
+                    let value = term["value"].as_str().expect("term value");
+                    (var.clone(), value.to_string())
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn wildcard_select_binds_the_quoted_triple_variables() {
+    // `SELECT *` has no projection-pushdown set, so the chain elision reads
+    // its needed variables off the WHERE walk, which has to see into the
+    // quoted triple. When it did not, the triple's own variables counted as
+    // unread, their `f:reifies*` lookups were dropped, and the rows came back
+    // without them (W3C sparql12 eval-triple-terms basic-4, basic-5,
+    // pattern-7, pattern-8).
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-wildcard").await;
+
+    // basic-4: a variable predicate inside the quoted triple.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ?p ex:acme >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("p").map(String::as_str),
+        Some("http://example.org/worksFor"),
+        "{rows:#?}"
+    );
+    assert_eq!(
+        rows[0].get("q").map(String::as_str),
+        Some("http://example.org/source"),
+        "{rows:#?}"
+    );
+
+    // basic-5: a variable object.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        r#"PREFIX ex: <http://example.org/>
+           SELECT * WHERE { << ex:alice ex:worksFor ?o >> ?q "hr" }"#,
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(
+        rows[0].get("o").map(String::as_str),
+        Some("http://example.org/acme"),
+        "{rows:#?}"
+    );
+
+    // Every position a variable, ordered by the body's.
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT * WHERE { << ?s ?p ?o >> ex:source ?src } ORDER BY ?src",
+    )
+    .await;
+    assert_eq!(rows.len(), 3, "{rows:#?}");
+    for var in ["s", "p", "o", "src"] {
+        assert!(
+            rows.iter().all(|row| row.contains_key(var)),
+            "?{var} unbound: {rows:#?}"
+        );
+    }
+    let objects: Vec<&str> = rows.iter().map(|row| row["o"].as_str()).collect();
+    assert_eq!(
+        objects,
+        [
+            "http://example.org/bob",
+            "http://example.org/acme",
+            "http://example.org/alice"
+        ]
+    );
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": "*",
+            "where": {
+                "@id": "?s",
+                "ex:worksFor": {
+                    "@id": "?o",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld wildcard query");
+    let arr = rows.as_array().expect("Select array");
+    assert_eq!(arr.len(), 1, "rows: {rows}");
+    let row = arr[0].as_object().expect("wildcard row object");
+    assert!(
+        row.get("?s")
+            .is_some_and(|v| iri_matches(v, "ex:alice", "http://example.org/alice")),
+        "?s unbound: {rows}"
+    );
+    assert!(
+        row.get("?o")
+            .is_some_and(|v| iri_matches(v, "ex:acme", "http://example.org/acme")),
+        "?o unbound: {rows}"
+    );
+    assert_eq!(row.get("?src").and_then(JsonValue::as_str), Some("hr"));
+}
+
+#[tokio::test]
+async fn a_repeated_quoted_triple_variable_still_equates_its_positions() {
+    // `<< ?s ex:knows ?s >>` with nothing reading ?s: the elided chain drops
+    // the base edge, so the subject and object lookups joining on ?s are all
+    // that keeps alice-knows-bob from matching.
+    let (fluree, ledger) = seed_elided_chain_edges("it/edge-annotations:elided-self-loop").await;
+
+    let rows = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT (COUNT(*) AS ?n) WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await
+    .expect("self-loop count");
+    assert_eq!(
+        rows[0][0].as_i64(),
+        Some(1),
+        "only alice knows herself: {rows}"
+    );
+
+    let rows = sparql_solutions(
+        &fluree,
+        &ledger,
+        "PREFIX ex: <http://example.org/>
+         SELECT ?src WHERE { << ?s ex:knows ?s >> ex:source ?src }",
+    )
+    .await;
+    assert_eq!(rows.len(), 1, "{rows:#?}");
+    assert_eq!(rows[0]["src"], "self");
+
+    // JSON-LD twin.
+    let rows = support::query_jsonld_formatted(
+        &fluree,
+        &ledger,
+        &json!({
+            "@context": ctx(),
+            "select": ["?src"],
+            "where": {
+                "@id": "?s",
+                "ex:knows": {
+                    "@id": "?s",
+                    "@annotation": { "ex:source": "?src" }
+                }
+            }
+        }),
+    )
+    .await
+    .expect("jsonld self-loop query");
+    assert_eq!(rows, json!([["self"]]), "only alice knows herself");
+}
+
+#[tokio::test]
+async fn one_reifier_on_the_same_edge_in_two_graphs_writes_in_one_transaction() {
+    // `add_same_edge_same_reifier_succeeds` establishes that this state is
+    // legal and that graph management produces it: `COPY <g1> TO <g2>`
+    // duplicates annotated edges, reifier IRIs included. It reaches that state
+    // through two transactions.
+    //
+    // Writing it in ONE transaction used to be refused. The single-target
+    // invariant grouped a transaction's `f:reifies*` flakes by reifier alone,
+    // so both graphs' bundles folded into one, and a bundle that names two
+    // graphs fails `EdgeKey::from_reifies_facts`'s graph-uniformity check
+    // before it reaches any duplicate check — reported as "multi-target",
+    // which it is not. Two transactions were free to do what one could not.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:same-reifier-two-graphs-one-txn";
+    let g1 = "http://example.org/g1";
+    let g2 = "http://example.org/g2";
+
+    let committed = fluree
+        .insert(
+            genesis_ledger(&fluree, ledger_id),
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {
+                        "@id": "ex:alice",
+                        "@graph": g1,
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": {"@id": "ex:r1", "ex:role": "Engineer"}
+                        }
+                    },
+                    {
+                        "@id": "ex:alice",
+                        "@graph": g2,
+                        "ex:worksFor": {
+                            "@id": "ex:acme",
+                            "@annotation": {"@id": "ex:r1", "ex:role": "Engineer"}
+                        }
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("one reifier, one edge, two graphs, one transaction");
+
+    for g in [g1, g2] {
+        let anns = support::decode_annotations_for_subject(
+            &committed.ledger,
+            graph_id(&committed.ledger, g),
+            "http://example.org/alice",
+        )
+        .await;
+        assert_eq!(anns.len(), 1, "graph {g} must carry its own bundle");
+    }
+}
+
+#[tokio::test]
+async fn replaying_a_commit_does_not_refuse_a_reifier_an_older_build_wrote() {
+    // The single-target invariant runs on `stage_flakes`, which put it on the
+    // push path. `insert_turtle` and the permissive bulk-import sink did not
+    // enforce it before this work, so a commit written by an older build can
+    // hold a reifier on two edges. Refusing that on push would strand the
+    // ledger permanently — there is no way forward short of rewriting history
+    // — to prevent data that is already written.
+    //
+    // Authoring still refuses it, which is the case where refusing changes the
+    // outcome. This drives both sides of that distinction through the same
+    // flakes, so the difference is the option and nothing else.
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:replayed-commit";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+
+    let sid = |ns: u16, name: &str| Sid::new(ns, name);
+    let reifies = |local: &str| {
+        Sid::new(
+            fluree_vocab::namespaces::FLUREE_DB,
+            Box::leak(local.to_string().into_boxed_str()) as &'static str,
+        )
+    };
+    let ns = 100u16;
+    // One reifier, two different subjects: a bundle that cannot decode.
+    let assert_reifies = |object: Sid| {
+        Flake::new(
+            sid(ns, "claim1"),
+            reifies(fluree_vocab::db::REIFIES_SUBJECT),
+            FlakeValue::Ref(object),
+            Sid::new(0, "@id"),
+            1,
+            true,
+            None,
+        )
+    };
+    let flakes = vec![
+        assert_reifies(sid(ns, "alice")),
+        assert_reifies(sid(ns, "carol")),
+    ];
+
+    let authored = fluree_db_transact::stage_flakes(
+        ledger0.clone(),
+        flakes.clone(),
+        fluree_db_transact::StageOptions::new(),
+    )
+    .await;
+    let err = match authored {
+        Err(e) => e,
+        Ok(_) => panic!("authoring a two-target reifier must be refused"),
+    };
+    assert!(
+        err.to_string().contains("claim1"),
+        "the refusal must name the reifier: {err}"
+    );
+
+    let replayed = fluree_db_transact::stage_flakes(
+        ledger0,
+        flakes,
+        fluree_db_transact::StageOptions::new().replaying_commit(),
+    )
+    .await;
+    assert!(
+        replayed.is_ok(),
+        "replaying an already-authored commit must apply, not strand the ledger"
+    );
+}
+
+// ===========================================================================
+// Annotation-form DELETE: the full spelling matrix (issue #1861)
+//
+// Two separate rules combine into a result that surprises people, and the
+// docs used to describe each one only in isolation:
+//
+//   1. The annotation form ASSERTS the base triple. RDF 1.2 Turtle §2.11.1
+//      defines `s p o ~ :r {| … |}` as "both reify and assert" the triple, and
+//      SPARQL 1.2 Update §3.1.2 routes `DELETE DATA`'s QuadData through the
+//      same production. So the annotation form of a delete is a base-edge
+//      retraction. This is spec-mandated, not a Fluree choice.
+//   2. Retracting a base edge cascades to EVERY reifier attached to it, not
+//      just the one named. This one IS a Fluree choice — neither spec entails
+//      it — and it is why sibling claims lose their attachment.
+//
+// The rows below are measured, not assumed. `docs/concepts/edge-annotations.md`
+// quotes this table; if a row changes here, that section is wrong.
+// ===========================================================================
+
+/// The issue's seed: one edge, two independent claims about it.
+const ANNOTATION_MATRIX_SEED: &str = r"@prefix : <http://example.org/> .
+:alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .
+:alice :knows :bob ~ :claim2 {| :confidence 0.6 ; :source :sourceB |} .
+";
+
+/// What survives a write, counted the way a user would check.
+#[derive(Debug, PartialEq, Eq)]
+struct Survivors {
+    /// Rows for `:alice :knows ?o` — 0 means the base edge is gone.
+    base: usize,
+    /// Body properties still on `:claim1` (the `f:reifies*` bundle is hidden).
+    claim1_body: usize,
+    /// Body properties still on `:claim2`.
+    claim2_body: usize,
+    /// Reifiers still attached to `:alice :knows :bob`.
+    attached: usize,
+    /// Rows for `:alice :knows :carol` — 1 means the object was rewritten.
+    new_object: usize,
+}
+
+async fn annotation_matrix_survivors(fluree: &MemoryFluree, ledger_id: &str) -> Survivors {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let count = |q: &'static str| {
+        let ledger = &ledger;
+        async move {
+            support::query_sparql(fluree, ledger, q)
+                .await
+                .ok()
+                .and_then(|v| v.to_jsonld(&ledger.snapshot).ok())
+                .and_then(|v| v.as_array().map(Vec::len))
+                .unwrap_or(0)
+        }
+    };
+    Survivors {
+        base: count("PREFIX : <http://example.org/> SELECT ?o WHERE { :alice :knows ?o }").await,
+        claim1_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim1 ?p ?v }")
+            .await,
+        claim2_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim2 ?p ?v }")
+            .await,
+        attached: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?c WHERE { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
+        )
+        .await,
+        new_object: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?o WHERE { :alice :knows ?o . FILTER(?o = :carol) }",
+        )
+        .await,
+    }
+}
+
+/// How a row's write is spelled.
+enum MatrixOp {
+    Sparql(&'static str),
+    /// A Turtle `upsert` — not a delete at all, but it retracts the old edge.
+    UpsertTurtle(&'static str),
+    /// The JSON-LD `@annotation` delete.
+    JsonLdAnnotation,
+}
+
+/// Every spelling of "remove this annotated edge", and what each one leaves.
+///
+/// Rows 2, 7 and 10 are the ones issue #1861 does not mention, and two of
+/// them change what the documentation has to say:
+///
+/// - **Row 10** (`~ :claim1` with no block) reads as "detach claim1" and is
+///   the worst outcome in the table: the edge goes, BOTH claims are detached,
+///   and BOTH bodies are left standing as well-formed-looking orphans.
+/// - **Row 7** is an `upsert`, with no delete written anywhere, and it fires
+///   the identical cascade.
+#[tokio::test]
+async fn annotation_form_delete_matrix() {
+    let rows: Vec<(&str, MatrixOp, Option<Survivors>)> = vec![
+        // Row 1 — the issue's own spelling. The named claim's body goes with
+        // the edge; the sibling's body is orphaned.
+        (
+            "explicit reifier + body block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 0,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 2 — a variable reifier matches EVERY reifier on the edge and
+        // strips exactly the properties the block names, from all of them.
+        // The result is not "claim1 withdrawn" but "both claims gutted".
+        (
+            "DELETE WHERE with a variable reifier",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE WHERE \
+                 { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 1,
+                claim2_body: 1,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 3 — the ONLY spelling that means "detach exactly this claim".
+        // The edge stands, both bodies stand, and claim2 stays attached.
+        (
+            "JSON-LD @annotation delete",
+            MatrixOp::JsonLdAnnotation,
+            Some(Survivors {
+                base: 1,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 1,
+                new_object: 0,
+            }),
+        ),
+        // Row 4 — property-level retraction: what a reader usually means by
+        // "withdraw claim1". Pass 2 then retires the now-empty reifier.
+        (
+            "property-level retraction of the claim body",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :claim1 :confidence 0.8 ; :source :sourceA }",
+            ),
+            Some(Survivors {
+                base: 1,
+                claim1_body: 0,
+                claim2_body: 2,
+                attached: 1,
+                new_object: 0,
+            }),
+        ),
+        // Row 6 — the baseline: deleting the bare edge detaches both claims.
+        (
+            "bare base edge",
+            MatrixOp::Sparql("PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob }"),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 7 — an upsert that changes the object. No delete is written and
+        // the same cascade fires.
+        (
+            "upsert changing the object",
+            MatrixOp::UpsertTurtle(
+                "@prefix : <http://example.org/> .\n\
+                 :alice :knows :carol ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .\n",
+            ),
+            Some(Survivors {
+                base: 1,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 1,
+            }),
+        ),
+        // Row 8 — refused. An anonymous block would introduce a blank node,
+        // which SPARQL 1.2 Update §3.1.2 forbids in DELETE DATA.
+        (
+            "anonymous annotation block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :alice :knows :bob {| :confidence 0.8 |} }",
+            ),
+            None,
+        ),
+        // Row 10 — the sharpest footgun, and absent from the issue. Reads as
+        // "detach claim1"; removes the edge and orphans both bodies.
+        (
+            "bare reifier, no body block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob ~ :claim1 }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+    ];
+
+    for (label, op, expected) in rows {
+        let fluree = FlureeBuilder::memory().build_memory();
+        // Labels carry `@` (as in `@annotation`), which ledger ids reserve.
+        let ledger_id = format!("ann-matrix/{}:main", label.replace([' ', '@'], "-"));
+        let seeded = fluree
+            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .await
+            .expect("seed the annotated edge");
+        assert_eq!(seeded.ledger.t(), 1, "[{label}] seed must commit");
+
+        let graph = fluree.graph(&ledger_id);
+        let jsonld = json!({
+            "@context": {"ex": "http://example.org/"},
+            "delete": {
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}
+            }
+        });
+        let result = match op {
+            MatrixOp::Sparql(q) => graph.transact().sparql_update(q).commit().await,
+            MatrixOp::UpsertTurtle(t) => graph.transact().upsert_turtle(t).commit().await,
+            MatrixOp::JsonLdAnnotation => graph.transact().update(&jsonld).commit().await,
+        };
+
+        match expected {
+            None => {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("[{label}] must be refused"));
+                assert!(
+                    err.to_string().contains("anonymous annotation block"),
+                    "[{label}] expected the anonymous-block refusal, got: {err}"
+                );
+            }
+            Some(want) => {
+                result.unwrap_or_else(|e| panic!("[{label}] must commit: {e}"));
+                let got = annotation_matrix_survivors(&fluree, &ledger_id).await;
+                assert_eq!(got, want, "[{label}] survivor set changed");
+            }
+        }
+    }
+}
+
+/// The half of the matrix that is spec-mandated, stated on its own so a
+/// regression names the right cause.
+///
+/// `~ :r {| … |}` and the bare `~ :r` tail both expand to include the base
+/// triple (RDF 1.2 Turtle §2.11.1; SPARQL 1.2 Update §3.1.2 admits the
+/// production into `DELETE DATA`). A store that kept the edge here would be
+/// the one diverging from spec.
+#[tokio::test]
+async fn annotation_form_delete_retracts_the_base_edge_in_both_spellings() {
+    for (label, q) in [
+        (
+            "with a body block",
+            "PREFIX : <http://example.org/> DELETE DATA \
+             { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+        ),
+        (
+            "bare reifier",
+            "PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob ~ :claim1 }",
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("ann-base/{}:main", label.replace(' ', "-"));
+        fluree
+            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .await
+            .expect("seed");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .sparql_update(q)
+            .commit()
+            .await
+            .expect("delete");
+        assert_eq!(
+            annotation_matrix_survivors(&fluree, &ledger_id).await.base,
+            0,
+            "[{label}] the annotation form asserts the base triple, so deleting \
+             it must retract the base edge"
+        );
+    }
+}
+
+/// The half that is Fluree's own semantics: the cascade reaches reifiers the
+/// delete never named.
+///
+/// Pinned separately and explicitly because nothing in RDF 1.2 or SPARQL 1.2
+/// entails it — SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point,
+/// that deleting a reifying triple leaves the asserted triple alone. A reader
+/// who checks the spec and finds Fluree deleting more will otherwise conclude
+/// there is a second bug.
+#[tokio::test]
+async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "ann-sibling-cascade:main";
+    fluree
+        .insert_turtle(genesis_ledger(&fluree, ledger_id), ANNOTATION_MATRIX_SEED)
+        .await
+        .expect("seed");
+
+    let before = annotation_matrix_survivors(&fluree, ledger_id).await;
+    assert_eq!(before.attached, 2, "both claims start attached to the edge");
+
+    // Names :claim1 and nothing else.
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX : <http://example.org/> DELETE DATA \
+             { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+        )
+        .commit()
+        .await
+        .expect("delete");
+
+    let after = annotation_matrix_survivors(&fluree, ledger_id).await;
+    assert_eq!(
+        after.attached, 0,
+        ":claim2 is detached though it was never named"
+    );
+    assert_eq!(
+        after.claim2_body, 2,
+        ":claim2's body survives its attachment — this is the orphan state the \
+         docs must warn about"
+    );
+}
+
+// =============================================================================
+// Annotation deletes address the edge's graph; reverse-defined terms
+// =============================================================================
+
+/// The annotations reifying `(s, p, o)` in `graph` (or the default graph),
+/// by `@reifies`, which joins the edge itself.
+async fn reifiers_of(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    graph: Option<&str>,
+    s: &str,
+    p: &str,
+    o: &str,
+) -> Vec<JsonValue> {
+    let from = match graph {
+        Some(g) => format!("{ledger_id}#{g}"),
+        None => ledger_id.to_string(),
+    };
+    let q = json!({
+        "@context": ctx(), "from": from, "select": ["?ann"],
+        "where": {"@id": "?ann", "@reifies": {"@id": s, p: {"@id": o}}}
+    });
+    let result = fluree.query_connection(&q).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    result
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// An edge is in its subject's graph, whatever `@graph` its object node
+/// carries, and so is its annotation: deleting the annotated edge with the
+/// same document (by `@id`, or by selector) retracts the annotation there.
+#[tokio::test]
+async fn annotated_edge_delete_addresses_the_edge_graph_not_the_object_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, annotation) in [
+        json!({"@id": "ex:ann", "ex:since": 2020}),
+        json!({"ex:since": 2020}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-object-graph-{i}:main");
+        let node = |annotation: JsonValue| json!({"@id": "ex:a", "ex:knows": {"@id": "ex:b", "@graph": "ex:g2", "@annotation": annotation}});
+        let mut doc = node(json!({"@id": "ex:ann", "ex:since": 2020}));
+        doc["@context"] = ctx();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "the annotation is beside its edge, in the default graph"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(
+                ledger,
+                &json!({"@context": ctx(), "delete": node(annotation)}),
+            )
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "case {i}: the annotation is retracted from the edge's graph"
+        );
+    }
+}
+
+/// A selector-form annotation delete names its graph as any `where` and
+/// template does: `"default"`, a `fromNamed` alias, a compact IRI.
+#[tokio::test]
+async fn selector_annotation_delete_resolves_its_graph_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (graph_name, stored_in, from_named)) in [
+        ("default", None, None),
+        (
+            "two",
+            Some("http://example.org/g2"),
+            Some(json!([{"alias": "two", "graph": "ex:g2"}])),
+        ),
+        ("ex:g2", Some("http://example.org/g2"), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-selector-graph-{i}:main");
+        let mut node = json!({"@context": ctx(), "@id": "ex:a",
+            "ex:knows": {"@id": "ex:b", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}});
+        if stored_in.is_some() {
+            node["@graph"] = json!("ex:g2");
+        }
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &node)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "{graph_name}: inserted"
+        );
+        let mut delete = json!({"@context": ctx(), "delete": {"@id": "ex:a", "@graph": graph_name,
+            "ex:knows": {"@id": "ex:b", "@annotation": {"ex:since": 2020}}}});
+        if let Some(from_named) = from_named {
+            delete["fromNamed"] = from_named;
+        }
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &delete)
+            .await
+            .expect("selector delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "{graph_name}: the selector delete retracts the annotation"
+        );
+    }
+}
+
+/// An annotation on an edge stated through a term defined with `@reverse`
+/// (or under the `@reverse` keyword) reifies the edge as stored, `mom
+/// ex:child kid`, and the same document deletes it.
+#[tokio::test]
+async fn annotation_on_a_reverse_property_reifies_the_stored_edge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut reverse_ctx = ctx();
+    reverse_ctx["childOf"] = json!({"@reverse": "ex:child"});
+    reverse_ctx["parent"] = json!({"@reverse": "ex:child", "@type": "@id"});
+    for (i, node) in [
+        json!({"@id": "ex:kid", "childOf": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "parent": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "@reverse": {"ex:child": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-reverse-{i}:main");
+        let mut doc = node.clone();
+        doc["@context"] = reverse_ctx.clone();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid").await.len(),
+            1,
+            "case {i}: the annotation reifies the stored edge"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &json!({"@context": reverse_ctx, "delete": node}))
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid")
+                .await
+                .is_empty(),
+            "case {i}: the same document deletes it"
         );
     }
 }

@@ -31,6 +31,8 @@
 //! produce an authoritative event set without observing the
 //! ledger's running novelty.
 
+#[cfg(not(target_arch = "wasm32"))]
+use fluree_db_core::LedgerId;
 use std::sync::{Arc, OnceLock};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -90,7 +92,7 @@ impl fluree_db_indexer::WarmCacheSource for LedgerManagerWarmCache {
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait]
 impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
-    async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+    async fn attachment_events(&self, ledger_id: &LedgerId) -> Option<AttachmentEventCoverage> {
         let manager = self.manager.get()?;
         // Coverage from LedgerManager: when snapshot.t==0 (no index
         // has ever run on this ledger), the AttachmentNovelty was
@@ -192,8 +194,7 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
             // base-index scan is still authoritative, so allow forcing
             // past the sticky-bit gate. EXPERIMENTAL — not a substitute
             // for fixing the bit to track actual seals/retracts.
-            let force_bootstrap = std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
-                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+            let force_bootstrap = force_annotation_bootstrap();
             let load_view = manager.get_loaded_view(ledger_id).await;
             let bootstrap_eligible = load_view
                 .as_ref()
@@ -246,6 +247,102 @@ impl AttachmentEventsProvider for ApiAttachmentEventsProvider {
 #[cfg(not(target_arch = "wasm32"))]
 async fn scan_base_index_for_attachment_events(
     manager: &LedgerManager,
+    ledger_id: &LedgerId,
+) -> Option<
+    Vec<(
+        fluree_db_core::edge::EdgeKey,
+        fluree_db_core::Sid,
+        i64,
+        bool,
+    )>,
+> {
+    let view = manager.get_loaded_view(ledger_id).await?;
+    scan_base_index_for_attachment_events_in(
+        &view.snapshot,
+        view.novelty.as_ref(),
+        // A seal pass wants every bundle the base carries, so the bound is
+        // raised to whichever of the two is further ahead.
+        view.t.max(view.snapshot.t),
+        ledger_id,
+    )
+    .await
+}
+
+/// True when `FLUREE_FORCE_ANNOTATION_BOOTSTRAP` asks to run the base-index
+/// bootstrap even though the sticky `had_annotation_arena` bit is set.
+/// EXPERIMENTAL — not a substitute for fixing the bit to track actual
+/// seals/retracts.
+#[cfg(not(target_arch = "wasm32"))]
+fn force_annotation_bootstrap() -> bool {
+    std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Attachment-event coverage for a reindex that has no provider to ask —
+/// the CLI's client carries no `LedgerManager`, so `Fluree::reindex` used
+/// to hand the indexer `None` and every `fluree create --from` of an
+/// annotation-bearing file ended with no arena while printing "sealed".
+///
+/// Derived from an already-loaded `LedgerState` exactly the way
+/// [`ApiAttachmentEventsProvider`] derives it from the running handle: the
+/// novelty's attachment events under the same `snapshot.t == 0` coverage
+/// rule, and the base-index bootstrap scan when the overlay holds no
+/// events and the snapshot is a never-sealed bulk import.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn attachment_events_from_state(
+    state: &fluree_db_ledger::LedgerState,
+) -> Option<AttachmentEventCoverage> {
+    let events: Vec<_> = state.novelty.attachments.iter_event_pairs().collect();
+    let snapshot = state.snapshot.as_ref();
+    tracing::debug!(
+        ledger_id = %snapshot.ledger_id,
+        snapshot_t = snapshot.t,
+        novelty_events = events.len(),
+        has_annotations = snapshot.has_annotations,
+        arena = snapshot.annotation_index.is_some(),
+        had_annotation_arena = snapshot.had_annotation_arena,
+        range_provider = snapshot.range_provider.is_some(),
+        "attachment_events_from_state"
+    );
+    if events.is_empty() {
+        let bootstrap_eligible = snapshot.has_annotations
+            && snapshot.annotation_index.is_none()
+            && (force_annotation_bootstrap() || !snapshot.had_annotation_arena);
+        if bootstrap_eligible {
+            if let Some(events) = scan_base_index_for_attachment_events_in(
+                snapshot,
+                &*state.novelty,
+                // Seal pass: whole history, as above.
+                state.t().max(snapshot.t),
+                &snapshot.ledger_id,
+            )
+            .await
+            {
+                return Some(AttachmentEventCoverage::Authoritative(events));
+            }
+        }
+    }
+    Some(if snapshot.t == 0 {
+        AttachmentEventCoverage::Authoritative(events)
+    } else {
+        AttachmentEventCoverage::Augment(events)
+    })
+}
+
+/// The base-index bootstrap scan over an explicit snapshot + overlay (see
+/// [`scan_base_index_for_attachment_events`] for the contract).
+///
+/// Also the read-side fallback for `fluree export` on a ledger whose arena was
+/// never sealed. The sticky-bit gate that guards the *seal* caller
+/// ([`attachment_events_from_state`]) does not apply to a reader: it exists so
+/// a live-only scan cannot re-seal an arena and drop retract history the
+/// indexer owns, and export writes no arena — it needs the bundles currently
+/// asserted at `t`, which is exactly what this returns.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn scan_base_index_for_attachment_events_in(
+    snapshot: &fluree_db_core::LedgerSnapshot,
+    overlay: &dyn fluree_db_core::OverlayProvider,
+    to_t: i64,
     ledger_id: &str,
 ) -> Option<
     Vec<(
@@ -261,17 +358,11 @@ async fn scan_base_index_for_attachment_events(
     use fluree_db_core::Sid;
     use std::collections::{BTreeMap, HashSet};
 
-    let view = manager.get_loaded_view(ledger_id).await?;
-
-    if !view.snapshot.has_annotations {
+    if !snapshot.has_annotations {
         return None;
     }
-    view.snapshot.range_provider.as_ref()?;
-    tracing::debug!(
-        ledger_id,
-        t = view.t,
-        "scan_base_index_for_attachment_events"
-    );
+    snapshot.range_provider.as_ref()?;
+    tracing::debug!(ledger_id, to_t, "scan_base_index_for_attachment_events");
 
     // Annotation flakes may live in the default graph (g_id=0) or
     // any named graph. Always include g_id=0 — `GraphRegistry::iter_entries`
@@ -279,13 +370,20 @@ async fn scan_base_index_for_attachment_events(
     // graph the registry knows about.
     let mut graph_ids: HashSet<fluree_db_core::GraphId> = HashSet::new();
     graph_ids.insert(0);
-    for (id, _) in view.snapshot.graph_registry.iter_entries() {
+    for (id, _) in snapshot.graph_registry.iter_entries() {
         graph_ids.insert(id);
     }
     let graph_ids: Vec<fluree_db_core::GraphId> = graph_ids.into_iter().collect();
 
-    let overlay: &dyn fluree_db_core::OverlayProvider = view.novelty.as_ref();
-    let to_t = view.t.max(view.snapshot.t);
+    // `to_t` is the caller's, deliberately un-clamped. It used to be
+    // `t.max(snapshot.t)`, which is right for a seal pass — it wants the
+    // whole of history the base carries — and wrong for a point-in-time
+    // read. Raising the bound to HEAD for an `--at` export means a bundle
+    // retracted *after* the requested `t` is no longer returned by the
+    // range at all, and a downstream filter can only drop rows, never
+    // restore them: the annotation disappears from an export that should
+    // contain it, without bumping any counter, because no edge is known to
+    // be annotated. Seal callers pass the clamped value themselves.
 
     let mut events: Vec<(EdgeKey, Sid, i64, bool)> = Vec::new();
     let mut seen: HashSet<(fluree_db_core::GraphId, Sid, i64)> = HashSet::new();
@@ -303,12 +401,12 @@ async fn scan_base_index_for_attachment_events(
         // trips `from_reifies_facts`'s Duplicate check and gets dropped.
         let mut by_ann: BTreeMap<(Sid, i64), Vec<fluree_db_core::Flake>> = BTreeMap::new();
         for p_iri in fluree_vocab::reifies_iris::ALL {
-            let Some(p_sid) = view.snapshot.encode_iri(p_iri) else {
+            let Some(p_sid) = snapshot.encode_iri(p_iri) else {
                 // Predicate IRI never observed on this ledger — skip.
                 continue;
             };
             let flakes = match range_with_overlay(
-                &view.snapshot,
+                snapshot,
                 g_id,
                 overlay,
                 IndexType::Psot,
@@ -358,8 +456,8 @@ async fn scan_base_index_for_attachment_events(
             // `f:reifiesSubject` row (the decoder returns `Missing`
             // otherwise), so `group_t` is the bundle's assertion time —
             // trustworthy on the arena's `t` axis without a separate
-            // f:reifiesSubject lookup. The arena builder applies
-            // (t, op) latest-wins across the emitted events.
+            // f:reifiesSubject lookup. The arena builder resolves the
+            // emitted events by `op_order` (`fluree_db_core::same_t`).
             let Ok(edge_key) = EdgeKey::from_reifies_facts(&bundle) else {
                 continue;
             };

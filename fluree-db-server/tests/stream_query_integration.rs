@@ -230,10 +230,9 @@ async fn connection_missing_ledger_spec_rejected() {
     );
 }
 
-/// Connection-scoped SPARQL refuses policy signals (no multi-ledger identity
-/// resolution); use the ledger-scoped route or /query.
+/// Connection SPARQL enforces supplied policies; a missing class grants no rows.
 #[tokio::test]
-async fn connection_sparql_policy_refused() {
+async fn connection_sparql_policy_enforced() {
     let (_tmp, state) = test_state().await;
     let app = build_router(state);
     create_ledger(&app, "strm:cpr").await;
@@ -245,7 +244,9 @@ async fn connection_sparql_policy_refused() {
         Some(("fluree-policy-class", "http://example.org/PublicClass")),
     )
     .await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), StatusCode::OK);
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(!std::str::from_utf8(&bytes).unwrap().contains("Xavier"));
 }
 
 async fn state_no_heartbeat() -> (TempDir, Arc<AppState>) {
@@ -449,6 +450,29 @@ async fn sparql_max_fuel_header_emits_error_code() {
         "strm:sfuel",
         "SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
         Some(("fluree-max-fuel", "0.5")),
+    )
+    .await;
+    let (status, _ct, records) = ndjson_records(resp).await;
+    assert_eq!(status, StatusCode::OK, "stream committed before execution");
+    let terminal = records.last().expect("a terminal record");
+    assert_eq!(terminal["type"], "error");
+    assert_eq!(terminal["error"]["code"], "fuel_exhausted");
+}
+
+/// Twin of the header test above: `# PRAGMA max-fuel` in the query text.
+#[tokio::test]
+async fn sparql_max_fuel_pragma_emits_error_code() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "strm:pfuel").await;
+    insert_name(&app, "strm:pfuel", "ex:x", "Xavier").await;
+
+    let resp = stream_sparql(
+        &app,
+        "strm:pfuel",
+        "# PRAGMA max-fuel: 0.5
+SELECT ?name WHERE { ?s <http://example.org/name> ?name }",
+        None,
     )
     .await;
     let (status, _ct, records) = ndjson_records(resp).await;

@@ -4,152 +4,195 @@
 //! modified between two points, producing a set of [`ConflictKey`]s that
 //! can be checked against branch commits to detect overlapping changes.
 
-use crate::{trace_commits_by_id, Result};
-use fluree_db_core::{ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid};
+use crate::{trace_first_parent_commits_by_id, Result};
+use fluree_db_core::same_t::supersedes;
+use fluree_db_core::{
+    load_commit_by_id, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
+};
 use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeSet, HashMap};
 
-/// Walk the commit chain from `head_id` back to `stop_at_t` and collect
-/// all (subject, predicate, graph) tuples modified in those commits.
-///
-/// This produces the "source delta" — the set of data points changed on
-/// the source branch since the branch point. During rebase, branch commits
-/// whose flakes overlap with this set are flagged as conflicts.
-///
-/// # Arguments
-///
-/// * `store` - Content store for loading commits by CID
-/// * `head_id` - CID of the source branch's current HEAD commit
-/// * `stop_at_t` - Stop when `commit.t <= stop_at_t` (the branch point t)
-pub async fn compute_delta_keys<C: ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
-) -> Result<FxHashSet<ConflictKey>> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
-    futures::pin_mut!(stream);
-
-    let mut keys = FxHashSet::default();
-
-    while let Some(commit) = stream.try_next().await? {
-        for flake in &commit.flakes {
-            keys.insert(ConflictKey::new(
-                flake.s.clone(),
-                flake.p.clone(),
-                flake.g.clone(),
-            ));
-        }
-    }
-
-    Ok(keys)
-}
-
-/// Full identity of a fact — every [`Flake`] component except `t` and `op`.
+/// Full identity of a fact — every [`Flake`] component except `t` and `op`,
+/// and the datatype of a value the index keys by value alone
+/// ([`FlakeValue::index_keys_by_value`]): storage holds an integer too large
+/// for 64 bits as one fact whatever XSD subtype each op writes it with, so
+/// netting it per term would replay a retraction under one subtype and an
+/// assertion under another at one `t`, which a commit may not hold.
 ///
 /// This is deliberately NOT `Flake`'s own `Eq`/`Hash` (which ignore `g` by
 /// design — flake identity is graph-independent for index purposes). Netting
 /// must treat the same triple in two graphs as two distinct facts, and must
 /// keep language-tagged strings and list positions apart, so `g`, `lang`,
 /// and `i` are all part of the key.
-#[derive(PartialEq, Eq, Hash)]
-struct FactKey {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct FactKey {
     g: Option<Sid>,
     s: Sid,
     p: Sid,
     o: FlakeValue,
-    dt: Sid,
+    dt: Option<Sid>,
     lang: Option<String>,
     i: Option<i32>,
 }
 
 impl FactKey {
-    fn of(flake: &Flake) -> Self {
+    /// The identity of `flake`'s fact, independent of `t` and `op`.
+    pub fn of(flake: &Flake) -> Self {
         Self {
             g: flake.g.clone(),
             s: flake.s.clone(),
             p: flake.p.clone(),
             o: flake.o.clone(),
-            dt: flake.dt.clone(),
+            dt: (!flake.o.index_keys_by_value()).then(|| flake.dt.clone()),
             lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
             i: flake.m.as_ref().and_then(|m| m.i),
         }
     }
 }
 
-struct NetState {
-    /// Flake of the newest in-range occurrence — the representative emitted
-    /// when the fact survives netting.
-    newest: Flake,
-    /// Op of the oldest in-range occurrence seen so far.
-    oldest_op: bool,
-}
-
 /// Accumulates the net effect of a commit range on each distinct fact.
 ///
 /// Feed flakes in strictly **newest-first** order (reverse-chronological).
-/// Per fact, the net op is the newest op — but a fact only survives netting
-/// when its oldest and newest in-range ops agree:
+/// Per fact the newest op wins: it is the fact's state at the range head,
+/// which is what replaying the range has to reproduce. Within one commit
+/// (one `t`) a retraction and an assertion of one fact resolve to the
+/// assertion ([`fluree_db_core::same_t`]), whatever their order in the
+/// commit; commits written before the staging fix hold such pairs.
 ///
-/// - assert … assert → net assert (created, or re-asserted/replaced)
-/// - retract … retract → net retract (removes pre-range state)
-/// - assert … retract / retract … assert → dropped (the range ends where
-///   it started: created-then-destroyed, or removed-then-restored)
+/// The rule deliberately infers nothing about whether the fact existed
+/// before the range, because a commit stream cannot support that inference:
+/// re-asserting a value the ledger already holds writes a real assert flake,
+/// and only [`Novelty::apply_commit`](crate::Novelty::apply_commit) discards
+/// it at apply time. Reading "assert … retract" as created-then-destroyed
+/// would therefore drop a genuine deletion whenever the range happened to
+/// re-assert the value first, which idempotent loads and upserts do
+/// routinely.
 ///
-/// This is the "net commit effect" contract: what a merge replaying the
-/// range would apply, minus internally-cancelling pairs. It infers pre-range
-/// presence from the oldest op, so a re-assert of a value that already
-/// existed before the range nets as an assert (the merge does apply it).
+/// What this emits instead is at worst redundant, never wrong: a redundant
+/// assert is deduplicated on apply, and a retract of a fact the target does
+/// not hold is a no-op for reads, reindexing and later writes.
 #[derive(Default)]
 pub struct NetChangeAccumulator {
-    map: FxHashMap<FactKey, NetState>,
+    map: FxHashMap<FactKey, Flake>,
+    /// Facts whose deciding commit (the first to arrive) both retracted and
+    /// asserted them at one `t`: see [`Self::finish_with_pairs`].
+    paired: FxHashSet<FactKey>,
 }
 
 impl NetChangeAccumulator {
-    /// Record one flake. Flakes must arrive newest-first.
+    /// Record one flake. Flakes must arrive newest-first, so the first
+    /// occurrence of a fact is the one that decides its net op, except that
+    /// a later occurrence at the same `t` replaces it when it holds there.
     pub fn push_newest_first(&mut self, flake: &Flake) {
         match self.map.entry(FactKey::of(flake)) {
-            Entry::Vacant(v) => {
-                v.insert(NetState {
-                    newest: flake.clone(),
-                    oldest_op: flake.op,
-                });
+            Entry::Vacant(e) => {
+                e.insert(flake.clone());
             }
-            // An older occurrence of the same fact: it becomes the oldest.
-            Entry::Occupied(mut o) => o.get_mut().oldest_op = flake.op,
+            Entry::Occupied(mut e) => {
+                let cur = e.get();
+                if flake.t != cur.t {
+                    return;
+                }
+                if flake.op != cur.op {
+                    self.paired.insert(e.key().clone());
+                }
+                if supersedes((flake.t, flake.op), (cur.t, cur.op)) {
+                    e.insert(flake.clone());
+                }
+            }
         }
     }
 
-    /// Facts that survive netting, each represented by its newest in-range
-    /// flake (so `op` is the net op). Unordered.
+    /// Every fact the range touched, represented by its newest in-range
+    /// flake, so `op` is the fact's state at the range head. Unordered.
     pub fn finish(self) -> Vec<Flake> {
-        self.map
-            .into_values()
-            .filter(|st| st.oldest_op == st.newest.op)
-            .map(|st| st.newest)
-            .collect()
+        self.map.into_values().collect()
+    }
+
+    /// [`Self::finish`], with the positions of the facts whose deciding
+    /// commit held a same-`t` retraction and assertion of them. Such a pair
+    /// resolves to its assertion, but what the commit changed depends on
+    /// whether the fact was present before it, which only the state can say:
+    /// an undo of the range resolves these against it.
+    pub fn finish_with_pairs(self) -> (Vec<Flake>, Vec<usize>) {
+        let Self { map, paired } = self;
+        if paired.is_empty() {
+            return (map.into_values().collect(), Vec::new());
+        }
+        let mut flakes = Vec::with_capacity(map.len());
+        let mut pairs = Vec::with_capacity(paired.len());
+        for (key, flake) in map {
+            if paired.contains(&key) {
+                pairs.push(flakes.len());
+            }
+            flakes.push(flake);
+        }
+        (flakes, pairs)
     }
 }
 
-/// Like [`compute_delta_keys`], but additionally nets the range's flakes
-/// into the aggregate change set the range applies (see
-/// [`NetChangeAccumulator`] for the netting contract).
+/// The (subject, predicate, graph) tuples these commits changed, oldest
+/// commit first.
 ///
-/// One walk serves both outputs, so callers that need conflict keys *and*
-/// the change set (merge preview with `include_changes`) replay the source
-/// chain once instead of twice.
+/// Branch clocks are not comparable, so a range that crosses a merge cannot
+/// be cut by `t`. Callers that compare two branches name the commits
+/// instead.
+pub async fn delta_keys_of<C: ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+) -> Result<FxHashSet<ConflictKey>> {
+    let mut keys = FxHashSet::default();
+    for cid in cids {
+        let commit = load_commit_by_id(store, cid).await?;
+        keys.extend(
+            commit
+                .flakes
+                .iter()
+                .map(|flake| ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())),
+        );
+    }
+    Ok(keys)
+}
+
+/// Walk the first-parent lineage from `head_id` back to `stop_at_t`,
+/// collecting the (subject, predicate, graph) tuples those commits changed
+/// and netting their flakes into the aggregate change set the range applies
+/// (see [`NetChangeAccumulator`] for the netting contract).
+///
+/// One walk serves every output, so callers that need conflict keys *and*
+/// the change set (merge preview) replay the source chain once instead of
+/// twice. The third element is the union of the range's namespace deltas,
+/// earliest commit winning on a code collision: the codes a consumer needs
+/// to make the change set's terms encodable before the range is committed.
+/// The fourth is every named graph the range's commits list, by IRI: the
+/// graphs a consumer must route before staging the change set elsewhere.
 pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
     store: C,
     head_id: ContentId,
     stop_at_t: i64,
-) -> Result<(FxHashSet<ConflictKey>, Vec<Flake>)> {
-    let stream = trace_commits_by_id(store, head_id, stop_at_t);
+) -> Result<(
+    FxHashSet<ConflictKey>,
+    Vec<Flake>,
+    HashMap<u16, String>,
+    BTreeSet<String>,
+)> {
+    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
     futures::pin_mut!(stream);
 
     let mut keys = FxHashSet::default();
     let mut acc = NetChangeAccumulator::default();
+    let mut namespace_delta: HashMap<u16, String> = HashMap::new();
+    let mut graph_iris: BTreeSet<String> = BTreeSet::new();
 
     while let Some(commit) = stream.try_next().await? {
+        graph_iris.extend(commit.graph_delta.into_values());
+        // Commits stream newest-first, so a plain insert leaves the oldest
+        // commit's prefix in place for a colliding code.
+        for (code, prefix) in commit.namespace_delta {
+            namespace_delta.insert(code, prefix);
+        }
         // Commits stream newest-first; iterate each commit's flakes in
         // reverse so the accumulator sees a strictly reverse-chronological
         // sequence even when one commit touches the same fact twice.
@@ -163,7 +206,7 @@ pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
         }
     }
 
-    Ok((keys, acc.finish()))
+    Ok((keys, acc.finish(), namespace_delta, graph_iris))
 }
 
 #[cfg(test)]
@@ -212,15 +255,22 @@ mod tests {
     }
 
     #[test]
-    fn assert_then_retract_cancels() {
+    fn assert_then_retract_nets_to_the_retract() {
+        // The assert may be redundant with state the range inherited, so the
+        // retract is the only thing that can be known: the fact is gone at
+        // the range head.
         let out = net(&[flake("a", "v", 1, true), flake("a", "v", 2, false)]);
-        assert!(out.is_empty(), "created-then-destroyed must net to nothing");
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].op);
+        assert_eq!(out[0].t, 2);
     }
 
     #[test]
-    fn retract_then_assert_cancels() {
+    fn retract_then_assert_nets_to_the_assert() {
         let out = net(&[flake("a", "v", 1, false), flake("a", "v", 2, true)]);
-        assert!(out.is_empty(), "removed-then-restored must net to nothing");
+        assert_eq!(out.len(), 1);
+        assert!(out[0].op);
+        assert_eq!(out[0].t, 2);
     }
 
     #[test]
@@ -242,11 +292,53 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
+    /// A fact both retracted and asserted by its deciding commit is reported
+    /// as paired; one changed at another `t` after that, or by one op, is not.
     #[test]
-    fn same_commit_pair_cancels_via_reverse_iteration() {
-        // Both ops at the same t, chronological order assert-then-retract.
-        let out = net(&[flake("a", "v", 2, true), flake("a", "v", 2, false)]);
-        assert!(out.is_empty());
+    fn a_same_t_pair_in_the_deciding_commit_is_reported() {
+        let mut acc = NetChangeAccumulator::default();
+        for f in [
+            flake("a", "v", 2, false),
+            flake("a", "v", 2, true),
+            flake("b", "w", 2, true),
+            flake("c", "x", 3, true),
+            flake("c", "x", 2, false),
+            flake("c", "x", 2, true),
+        ] {
+            acc.push_newest_first(&f);
+        }
+        let (flakes, pairs) = acc.finish_with_pairs();
+        let paired: Vec<String> = pairs
+            .iter()
+            .map(|&n| match &flakes[n].o {
+                FlakeValue::String(s) => s.clone(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(paired, vec!["v".to_string()], "{flakes:?}");
+    }
+
+    /// Both ops of one fact at the same `t` net to the assertion
+    /// (`fluree_db_core::same_t`), whatever their order in the commit.
+    #[test]
+    fn same_commit_pair_nets_to_the_assert_in_either_order() {
+        for pair in [
+            [flake("a", "v", 2, true), flake("a", "v", 2, false)],
+            [flake("a", "v", 2, false), flake("a", "v", 2, true)],
+        ] {
+            let out = net(&pair);
+            assert_eq!(out.len(), 1);
+            assert!(out[0].op);
+        }
+        // A newer commit still decides: a retract at t=3 after the pair.
+        let out = net(&[
+            flake("a", "v", 2, false),
+            flake("a", "v", 2, true),
+            flake("a", "v", 3, false),
+        ]);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].op);
+        assert_eq!(out[0].t, 3);
     }
 
     #[test]
@@ -282,6 +374,45 @@ mod tests {
         let mut p1 = flake("a", "v", 1, true);
         p1.m = Some(FlakeMeta::with_index(1));
         let out = net(&[p0, p1]);
+        assert_eq!(out.len(), 2);
+    }
+
+    /// An integer too large for 64 bits is one fact whatever subtype each op
+    /// writes it with, so a delete under one subtype and a write under
+    /// another net to the write alone. A value that fits 64 bits keeps its
+    /// datatype in the key.
+    #[test]
+    fn a_big_integer_nets_by_value_across_subtypes() {
+        let big = |dt: &str, t: i64, op: bool| {
+            Flake::new(
+                sid("a"),
+                sid("pred"),
+                FlakeValue::BigInt(Box::new(
+                    "123456789012345678901234567890".parse().expect("big"),
+                )),
+                sid(dt),
+                t,
+                op,
+                None,
+            )
+        };
+        let out = net(&[big("integer", 1, false), big("nonNegativeInteger", 2, true)]);
+        assert_eq!(out.len(), 1);
+        assert!(out[0].op);
+        assert_eq!(out[0].dt, sid("nonNegativeInteger"));
+
+        let long = |dt: &str, t: i64, op: bool| {
+            Flake::new(
+                sid("a"),
+                sid("pred"),
+                FlakeValue::Long(7),
+                sid(dt),
+                t,
+                op,
+                None,
+            )
+        };
+        let out = net(&[long("integer", 1, false), long("int", 2, true)]);
         assert_eq!(out.len(), 2);
     }
 }

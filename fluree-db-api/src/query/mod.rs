@@ -8,13 +8,14 @@ pub(crate) mod helpers;
 pub mod multi;
 pub mod nameservice_builder;
 
+use fluree_db_core::VerifiedIdentity;
 use serde_json::Value as JsonValue;
 use std::fmt;
 use std::sync::Arc;
 
 use crate::{
-    format, Batch, FormatterConfig, FuelExceededError, OverlayProvider, PolicyContext, PolicyStats,
-    Tracker, TrackingTally, VarRegistry,
+    format, Batch, FormatterConfig, FuelExceededError, GraphDb, OverlayProvider, PolicyContext,
+    PolicyStats, Tracker, TrackingTally, VarRegistry,
 };
 
 use fluree_db_binary_index::BinaryGraphView;
@@ -39,14 +40,54 @@ pub struct QueryExecutionOptions {
     /// stringified child value never equals the parent key — is treated as
     /// dangling, so the templated IRI may not resolve to a real parent subject.
     pub trust_fk_refs: bool,
+    /// Make every graph-source table scan emit a fixed row order, even when the
+    /// query has no LIMIT or OFFSET, for a caller that pages the answer itself.
+    /// Without it, a query with no slice may stream a table's rows as its file
+    /// reads finish. Set by the graph-source crawl, which applies its subject
+    /// OFFSET after the query.
+    pub deterministic_scans: bool,
+    /// Read lists as RDF does: a list is its owner's edge to a head cell and
+    /// a chain of `rdf:first`/`rdf:rest` cells (`fluree_db_query::list_view`),
+    /// so a CONSTRUCT writes it back as the list. Set only by the Graph Store
+    /// `GET`; every query surface reads a list's members as values.
+    rdf_list_view: bool,
+    /// Auth-layer-verified identity of the caller, used only for
+    /// `f:overrideControl` (`f:IdentityRestricted`) checks on the query path.
+    ///
+    /// Query routes parse [`crate::GovernanceOptions`] from the request JSON
+    /// inside the API, and the reasoning / datalog override gate has no
+    /// governance struct at all, so this is how the verified identity travels
+    /// from the request boundary to those checks. The API stamps it onto every
+    /// `GovernanceOptions` it parses and reads it at the reasoning choke point.
+    /// Same contract as `GovernanceOptions::server_identity`: set by an auth
+    /// layer, never derived from the request body or headers.
+    pub server_identity: Option<VerifiedIdentity>,
+    /// SPARQL parameters: variable name → JSON-LD value, substituted into the
+    /// parsed query before lowering (see [`fluree_db_sparql::substitute_params`]).
+    params: Option<Arc<fluree_db_sparql::ParamMap>>,
     lifecycle_guard: Option<Arc<dyn Send + Sync + 'static>>,
+    /// The view the query runs on was loaded from the query's own dataset (the
+    /// connection path's one-ledger shortcut), so the view does not read the
+    /// query's dataset keys again.
+    pub(crate) view_is_the_dataset: bool,
+    /// A time per ledger that the query's host fixed (a multi-query envelope's
+    /// snapshot): the connection path reads each dataset member of one of these
+    /// ledgers that names no time of its own at it
+    /// ([`DatasetSpec::read_unpinned_at`](crate::DatasetSpec::read_unpinned_at)).
+    pub(crate) ledger_times: Option<Arc<crate::dataset::LedgerTimes>>,
 }
 
 impl fmt::Debug for QueryExecutionOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("QueryExecutionOptions")
             .field("cancellation", &self.cancellation)
+            .field("trust_fk_refs", &self.trust_fk_refs)
+            .field("deterministic_scans", &self.deterministic_scans)
+            .field("rdf_list_view", &self.rdf_list_view)
+            .field("server_identity", &self.server_identity)
+            .field("params", &self.params)
             .field("has_lifecycle_guard", &self.lifecycle_guard.is_some())
+            .field("ledger_times", &self.ledger_times)
             .finish()
     }
 }
@@ -71,6 +112,56 @@ impl QueryExecutionOptions {
         self
     }
 
+    /// Make graph-source scans emit a fixed row order whatever the query's
+    /// shape. See [`QueryExecutionOptions::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
+        self
+    }
+
+    /// Read lists as their RDF cells (see [`QueryExecutionOptions`]'s
+    /// `rdf_list_view`). Set only by the Graph Store `GET`.
+    #[doc(hidden)]
+    pub fn with_rdf_list_view(mut self, on: bool) -> Self {
+        self.rdf_list_view = on;
+        self
+    }
+
+    /// Whether the query reads lists as their RDF cells.
+    pub(crate) fn rdf_list_view(&self) -> bool {
+        self.rdf_list_view
+    }
+
+    /// Attach the auth-layer-verified caller identity for override control.
+    /// See [`QueryExecutionOptions::server_identity`]. Only an auth layer
+    /// should call this.
+    pub fn with_server_identity(mut self, identity: VerifiedIdentity) -> Self {
+        self.server_identity = Some(identity);
+        self
+    }
+
+    /// Bind SPARQL variables to values for this query: each named variable
+    /// (`?name` or `$name`) is replaced by its value wherever it appears. A
+    /// name the query does not mention is an error, as are parameters on a
+    /// JSON-LD query.
+    pub fn with_params(mut self, params: fluree_db_sparql::ParamMap) -> Self {
+        self.params = (!params.is_empty()).then(|| Arc::new(params));
+        self
+    }
+
+    /// The SPARQL parameters for `input`; JSON-LD queries take none.
+    pub(crate) fn sparql_params(
+        &self,
+        input: &crate::view::QueryInput<'_>,
+    ) -> crate::Result<Option<&fluree_db_sparql::ParamMap>> {
+        match (&self.params, input) {
+            (Some(_), crate::view::QueryInput::JsonLd(_)) => Err(crate::ApiError::invalid_query(
+                "parameters apply to SPARQL queries; a JSON-LD query takes its values in the query",
+            )),
+            (params, _) => Ok(params.as_deref()),
+        }
+    }
+
     /// Attach an opaque guard that lives as long as these execution options.
     ///
     /// This is intended for adapters that need a runtime-specific cancellation
@@ -82,6 +173,20 @@ impl QueryExecutionOptions {
         G: Send + Sync + 'static,
     {
         self.lifecycle_guard = Some(Arc::new(guard));
+        self
+    }
+
+    /// Mark the view the query runs on as loaded from the query's own dataset
+    /// (see [`QueryExecutionOptions::view_is_the_dataset`]).
+    pub(crate) fn on_the_datasets_view(mut self) -> Self {
+        self.view_is_the_dataset = true;
+        self
+    }
+
+    /// Read the dataset's unpinned members of these ledgers at their times
+    /// (see [`QueryExecutionOptions::ledger_times`]).
+    pub(crate) fn reading_ledgers_at(mut self, times: Arc<crate::dataset::LedgerTimes>) -> Self {
+        self.ledger_times = Some(times);
         self
     }
 }
@@ -123,6 +228,10 @@ pub struct QueryResult {
     /// mixed-dataset paths not routed through that method leave it false → today's
     /// raw rendering is unchanged.
     pub from_graph_source: bool,
+    /// Non-fatal notes about how the query was read (see
+    /// [`crate::QueryAdvisory`]). Empty for most queries; never changes the
+    /// result.
+    pub advisories: Vec<crate::QueryAdvisory>,
 }
 
 impl std::fmt::Debug for QueryResult {
@@ -159,6 +268,12 @@ pub struct TrackedQueryResponse {
     /// `reasoning.capped == true` means the result set may be incomplete.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<fluree_db_core::ReasoningTally>,
+    /// Statements the SQL pushdown lane sent to graph sources, in order.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql: Option<Vec<fluree_db_core::PushedStatement>>,
+    /// Statements sent beyond the reported cap, when `sql` is a prefix.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sql_elided: Option<u64>,
 }
 
 impl TrackedQueryResponse {
@@ -171,6 +286,8 @@ impl TrackedQueryResponse {
                 policy,
                 policy_enforcement,
                 reasoning,
+                sql,
+                sql_elided,
             }) => Self {
                 status: 200,
                 result,
@@ -179,6 +296,8 @@ impl TrackedQueryResponse {
                 policy,
                 policy_enforcement,
                 reasoning,
+                sql,
+                sql_elided,
             },
             None => Self {
                 status: 200,
@@ -188,6 +307,8 @@ impl TrackedQueryResponse {
                 policy: None,
                 policy_enforcement: None,
                 reasoning: None,
+                sql: None,
+                sql_elided: None,
             },
         }
     }
@@ -237,6 +358,17 @@ impl TrackedErrorResponse {
                 policy_enforcement: None,
             },
         }
+    }
+
+    /// An engine error, answering the status [`crate::ApiError::status_code`]
+    /// gives it, so a tracked request answers what the same request untracked
+    /// does. The message is the error's own.
+    pub fn from_api<E>(err: E, tally: Option<TrackingTally>) -> Self
+    where
+        E: std::fmt::Display + Into<crate::ApiError>,
+    {
+        let error = err.to_string();
+        Self::new(err.into().status_code(), error, tally)
     }
 
     /// Create a fuel exceeded error response
@@ -553,6 +685,47 @@ impl QueryResult {
         config: &FormatterConfig,
     ) -> format::Result<JsonValue> {
         format::format_results_async(self, &self.context, db, config, None, None).await
+    }
+
+    /// Format against a view, filtered by whatever policy that view carries.
+    ///
+    /// Prefer this over [`Self::format_async`] and [`Self::format_async_with_policy`]
+    /// whenever a `&GraphDb` is in hand. Those take a `GraphDbRef`, which does not
+    /// carry policy, so the caller has to remember to pass it separately; three of
+    /// the sites that forgot were the hydration bypasses fixed in #1935.
+    pub async fn format_async_for_view(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            None,
+        )
+        .await
+    }
+
+    /// Tracked twin of [`Self::format_async_for_view`]: hydration counts fuel and
+    /// policy against `tracker`.
+    pub async fn format_async_for_view_tracked(
+        &self,
+        view: &GraphDb,
+        config: &FormatterConfig,
+        tracker: &Tracker,
+    ) -> format::Result<JsonValue> {
+        format::format_results_async(
+            self,
+            &self.context,
+            view.as_graph_db_ref(),
+            config,
+            view.policy(),
+            Some(tracker),
+        )
+        .await
     }
 
     // ========================================================================

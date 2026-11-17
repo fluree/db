@@ -105,10 +105,19 @@ macro_rules! view_context_config {
         // (`operator.rs`), so it would return zero rows for every
         // policy-enforced query. Do not "upgrade" this.
         let __index_provider = $crate::FlureeIndexProvider::new($self);
-        let $cfg = ContextConfig {
+        #[allow(
+            unused_mut,
+            reason = "vector_provider is set inside cfg(feature = \"vector\")"
+        )]
+        let mut $cfg = ContextConfig {
             tracker: Some($tracker),
             cancellation: $options.cancellation.clone(),
             policy_enforcer: __db.policy_enforcer().cloned(),
+            policy_source: Some(
+                __db.graph_source_id
+                    .clone()
+                    .unwrap_or_else(|| ::std::sync::Arc::clone(&__db.ledger_id)),
+            ),
             r2rml: $r2rml,
             bm25_provider: Some(&__index_provider),
             binary_store: __db.binary_store.clone(),
@@ -126,22 +135,33 @@ macro_rules! view_context_config {
             include_system_facts: $executable.query.include_system_facts,
             cypher_vocab: $executable.query.cypher_vocab.clone(),
             trust_fk_refs: $options.trust_fk_refs,
+            deterministic_scans: $options.deterministic_scans,
+            primary_kind: __db.member_kind(),
             ..Default::default()
         };
+        // The same provider answers `f:queryVector` when the embedded HNSW
+        // index is compiled in.
+        #[cfg(feature = "vector")]
+        {
+            $cfg.vector_provider = Some(&__index_provider);
+        }
     };
 }
 
 mod dataset;
 mod dataset_builder;
 mod dataset_query;
+mod explain;
 mod fluree_ext;
 pub(crate) mod query;
 mod query_builder;
 mod query_input;
 mod stream_query;
 mod types;
+mod union_graph;
 
 pub use dataset::DataSetDb;
 pub use query_input::QueryInput;
 pub use stream_query::{OwnedStreamQuery, StreamDatasetPlan, StreamQueryPlan};
 pub use types::{ConfigReasoningBudget, DerivedFactsHandle, GraphDb, ReasoningModePrecedence};
+pub(crate) use union_graph::union_default_dataset;

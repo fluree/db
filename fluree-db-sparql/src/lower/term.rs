@@ -5,10 +5,9 @@
 //! registration.
 
 use crate::ast::term::{
-    BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, SubjectTerm,
+    Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, SubjectTerm,
     Term as SparqlTerm, Var,
 };
-use crate::ast::TriplePattern as SparqlTriplePattern;
 
 use fluree_db_core::ns_encoding::STABLE_BLANK_NODE_LABEL_PREFIX;
 use fluree_db_core::temporal::{
@@ -16,10 +15,10 @@ use fluree_db_core::temporal::{
 };
 use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
 use fluree_db_query::binding::Binding;
-use fluree_db_query::ir::triple::{Ref, Term, TriplePattern};
+use fluree_db_query::ir::triple::{Ref, Term};
 use fluree_db_query::parse::encode::IriEncoder;
 use fluree_db_query::var_registry::VarId;
-use fluree_vocab::namespaces::{FLUREE_DB, XSD};
+use fluree_vocab::namespaces::{EMPTY, FLUREE_DB, XSD};
 use fluree_vocab::{fluree, xsd, xsd_names};
 use std::sync::Arc;
 
@@ -67,40 +66,28 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
         self.vars.get_or_insert(&format!("?{}", v.name))
     }
 
-    pub(super) fn lower_triple_pattern(
-        &mut self,
-        tp: &SparqlTriplePattern,
-    ) -> Result<TriplePattern> {
-        let s = self.lower_subject(&tp.subject)?;
-        let p = self.lower_predicate(&tp.predicate)?;
-        let o = self.lower_object(&tp.object)?;
-        Ok(TriplePattern::new(s, p, o))
+    /// Register a fresh anonymous blank-node variable in the shared `_:[]`
+    /// namespace, which cannot collide with a user-written blank-node label.
+    pub(super) fn fresh_blank_node_var(&mut self) -> VarId {
+        self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()))
     }
 
     pub(super) fn lower_subject(&mut self, term: &SubjectTerm) -> Result<Ref> {
         match term {
             SubjectTerm::Var(v) => Ok(self.lower_var_ref(v)),
             SubjectTerm::Iri(iri) => self.lower_iri_ref(iri),
-            SubjectTerm::BlankNode(bn) => match &bn.value {
-                BlankNodeValue::Labeled(label) => {
-                    // Stable Fluree blank-node ids (`_:fdb-...`) denote the
-                    // stored node, so they lower to a constant like an IRI;
-                    // other labels are non-distinguished variables per spec.
-                    if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
-                        let full_iri = format!("_:{label}");
-                        return Ok(match self.encoder.encode_iri_strict(&full_iri) {
-                            Some(sid) => Ref::Sid(sid),
-                            None => Ref::Iri(Arc::from(full_iri)),
-                        });
-                    }
-                    let var_id = self.vars.get_or_insert(&format!("_:{label}"));
-                    Ok(Ref::Var(var_id))
+            SubjectTerm::BlankNode(bn) => {
+                // Stable Fluree blank-node ids (`_:fdb-...`) denote the
+                // stored node, so they lower to a constant like an IRI;
+                // other labels are non-distinguished variables per spec.
+                let label = &bn.label;
+                if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+                    let full_iri = format!("_:{label}");
+                    return Ok(self.encoder.encode_ref(&full_iri));
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Ref::Var(var_id))
-                }
-            },
+                let var_id = self.vars.get_or_insert(&format!("_:{label}"));
+                Ok(Ref::Var(var_id))
+            }
             SubjectTerm::QuotedTriple(_qt) => {
                 // This path is reached when a quoted triple appears in a
                 // context without a reified-triple desugaring hook.
@@ -144,25 +131,17 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             SparqlTerm::Var(v) => Ok(self.lower_var(v)),
             SparqlTerm::Iri(iri) => self.lower_iri(iri),
             SparqlTerm::Literal(lit) => self.lower_literal(lit),
-            SparqlTerm::BlankNode(bn) => match &bn.value {
-                BlankNodeValue::Labeled(label) => {
-                    // Stable Fluree blank-node ids lower to a constant
-                    // (see lower_subject).
-                    if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
-                        let full_iri = format!("_:{label}");
-                        return Ok(match self.encoder.encode_iri_strict(&full_iri) {
-                            Some(sid) => Term::Sid(sid),
-                            None => Term::Iri(Arc::from(full_iri)),
-                        });
-                    }
-                    let var_id = self.vars.get_or_insert(&format!("_:{label}"));
-                    Ok(Term::Var(var_id))
+            SparqlTerm::BlankNode(bn) => {
+                // Stable Fluree blank-node ids lower to a constant
+                // (see lower_subject).
+                let label = &bn.label;
+                if label.starts_with(STABLE_BLANK_NODE_LABEL_PREFIX) {
+                    let full_iri = format!("_:{label}");
+                    return Ok(self.encoder.encode_term(&full_iri));
                 }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Term::Var(var_id))
-                }
-            },
+                let var_id = self.vars.get_or_insert(&format!("_:{label}"));
+                Ok(Term::Var(var_id))
+            }
             SparqlTerm::QuotedTriple(qt) => {
                 // Reified-triple objects are desugared by
                 // `lower_object_desugared` before this is reached on
@@ -261,15 +240,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
             ),
             LiteralValue::Typed { value, datatype } => {
                 let fv = self.lower_typed_literal(value, datatype)?;
-                // Resolve the datatype IRI to its canonical SID via the
-                // encoder. For custom (unencoded) datatypes the encoder
-                // returns None — fall back to `xsd:string`, matching
-                // the storage-side fallback in `term_to_binding`.
                 let dt_iri = self.expand_iri(datatype)?;
-                let dt_sid = self
-                    .encoder
-                    .encode_iri_strict(&dt_iri)
-                    .unwrap_or_else(|| Sid::new(XSD, xsd_names::STRING));
+                let dt_sid = self.datatype_sid(&dt_iri);
                 (fv, DatatypeConstraint::Explicit(dt_sid))
             }
             LiteralValue::Integer(i) => (
@@ -308,20 +280,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     pub(super) fn lower_iri(&mut self, iri: &Iri) -> Result<Term> {
         let full_iri = self.expand_iri(iri)?;
-        if let Some(sid) = self.encoder.encode_iri_strict(&full_iri) {
-            Ok(Term::Sid(sid))
-        } else {
-            Ok(Term::Iri(Arc::from(full_iri)))
-        }
+        Ok(self.encoder.encode_term(&full_iri))
     }
 
     pub(super) fn lower_iri_ref(&mut self, iri: &Iri) -> Result<Ref> {
         let full_iri = self.expand_iri(iri)?;
-        if let Some(sid) = self.encoder.encode_iri_strict(&full_iri) {
-            Ok(Ref::Sid(sid))
-        } else {
-            Ok(Ref::Iri(Arc::from(full_iri)))
-        }
+        Ok(self.encoder.encode_ref(&full_iri))
     }
 
     fn lower_literal(&self, lit: &Literal) -> Result<Term> {
@@ -359,11 +323,22 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(FlakeValue::Long(i))
             }
             xsd::DECIMAL => parse_decimal_value(value, datatype.span),
+            // The write surfaces' parser, so a query literal accepts exactly
+            // the XSD lexical forms a transaction does.
             xsd::DOUBLE | xsd::FLOAT => {
-                let d: f64 = value
-                    .parse()
-                    .map_err(|_| LowerError::invalid_decimal(value, datatype.span))?;
-                Ok(FlakeValue::Double(d))
+                fluree_db_core::coerce::coerce_string_value(value, dt_iri.as_str()).map_err(|_| {
+                    let name = if dt_iri.as_str() == xsd::DOUBLE {
+                        "xsd:double"
+                    } else {
+                        "xsd:float"
+                    };
+                    LowerError::invalid_literal(
+                        value,
+                        name,
+                        fluree_db_core::coerce::XSD_DOUBLE_LEXICAL_HINT,
+                        datatype.span,
+                    )
+                })
             }
             xsd::BOOLEAN => {
                 let b = value == "true" || value == "1";
@@ -450,6 +425,12 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 })?;
                 Ok(FlakeValue::Vector(arr.into()))
             }
+            // A WKT POINT is stored as a GeoPoint; a constant that stayed a
+            // string would match no stored point. Coerced as a write coerces.
+            fluree_vocab::geo::WKT_LITERAL => {
+                Ok(fluree_db_core::coerce::coerce_string_value(value, &dt_iri)
+                    .unwrap_or_else(|_| FlakeValue::String(value.to_string())))
+            }
             _ => {
                 // Default to string for unknown datatypes
                 Ok(FlakeValue::String(value.to_string()))
@@ -459,6 +440,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
     pub(super) fn expand_iri(&self, iri: &Iri) -> Result<String> {
         expand_iri_with(&self.prefixes, self.base.as_deref(), iri)
+    }
+
+    /// Resolve a typed literal's datatype IRI to the Sid that names it in
+    /// term-identity positions (triple-pattern constraints, VALUES rows).
+    ///
+    /// A registered namespace resolves to its canonical Sid. An IRI whose
+    /// canonical prefix is NOT registered on this ledger resolves to the
+    /// EMPTY-namespace full-IRI Sid — the same form the storage side's
+    /// non-strict `encode_iri` produces, and the form the JSON-LD query
+    /// surface already uses (`fluree-db-query/src/parse/lower.rs`). Ingest
+    /// registers every namespace it stores, so no stored term can carry a
+    /// datatype in an unregistered namespace: the EMPTY-namespace Sid
+    /// matches nothing, which is the spec answer for a term that does not
+    /// exist. (The previous `xsd:string` fallback made
+    /// `"a"^^ex:NoSuchType` match every plain-string `"a"` row — #1686.)
+    fn datatype_sid(&self, dt_iri: &str) -> Sid {
+        self.encoder
+            .encode_iri(dt_iri)
+            .unwrap_or_else(|| Sid::new(EMPTY, dt_iri))
     }
 
     /// Convert a SPARQL term to a Binding (for VALUES rows).
@@ -512,13 +512,14 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     // Bind the DECLARED datatype: Binding::Lit equality
                     // includes the datatype, so labeling every typed literal
                     // xsd:string made VALUES constants like
-                    // "…"^^xsd:integer unable to match stored values.
+                    // "…"^^xsd:integer unable to match stored values. An
+                    // unregistered datatype resolves to the match-nothing
+                    // EMPTY-namespace Sid (see `datatype_sid`), keeping this
+                    // site in lockstep with triple-pattern constraints.
                     let dt_sid = if dt_iri == fluree::EMBEDDING_VECTOR {
                         Sid::new(FLUREE_DB, "vector")
-                    } else if let Some(sid) = self.encoder.encode_iri_strict(&dt_iri) {
-                        sid
                     } else {
-                        Sid::new(XSD, xsd_names::STRING)
+                        self.datatype_sid(&dt_iri)
                     };
                     Ok(Binding::lit(fv, dt_sid))
                 }

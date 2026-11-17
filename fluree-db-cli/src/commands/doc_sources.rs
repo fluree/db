@@ -1,0 +1,543 @@
+//! Where `--ontology` and `--entities` come from.
+//!
+//! A source is a ledger in the local store, a graph source mapped over a
+//! table (`fluree iceberg|sql|delta map`), or an RDF file. A file is loaded
+//! into a scratch in-memory ledger, so every source is queried the same
+//! way with the database's own parsers and no second RDF stack. Names and
+//! file paths are told apart by extension: `.ttl`, `.nt`, `.jsonld` and
+//! `.json` are files.
+
+use crate::context;
+use crate::error::{CliError, CliResult};
+use fluree_db_api::server_defaults::FlureeDir;
+use fluree_db_api::{Fluree, FlureeBuilder};
+use fluree_db_doc::gazetteer::{Gazetteer, GazetteerBuilder};
+use fluree_db_doc::model::{Model, ModelBuilder};
+use fluree_db_nameservice::{GraphSourceKind, GraphSourceType};
+use serde_json::Value;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceKind {
+    Ledger(String),
+    File(PathBuf),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub kind: SourceKind,
+    /// `#Class` suffix: only subjects of this type.
+    pub class: Option<String>,
+}
+
+impl Source {
+    /// `ledger`, `ledger#Class`, `path.ttl`, `path.ttl#Class`. Ledger names
+    /// and paths carry no `#`, so everything after the first one is the
+    /// class, full IRIs with their own fragment included.
+    pub fn parse(spec: &str) -> Self {
+        let (base, class) = match spec.split_once('#') {
+            Some((b, c)) if !b.is_empty() && !c.is_empty() => (b, Some(c.to_string())),
+            Some((b, _)) if !b.is_empty() => (b, None),
+            _ => (spec, None),
+        };
+        let kind = if is_rdf_file(base) {
+            SourceKind::File(PathBuf::from(base))
+        } else {
+            SourceKind::Ledger(base.to_string())
+        };
+        Self { kind, class }
+    }
+
+    pub fn label(&self) -> String {
+        let base = match &self.kind {
+            SourceKind::Ledger(alias) => alias.clone(),
+            SourceKind::File(path) => path.display().to_string(),
+        };
+        match &self.class {
+            Some(c) => format!("{base}#{c}"),
+            None => base,
+        }
+    }
+}
+
+fn is_rdf_file(spec: &str) -> bool {
+    Path::new(spec)
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| {
+            matches!(
+                e.to_ascii_lowercase().as_str(),
+                "ttl" | "nt" | "jsonld" | "json"
+            )
+        })
+}
+
+/// A source made queryable: the store holding it and the alias to query.
+pub struct Opened {
+    fluree: Fluree,
+    alias: String,
+    /// Queried through the graph-source path, which maps the table's rows
+    /// to triples as it reads them; a ledger or file has flakes to read.
+    graph_source: bool,
+}
+
+impl Opened {
+    /// `dirs` is the project a ledger source lives in; a file needs none.
+    pub async fn open(source: &Source, dirs: Option<&FlureeDir>) -> CliResult<Self> {
+        match &source.kind {
+            SourceKind::Ledger(alias) => {
+                let Some(dirs) = dirs else {
+                    return Err(CliError::Config(format!(
+                        "{alias}: a ledger source needs a project (fluree init), or name a .ttl, .nt, .jsonld or .json file"
+                    )));
+                };
+                let fluree = context::build_fluree(dirs).await?;
+                let ledger_id = context::to_ledger_id(alias)?;
+                let graph_source = if fluree.ledger_exists(&ledger_id).await? {
+                    false
+                } else {
+                    match graph_source_type(&fluree, &ledger_id).await? {
+                        Some(t) if t.kind() == GraphSourceKind::Mapped => true,
+                        // An index answers searches, not the label queries
+                        // a source is read with.
+                        Some(t) => {
+                            return Err(CliError::Usage(format!(
+                                "{alias} is {}, not a table mapped as a graph source; a source is a ledger, a file, or a graph source from `fluree iceberg|sql|delta map`",
+                                describe(&t)
+                            )))
+                        }
+                        None => {
+                            return Err(CliError::NotFound(format!(
+                                "{alias}: no such ledger or graph source (a file source needs a .ttl, .nt, .jsonld or .json extension)"
+                            )))
+                        }
+                    }
+                };
+                Ok(Self {
+                    fluree,
+                    alias: alias.clone(),
+                    graph_source,
+                })
+            }
+            SourceKind::File(path) => {
+                let content = std::fs::read_to_string(path)
+                    .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+                let fluree = FlureeBuilder::memory().build_memory();
+                let alias = "scratch:main".to_string();
+                fluree
+                    .create_ledger(&context::to_ledger_id(&alias)?)
+                    .await?;
+                let g = fluree.graph(&alias);
+                let ext = path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .unwrap_or_default();
+                if ext == "ttl" || ext == "nt" {
+                    g.transact().insert_turtle(&content).commit().await?;
+                } else {
+                    let json: Value = serde_json::from_str(&content).map_err(|e| {
+                        CliError::Input(format!("{}: not JSON: {e}", path.display()))
+                    })?;
+                    g.transact().insert(&json).commit().await?;
+                }
+                Ok(Self {
+                    fluree,
+                    alias,
+                    graph_source: false,
+                })
+            }
+        }
+    }
+
+    pub async fn rows(&self, query: &Value) -> CliResult<Vec<Value>> {
+        if self.graph_source {
+            let json = self
+                .fluree
+                .graph(&self.alias)
+                .query()
+                .jsonld(query)
+                .execute_formatted()
+                .await?;
+            return Ok(json.as_array().cloned().unwrap_or_default());
+        }
+        let view = self.fluree.db_with_default_context(&self.alias).await?;
+        let result = self.fluree.query(&view, query).await?;
+        let json = result.to_jsonld(&view.snapshot)?;
+        Ok(json.as_array().cloned().unwrap_or_default())
+    }
+}
+
+/// The type of a live graph source named `id`, when this build can read
+/// one. Without the `iceberg` feature the table readers are not compiled
+/// in, so a graph source reads as missing rather than failing on its first
+/// query.
+async fn graph_source_type(fluree: &Fluree, id: &str) -> CliResult<Option<GraphSourceType>> {
+    if !cfg!(feature = "iceberg") {
+        return Ok(None);
+    }
+    Ok(fluree
+        .nameservice()
+        .lookup_graph_source(id)
+        .await?
+        .filter(|r| !r.retracted)
+        .map(|r| r.source_type))
+}
+
+/// A graph source that is not a mapped table, as an error names it.
+fn describe(t: &GraphSourceType) -> String {
+    match t {
+        GraphSourceType::Bm25 => "a BM25 full-text index".to_string(),
+        GraphSourceType::Vector => "a vector index".to_string(),
+        GraphSourceType::Geo => "a geospatial index".to_string(),
+        other => format!("a graph source of type {}", other.to_type_string()),
+    }
+}
+
+pub async fn load_model(source: &Source, dirs: &FlureeDir) -> CliResult<Model> {
+    let opened = Opened::open(source, Some(dirs)).await?;
+    let mut builder = ModelBuilder::default();
+    for query in Model::class_queries() {
+        builder.add_class_rows(&opened.rows(&query).await?);
+    }
+    for (query, kind) in Model::property_queries() {
+        builder.add_property_rows(&opened.rows(&query).await?, kind);
+    }
+    let model = builder.build();
+    if model.is_empty() {
+        return Err(CliError::Input(format!(
+            "--ontology {}: no classes or properties found (rdfs:Class, owl:Class, rdf:Property, owl:ObjectProperty, owl:DatatypeProperty, or anything with rdfs:subClassOf / rdfs:domain / schema:domainIncludes)",
+            source.label()
+        )));
+    }
+    Ok(model)
+}
+
+pub struct LoadedGazetteer {
+    pub gazetteer: Gazetteer,
+    /// Labels found per source, for the run's announcement.
+    pub counts: Vec<(String, usize)>,
+    /// Over the sources alone. The target ledger's own entities are not
+    /// part of it: they grow with every run, and a document is unchanged
+    /// when its inputs are.
+    pub fingerprint: String,
+}
+
+/// Every label from every source, plus the entities earlier runs minted
+/// into the target ledger, so a name already on a node keeps that node.
+/// A `#Class` scope must be something the label queries can name: a full
+/// IRI, or a compact form under a prefix they know.
+fn check_class_scope(source: &Source) -> CliResult<()> {
+    let Some(class) = &source.class else {
+        return Ok(());
+    };
+    if class.contains("://") || class.starts_with("urn:") {
+        return Ok(());
+    }
+    let known = fluree_db_doc::model::PREFIXES
+        .iter()
+        .map(|(p, _)| *p)
+        .chain(std::iter::once("doc"));
+    let prefix = class.split_once(':').map(|(p, _)| p).unwrap_or("");
+    if known.clone().any(|k| k == prefix) {
+        return Ok(());
+    }
+    Err(CliError::Usage(format!(
+        "--entities {}: class scope '{class}' uses a prefix the scan does not know; write the full IRI (known prefixes: {})",
+        source.label(),
+        known.collect::<Vec<_>>().join(", ")
+    )))
+}
+
+pub async fn load_gazetteer(
+    sources: &[Source],
+    target: Option<(&Fluree, &str)>,
+    lang: &str,
+    dirs: &FlureeDir,
+) -> CliResult<LoadedGazetteer> {
+    let mut builder = GazetteerBuilder::default();
+    let mut counts = Vec::new();
+    for source in sources {
+        check_class_scope(source)?;
+        let opened = Opened::open(source, Some(dirs)).await?;
+        let mut n = 0;
+        for (query, predicate) in Gazetteer::queries(source.class.as_deref()) {
+            let rows = opened.rows(&query).await?;
+            n += rows.len();
+            builder.add_rows(&rows, predicate);
+        }
+        counts.push((source.label(), n));
+    }
+    let fingerprint = builder.fingerprint();
+    if let Some((fluree, alias)) = target {
+        let opened = Opened {
+            fluree: fluree.clone(),
+            alias: alias.to_string(),
+            graph_source: false,
+        };
+        for (query, predicate) in Gazetteer::queries(Some(fluree_db_doc::vocab::ENTITY)) {
+            builder.add_rows(&opened.rows(&query).await?, predicate);
+        }
+        // An entity minted outside the ontology is kept for review, not
+        // trusted: "notes" scanned for by name would tag every page.
+        let off_model = opened
+            .rows(&serde_json::json!({
+                "@context": { "doc": fluree_db_doc::vocab::DOC_NS },
+                "where": [{ "@id": "?s", "@type": fluree_db_doc::vocab::ENTITY, fluree_db_doc::vocab::OFF_MODEL: true }],
+                "select": ["?s"]
+            }))
+            .await?
+            .iter()
+            .filter_map(|row| row.as_array()?.first()?.as_str().map(str::to_string))
+            .collect();
+        builder.remove(&off_model);
+    }
+    Ok(LoadedGazetteer {
+        gazetteer: builder.build(lang),
+        counts,
+        fingerprint,
+    })
+}
+
+/// An ontology as RDF, for a reader that is sent the ontology itself: a
+/// file read as it is, or a ledger's default graph.
+pub async fn load_rdf(
+    source: &Source,
+    dirs: Option<&FlureeDir>,
+) -> CliResult<fluree_graph_ir::Graph> {
+    use fluree_db_doc::reader::request::parse_turtle;
+    let label = source.label();
+    let graph = match &source.kind {
+        SourceKind::File(path) => read_rdf_file(path, &label)?,
+        SourceKind::Ledger(alias) => {
+            let opened = Opened::open(source, dirs).await?;
+            if opened.graph_source {
+                return Err(CliError::Usage(format!(
+                    "--ontology {alias}: a graph source cannot be an ontology; export one to a file, or name a ledger"
+                )));
+            }
+            let mut bytes = Vec::new();
+            opened
+                .fluree
+                .export(&opened.alias)
+                .format(fluree_db_api::export::ExportFormat::NTriples)
+                .write_to(&mut bytes)
+                .await?;
+            parse_turtle(&String::from_utf8_lossy(&bytes))
+                .map_err(|e| CliError::Input(format!("{label}: {e}")))?
+        }
+    };
+    if graph.is_empty() {
+        return Err(CliError::Input(format!("--ontology {label}: no triples")));
+    }
+    Ok(graph)
+}
+
+/// A `.ttl` / `.nt` or JSON-LD file as a graph, read as it is.
+fn read_rdf_file(path: &std::path::Path, label: &str) -> CliResult<fluree_graph_ir::Graph> {
+    use fluree_db_doc::reader::request::{parse_jsonld, parse_turtle};
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| CliError::Input(format!("{}: {e}", path.display())))?;
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    if ext == "ttl" || ext == "nt" {
+        parse_turtle(&content)
+    } else {
+        parse_jsonld(&content)
+    }
+    .map_err(|e| CliError::Input(format!("{label}: {e}")))
+}
+
+pub struct LoadedCatalog {
+    pub graph: fluree_graph_ir::Graph,
+    /// Records found per source, for the run's announcement.
+    pub counts: Vec<(String, usize)>,
+}
+
+/// The catalog a reader is sent: each source's records, scoped to its
+/// `#Class` when it has one.
+pub async fn load_catalog(
+    sources: &[Source],
+    dirs: Option<&FlureeDir>,
+) -> CliResult<LoadedCatalog> {
+    use fluree_graph_ir::Term;
+    let mut graph = fluree_graph_ir::Graph::new();
+    let mut counts = Vec::new();
+    let rdf_type = format!("{}type", fluree_db_doc::vocab::RDF_NS);
+    for source in sources {
+        check_class_scope(source)?;
+        // A file is read as it is, with the same selection the Python
+        // package makes, so both send the same records (and share answers
+        // in one cache).
+        if let SourceKind::File(path) = &source.kind {
+            let class = source.class.as_deref().map(expand_compact);
+            let records = fluree_db_doc::reader::request::catalog_records_of(
+                &read_rdf_file(path, &source.label())?,
+                class.as_deref(),
+            );
+            counts.push((
+                source.label(),
+                fluree_db_doc::reader::request::catalog_records(&records),
+            ));
+            for t in records.iter() {
+                graph.add(t.clone());
+            }
+            continue;
+        }
+        let opened = Opened::open(source, dirs).await?;
+        let anchor = |extra: (&str, &str)| {
+            let mut node = serde_json::json!({ "@id": "?s", extra.0: extra.1 });
+            if let Some(c) = &source.class {
+                node["@type"] = serde_json::json!(c);
+            }
+            node
+        };
+        let mut subjects = std::collections::BTreeSet::new();
+        // One list of record predicates, the reader request's.
+        for predicate in fluree_db_doc::reader::request::RECORD_PREDICATES {
+            let query = serde_json::json!({
+                "@context": fluree_db_doc::model::query_context(),
+                "where": [anchor((predicate, "?v"))],
+                "select": ["?s", "?v"]
+            });
+            for row in opened.rows(&query).await? {
+                let (Some(s), Some(v)) = (row_cell(&row, 0), row_literal(&row, 1)) else {
+                    continue;
+                };
+                if s.starts_with("_:") {
+                    continue;
+                }
+                let s = expand_compact(&s);
+                graph.add_triple(Term::iri(&s), Term::iri(expand_compact(predicate)), v);
+                subjects.insert(s);
+            }
+        }
+        // Unscoped: the label queries already chose the subjects (and a
+        // `#Class` scope written into this pattern would replace `?t`).
+        let query = serde_json::json!({
+            "@context": fluree_db_doc::model::query_context(),
+            "where": [{ "@id": "?s", "@type": "?t" }],
+            "select": ["?s", "?t"]
+        });
+        for row in opened.rows(&query).await? {
+            let (Some(s), Some(t)) = (row_cell(&row, 0), row_cell(&row, 1)) else {
+                continue;
+            };
+            let s = expand_compact(&s);
+            if subjects.contains(&s) {
+                graph.add_triple(
+                    Term::iri(&s),
+                    Term::iri(&rdf_type),
+                    Term::iri(expand_compact(&t)),
+                );
+            }
+        }
+        counts.push((source.label(), subjects.len()));
+    }
+    graph.sort();
+    graph.dedupe();
+    Ok(LoadedCatalog { graph, counts })
+}
+
+fn row_cell(row: &Value, i: usize) -> Option<String> {
+    match row.get(i)? {
+        Value::String(s) => Some(s.clone()),
+        Value::Object(o) => o
+            .get("@id")
+            .or_else(|| o.get("@value"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        _ => None,
+    }
+}
+
+/// A label from a query row as a literal, keeping its language tag or
+/// datatype when the row carries one; `None` for an empty one.
+fn row_literal(row: &Value, i: usize) -> Option<fluree_graph_ir::Term> {
+    use fluree_graph_ir::{Datatype, Term};
+    let cell = row.get(i)?;
+    let (value, lang, datatype) = match cell {
+        Value::String(s) => (s.as_str(), None, None),
+        Value::Object(o) => (
+            o.get("@value").and_then(Value::as_str)?,
+            o.get("@language").and_then(Value::as_str),
+            o.get("@type").and_then(Value::as_str),
+        ),
+        _ => return None,
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    Some(match (lang, datatype) {
+        (Some(l), _) => Term::lang_string(value, l),
+        (None, Some(dt))
+            if expand_compact(dt) != format!("{}string", fluree_db_doc::vocab::XSD_NS) =>
+        {
+            Term::typed(value, Datatype::from_iri(expand_compact(dt)))
+        }
+        _ => Term::string(value),
+    })
+}
+
+/// A compact IRI from a query row, with the prefixes the queries bind.
+fn expand_compact(iri: &str) -> String {
+    for (prefix, ns) in fluree_db_doc::model::PREFIXES {
+        if let Some(rest) = iri.strip_prefix(&format!("{prefix}:")) {
+            return format!("{ns}{rest}");
+        }
+    }
+    if let Some(rest) = iri.strip_prefix("doc:") {
+        return format!("{}{rest}", fluree_db_doc::vocab::DOC_NS);
+    }
+    iri.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn specs_split_into_kind_and_class() {
+        assert_eq!(
+            Source::parse("people"),
+            Source {
+                kind: SourceKind::Ledger("people".into()),
+                class: None
+            }
+        );
+        assert_eq!(
+            Source::parse("people:main#schema:Person"),
+            Source {
+                kind: SourceKind::Ledger("people:main".into()),
+                class: Some("schema:Person".into())
+            }
+        );
+        assert_eq!(
+            Source::parse("./ont/model.TTL"),
+            Source {
+                kind: SourceKind::File("./ont/model.TTL".into()),
+                class: None
+            }
+        );
+        assert_eq!(
+            Source::parse("gaz.jsonld#https://schema.org/City")
+                .class
+                .as_deref(),
+            Some("https://schema.org/City")
+        );
+        assert_eq!(
+            Source::parse("gaz.jsonld#").kind,
+            SourceKind::File("gaz.jsonld".into())
+        );
+        assert_eq!(
+            Source::parse("model.ttl#https://ns.flur.ee/magna#Drawing")
+                .class
+                .as_deref(),
+            Some("https://ns.flur.ee/magna#Drawing")
+        );
+    }
+}

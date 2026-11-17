@@ -13,6 +13,10 @@ Fluree's authentication model, covering:
 - Replication vs query access boundary
 - Token verification paths (Ed25519 + OIDC/JWKS)
 
+### [Trusted policy authorization](policy-authorization.md)
+
+Application-selected policy contexts for embedded hosts and signed, scoped gateway delegation.
+
 ## Data Encryption
 
 ### [Storage Encryption](encryption.md)
@@ -66,7 +70,7 @@ How policies affect transaction operations:
 
 Using policies in Rust applications:
 - `wrap_identity_policy_view` - Identity-based policy lookup via `f:policyClass`
-- `wrap_policy_view` - Inline policies with `QueryConnectionOptions`
+- `wrap_policy_view` - Inline policies with `GovernanceOptions`
 - Policy precedence rules
 - Transaction-side policy enforcement
 - Historical views with policy

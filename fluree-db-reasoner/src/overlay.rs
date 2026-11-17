@@ -5,16 +5,25 @@
 //!
 //! # Design
 //!
-//! - Flakes are stored sorted by each index type for efficient range queries
+//! - Flakes are partitioned by graph. Within a graph they are stored once,
+//!   sorted in SPOT order; the other three index orders are permutations of
+//!   that array (`u32` positions), so a derived fact costs one `Flake` plus
+//!   twelve bytes rather than four `Flake`s. Range lookups binary-search the
+//!   permutation with the index comparator.
+//! - OWL 2 RL facts all belong to the default graph; a datalog rule can
+//!   derive into a named graph.
 //! - The overlay includes `FrozenSameAs` for owl:sameAs equivalence handling
 //! - Derived facts are canonicalized (use canonical representatives for S/O positions)
 //! - Query-time lookups canonicalize the query key first, only expand when necessary
 
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::flake::Flake;
+use fluree_db_core::graph_registry::DEFAULT_GRAPH_ID;
 use fluree_db_core::overlay::OverlayProvider;
 use fluree_db_core::{GraphId, Sid};
-use std::sync::Arc;
+use std::any::Any;
+use std::collections::BTreeMap;
+use std::sync::{Arc, OnceLock};
 
 use crate::same_as::FrozenSameAs;
 
@@ -23,28 +32,129 @@ use crate::same_as::FrozenSameAs;
 /// Implements `OverlayProvider` to be composable with base overlays (e.g., novelty).
 #[derive(Debug, Clone)]
 pub struct DerivedFactsOverlay {
-    /// Flakes sorted by SPOT index order
-    spot: Arc<[Flake]>,
-    /// Flakes sorted by PSOT index order
-    psot: Arc<[Flake]>,
-    /// Flakes sorted by POST index order
-    post: Arc<[Flake]>,
-    /// Flakes sorted by OPST index order
-    opst: Arc<[Flake]>,
+    /// One partition per graph holding derived facts, in graph id order.
+    graphs: Arc<[GraphFacts]>,
     /// owl:sameAs equivalence classes
     same_as: FrozenSameAs,
     /// Epoch for cache key differentiation
     epoch: u64,
-    /// Process-unique id assigned at construction (shared by clones).
+    /// Process-unique id assigned at construction (shared by clones), drawn
+    /// from the overlay-wide content-version allocator so it doubles as this
+    /// immutable overlay's [`OverlayProvider::content_version`].
     ///
     /// The `epoch` alone cannot distinguish two materializations built at the
     /// same base-overlay epoch under different rule configs / ontologies —
     /// caches keyed on overlay identity must incorporate this id.
     instance_id: u64,
+    /// Derived state a reader keeps for as long as this materialization
+    /// lives, such as a query engine's translated view of it. Shared by
+    /// clones, so every query reading this materialization sees one copy.
+    attachment: Attachment,
 }
 
-/// Process-wide counter for [`DerivedFactsOverlay::instance_id`].
-static OVERLAY_INSTANCE_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+/// See [`DerivedFactsOverlay::attachment`].
+#[derive(Clone, Default)]
+struct Attachment(Arc<OnceLock<Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "Attachment(set)"
+        } else {
+            "Attachment(empty)"
+        })
+    }
+}
+
+/// The derived facts of one graph.
+#[derive(Debug)]
+struct GraphFacts {
+    g_id: GraphId,
+    /// Flakes sorted by SPOT index order — the only materialized copy.
+    spot: Box<[Flake]>,
+    /// Positions into `spot`, ordered by the PSOT comparator.
+    psot: Box<[u32]>,
+    /// Positions into `spot`, ordered by the POST comparator.
+    post: Box<[u32]>,
+    /// Positions into `spot`, ordered by the OPST comparator.
+    opst: Box<[u32]>,
+}
+
+impl GraphFacts {
+    fn new(g_id: GraphId, mut flakes: Vec<Flake>) -> Self {
+        assert!(
+            flakes.len() <= u32::MAX as usize,
+            "derived-facts overlay exceeds u32 positions"
+        );
+        flakes.sort_by(|a, b| IndexType::Spot.comparator()(a, b));
+        let spot: Box<[Flake]> = flakes.into();
+        let permutation = |index: IndexType| -> Box<[u32]> {
+            let cmp = index.comparator();
+            let mut order: Vec<u32> = (0..spot.len() as u32).collect();
+            order.sort_by(|a, b| cmp(&spot[*a as usize], &spot[*b as usize]));
+            order.into()
+        };
+        let psot = permutation(IndexType::Psot);
+        let post = permutation(IndexType::Post);
+        let opst = permutation(IndexType::Opst);
+        Self {
+            g_id,
+            spot,
+            psot,
+            post,
+            opst,
+        }
+    }
+
+    /// Positional view of the flakes in one index order.
+    fn view(&self, index: IndexType) -> OrderView<'_> {
+        let order = match index {
+            IndexType::Spot => None,
+            IndexType::Psot => Some(&*self.psot),
+            IndexType::Post => Some(&*self.post),
+            IndexType::Opst => Some(&*self.opst),
+        };
+        OrderView {
+            spot: &self.spot,
+            order,
+        }
+    }
+
+    /// Positions [`OverlayProvider::for_each_overlay_flake`] visits: `first`
+    /// exclusive (unless `leftmost`), `rhs` inclusive.
+    fn range(
+        &self,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> std::ops::Range<usize> {
+        let start = match first {
+            Some(first) if !leftmost => self.upper_bound(index, first),
+            _ => 0,
+        };
+        let end = rhs.map_or(self.spot.len(), |rhs| self.upper_bound(index, rhs));
+        start..end.max(start)
+    }
+
+    /// Binary search for the first flake > target in the given index
+    fn upper_bound(&self, index: IndexType, target: &Flake) -> usize {
+        let view = self.view(index);
+        let cmp = index.comparator();
+        // partition_point over positions [0, len): the ordered predicate
+        // "flake at position <= target" is monotone in every index order.
+        let (mut lo, mut hi) = (0usize, view.len());
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if cmp(view.get(mid), target).is_le() {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        lo
+    }
+}
 
 impl DerivedFactsOverlay {
     /// Create an empty overlay (no derived facts) with default epoch and empty sameAs
@@ -60,48 +170,75 @@ impl DerivedFactsOverlay {
     /// preserve the epoch and sameAs state for cache correctness.
     pub fn empty_with_metadata(same_as: FrozenSameAs, epoch: u64) -> Self {
         Self {
-            spot: Arc::from([]),
-            psot: Arc::from([]),
-            post: Arc::from([]),
-            opst: Arc::from([]),
+            graphs: Arc::from([]),
             same_as,
             epoch,
-            instance_id: OVERLAY_INSTANCE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+            attachment: Attachment::default(),
         }
     }
 
-    /// Create an overlay from pre-sorted flakes
+    /// Create an overlay of default-graph facts from flakes in any order.
+    ///
+    /// The flakes are sorted into SPOT order once; the PSOT / POST / OPST
+    /// orders are derived as position permutations over that array.
     ///
     /// # Arguments
     ///
-    /// * `spot` - Flakes sorted by SPOT order
-    /// * `psot` - Flakes sorted by PSOT order
-    /// * `post` - Flakes sorted by POST order
-    /// * `opst` - Flakes sorted by OPST order
+    /// * `flakes` - Derived flakes (deduplicated by the caller)
     /// * `same_as` - Frozen sameAs equivalence classes
     /// * `epoch` - Epoch for cache differentiation
-    pub fn new(
-        spot: Vec<Flake>,
-        psot: Vec<Flake>,
-        post: Vec<Flake>,
-        opst: Vec<Flake>,
+    pub fn new(flakes: Vec<Flake>, same_as: FrozenSameAs, epoch: u64) -> Self {
+        Self::new_routed(flakes, same_as, epoch, |_| DEFAULT_GRAPH_ID)
+    }
+
+    /// Create an overlay whose flakes each belong to the graph `route`
+    /// assigns them.
+    pub fn new_routed(
+        flakes: Vec<Flake>,
         same_as: FrozenSameAs,
         epoch: u64,
+        route: impl Fn(&Flake) -> GraphId,
     ) -> Self {
+        let mut by_graph: BTreeMap<GraphId, Vec<Flake>> = BTreeMap::new();
+        for flake in flakes {
+            by_graph.entry(route(&flake)).or_default().push(flake);
+        }
         Self {
-            spot: spot.into(),
-            psot: psot.into(),
-            post: post.into(),
-            opst: opst.into(),
+            graphs: by_graph
+                .into_iter()
+                .map(|(g_id, flakes)| GraphFacts::new(g_id, flakes))
+                .collect(),
             same_as,
             epoch,
-            instance_id: OVERLAY_INSTANCE_IDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+            attachment: Attachment::default(),
         }
     }
 
     /// Process-unique identity of this materialization (stable across clones).
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// The reader state attached to this materialization, created by `init`
+    /// on first use. It lives exactly as long as the materialization: when a
+    /// cache evicts it and the last query reading it ends, the state goes too.
+    /// `None` when a reader attached state of another type.
+    pub fn attachment<T: Any + Send + Sync>(&self, init: impl FnOnce() -> T) -> Option<Arc<T>> {
+        let state = self.attachment.0.get_or_init(|| Arc::new(init()));
+        Arc::clone(state).downcast::<T>().ok()
+    }
+
+    /// Estimated memory this materialization holds: its facts (as
+    /// [`approx_flake_bytes`](crate::approx_flake_bytes) counts them toward
+    /// the reasoning memory budget) plus the three position permutations.
+    pub fn approx_bytes(&self) -> usize {
+        self.graphs
+            .iter()
+            .flat_map(|g| g.spot.iter())
+            .map(|flake| crate::approx_flake_bytes(flake) + 3 * std::mem::size_of::<u32>())
+            .sum()
     }
 
     /// Get the sameAs equivalence structure
@@ -119,32 +256,56 @@ impl DerivedFactsOverlay {
         self.same_as.expand(sid)
     }
 
-    /// Get number of derived facts
+    /// Get number of derived facts, across graphs
     pub fn len(&self) -> usize {
-        self.spot.len()
+        self.graphs.iter().map(|g| g.spot.len()).sum()
     }
 
     /// Check if empty (no derived facts)
     pub fn is_empty(&self) -> bool {
-        self.spot.is_empty()
+        self.graphs.iter().all(|g| g.spot.is_empty())
     }
 
-    /// Get flakes by index type (for iteration/debugging)
-    pub fn flakes(&self, index: IndexType) -> &[Flake] {
-        match index {
-            IndexType::Spot => &self.spot,
-            IndexType::Psot => &self.psot,
-            IndexType::Post => &self.post,
-            IndexType::Opst => &self.opst,
+    /// The graphs holding derived facts.
+    pub fn graph_ids(&self) -> impl Iterator<Item = GraphId> + '_ {
+        self.graphs.iter().map(|g| g.g_id)
+    }
+
+    fn graph(&self, g_id: GraphId) -> Option<&GraphFacts> {
+        self.graphs.iter().find(|g| g.g_id == g_id)
+    }
+
+    /// The default graph's derived flakes in SPOT order.
+    pub fn flakes_spot(&self) -> &[Flake] {
+        self.graph(DEFAULT_GRAPH_ID).map_or(&[], |g| &g.spot)
+    }
+
+    /// Iterate the default graph's derived flakes in the given index order.
+    pub fn iter(&self, index: IndexType) -> impl Iterator<Item = &Flake> + '_ {
+        let view = self.graph(DEFAULT_GRAPH_ID).map(|g| g.view(index));
+        let len = view.map_or(0, |v| v.len());
+        (0..len).map(move |i| view.expect("non-empty view").get(i))
+    }
+}
+
+/// Read-only view of the SPOT array through one index order's permutation
+/// (`None` = SPOT itself, the identity order).
+#[derive(Clone, Copy)]
+struct OrderView<'a> {
+    spot: &'a [Flake],
+    order: Option<&'a [u32]>,
+}
+
+impl<'a> OrderView<'a> {
+    fn len(&self) -> usize {
+        self.spot.len()
+    }
+
+    fn get(&self, i: usize) -> &'a Flake {
+        match self.order {
+            None => &self.spot[i],
+            Some(order) => &self.spot[order[i] as usize],
         }
-    }
-
-    /// Binary search for the first flake > target in the given index
-    fn upper_bound(&self, index: IndexType, target: &Flake) -> usize {
-        let flakes = self.flakes(index);
-        let cmp = index.comparator();
-
-        flakes.partition_point(|f| cmp(f, target).is_le())
     }
 }
 
@@ -153,8 +314,19 @@ impl OverlayProvider for DerivedFactsOverlay {
         self
     }
 
+    /// None: a derived fact carries no list position.
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        Some(Default::default())
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    fn content_version(&self) -> Option<u64> {
+        Some(self.instance_id)
     }
 
     fn for_each_overlay_flake(
@@ -167,40 +339,30 @@ impl OverlayProvider for DerivedFactsOverlay {
         to_t: i64,
         callback: &mut dyn FnMut(&Flake),
     ) {
-        // Derived facts from reasoning are default-graph only
-        if g_id != 0 {
+        let Some(graph) = self.graph(g_id) else {
             return;
-        }
-
-        let flakes = self.flakes(index);
-        if flakes.is_empty() {
-            return;
-        }
-
-        // Determine start position
-        let start = if leftmost {
-            0
-        } else if let Some(first) = first {
-            // Exclusive left boundary: start after first
-            self.upper_bound(index, first)
-        } else {
-            0
         };
-
-        // Determine end position
-        let end = if let Some(rhs) = rhs {
-            // Inclusive right boundary: include rhs
-            self.upper_bound(index, rhs)
-        } else {
-            flakes.len()
-        };
-
-        // Emit flakes in range, filtered by to_t
-        for flake in &flakes[start..end] {
+        let view = graph.view(index);
+        for i in graph.range(index, first, rhs, leftmost) {
+            let flake = view.get(i);
             if flake.t <= to_t {
                 callback(flake);
             }
         }
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        Some(
+            self.graph(g_id)
+                .map_or(0, |g| g.range(index, first, rhs, leftmost).len()),
+        )
     }
 }
 
@@ -251,30 +413,18 @@ impl DerivedFactsBuilder {
     /// Sorts flakes by each index and constructs the immutable overlay.
     /// Preserves `same_as` and `epoch` even when no flakes were derived.
     pub fn build(self, same_as: FrozenSameAs, epoch: u64) -> DerivedFactsOverlay {
-        if self.flakes.is_empty() {
-            // Preserve same_as and epoch even with zero derived flakes
-            return DerivedFactsOverlay::new(
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                Vec::new(),
-                same_as,
-                epoch,
-            );
-        }
+        // Preserves same_as and epoch even with zero derived flakes.
+        DerivedFactsOverlay::new(self.flakes, same_as, epoch)
+    }
 
-        // Sort by each index
-        let mut spot = self.flakes.clone();
-        let mut psot = self.flakes.clone();
-        let mut post = self.flakes.clone();
-        let mut opst = self.flakes;
-
-        spot.sort_by(|a, b| IndexType::Spot.comparator()(a, b));
-        psot.sort_by(|a, b| IndexType::Psot.comparator()(a, b));
-        post.sort_by(|a, b| IndexType::Post.comparator()(a, b));
-        opst.sort_by(|a, b| IndexType::Opst.comparator()(a, b));
-
-        DerivedFactsOverlay::new(spot, psot, post, opst, same_as, epoch)
+    /// Build the final overlay, each flake in the graph `route` assigns it.
+    pub fn build_routed(
+        self,
+        same_as: FrozenSameAs,
+        epoch: u64,
+        route: impl Fn(&Flake) -> GraphId,
+    ) -> DerivedFactsOverlay {
+        DerivedFactsOverlay::new_routed(self.flakes, same_as, epoch, route)
     }
 }
 
@@ -292,12 +442,84 @@ mod tests {
         Flake::new(sid(s), sid(p), FlakeValue::Long(o), sid(0), t, true, None)
     }
 
+    /// `make_flake` with an explicit datatype, for the object tie-break.
+    fn make_flake_dt(s: u16, p: u16, o: i64, dt: u16, t: i64) -> Flake {
+        Flake::new(sid(s), sid(p), FlakeValue::Long(o), sid(dt), t, true, None)
+    }
+
     #[test]
     fn test_empty_overlay() {
         let overlay = DerivedFactsOverlay::empty();
         assert!(overlay.is_empty());
         assert_eq!(overlay.len(), 0);
         assert_eq!(overlay.epoch(), 0);
+    }
+
+    #[test]
+    fn range_count_matches_the_walk() {
+        let mut builder = DerivedFactsBuilder::new();
+        for s in 1..=5 {
+            builder.push(make_flake(s, 1, 100, 1));
+        }
+        for s in 1..=3 {
+            builder.push(make_flake(s, 2, 100, 1));
+        }
+        let overlay =
+            builder.build_routed(
+                FrozenSameAs::empty(),
+                1,
+                |f| {
+                    if f.p == sid(2) {
+                        0
+                    } else {
+                        4
+                    }
+                },
+            );
+        let bracket = |p: u16| {
+            let lo = Flake::new(
+                Sid::min(),
+                sid(p),
+                FlakeValue::min(),
+                Sid::min(),
+                i64::MIN,
+                false,
+                None,
+            );
+            let hi = Flake::new(
+                Sid::max(),
+                sid(p),
+                FlakeValue::max(),
+                Sid::max(),
+                i64::MAX,
+                true,
+                None,
+            );
+            (lo, hi)
+        };
+        for (g_id, p) in [(4, 1), (0, 2), (0, 1), (4, 2), (9, 1)] {
+            let (lo, hi) = bracket(p);
+            let mut walked = 0;
+            overlay.for_each_overlay_flake(
+                g_id,
+                IndexType::Psot,
+                Some(&lo),
+                Some(&hi),
+                false,
+                i64::MAX,
+                &mut |_| walked += 1,
+            );
+            let counted = overlay.overlay_range_flake_count(
+                g_id,
+                IndexType::Psot,
+                Some(&lo),
+                Some(&hi),
+                false,
+            );
+            assert_eq!(counted, Some(walked), "graph {g_id}, predicate {p}");
+        }
+        let counted = overlay.overlay_range_flake_count(4, IndexType::Spot, None, None, true);
+        assert_eq!(counted, Some(5));
     }
 
     #[test]
@@ -309,6 +531,38 @@ mod tests {
         let overlay = builder.build(FrozenSameAs::empty(), 42);
         assert_eq!(overlay.len(), 2);
         assert_eq!(overlay.epoch(), 42);
+    }
+
+    #[test]
+    fn routed_flakes_are_visible_only_in_their_graph() {
+        let mut builder = DerivedFactsBuilder::new();
+        builder.push(make_flake(1, 1, 100, 1));
+        builder.push(make_flake(2, 1, 200, 1));
+        builder.push(make_flake(3, 1, 300, 1));
+        let overlay =
+            builder.build_routed(
+                FrozenSameAs::empty(),
+                1,
+                |f| {
+                    if f.s == sid(2) {
+                        5
+                    } else {
+                        0
+                    }
+                },
+            );
+        assert_eq!(overlay.len(), 3);
+        assert_eq!(overlay.graph_ids().collect::<Vec<_>>(), vec![0, 5]);
+        let subjects = |g_id| {
+            let mut out = Vec::new();
+            overlay.for_each_overlay_flake(g_id, IndexType::Spot, None, None, true, 1, &mut |f| {
+                out.push(f.s.clone());
+            });
+            out
+        };
+        assert_eq!(subjects(0), vec![sid(1), sid(3)]);
+        assert_eq!(subjects(5), vec![sid(2)]);
+        assert!(subjects(7).is_empty());
     }
 
     #[test]
@@ -333,5 +587,73 @@ mod tests {
             collected.push(f.clone());
         });
         assert_eq!(collected.len(), 2);
+    }
+
+    /// Every index order must enumerate the same flakes as a fully sorted
+    /// copy would, and range bounds must resolve identically through the
+    /// permutation — the property the four-copies layout used to give for
+    /// free.
+    #[test]
+    fn permuted_orders_match_fully_sorted_copies() {
+        let mut builder = DerivedFactsBuilder::new();
+        // Deliberately unsorted, with repeated predicates and objects so the
+        // non-SPOT orders differ from SPOT.
+        for (s, p, o) in [
+            (3, 2, 5),
+            (1, 2, 9),
+            (2, 1, 5),
+            (1, 1, 7),
+            (3, 1, 9),
+            (2, 2, 7),
+        ] {
+            builder.push(make_flake(s, p, o, 1));
+        }
+        // Every comparator falls through to `t` and then the datatype once
+        // (s, p, o) tie, and flakes that differ only past that point are the
+        // ones a permutation can reorder without any earlier field noticing.
+        // Flakes sharing a `t` and a `dt` never reach those arms, so these
+        // duplicates are what make the tie-break itself part of the test.
+        builder.push(make_flake(1, 1, 7, 9)); // ties (1,1,7) on s/p/o, later t
+        builder.push(make_flake(1, 1, 7, 4)); // and again, between the two
+        builder.push(make_flake_dt(2, 1, 5, 3, 1)); // ties (2,1,5), later dt
+        let overlay = builder.build(FrozenSameAs::empty(), 1);
+        assert_eq!(overlay.len(), 9, "duplicates must survive the build");
+
+        for index in [
+            IndexType::Spot,
+            IndexType::Psot,
+            IndexType::Post,
+            IndexType::Opst,
+        ] {
+            let mut expected: Vec<Flake> = overlay.flakes_spot().to_vec();
+            expected.sort_by(|a, b| index.comparator()(a, b));
+
+            let via_iter: Vec<Flake> = overlay.iter(index).cloned().collect();
+            assert_eq!(via_iter, expected, "iter order for {index:?}");
+
+            let mut via_scan = Vec::new();
+            overlay.for_each_overlay_flake(0, index, None, None, true, i64::MAX, &mut |f| {
+                via_scan.push(f.clone());
+            });
+            assert_eq!(via_scan, expected, "full scan order for {index:?}");
+
+            // A bounded scan (exclusive left = second flake, inclusive right =
+            // fifth flake) must yield exactly the sorted slice (2..=4].
+            let mut bounded = Vec::new();
+            overlay.for_each_overlay_flake(
+                0,
+                index,
+                Some(&expected[1]),
+                Some(&expected[4]),
+                false,
+                i64::MAX,
+                &mut |f| bounded.push(f.clone()),
+            );
+            assert_eq!(
+                bounded,
+                expected[2..=4].to_vec(),
+                "bounded scan for {index:?}"
+            );
+        }
     }
 }

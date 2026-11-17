@@ -4,7 +4,7 @@
 
 use crate::binding::Batch;
 use crate::context::{ExecutionContext, FulltextProviders};
-use crate::dataset::DataSet;
+use crate::dataset::{DataSet, MemberKind};
 use crate::error::Result;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tracing::Instrument;
 
 use super::operator_tree::build_operator_tree;
-use super::reasoning_prep::{compute_derived_facts, schema_hierarchy_with_overlay};
+use super::reasoning_prep::compute_derived_facts;
 use super::rewrite_glue::rewrite_query_patterns;
 
 /// Remove exact duplicate triple patterns inside conjunctive blocks.
@@ -112,8 +112,7 @@ impl ExecutableQuery {
                 .iter()
                 .any(|(_, expr)| expr.contains_function(&target))
             || self.query.grouping.as_ref().is_some_and(|g| {
-                g.aggregation()
-                    .is_some_and(|a| a.binds.iter().any(|(_, e)| e.contains_function(&target)))
+                g.binds().any(|(_, e)| e.contains_function(&target))
                     || g.having().is_some_and(|h| h.contains_function(&target))
             })
     }
@@ -138,12 +137,30 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// The reasoning memory budget `derived_overlay` was materialized under.
+    pub reasoning_memory_limit: usize,
     /// Whether any reasoning/entailment mode was enabled for this query.
     ///
     /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
     /// read by the R2RML rewriter to refuse an exact-class wildcard fusion that
     /// could drop a subclass-entailed subject.
     pub reasoning_active: bool,
+}
+
+/// The request a query is prepared for. Preparing a query that reasons
+/// materializes derived facts; with these, that work is charged to the
+/// request's fuel and stops when the request is cancelled.
+#[derive(Clone, Copy, Default)]
+pub struct QueryRequest<'a> {
+    pub tracker: Option<&'a Tracker>,
+    pub cancellation: Option<&'a QueryCancellation>,
+}
+
+impl QueryRequest<'_> {
+    /// Why the request was cancelled, if it was.
+    pub fn cancelled(&self) -> Option<fluree_db_core::QueryCancellationReason> {
+        self.cancellation.and_then(QueryCancellation::reason)
+    }
 }
 
 /// Inputs that the preparation phase needs to know up front.
@@ -158,6 +175,12 @@ pub struct PrepareConfig<'a> {
     pub binary_store: Option<&'a Arc<BinaryIndexStore>>,
     /// Planning-time decisions captured before prepare runs.
     pub planning: crate::temporal_mode::PlanningContext,
+    /// Whether execution will hand operators a binary store. A dataset that
+    /// spans several ledgers runs without one, so nothing may be rewritten
+    /// into an operator that reads it.
+    pub binary_scans: bool,
+    /// The request being prepared for (see [`QueryRequest`]).
+    pub request: QueryRequest<'a>,
 }
 
 impl<'a> PrepareConfig<'a> {
@@ -171,6 +194,8 @@ impl<'a> PrepareConfig<'a> {
         Self {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current(),
+            binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -186,6 +211,8 @@ impl<'a> PrepareConfig<'a> {
         Self {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::current().with_semantic_elision(allow),
+            binary_scans: true,
+            request: QueryRequest::default(),
         }
     }
 
@@ -199,7 +226,29 @@ impl<'a> PrepareConfig<'a> {
         Self {
             binary_store,
             planning: crate::temporal_mode::PlanningContext::history(),
+            binary_scans: true,
+            request: QueryRequest::default(),
         }
+    }
+
+    /// Execution will give operators no binary store (see
+    /// [`Self::binary_scans`]).
+    pub fn without_binary_scans(mut self) -> Self {
+        self.binary_scans = false;
+        self
+    }
+
+    /// Prepare for a request with this tracker and cancellation handle.
+    pub fn for_request(
+        mut self,
+        tracker: Option<&'a Tracker>,
+        cancellation: Option<&'a QueryCancellation>,
+    ) -> Self {
+        self.request = QueryRequest {
+            tracker,
+            cancellation,
+        };
+        self
     }
 }
 
@@ -243,6 +292,7 @@ pub async fn prepare_execution_with_config(
 ) -> Result<PreparedExecution> {
     let binary_store = config.binary_store;
     let planning = config.planning;
+    let binary_scans = config.binary_scans;
     let span = tracing::debug_span!(
         "query_prepare",
         db_t = db.snapshot.t,
@@ -287,8 +337,12 @@ pub async fn prepare_execution_with_config(
             }
 
             // Step 1: Compute schema hierarchy from overlay
-            let hierarchy =
-                schema_hierarchy_with_overlay(db.snapshot, effective_overlay, db.t).await?;
+            let hierarchy = fluree_db_core::compute_schema_hierarchy_with_overlay(
+                db.snapshot,
+                effective_overlay,
+                db.t,
+            )
+            .await?;
 
             tracing::debug!(
                 rdfs = reasoning.rdfs,
@@ -307,14 +361,13 @@ pub async fn prepare_execution_with_config(
             // closure are visible when scanning g_id=0, and base-overlay
             // novelty remains visible for other graphs.
             let derived_outcome = compute_derived_facts(
-                db.snapshot,
-                db.g_id,
-                effective_overlay,
-                db.t,
+                GraphDbRef::new(db.snapshot, db.g_id, effective_overlay, db.t),
                 &reasoning,
                 query.reasoning.rules_source_g_id,
+                binary_store,
+                config.request,
             )
-            .await;
+            .await?;
 
             // Step 4: Build ontology for OWL2-QL mode (if enabled)
             let reasoning_overlay_for_ontology: Option<ReasoningOverlay<'_>> = derived_outcome
@@ -421,10 +474,35 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            let rewritten_patterns =
-                crate::geo_rewrite::rewrite_geo_patterns(rewritten_patterns, &|iri: &str| {
-                    db.snapshot.encode_iri(iri)
-                });
+            // The GeoSearch operator reads the binary index, so without one
+            // covering `to_t` (a ledger not yet indexed, a time before the
+            // index's base) the patterns stay as written and evaluate as such.
+            // The operator reads the store its execution context takes from
+            // the snapshot, which a caller need not have passed in here,
+            // unless execution runs with none (a multi-ledger dataset).
+            let geo_index_covers = binary_scans
+                && binary_store
+                    .cloned()
+                    .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
+                    .is_some_and(|store| db.t >= store.base_t());
+            let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
+                rewritten_patterns,
+                &|iri: &str| db.snapshot.encode_iri(iri),
+                geo_index_covers,
+            );
+
+            // SPARQL's view of RDF lists (`crate::list_view`), for a ledger
+            // that may hold list members. History reads keep the stored rows.
+            let list_view = if query.query.rdf_list_view && !planning.is_history() {
+                crate::list_view::view_for(db.snapshot, db.overlay, binary_store)?
+            } else {
+                None
+            };
+            let encode = |iri: &str| db.snapshot.encode_iri(iri);
+            let rewritten_patterns = match &list_view {
+                Some(view) => crate::list_view::rewrite_patterns(rewritten_patterns, view, &encode),
+                None => rewritten_patterns,
+            };
 
             let before_dedup = rewritten_patterns.len();
             let rewritten_patterns = dedup_exact_triples(rewritten_patterns);
@@ -446,7 +524,13 @@ pub async fn prepare_execution_with_config(
                 );
             }
 
-            query.query.with_patterns(rewritten_patterns)
+            let mut rewritten = query.query.with_patterns(rewritten_patterns);
+            if let Some(view) = &list_view {
+                // The WHERE is rewritten above; this reaches the `EXISTS` of
+                // the grouping and ordering expressions.
+                crate::list_view::rewrite_modifiers_of(&mut rewritten, view, &encode);
+            }
+            rewritten
         };
 
         // ---- plan: build operator tree from rewritten query ----
@@ -466,10 +550,33 @@ pub async fn prepare_execution_with_config(
             build_operator_tree(&rewritten_query, stats_view, &planning)?
         };
 
+        // A CONSTRUCT writes the list entries its template restates
+        // (`crate::list_entries`), for a ledger that may hold list members
+        // and a template triple whose predicate may hold them.
+        let operator = match &rewritten_query.output {
+            crate::ir::QueryOutput::Construct(template)
+                if template.writes_list_entries()
+                    && !rewritten_query.rdf_list_view
+                    && !planning.is_history() =>
+            {
+                match crate::list_view::view_for(db.snapshot, db.overlay, binary_store)? {
+                    Some(view) => crate::list_entries::ListEntriesOperator::over(
+                        operator,
+                        template,
+                        view,
+                        &|iri| db.snapshot.encode_iri(iri),
+                    ),
+                    None => operator,
+                }
+            }
+            _ => operator,
+        };
+
         Ok(PreparedExecution {
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_memory_limit: derived_outcome.memory_limit_bytes,
             reasoning_active: reasoning.has_any_enabled(),
         })
     }
@@ -648,6 +755,9 @@ pub struct ContextConfig<'a, 'b> {
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
     /// Access the raw PolicyContext via `enforcer.policy()` if needed.
     pub policy_enforcer: Option<Arc<crate::policy::QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is (see
+    /// [`ExecutionContext::policy_source`]).
+    pub policy_source: Option<Arc<str>>,
     pub dataset: Option<&'a DataSet<'a>>,
     pub r2rml: Option<(
         &'b dyn crate::r2rml::R2rmlProvider,
@@ -682,12 +792,20 @@ pub struct ContextConfig<'a, 'b> {
     /// `@vocab` prefix a Cypher query was lowered against (from
     /// `Query::cypher_vocab`); see [`ExecutionContext::cypher_vocab`].
     pub cypher_vocab: Option<Arc<str>>,
+    /// What `NOW()` and `TODAY()` return (see
+    /// [`ExecutionContext::evaluation_time`]).
+    pub evaluation_time: Option<fluree_db_core::temporal::DateTime>,
     /// When true, the injected true-wildcard crawl scan renders R2RML
     /// `RefObjectMap` objects by templating the parent IRI from the child row's
     /// FK columns (no parent-table scan, dangling-FK relaxed). Default `false`;
     /// set only by the graph-source browse-crawl path. See
     /// [`ExecutionContext::trust_fk_refs`].
     pub trust_fk_refs: bool,
+    /// Every graph-source scan emits a fixed row order; set by a caller that
+    /// slices the answer itself. See [`ExecutionContext::deterministic_scans`].
+    pub deterministic_scans: bool,
+    /// See [`ExecutionContext::path_pair_limit`].
+    pub path_pair_limit: Option<usize>,
     /// Binary columnar index store for `BinaryScanOperator`.
     ///
     /// This is the explicit path — separate from `LedgerSnapshot.range_provider` which
@@ -710,6 +828,10 @@ pub struct ContextConfig<'a, 'b> {
     pub english_lang_id: Option<u16>,
     /// Remote SERVICE executor for `fluree:remote:` endpoints.
     pub remote_service: Option<&'b dyn crate::remote_service::RemoteServiceExecutor>,
+    /// What `db` reads when there is no dataset, if the caller knows (see
+    /// [`MemberKind`]); dataset members carry their own
+    /// [`GraphRef::kind`](crate::dataset::GraphRef::kind).
+    pub primary_kind: MemberKind,
 }
 
 /// Execute a prepared query with configurable context options
@@ -759,6 +881,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
             derived_facts: diag.facts_derived as u64,
             iterations: diag.iterations as u64,
             duration_ms: diag.duration.as_millis() as u64,
+            capped_rules: diag.capped_rules.clone(),
+            pending_rules: diag.pending_rules.clone(),
+            evaluation_time: diag.evaluation_time.clone(),
         });
     }
 
@@ -774,15 +899,20 @@ async fn execute_prepared_into<'a, S: BatchSink>(
 
     // Dataset execution scans through per-graph `GraphRef`s, not the
     // top-level context overlay — splice the derived-facts overlay into
-    // every ref matching the primary execution view, or datalog / OWL2-RL
-    // derived facts are invisible to dataset queries.
+    // every ref matching the primary execution view, and every named graph
+    // of the same ledger a rule derived into, or datalog / OWL2-RL derived
+    // facts are invisible to dataset queries.
     let patched_dataset = match (config.dataset, reasoning_overlay.as_ref()) {
-        (Some(ds), Some(_)) => Some(ds.with_overlay_for_graph(
-            db.snapshot.ledger_id.as_str(),
-            db.g_id,
-            db.t,
-            effective_overlay,
-        )),
+        (Some(ds), Some(reasoning)) => {
+            let mut graphs = vec![db.g_id];
+            graphs.extend(reasoning.derived().graph_ids().filter(|g| *g != db.g_id));
+            Some(ds.with_overlay_for_graphs(
+                db.snapshot.ledger_id.as_str(),
+                &graphs,
+                db.t,
+                effective_overlay,
+            ))
+        }
         _ => None,
     };
 
@@ -824,6 +954,15 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if prepared.reasoning_active {
         ctx = ctx.with_reasoning_active(true);
     }
+    if let Some(derived) = prepared.derived_overlay.as_ref() {
+        if let Some(ops) = crate::reasoning_ops::ReasoningOpsHandle::attach(
+            derived,
+            prepared.reasoning_memory_limit,
+            ctx.overlay().content_version(),
+        ) {
+            ctx = ctx.with_reasoning_ops(ops);
+        }
+    }
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
@@ -847,6 +986,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);
     }
+    ctx.policy_source = config.policy_source;
     if let Some(dataset) = patched_dataset.as_ref().or(config.dataset) {
         ctx = ctx.with_dataset(dataset);
     }
@@ -865,11 +1005,18 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(vocab) = config.cypher_vocab.clone() {
         ctx.cypher_vocab = Some(vocab);
     }
+    ctx.evaluation_time = config.evaluation_time.clone();
     if config.include_system_facts {
         ctx = ctx.with_include_system_facts(true);
     }
     if config.trust_fk_refs {
         ctx = ctx.with_trust_fk_refs(true);
+    }
+    if config.deterministic_scans {
+        ctx = ctx.with_deterministic_scans(true);
+    }
+    if let Some(limit) = config.path_pair_limit {
+        ctx = ctx.with_path_pair_limit(limit);
     }
     if let Some(store) = config.binary_store {
         ctx = ctx.with_binary_store(store, config.binary_g_id);
@@ -888,37 +1035,45 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx = ctx.with_remote_service(executor);
     }
 
-    // Precompute which graphs in the dataset are R2RML-backed.
-    if let (Some(r2rml_provider), Some(dataset)) = (ctx.r2rml_provider, ctx.dataset) {
+    // Precompute which of the query's graphs are R2RML-backed: the members of
+    // a dataset the query named, or otherwise the primary snapshot (a
+    // single-source graph source query; a union default graph's members are
+    // the primary ledger's own graphs). The provider is asked only about
+    // graphs whose kind leaves it open; a native graph is never looked up, and
+    // a lookup that fails fails the query rather than reading a graph source
+    // as an empty graph.
+    ctx.primary_kind = config.primary_kind;
+    if let Some(provider) = ctx.r2rml_provider {
         let mut r2rml_ids = std::collections::HashSet::new();
-        for graph_ref in dataset.default_graphs() {
-            let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
-            if is_r2rml {
-                r2rml_ids.insert(Arc::clone(&graph_ref.ledger_id));
+        if let Some(dataset) = ctx.explicit_dataset() {
+            for graph_ref in dataset.default_graphs() {
+                if graph_ref.kind != MemberKind::Native
+                    && provider.has_r2rml_mapping(&graph_ref.ledger_id).await?
+                {
+                    r2rml_ids.insert(Arc::clone(&graph_ref.ledger_id));
+                }
             }
-        }
-        for (iri, graph_ref) in dataset.named_graphs_iter() {
-            let is_r2rml = r2rml_provider.has_r2rml_mapping(&graph_ref.ledger_id).await;
-            if is_r2rml {
-                // Insert the graph IRI (not ledger_id) since graph.rs
-                // checks r2rml_graph_ids against the GRAPH pattern IRI.
-                r2rml_ids.insert(Arc::clone(iri));
+            for (iri, graph_ref) in dataset.named_graphs_iter() {
+                if graph_ref.kind != MemberKind::Native
+                    && provider.has_r2rml_mapping(&graph_ref.ledger_id).await?
+                {
+                    // Insert the graph IRI (not ledger_id) since graph.rs
+                    // checks r2rml_graph_ids against the GRAPH pattern IRI.
+                    r2rml_ids.insert(Arc::clone(iri));
+                }
             }
+        } else if config.primary_kind != MemberKind::Native
+            && provider.has_r2rml_mapping(&db.snapshot.ledger_id).await?
+        {
+            r2rml_ids.insert(Arc::from(db.snapshot.ledger_id.as_str()));
         }
         ctx.r2rml_graph_ids = r2rml_ids;
     }
-    // Also check the primary snapshot's ledger_id (for single-source graph source queries)
-    if let Some(provider) = ctx.r2rml_provider {
-        if ctx.dataset.is_none() {
-            let is_r2rml = provider.has_r2rml_mapping(&db.snapshot.ledger_id).await;
-            if is_r2rml {
-                ctx.r2rml_graph_ids
-                    .insert(Arc::from(db.snapshot.ledger_id.as_str()));
-            }
-        }
-    }
 
-    run_operator_streaming(prepared.operator, &ctx, sink).await
+    // A sub-query plans at run time; name the variables in its plan errors.
+    run_operator_streaming(prepared.operator, &ctx, sink)
+        .await
+        .map_err(|e| e.name_variables(vars))
 }
 
 /// Prepare and execute a query in a single call.
@@ -934,6 +1089,17 @@ pub async fn execute<'a>(
     query: &ExecutableQuery,
     config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
-    let prepared = prepare_execution(db, query).await?;
+    // A `>= 2`-member default graph is a set (SPARQL §13.2); plan for it as
+    // the dataset paths do, so the members' scans deduplicate on full rows.
+    let mut prepare_config =
+        PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
+    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
+        config
+            .dataset
+            .is_some_and(|ds| ds.default_graphs().len() >= 2),
+    );
+    let prepared = prepare_execution_with_config(db, query, &prepare_config)
+        .await
+        .map_err(|e| e.name_variables(vars))?;
     execute_prepared(db, vars, prepared, config).await
 }

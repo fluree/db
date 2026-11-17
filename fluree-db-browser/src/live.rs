@@ -666,6 +666,9 @@ mod tests {
     use super::*;
     use fluree_db_api::FlureeBuilder;
 
+    /// Each delivered cycle's `(changed, unchanged)` sub ids.
+    type SeenCycles = Arc<Mutex<Vec<(Vec<SubId>, Vec<SubId>)>>>;
+
     const LEDGER: &str = "live/test:main";
 
     async fn seeded_fluree() -> Fluree {
@@ -997,7 +1000,7 @@ mod tests {
         assert_eq!(primed.changed.len(), 1, "the solo prime computed a result");
 
         // A listener attaches, then a head change drives a cycle.
-        let seen: Arc<Mutex<Vec<(Vec<SubId>, Vec<SubId>)>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen: SeenCycles = Arc::new(Mutex::new(Vec::new()));
         {
             let seen = Arc::clone(&seen);
             live.on_outcome(move |o| {

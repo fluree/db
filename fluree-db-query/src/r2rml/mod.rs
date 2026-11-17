@@ -23,19 +23,27 @@
 
 mod fused_aggregate;
 mod operator;
+pub(crate) mod policy;
 mod provider;
 mod rewrite;
+pub mod set_semantics;
+pub mod sql_lane;
 
+pub use fluree_db_tabular::plan;
 pub use fused_aggregate::{detect_fused_r2rml_aggregate, FusedR2rmlAggregateOperator};
 pub use operator::{R2rmlParentMemo, R2rmlScanOperator};
 pub use provider::{
-    ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant, R2rmlProvider, R2rmlTableProvider,
-    ScanCmpOp, ScanFilter, ScanTopK, ScanValue, TableWatermark,
+    effective_table_keys, BatchSchema, ColumnBatchStream, NoOpR2rmlProvider, ObjectConstant,
+    PushdownCapabilities, R2rmlProvider, R2rmlTableProvider, RelPlan, RelSource, ScanCmpOp,
+    ScanFileCounts, ScanFilter, ScanOrder, ScanTopK, ScanValue, SourceTime, TableWatermark,
+    TermOrder,
 };
 pub use rewrite::{
     convert_triple_to_r2rml, r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml,
-    unsupported_outside_graph_scopes, unsupported_subscope_error, R2rmlRewriteResult,
+    rewrite_patterns_for_r2rml_source, unsupported_outside_graph_scopes,
+    unsupported_query_modifiers, unsupported_subscope_error, R2rmlRewriteResult,
 };
+pub use sql_lane::{SqlBlockOperator, SQL_BLOCK_PUSHDOWN_SITE};
 
 /// Read an on/off environment switch that defaults to **on**. Only `0`, `false`,
 /// `off`, or `no` (trimmed, case-insensitive) disable it — the single falsy
@@ -145,9 +153,10 @@ pub(crate) fn optional_budget_enabled() -> bool {
 }
 
 /// D7 (Cluster E / E1): whether a variable-predicate R2RML "crawl wildcard" scan
-/// with NO pruning key (no bound subject, no `class_filter`, no `class_prune_hint`,
-/// no pinned `triples_map_iri`) — which resolves to EVERY TriplesMap, i.e. a
-/// full-source scan — is cost-estimated as [`crate::planner`]'s `FULL_SCAN` so
+/// with NO pruning key (no bound subject, no `class_filter`, no pinned
+/// `triples_map_iri`; a `class_prune_hint` narrows the maps but not the rows
+/// read, so it does not count) — a full-source scan — is cost-estimated as
+/// [`crate::planner`]'s `FULL_SCAN` so
 /// `reorder_patterns` places it LAST among the query's co-subject R2RML scans.
 /// That makes the wildcard the LIMIT-budgeted, correlated OUTER scan driven by the
 /// selective INNER scan (the property-scoped browse crawl `{?s <prop> ?v}` +
@@ -176,12 +185,16 @@ pub(crate) fn topk_asc_enabled() -> bool {
     *ENABLED.get_or_init(|| env_switch_enabled("FLUREE_R2RML_TOPK_ASC"))
 }
 
-/// Item 7 (F-AUD-5): the maximum set size lowered to `Expression::In`. A larger
-/// set declines the pushdown (stays with the in-engine FILTER / VALUES join) so
-/// manifest evaluation stays cheap — every member is bound-checked against every
-/// candidate file, i.e. O(files × members). Default 64; override with
-/// `FLUREE_R2RML_IN_PUSHDOWN_MAX=<n>` (a non-numeric or zero value falls back to
-/// the default). Read once (process-wide).
+/// Item 7 (F-AUD-5): the largest set a scan push carries as an
+/// `Expression::In` — a `FILTER … IN`, a single-var `VALUES`, the subject keys
+/// of a child window, or a parent probe's join keys (#2239). A larger set
+/// declines the push (the in-engine FILTER / `VALUES` / join stays the
+/// authority). The reader applies a set row by row with one hashed lookup per
+/// row, and pruning decodes a file's bounds once per set, so the bound that
+/// matters is the set's size itself: every file task of a filtered scan holds
+/// it. Default 1024; override with `FLUREE_R2RML_IN_PUSHDOWN_MAX=<n>` (a
+/// non-numeric or zero value falls back to the default). Read once
+/// (process-wide).
 pub(crate) fn in_pushdown_max() -> usize {
     static MAX: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAX.get_or_init(|| {
@@ -189,6 +202,6 @@ pub(crate) fn in_pushdown_max() -> usize {
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
             .filter(|n| *n > 0)
-            .unwrap_or(64)
+            .unwrap_or(1024)
     })
 }

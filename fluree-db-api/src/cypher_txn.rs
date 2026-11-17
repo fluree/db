@@ -46,7 +46,8 @@ use crate::{
     CommitReceipt, Fluree, GovernanceOptions, IndexingStatus, Result, Tracker, TrackingOptions,
     TransactResultRef,
 };
-use fluree_db_core::{ContentId, ContentKind};
+use fluree_db_core::ContentId;
+use fluree_db_core::LedgerId;
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{CasResult, RefKind, RefValue};
 use fluree_db_transact::{CommitOpts, TransactError};
@@ -54,12 +55,13 @@ use fluree_db_transact::{CommitOpts, TransactError};
 /// An open interactive Cypher transaction. Create with
 /// [`Fluree::begin_cypher_transaction`]; drop to roll back.
 pub struct CypherTransaction {
-    ledger_id: String,
+    ledger_id: LedgerId,
     /// `t` of the pinned base — the commit-time precondition.
     base_t: i64,
-    /// Head ref of the pinned base (`None` on an empty ledger) — the
-    /// `expected` side of the publish CAS.
-    base_head: Option<RefValue>,
+    /// Head ref of the pinned base — the `expected` side of the publish CAS.
+    /// A ledger with no commit yet has the unborn ref (`id: None`, `t: 0`)
+    /// that `create_ledger` publishes, as the autocommit path expects too.
+    base_head: RefValue,
     /// The transaction's private state: base + every staged statement.
     state: LedgerState,
     /// Built-but-unpublished commits, in statement order.
@@ -99,7 +101,7 @@ pub struct CypherTxnWriteOutcome {
 }
 
 impl CypherTransaction {
-    pub fn ledger_id(&self) -> &str {
+    pub fn ledger_id(&self) -> &LedgerId {
         &self.ledger_id
     }
 
@@ -130,12 +132,14 @@ impl Fluree {
     ) -> Result<CypherTransaction> {
         let handle = self.ledger_cached(ledger_id).await?;
         let state = handle.snapshot().await.to_ledger_state();
-        let base_head = state.head_commit_id.clone().map(|cid| RefValue {
-            id: Some(cid),
+        let base_head = RefValue {
+            id: state.head_commit_id.clone(),
             t: state.t(),
-        });
+        };
         Ok(CypherTransaction {
-            ledger_id: ledger_id.to_string(),
+            // The id the handle resolved to, not the caller's spelling: the
+            // commit derives storage paths and cache keys from it.
+            ledger_id: handle.id().clone(),
             base_t: state.t(),
             base_head,
             state,
@@ -197,7 +201,7 @@ impl Fluree {
                 // policy-visible data only.
                 let probe = GraphDb::from_ledger_state(&txn.state);
                 let probe = if txn.governance.has_any_policy_inputs() {
-                    self.wrap_policy(probe, &txn.governance, None).await?
+                    self.wrap_policy(probe, &txn.governance).await?
                 } else {
                     probe
                 };
@@ -241,6 +245,7 @@ impl Fluree {
                 Some(&index_config),
                 policy.as_ref(),
                 Some(&tracker),
+                None,
             )
             .await?
         } else {
@@ -302,13 +307,16 @@ impl Fluree {
                 policy.as_ref(),
                 Some(&tracker),
                 None,
+                None,
             )
             .await?;
 
+        // The rows format against the transaction's state, not the virtual one.
+        let return_result = outcome.returned.map(|answered| answered.result);
         let flake_count = self
             .pend_stage_result(txn, outcome.stage_result, &index_config)
             .await?;
-        let return_table = match outcome.return_result {
+        let return_table = match return_result {
             Some(qr) => {
                 let view = self.cypher_transaction_view(txn).await?;
                 Some(qr.to_cypher_typed_table(&view).await.map_err(|e| {
@@ -339,6 +347,7 @@ impl Fluree {
             txn_meta,
             graph_delta,
             sync_graph: _,
+            scope: _,
         } = stage_result;
 
         if !view.has_staged() {
@@ -349,7 +358,7 @@ impl Fluree {
 
         let mut commit_opts = CommitOpts::default()
             .with_txn_meta(txn_meta)
-            .with_graph_delta(graph_delta.into_iter().collect());
+            .with_graph_iris(graph_delta.into_values());
         if let Some(identity) = &txn.governance.identity {
             commit_opts = commit_opts.identity(identity.clone());
         }
@@ -431,16 +440,10 @@ impl Fluree {
         if txn.pending.is_empty() {
             // Nothing published, head unchanged — mirror the autocommit no-op
             // receipt exactly. A `create_ledger` ledger has a nameservice
-            // record but no genesis commit, so `base_head` is legitimately
-            // `None` here; that must stay a successful no-op, not an error.
+            // record but no genesis commit, so `base_head` legitimately has
+            // no id here; that must stay a successful no-op, not an error.
             return Ok(TransactResultRef {
-                receipt: CommitReceipt {
-                    commit_id: ContentId::new(ContentKind::Commit, &[]),
-                    t: txn.base_t,
-                    flake_count: 0,
-                    assert_count: 0,
-                    retract_count: 0,
-                },
+                receipt: CommitReceipt::no_op(txn.base_t),
                 indexing: IndexingStatus {
                     enabled: self.indexing_mode.is_enabled(),
                     needed: false,
@@ -456,8 +459,7 @@ impl Fluree {
         let guard = handle.lock_for_write().await;
 
         let head = guard.state();
-        let base_head_id = txn.base_head.as_ref().and_then(|r| r.id.clone());
-        if head.t() != txn.base_t || head.head_commit_id != base_head_id {
+        if head.t() != txn.base_t || head.head_commit_id != txn.base_head.id {
             return Err(ApiError::Transact(TransactError::CommitConflict {
                 expected_t: txn.base_t,
                 head_t: head.t(),
@@ -484,7 +486,7 @@ impl Fluree {
             .compare_and_set_ref(
                 &txn.ledger_id,
                 RefKind::CommitHead,
-                txn.base_head.as_ref(),
+                Some(&txn.base_head),
                 &new_head,
             )
             .await

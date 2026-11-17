@@ -51,7 +51,7 @@ impl TermType {
 ///
 /// Represents a `rr:predicateObjectMap` containing a predicate map
 /// and an object map that together generate predicate-object pairs.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PredicateObjectMap {
     /// The predicate map (usually a constant IRI)
     pub predicate_map: PredicateMap,
@@ -63,7 +63,7 @@ pub struct PredicateObjectMap {
 ///
 /// Defines how predicates are generated. In most R2RML mappings,
 /// predicates are constant IRIs specified via `rr:predicate`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PredicateMap {
     /// `rr:predicate` - a constant predicate IRI
     Constant(String),
@@ -124,7 +124,7 @@ impl PredicateMap {
 /// - A constant value (fixed IRI or literal)
 /// - A template (interpolated IRI or literal)
 /// - A reference to another TriplesMap (for joins)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ObjectMap {
     /// `rr:column` - generate object from column value
     Column {
@@ -163,7 +163,7 @@ pub enum ObjectMap {
 }
 
 /// Constant value in an object map
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum ConstantValue {
     /// Constant IRI
     Iri(String),

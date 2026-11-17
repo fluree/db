@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use fluree_db_iceberg::auth::NoAuth;
+use fluree_db_iceberg::auth::{NoAuth, SendCatalogAuth};
 use fluree_db_sql::{LogicalSource, SqlGsConfig, TrinoClient};
 use futures::StreamExt;
 use serde_json::json;
@@ -291,4 +291,132 @@ async fn presto_header_family_is_selectable() {
     let c = TrinoClient::new(&cfg, Arc::new(NoAuth)).unwrap();
     let (_, b) = c.execute_collect("SELECT 1").await.unwrap();
     assert_eq!(b[0].column(0).unwrap().get_i32(0), Some(1));
+}
+
+/// Every header the auth provider sends reaches the endpoint, not just
+/// `Authorization`: a Google identity's quota project rides along, and the
+/// provider's `Authorization` is the one sent.
+#[tokio::test]
+async fn every_auth_header_reaches_the_statement_endpoint() {
+    #[derive(Debug)]
+    struct WithQuotaProject;
+    #[async_trait::async_trait]
+    impl SendCatalogAuth for WithQuotaProject {
+        async fn request_headers(
+            &self,
+            _url: &str,
+        ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("authorization", "Bearer ya29.minted".parse().unwrap());
+            headers.insert("x-goog-user-project", "lake-project".parse().unwrap());
+            Ok(headers)
+        }
+        async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .and(header("Authorization", "Bearer ya29.minted"))
+        .and(header("x-goog-user-project", "lake-project"))
+        .and(header("X-Trino-User", "fluree"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "id": "q", "columns": [{"name": "x", "type": "integer"}], "data": [[1]], "stats": {"state": "FINISHED"}
+        })))
+        .mount(&server)
+        .await;
+    let c = TrinoClient::new(&SqlGsConfig::new(server.uri()), Arc::new(WithQuotaProject)).unwrap();
+    let (_, b) = c.execute_collect("SELECT 1").await.unwrap();
+    assert_eq!(b[0].column(0).unwrap().get_i32(0), Some(1));
+}
+
+/// An identity refusal from the endpoint's auth provider stays typed, so the
+/// API reports it with the same code as an Iceberg source.
+#[tokio::test]
+async fn an_identity_refusal_from_the_auth_provider_stays_typed() {
+    #[derive(Debug)]
+    struct Refused;
+    #[async_trait::async_trait]
+    impl SendCatalogAuth for Refused {
+        async fn request_headers(
+            &self,
+            _url: &str,
+        ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+            Err(fluree_db_iceberg::IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Sts,
+                status: Some(403),
+                reason: Some("PERMISSION_DENIED".to_string()),
+            })
+        }
+        async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    let c = TrinoClient::new(&SqlGsConfig::new(server.uri()), Arc::new(Refused)).unwrap();
+    match c.execute_collect("SELECT 1").await {
+        Err(fluree_db_sql::SqlError::Identity(
+            fluree_db_iceberg::IcebergError::GoogleTokenExchange { status, .. },
+        )) => assert_eq!(status, Some(403)),
+        other => panic!("expected a typed identity refusal, got {other:?}"),
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "nothing is sent without the provider's headers"
+    );
+}
+
+/// Every request names its own URL to the auth provider (which decides where
+/// its credential may go): the statement, and each page at the `nextUri` the
+/// endpoint chose.
+#[tokio::test]
+async fn every_request_names_its_own_url_to_the_auth_provider() {
+    #[derive(Debug, Default)]
+    struct Recording(std::sync::Mutex<Vec<String>>);
+    #[async_trait::async_trait]
+    impl SendCatalogAuth for Recording {
+        async fn request_headers(
+            &self,
+            url: &str,
+        ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+            self.0.lock().unwrap().push(url.to_string());
+            Ok(reqwest::header::HeaderMap::new())
+        }
+        async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+            Ok(())
+        }
+    }
+    let server = MockServer::start().await;
+    let base = server.uri();
+    Mock::given(method("POST"))
+        .and(path("/v1/statement"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            "q",
+            Some(format!("{base}/v1/statement/q/1")),
+            true,
+            json!([[1, "a"]]),
+        )))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/statement/q/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(page(
+            "q",
+            None,
+            false,
+            json!([[2, "b"]]),
+        )))
+        .mount(&server)
+        .await;
+    let auth = Arc::new(Recording::default());
+    let c = TrinoClient::new(&SqlGsConfig::new(server.uri()), auth.clone()).unwrap();
+    c.execute_collect("SELECT 1").await.unwrap();
+    assert_eq!(
+        *auth.0.lock().unwrap(),
+        vec![
+            format!("{base}/v1/statement"),
+            format!("{base}/v1/statement/q/1")
+        ]
+    );
 }

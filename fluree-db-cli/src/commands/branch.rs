@@ -76,6 +76,7 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             branch,
             strategy,
             preview,
+            no_validate,
             json,
             ledger,
             remote,
@@ -87,6 +88,7 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                 branch.as_deref(),
                 &strategy,
                 preview,
+                !no_validate,
                 json,
                 ledger.as_deref(),
                 dirs,
@@ -107,6 +109,7 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
             max_changes,
             stat,
             changes_after,
+            no_validate,
             json,
             ledger,
             remote,
@@ -127,6 +130,7 @@ pub async fn run(action: BranchAction, dirs: &FlureeDir, direct: bool) -> CliRes
                     max_changes,
                     stat,
                     changes_after,
+                    include_validation: !no_validate,
                     json,
                 },
                 ledger.as_deref(),
@@ -189,13 +193,8 @@ async fn run_create(
         }
         LedgerMode::Local { fluree, alias } => {
             let (ledger_name, _) = split_ledger_id(&alias)?;
-            let at_commit = match at {
-                Some(s) => Some(fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?),
-                None => None,
-            };
-            let record = fluree
-                .create_branch(&ledger_name, name, from, at_commit)
-                .await?;
+            let at = at.map(super::query::parse_time_spec).transpose()?;
+            let record = fluree.create_branch(&ledger_name, name, from, at).await?;
 
             let source = record.source_branch.as_deref().unwrap_or("main");
             let t = record.commit_t;
@@ -677,6 +676,7 @@ async fn run_revert(
     branch: Option<&str>,
     strategy: &str,
     preview: bool,
+    include_validation: bool,
     json: bool,
     ledger: Option<&str>,
     dirs: &FlureeDir,
@@ -725,7 +725,13 @@ async fn run_revert(
 
         if preview {
             let result = client
-                .revert_preview(&ledger_name, branch_name, &payload, Some(strategy))
+                .revert_preview(
+                    &ledger_name,
+                    branch_name,
+                    &payload,
+                    Some(strategy),
+                    (!include_validation).then_some(false),
+                )
                 .await?;
             context::persist_refreshed_tokens(&client, remote_name, dirs).await;
             print_revert_preview_json(&result, json)?;
@@ -765,7 +771,13 @@ async fn run_revert(
             let branch_name = branch.unwrap_or(&default_branch);
             if preview {
                 let result = client
-                    .revert_preview(&ledger_name, branch_name, &payload, Some(strategy))
+                    .revert_preview(
+                        &ledger_name,
+                        branch_name,
+                        &payload,
+                        Some(strategy),
+                        (!include_validation).then_some(false),
+                    )
                     .await?;
                 context::persist_refreshed_tokens(&client, &remote_name, dirs).await;
                 print_revert_preview_json(&result, json)?;
@@ -791,7 +803,7 @@ async fn run_revert(
                                 &ledger_name,
                                 branch_name,
                                 commit_ref,
-                                preview_opts(conflict_strategy),
+                                preview_opts(conflict_strategy, include_validation),
                             )
                             .await?
                     }
@@ -805,7 +817,7 @@ async fn run_revert(
                                 &ledger_name,
                                 branch_name,
                                 refs,
-                                preview_opts(conflict_strategy),
+                                preview_opts(conflict_strategy, include_validation),
                             )
                             .await?
                     }
@@ -820,7 +832,7 @@ async fn run_revert(
                                 branch_name,
                                 from_ref,
                                 to_ref,
-                                preview_opts(conflict_strategy),
+                                preview_opts(conflict_strategy, include_validation),
                             )
                             .await?
                     }
@@ -869,9 +881,13 @@ async fn run_revert(
     Ok(())
 }
 
-fn preview_opts(strategy: fluree_db_api::ConflictStrategy) -> fluree_db_api::RevertPreviewOpts {
+fn preview_opts(
+    strategy: fluree_db_api::ConflictStrategy,
+    include_validation: bool,
+) -> fluree_db_api::RevertPreviewOpts {
     fluree_db_api::RevertPreviewOpts {
         conflict_strategy: strategy,
+        include_validation,
         ..Default::default()
     }
 }
@@ -890,6 +906,14 @@ fn print_revert_preview_local(
     println!(
         "Would revert {} commit(s) on '{}' ({} conflicts, revertable={}).",
         preview.reverted_count, preview.branch, preview.conflicts.count, preview.revertable,
+    );
+    print_validation(
+        preview
+            .validation
+            .as_ref()
+            .map(|v| (v.conforms, v.report.as_deref())),
+        preview.revertable,
+        "revertable",
     );
     if preview.truncated {
         println!(
@@ -930,10 +954,28 @@ fn print_revert_preview_json(result: &serde_json::Value, as_json: bool) -> CliRe
     println!(
         "Would revert {reverted_count} commit(s) on '{branch}' ({conflict_count} conflicts, revertable={revertable}).",
     );
+    let validation = result.get("validation").map(|v| {
+        (
+            v.get("conforms")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            v.get("report").and_then(serde_json::Value::as_str),
+        )
+    });
+    print_validation(validation, revertable, "revertable");
     Ok(())
 }
 
 fn print_revert_report_local(report: &fluree_db_api::RevertReport) {
+    if !report.wrote_commit {
+        println!(
+            "Nothing to revert on '{}': the {} commit(s) selected have no net effect, so HEAD stays at t={}.",
+            report.branch,
+            report.reverted_commits.len(),
+            report.new_head_t,
+        );
+        return;
+    }
     println!(
         "Reverted {} commit(s) on '{}' (t={}, {} conflicts, strategy={}).",
         report.reverted_commits.len(),
@@ -966,6 +1008,17 @@ fn print_revert_result(result: &serde_json::Value) -> CliResult<()> {
         .and_then(serde_json::Value::as_array)
         .map_or(0, Vec::len);
 
+    // Older servers omit the field; they only ever reported written commits.
+    let wrote_commit = result
+        .get("wrote_commit")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true);
+    if !wrote_commit {
+        println!(
+            "Nothing to revert on '{branch}': the {reverted_count} commit(s) selected have no net effect, so HEAD stays at t={new_t}.",
+        );
+        return Ok(());
+    }
     println!(
         "Reverted {reverted_count} commit(s) on '{branch}' (t={new_t}, {conflict_count} conflicts, strategy={strategy}).",
     );
@@ -1049,6 +1102,8 @@ struct DiffOpts {
     max_changes: Option<usize>,
     stat: bool,
     changes_after: Option<String>,
+    /// SHACL validation of the merged state (on by default; `--no-validate`).
+    include_validation: bool,
     json: bool,
 }
 
@@ -1098,6 +1153,7 @@ async fn run_diff(
     // convention maps to `None` locally and to "omit the param" remotely
     // (the server always enforces its own cap).
     let include_changes = opts.include_changes;
+    let include_validation = opts.include_validation;
     let max_changes = if opts.stat {
         Some(0)
     } else {
@@ -1125,6 +1181,7 @@ async fn run_diff(
                 include_changes.then_some(true),
                 max_changes.filter(|_| include_changes),
                 opts.changes_after.as_deref(),
+                (!include_validation).then_some(false),
             )
             .await?;
 
@@ -1168,6 +1225,7 @@ async fn run_diff(
                     include_changes.then_some(true),
                     max_changes.filter(|_| include_changes),
                     opts.changes_after.as_deref(),
+                    (!include_validation).then_some(false),
                 )
                 .await?;
 
@@ -1190,6 +1248,7 @@ async fn run_diff(
                 include_changes,
                 max_changes,
                 changes_after_subject: opts.changes_after.clone(),
+                include_validation,
             };
 
             let preview = fluree
@@ -1283,6 +1342,14 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
         }
     }
 
+    print_validation(
+        p.validation
+            .as_ref()
+            .map(|v| (v.conforms, v.report.as_deref())),
+        p.mergeable,
+        "mergeable",
+    );
+
     if let Some(ch) = &p.changes {
         let shown: usize = ch
             .entries
@@ -1317,6 +1384,23 @@ fn print_preview_local(p: &fluree_db_api::MergePreview) {
             println!("  next page: --changes-after '{cursor}'");
         }
     }
+}
+
+/// The SHACL outcome and the verdict that depends on it, rendered the same
+/// way by every printer so they cannot drift apart. The verdict is
+/// `mergeable` for a merge preview and `revertable` for a revert preview.
+fn print_validation(validation: Option<(bool, Option<&str>)>, verdict: bool, label: &str) {
+    if let Some((conforms, report)) = validation {
+        if conforms {
+            println!("validation: conforms");
+        } else {
+            println!("validation: violations (the operation would be rejected)");
+            for line in report.unwrap_or_default().lines() {
+                println!("  {line}");
+            }
+        }
+    }
+    println!("{label}: {}", if verdict { "yes" } else { "no" });
 }
 
 fn print_delta_local(label: &str, d: &fluree_db_api::BranchDelta) {
@@ -1432,6 +1516,17 @@ fn print_preview_json(v: &serde_json::Value) -> CliResult<()> {
             }
         }
     }
+
+    let validation = v.get("validation").map(|val| {
+        (
+            val.get("conforms")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            val.get("report").and_then(Value::as_str),
+        )
+    });
+    let mergeable = v.get("mergeable").and_then(Value::as_bool).unwrap_or(false);
+    print_validation(validation, mergeable, "mergeable");
 
     if let Some(ch) = v.get("changes").filter(|x| !x.is_null()) {
         let asserts = ch.get("assert_count").and_then(Value::as_u64).unwrap_or(0);

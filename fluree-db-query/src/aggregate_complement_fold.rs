@@ -37,6 +37,8 @@
 //! else is left untouched (safe no-op). `AVG` only — the empty-complement filter
 //! needs the count, and `MIN`/`MAX`/`COUNT(DISTINCT)`/etc. are not distributive.
 
+mod shared;
+
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Function, Grouping, InputSemantics,
     Pattern, Query, SubqueryPattern,
@@ -96,7 +98,17 @@ fn not_exists_inner(p: &Pattern) -> Option<&[Pattern]> {
 
 /// Rewrite every matching avg-over-complement sub-SELECT in `query`, recursing
 /// into nested scopes. No-op for queries that do not match.
-pub fn fold_aggregate_complements(query: &mut Query) {
+pub fn fold_aggregate_complements(
+    query: &mut Query,
+    planning: &crate::temporal_mode::PlanningContext,
+) {
+    if planning.allow_semantic_elision
+        && !planning.multi_default_graph
+        && !planning.is_history()
+        && shared::fold(query)
+    {
+        return;
+    }
     let mut next_var = max_var_id(query).saturating_add(1);
     fold_in_patterns(&mut query.patterns, &mut next_var);
 }
@@ -137,11 +149,12 @@ fn try_rewrite_without_feature(sq: &mut SubqueryPattern, next_var: &mut u16) -> 
         group_by,
         aggregation: Some(agg),
         having: None,
+        binds,
     }) = &sq.grouping
     else {
         return false;
     };
-    if group_by.len() != 1 || !agg.binds.is_empty() || agg.aggregates.len() != 1 {
+    if group_by.len() != 1 || !binds.is_empty() || agg.aggregates.len() != 1 {
         return false;
     }
     let key = *group_by.iter().next().expect("len checked == 1");
@@ -253,9 +266,9 @@ fn try_rewrite_without_feature(sq: &mut SubqueryPattern, next_var: &mut u16) -> 
                         output_var: u_cnt,
                     },
                 ]),
-                binds: Vec::new(),
             },
             having: None,
+            binds: Vec::new(),
         });
 
     // --- per-feature WITH aggregate: SELECT ?key (SUM(av_w))(COUNT(av_w)) GROUP BY ?key ---
@@ -277,9 +290,9 @@ fn try_rewrite_without_feature(sq: &mut SubqueryPattern, next_var: &mut u16) -> 
                         output_var: w_cnt,
                     },
                 ]),
-                binds: Vec::new(),
             }),
             having: None,
+            binds: Vec::new(),
         },
     );
 

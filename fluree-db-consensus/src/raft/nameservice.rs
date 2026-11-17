@@ -62,8 +62,8 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
-use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id};
-use fluree_db_core::ContentId;
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
+use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_nameservice::{
     AdminPublisher, BranchLifecycle, CasResult, CommitPublisher, ConfigCasResult, ConfigLookup,
     ConfigPublisher, ConfigValue, GraphSourceLookup, GraphSourcePublisher, GraphSourceRecord,
@@ -275,7 +275,17 @@ fn record_from_state(
     if !ledger.branches.iter().any(|b| b == branch) {
         return None;
     }
-    let mut record = NsRecord::new(ledger_name, branch);
+    let id = LedgerId::from_persisted_parts(ledger_name, branch)
+        .inspect_err(|e| {
+            tracing::warn!(
+                ledger_name,
+                branch,
+                error = %e,
+                "Skipping nameservice record whose id is invalid; rename or remove it"
+            );
+        })
+        .ok()?;
+    let mut record = NsRecord::new(id);
     let ref_key = RefKey::new(ledger_name, branch);
     if let Some(entry) = state.refs.get(&ref_key) {
         record.commit_head_id = Some(entry.head.clone());
@@ -1467,7 +1477,7 @@ fn build_create_command(ledger_id: &str) -> std::result::Result<SmCommand, NameS
 }
 
 fn build_retract_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
     Ok(SmCommand::RetractLedger {
         ledger_id: ledger_name,
         branch,
@@ -1586,7 +1596,7 @@ fn build_create_branch_command(
 }
 
 fn build_drop_branch_command(ledger_id: &str) -> std::result::Result<SmCommand, NameServiceError> {
-    let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+    let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
     Ok(SmCommand::DropBranch {
         ledger_id: ledger_name,
         branch,
@@ -1759,8 +1769,10 @@ impl GraphSourceLookup for RaftNameService {
         &self,
         graph_source_id: &str,
     ) -> Result<Option<GraphSourceRecord>> {
+        // Keyed by canonical `name:branch`, as every other backend resolves.
+        let key = LedgerId::parse(graph_source_id)?.to_string();
         let state = self.state.read().await;
-        Ok(state.graph_sources.get(graph_source_id).cloned())
+        Ok(state.graph_sources.get(&key).cloned())
     }
 
     /// Resolve `resource_id` against the ledger map first, then the
@@ -1770,8 +1782,9 @@ impl GraphSourceLookup for RaftNameService {
         if let Some(record) = self.lookup(resource_id).await? {
             return Ok(NsLookupResult::Ledger(record));
         }
+        let key = LedgerId::parse(resource_id)?.to_string();
         let state = self.state.read().await;
-        if let Some(record) = state.graph_sources.get(resource_id).cloned() {
+        if let Some(record) = state.graph_sources.get(&key).cloned() {
             return Ok(NsLookupResult::GraphSource(record));
         }
         Ok(NsLookupResult::NotFound)
@@ -2455,7 +2468,12 @@ mod tests {
                 derived_facts: 42,
                 iterations: 3,
                 duration_ms: 17,
+                capped_rules: Vec::new(),
+                pending_rules: Vec::new(),
+                evaluation_time: None,
             }),
+            sql: None,
+            sql_elided: None,
         }
     }
 
@@ -2533,7 +2551,12 @@ mod tests {
                 derived_facts: 10,
                 iterations: 1,
                 duration_ms: 5,
+                capped_rules: Vec::new(),
+                pending_rules: Vec::new(),
+                evaluation_time: None,
             }),
+            sql: None,
+            sql_elided: None,
         };
         let receipt = AppliedReceipt::Transact(TransactApplied {
             commit_id: cid(2),
@@ -2794,6 +2817,9 @@ mod tests {
             derived_facts: 42,
             iterations: 3,
             duration_ms: 17,
+            capped_rules: vec!["ex:rule".to_string()],
+            pending_rules: vec!["ex:later".to_string()],
+            evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -2811,6 +2837,8 @@ mod tests {
             }),
             policy_enforcement: None,
             reasoning: Some(original_reasoning),
+            sql: None,
+            sql_elided: None,
         };
         let original_transact = TransactApplied {
             commit_id: cid(2),
@@ -2857,7 +2885,11 @@ mod tests {
             policy: rt_policy,
             policy_enforcement: rt_policy_enforcement,
             reasoning: rt_reasoning,
+            sql: rt_sql,
+            sql_elided: rt_sql_elided,
         } = rt_tally.expect("tally Some on round-trip");
+        assert_eq!(rt_sql, None);
+        assert_eq!(rt_sql_elided, None);
         assert_eq!(rt_time, original_tally.time);
         assert_eq!(rt_fuel, original_tally.fuel);
         assert_eq!(rt_policy, original_tally.policy);
@@ -2871,7 +2903,14 @@ mod tests {
             derived_facts: rt_derived_facts,
             iterations: rt_iterations,
             duration_ms: rt_duration_ms,
+            capped_rules: rt_capped_rules,
+            pending_rules: rt_pending_rules,
+            evaluation_time: rt_evaluation_time,
         } = rt_reasoning.expect("reasoning Some on round-trip");
+        // Not carried by the recorded mirror: adding them would change the
+        // wire form of records already in the log.
+        assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());
+        assert_eq!(rt_evaluation_time, None);
         let original_reasoning = original_tally.reasoning.expect("reasoning populated above");
         assert_eq!(rt_capped, original_reasoning.capped);
         assert_eq!(rt_capped_reason, original_reasoning.capped_reason);
@@ -3051,6 +3090,32 @@ mod tests {
         assert_eq!(record.commit_head_id, Some(cid(5)));
         assert_eq!(record.commit_t, 7);
         assert_eq!(record.index_head_id, None);
+    }
+
+    /// Graph sources are stored under canonical `name:branch`; a branchless
+    /// lookup must resolve like every other backend's, not miss on raft only.
+    #[tokio::test]
+    async fn graph_source_lookups_accept_the_branchless_spelling() {
+        let state = fresh_state();
+        apply_cmd(
+            &state,
+            Command::PublishGraphSource {
+                name: "search".into(),
+                branch: "main".into(),
+                source_type: GraphSourceType::Bm25,
+                config: "{}".into(),
+                dependencies: vec![],
+            },
+            1,
+        )
+        .await;
+        let ns = RaftNameService::new(view(&state), stub_raft().await);
+        let record = ns.lookup_graph_source("search").await.unwrap();
+        assert_eq!(record.expect("found").graph_source_id, "search:main");
+        assert!(matches!(
+            ns.lookup_any("search").await.unwrap(),
+            NsLookupResult::GraphSource(_)
+        ));
     }
 
     #[tokio::test]

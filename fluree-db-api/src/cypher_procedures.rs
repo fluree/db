@@ -30,6 +30,7 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use fluree_db_core::{
     is_rdf_type, FlakeValue, IndexStats, IndexType, LedgerSnapshot, OverlayProvider, Sid,
@@ -661,10 +662,13 @@ pub(crate) fn predicate_denied(enforcer: &QueryPolicyEnforcer, p: &Sid) -> bool 
 /// be charged twice (#1391). The reconciliation costs one bounded base-index
 /// probe per `(graph, subject, predicate)` novelty touched — a per-request
 /// catalog call, not a hot path.
-fn merged_stats(snapshot: &LedgerSnapshot, overlay: Option<&dyn OverlayProvider>) -> IndexStats {
+fn merged_stats(
+    snapshot: &LedgerSnapshot,
+    overlay: Option<&dyn OverlayProvider>,
+) -> Arc<IndexStats> {
     let indexed = snapshot.stats.clone().unwrap_or_default();
     match overlay.and_then(|o| o.as_any().downcast_ref::<Novelty>()) {
-        Some(novelty) => assemble_fast_stats_with(
+        Some(novelty) => Arc::new(assemble_fast_stats_with(
             &indexed,
             snapshot,
             novelty,
@@ -673,7 +677,7 @@ fn merged_stats(snapshot: &LedgerSnapshot, overlay: Option<&dyn OverlayProvider>
             NoveltyMerge::Reconciled {
                 site: stats_merge_site::MERGED_STATS,
             },
-        ),
+        )),
         None => indexed,
     }
 }

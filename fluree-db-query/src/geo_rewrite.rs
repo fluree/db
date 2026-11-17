@@ -6,6 +6,7 @@
 //! This optimization runs for both SPARQL and JSON-LD queries, enabling `geof:distance`
 //! patterns to use the accelerated GeoPoint binary index path.
 
+use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, FlakeValue, Function, GeoSearchCenter, GeoSearchPattern, Pattern};
 use crate::var_registry::VarId;
@@ -30,10 +31,40 @@ pub fn rewrite_geo_patterns<F>(patterns: Vec<Pattern>, encode_iri: &F) -> Vec<Pa
 where
     F: Fn(&str) -> Option<Sid>,
 {
-    rewrite_recursive(patterns, encode_iri)
+    rewrite_recursive(patterns, encode_iri, true, &mut false)
 }
 
-fn rewrite_recursive<F>(patterns: Vec<Pattern>, encode_iri: &F) -> Vec<Pattern>
+/// [`rewrite_geo_patterns`] when `index_covers` — the binary index the
+/// GeoSearch operator reads covers the query's `t` — and the patterns as
+/// written otherwise, stamping the `geo_search` routing site either way when
+/// the query has a shape to rewrite.
+pub fn rewrite_geo_patterns_if_indexed<F>(
+    patterns: Vec<Pattern>,
+    encode_iri: &F,
+    index_covers: bool,
+) -> Vec<Pattern>
+where
+    F: Fn(&str) -> Option<Sid>,
+{
+    let mut found = false;
+    let patterns = rewrite_recursive(patterns, encode_iri, index_covers, &mut found);
+    if found {
+        let outcome = if index_covers {
+            FastPathOutcome::Proceed
+        } else {
+            FastPathOutcome::Fallback(FastPathFallback::GateDeclined)
+        };
+        stamp_fast_path("geo_search", outcome);
+    }
+    patterns
+}
+
+fn rewrite_recursive<F>(
+    patterns: Vec<Pattern>,
+    encode_iri: &F,
+    apply: bool,
+    found: &mut bool,
+) -> Vec<Pattern>
 where
     F: Fn(&str) -> Option<Sid>,
 {
@@ -48,7 +79,9 @@ where
         .into_iter()
         .map(|p| match p {
             Pattern::Service(_) | Pattern::Subquery(_) => p,
-            other => other.map_subpatterns(&mut |xs| rewrite_recursive(xs, encode_iri)),
+            other => {
+                other.map_subpatterns(&mut |xs| rewrite_recursive(xs, encode_iri, apply, found))
+            }
         })
         .collect();
 
@@ -56,7 +89,8 @@ where
     let candidates = find_geo_candidates(&patterns, encode_iri);
 
     // 3. Apply rewrites
-    if candidates.is_empty() {
+    *found |= !candidates.is_empty();
+    if candidates.is_empty() || !apply {
         patterns
     } else {
         apply_rewrites(patterns, candidates)
@@ -71,9 +105,9 @@ struct GeoCandidate {
     predicate: Sid,
     subject_var: VarId,
     distance_var: VarId,
+    location_var: VarId,
     center: GeoSearchCenter,
     radius_meters: f64,
-    keep_triple: bool, // true if loc_var is used elsewhere
 }
 
 fn find_geo_candidates<F>(patterns: &[Pattern], encode_iri: &F) -> Vec<GeoCandidate>
@@ -123,26 +157,29 @@ where
                                     if let Some(radius) =
                                         extract_lt_comparison(filter_expr, *dist_var)
                                     {
-                                        // 7. Check loc_var liveness
-                                        let keep_triple = is_var_used_elsewhere(
+                                        // 7. GeoSearch binds the point itself, so
+                                        // the triple goes. A point another pattern
+                                        // also joins on stays with the triple: the
+                                        // two would bind it in different encodings.
+                                        if !is_var_used_elsewhere(
                                             patterns,
                                             loc_var,
                                             *triple_idx,
                                             bind_idx,
                                             filter_idx,
-                                        );
-
-                                        candidates.push(GeoCandidate {
-                                            triple_idx: *triple_idx,
-                                            bind_idx,
-                                            filter_idx,
-                                            predicate,
-                                            subject_var,
-                                            distance_var: *dist_var,
-                                            center,
-                                            radius_meters: radius,
-                                            keep_triple,
-                                        });
+                                        ) {
+                                            candidates.push(GeoCandidate {
+                                                triple_idx: *triple_idx,
+                                                bind_idx,
+                                                filter_idx,
+                                                predicate,
+                                                subject_var,
+                                                distance_var: *dist_var,
+                                                location_var: loc_var,
+                                                center,
+                                                radius_meters: radius,
+                                            });
+                                        }
                                         break; // One filter per candidate
                                     }
                                 }
@@ -179,14 +216,13 @@ fn extract_distance_call(expr: &Expression) -> Option<(VarId, GeoSearchCenter)> 
             _ => return None,
         };
 
-        // Second arg must be a constant WKT string
-        let wkt = match &args[1] {
-            Expression::Const(FlakeValue::String(s)) => s.as_str(),
+        // Second arg must be a constant point: a WKT string, or the
+        // GeoPoint a typed `geo:wktLiteral` POINT constant lowers to
+        let (lat, lng) = match &args[1] {
+            Expression::Const(FlakeValue::String(wkt)) => try_extract_point(wkt)?,
+            Expression::Const(FlakeValue::GeoPoint(bits)) => (bits.lat(), bits.lng()),
             _ => return None,
         };
-
-        // Parse WKT POINT to lat/lng
-        let (lat, lng) = try_extract_point(wkt)?;
 
         Some((loc_var, GeoSearchCenter::Const { lat, lng }))
     } else {
@@ -264,10 +300,11 @@ fn apply_rewrites(patterns: Vec<Pattern>, mut candidates: Vec<GeoCandidate>) -> 
 
     for candidate in candidates {
         // Collect indices to remove (in descending order)
-        let mut to_remove = vec![candidate.filter_idx, candidate.bind_idx];
-        if !candidate.keep_triple {
-            to_remove.push(candidate.triple_idx);
-        }
+        let mut to_remove = vec![
+            candidate.filter_idx,
+            candidate.bind_idx,
+            candidate.triple_idx,
+        ];
         to_remove.sort_by(|a, b| b.cmp(a)); // Descending
 
         // Remove patterns
@@ -283,21 +320,16 @@ fn apply_rewrites(patterns: Vec<Pattern>, mut candidates: Vec<GeoCandidate>) -> 
                 candidate.radius_meters,
                 candidate.subject_var,
             )
-            .with_distance_var(candidate.distance_var),
+            .with_distance_var(candidate.distance_var)
+            .with_location_var(candidate.location_var),
         );
 
-        // Insert at the position of the original triple
-        let insert_pos = if candidate.keep_triple {
-            // Insert before the triple
-            candidate.triple_idx
-        } else {
-            // Triple was removed, adjust for removed patterns before this position
-            let removed_before = to_remove
-                .iter()
-                .filter(|&&idx| idx < candidate.triple_idx)
-                .count();
-            candidate.triple_idx - removed_before
-        };
+        // Insert where the triple was, less the patterns removed before it
+        let removed_before = to_remove
+            .iter()
+            .filter(|&&idx| idx < candidate.triple_idx)
+            .count();
+        let insert_pos = candidate.triple_idx - removed_before;
 
         result.insert(insert_pos, geo_search);
     }
@@ -422,6 +454,8 @@ mod tests {
                 assert_eq!(gsp.predicate, pred_sid);
                 assert_eq!(gsp.subject_var, place_var);
                 assert_eq!(gsp.distance_var, Some(dist_var));
+                // The triple is gone, so the GeoSearch binds the point.
+                assert_eq!(gsp.location_var, Some(loc_var));
                 assert!((gsp.radius_meters - 1000.0).abs() < 0.001);
             }
             _ => panic!("Expected GeoSearch pattern"),
@@ -429,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn test_loc_var_preserved_when_used() {
+    fn test_loc_var_used_elsewhere_is_not_rewritten() {
         let mut vars = VarRegistry::new();
         let place_var = vars.get_or_insert("?place");
         let loc_var = vars.get_or_insert("?loc");
@@ -458,7 +492,7 @@ mod tests {
                 Expression::Var(dist_var),
                 Expression::Const(FlakeValue::Long(1000)),
             )),
-            // ?loc is used here too - Triple should be kept
+            // ?loc is used here too: the triple would bind it in another encoding
             Pattern::Filter(Expression::eq(
                 Expression::Var(loc_var),
                 Expression::Const(FlakeValue::String("test".to_string())),
@@ -467,17 +501,10 @@ mod tests {
 
         let result = rewrite_geo_patterns(patterns, &mock_encoder);
 
-        // Should have GeoSearch + Triple + extra Filter (Bind and original Filter removed)
-        assert_eq!(result.len(), 3);
-
-        // First should be GeoSearch
-        assert!(matches!(&result[0], Pattern::GeoSearch(_)));
-
-        // Second should be the original Triple (kept because ?loc is used)
-        assert!(matches!(&result[1], Pattern::Triple(_)));
-
-        // Third should be the extra filter
-        assert!(matches!(&result[2], Pattern::Filter(_)));
+        // Left as written: GeoSearch would bind ?loc itself, in a different
+        // encoding from the triple the other pattern joins with.
+        assert_eq!(result.len(), 4);
+        assert!(!result.iter().any(|p| matches!(p, Pattern::GeoSearch(_))));
     }
 
     #[test]

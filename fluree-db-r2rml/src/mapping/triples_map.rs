@@ -5,7 +5,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{PredicateObjectMap, TermType};
+use super::{PredicateObjectMap, TableKeys, TermType};
 
 /// A compiled R2RML TriplesMap
 ///
@@ -38,6 +38,13 @@ pub struct TriplesMap {
     pub subject_map: SubjectMap,
     /// Zero or more predicate-object maps
     pub predicate_object_maps: Vec<PredicateObjectMap>,
+    /// The keys the mapping declares on this map's logical table (`f:key`).
+    ///
+    /// Skipped when empty, so a mapping that declares none serializes, and
+    /// hashes for its materialized twin, exactly as it did before keys could be
+    /// declared.
+    #[serde(default, skip_serializing_if = "TableKeys::is_empty")]
+    pub declared_keys: TableKeys,
 }
 
 impl TriplesMap {
@@ -48,12 +55,26 @@ impl TriplesMap {
             logical_table: LogicalTable::TableName(table_name.into()),
             subject_map: SubjectMap::default(),
             predicate_object_maps: Vec::new(),
+            declared_keys: TableKeys::none(),
         }
     }
 
-    /// Set the subject map template
+    /// Declare a key of the logical table: columns no two rows agree on.
+    pub fn with_declared_key<S: Into<String>>(
+        mut self,
+        columns: impl IntoIterator<Item = S>,
+    ) -> Self {
+        self.declared_keys = std::mem::take(&mut self.declared_keys)
+            .union([columns.into_iter().map(Into::into).collect::<Vec<String>>()]);
+        self
+    }
+
+    /// Set the subject map template, and the columns it reads
+    /// ([`SubjectMap::template_columns`]), as the loader does.
     pub fn with_subject_template(mut self, template: impl Into<String>) -> Self {
-        self.subject_map.template = Some(template.into());
+        let template = template.into();
+        self.subject_map.template_columns = extract_template_columns(&template);
+        self.subject_map.template = Some(template);
         self
     }
 
@@ -85,17 +106,33 @@ impl TriplesMap {
 
     /// Get all columns referenced by this TriplesMap
     ///
-    /// Includes columns from subject template and all object maps.
+    /// Every column a row must carry for the map to produce what it describes:
+    /// the subject (template or `rr:column`), the graph map when there is one,
+    /// and every predicate-object map. A scan projected to this set reads
+    /// nothing the map does not use, and a schema check over it catches a
+    /// column the map names but the table lacks.
     pub fn referenced_columns(&self) -> Vec<&str> {
         let mut columns: Vec<&str> = Vec::new();
 
-        // Subject template columns
+        // Subject template columns, or the rr:column subject
         columns.extend(
             self.subject_map
                 .template_columns
                 .iter()
                 .map(std::string::String::as_str),
         );
+        if let Some(ref col) = self.subject_map.column {
+            columns.push(col.as_str());
+        }
+
+        // Graph map columns: a graph template with a column the table lacks
+        // would route every row to the default graph, with nothing to say so.
+        if let Some(gm) = &self.subject_map.graph_map {
+            columns.extend(gm.template_columns.iter().map(std::string::String::as_str));
+            if let Some(ref col) = gm.column {
+                columns.push(col.as_str());
+            }
+        }
 
         // Predicate-object map columns
         for pom in &self.predicate_object_maps {
@@ -178,6 +215,41 @@ impl TriplesMap {
     /// reading any POM or parent column for it is wasted I/O. Use this instead of
     /// `columns_for_predicate(None)` (which projects every POM column) when the
     /// pattern has no object variable.
+    /// Whether `other` reads the same rows and mints the same subject from
+    /// them: the same logical table and the same subject template, column
+    /// or constant (its classes aside).
+    pub fn same_source_row(&self, other: &TriplesMap) -> bool {
+        let (a, b) = (&self.subject_map, &other.subject_map);
+        self.logical_table == other.logical_table
+            && a.template == b.template
+            && a.template_columns == b.template_columns
+            && a.column == b.column
+            && a.constant == b.constant
+            && a.term_type == b.term_type
+    }
+
+    /// The object map of the first predicate-object map naming `predicate`
+    /// as a constant — the one the projection path materializes under a
+    /// predicate filter (`columns_for_predicate`); a second map for the same
+    /// predicate is not read there either.
+    pub fn object_map_for(&self, predicate: &str) -> Option<&super::term_map::ObjectMap> {
+        self.predicate_object_maps
+            .iter()
+            .find(|pom| pom.predicate_map.as_constant() == Some(predicate))
+            .map(|pom| &pom.object_map)
+    }
+
+    /// Whether the two maps mint `predicate` alike — from the same rows,
+    /// the same subject and the same object map — and so the same triples,
+    /// which an RDF graph holds once.
+    pub fn mints_alike(&self, other: &TriplesMap, predicate: &str) -> bool {
+        self.same_source_row(other)
+            && matches!(
+                (self.object_map_for(predicate), other.object_map_for(predicate)),
+                (Some(a), Some(b)) if a == b
+            )
+    }
+
     pub fn subject_columns(&self) -> Vec<&str> {
         let mut columns: Vec<&str> = self
             .subject_map
@@ -268,7 +340,7 @@ impl TriplesMap {
 /// Defines where the tabular data comes from.
 /// Iceberg graph sources accept only table names; SQL graph sources also
 /// accept `rr:sqlQuery`, which is scanned as a derived table.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum LogicalTable {
     /// `rr:tableName` - direct table reference
     ///
@@ -527,6 +599,53 @@ mod tests {
     }
 
     #[test]
+    fn mints_alike_needs_same_rows_subject_and_object_map() {
+        use super::super::{ObjectMap, PredicateMap, RefObjectMap};
+        const LABEL: &str = "http://example.org/label";
+        let pom = |om: ObjectMap| PredicateObjectMap {
+            predicate_map: PredicateMap::constant(LABEL),
+            object_map: om,
+        };
+        let base = || {
+            TriplesMap::new("<#A>", "customers")
+                .with_subject_template("http://example.org/customer/{id}")
+                .with_class("http://example.org/A")
+        };
+        let a = base().with_predicate_object(pom(ObjectMap::column("name")));
+
+        // Classes aside, the same rows, subject and object map.
+        let b = TriplesMap::new("<#B>", "customers")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_class("http://example.org/B")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(a.mints_alike(&b, LABEL));
+        assert!(b.mints_alike(&a, LABEL));
+
+        // Another column, a datatype, a template or a reference derive the
+        // value differently.
+        for om in [
+            ObjectMap::column("nickname"),
+            ObjectMap::column_typed("name", "http://www.w3.org/2001/XMLSchema#string"),
+            ObjectMap::template("{name}", vec!["name".into()]),
+            ObjectMap::RefObjectMap(RefObjectMap::new("<#Parent>", "name", "id")),
+        ] {
+            assert!(!a.mints_alike(&base().with_predicate_object(pom(om)), LABEL));
+        }
+        // Other rows or another subject.
+        let other_table = TriplesMap::new("<#C>", "profiles")
+            .with_subject_template("http://example.org/customer/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_table, LABEL));
+        let other_subject = base()
+            .with_subject_template("http://example.org/person/{id}")
+            .with_predicate_object(pom(ObjectMap::column("name")));
+        assert!(!a.mints_alike(&other_subject, LABEL));
+        // A predicate one side lacks.
+        assert!(!a.mints_alike(&base(), LABEL));
+        assert!(!a.mints_alike(&b, "http://example.org/other"));
+    }
+
+    #[test]
     fn test_triples_map_new() {
         let tm = TriplesMap::new("<#AirlineMapping>", "openflights.airlines")
             .with_subject_template("http://example.org/airline/{id}")
@@ -564,6 +683,12 @@ mod tests {
     }
 
     #[test]
+    fn the_builder_records_a_subject_templates_columns() {
+        let tm = TriplesMap::new("#T", "t").with_subject_template("http://ex/t/{a}/{b}");
+        assert_eq!(tm.subject_map.template_columns, vec!["a", "b"]);
+    }
+
+    #[test]
     fn test_referenced_columns() {
         use super::super::{ObjectMap, PredicateMap, PredicateObjectMap};
 
@@ -582,6 +707,34 @@ mod tests {
 
         let cols = tm.referenced_columns();
         assert_eq!(cols, vec!["code", "id", "name"]);
+    }
+
+    #[test]
+    fn referenced_columns_covers_subject_column_and_graph_map() {
+        use super::super::{ObjectMap, PredicateMap, PredicateObjectMap};
+
+        // An rr:column subject and a graph template: a scan projected to
+        // `referenced_columns()` must read both, or the subject is skipped and
+        // the row routes to the default graph.
+        let mut tm = TriplesMap::new("<#Test>", "test.table");
+        tm.subject_map = SubjectMap::column("uri");
+        tm.subject_map.graph_map =
+            Some(GraphMap::template("http://example.org/g/{tenant}/{region}"));
+        tm.predicate_object_maps = vec![PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://example.org/name"),
+            object_map: ObjectMap::column("name"),
+        }];
+        assert_eq!(
+            tm.referenced_columns(),
+            vec!["name", "region", "tenant", "uri"]
+        );
+
+        tm.subject_map.graph_map = Some(GraphMap::column("graph_iri"));
+        assert_eq!(tm.referenced_columns(), vec!["graph_iri", "name", "uri"]);
+
+        // A constant graph reads no column.
+        tm.subject_map.graph_map = Some(GraphMap::constant("http://example.org/g"));
+        assert_eq!(tm.referenced_columns(), vec!["name", "uri"]);
     }
 
     #[test]

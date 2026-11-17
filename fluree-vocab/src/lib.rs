@@ -215,64 +215,6 @@ pub mod xsd {
     /// xsd:hexBinary IRI
     pub const HEX_BINARY: &str = "http://www.w3.org/2001/XMLSchema#hexBinary";
 
-    // ========================================================================
-    // Datatype Normalization Helpers
-    // ========================================================================
-    //
-    // These functions normalize XSD datatypes to canonical forms for storage.
-    // This ensures consistency between transact and query paths.
-
-    /// Normalize integer-family datatypes to xsd:integer
-    ///
-    /// XSD defines a type hierarchy where int, short, byte, long are subtypes
-    /// of integer. For storage consistency, we normalize all of these to
-    /// xsd:integer since they all map to the same Rust type (i64 or BigInt).
-    ///
-    /// # Arguments
-    /// * `datatype_iri` - The full IRI of the datatype
-    ///
-    /// # Returns
-    /// * `xsd:integer` IRI if input is an integer-family type
-    /// * The original IRI unchanged otherwise
-    #[inline]
-    pub fn normalize_integer_family(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            LONG | INT | SHORT | BYTE | UNSIGNED_LONG | UNSIGNED_INT | UNSIGNED_SHORT
-            | UNSIGNED_BYTE | NON_NEGATIVE_INTEGER | POSITIVE_INTEGER | NON_POSITIVE_INTEGER
-            | NEGATIVE_INTEGER => INTEGER,
-            _ => datatype_iri,
-        }
-    }
-
-    /// Normalize float to double
-    ///
-    /// XSD float and double both map to f64 in Rust. Normalize to double
-    /// for storage consistency.
-    #[inline]
-    pub fn normalize_float_family(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            FLOAT => DOUBLE,
-            _ => datatype_iri,
-        }
-    }
-
-    /// Normalize all numeric datatypes to their canonical storage form
-    ///
-    /// Combines integer-family and float-family normalization:
-    /// - xsd:int, xsd:short, xsd:byte, xsd:long → xsd:integer
-    /// - xsd:float → xsd:double
-    /// - All other types pass through unchanged
-    #[inline]
-    pub fn normalize_numeric_datatype(datatype_iri: &str) -> &str {
-        match datatype_iri {
-            LONG | INT | SHORT | BYTE | UNSIGNED_LONG | UNSIGNED_INT | UNSIGNED_SHORT
-            | UNSIGNED_BYTE | NON_NEGATIVE_INTEGER | POSITIVE_INTEGER | NON_POSITIVE_INTEGER
-            | NEGATIVE_INTEGER => INTEGER,
-            FLOAT => DOUBLE,
-            _ => datatype_iri,
-        }
-    }
-
     /// Check if a datatype IRI is a numeric type
     #[inline]
     pub fn is_numeric_datatype(datatype_iri: &str) -> bool {
@@ -1651,6 +1593,13 @@ pub mod fluree {
     /// Fluree DB system namespace IRI (canonical base for all Fluree system vocabulary)
     pub const DB: &str = "https://ns.flur.ee/db#";
 
+    /// `f:key` — on an R2RML logical table (`rr:logicalTable`), an `rdf:List`
+    /// of column names no two of the table's rows agree on (rows with a NULL
+    /// in any of them aside). Repeatable: one list per alternative key, a
+    /// composite key being one list of several columns. Trusted, not checked
+    /// against the data.
+    pub const KEY: &str = "https://ns.flur.ee/db#key";
+
     /// Constraint component reported when a `sh:path` could not be compiled
     /// (Fluree extension; W3C SHACL has no component for this condition)
     pub const UNRESOLVABLE_PATH_CONSTRAINT_COMPONENT: &str =
@@ -1712,7 +1661,7 @@ pub mod fluree {
 ///
 /// Codes 0 through `USER_START - 1` are reserved for built-in namespaces.
 /// User-defined namespaces are allocated contiguously starting at `USER_START`.
-/// Code `OVERFLOW` (0xFFFF) is reserved for IRIs whose namespace could not
+/// Code `OVERFLOW` (0xFFFE) is reserved for IRIs whose namespace could not
 /// be assigned a code (full IRI stored as the SID name).
 pub mod namespaces {
     /// Code 0: empty / relative IRI prefix (@base resolution)
@@ -1768,6 +1717,13 @@ pub mod namespaces {
     /// Note: 0xFFFF is reserved for `Sid::max()` sentinel, so overflow
     /// uses 0xFFFE.
     pub const OVERFLOW: u16 = 0xFFFE;
+
+    /// Whether a SID name in this namespace already is the full IRI, so
+    /// decoding must not look up a prefix.
+    #[inline]
+    pub const fn is_full_iri(ns_code: u16) -> bool {
+        ns_code == EMPTY || ns_code == OVERFLOW
+    }
 }
 
 /// Common predicate local names (for schema extraction, validation, etc.)
@@ -1885,6 +1841,15 @@ pub mod db {
     /// reconstruct revert provenance from the txn-meta graph.
     pub const REVERTS: &str = "reverts";
 
+    /// The local names in this namespace that a user may set in a commit's
+    /// txn-meta: `f:message` and `f:author`.
+    pub const TXN_META_USER: &[&str] = &[MESSAGE, AUTHOR];
+
+    /// Every local name in this namespace a commit's txn-meta holds: the user
+    /// claims ([`TXN_META_USER`]) and the entries the system writes
+    /// (`f:identity`, `db:receivedAt`, and `f:reverts` on a revert).
+    pub const TXN_META: &[&str] = &[MESSAGE, AUTHOR, IDENTITY, RECEIVED_AT, REVERTS];
+
     /// db:txn - transaction address (optional)
     pub const TXN: &str = "txn";
 
@@ -1968,6 +1933,66 @@ pub mod db {
     /// edge is a list element. Always omitted in v1 (list-occurrence
     /// annotations are deferred).
     pub const REIFIES_LIST_INDEX: &str = "reifiesListIndex";
+}
+
+/// Which predicates a commit's txn-meta may carry.
+///
+/// A commit's subject in `#txn-meta` holds Fluree's provenance and the user's
+/// claims side by side, so predicates in Fluree's own namespaces are reserved:
+/// a transaction may set only [`db::TXN_META_USER`], and txn-meta holds only
+/// [`db::TXN_META`] from those namespaces. Every reader of user txn-meta and
+/// the index resolver decide through [`user_may_set`] and [`may_hold`].
+pub mod txn_meta {
+    use crate::db::{TXN_META, TXN_META_USER};
+    use crate::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
+
+    /// Namespaces whose predicates are Fluree provenance.
+    pub const RESERVED_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
+
+    /// Whether a transaction may set this predicate in its txn-meta.
+    pub fn user_may_set(ns: u16, name: &str) -> bool {
+        outside_reserved_or_in(ns, name, TXN_META_USER)
+    }
+
+    /// Whether a commit's txn-meta may hold this predicate, from the user or
+    /// the system.
+    pub fn may_hold(ns: u16, name: &str) -> bool {
+        outside_reserved_or_in(ns, name, TXN_META)
+    }
+
+    fn outside_reserved_or_in(ns: u16, name: &str, fluree_db_names: &[&str]) -> bool {
+        !RESERVED_NAMESPACES.contains(&ns) || (ns == FLUREE_DB && fluree_db_names.contains(&name))
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::db;
+
+        #[test]
+        fn txn_meta_holds_every_name_a_user_may_set() {
+            for name in TXN_META_USER {
+                assert!(TXN_META.contains(name), "db::TXN_META lacks {name}");
+            }
+        }
+
+        #[test]
+        fn users_set_only_their_claims_in_reserved_namespaces() {
+            assert!(user_may_set(FLUREE_DB, db::MESSAGE));
+            assert!(user_may_set(FLUREE_DB, db::AUTHOR));
+            assert!(!user_may_set(FLUREE_DB, db::IDENTITY));
+            assert!(!user_may_set(FLUREE_DB, db::REVERTS));
+            assert!(!user_may_set(FLUREE_DB, db::T));
+            assert!(!user_may_set(FLUREE_COMMIT, db::MESSAGE));
+            assert!(!user_may_set(FLUREE_URN, "x"));
+            assert!(user_may_set(crate::namespaces::USER_START, db::T));
+
+            assert!(may_hold(FLUREE_DB, db::IDENTITY));
+            assert!(may_hold(FLUREE_DB, db::REVERTS));
+            assert!(!may_hold(FLUREE_DB, db::T));
+            assert!(!may_hold(FLUREE_COMMIT, db::IDENTITY));
+        }
+    }
 }
 
 /// Edge-annotation system predicate IRIs (`https://ns.flur.ee/db#reifies*`).
@@ -2119,6 +2144,9 @@ pub mod ns_types {
 
     /// `https://ns.flur.ee/db#SqlMapping` - R2RML mapping over a SQL endpoint
     pub const SQL_MAPPING: &str = "https://ns.flur.ee/db#SqlMapping";
+
+    /// `https://ns.flur.ee/db#DeltaMapping` - R2RML mapping over Delta Lake tables
+    pub const DELTA_MAPPING: &str = "https://ns.flur.ee/db#DeltaMapping";
 }
 
 /// Graph source nameservice field local names (under `https://ns.flur.ee/db#`)
@@ -2265,6 +2293,10 @@ pub mod config_iris {
     /// `f:shapesSource` — GraphRef pointing to SHACL shapes graph
     pub const SHAPES_SOURCE: &str = "https://ns.flur.ee/db#shapesSource";
 
+    /// `f:additionalDataSource` — GraphRef (repeatable) to a graph read with
+    /// each validated graph when SHACL checks its nodes
+    pub const ADDITIONAL_DATA_SOURCE: &str = "https://ns.flur.ee/db#additionalDataSource";
+
     /// `f:validationMode` — IRI: f:ValidationReject or f:ValidationWarn
     pub const VALIDATION_MODE: &str = "https://ns.flur.ee/db#validationMode";
 
@@ -2292,6 +2324,12 @@ pub mod config_iris {
     /// `f:reasoningMaxSeconds` — integer, max wall-clock seconds before OWL2-RL
     /// materialization is capped (incomplete closure)
     pub const REASONING_MAX_SECONDS: &str = "https://ns.flur.ee/db#reasoningMaxSeconds";
+
+    /// `f:reasoningMaxMemoryMb` — integer, max megabytes of derived facts
+    /// before materialization is capped (incomplete closure). Defaults to a
+    /// ceiling derived from `f:reasoningMaxFacts`, so the fact cap normally
+    /// binds first and this one only catches abnormally large facts.
+    pub const REASONING_MAX_MEMORY_MB: &str = "https://ns.flur.ee/db#reasoningMaxMemoryMb";
 
     /// `f:ontologyImportMap` — list of OntologyImportBinding
     pub const ONTOLOGY_IMPORT_MAP: &str = "https://ns.flur.ee/db#ontologyImportMap";
@@ -2443,6 +2481,17 @@ pub mod config_iris {
     /// `f:publicVisibility` — boolean, ledger may be discovered and read
     /// without authentication. Absent means false (token required).
     pub const PUBLIC_VISIBILITY: &str = "https://ns.flur.ee/db#publicVisibility";
+
+    // ---- Query defaults fields (ledger-scoped) ----
+
+    /// `f:queryDefaults` — query-time defaults on LedgerConfig.
+    /// Ledger-scoped: ignored on GraphConfig, not subject to override control.
+    pub const QUERY_DEFAULTS: &str = "https://ns.flur.ee/db#queryDefaults";
+
+    /// `f:unionDefaultGraph` — boolean, a query that does not choose its own
+    /// default graph reads the union of the ledger's default graph and its
+    /// named graphs. Absent means false.
+    pub const UNION_DEFAULT_GRAPH: &str = "https://ns.flur.ee/db#unionDefaultGraph";
 }
 
 // ============================================================================

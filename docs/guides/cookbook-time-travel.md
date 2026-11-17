@@ -8,7 +8,7 @@ There are two distinct capabilities, and it's worth keeping them straight:
 |---|---|---|
 | Question | "What did the graph look like *at* time T?" | "What *changed* between T1 and T2?" |
 | Result | An ordinary graph, as of one moment | A change log: value + `t` + assert/retract |
-| Syntax | `@t:` / `@iso:` / `@recorded:` / `@commit:` on a ledger reference | `from` **and** `to`, plus per-value metadata bindings |
+| Syntax | `@t:` / `@time:` / `@recorded:` / `@commit:` on a ledger reference | `from` **and** `to`, plus per-value metadata bindings |
 
 Time travel needs nothing special in the query body — you write a normal query and pin the snapshot. History queries need explicit metadata bindings, covered under [History queries](#history-queries) below.
 
@@ -73,11 +73,11 @@ The structured form is equivalent and composes with named-graph selection:
 }
 ```
 
-The suffix forms are `@t:5`, `@t:latest`, `@iso:2025-01-15T00:00:00Z`, `@recorded:2025-01-15T00:00:00Z`, and `@commit:bafyreif...`.
+The suffix forms are `@t:5`, `@t:latest`, `@time:2025-01-15T00:00:00Z`, `@recorded:2025-01-15T00:00:00Z`, and `@commit:bafyreif...`.
 
 ### SPARQL with a time specifier
 
-The `@t:` suffix is parsed on ledger references inside a `FROM` clause, which means SPARQL time travel goes through the **connection-scoped** endpoint:
+The `@t:` suffix is parsed on ledger references inside a `FROM` clause. That works on the connection-scoped endpoint, and on a ledger-scoped endpoint when the `FROM` names the path's ledger. A `FROM` makes that graph the query's default graph; to read the whole ledger at a time, named graphs included, pin the ledger path instead (see [HTTP API](#http-api) below):
 
 ```sparql
 PREFIX schema: <http://schema.org/>
@@ -89,13 +89,18 @@ WHERE { ?p schema:name ?name }
 
 ### HTTP API
 
-Ledger-scoped queries put the ledger in the path; time travel rides on the `FROM` clause (SPARQL) or the `from` key (JSON-LD) at the connection-scoped endpoint.
+Ledger-scoped queries put the ledger in the path, and a time pin can go there too: the whole ledger, named graphs included, is read as of that point. Time travel can also ride on the `FROM` clause (SPARQL) or the `from` key (JSON-LD).
 
 ```bash
 # Ledger-scoped, current state
 curl -X POST 'http://localhost:8090/v1/fluree/query/mydb:main' \
   -H 'Content-Type: application/sparql-query' \
   -d 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
+
+# Ledger-scoped, pinned to t=5 in the path (GRAPH ?g sees the named graphs as of t=5)
+curl -X POST 'http://localhost:8090/v1/fluree/query/mydb:main@t:5' \
+  -H 'Content-Type: application/sparql-query' \
+  -d 'SELECT ?g ?s ?p ?o WHERE { GRAPH ?g { ?s ?p ?o } }'
 
 # Connection-scoped, pinned to t=5
 curl -X POST 'http://localhost:8090/v1/fluree/query' \
@@ -106,7 +111,7 @@ curl -X POST 'http://localhost:8090/v1/fluree/query' \
 curl -X POST 'http://localhost:8090/v1/fluree/query' \
   -H 'Content-Type: application/json' \
   -d '{
-        "from": "mydb:main@iso:2025-01-15T00:00:00Z",
+        "from": "mydb:main@time:2025-01-15T00:00:00Z",
         "select": ["?s", "?p", "?o"],
         "where": [{"@id": "?s", "?p": "?o"}]
       }'
@@ -328,7 +333,7 @@ The JSON-LD equivalent:
 }
 ```
 
-ISO timestamps work as endpoints too, in either syntax: `FROM <mydb:main@iso:2025-01-01T00:00:00Z>`.
+ISO timestamps work as endpoints too, in either syntax: `FROM <mydb:main@time:2025-01-01T00:00:00Z>`.
 
 ### Count changes per entity (SPARQL)
 
@@ -462,7 +467,7 @@ A tracked ledger has no local commit chain; use `--remote <name>` to query the u
 ## Common questions
 
 **Is time travel expensive?**
-No. Querying a historical state uses the same indexes as querying the current state. The cost is O(log n) for index lookups. `@t:` is cheapest (no resolution); `@iso:` / `@recorded:` cost a binary search over commit timestamps; `@commit:` costs a bounded scan.
+No. Querying a historical state uses the same indexes as querying the current state. The cost is O(log n) for index lookups. `@t:` is cheapest (no resolution); `@time:` / `@recorded:` cost a binary search over commit timestamps; `@commit:` costs a bounded scan.
 
 **Does old data use extra storage?**
 Yes — immutability means retracted values are preserved. Storage grows with the number of changes, not just the current state size. For most workloads this is negligible.

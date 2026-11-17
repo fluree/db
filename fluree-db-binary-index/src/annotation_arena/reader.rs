@@ -20,10 +20,12 @@
 //!
 //! ## Visibility model
 //!
-//! Forward-arena rows are sorted by `(edge, ann, t, op)`. Within a
-//! single `(edge, ann)` group:
+//! Forward-arena rows are sorted by `(edge, ann)` and then
+//! [`op_order`](fluree_db_core::same_t::op_order) — `(t, op)` with a
+//! same-`t` assertion last. Within a single `(edge, ann)` group:
 //!
-//! - The latest row whose `t <= as_of_t` is the visible event.
+//! - The latest row whose `t <= as_of_t` is the visible event (so a
+//!   retraction and an assertion at one `t` leave it live).
 //! - If that event is `op = true`, the annotation is live at that t.
 //! - If `op = false` (or no event ≤ as_of_t exists), the annotation
 //!   is not visible.
@@ -49,8 +51,10 @@
 //!   storage-inspector path.
 
 use super::format::{
-    AnnotationForwardBranch, AnnotationForwardLeaf, AnnotationReverseBranch, AnnotationReverseLeaf,
+    AnnotationForwardBranch, AnnotationForwardBranchEntry, AnnotationForwardLeaf,
+    AnnotationReverseBranch, AnnotationReverseBranchEntry, AnnotationReverseLeaf,
 };
+use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
     storage::ContentStore, AnnotationIndexRoot, ContentId, EdgeKey, Result as CoreResult, Sid,
 };
@@ -305,6 +309,91 @@ impl<'a, S: ContentStore + ?Sized> AnnotationArenaReader<'a, S> {
         Ok(out)
     }
 
+    /// Forward-arena leaf entries in arena order — the itinerary for a
+    /// streaming walk of every live attachment, one
+    /// [`Self::live_pairs_in_forward_leaf`] call per entry.
+    pub async fn forward_leaf_entries(&self) -> CoreResult<Vec<AnnotationForwardBranchEntry>> {
+        Ok(self.load_forward_branch().await?.leaves.clone())
+    }
+
+    /// Live `(edge, ann)` pairs of one forward leaf at `as_of_t`, in arena
+    /// order. The leaf is decoded and dropped rather than cached — a
+    /// whole-arena walk must not retain every leaf — and the builder never
+    /// splits an `(edge, ann)` group across leaves, so latest-wins resolves
+    /// within the leaf.
+    pub async fn live_pairs_in_forward_leaf(
+        &self,
+        cid: &ContentId,
+        as_of_t: i64,
+    ) -> CoreResult<Vec<(EdgeKey, Sid)>> {
+        let bytes = self.store.get(cid).await?;
+        let leaf = AnnotationForwardLeaf::decode(&bytes).map_err(|e| {
+            fluree_db_core::Error::invalid_index(format!("annotation forward leaf decode: {e}"))
+        })?;
+        let rows = &leaf.rows;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            let group = &rows[i];
+            let mut latest_visible: Option<bool> = None;
+            while i < rows.len() && rows[i].edge == group.edge && rows[i].ann == group.ann {
+                if rows[i].t <= as_of_t {
+                    // Sorted by `op_order`, so the last row at or before
+                    // `as_of_t` is the visible event.
+                    latest_visible = Some(rows[i].op);
+                }
+                i += 1;
+            }
+            if latest_visible == Some(true) {
+                out.push((group.edge.clone(), group.ann.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Reverse-arena leaf entries in arena order — the itinerary for a
+    /// streaming walk of every live attachment in **reifier** order
+    /// (`(ann, edge)` sorted), one [`Self::live_pairs_in_reverse_leaf`]
+    /// call per entry. Reifier order is dictionary order, so a consumer
+    /// that encodes the reifiers touches the subject dictionary
+    /// sequentially instead of at random.
+    pub async fn reverse_leaf_entries(&self) -> CoreResult<Vec<AnnotationReverseBranchEntry>> {
+        Ok(self.load_reverse_branch().await?.leaves.clone())
+    }
+
+    /// Live `(edge, ann)` pairs of one reverse leaf at `as_of_t`, in
+    /// `(ann, edge)` order. Same contract as
+    /// [`Self::live_pairs_in_forward_leaf`]: decoded and dropped, not
+    /// cached, latest-wins within the leaf (the builder never splits an
+    /// `(ann, edge)` group across leaves).
+    pub async fn live_pairs_in_reverse_leaf(
+        &self,
+        cid: &ContentId,
+        as_of_t: i64,
+    ) -> CoreResult<Vec<(EdgeKey, Sid)>> {
+        let bytes = self.store.get(cid).await?;
+        let leaf = AnnotationReverseLeaf::decode(&bytes).map_err(|e| {
+            fluree_db_core::Error::invalid_index(format!("annotation reverse leaf decode: {e}"))
+        })?;
+        let rows = &leaf.rows;
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < rows.len() {
+            let group = &rows[i];
+            let mut latest_visible: Option<bool> = None;
+            while i < rows.len() && rows[i].ann == group.ann && rows[i].edge == group.edge {
+                if rows[i].t <= as_of_t {
+                    latest_visible = Some(rows[i].op);
+                }
+                i += 1;
+            }
+            if latest_visible == Some(true) {
+                out.push((group.edge.clone(), group.ann.clone()));
+            }
+        }
+        Ok(out)
+    }
+
     /// Walk every forward-arena row in sort order and yield it as a
     /// `(EdgeKey, ann, t, op)` event tuple. Used by the indexer's
     /// arena-rebuild path when merging the previous arena with a
@@ -427,9 +516,8 @@ fn collect_live_anns_from_forward_leaf(
         let mut latest_visible: Option<bool> = None;
         while i < rows.len() && rows[i].edge == *edge && rows[i].ann == group_ann {
             if rows[i].t <= as_of_t {
-                // Sort within the group is `(t, op)` ascending and
-                // `false < true`, so the last row at or before
-                // `as_of_t` is the latest visible event.
+                // Sorted by `op_order` within the group, so the last row
+                // at or before `as_of_t` is the latest visible event.
                 latest_visible = Some(rows[i].op);
             }
             i += 1;
@@ -444,9 +532,8 @@ fn collect_live_anns_from_forward_leaf(
 /// pass. Per-`(edge, ann)` pair, the latest event with `t <= as_of_t`
 /// determines liveness. The arena and novelty event lists are not
 /// required to be sorted or deduplicated — duplicate `(ann, t)`
-/// entries are tolerated; later occurrences with the same `t` win on
-/// the `op` axis (`false < true` so an assert at the same `t` as a
-/// retract wins, matching the on-disk sort tie-break).
+/// entries are tolerated, and an assert at the same `t` as a retract
+/// holds ([`supersedes`]), matching the on-disk sort.
 fn merge_live_annotations(
     arena: &[(Sid, i64, bool)],
     novelty: &[(Sid, i64, bool)],
@@ -461,7 +548,7 @@ fn merge_live_annotations(
         latest
             .entry(ann.clone())
             .and_modify(|cur| {
-                if (t, op) >= (cur.0, cur.1) {
+                if supersedes((t, op), *cur) {
                     *cur = (t, op);
                 }
             })
@@ -494,7 +581,7 @@ fn merge_live_edges(
             latest
                 .entry(edge.clone())
                 .and_modify(|cur| {
-                    if (t, op) >= (cur.0, cur.1) {
+                    if supersedes((t, op), *cur) {
                         *cur = (t, op);
                     }
                 })
@@ -644,6 +731,65 @@ mod tests {
             reverse_branch_cid: rev_branch_cid,
             stats: out.stats,
         }
+    }
+
+    #[tokio::test]
+    async fn streaming_walk_yields_exactly_the_live_pairs() {
+        // Tiny leaves so the walk crosses leaf boundaries; one attachment
+        // retracted, one edge with two attachments, one lone edge.
+        let mut flakes = Vec::new();
+        flakes.extend(make_bundle("ann_a", "alice", "worksFor", "acme", 1, true));
+        flakes.extend(make_bundle("ann_b", "alice", "worksFor", "acme", 2, true));
+        flakes.extend(make_bundle("ann_a", "alice", "worksFor", "acme", 3, false));
+        flakes.extend(make_bundle("ann_c", "bob", "worksFor", "acme", 2, true));
+        flakes.extend(make_bundle("ann_d", "carol", "knows", "bob", 4, true));
+
+        let store = MemoryContentStore::new();
+        let root = build_and_store(&flakes, 2, &store).await;
+        let reader = AnnotationArenaReader::new(&root, &store);
+        let entries = reader.forward_leaf_entries().await.unwrap();
+        assert!(entries.len() > 1, "test must span several leaves");
+
+        let walk = |as_of_t: i64| {
+            let reader = &reader;
+            let entries = &entries;
+            async move {
+                let mut out: Vec<String> = Vec::new();
+                for entry in entries {
+                    for (edge, ann) in reader
+                        .live_pairs_in_forward_leaf(&entry.leaf_cid, as_of_t)
+                        .await
+                        .unwrap()
+                    {
+                        out.push(format!("{}/{}", edge.s.name, ann.name));
+                    }
+                }
+                out
+            }
+        };
+        assert_eq!(
+            walk(10).await,
+            ["alice/ann_b", "bob/ann_c", "carol/ann_d"],
+            "current state: the retracted attachment is gone, arena order kept"
+        );
+        assert_eq!(
+            walk(1).await,
+            ["alice/ann_a"],
+            "as_of_t=1 sees only the first assertion"
+        );
+
+        // The reverse walk yields the same live set in reifier order.
+        let mut reverse: Vec<String> = Vec::new();
+        for entry in reader.reverse_leaf_entries().await.unwrap() {
+            for (edge, ann) in reader
+                .live_pairs_in_reverse_leaf(&entry.leaf_cid, 10)
+                .await
+                .unwrap()
+            {
+                reverse.push(format!("{}/{}", ann.name, edge.s.name));
+            }
+        }
+        assert_eq!(reverse, ["ann_b/alice", "ann_c/bob", "ann_d/carol"]);
     }
 
     #[tokio::test]

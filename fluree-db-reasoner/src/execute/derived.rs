@@ -30,6 +30,8 @@ pub struct DerivedSet {
     is_base: Vec<bool>,
     /// Number of entries in `flakes` flagged as base facts.
     base_count: usize,
+    /// Approximate heap footprint of every flake held, for the memory budget.
+    approx_bytes: usize,
 }
 
 impl DerivedSet {
@@ -38,7 +40,7 @@ impl DerivedSet {
     }
 
     /// Compute a hash key for a flake's object
-    fn object_hash(o: &FlakeValue) -> u64 {
+    pub(crate) fn object_hash(o: &FlakeValue) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         match o {
@@ -53,7 +55,8 @@ impl DerivedSet {
             }
             FlakeValue::Double(v) => {
                 2u8.hash(&mut hasher);
-                v.to_bits().hash(&mut hasher);
+                // One key per stored value: every NaN, and -0.0 with 0.0.
+                fluree_db_core::value_id::canonical_f64_bits(*v).hash(&mut hasher);
             }
             FlakeValue::Boolean(v) => {
                 3u8.hash(&mut hasher);
@@ -168,6 +171,16 @@ impl DerivedSet {
         self.is_base.push(is_base);
 
         self.seen.insert(key);
+        // Seed facts are excluded from the memory total for the same reason
+        // `derived_len` excludes them from the fact total: they are the base
+        // data the fixpoint was handed, not closure it produced, and
+        // `into_derived_flakes` drops them from the overlay this budget
+        // bounds. Charging them made the memory cap fire on the seed delta —
+        // every fact of every rule-relevant predicate — from round two
+        // onward, capping closures far below their fact budget.
+        if !is_base {
+            self.approx_bytes += crate::cache::approx_flake_bytes(&flake);
+        }
         let idx = self.flakes.len();
 
         // Index by predicate
@@ -191,10 +204,20 @@ impl DerivedSet {
         true
     }
 
-    /// Check if a flake already exists
+    /// Check if a flake is already accounted for — either derived this run or
+    /// present in the base data the fixpoint was seeded with.
+    ///
+    /// Consulting `base_keys` as well as `seen` is what keeps a rule from
+    /// re-proposing a fact the ledger already stores. In round 1 the seed is
+    /// registered only in `base_keys` (it merges into `seen` at the end of the
+    /// round), so without this a ledger that stores its own entailments —
+    /// symmetric edges written both ways, a `Student` also typed `Person` —
+    /// pushed every re-derived fact into the round's delta, where the in-round
+    /// cap counted it. A closure deriving nothing new could report
+    /// `capped: "facts"`, and the truncated result was then cached.
     pub fn contains(&self, s: &Sid, p: &Sid, o: &FlakeValue) -> bool {
         let key = (s.clone(), p.clone(), Self::object_hash(o));
-        self.seen.contains(&key)
+        self.seen.contains(&key) || self.base_keys.contains(&key)
     }
 
     /// Get all flakes with a specific predicate
@@ -231,6 +254,13 @@ impl DerivedSet {
         self.flakes.len() - self.base_count
     }
 
+    /// Approximate heap footprint of the DERIVED flakes — the population
+    /// `into_derived_flakes` yields and `derived_len` counts (see
+    /// [`crate::approx_flake_bytes`]).
+    pub fn approx_bytes(&self) -> usize {
+        self.approx_bytes
+    }
+
     /// Check if empty
     pub fn is_empty(&self) -> bool {
         self.flakes.is_empty()
@@ -250,5 +280,30 @@ impl DerivedSet {
             .zip(is_base)
             .filter_map(|(flake, base)| (!base).then_some(flake))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A derived fact and a stored one are the same fact when their objects
+    /// are the same value: every NaN is one value, and -0.0 is 0.0.
+    #[test]
+    fn object_hash_identifies_doubles_by_value() {
+        let hash = |bits: u64| DerivedSet::object_hash(&FlakeValue::Double(f64::from_bits(bits)));
+        let nan = hash(f64::NAN.to_bits());
+        for bits in [
+            0xFFF8_0000_0000_0000u64,
+            0x7FF0_0000_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ] {
+            assert_eq!(hash(bits), nan, "{bits:#x}");
+        }
+        assert_eq!(hash((-0.0f64).to_bits()), hash(0.0f64.to_bits()));
+        assert_ne!(
+            hash(f64::INFINITY.to_bits()),
+            hash(f64::NEG_INFINITY.to_bits())
+        );
     }
 }

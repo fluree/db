@@ -5,7 +5,7 @@
 //! orders, and writes an `IndexRoot` (FIR6) descriptor to storage.
 
 use fluree_db_binary_index::{BinaryPrevIndexRef, GraphArenaRefs, RunRecord, VectorDictRef};
-use fluree_db_core::{ContentId, ContentKind, ContentStore};
+use fluree_db_core::{ContentId, ContentStore};
 
 use crate::error::{IndexerError, Result};
 use crate::run_index;
@@ -39,6 +39,33 @@ fn dedicated_rebuild_runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+/// The rebuild's session directories, removed when dropped.
+///
+/// Both trees hold plaintext ledger content — sorted commit runs, dictionaries,
+/// staged leaves — and default to the system temp directory. Tying their
+/// removal to a drop rather than to the success path means every exit clears
+/// them: an early `?`, a panic unwinding the blocking task, or the normal
+/// return. A directory that was never created is not an error.
+struct SessionDirs {
+    run_dir: std::path::PathBuf,
+    index_dir: std::path::PathBuf,
+}
+
+impl Drop for SessionDirs {
+    fn drop(&mut self) {
+        for dir in [&self.run_dir, &self.index_dir] {
+            match std::fs::remove_dir_all(dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(dir = %dir.display(), %e, "failed to remove index build session dir");
+                }
+            }
+        }
+    }
+}
+
+/// Build a binary index from the full commit chain, from scratch.
 ///
 /// Unlike `build_index_for_ledger`, this skips the nameservice lookup and
 /// the "already current" early-return check. Use this when you already have
@@ -89,9 +116,18 @@ where
         .ok_or(IndexerError::NoCommits)?;
 
     // Determine output directory for binary index artifacts
+    let staging_in_temp = config.data_dir.is_none();
     let data_dir = config
         .data_dir
         .unwrap_or_else(|| std::env::temp_dir().join("fluree-index"));
+    if staging_in_temp && !commit_store.permits_plaintext_cache() {
+        tracing::warn!(
+            ledger = %ledger_id,
+            ?data_dir,
+            "encrypted storage: index build staging defaults to the system temp directory; \
+             set IndexerConfig::data_dir to a directory on an encrypted volume"
+        );
+    }
     let ledger_id_path = fluree_db_core::address_path::ledger_id_to_path_prefix(ledger_id)
         .unwrap_or_else(|_| ledger_id.replace(':', "/"));
     let session_id = uuid::Uuid::new_v4().to_string();
@@ -158,6 +194,13 @@ where
 
     tokio::task::spawn_blocking(move || {
         let _guard = parent_span.enter(); // safe: spawn_blocking pins to one thread
+                                          // Owned by the blocking task, not the caller's future: the task runs to
+                                          // completion even when the caller is cancelled, so the directories are
+                                          // removed only after the last write to them.
+        let _session_dirs = SessionDirs {
+            run_dir: run_dir.clone(),
+            index_dir: index_dir.clone(),
+        };
         handle.block_on(async {
             std::fs::create_dir_all(&run_dir)
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
@@ -179,18 +222,22 @@ where
                 tracing::debug_span!("commit_chain_walk", commits = tracing::field::Empty)
                     .entered();
             let walk_started = std::time::Instant::now();
-            let (commit_cids, ledger_split_mode) = {
+            let (commit_cids, ledger_split_mode, lifecycles) = {
                 // stop_at_t=0 collects all commits (t starts at 1).
-                let (dag, split_mode) = fluree_db_core::collect_dag_cids_with_split_mode(
-                    &content_store,
-                    &head_commit_id,
-                    0,
-                )
-                .await?;
+                let (dag, split_mode, lifecycles) =
+                    fluree_db_core::collect_first_parent_cids_with_split_mode(
+                        &content_store,
+                        &head_commit_id,
+                        0,
+                    )
+                    .await?;
 
                 // Sorted by t descending; reverse for chronological (genesis-first).
                 let cids: Vec<ContentId> = dag.into_iter().rev().map(|(_, cid)| cid).collect();
-                (cids, split_mode)
+                // Graph lifecycles, likewise oldest first.
+                let lifecycles: Vec<fluree_db_core::CommitGraphLifecycle> =
+                    lifecycles.into_iter().rev().collect();
+                (cids, split_mode, lifecycles)
             };
             _span_a.record("commits", commit_cids.len());
             tracing::info!(
@@ -262,6 +309,12 @@ where
             // Enable schema hierarchy extraction during resolution.
             shared.schema_hook = Some(crate::stats::SchemaExtractor::new());
 
+            // What a graph held before its latest drop is not indexed: the
+            // commits keep it, the index does not (see `Commit::graph_drops`).
+            let graph_floors =
+                crate::run_index::build::incremental_resolve::graph_floors(&lifecycles, &shared);
+            shared.set_graph_floors(graph_floors.clone());
+
             let chunk_max_flakes: u64 = 5_000_000; // ~5M flakes per chunk
             let mut chunk = RebuildChunk::new();
             let mut chunks: Vec<RebuildChunk> = Vec::new();
@@ -319,7 +372,12 @@ where
 
                 let resolved = shared
                     .resolve_commit_into_chunk(&bytes, &cid.digest_hex(), &mut chunk)
-                    .map_err(|e| IndexerError::StorageRead(e.to_string()))?;
+                    .map_err(|e| match e {
+                        run_index::ResolverError::Unindexable(_) => {
+                            IndexerError::Unindexable(format!("commit {cid}: {e}"))
+                        }
+                        e => IndexerError::StorageRead(e.to_string()),
+                    })?;
 
                 // Accumulate totals
                 total_commit_size += resolved.size;
@@ -415,22 +473,35 @@ where
             // Remap spatial entries' chunk-local subject IDs → global sid64.
             // The spatial hook accumulated entries with chunk-local s_id values;
             // spatial_chunk_ranges[ci] = (start, end) into entries for chunk ci.
-            let _spatial_entries: Vec<crate::spatial_hook::SpatialEntry> = {
+            let spatial_entries: Vec<crate::spatial_hook::SpatialEntry> = {
                 let mut all_entries = shared
                     .spatial_hook
                     .take()
                     .map(super::super::spatial_hook::SpatialHook::into_entries)
                     .unwrap_or_default();
 
+                let mut keep = vec![true; all_entries.len()];
                 for (ci, &(start, end)) in spatial_chunk_ranges.iter().enumerate() {
                     let s_remap = &subject_remaps[ci];
-                    for entry in &mut all_entries[start..end] {
+                    for (entry, keep) in all_entries[start..end]
+                        .iter_mut()
+                        .zip(&mut keep[start..end])
+                    {
                         let local_s = entry.subject_id as usize;
                         if let Some(&global_s) = s_remap.get(local_s) {
                             entry.subject_id = global_s;
+                        } else {
+                            tracing::warn!(
+                                chunk = ci,
+                                local_s,
+                                "spatial entry subject_id remap miss; skipping"
+                            );
+                            *keep = false;
                         }
                     }
                 }
+                let mut keep = keep.into_iter();
+                all_entries.retain(|_| keep.next().unwrap_or(true));
 
                 if !all_entries.is_empty() {
                     tracing::info!(
@@ -810,10 +881,15 @@ where
             //
             // Uses two separate passes over the .fsc files:
             //   Pass 1 (HLL): feeds ALL records to IdStatsHook in HLL-only mode
-            //                  (no per-subject maps — bounded memory).
-            //   Pass 2 (class): k-way merges .fsc files, deduplicates, feeds
-            //                   winning assertions to SpotClassStatsCollector
-            //                   (O(1) per-subject, class-level accumulators).
+            //                  (no per-subject maps — bounded memory). It
+            //                  observes them for the sketches only: counts
+            //                  from an op's sign miscount a same-`t` pair or a
+            //                  retraction of a fact never asserted.
+            //   Pass 2 (class + counts): k-way merges .fsc files, deduplicates,
+            //                   feeds winning assertions to
+            //                   SpotClassStatsCollector (O(1) per-subject,
+            //                   class-level accumulators) and counts them, one
+            //                   per fact the index holds, in the IdStatsHook.
             //
             // This replaces the old approach that accumulated ~16 GB of per-subject
             // HashMaps. Total stats-phase memory is now ~200 MB - 1 GB.
@@ -836,36 +912,9 @@ where
                         &record, &registry,
                     );
                     let sr = crate::stats::stats_record_from_v2(&v2, record.op);
-                    stats_hook.on_record(&sr);
+                    stats_hook.observe_record(&sr);
                 }
             }
-
-            // Upload HLL sketches to CAS.
-            let sketch_ref = {
-                let sketch_blob =
-                    crate::stats::HllSketchBlob::from_properties(commit_t, stats_hook.properties());
-                if !sketch_blob.entries.is_empty() {
-                    let sketch_bytes = sketch_blob.to_json_bytes().map_err(|e| {
-                        IndexerError::StorageWrite(format!("sketch serialize: {e}"))
-                    })?;
-                    let cid = content_store
-                        .put(ContentKind::StatsSketch, &sketch_bytes)
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    tracing::info!(
-                        %cid,
-                        bytes = sketch_bytes.len(),
-                        entries = sketch_blob.entries.len(),
-                        "Phase D-V3 stats: HLL sketch uploaded"
-                    );
-                    Some(cid)
-                } else {
-                    None
-                }
-            };
-
-            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
-            let id_stats_result = stats_hook.finalize();
 
             // ---- Pass 2: Streaming class stats via k-way merge ----
             //
@@ -907,18 +956,33 @@ where
                         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
 
                 // Iterate with dedup: next_deduped() returns the winning record
-                // per identity group (highest t wins). Feed assertions to collector.
+                // per identity group (highest t, and at one t the assert): an
+                // assertion is a fact the index holds. Feed it to the collector
+                // and count it.
                 while let Some((winner, op)) = merge
                     .next_deduped()
                     .map_err(|e| IndexerError::StorageWrite(e.to_string()))?
                 {
                     if op == 1 {
                         collector.on_record(&winner);
+                        stats_hook.count_present(&crate::stats::stats_record_from_v2(&winner, op));
                     }
                 }
 
                 collector.finish()
             };
+
+            // Upload HLL sketches (counts included) to CAS.
+            let sketch_ref = super::upload::upload_stats_sketch(
+                &content_store,
+                commit_t,
+                stats_hook.properties(),
+            )
+            .await?
+            .map(|(cid, _)| cid);
+
+            // Finalize HLL stats (no per-subject maps to move — hll_only mode).
+            let id_stats_result = stats_hook.finalize();
 
             // ---- Build IndexStats for FIR6 root ----
             let trie_for_stats =
@@ -1049,6 +1113,20 @@ where
                 per_graph.into_iter().collect()
             };
 
+            let spatial_by_graph: std::collections::BTreeMap<
+                fluree_db_core::GraphId,
+                Vec<fluree_db_binary_index::SpatialArenaRef>,
+            > = super::spatial::build_and_upload_spatial_indexes(
+                &spatial_entries,
+                &shared.predicates,
+                &ledger_id,
+                &content_store,
+                |_, _| {},
+            )
+            .await?
+            .into_iter()
+            .collect();
+
             // Datatype and language tag lists for the root. Re-snapshot
             // `language_tags` AFTER the fulltext build so any lang_id
             // allocated by the builder (notably `"en"`) is persisted.
@@ -1066,7 +1144,7 @@ where
                 tags.into_iter().map(|(_, tag)| tag).collect()
             };
 
-            // Graph arenas (numbig, vectors, fulltext) — build from uploaded_dicts CIDs.
+            // Graph arenas (numbig, vectors, spatial, fulltext).
             let graph_arenas: Vec<GraphArenaRefs> = {
                 let mut graph_ids = std::collections::BTreeSet::new();
                 for g_id_str in uploaded_dicts.numbig.keys() {
@@ -1079,7 +1157,7 @@ where
                         graph_ids.insert(g_id);
                     }
                 }
-                for g_id in fulltext_by_graph.keys() {
+                for g_id in fulltext_by_graph.keys().chain(spatial_by_graph.keys()) {
                     graph_ids.insert(*g_id);
                 }
                 graph_ids
@@ -1105,7 +1183,7 @@ where
                             g_id,
                             numbig,
                             vectors,
-                            spatial: Vec::new(),
+                            spatial: spatial_by_graph.get(&g_id).cloned().unwrap_or_default(),
                             fulltext,
                         }
                     })
@@ -1141,6 +1219,16 @@ where
                 sketch_ref,
                 attachment_events: config.attachment_events.clone(),
                 prev_index: prev_index.clone(),
+                graph_floors,
+                graph_drops: {
+                    let mut drops = std::collections::BTreeMap::new();
+                    crate::run_index::build::incremental_resolve::apply_lifecycles(
+                        &mut drops,
+                        &lifecycles,
+                        &shared,
+                    );
+                    drops.into_iter().collect()
+                },
             };
 
             let result = super::root_assembly::encode_and_write_root_v6(
@@ -1162,17 +1250,9 @@ where
 
             drop(_span_v3);
 
-            // Clean up ephemeral session directories.
-            if let Err(e) = std::fs::remove_dir_all(&run_dir) {
-                tracing::warn!(?run_dir, %e, "failed to clean up tmp_import session dir");
-            }
-            if let Err(e) = std::fs::remove_dir_all(&index_dir) {
-                tracing::warn!(?index_dir, %e, "failed to clean up index session dir");
-            }
-
             Ok(result)
         })
     })
     .await
-    .map_err(|e| IndexerError::StorageWrite(format!("index build task panicked: {e}")))?
+    .map_err(|e| IndexerError::from_join("index build task", e))?
 }

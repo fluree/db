@@ -17,10 +17,14 @@ Apache Iceberg is an open table format for huge analytical datasets. It provides
 
 ### Catalog Modes
 
-Fluree supports two ways to discover Iceberg metadata:
+Fluree supports four ways to discover Iceberg metadata:
 
-- **REST catalog**: discover table metadata via an Iceberg REST catalog API (e.g., Polaris).
+- **REST catalog**: discover table metadata via an Iceberg REST catalog API (e.g., Polaris, Snowflake Horizon).
 - **Direct S3 (no catalog server)**: bypass REST discovery and read `version-hint.text` from the table’s `metadata/` directory to resolve the current metadata file.
+- **AWS Glue Data Catalog** (`--mode glue`): look the table up with Glue `GetTable` through the native AWS SDK (`aws-sdk-glue`) and read the Iceberg metadata file named by the table's `metadata_location` parameter; manifests and data files are then read from S3. The catalog pointer is authoritative: no `version-hint.text` is needed, and uncommitted or orphaned metadata files in the table's `metadata/` directory are never read. The Glue *database* is the table identifier's namespace (`<database>.<table>`); `--catalog-id` reads another account's catalog (default: the caller's account).
+- **AWS S3 Tables** (`--mode s3tables`): the same native-SDK approach via `aws-sdk-s3tables` against an S3 Tables table bucket (`--table-bucket-arn`), resolving the metadata file with `GetTableMetadataLocation`.
+
+Glue and S3 Tables use the **ambient** AWS credential chain (environment variables, the shared config and credentials files including `AWS_PROFILE` and SSO, or the container / instance role) for both the catalog call and the S3 reads; the SDK signs its own requests. They do not use vended credentials: the CLI and server turn them off for these modes, and a stored config with `io.vended_credentials: true` is refused. Glue tables whose files can be read only with Lake Formation–vended credentials are not supported yet ([#1456](https://github.com/fluree/db/issues/1456)): the ambient identity must be able to read the table's files in S3 itself. Catalogs that vend credentials over the Iceberg REST API (Snowflake Horizon / Polaris) use REST mode.
 
 ### CLI
 
@@ -39,6 +43,28 @@ fluree iceberg map execution-log \
   --table-location s3://bucket/warehouse/logs/execution_log \
   --r2rml mappings/execution_log.ttl
 
+# Governed by a model ledger holding its policies and class hierarchy
+# (see "Access policy" below)
+fluree iceberg map execution-log \
+  --mode direct \
+  --table-location s3://bucket/warehouse/logs/execution_log \
+  --r2rml mappings/execution_log.ttl \
+  --model governance:main
+
+# AWS Glue Data Catalog (native SDK, ambient AWS credentials)
+# (each rr:tableName in the mapping is a Glue <database>.<table>)
+fluree iceberg map warehouse-orders \
+  --mode glue \
+  --region us-east-1 \
+  --r2rml mappings/orders.ttl
+
+# AWS S3 Tables (native SDK, ambient AWS credentials; the region comes from the ARN)
+# (each rr:tableName in the mapping is a <namespace>.<table> in the table bucket)
+fluree iceberg map warehouse-orders \
+  --mode s3tables \
+  --table-bucket-arn arn:aws:s3tables:us-east-1:123456789012:bucket/analytics \
+  --r2rml mappings/orders.ttl
+
 # Google Cloud Storage — see "Google Cloud Storage (GCS)" below
 fluree iceberg map orders \
   --mode direct \
@@ -50,9 +76,15 @@ fluree iceberg map orders \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
+`info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. For a catalog-backed source the count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A Direct (`--table-location`) source reads each table's metadata file and reports its summary's `total-records`, or no count when the writer left it out. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`.
+
+A class or property `count` for a graph source means one thing: the exact number, as a native ledger loaded with the mapping's triples would report it. Where the metadata cannot prove the number, `count` is `null`, and `count-upper-bound` beside it gives the most it can be when that is provable. A class count is exact when every triples map minting the class reads its whole table (no [row filter](#row-filters-rrsqlquery)) under a row count that is not a merge-on-read bound, mints one distinct subject per row (its subject is built from a [key](r2rml.md#declaring-a-tables-keys-fkey) of the table, and no subject column can be null), and the maps provably mint different subjects (of any two subject templates, neither one's text before its first placeholder begins the other's). A property count is exact under the same conditions, when also no row mints one value of the property twice and the object column can never be null. "Can never be null" means the column is `required` in the table's schema, for format version 2 or older tables (from version 3 a required column can be added with a default that older files do not store). Otherwise the bound is the sum of the contributing tables' row counts, absent when one of them is unknown. A reference (`rr:parentTriplesMap`) is never counted exactly, because a child key may match no parent row: it is bounded by the child's rows when one join key value can match at most one parent subject (the parent's subject is built from the join columns, or they hold a key of the parent's table), and has no bound when one value can match several parents. Its `ref-classes` entries are `null`, with the bound under `ref-classes-upper-bound`. Per-datatype counts are the exact count or `null`.
+
+**Reading a virtual count.** Earlier releases reported the contributing tables' row counts as `count`. Now most classes and properties of a mapping that declares no key have `count: null`, since a count is exact only for maps whose subjects a key proves unique. A client that displays a count shows `count` when it is a number, else `count-upper-bound` as "at most N", else "not counted"; it never reads a `null` as 0. A `ref-classes` entry reads the same way, with its bound under `ref-classes-upper-bound`. Fluree's own MCP data-model summary does this. Declaring the tables' keys ([`f:key`](r2rml.md#declaring-a-tables-keys-fkey)) makes the counts of maps over unfiltered tables exact again.
+
 #### Warehouse-root `--table-location` (multi-table, catalog-less)
 
-`--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name (the namespace prefix stripped). Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
+`--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name. When the root holds a directory for the table's namespace (`<root>/<namespace>/<table>` or the Hive/Glue spelling `<root>/<namespace>.db/<table>`, one directory per namespace level), the table is looked up there and only there, so the same table name in two namespaces resolves to two different tables and a table missing from its namespace directory is an error naming that directory; a root with no such directory is matched flat, with the namespace prefix ignored. Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
 
 ### HTTP API
 
@@ -93,7 +125,43 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
   }'
 ```
 
-R2RML can be omitted to auto-generate a direct mapping. AWS credentials for `direct` mode are read from the server's environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
+```bash
+# AWS Glue Data Catalog (native AWS SDK, the server's ambient AWS credentials)
+curl -X POST http://localhost:8090/v1/fluree/iceberg/map \
+  -H 'Content-Type: application/json' \
+  -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -d '{
+    "name": "warehouse-orders",
+    "mode": "glue",
+    "region": "us-east-1",
+    "table": "sales.orders",
+    "r2rml": "...",
+    "r2rml_type": "text/turtle"
+  }'
+```
+
+For AWS S3 Tables, send `"mode": "s3tables"` and `"table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"` in place of `region`; a Glue catalog in another account takes `"catalog_id": "123456789012"`. `table` may be omitted in every mode: each `rr:tableName` in the `r2rml` mapping names a table.
+
+The connection may instead be given structured, as the stored config spells it: a `catalog` object (its `auth` included) and an `io` object (its `storage_auth` included), in place of the flat fields, never beside them. Every Google identity and storage identity is given this way:
+
+```json
+{
+  "name": "orders",
+  "table": "sales.orders",
+  "r2rml": "...",
+  "catalog": {
+    "type": "rest",
+    "uri": "https://biglake.googleapis.com/iceberg/v1/restcatalog",
+    "warehouse": "bq://projects/lake/locations/us/catalogs/sales",
+    "auth": { "type": "google", "credentials": { "source": "service_account", "key": { "env_var": "LAKE_SA_KEY" } }, "quota_project": "lake" }
+  },
+  "io": { "storage_auth": { "type": "catalog" } }
+}
+```
+
+The server stores the `storage_auth` it is sent and infers none: `fluree iceberg map` and Python's `map_iceberg` default a `bq://` warehouse to `catalog` and a `bl://` one to `vended`, but an HTTP request that omits it reads as `vended_credentials` says. The same holds for the catalog's quota project, which BigLake requires (see [Google BigLake](#google-biglake)): the CLI and Python default it to the warehouse's project, and an HTTP request names it. An unknown field, the two forms mixed, and auth given two ways or only partly are refused with `400`; see [Iceberg connection](../api/endpoints.md#iceberg-connection) for every shape and rule. The read-only routes (`catalog/browse`, `catalog/preview`, `catalog/verify`, `r2rml/generate`, `r2rml/validate`) take the connection the same way.
+
+`r2rml` is required: a source's queries are answered from its mapping, so a request without one is a 400 and registers nothing. A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused the same way. A source that answers every query with `409` `err:db/GraphSourceUnmapped` predates that check; see [Unmapped Sources](#unmapped-sources). An optional `"model": "governance:main"` names the model ledger that governs the source (see [Access policy](#access-policy)). AWS credentials for `direct`, `glue` and `s3tables` modes come from the server's ambient AWS credential chain (`AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`, `AWS_PROFILE`, `AWS_REGION`, or an attached instance role). See the [Graph Source Endpoints](../api/endpoints.md#graph-source-endpoints) section in the API reference for the complete request/response schema.
 
 ### Rust API
 
@@ -137,11 +205,38 @@ let config = R2rmlCreateConfig::new_direct(
 fluree.create_r2rml_graph_source(config).await?;
 ```
 
+**AWS Glue / S3 Tables:**
+
+There is no `R2rmlCreateConfig` shorthand for these modes; build the connection with `IcebergConnectionConfig::glue(region, catalog_id)` or `IcebergConnectionConfig::s3_tables(region, table_bucket_arn)` and wrap it. Both turn vended credentials off.
+
+```rust
+use fluree_db_api::{
+    IcebergConnectionConfig, IcebergCreateConfig, R2rmlCreateConfig, R2rmlMappingInput,
+};
+
+let mapping = std::fs::read_to_string("mappings/orders.ttl")?;
+
+let connection = IcebergConnectionConfig::glue(Some("us-east-1".to_string()), None);
+// AWS S3 Tables instead (the region comes from the ARN):
+// let connection = IcebergConnectionConfig::s3_tables(
+//     None,
+//     "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics",
+// );
+
+let config = R2rmlCreateConfig {
+    iceberg: IcebergCreateConfig::from_connection("warehouse-orders", connection, "sales.orders"),
+    mapping: R2rmlMappingInput::Content(mapping),
+    mapping_media_type: None,
+};
+
+fluree.create_r2rml_graph_source(config).await?;
+```
+
 ### Stored Configuration Format (Nameservice)
 
 Iceberg graph sources are persisted as an `IcebergGsConfig` JSON document in the nameservice record’s `config` field.
 
-Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest` vs `direct`) used to discover Iceberg metadata.
+Note the nesting: the graph source is “Iceberg” (this page), and `catalog.type` selects the **catalog mode** (`rest`, `direct`, `glue` or `s3tables`) used to discover Iceberg metadata. Top-level fields not shown below: `mapping` (the stored R2RML address and media type, which registration always writes; a record without one cannot be queried), and the optional `delete` and `order_by` (materialization conventions) and `model` (the governing model ledger, see [Access policy](#access-policy)).
 
 **REST catalog config:**
 
@@ -162,6 +257,31 @@ Note the nesting: the graph source is “Iceberg” (this page), and `catalog.ty
   }
 }
 ```
+
+`warehouse` is the name the catalog knows the warehouse (or catalog) by. It is
+sent to the catalog's `/v1/config` route, and the path prefix that route
+returns is used for every later request, as the Iceberg REST specification
+describes — so the name is enough even where the catalog's routes are laid out
+differently (for example `catalogs/<name>` on Databricks Unity Catalog, whose
+Iceberg endpoint is `https://<workspace>/api/2.1/unity-catalog/iceberg-rest`).
+A catalog with no `/v1/config` route is addressed with the warehouse name as
+the prefix.
+
+**Keeping the secret out of the stored config.** `auth_bearer` and
+`oauth2_client_secret` are stored with the graph source as given. To store only
+a name, give `auth_bearer_env` / `oauth2_client_secret_env`
+(`--auth-bearer-env` / `--oauth2-client-secret-env`): the variable is read from
+the environment of the process that reads the tables, each time a token is
+needed, and the stored config holds `{ "env_var": "<name>" }`. A local CLI
+may name any variable. A **server** accepts only names its operator has listed
+in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS` (comma-separated): the request also
+chooses the catalog and token URLs the secret is sent to, so an unlisted name
+would let a caller send the server's environment to a host of their choosing.
+An embedding application can use a secret reference resolved through its
+`SecretResolver` instead.
+
+For Databricks — what to enable in Unity Catalog, and the token it needs — see
+[Connecting to lakehouse platforms](lakehouse-platforms.md#databricks-through-the-iceberg-rest-endpoint).
 
 **Direct S3 config:**
 
@@ -205,6 +325,35 @@ disk. Ideal for local development and test datasets.
   "io": { "vended_credentials": false }
 }
 ```
+
+**AWS Glue Data Catalog config:**
+
+```json
+{
+  "catalog": {
+    "type": "glue",
+    "region": "us-east-1",
+    "catalog_id": "123456789012"
+  },
+  "table": "sales.orders",
+  "io": { "vended_credentials": false }
+}
+```
+
+**AWS S3 Tables config:**
+
+```json
+{
+  "catalog": {
+    "type": "s3tables",
+    "table_bucket_arn": "arn:aws:s3tables:us-east-1:123456789012:bucket/analytics"
+  },
+  "table": "sales.orders",
+  "io": { "vended_credentials": false }
+}
+```
+
+`region` is optional in both (S3 Tables defaults to the ARN's region, and refuses a `region` that contradicts it), as is Glue's `catalog_id` (default: the caller's account). `io.vended_credentials` must be `false`: these catalogs vend no credentials, so a config that requires them is refused. `io.s3_region`, `io.s3_endpoint` and `io.s3_path_style` apply to the S3 reads as in the other modes.
 
 ### Enabling local tables
 
@@ -274,7 +423,7 @@ whose manifests reference files *outside* its own root is not remapped.)
 **Direct mode requirements:**
 
 - `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory. Local paths additionally require `FLUREE_ICEBERG_LOCAL_ROOTS` to name a directory containing them (see [Enabling local tables](#enabling-local-tables)).
-- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file, and (for S3 locations) `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
+- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file. A `version-hint.text` there is optional; when present it names the current metadata — a filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
 - Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`) for S3 locations. It does **not** support vended credentials. Local locations use no credentials at all.
 
 **How Direct metadata resolution works:**
@@ -283,13 +432,13 @@ whose manifests reference files *outside* its own root is not remapped.)
   - `"{table_location}/metadata/version-hint.text"` to get the current metadata filename
   - `"{table_location}/metadata/{filename}"` as the table’s current metadata
 - `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`), a full absolute path (`s3://...` / `gs://...`), or a bare integer version `N` — the Iceberg Hadoop file-based catalog convention — which resolves to `vN.metadata.json`.
-- **Local tables don't need `version-hint.text`** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3, where listing is not performed, a missing or empty `version-hint.text` fails with an error mentioning `version-hint.text`.
+- **`version-hint.text` is optional** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent or empty, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3 this needs `s3:ListBucket` on the bucket; if the listing is denied or finds no metadata file, the error mentions `version-hint.text`.
 
 **Iceberg table setup must already exist:**
 
 Direct mode assumes `table_location` points at a **valid Iceberg table layout** (created by `iceberg-rust`, Spark, etc.), including the `metadata/` directory and referenced metadata/manifest files. Fluree does not create or “bootstrap” Iceberg tables; it only reads them.
 
-**When to use Direct vs REST:**
+**When to use which mode:**
 | Scenario | Recommended |
 |----------|-------------|
 | Shared catalog (multiple consumers) | REST |
@@ -297,10 +446,17 @@ Direct mode assumes `table_location` points at a **valid Iceberg table layout** 
 | `iceberg-rust` / Spark appending to known S3 path | Direct |
 | Need catalog-managed credentials (vended) | REST |
 | Minimizing infrastructure (no catalog server) | Direct |
+| Tables registered in the AWS Glue Data Catalog (by Athena, Spark, Trino, pyiceberg, …) | Glue |
+| Tables in an AWS S3 Tables table bucket | S3 Tables |
 
 ### Google Cloud Storage (GCS)
 
-Fluree can read Iceberg tables stored in Google Cloud Storage over the GCS **S3-interoperability** endpoint. Set `s3_endpoint` to that endpoint and use path-style addressing:
+Fluree reads an Iceberg table's `gs://` files in one of two ways, chosen by the source's storage identity (`io.storage_auth`), never by the path:
+
+- **With a Google identity, through the native GCS reader.** This is the path for every Google identity: the source's own (`storage_auth: google`: a service-account key in an environment variable, Workload Identity Federation, the metadata server, application-default credentials), the REST catalog's (`storage_auth: catalog`, what [BigLake federation](#google-biglake) needs), and a GCS token the catalog vends for the table (`storage_auth: vended`). The reader sends OAuth tokens minted for read-only storage (a user's own credentials carry their `cloud-platform` scope instead; see [token scopes](#google-biglake)) to Google's storage host only (or the operator's `FLUREE_GCS_ENDPOINT`; no source can choose it), renews a token before it expires and once more on a `401`, and reports a `403` as `err:storage/AccessDenied`. It never falls back to the host's own credentials: a host identity is used only when the source names it, and its token goes only to Google's APIs and the hosts the operator lists in `FLUREE_GOOGLE_TOKEN_HOSTS`. See [Iceberg connection](../api/endpoints.md#iceberg-connection) for the `storage_auth` forms.
+- **With AWS credentials, through the GCS S3-interoperability endpoint**, signed with HMAC interoperability keys, as described below.
+
+To read over the S3-interoperability endpoint, set `s3_endpoint` to that endpoint and use path-style addressing:
 
 ```json
 {
@@ -315,9 +471,9 @@ Fluree can read Iceberg tables stored in Google Cloud Storage over the GCS **S3-
 }
 ```
 
-GCS-backed tables are read through the **same AWS S3 SDK path** as any other S3-compatible store, with one adjustment: the SDK's transport is pinned to **HTTP/1.1**. Reading byte-range requests from GCS through the SDK over HTTP/2 fails (smithy-rs mishandles the partial-content response body), and the Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. HTTP/1.1 handles GCS range responses correctly, and only the Parquet footer plus the column chunks a query needs are fetched — never the whole object. AWS S3 and other S3-compatible stores serve range reads over HTTP/1.1 identically, so this is transparent for every endpoint. (Response-checksum validation is also disabled for these reads, because an object-level checksum cannot validate a partial byte range.)
+Over this endpoint, GCS-backed tables are read through the **same AWS S3 SDK path** as any other S3-compatible store, with one adjustment: the SDK's transport is pinned to **HTTP/1.1**. Reading byte-range requests from GCS through the SDK over HTTP/2 fails (smithy-rs mishandles the partial-content response body), and the Parquet reader is range-based, so data reads would otherwise fail even though metadata reads succeed. HTTP/1.1 handles GCS range responses correctly, and only the Parquet footer plus the column chunks a query needs are fetched — never the whole object. AWS S3 and other S3-compatible stores serve range reads over HTTP/1.1 identically, so this is transparent for every endpoint. (Response-checksum validation is also disabled for these reads, because an object-level checksum cannot validate a partial byte range.)
 
-Because reads go through the AWS SDK, GCS inherits the SDK's correct SigV4 signing — including partition directories like `event_date=2024-01-01/` and values with spaces or non-ASCII characters — plus credential refresh and retries.
+Because these reads go through the AWS SDK, GCS inherits the SDK's correct SigV4 signing — including partition directories like `event_date=2024-01-01/` and values with spaces or non-ASCII characters — plus credential refresh and retries.
 
 **Authentication.** Requests are signed with **AWS SigV4** using GCS **HMAC interoperability keys**, resolved from the standard AWS credential chain. Set them as you would for any S3 access:
 
@@ -327,11 +483,36 @@ export AWS_SECRET_ACCESS_KEY=<gcs-hmac-secret>
 # s3_region in the config is the SigV4 signing region (the bucket location).
 ```
 
-A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire; in `rest` mode, credentials vended by the catalog for a GCS-backed table are used instead (and refreshed by the SDK).
+A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire. In `rest` mode with vended credentials, the catalog's credentials for the table are used instead (S3 interoperability keys through this path, a GCS token through the native reader), and are renewed by asking the catalog again before they expire.
 
-GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
+GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory with a current metadata file) must already exist in the bucket.
 
-**BigLake REST catalog (catalog auth, distinct from the storage HMAC above).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token** — separate from the HMAC keys that read the `gs://` data files. A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. (The metadata server is only reachable on GCE/GKE; locally, use a static `auth_bearer`.) The storage HMAC keys are unaffected — they don't expire.
+**BigLake REST catalog (catalog auth, distinct from the storage identity above; see also [Google BigLake](#google-biglake)).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token**, separately from whatever reads the `gs://` data files (the catalog's own identity with `storage_auth: catalog`, another Google identity, vended credentials, or HMAC keys). A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). Storage HMAC keys, if the files are read with them, are unaffected: they don't expire.
+
+### Google BigLake
+
+Google's BigLake Iceberg REST catalog (`https://biglake.googleapis.com/iceberg/v1/restcatalog`) serves two kinds of warehouse: BigLake federation (`bq://projects/<P>/locations/<L>…`, tables BigQuery manages, which never vends credentials, so the files are read with the catalog's own Google identity, `storage_auth: catalog`) and BigLake runtime catalogs (`bl://projects/<P>/catalogs/<C>`, which vend).
+
+**A quota project is required, whatever the identity.** BigLake bills every request to the project named in `x-goog-user-project` and refuses a request that names none: `403` "missing `x-goog-user-project` header" for a service account or Workload Identity Federation, "requires a quota project" for user credentials. Fluree reports it as `err:catalog/QuotaProjectRequired`. Set `quota_project` on the catalog's Google auth (`--auth-google-quota-project`). `fluree iceberg map` and Python's `map_iceberg` default it, when not given, to the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names, and store it with the source; an HTTP request names it, since the server infers none.
+
+**The catalog's quota project bills the catalog only.** With `storage_auth: catalog`, the files are read with the catalog's identity but not its quota project: sent to GCS, `x-goog-user-project` is a requester-pays billing project, which would make every read need `serviceusage.services.use` on it. A storage read names a billing project only when one is configured for storage: `storage_auth: google`'s `quota_project` (`--storage-google-quota-project`) for a requester-pays bucket, or the `gcs.user-project` a catalog vends.
+
+**Minimum roles for the catalog identity**, for BigLake federation with a service-account identity and `storage_auth: catalog` (WIF impersonating the same service account needs the same):
+
+| Role | Granted on | For |
+|------|------------|-----|
+| `roles/biglake.viewer` | the project | the catalog's `/v1/config` and `loadTable` |
+| `roles/bigquery.metadataViewer` | the project | the BigQuery-managed tables' metadata |
+| `roles/storage.objectViewer` | the bucket | reading the table's metadata and data files (`storage_auth: catalog`) |
+| `roles/serviceusage.serviceUsageConsumer` | the quota project, only if it is not the project that holds the tables | billing BigLake's requests to another project |
+
+None is needed when the quota project is the project that holds the tables (the default from the warehouse); if you bill a different project, the identity also needs `roles/serviceusage.serviceUsageConsumer` there (Google's rule for `x-goog-user-project`).
+
+**Token scopes.** A service account, Workload Identity Federation and the metadata server mint storage tokens for `devstorage.read_only` only. User credentials (gcloud's `application-default login`, an `authorized_user` file) cannot be narrowed that way: a refresh grant may ask only for scopes the user consented to, and gcloud's login consents to `cloud-platform`, so asking for `devstorage.read_only` is refused (`invalid_scope`). A user's token therefore carries the user's own `cloud-platform` scope, for the catalog and for storage alike (one token serves both). User credentials are for development on your own machine; on a server they are a host identity the operator can refuse (`google-adc` in `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`).
+
+GCS reads need no `serviceusage` grant unless the bucket is requester-pays, in which case the reading identity needs `roles/serviceusage.serviceUsageConsumer` on the storage quota project. A refused read says what GCS said, once: `AccessDenied` (a missing `storage.objects.get`) or `UserProjectAccessDenied` (no `serviceusage.services.use` on the billed project).
+
+Tests and private deployments can point the Google endpoints at their own hosts with the operator-only overrides `FLUREE_GOOGLE_METADATA_URL`, `FLUREE_GOOGLE_TOKEN_HOSTS` and `FLUREE_GCS_ENDPOINT` (see [configuration](../operations/configuration.md#iceberg--r2rml-graph-source-tuning)); no source can.
 
 ## RDF Mapping (R2RML)
 
@@ -339,17 +520,76 @@ Every Iceberg graph source requires an [R2RML mapping](r2rml.md) (Turtle format)
 
 ### Type Mapping
 
-Iceberg types map to XSD types:
+A column's value becomes an RDF literal through its object map. With `rr:datatype`, the literal has that datatype. Without one, the literal's datatype is the column type's entry in the table below, its lexical form the column's value:
 
-| Iceberg Type | RDF Type |
-|--------------|----------|
-| int, long | xsd:integer |
-| float, double | xsd:decimal |
-| string | xsd:string |
-| boolean | xsd:boolean |
-| date | xsd:date |
-| timestamp | xsd:dateTime |
-| uuid | xsd:string |
+| Iceberg type | Datatype of an `rr:column` without `rr:datatype` | `rr:datatype` the generator (`POST /iceberg/r2rml/generate`) emits |
+|--------------|-----------------------------------------------|-------------------------------------|
+| boolean | xsd:string | xsd:boolean |
+| int | xsd:string | xsd:integer (xsd:int with `xsd_long_as_integer: false`) |
+| long | xsd:string | xsd:integer (xsd:long with `xsd_long_as_integer: false`) |
+| float | xsd:string | xsd:float |
+| double | xsd:string | xsd:double |
+| decimal(p, s) | xsd:string | xsd:decimal |
+| date | xsd:string | xsd:date |
+| timestamp, timestamptz | xsd:string | xsd:dateTime |
+| binary, fixed | xsd:string | xsd:hexBinary |
+| string | xsd:string | none (xsd:string) |
+
+`uuid`, `time` and nested `struct`/`list`/`map` columns are left out of a generated mapping and reported as skipped columns.
+
+An un-annotated numeric, boolean or temporal column therefore compares, sorts and aggregates as text: `FILTER(?score > 80)` compares `"9"` with `80` and finds no match. Give such a column an `rr:datatype`, as a generated mapping does. An `rr:template` object map produces an IRI (or, with `rr:termType rr:Literal`, an `xsd:string` literal), and a reference object map the parent's subject IRI.
+
+### Row filters (`rr:sqlQuery`)
+
+An Iceberg source has no SQL engine behind it, so it accepts an `rr:sqlQuery` logical table only in a restricted form it evaluates itself: one table, narrowed by a conjunction of column comparisons. The usual case is a history table mapped to its current rows:
+
+```turtle
+<#Customer> a rr:TriplesMap ;
+  rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1 AND is_deleted = FALSE" ] ;
+  rr:subjectMap [ rr:template "http://example.org/customer/{customer_id}" ; rr:class ex:Customer ] ;
+  rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+```
+
+The accepted form:
+
+```text
+SELECT * | <column> [, <column>]...
+FROM <table>
+[WHERE <condition> [AND <condition>]...]
+
+<condition> := <column> <op> <literal> | <column> IS [NOT] NULL
+<op>        := = | <> | != | < | <= | > | >=
+<literal>   := an integer | a decimal | 'a string' ('' escapes a quote) | TRUE | FALSE
+```
+
+- The table resolves the way an `rr:tableName` does (`namespace.table`). As there, a table name may not begin with `sqlQuery:`, which is reserved for the aliases of `rr:sqlQuery` logical tables.
+- Identifiers, bare or double-quoted, match the table's columns **exactly, case included**, as `rr:tableName` and `rr:column` do. This departs from SQL, which folds unquoted identifiers. Keywords are case-insensitive. Quote a column or table whose name is a keyword or one of the refused words below (`top`, `left`, `on`, `all`, ...): `WHERE "top" = 1`.
+- A float or double column compares as IEEE numbers, as a SPARQL `FILTER` over the mapped triples does: a NaN cell satisfies only `<>`. This departs from SQL engines that treat NaN as equal to itself and greater than every number (PostgreSQL, Spark).
+- The select list is the logical table's columns, as in R2RML. Every column the map reads (its term maps, and the parent columns of a join into it) must be in the list, or registration refuses the map. A column the list names must exist. `SELECT *` selects every column.
+- Anything else is refused when the source is registered, with an error naming the map and the construct: `OR`, `NOT` (other than `IS NOT NULL`), joins or a second table, aliases, functions, sub-queries, parentheses, `IN`, `BETWEEN`, `LIKE`, `GROUP BY`, `ORDER BY`, `LIMIT`, comments.
+
+**The filter is exact.** It is part of what the map means, not an optimization, so it is applied to every row of every read regardless of `FLUREE_ICEBERG_PREDICATE_PUSHDOWN`. That covers queries, `COUNT`, `ORDER BY … LIMIT`, references into the map, and `fluree materialize`. It also prunes data files and row groups by their statistics. A comparison with a null cell is unknown and drops the row, and only `IS NULL` keeps one. A column added to the table after a data file was written reads as null in that file.
+
+Each literal is checked against the column's type in the schema of the snapshot being read:
+
+| Column type | Accepted comparison |
+|-------------|---------------------|
+| int, long | an integer within the column's range (a decimal with a zero fraction, `1.0`, counts as one) |
+| decimal(p, s) | an integer or a decimal, compared exactly |
+| float, double | an integer within ±2^53, compared as IEEE numbers: a NaN cell satisfies only `<>`, and -0.0 equals 0.0. A decimal literal (`0.1`) has no exact binary value and is refused |
+| string | a quoted string, ordered by Unicode code point |
+| boolean | `TRUE` or `FALSE` |
+| date, timestamp, time, binary, uuid, and other types | `IS [NOT] NULL` only (comparisons may be accepted by a later version) |
+
+A column the table does not have (or spells in another case), or a literal that does not fit its column, is refused with an error naming the map, the column and its type. Registration loads the tables the mapping reads and refuses such a mapping with HTTP `400`; [`r2rml/validate`](#schema-mismatch) reports the same message as an error before you save. A read checks again against the schema of the snapshot it reads, so a table changed after registration, or a table registration could not load, fails the read with that error instead. An empty table refuses such a filter too. Nothing is approximated.
+
+What else changes for a filtered map:
+
+- A `COUNT` over it scans the data files, because the manifest row-count shortcut cannot know which rows a filter keeps.
+- A reference into it (`rr:parentTriplesMap`) joins the rows the filter keeps. A child row whose key names an excluded row has no reference, in the browse crawl too.
+- In `info` / `/info`, its class and property counts are `null`, with `count-upper-bound` reporting the most they can be, even when the map declares a key: no metadata knows how many rows the filter keeps.
+- [Tracking materialization](#tracking-keep-the-target-fresh-automatically) (`/iceberg/materialize`, `/iceberg/track`) refuses a mapping with any `rr:sqlQuery` logical table. A row that stops matching the `WHERE` (say, `is_current` going from 1 to 0) is never read again, so the subject it produced would never be retracted. Build a [native twin](#materializing-a-native-twin) with `fluree materialize` instead, and rebuild it to refresh.
+- Delta sources refuse `rr:sqlQuery`; [SQL sources](sql.md#rrsqlquery) hand any query to their engine.
 
 ## Querying Iceberg Tables
 
@@ -408,6 +648,30 @@ WHERE {
 ORDER BY DESC(?date)
 LIMIT 100
 ```
+
+### Row order and paging
+
+A query with no `ORDER BY` has no defined row order; SPARQL leaves it open. Over
+an Iceberg graph source:
+
+- A query with a `LIMIT` or `OFFSET` anywhere in it, sub-queries included, reads
+  the table's data files in a fixed order: smallest file first, ties in commit
+  order. Run again over the same snapshot, it returns the same rows in the same
+  order, so pages fetched with `LIMIT n OFFSET k×n` partition the answer: no row
+  is skipped or repeated. Subgraph crawls (`"select": {"?s": ["*"]}`) page their
+  subjects the same way.
+- A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
+  its row order can differ from one run to the next. The rows are the same.
+- The fixed order has a cost where the data files differ widely in size: the
+  reads still overlap, but rows are taken in file order, not as each read
+  finishes. It shows most on a query that must read the whole table before its
+  `LIMIT` applies, such as a grouped one: over a table with uneven files, a
+  grouped query with a `LIMIT` measured about 13% slower than reading in
+  completion order. Any `LIMIT` or `OFFSET` takes the fixed order, with or
+  without an `ORDER BY`.
+- Pages hold together only while the table does: an append or compaction between
+  two page requests changes the snapshot, and with it the order. For paging that
+  must survive table changes, order by a unique key (`ORDER BY ?id`).
 
 ## Materialization (into a native ledger)
 
@@ -473,6 +737,9 @@ curl -X POST http://localhost:8090/v1/fluree/iceberg/track \
   -d '{ "source": "orders:main", "target": "orders-native:main" }'
 ```
 
+A mapping with an `rr:sqlQuery` logical table is refused by `materialize` and
+`track`: see [Row filters](#row-filters-rrsqlquery).
+
 - `POST {api_base_url}/iceberg/untrack` — stop tracking (leaves materialized data in place).
 - `GET {api_base_url}/iceberg/tracking` — list tracked jobs and worker stats.
 
@@ -506,7 +773,8 @@ This is the way to give each partition its **own** ledger for per-partition
 access isolation: Fluree's read policy is graph-blind, so separate access regimes
 are separate ledgers (isolated by the per-ledger read gate) rather than named
 graphs. Within each per-partition ledger, `rr:graphMap` named-graph routing still
-applies independently.
+applies independently. Row- and column-level policy on the live source itself is
+covered under [Access policy](#access-policy).
 
 ### Multiple sources into one target (additive)
 
@@ -520,6 +788,12 @@ source can type a subject `as:Article` while a second source adds `as:Announce`
 to the *same* subject IRI, and both classes remain queryable. (The "dedicated
 target" restriction under *Assumptions and limitations* applies only to
 latest-by-key mode, not to additive mode.)
+
+A Delta source read through its change data feed is the exception: in
+additive mode a deleted row's triples are removed, including any that another
+row or source also asserts, such as a shared class. Don't share a target's
+subjects between such a source and others whose triples must outlive its
+deletes. See [Delta → Materialization](delta.md#materialization).
 
 ### Change data capture: updates and deletes (latest-by-key)
 
@@ -599,6 +873,34 @@ target. The materializer enforces what it can and documents the rest:
   target *partially applied* — some subjects re-asserted, others not yet — until
   the next successful poll re-materializes the window (the watermark only
   advances after the whole window commits).
+- **A full read is bounded and resumable.** When a source falls back to a full
+  read — first run, a watermark expired by the source's snapshot retention, or a
+  window containing an `overwrite`/`delete` — the pass reads a commit-ordered
+  prefix sized to the novelty ceiling (`FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS`,
+  derived from `reindex_max_bytes` by default) and records where it stopped: at a
+  retained snapshot when one names the prefix, otherwise as a commit-sequence
+  cursor (`urn:fluree:materialize#appliedSequence`), which survives snapshot
+  expiry. Each poll resumes above the cursor until the read completes, at which
+  point the snapshot watermark advances and the cursor is retired. Without the
+  bound, a full read too large to commit deferred on every poll and never made
+  progress.
+- **An incremental backlog is bounded too.** A window is only committed whole,
+  so a window whose flakes exceed the target's novelty ceiling is deferred on
+  every poll, writes no watermark, and grows by one poll each time — until the
+  stored snapshot falls out of the source's retention and the job degrades to a
+  full read of the whole table to recover a backlog that was a few snapshots
+  wide. So an unpinned incremental window over the same per-pass budget (sized
+  from each snapshot's `added-records` summary, so no manifest is read to
+  decide) stops at the last snapshot the budget covers, keeping that snapshot
+  whole, and advances the watermark to it. The next poll resumes from there.
+  A window with an `overwrite`/`delete` anywhere in it is not cut: it full-reads
+  the head regardless, and that read subsumes every prefix.
+- **A pinned read is never cut.** Both bounds pace the tracking worker, which
+  reads to the head. A read pinned to a snapshot — in Rust,
+  `FlureeR2rmlProvider::scan_for_materialize_stream` with an explicit `to`, after
+  `current_snapshot_id` — is never cut by either bound and reports the pin as
+  its `to`: a pinned full read returns that snapshot whole, and a pinned window
+  returns the whole window.
 - **A window's working memory is budgeted, not unbounded.** The pass retains one
   node per distinct subject in the window; a window whose estimated accumulator
   exceeds `FLUREE_MATERIALIZE_MEMORY_BUDGET_MB` (default 1024; `0` disables)
@@ -613,6 +915,13 @@ target. The materializer enforces what it can and documents the rest:
   Materializing makes the guard *more* important, not less: a query returning
   deleted rows is a transient wrong answer, but a materialized twin commits them
   as state and advances the watermark past the window.
+- **Credentials are decided exactly as on the query path**, for `materialize`
+  and `track` alike, incremental scans included. A REST source with vended
+  credentials on whose catalog vends none is refused with
+  `err:catalog/CredentialsNotVended`, never read with the server's own AWS
+  identity; and catalog auth held as a reference (an `auth_bearer_env` /
+  `oauth2_client_secret_env` variable, or an embedder's secret reference) is
+  resolved as it is for a query.
 - **Foreign-key (`rr:refObjectMap`) edges are not materialized.** The virtual
   query path resolves them at query time; the materializer does not yet index
   parent tables, so FK edges are absent from the twin (each pass logs a warning
@@ -621,7 +930,8 @@ target. The materializer enforces what it can and documents the rest:
   rows into named graphs per the subject map's graph map; the virtual query path
   does not yet read graph maps, so a graph-scoped query returns different
   results against the source and its twin. Query-path parity is a tracked
-  follow-up.
+  follow-up. The [native twin](#materializing-a-native-twin) builder refuses a
+  mapping with a graph map rather than flattening it into the default graph.
 - **Compaction can silently turn incremental into a full re-read.** The
   incremental window treats `replace` (compaction) snapshots as safe when the
   writer preserves data sequence numbers (Spark's `rewrite_data_files` default).
@@ -662,18 +972,25 @@ If `orderDate` is a partition column, Iceberg only scans January 2024 partitions
 
 ## Combining with Fluree Data
 
-Join Iceberg data with Fluree ledgers:
+Join Iceberg data with Fluree ledgers by naming the graph source in
+`fromNamed` (SPARQL: `FROM NAMED`) and reading it inside a `graph` block. A
+graph source cannot share the default graph with a ledger; such a query is
+refused.
 
 ```json
 {
-  "from": ["customers:main", "warehouse-orders:main"],
+  "from": "customers:main",
+  "fromNamed": "warehouse-orders:main",
   "select": ["?customerName", "?orderTotal", "?orderDate"],
   "where": [
     { "@id": "?customer", "schema:name": "?customerName" },
     { "@id": "?customer", "ex:customerId": "?customerId" },
-    { "@id": "?order", "ex:customerId": "?customerId" },
-    { "@id": "?order", "ex:total": "?orderTotal" },
-    { "@id": "?order", "ex:orderDate": "?orderDate" }
+    ["graph", "warehouse-orders:main", {
+      "@id": "?order",
+      "ex:customerId": "?customerId",
+      "ex:total": "?orderTotal",
+      "ex:orderDate": "?orderDate"
+    }]
   ],
   "filter": "?orderDate >= '2024-01-01'",
   "orderBy": ["-?orderDate"]
@@ -684,11 +1001,23 @@ Combines customer data from Fluree with order data from Iceberg.
 
 ## Time Travel
 
-Query historical Iceberg snapshots:
+A query against a virtual Iceberg source reads the table's **current**
+snapshot unless the alias carries a time specification, in which case every
+table of the source is read at the snapshot that specification selects, for the
+whole query. Two selectors apply to Iceberg sources:
+
+| Selector | Selects |
+| --- | --- |
+| `@snapshot:<id>` | The snapshot with exactly that Iceberg snapshot id (any retained snapshot, including one later rolled back) |
+| `@time:<timestamp>` | The snapshot that **was the table's current state** at that instant (RFC 3339): the latest snapshot-log entry at or before it, the same rule as Iceberg's own `TIMESTAMP AS OF`. A retained snapshot that was rolled back, or lives only on a branch, is not selected by time. |
+
+`@recorded:<timestamp>` is accepted as a synonym for `@time:`: an Iceberg
+snapshot carries one time, its commit time, and no separate event-time axis —
+the same rule as a ledger that never used caller-supplied event times.
 
 ```json
 {
-  "from": "warehouse-orders:main@snapshot:12345",
+  "from": "warehouse-orders:main@snapshot:5648190075564901028",
   "select": ["?orderId", "?total"],
   "where": [
     { "@id": "?order", "ex:orderId": "?orderId" },
@@ -697,15 +1026,48 @@ Query historical Iceberg snapshots:
 }
 ```
 
-Or by timestamp:
-
 ```json
 {
-  "from": "warehouse-orders:main@timestamp:2024-01-01T00:00:00Z",
+  "from": "warehouse-orders:main@time:2024-01-01T00:00:00Z",
   "select": ["?orderId", "?total"],
   "where": [...]
 }
 ```
+
+The same selectors work in SPARQL `FROM <warehouse-orders:main@time:...>` and in
+the Rust API as `fluree.graph_at(alias, TimeSpec::AtSnapshot(id))` /
+`TimeSpec::AtTime(iso)`. Aggregates, including the manifest-backed `COUNT`
+shortcut, answer from the selected snapshot, so a count and a row scan in one
+query never disagree. Columns are resolved against the schema **as of that
+snapshot** (Iceberg reads Parquet by field id); the R2RML mapping applied is
+always the source's current mapping.
+
+A selection that no retained snapshot can satisfy is an **error**, never a
+fallback to the current or oldest snapshot:
+
+- `@snapshot:` with an id the table no longer has (expired by snapshot
+  retention, or never existed) → `snapshot <id> not found for table '...'`.
+- `@time:` before the oldest retained snapshot → `no snapshot of table '...' at
+  or before <requested>; the oldest retained snapshot is <time>`.
+- Either selector on a table that has never committed (no snapshots yet) →
+  the same errors, saying the table has no snapshots. Unpinned, such a table
+  simply reads as empty.
+
+`@t:` and `@commit:` name Fluree ledger states and are rejected on a graph
+source; `@snapshot:` is rejected on a native ledger. Only table sources with
+retained history can be pinned — Iceberg and [Delta](delta.md#time-travel): a
+SQL-backed R2RML source, a BM25 or vector index read their current state and
+reject any time specification. Naming one source at
+two different states in one query — two different pins, or one reference
+pinned and another not, across `from` and `fromNamed` — is also rejected,
+because a pin applies to every read of that source in the query.
+
+Retention matters: Iceberg's `expire_snapshots` removes old snapshots, and a
+table whose history has been expired cannot answer for it. For a durable
+point-in-time copy, [materialize a native twin](#materializing-a-native-twin);
+its completion stamp records the exact snapshot each table was read at, and
+`@snapshot:` with that id re-reads the same state from the source while it is
+retained.
 
 ## Aggregations
 
@@ -729,7 +1091,9 @@ ORDER BY ?date
 
 ### Query Planning
 
-Fluree pushes filters to Iceberg:
+Fluree pushes filters to Iceberg. Here `ex:orderDate` maps a `date` column
+with `rr:datatype xsd:date`, as a generated mapping does, so the plain string
+compares as a date:
 
 ```text
 Query: SELECT ?id WHERE { ?order ex:orderDate ?date } FILTER (?date > "2024-01-01")
@@ -738,24 +1102,52 @@ Pushed to Iceberg:
   SELECT order_id FROM sales.orders WHERE order_date > '2024-01-01'
   ↓
 Iceberg optimizations:
-  - Partition pruning (only scan 2024 partitions)
-  - File skipping (skip files outside date range)
+  - File skipping (skip files whose order_date bounds lie outside the range)
+  - Row-group skipping and row filtering inside the files read
   - Column pruning (only read order_id, order_date)
 ```
 
+Files are skipped by the column bounds and null counts each manifest records
+per file. Partition values and manifest-list partition summaries are not used
+yet, so every manifest of the snapshot is read; a partitioned table still
+benefits, because its files' bounds on the partition column are narrow.
+
+A snapshot's data-file list never changes, so it is read from the manifests
+once (up to 16 manifests at a time) and kept, in memory
+(`FLUREE_ICEBERG_SCAN_FILES_CACHE_MB`) and in the on-disk catalog cache. Every
+later query against that snapshot selects its files from the kept list in
+memory, whatever its filter: a repeated filtered query reads no manifest.
+
+### Same-subject stars over several triples maps
+
+A star of predicates on one subject is read in one scan when a single
+triples map provides every member. Where a second map over the same table
+and subject template provides only some of them and mints each the same way
+(the same column under the same predicate — the one-map-per-class idiom,
+where a `Customer` map and a `CustomerCountry` map both carry `ex:label`
+from `name`), the star stays one scan: that map adds no triple the fused
+scan misses, and an RDF graph holds a triple once. A map deriving a member
+differently (another column, a datatype, a reference) is a real second
+provider: the star is then read as one scan per member and joined on the
+subject, so every provider's rows come back. Two maps minting a pattern's
+triples alike are read once at the scan as well; when the pattern projects
+the type (`?s a ?t`), both are kept unless their class sets are equal.
+
 ### Best Practices
 
-1. **Partition by Common Filters:**
+1. **Partition or Sort by Common Filters:**
    ```sql
    -- Partition Iceberg table by date
    PARTITIONED BY (YEAR(order_date), MONTH(order_date))
    ```
+   Files then hold narrow ranges of the filtered column, so their bounds let
+   a filter skip most of them.
 
 2. **Use Filters:**
    ```json
    {
      "where": [...],
-     "filter": "?date >= '2024-01-01'"  // Enables partition pruning
+     "filter": "?date >= '2024-01-01'"  // Enables file skipping
    }
    ```
 
@@ -779,11 +1171,13 @@ Iceberg optimizations:
 
 Iceberg supports schema evolution via metadata updates. If a schema change renames/removes columns used by your R2RML mapping, update the mapping accordingly.
 
+A time-pinned read always uses the current mapping. Columns are matched by Iceberg field id, so a column renamed since the pinned snapshot still resolves under its new name, and a column added since reads as absent, as it was at that snapshot.
+
 ## Configuration Options
 
 ### AWS Credentials
 
-For S3-backed Iceberg (both REST and Direct modes):
+For S3-backed Iceberg (every catalog mode):
 
 ```bash
 export AWS_ACCESS_KEY_ID=your-key
@@ -791,7 +1185,16 @@ export AWS_SECRET_ACCESS_KEY=your-secret
 export AWS_REGION=us-east-1
 ```
 
-REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct mode uses only ambient AWS credentials (env vars, IAM roles, `~/.aws/credentials`).
+REST catalog mode also supports vended credentials (credentials issued by the catalog). Direct, Glue and S3 Tables modes use only the ambient AWS credential chain (env vars, `~/.aws/credentials` and `~/.aws/config` including `AWS_PROFILE` and SSO, IAM roles); Glue and S3 Tables use it for the catalog call as well as the S3 reads.
+
+**Scope the server's identity.** In `direct`, `glue` and `s3tables` modes a server reads with its **own** ambient AWS identity, not the caller's, so anyone allowed to map a graph source on that server can read any table that identity can reach. Scope the server's IAM role, and the Lake Formation grants and bucket policies behind it, to the tables the server should serve. (A REST source with vended credentials turned off also reads its files with that identity.)
+
+**Regions and endpoints (Glue, S3 Tables):**
+
+- The Glue API is called in `--region` (JSON `region`), else `--s3-region`, else the AWS SDK's region chain (`AWS_REGION`, the profile's region, instance metadata). The S3 Tables API is called in the table bucket ARN's region; a `--region` that contradicts the ARN is refused. ARNs in every AWS partition (`aws`, `aws-cn`, `aws-us-gov`) are accepted.
+- S3 reads use `--s3-region` when given, else the catalog's region.
+- Region values must be AWS region codes (e.g. `us-east-1`); anything else is refused.
+- The catalog API endpoint follows the standard AWS SDK overrides: `AWS_ENDPOINT_URL_GLUE`, `AWS_ENDPOINT_URL_S3TABLES`, `AWS_ENDPOINT_URL`, or `endpoint_url` in the shared config file — for a private endpoint, or a local mock such as moto. S3 reads honor `--s3-endpoint`, `--s3-path-style` and `--s3-region` exactly as in the other modes (MinIO, private endpoints).
 
 **Google Cloud Storage:** when the endpoint is the GCS S3-interoperability host, reads go through the AWS S3 SDK (transport pinned to HTTP/1.1), signing requests with AWS SigV4 using GCS HMAC interop keys — the same `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` shown above (set them to your HMAC keys). See [Google Cloud Storage (GCS)](#google-cloud-storage-gcs).
 
@@ -869,6 +1272,99 @@ Before a twin is announced, a memory-bounded parity gate re-checks it against th
 
 A failed gate drops the twin so nothing unverified stays announced. See the [`fluree materialize`](../cli/materialize.md) reference for the full flow, the machine-safety posture, and `--tmp-dir`.
 
+## Access policy
+
+Fluree's view policy applies to an Iceberg source the same way it applies to a
+native ledger, with one difference in what a policy can express. A request that
+carries policy inputs (`identity`, `policy-class`, an inline `policy`, or
+`default-allow`) is enforced inside the R2RML scan: subject classes come from
+the mapping (`rr:class`, plus any column-derived `rdf:type`), targets are
+matched on the row's IRIs, and a triples map whose required predicates are all
+hidden is skipped before its table is read. In the common case a decision is
+made once per `(triples map, predicate)`, so enforcement is cheaper than the
+per-flake filter a native scan pays.
+
+Supported, with native parity (the test suite checks each shape against a
+native twin of the same data):
+
+- `f:onProperty`, `f:onClass`, `f:onSubject`, and untargeted policies with a
+  static `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onClass` / `f:onProperty` expansion through `rdfs:subClassOf` /
+  `rdfs:subPropertyOf`, when the source references a model ledger (below).
+- Every pattern shape the scan produces: fixed predicates, same-subject stars,
+  constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
+  aggregates, and `GRAPH` blocks in a dataset query.
+
+A source read through a graph scope is filtered by its own policy (the
+request's and the source's model), whatever governs the graph the query
+reads by default. A graph scope reads a source only as a named graph of the
+query's dataset: name it in `from-named` (SPARQL: `FROM NAMED <iri>`) and use
+`GRAPH <iri>`, `VALUES ?g { <iri> }`, or an unbound `GRAPH ?g` ranging over
+the named graphs. A query over one ledger that reaches a source through a
+graph scope without naming it in the dataset does not read it, governed
+source or not: JSON-LD answers `400` `err:db/InvalidQuery` with that remedy,
+and a SPARQL query with `FROM` and no `FROM NAMED` answers no rows, as for
+any graph outside its dataset.
+
+Not supported: **`f:query`** policies. A virtual source has no graph to run the
+policy query against, so a targeted `f:query` evaluates as "no rows" and
+denies its targets — it never falls open. Relationship gates that join the
+requesting identity to the row (`fluree model access … --connected`) fall in
+this category. Write verbs do not apply; the source is read-only.
+
+### Where policies live: the model ledger
+
+A virtual source has no ledger of its own, so its stored policies, the
+identities' `f:policyClass` assignments, and the class hierarchy are held in a
+**model ledger** the source references at registration:
+
+```bash
+fluree create governance
+fluree model class define governance --class https://example.org/Person --subclass-of https://example.org/Agent
+fluree model access enable governance --profile read --class https://example.org/Agent
+fluree iceberg map orders --mode direct --table-location s3://… --r2rml orders.ttl \
+  --model governance:main
+```
+
+The reference (`model` in the HTTP body and stored config, `--model` on the
+CLI) makes the model ledger's default graph the source's `f:policySource` and
+`f:schemaSource`, resolved through the same cross-ledger mechanism a native
+ledger's config uses. Rule selection follows the cross-ledger contract: an
+explicit `policy-class` on the request (or token) selects rules; a bare
+`identity` is looked up in the model ledger for its `f:policyClass`; an
+anonymous request carrying `default-allow` applies the baseline
+`f:AccessPolicy` rules. A request with no policy inputs at all is governed by
+the model's own rules, as a native ledger's configured `f:policyDefaults`
+govern a bare read of it; a source registered without `--default-allow` is
+fail-closed, so such a request sees nothing. Inline `opts.policy` works with
+or without a model.
+
+The model is validated when the source is registered: it must be an existing
+native ledger (not a graph source), so a mistyped name fails at `map` time
+rather than as a 502 on every governed query. Registration also reports every
+policy in the model that uses `f:query` — in the CLI output, and as
+`model_warnings` in the HTTP response — since the source will deny their
+targets.
+
+### Sources without a model under authentication
+
+On a server with data auth enabled every request carries an identity, which is
+a policy input, so a source with **no** model and no matching policy resolves
+to nothing: `default-allow` is fail-closed when unset. To keep such a source
+readable without attaching a model, register it with `--default-allow true`
+(`default_allow` in the HTTP body and stored config). It plays the same role as
+a native ledger's `f:defaultAllow` config: it fills a request that left
+`default-allow` unset, and an explicit request value still wins.
+
+### Seeing what policy did
+
+With `"meta": {"policy": true}` (or the `fluree-meta` header) the tracked
+response's `policy_enforcement` carries `unevaluable_policies`: the ids of
+`f:query` policies the source could not evaluate and therefore denied. That is
+how to tell a fail-closed policy from an empty table. The server also logs a
+warning the first time each such policy is met, and a debug line for every
+triples map a scan skipped because its predicates were hidden.
+
 ## Limitations
 
 1. **Read-Only:** Iceberg graph sources are read-only (no writes via Fluree)
@@ -885,17 +1381,38 @@ A failed gate drops the twin so nothing unverified stays announced. See the [`fl
    deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
    See the switch below to override.
 5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
-   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
-   `shortestPath`, and subqueries need a native index to walk and cannot be
-   evaluated over an Iceberg source. A query using one is **refused** with HTTP
-   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`) and
+   `shortestPath` need a native index to walk and cannot be evaluated over an
+   Iceberg source. A query using one is **refused** with HTTP 400
+   `err:db/InvalidQuery` naming the pattern, rather than returning the empty
    result it would otherwise produce as a success. Fixed-length patterns (`p`,
    `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
    traversal to a known depth (see [Graph Sources Overview → Query Patterns a
    Graph Source Cannot
    Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
    [materialize a native twin](#materializing-a-native-twin), which evaluates
-   all of them.
+   all of them. Sub-selects scan the tables like any other pattern; see
+   [Sub-selects over a Graph
+   Source](overview.md#sub-selects-over-a-graph-source).
+6. **A sliced JSON-LD sub-select reads its tables once per outer row:** a
+   JSON-LD sub-select with a `limit` or `offset` that shares a variable with
+   the patterns before it runs once per outer row (a top-k per row, as on a
+   native ledger), and each run reads the tables its body scans in full. Under
+   10,000 outer rows that is 10,000 reads of each table. Pushing the outer
+   row's key into those reads is [#2310](https://github.com/fluree/db/issues/2310).
+   A SPARQL sub-select is evaluated once.
+   See [Cost: a sliced JSON-LD sub-select reads per outer
+   row](overview.md#cost-a-sliced-json-ld-sub-select-reads-per-outer-row).
+   A sub-select outside every `GRAPH` block whose body reads the default view
+   is refused; see [A sub-select outside every GRAPH
+   block](overview.md#a-sub-select-outside-every-graph-block).
+7. **An `EXISTS` after the `WHERE` clause is refused:** an `EXISTS` in the
+   query's own `HAVING` or `ORDER BY`, or in an expression evaluated after a
+   trailing `VALUES`, runs outside the source's scope and is refused with HTTP
+   400 `err:db/InvalidQuery`. Move the condition into the `WHERE` clause as a
+   `FILTER` or `BIND`; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source). An `EXISTS` inside the
+   `WHERE` clause, in a pattern or an expression, scans the tables normally.
 
 ### Environment switches
 
@@ -903,38 +1420,66 @@ A failed gate drops the twin so nothing unverified stays announced. See the [`fl
 | --- | --- | --- |
 | `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
-| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch; `0` returns structure only. |
+| `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch. A table whose count is not read by then has none; the others keep theirs. `0` returns structure only. |
+| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the whole budget is held in one oversize slot beside it (the latest such list; a second replaces the first). `0` keeps none in memory. |
 
 ## Troubleshooting
 
 ### Connection Issues
 
-```json
-{
-  "error": "IcebergConnectionError",
-  "message": "Cannot connect to Glue catalog"
-}
-```
+**AWS Glue / S3 Tables.** `fluree iceberg map` loads each mapped table through the Glue or S3 Tables catalog, as a query will, and reports `Connection: not verified` when one cannot be loaded; the source is still registered. To check that the credentials can also read the table's storage, use [`POST /iceberg/catalog/verify`](../api/endpoints.md#post-api_base_urlicebergcatalogverify).
 
-**Solutions:**
-- Check AWS credentials
-- Verify IAM permissions
-- Check network connectivity
+| Error | Cause |
+|---|---|
+| `… Table not found: Glue table sales.nope not found: …EntityNotFoundException…` | No such Glue database or table in this catalog and region. Check the `<database>.<table>` name, `--region`, and (for another account's catalog) `--catalog-id`. |
+| ``… Glue table sales.t is not an Iceberg table: it has no `metadata_location` parameter`` | The Glue table is a Hive / Parquet table, not an Iceberg one. Only tables that carry `metadata_location` can be mapped; catalog browse lists only those. |
+| A query fails with HTTP `403`, `@type` `err:catalog/AccessDenied`: `Catalog denied access to table 'sales.orders': …` | The catalog refused this principal the table. For a REST catalog, the bearer or OAuth2 token lacks access to the table, or the role it acts as lacks grants on it: the catalog's `loadTable` answered `403`, or `401` again after one token refresh, and its reply follows as `Catalog request failed (403 …): …` (or `(401 …)`). For Glue and S3 Tables, the ambient AWS identity may not call the catalog operation (for example `glue:GetTable`, or `s3tables:GetTableMetadataLocation`), or a Lake Formation grant is missing. |
+| A query fails with HTTP `403`, `@type` `err:storage/AccessDenied`: `Storage access denied for s3://…` | The catalog answered, but the identity cannot read the table's files in S3. Glue tables readable only with Lake Formation–vended credentials are not supported yet ([#1456](https://github.com/fluree/db/issues/1456)). |
+| `Vended credentials are not supported with the Glue catalog …` (or `S3 Tables catalog`) | A stored config sets `io.vended_credentials: true`; these modes read with the ambient chain only. Set it to `false` (the CLI and server do so automatically). |
+| `… is not an AWS region (expected e.g. us-east-1)` | `--region` / `--s3-region` must be an AWS region code. |
+| `S3Tables catalog.region '…' contradicts the table bucket ARN's region '…'` | Omit `--region`; S3 Tables uses the ARN's region. |
+
+Credentials, regions and endpoint overrides for these modes are described under [AWS Credentials](#aws-credentials).
+
+**A dropped table, or revoked catalog access, is noticed only after the cache window.** Once a table has been read, its current metadata location is cached: for up to `FLUREE_ICEBERG_LOADTABLE_TTL_SECS` (default 60 s) in the server's memory and `FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS` (default 300 s) on disk, across restarts. Within that window a query does not ask Glue or S3 Tables again, so a table dropped from the catalog, or a revoked `glue:GetTable` or Lake Formation grant, is not seen until it passes. S3 still authorizes every data read. (A REST catalog that vends credentials is asked again sooner: once the in-memory entry expires, a query that must read data files asks it for fresh credentials.) Set either variable to `0` to always ask (see [Configuration](../operations/configuration.md)). Re-creating a source under the same name with a different catalog never reuses the old one's cached location.
+
+To try the Glue mode without an AWS account, `scripts/glue-local/` in the repository runs moto (a local mock of S3 and the Glue Data Catalog), writes Glue-catalogued tables with pyiceberg, and grades a `fluree` binary against them; see its `README.md`.
 
 ### Schema Mismatch
 
-```json
-{
-  "error": "SchemaMismatchError",
-  "message": "Column 'order_date' not found in Iceberg table"
-}
-```
+Mapping a source compiles the R2RML mapping (a mapping that does not parse or compile is refused with HTTP `400`: `Failed to parse R2RML Turtle: …` or `Failed to compile R2RML mapping: …`), but does not check its table and column names against the tables, except an [`rr:sqlQuery` row filter](#row-filters-rrsqlquery)'s, which it refuses when a table it loads does not accept it. To check them before saving or querying, send the mapping to `POST {api_base_url}/iceberg/r2rml/validate` with the connection fields of [`/iceberg/map`](../api/endpoints.md#post-api_base_urlicebergmap) and the mapping as inline Turtle in `r2rml`. It is read-only and admin-protected, and answers `200` whether or not the mapping is sound: `compiled_ok` is `false` for a mapping that does not compile, and each entry of `diagnostics` has a `severity`, a `code`, and the `table`, `column` and `message` it concerns:
 
-**Solutions:**
-- Update R2RML mapping configuration (if the mapping references missing columns)
-- Verify table name and catalog
+| `code` | `severity` | `message` |
+|---|---|---|
+| `compileError` | `error` | `R2RML mapping failed to compile: …`, or, for an [`rr:sqlQuery` row filter](#row-filters-rrsqlquery) registration would refuse, its refusal: ``triples map <…>: rr:sqlQuery condition `valid_from > '2024-01-01'`: column 'valid_from' is date; …`` |
+| `tableNotFound` | `error` | `Table 'sales.orders' referenced by TriplesMap <…> was not found in the live catalog schema.` When the catalog could not load the table, its reason follows in parentheses. |
+| `columnNotFound` | `error` | `Column 'order_date' referenced by the mapping does not exist in table 'sales.orders'.` A row filter naming a column the table does not have, or spells in another case, gets registration's message: `triples map <…>: rr:sqlQuery names column 'region', which table 'crm.customers_history' does not have` |
+| `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
+| `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
+| `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
+| `columnNotFound` | `error` | `f:key on 'sales.orders' names column 'order_key', which the table does not have.` A declared key's column, checked as a query checks it (see [R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)). |
+| `casingMismatch` | `error` | `f:key on 'sales.orders' names column 'ORDER_ID', which the schema spells 'order_id'; a key column must match exactly.` |
+| `nonKeyTypeSkipped` | `error` | `f:key on 'sales.orders' names column 'score' of type Float64; a floating-point value cannot identify a row (NaN is unequal to itself).` Also for a nested column. |
+| `keylessMap` | `advisory` | `TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, so queries over it remove repeated solutions as they run. …` One per map that neither an `f:key` nor the table's identifier fields prove subject-unique; it names the `f:key` that would. Informational: queries answer correctly, but more slowly (see [R2RML → Slow Queries](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Registration (`POST /iceberg/map`, `fluree iceberg map`) reports the same advisories in its `diagnostics`. |
+
+Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
+
+At query time a column the table does not have is read like a NULL: the triples it would supply are not produced, and a row whose subject template names it produces no subject, so the query returns fewer results instead of failing. Only when none of the columns a scan needs exist does the query fail, with HTTP `400` `err:db/InvalidQuery`: `None of the projected columns [...] exist in table schema. Available: [...]`.
+
+### Unmapped Sources
+
+Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
+
+**After an upgrade, a `COUNT`, a same-subject star or an `ORDER BY … LIMIT`
+got slower, or a query now fails with `MemoryBudgetExceeded`.** The most
+likely cause is a map with no key: neither an `f:key` nor the table's
+identifier fields prove its subjects unique, so its queries remove repeated
+solutions as they read. Registration and `POST /iceberg/r2rml/validate` name
+each such map (`keylessMap`). See
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)
+for how to confirm it per query and how to declare the key.
 
 **Causes:**
 - Large result sets

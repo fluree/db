@@ -34,7 +34,8 @@ use crate::ontology_rl::{load_same_as_assertions, OntologyRL};
 use crate::owl;
 use crate::restrictions::{extract_restrictions, RestrictionIndex};
 use crate::same_as::SameAsTracker;
-use crate::{FrozenSameAs, ReasoningDiagnostics, ReasoningOptions, Result};
+use crate::{FrozenSameAs, ReasonerError, ReasoningDiagnostics, ReasoningOptions, Result};
+use fluree_db_core::tracking::schedule::PER_ROW_MICRO_FUEL;
 
 /// Run OWL2-RL reasoning to fixpoint
 ///
@@ -152,6 +153,10 @@ pub async fn run_fixpoint(
 
     // Semi-naive fixpoint loop
     while !delta.is_empty() || same_as_changed_carry {
+        interrupted(opts)?;
+        opts.tracker
+            .consume_fuel(delta.len() as u64 * PER_ROW_MICRO_FUEL)?;
+
         // Check budget
         if start.elapsed() > budget.max_duration {
             diagnostics.mark_capped("time", iterations, derived.derived_len(), start.elapsed());
@@ -253,6 +258,18 @@ pub async fn run_fixpoint(
 
         // Single pass over the delta: dispatch each fact to exactly the
         // compiled rules its predicate/class can fire (rulesFor index).
+        // The budget is also checked INSIDE the round, after every delta fact
+        // is dispatched: one round of a transitive closure over a dense graph
+        // can derive tens of millions of facts, so a between-rounds check alone
+        // let the default 1M cap overshoot twentyfold. The count is an upper
+        // estimate — it includes this round's candidates before they are
+        // deduplicated against earlier rounds — so a closure may cap slightly
+        // early, never late.
+        let mut in_round_cap: Option<&'static str> = None;
+        // Clock-sample counter for the per-fact budget check; see
+        // `CLOCK_SAMPLE_INTERVAL`. Round-scoped, so each round samples on its
+        // own schedule and the exact check at the round head still bounds it.
+        let mut ticks: u32 = 0;
         for flake in delta.iter() {
             for rule in compiled.property_rules_for(&flake.p) {
                 fire_property_rule(rule, &ontology, &restrictions, flake, &mut ctx);
@@ -264,20 +281,36 @@ pub async fn run_fixpoint(
                     }
                 }
             }
+            if let Some(reason) =
+                budget_exceeded_sampled(budget, &start, ctx.derived, ctx.new_delta, &mut ticks)
+            {
+                in_round_cap = Some(reason);
+                break;
+            }
+            if ticks.is_multiple_of(CLOCK_SAMPLE_INTERVAL) {
+                interrupted(opts)?;
+            }
         }
 
-        // Property chains (prp-spo2) are n-way joins seeded from every chain
-        // position; they run whole, gated on any component predicate being
-        // present in the delta.
-        let chains = ontology.property_chains();
-        for chain_idx in compiled.triggered_chains(delta.predicates()) {
-            apply_single_property_chain(&chains[chain_idx], &mut ctx);
+        if in_round_cap.is_none() {
+            // Property chains (prp-spo2) are n-way joins seeded from every chain
+            // position; they run whole, gated on any component predicate being
+            // present in the delta.
+            let chains = ontology.property_chains();
+            for chain_idx in compiled.triggered_chains(delta.predicates()) {
+                apply_single_property_chain(&chains[chain_idx], &mut ctx);
+                if let Some(reason) = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta) {
+                    in_round_cap = Some(reason);
+                    break;
+                }
+            }
         }
 
         // cls-oo: enumerated individuals are typed unconditionally (no delta
         // trigger); the derived-set check keeps it idempotent per iteration.
-        if compiled.one_of_active() {
+        if in_round_cap.is_none() && compiled.one_of_active() {
             apply_one_of_rule(&restrictions, &mut ctx);
+            in_round_cap = budget_exceeded(budget, &start, ctx.derived, ctx.new_delta);
         }
 
         // If sameAs changed this iteration, canonicalize both delta and
@@ -311,6 +344,11 @@ pub async fn run_fixpoint(
         }
 
         delta = filtered_delta;
+
+        if let Some(reason) = in_round_cap {
+            diagnostics.mark_capped(reason, iterations, derived.derived_len(), start.elapsed());
+            break;
+        }
     }
 
     // Finalize sameAs
@@ -330,6 +368,73 @@ pub async fn run_fixpoint(
     }
 
     Ok((derived.into_derived_flakes(), frozen_same_as, diagnostics))
+}
+
+/// Fails the run once the request it serves has been cancelled. A cancelled
+/// run is not capped: it ends the request, and nothing it derived is kept.
+fn interrupted(opts: &ReasoningOptions) -> Result<()> {
+    match opts.cancellation.reason() {
+        Some(reason) => Err(ReasonerError::Cancelled(reason)),
+        None => Ok(()),
+    }
+}
+
+/// How many per-fact checks pass between clock samples.
+///
+/// The fact and memory comparisons are two integer compares and stay exact on
+/// every call. Reading the clock is not free everywhere: `clock::Instant` is
+/// `std::time` natively, where `elapsed()` is a vDSO call, but `web_time` on
+/// wasm32, where it is a `performance.now()` call across the JS boundary —
+/// once per derived fact. Sampling bounds the time-cap overshoot by whatever
+/// the next 1,023 facts cost, and the round boundary checks the clock exactly
+/// anyway, so a short round is never left unchecked.
+const CLOCK_SAMPLE_INTERVAL: u32 = 1024;
+
+/// In-round budget check: derived facts so far plus this round's candidates,
+/// their approximate heap footprint, and wall-clock time.
+fn budget_exceeded(
+    budget: &crate::cache::ReasoningBudget,
+    start: &Instant,
+    derived: &DerivedSet,
+    new_delta: &DeltaSet,
+) -> Option<&'static str> {
+    budget_exceeded_inner(budget, derived, new_delta, || {
+        start.elapsed() > budget.max_duration
+    })
+}
+
+/// [`budget_exceeded`] for the per-fact dispatch loop: the facts and memory
+/// limits are exact, the clock is sampled every [`CLOCK_SAMPLE_INTERVAL`]
+/// calls.
+fn budget_exceeded_sampled(
+    budget: &crate::cache::ReasoningBudget,
+    start: &Instant,
+    derived: &DerivedSet,
+    new_delta: &DeltaSet,
+    ticks: &mut u32,
+) -> Option<&'static str> {
+    *ticks = ticks.wrapping_add(1);
+    let sample = (*ticks).is_multiple_of(CLOCK_SAMPLE_INTERVAL);
+    budget_exceeded_inner(budget, derived, new_delta, || {
+        sample && start.elapsed() > budget.max_duration
+    })
+}
+
+fn budget_exceeded_inner(
+    budget: &crate::cache::ReasoningBudget,
+    derived: &DerivedSet,
+    new_delta: &DeltaSet,
+    out_of_time: impl FnOnce() -> bool,
+) -> Option<&'static str> {
+    if derived.derived_len() + new_delta.len() > budget.max_facts {
+        Some("facts")
+    } else if derived.approx_bytes() + new_delta.approx_bytes() > budget.max_memory_bytes {
+        Some("memory")
+    } else if out_of_time() {
+        Some("time")
+    } else {
+        None
+    }
 }
 
 /// Dispatch one delta fact to a compiled property-triggered rule.

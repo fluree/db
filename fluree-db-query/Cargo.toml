@@ -15,6 +15,9 @@ fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 fluree-db-reasoner = { path = "../fluree-db-reasoner" }
 fluree-search-protocol = { path = "../fluree-search-protocol" }
 fluree-vocab = { path = "../fluree-vocab" }
+# Canonical XSD lexical forms (xsd:double / xsd:float) — the same routines the
+# result serializers use, so STR()/casts can never drift from output formats.
+fluree-graph-ir = { path = "../fluree-graph-ir" }
 fluree-graph-json-ld = { path = "../fluree-graph-json-ld" }
 fluree-db-binary-index = { path = "../fluree-db-binary-index" }
 futures = { workspace = true }
@@ -32,7 +35,7 @@ num-traits = "0.2"
 bigdecimal = "0.4"
 once_cell = "1"
 # LRU cache for compiled regexes
-lru = "0.12"
+lru = { workspace = true }
 parking_lot = "0.12"
 # TinyLFU cache for fulltext novelty deltas
 # moka is native-only: its eviction clock aborts on wasm32 (see fluree-db-core::wasm_cache)
@@ -56,6 +59,8 @@ xxhash-rust = "0.8"
 percent-encoding = "2"
 # HashSet raw entry API for DISTINCT (avoid per-row allocations)
 hashbrown = { workspace = true }
+# Stable bucket positions for resumable subquery join probes
+indexmap = { workspace = true }
 # GeoRust ecosystem for WKT parsing and geometry types (S2 search)
 geo = "0.29"
 geo-types = "0.7"

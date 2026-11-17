@@ -11,7 +11,7 @@
 //! - Does NOT add new variables to output solution
 //! - Short-circuits on first match for efficiency
 
-use crate::binding::{Batch, Binding};
+use crate::binding::Batch;
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
@@ -116,28 +116,37 @@ impl ExistsOperator {
 
         // Seed with current row bindings (correlated subquery)
         let seed = SeedOperator::from_batch_row(input_batch, row_idx);
-        let mut exists_op = build_where_operators_seeded(
-            Some(Box::new(seed)),
+        any_solution(
+            Box::new(seed),
             &self.exists_patterns,
             self.stats.clone(),
-            None,
             &self.planning,
-        )?;
-
-        exists_op.open(ctx).await?;
-
-        // Short-circuit: check if any result is produced
-        let has_result = loop {
-            match exists_op.next_batch(ctx).await? {
-                Some(batch) if !batch.is_empty() => break true,
-                Some(_) => continue, // Empty batch, try next
-                None => break false, // No results
-            }
-        };
-
-        exists_op.close();
-        Ok(has_result)
+            ctx,
+        )
+        .await
     }
+}
+
+/// True if `patterns`, run over `seed`, produce at least one solution. Stops
+/// at the first non-empty batch.
+pub(crate) async fn any_solution(
+    seed: BoxedOperator,
+    patterns: &[Pattern],
+    stats: Option<Arc<StatsView>>,
+    planning: &PlanningContext,
+    ctx: &ExecutionContext<'_>,
+) -> Result<bool> {
+    let mut op = build_where_operators_seeded(Some(seed), patterns, stats, None, planning)?;
+    op.open(ctx).await?;
+    let found = loop {
+        match op.next_batch(ctx).await? {
+            Some(batch) if !batch.is_empty() => break true,
+            Some(_) => continue,
+            None => break false,
+        }
+    };
+    op.close();
+    Ok(found)
 }
 
 #[async_trait]
@@ -154,22 +163,14 @@ impl Operator for ExistsOperator {
             // Evaluate once with an empty seed (fresh scope).
             #[allow(clippy::box_default)]
             let seed: BoxedOperator = Box::new(EmptyOperator::new());
-            let mut exists_op = build_where_operators_seeded(
-                Some(seed),
+            let has_result = any_solution(
+                seed,
                 &self.exists_patterns,
                 self.stats.clone(),
-                None,
                 &self.planning,
-            )?;
-            exists_op.open(ctx).await?;
-            let has_result = loop {
-                match exists_op.next_batch(ctx).await? {
-                    Some(batch) if !batch.is_empty() => break true,
-                    Some(_) => continue,
-                    None => break false,
-                }
-            };
-            exists_op.close();
+                ctx,
+            )
+            .await?;
             self.uncorrelated_has_match = Some(has_result);
         }
 
@@ -206,34 +207,9 @@ impl Operator for ExistsOperator {
                 keep_rows.push(keep);
             }
 
-            // Build output batch with only kept rows
-            let kept_count = keep_rows.iter().filter(|&&k| k).count();
-            if kept_count == 0 {
-                // All rows filtered out, try next input batch
-                continue;
+            if let Some(kept) = input_batch.filter_rows(&keep_rows) {
+                return Ok(Some(kept));
             }
-
-            if kept_count == input_batch.len() {
-                // All rows kept, return unchanged
-                return Ok(Some(input_batch));
-            }
-
-            // Build filtered batch
-            let mut columns: Vec<Vec<Binding>> = (0..self.schema.len())
-                .map(|_| Vec::with_capacity(kept_count))
-                .collect();
-
-            for (row_idx, keep) in keep_rows.iter().enumerate() {
-                if *keep {
-                    for (col_idx, var) in self.schema.iter().enumerate() {
-                        if let Some(col) = input_batch.column(*var) {
-                            columns[col_idx].push(col[row_idx].clone());
-                        }
-                    }
-                }
-            }
-
-            return Ok(Some(Batch::new(self.schema.clone(), columns)?));
         }
     }
 

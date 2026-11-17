@@ -316,11 +316,11 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
     create_ledger(&app, "mq:partial").await;
     insert_one(&app, "mq:partial", "ex:p", "P").await;
 
-    // 'bad' uses a SPARQL string that the envelope validator can't tell
-    // apart from a valid query (parse failure defers to the downstream
-    // parser) — so envelope-level checks pass, snapshot resolution
-    // succeeds against mq:partial, and dispatch reports the per-alias
-    // SPARQL parse error.
+    // 'bad' parses, so envelope-level checks pass and snapshot resolution
+    // succeeds against mq:partial, but its WHERE uses a prefix it never
+    // declares: the query fails when it runs, and dispatch reports that as
+    // the alias's error. (A sub-query that does not parse is reported the same
+    // way; see `multi_query_sub_queries_that_do_not_parse_are_reported_per_alias`.)
     let envelope = json!({
         "queries": {
             "good": {
@@ -334,7 +334,7 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
             },
             "bad": {
                 "language": "sparql",
-                "query": "SELECT ?x FROM <mq:partial> WHERE { this is not valid SPARQL }"
+                "query": "SELECT ?x FROM <mq:partial> WHERE { ?x undeclared:p ?y }"
             }
         }
     });
@@ -347,6 +347,309 @@ async fn multi_query_partial_failure_reports_per_alias_error() {
         body["errors"]["bad"].is_object(),
         "bad alias should land in errors, got: {body}"
     );
+}
+
+// =============================================================================
+// The ledgers a SPARQL sub-query reads
+// =============================================================================
+
+/// Every ledger a SPARQL sub-query reads is pinned to the envelope snapshot,
+/// whether its `FROM` names it as a bracketed IRI or as a prefixed name.
+#[tokio::test]
+async fn multi_query_snapshot_pins_every_ledger_a_sparql_sibling_reads() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:p1").await;
+    create_ledger(&app, "mq:p2").await;
+    insert_one(&app, "mq:p1", "ex:a", "A").await;
+    insert_one(&app, "mq:p2", "ex:b", "B-1").await;
+    // A moment between mq:p2's two commits.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let as_of = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    insert_one(&app, "mq:p2", "ex:c", "B-2").await;
+
+    let envelope = json!({
+        "asOf": as_of,
+        "queries": {
+            "both": {
+                "language": "sparql",
+                "query": "PREFIX ex: <http://example.org/> \
+                          SELECT ?name FROM <mq:p1> FROM mq:p2 WHERE { ?s ex:name ?name }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    assert_eq!(body["status"], "ok", "got body: {body}");
+    for ledger in ["mq:p1", "mq:p2"] {
+        assert_eq!(
+            body["snapshot"]["ledgers"][ledger], 1,
+            "{ledger} must be pinned to the envelope snapshot, got: {body}"
+        );
+    }
+    let text = body["results"]["both"].to_string();
+    assert!(
+        text.contains("\"A\"") && text.contains("\"B-1\""),
+        "both ledgers' rows at the snapshot expected, got: {body}"
+    );
+    assert!(
+        !text.contains("\"B-2\""),
+        "mq:p2 must be read at the snapshot, not at its head, got: {body}"
+    );
+}
+
+/// A sub-query's `min-t` covers every ledger it reads, a prefixed `FROM`
+/// member included.
+#[tokio::test]
+async fn multi_query_sub_query_min_t_covers_every_ledger_it_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:m1").await;
+    create_ledger(&app, "mq:m2").await;
+    insert_one(&app, "mq:m1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:m1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:m2", "ex:c", "B").await;
+
+    // mq:m1 is at t=2, mq:m2 (the prefixed member) at t=1.
+    let envelope = |min_t: i64| {
+        json!({
+            "queries": {
+                "both": {
+                    "language": "sparql",
+                    "query": "PREFIX ex: <http://example.org/> \
+                              SELECT ?name FROM <mq:m1> FROM mq:m2 WHERE { ?s ex:name ?name }",
+                    "opts": { "min-t": min_t }
+                }
+            }
+        })
+    };
+    let (status, body) = post_envelope(&app, &envelope(1)).await;
+    assert_eq!(status, StatusCode::OK, "control, got body: {body}");
+
+    let (status, body) = post_envelope(&app, &envelope(2)).await;
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "got body: {body}");
+    assert!(
+        body.to_string().contains("current t=1"),
+        "the wait must be on mq:m2, got: {body}"
+    );
+}
+
+/// A JSON-LD sub-query's `min-t` covers every ledger its body reads, one its
+/// `opts` or its `fromNamed` names included, and the envelope lists that
+/// ledger in its snapshot.
+#[tokio::test]
+async fn multi_query_jsonld_min_t_covers_every_ledger_the_body_reads() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:j1").await;
+    create_ledger(&app, "mq:j2").await;
+    insert_one(&app, "mq:j1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:j1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:j2", "ex:c", "B").await;
+
+    // mq:j1 is at t=2, mq:j2 (named only in the body's `opts`, or only in
+    // its `fromNamed`) at t=1.
+    for (shape, names_j2) in [
+        (
+            "opts.from",
+            json!({ "opts": { "from": ["mq:j1", "mq:j2"] } }),
+        ),
+        (
+            "fromNamed",
+            json!({ "fromNamed": { "j": { "@id": "mq:j2" } } }),
+        ),
+    ] {
+        let envelope = |min_t: i64| {
+            let mut query = json!({
+                "@context": { "ex": "http://example.org/" },
+                "from": "mq:j1",
+                "opts": { "min-t": min_t },
+                "select": ["?name"],
+                "where": { "@id": "?s", "ex:name": "?name" }
+            });
+            for (k, v) in names_j2.as_object().into_iter().flatten() {
+                match (k.as_str(), v) {
+                    ("opts", JsonValue::Object(o)) => {
+                        for (ok, ov) in o {
+                            query["opts"][ok] = ov.clone();
+                        }
+                    }
+                    _ => query[k] = v.clone(),
+                }
+            }
+            json!({ "queries": { "both": { "language": "jsonld", "query": query } } })
+        };
+        let (status, body) = post_envelope(&app, &envelope(1)).await;
+        assert_eq!(status, StatusCode::OK, "{shape}: control, got body: {body}");
+        assert_eq!(
+            body["snapshot"]["ledgers"]["mq:j2"], 1,
+            "{shape}: got body: {body}"
+        );
+
+        let (status, body) = post_envelope(&app, &envelope(2)).await;
+        assert_eq!(
+            status,
+            StatusCode::REQUEST_TIMEOUT,
+            "{shape}: got body: {body}"
+        );
+        assert!(
+            body.to_string().contains("current t=1"),
+            "{shape}: the wait must be on mq:j2, got: {body}"
+        );
+    }
+}
+
+/// The server reads a JSON-LD sibling's dataset after merging the envelope's
+/// and the alias's `opts` into it, as the sibling runs: a ledger those `opts`
+/// add is listed in the snapshot and covered by the alias's `min-t`, and
+/// `opts` that would change the default graph the body names are a 400,
+/// before the route waits on `min-t` or refreshes anything.
+#[tokio::test]
+async fn multi_query_reads_a_sibling_with_its_outer_opts_merged() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let cfg = ServerConfig {
+        cors_enabled: false,
+        indexing_enabled: false,
+        storage_path: Some(tmp.path().to_path_buf()),
+        query_min_t_timeout_ms: 300,
+        ..Default::default()
+    };
+    let telemetry = TelemetryConfig::with_server_config(&cfg);
+    let state = Arc::new(AppState::new(cfg, telemetry).await.expect("AppState::new"));
+    let app = build_router(state);
+    create_ledger(&app, "mq:o1").await;
+    create_ledger(&app, "mq:o2").await;
+    insert_one(&app, "mq:o1", "ex:a", "A-1").await;
+    insert_one(&app, "mq:o1", "ex:b", "A-2").await;
+    insert_one(&app, "mq:o2", "ex:c", "B").await;
+
+    // mq:o1 is at t=2; mq:o2, named only in the outer `opts`, at t=1.
+    let envelope = |envelope_opts: JsonValue, alias_opts: JsonValue| {
+        json!({
+            "opts": envelope_opts,
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:o1",
+                        "select": ["?name"],
+                        "where": [["graph", "o2", { "@id": "?s", "ex:name": "?name" }]]
+                    },
+                    "opts": alias_opts
+                }
+            }
+        })
+    };
+    let named = json!({ "fromNamed": { "o2": { "@id": "mq:o2" } } });
+    for (layer, envelope_opts, alias_opts) in [
+        ("envelope", named.clone(), json!({ "min-t": 2 })),
+        (
+            "alias",
+            json!({}),
+            json!({ "fromNamed": named["fromNamed"], "min-t": 2 }),
+        ),
+    ] {
+        let mut control = envelope(envelope_opts.clone(), alias_opts.clone());
+        control["queries"]["a"]["opts"]["min-t"] = json!(1);
+        let (status, body) = post_envelope(&app, &control).await;
+        assert_eq!(status, StatusCode::OK, "{layer} control, got body: {body}");
+        assert_eq!(body["snapshot"]["ledgers"]["mq:o2"], 1, "{layer}: {body}");
+        assert!(body.to_string().contains("\"B\""), "{layer}: {body}");
+
+        let (status, body) = post_envelope(&app, &envelope(envelope_opts, alias_opts)).await;
+        assert_eq!(
+            status,
+            StatusCode::REQUEST_TIMEOUT,
+            "{layer}, got body: {body}"
+        );
+        assert!(
+            body.to_string().contains("current t=1"),
+            "{layer}: the wait must be on mq:o2, got: {body}"
+        );
+    }
+
+    // Outer `opts` that change the default graph the body names are refused
+    // before any wait: with `min-t: 2` (mq:o2 is at t=1) the answer is the
+    // 400, not a read of mq:o2 at t=1 and not a wait.
+    for (layer, envelope_opts, alias_opts) in [
+        (
+            "envelope",
+            json!({ "from": ["mq:o1", "mq:o2"], "min-t": 2 }),
+            json!({}),
+        ),
+        ("alias", json!({}), json!({ "from": "mq:o2", "min-t": 2 })),
+        (
+            "envelope, no min-t",
+            json!({ "from": ["mq:o1", "mq:o2"] }),
+            json!({}),
+        ),
+    ] {
+        let (status, body) = post_envelope(&app, &envelope(envelope_opts, alias_opts)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{layer}, got body: {body}");
+        assert!(
+            body.to_string().contains("names its default graphs"),
+            "{layer}: {body}"
+        );
+    }
+}
+
+/// A SPARQL sub-query that does not parse refuses the whole envelope with the
+/// parser's error.
+#[tokio::test]
+async fn multi_query_sub_queries_that_do_not_parse_are_reported_per_alias() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:pf").await;
+    insert_one(&app, "mq:pf", "ex:p", "P").await;
+
+    let envelope = json!({
+        "queries": {
+            "good": {
+                "language": "jsonld",
+                "query": {
+                    "@context": { "ex": "http://example.org/" },
+                    "from": "mq:pf",
+                    "select": ["?name"],
+                    "where": { "@id": "?s", "ex:name": "?name" }
+                }
+            },
+            "bad_sparql": {
+                "language": "sparql",
+                "query": "SELECT ?x FROM <mq:pf> WHERE { this is not valid SPARQL }"
+            },
+            "bad_jsonld": {
+                "language": "jsonld",
+                "query": { "from": "mq:pf", "select": 42, "where": { "@id": "?s" } }
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    assert_eq!(body["status"], "partial", "got body: {body}");
+    assert!(body["results"].get("good").is_some(), "got body: {body}");
+    for alias in ["bad_sparql", "bad_jsonld"] {
+        assert!(body["errors"].get(alias).is_some(), "{alias}: {body}");
+    }
 }
 
 // =============================================================================
@@ -402,6 +705,73 @@ async fn multi_query_asof_collision_returns_400() {
     });
     let (status, _body) = post_envelope(&app, &envelope).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+/// An `asOf` the caller got wrong is a 400, as the same instant is on
+/// `/query`: a time before the ledger's first commit, or a malformed
+/// timestamp.
+#[tokio::test]
+async fn multi_query_asof_naming_no_data_returns_400() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mq:early").await;
+    insert_one(&app, "mq:early", "ex:z", "Z").await;
+
+    for (as_of, expect) in [
+        ("1999-01-01T00:00:00Z", "no data as of"),
+        (
+            "2021-13-45T00:00:00Z",
+            "invalid ISO 8601 timestamp for asOf",
+        ),
+    ] {
+        let envelope = json!({
+            "asOf": as_of,
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:early",
+                        "select": ["?name"],
+                        "where": { "@id": "?s", "ex:name": "?name" }
+                    }
+                }
+            }
+        });
+        let (status, body) = post_envelope(&app, &envelope).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{as_of}: {body}");
+        assert_eq!(body["@type"], "err:db/InvalidQuery", "{as_of}: {body}");
+        assert!(body.to_string().contains(expect), "{as_of}: {body}");
+    }
+}
+
+/// A ledger that does not exist is a 404, as it is on `/query`.
+#[tokio::test]
+async fn multi_query_unknown_ledger_returns_404() {
+    let (_tmp, state) = test_state().await;
+    let app = build_router(state);
+
+    for as_of in [None, Some("2024-01-01T00:00:00Z")] {
+        let mut envelope = json!({
+            "queries": {
+                "a": {
+                    "language": "jsonld",
+                    "query": {
+                        "@context": { "ex": "http://example.org/" },
+                        "from": "mq:missing",
+                        "select": ["?name"],
+                        "where": { "@id": "?s", "ex:name": "?name" }
+                    }
+                }
+            }
+        });
+        if let Some(as_of) = as_of {
+            envelope["asOf"] = json!(as_of);
+        }
+        let (status, body) = post_envelope(&app, &envelope).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{as_of:?}: {body}");
+        assert!(body.to_string().contains("mq:missing"), "{as_of:?}: {body}");
+    }
 }
 
 #[tokio::test]

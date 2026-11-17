@@ -118,11 +118,12 @@ async fn sparql_rule_with_filter() {
     );
 }
 
-/// A SPARQL rule using constructs the datalog engine cannot execute
-/// (OPTIONAL) is skipped with a warning — it must not derive anything and
-/// must not break other rules.
+/// A SPARQL rule using a non-monotonic construct (OPTIONAL) is rejected
+/// with an error naming the construct and the rule, and the query fails —
+/// a fixpoint cannot evaluate a left join soundly, and silently skipping the
+/// rule would answer over an incomplete rule set.
 #[tokio::test]
-async fn sparql_rule_unsupported_construct_skipped() {
+async fn sparql_rule_unsupported_construct_rejected_loudly() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger0 = genesis_ledger(&fluree, "datalog/sparql-unsupported");
 
@@ -157,38 +158,19 @@ async fn sparql_rule_unsupported_construct_skipped() {
     });
     let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
 
-    // The good rule still derives; the bad rule derives nothing.
     let q = json!({
         "@context": { "ex": "http://example.org/" },
         "select": "?x",
         "where": {"@id": "?x", "ex:hasA": true},
         "reasoning": "datalog"
     });
-    let rows = support::query_jsonld(&fluree, &ledger, &q)
+    let err = support::query_jsonld(&fluree, &ledger, &q)
         .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
+        .expect_err("a stored rule with OPTIONAL must fail the query, not be skipped");
+    let message = err.to_string();
     assert!(
-        normalize_rows(&rows).contains(&json!("ex:thing")),
-        "good rule should still run when a sibling rule is unsupported, got {rows:?}"
-    );
-
-    let q_bad = json!({
-        "@context": { "ex": "http://example.org/" },
-        "select": ["?x", "?v"],
-        "where": {"@id": "?x", "ex:derived": "?v"},
-        "reasoning": "datalog"
-    });
-    let rows_bad = support::query_jsonld(&fluree, &ledger, &q_bad)
-        .await
-        .unwrap()
-        .to_jsonld(&ledger.snapshot)
-        .unwrap();
-    assert_eq!(
-        rows_bad.as_array().map(Vec::len),
-        Some(0),
-        "unsupported rule must be skipped, not partially applied"
+        message.contains("OPTIONAL") && message.contains("badRule"),
+        "the rejection must name the construct and the rule, got: {message}"
     );
 }
 
@@ -256,4 +238,59 @@ async fn sparql_rule_literal_bound_predicate_variable_does_not_abort_other_rules
         "sound rule's derivations must survive a sibling SPARQL rule's literal-bound \
          predicate variable, got {rows:?}"
     );
+}
+
+/// A CONSTRUCT template that annotates an edge is rejected by name, not run
+/// with the annotation dropped. One that writes into a named graph runs, and
+/// a graph the ledger does not have is an error naming it rather than a
+/// silent write into the default graph.
+#[tokio::test]
+async fn sparql_rule_head_with_annotation_or_missing_graph_rejected() {
+    for (name, template, expected) in [
+        (
+            "annotatedHead",
+            "?x ex:derived ?y ~ ?r",
+            "annotates an edge",
+        ),
+        (
+            "graphHead",
+            "GRAPH ex:inferred { ?x ex:derived ?y }",
+            "<http://example.org/inferred>, which this ledger does not have",
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger0 = genesis_ledger(&fluree, &format!("datalog/sparql-head-{name}"));
+        let rule_data = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "@id": format!("http://example.org/{name}"),
+            "f:rule": {
+                "@type": "https://ns.flur.ee/db#sparql",
+                "@value": format!(
+                    "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT {{ {template} }} WHERE {{ ?x ex:a ?y }}"
+                )
+            }
+        });
+        let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+        let data = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@graph": [ {"@id": "ex:thing", "ex:a": 1} ]
+        });
+        let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+        let q = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": "?x",
+            "where": {"@id": "?x", "ex:derived": "?y"},
+            "reasoning": "datalog"
+        });
+        let err = support::query_jsonld(&fluree, &ledger, &q)
+            .await
+            .expect_err("the rule must be rejected, not run without its annotation or graph");
+        let message = err.to_string();
+        assert!(
+            message.contains(name) && message.contains(expected),
+            "{name}: {message}"
+        );
+    }
 }

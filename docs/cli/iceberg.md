@@ -18,7 +18,8 @@ Map an Iceberg table as a queryable graph source.
 ### Usage
 
 ```bash
-fluree iceberg map <NAME> [OPTIONS]
+fluree iceberg map <NAME> --r2rml <PATH> [OPTIONS]
+fluree iceberg map <NAME> --remote <REMOTE> --stored-mapping <ID> [OPTIONS]
 ```
 
 ### Arguments
@@ -33,16 +34,16 @@ fluree iceberg map <NAME> [OPTIONS]
 
 | Option | Description |
 |--------|-------------|
-| `--mode <MODE>` | Catalog mode: `rest` (default) or `direct` |
+| `--mode <MODE>` | Catalog mode, case-insensitive: `rest` (default), `direct`, `glue` (AWS Glue Data Catalog), or `s3tables` (AWS S3 Tables) |
 
 **REST catalog mode options:**
 
 | Option | Description |
 |--------|-------------|
 | `--catalog-uri <URI>` | REST catalog URI (required for rest mode) |
-| `--table <ID>` | Table identifier in `namespace.table` format (required if not specified in R2RML mapping) |
-| `--warehouse <NAME>` | Warehouse identifier |
-| `--no-vended-credentials` | Disable vended credentials (enabled by default) |
+| `--table <ID>` | Table identifier in `namespace.table` format. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables |
+| `--warehouse <NAME>` | Warehouse (or catalog) name as the REST catalog knows it; the catalog's own route prefix is looked up from it |
+| `--no-vended-credentials` | Disable vended credentials (enabled by default); the same as `--storage-identity ambient`, and not given with it |
 
 **Direct S3 mode options:**
 
@@ -50,27 +51,70 @@ fluree iceberg map <NAME> [OPTIONS]
 |--------|-------------|
 | `--table-location <URI>` | S3 table location (required for direct mode, e.g., `s3://bucket/warehouse/ns/table`) |
 
+**AWS Glue / S3 Tables mode options** (native AWS SDK; reads S3 with the ambient AWS credential chain — no vended credentials):
+
+| Option | Description |
+|--------|-------------|
+| `--table <ID>` | Table identifier `namespace.table`. Optional: the `--r2rml` mapping's `rr:tableName` entries name the tables. For `glue`, `namespace` is the Glue database. |
+| `--region <REGION>` | AWS region of the Glue / S3 Tables API. Glue falls back to `--s3-region`, then the AWS SDK's region chain; S3 Tables defaults to the table bucket ARN's region and refuses a `--region` that contradicts it. S3 data reads use `--s3-region` when given, else this region. Must be an AWS region code (e.g. `us-east-1`). |
+| `--catalog-id <ID>` | Glue catalog id for cross-account access (`glue` mode; defaults to the caller's account) |
+| `--table-bucket-arn <ARN>` | S3 Tables table-bucket ARN, `arn:aws:s3tables:<region>:<account>:bucket/<name>` (required for `s3tables` mode; any AWS partition) |
+
 **R2RML mapping:**
 
 | Option | Description |
 |--------|-------------|
-| `--r2rml <PATH>` | R2RML mapping file (Turtle format, required). Defines how table rows become RDF triples. Table references come from the mapping's `rr:tableName` entries. |
+| `--r2rml <PATH>` | R2RML mapping file (Turtle format). Defines how table rows become RDF triples. Table references come from the mapping's `rr:tableName` entries. Required, unless `--stored-mapping` names a mapping the remote stores |
 | `--r2rml-type <TYPE>` | Mapping media type (e.g., `text/turtle`); inferred from extension if omitted |
 
-**Authentication:**
+**Stored on the remote** (`--remote` only; see [Stored connections and mappings](#stored-connections-and-mappings)):
 
 | Option | Description |
 |--------|-------------|
-| `--auth-bearer <TOKEN>` | Bearer token for REST catalog authentication |
+| `--stored-catalog <ID>` | A catalog connection the remote stores, by its id there. Replaces every connection, credential and storage option; needs a mapping (`--r2rml` or `--stored-mapping`) |
+| `--stored-mapping <ID>` | An R2RML mapping the remote stores, by its id there. Replaces `--r2rml` and implies its catalog connection; `--table` defaults to the mapping's first table |
+
+**Authentication:**
+
+These options, and `--warehouse`, configure a REST catalog: any other `--mode` refuses them rather than ignore them. With `--remote`, the CLI sends the server the structured connection its local map would store (see [Iceberg connection](../api/endpoints.md#iceberg-connection)), so the two register the same record.
+
+| Option | Description |
+|--------|-------------|
+| `--auth-bearer <TOKEN>` | Bearer token for REST catalog authentication. Stored with the graph source; prefer the option below |
+| `--auth-bearer-env <VAR>` | Environment variable holding the bearer token, read by the process that reads the tables. The token is not stored. With `--remote`, the server must list the variable in [`FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
 | `--oauth2-token-url <URL>` | OAuth2 token URL for client credentials auth |
 | `--oauth2-client-id <ID>` | OAuth2 client ID |
-| `--oauth2-client-secret <SECRET>` | OAuth2 client secret |
+| `--oauth2-client-secret <SECRET>` | OAuth2 client secret. Stored with the graph source; prefer the option below |
+| `--oauth2-client-secret-env <VAR>` | Environment variable holding the OAuth2 client secret; as `--auth-bearer-env` |
+| `--oauth2-scope <SCOPE>` | OAuth2 scope (e.g. `session:role:ICEBERG_READER` for Snowflake Horizon / Polaris) |
+| `--oauth2-audience <AUDIENCE>` | OAuth2 audience |
+| `--auth-google-metadata` | Authenticate as the GCE/GKE metadata server's service account (GKE Workload Identity). A host identity: an operator can refuse it with [`FLUREE_GRAPH_SOURCE_HOST_IDENTITIES`](../operations/configuration.md#iceberg--r2rml-graph-source-tuning) |
+| `--auth-google-adc` | Authenticate with the host's application-default credentials (`GOOGLE_APPLICATION_CREDENTIALS`, else gcloud's, e.g. after `gcloud auth application-default login`). A host identity. User credentials carry the user's own `cloud-platform` scope, which a refresh cannot narrow |
+| `--auth-google-service-account-env <VAR>` | Authenticate as the service account whose key JSON this environment variable holds, read by the process that reads the tables. The key is not stored, and is never taken literally |
+| `--auth-google-wif-config <FILE>` | Authenticate through Workload Identity Federation from AWS: the credential configuration that `gcloud iam workload-identity-pools create-cred-config … --aws` prints. Not a secret: the file is read and stored with the graph source |
+| `--auth-google-quota-project <PROJECT>` | The Google Cloud project catalog requests bill to (`x-goog-user-project`). BigLake requires one for every identity; default: the project a `bq://projects/<P>/…` or `bl://projects/<P>/…` warehouse names. It bills the catalog only, never storage reads |
+| `--auth-google-scopes <SCOPES>` | OAuth scopes, comma-separated (default: `cloud-platform`) |
+
+Give one way to authenticate: a bearer token, OAuth2 client credentials, or one Google source. Two at once are refused, and so is a partial OAuth2 set: OAuth2 needs `--oauth2-token-url` and the client secret (`--oauth2-client-id` defaults to empty, as Snowflake Horizon needs).
+
+**Storage identity:**
+
+| Option | Description |
+|--------|-------------|
+| `--storage-identity <IDENTITY>` | Which identity reads the table's files: `vended` (the REST catalog's per-table vended credentials, required), `ambient` (the ambient AWS credential chain), `catalog` (the REST catalog's own Google identity reads `gs://`, as BigLake federation needs), or `google` (a Google identity of the source's own, the options below). Default: `catalog` for a `bq://` warehouse, `vended` for a `bl://` one; otherwise vended credentials for a REST catalog (unless `--no-vended-credentials`) and the ambient chain for the other modes |
+| `--storage-google-metadata` | Read the files as the metadata server's service account |
+| `--storage-google-adc` | Read the files with the host's application-default credentials. User credentials read with the user's own `cloud-platform` scope (a refresh grant cannot narrow it to read-only storage); a service-account key file is minted read-only |
+| `--storage-google-service-account-env <VAR>` | Read the files as the service account whose key JSON this variable holds |
+| `--storage-google-wif-config <FILE>` | Read the files through this Workload Identity Federation configuration |
+| `--storage-google-quota-project <PROJECT>` | The project storage requests bill to (requester pays). Never defaulted, and never the catalog's quota project |
+
+The default is the CLI's (Python's `map_iceberg` has the same one); the server stores what it is sent, so a remote map sends the identity the default chose. A `--storage-google-*` source alone means `--storage-identity google`. A `bq://` warehouse never vends, so its default needs a Google catalog identity: without one, `map` refuses and names the options to give.
 
 **S3 overrides:**
 
 | Option | Description |
 |--------|-------------|
-| `--s3-region <REGION>` | S3 region override |
+| `--s3-region <REGION>` | S3 region override, in every mode (for `glue` / `s3tables`, defaults to the catalog's region) |
 | `--s3-endpoint <URL>` | S3 endpoint override (e.g. MinIO, LocalStack, or `https://storage.googleapis.com` for Google Cloud Storage) |
 | `--s3-path-style` | Use path-style S3 URLs |
 
@@ -80,17 +124,47 @@ fluree iceberg map <NAME> [OPTIONS]
 |--------|-------------|
 | `--remote <NAME>` | Execute against a remote server (by remote name) |
 | `--branch <NAME>` | Branch name (defaults to "main") |
+| `--model <LEDGER>` | Model ledger (`name:branch`) whose default graph supplies the source's view policies and class/property hierarchy. Must exist. See [Access policy](../graph-sources/iceberg.md#access-policy) |
+| `--default-allow <BOOL>` | Fallback for governed requests that match no policy; `true` keeps the source readable under authentication without a model (unset: deny) |
 
 ### Description
 
 Maps an Apache Iceberg table as a graph source that can be queried using SPARQL or JSON-LD queries. The table is accessed read-only; Fluree does not modify the Iceberg table.
 
-An R2RML mapping (`--r2rml`) is required to define how Iceberg table rows are transformed into RDF triples.
+An R2RML mapping is required to define how Iceberg table rows are transformed into RDF triples: a file (`--r2rml`), or, on a remote that stores mappings, one of its own (`--stored-mapping`; see [Stored connections and mappings](#stored-connections-and-mappings)). Without either, `map` is refused before it registers anything or contacts a remote.
 
-Two catalog modes are supported:
+Four catalog modes are supported:
 
 - **REST mode** (default): Connects to an Iceberg REST catalog (e.g., Apache Polaris) to discover table metadata. Supports vended credentials and warehouse selection.
 - **Direct S3 mode**: Reads table metadata directly from S3 by resolving `version-hint.text` in the table's `metadata/` directory. No catalog server required. Also reads **Google Cloud Storage** (`--s3-endpoint https://storage.googleapis.com`); GCS reads are signed with AWS SigV4 using GCS HMAC interop keys (the standard `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY`) — see the [Iceberg guide](../graph-sources/iceberg.md#google-cloud-storage-gcs).
+- **AWS Glue mode** (`--mode glue`): Looks the table up in the AWS Glue Data Catalog (Glue `GetTable`) and reads the metadata file its `metadata_location` parameter names. The Glue database is the namespace; `--catalog-id` reads another account's catalog.
+- **AWS S3 Tables mode** (`--mode s3tables`): Resolves the table's metadata file in an S3 Tables table bucket (`--table-bucket-arn`) with `GetTableMetadataLocation`.
+
+Glue and S3 Tables use the ambient AWS credential chain (environment, shared config / `AWS_PROFILE` / SSO, container or instance role) for the catalog call and the S3 reads; vended credentials are not supported, and the CLI turns them off for these modes. `map` loads each table the mapping names the way a query will: through the catalog (REST, Glue, S3 Tables), or by resolving its current metadata at the location (Direct). It reads table metadata only, never data files, and stops after 10 s. A table that cannot be loaded in that time does not fail `map`: it registers the source and reports `Connection: not verified: ` followed by why: the table that did not load and the catalog's or storage's reason, a catalog that did not answer, a catalog client that could not be built, or a check that ran past 10 s (in which case the tables may only be slow). Re-registering a source with the same config can be answered from the catalog caches rather than a new call: a `loadTable` response for up to 60 s in memory (`FLUREE_ICEBERG_LOADTABLE_TTL_SECS`) and its metadata pointer for up to 300 s on disk (`FLUREE_ICEBERG_LOADTABLE_PTR_TTL_SECS`). A mapping that defines no `rr:TriplesMap` (most often an `rr:` prefix without its trailing `#`) is refused. See [Catalog Modes](../graph-sources/iceberg.md#catalog-modes) and [AWS Credentials](../graph-sources/iceberg.md#aws-credentials).
+
+### Stored connections and mappings
+
+Some remotes store catalog connections and R2RML mappings themselves, under ids of their own. There, `map` can name them instead of restating them:
+
+```bash
+# A mapping the remote stores; it implies its catalog connection and first table
+fluree iceberg map orders --remote origin --stored-mapping <MAPPING-ID>
+
+# A connection the remote stores, read with a local mapping file
+fluree iceberg map orders --remote origin \
+  --stored-catalog <CATALOG-ID> \
+  --r2rml mappings/orders.ttl --table sales.orders
+```
+
+The request carries the ids (`stored_catalog_id`, `stored_mapping_id`) and the source's own options (`--table`, `--branch`, `--model`, `--default-allow`), plus the mapping file's text with `--stored-catalog`. It never carries a connection, so no credential is sent again. The CLI refuses before sending anything when:
+
+- a connection, credential or storage option (`--mode`, `--catalog-uri`, `--auth-*`, `--storage-*`, `--s3-*`, ...) is given beside either reference;
+- `--r2rml` or `--r2rml-type` is given beside `--stored-mapping`;
+- `--stored-catalog` is given with `--r2rml` but no `--table` (a stored connection is mapped one named table at a time);
+- an id is empty;
+- no `--remote` is given: only a named remote stores connections or mappings, and neither a local map nor one routed through a running local server has any.
+
+Both references together must name the mapping's own connection; the remote checks. A server that does not store connections or mappings, a Fluree server among them, refuses the request. The CLI then shows the server's message and adds a hint: if the remote does not store catalog connections or mappings, it refuses references to them; otherwise the id may name nothing it has.
 
 ### Examples
 
@@ -127,6 +201,14 @@ fluree iceberg map orders \
   --s3-region europe-west1 \
   --s3-path-style
 
+# AWS Glue Data Catalog (ambient AWS credentials; the Glue database is the namespace).
+# Add --catalog-id 123456789012 to read another account's catalog.
+fluree iceberg map glue-orders \
+  --mode glue \
+  --region us-east-1 \
+  --table sales.orders \
+  --r2rml mappings/orders.ttl
+
 # OAuth2 authentication
 fluree iceberg map orders \
   --catalog-uri https://polaris.example.com/api/catalog \
@@ -135,6 +217,24 @@ fluree iceberg map orders \
   --oauth2-token-url https://auth.example.com/token \
   --oauth2-client-id my-client \
   --oauth2-client-secret $CLIENT_SECRET
+
+# BigLake federation (bq://): a service account's key in LAKE_SA_KEY
+# authenticates the catalog, and the same identity reads the gs:// files
+# (--storage-identity catalog, the bq:// default)
+fluree iceberg map orders \
+  --catalog-uri https://biglake.googleapis.com/iceberg/v1/restcatalog \
+  --warehouse bq://projects/lake/locations/us/catalogs/sales \
+  --table sales.orders \
+  --r2rml mappings/orders.ttl \
+  --auth-google-service-account-env LAKE_SA_KEY
+
+# The same through Workload Identity Federation from AWS: no stored secret
+fluree iceberg map orders \
+  --catalog-uri https://biglake.googleapis.com/iceberg/v1/restcatalog \
+  --warehouse bq://projects/lake/locations/us/catalogs/sales \
+  --table sales.orders \
+  --r2rml mappings/orders.ttl \
+  --auth-google-wif-config wif-aws.json
 
 # Create the graph source on a remote Fluree server
 fluree iceberg map warehouse-orders \
@@ -154,7 +254,14 @@ Mapped Iceberg table as R2RML graph source 'airlines:main'
   TriplesMaps: 3
   Connection:  verified
   Mapping:     validated
+advisory: openflights.airlines: TriplesMap <http://example.org/mapping#Airline>: no key of its logical table 'openflights.airlines' lies within its subject's columns (airline_id), and it has no known key, so queries over it remove repeated solutions as they run. …
 ```
+
+An `advisory:` line on standard error names each triples map that neither an
+`f:key` nor the table's identifier fields prove subject-unique, and the
+`f:key` that would. The source is registered and answers correctly, but
+`COUNT`s, same-subject stars and `ORDER BY … LIMIT` over such a map cost more;
+see [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade). Advisories are reported only when every table loaded.
 
 ### After Mapping
 

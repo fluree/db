@@ -26,6 +26,25 @@ pub enum SqlError {
     /// Something the SQL graph source deliberately does not do.
     #[error("unsupported by SQL graph sources: {0}")]
     Unsupported(String),
+
+    /// A graph-source identity refusal from the shared auth machinery (a
+    /// Google token exchange refused, invalid Google credentials, a host
+    /// identity the policy refuses), kept typed so the source reports it with
+    /// the same wire code and status as an Iceberg source would.
+    #[error("{0}")]
+    Identity(fluree_db_iceberg::IcebergError),
+}
+
+impl SqlError {
+    /// An error from the endpoint's auth provider: an identity refusal stays
+    /// typed, anything else is an authentication failure.
+    pub fn from_auth(e: fluree_db_iceberg::IcebergError) -> Self {
+        if e.is_identity_refusal() {
+            SqlError::Identity(e)
+        } else {
+            SqlError::Auth(e.to_string())
+        }
+    }
 }
 
 impl From<fluree_db_iceberg::IcebergError> for SqlError {
@@ -34,9 +53,40 @@ impl From<fluree_db_iceberg::IcebergError> for SqlError {
         // conversion; anything else from that crate would be a wiring mistake.
         match e {
             fluree_db_iceberg::IcebergError::Config(m) => SqlError::Config(m),
-            other => SqlError::Auth(other.to_string()),
+            other => SqlError::from_auth(other),
         }
     }
 }
 
 pub type Result<T> = std::result::Result<T, SqlError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_iceberg::IcebergError;
+
+    #[test]
+    fn identity_refusals_stay_typed_and_the_rest_keep_their_mapping() {
+        let refusals = [
+            IcebergError::HostIdentityRefused {
+                kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+            },
+            IcebergError::GoogleCredentialsInvalid("field".to_string()),
+            IcebergError::GoogleTokenHostRefused {
+                kind: fluree_db_iceberg::HostIdentityKind::GoogleMetadata,
+                host: "attacker.example".to_string(),
+            },
+        ];
+        for refusal in refusals {
+            assert!(matches!(SqlError::from(refusal), SqlError::Identity(_)));
+        }
+        assert!(matches!(
+            SqlError::from(IcebergError::Config("c".to_string())),
+            SqlError::Config(_)
+        ));
+        assert!(matches!(
+            SqlError::from(IcebergError::Auth("a".to_string())),
+            SqlError::Auth(_)
+        ));
+    }
+}

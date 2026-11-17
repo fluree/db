@@ -23,7 +23,7 @@
 //! - Quoted strings may contain whitespace, parentheses, and backslash
 //!   escapes (`\"` and `\\`); any other `\x` sequence is preserved verbatim
 
-use super::ast::UnresolvedExpression;
+use super::ast::{UnresolvedExpression, UnresolvedFilterValue};
 use super::error::{ParseError, Result};
 use super::filter_common;
 use super::sexpr_tokenize;
@@ -49,8 +49,15 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
         if let Some(callee) = sparql_style_callee(s) {
             return Err(sparql_call_syntax_error(callee, s));
         }
-        // Could be a simple value
-        return parse_s_expression_atom(s);
+        // A bare expression is a VALUE — the whole of a `bind` or `unwind`
+        // operand — not a comparison operand, so it keeps its pre-4.2 string
+        // meaning. Classifying it here would change what a transaction
+        // WRITES: `["bind", "?link", "http://example.org/home"]` would insert
+        // a ref where it used to insert a literal.
+        let mut atom = [parse_s_expression_atom(s)?];
+        demote_iri_atoms(&mut atom);
+        let [atom] = atom;
+        return Ok(atom);
     }
 
     // Remove outer parens
@@ -80,8 +87,13 @@ pub fn parse_s_expression(s: &str) -> Result<UnresolvedExpression> {
         });
     }
 
-    // Parse arguments
-    let args = parse_s_expression_args(rest)?;
+    // Parse arguments, then keep the IRI classification only where an RDF
+    // term comparison is actually being made (see `compares_rdf_terms`).
+    let mut args = parse_s_expression_args(rest)?;
+    if !compares_rdf_terms(&op_lower) {
+        demote_iri_atoms(&mut args);
+    }
+    let args = args;
 
     // Helper closure to clone already-parsed expressions
     let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
@@ -225,8 +237,77 @@ fn parse_s_expression_atom(s: &str) -> Result<UnresolvedExpression> {
         return Ok(UnresolvedExpression::string(unescape_string(unquoted)));
     }
 
-    // Plain string
-    Ok(UnresolvedExpression::string(s))
+    // Unquoted: IRI forms, a possible compact IRI, or a plain string.
+    Ok(classify_unquoted_atom(s))
+}
+
+/// Classify an unquoted atom that is not a variable, boolean or number.
+///
+/// - `<…>` and `http(s)://…` are absolute IRIs.
+/// - `prefix:name` may be a compact IRI; only the WHERE-clause parser, which
+///   has the `@context`, can tell, so it is handed over undecided as
+///   [`UnresolvedFilterValue::Curie`] and lowers as a string if nothing
+///   resolves it.
+/// - Anything else is the bare string it always was.
+fn classify_unquoted_atom(s: &str) -> UnresolvedExpression {
+    use fluree_graph_json_ld::iri::UnresolvedIriDisposition;
+    if s.len() > 2 && s.starts_with('<') && s.ends_with('>') {
+        return UnresolvedExpression::Const(UnresolvedFilterValue::iri(&s[1..s.len() - 1]));
+    }
+    // Scheme classification is shared with JSON-LD expansion rather than
+    // spelled again here. Matching `http://` and `https://` by hand made every
+    // other scheme a would-be compact IRI: `did:key:z6Mk…`, `urn:uuid:…` and
+    // `mailto:…` classified as a CURIE, found no such prefix, and fell back to
+    // a string — so `(= ?id did:key:z6Mk…)`, a common shape in policy, never
+    // matched, and in a rule it was rejected outright as an undefined prefix.
+    match fluree_graph_json_ld::iri::check_unresolved_iri(s) {
+        UnresolvedIriDisposition::AllowAbsolute | UnresolvedIriDisposition::AllowKnownScheme => {
+            UnresolvedExpression::Const(UnresolvedFilterValue::iri(s))
+        }
+        UnresolvedIriDisposition::RejectLikelyCompact { .. } if looks_like_compact_iri(s) => {
+            UnresolvedExpression::Const(UnresolvedFilterValue::Curie(Arc::from(s)))
+        }
+        _ => UnresolvedExpression::Const(UnresolvedFilterValue::Bare(Arc::from(s))),
+    }
+}
+
+/// Operators whose operands are compared as RDF *terms*, and so are the only
+/// places an unquoted atom may mean an IRI.
+///
+/// Everywhere else an unquoted atom is the string it has always been. Without
+/// this restriction the classifier reaches every argument position, which is
+/// both wrong and a regression: `(strStarts (str ?s) http://example.org/p/)`
+/// compares a string against an IRI and matches nothing, `(concat ?a <-> ?b)`
+/// builds `IRI("-")`, `(count *)` in HAVING stops being a `*`, and a
+/// `["bind", "?link", "http://example.org/home"]` writes a ref where it used
+/// to write a literal. Identity comparison is the one position where an IRI
+/// operand is both meaningful and what the author must have meant — a string
+/// could never have matched an IRI-valued variable there.
+fn compares_rdf_terms(op_lower: &str) -> bool {
+    matches!(
+        op_lower,
+        "=" | "eq" | "!=" | "<>" | "ne" | "in" | "not-in" | "notin" | "sameterm"
+    )
+}
+
+/// Demote IRI-ish classifications back to plain strings, one level deep.
+///
+/// Only the immediate operands are touched: a nested expression was already
+/// dispatched by its own operator and carries whatever that position decided.
+fn demote_iri_atoms(args: &mut [UnresolvedExpression]) {
+    for arg in args {
+        if let UnresolvedExpression::Const(value) = arg {
+            let text = match value {
+                UnresolvedFilterValue::Iri(t)
+                | UnresolvedFilterValue::Curie(t)
+                | UnresolvedFilterValue::Bare(t) => Some(t.to_string()),
+                _ => None,
+            };
+            if let Some(text) = text {
+                *arg = UnresolvedExpression::string(text);
+            }
+        }
+    }
 }
 
 /// Parse arguments in an S-expression
@@ -384,9 +465,28 @@ fn atom_token_to_expr(s: &str) -> Result<UnresolvedExpression> {
     if let Ok(f) = s.parse::<f64>() {
         return Ok(UnresolvedExpression::double(f));
     }
-    // Unquoted atom that didn't match any other shape — treat as a bare
-    // string. Quoted strings take the explicit `String` path above.
-    Ok(UnresolvedExpression::string(s))
+    // Unquoted atom that didn't match any other shape: IRI, compact IRI, or
+    // bare string. Quoted strings take the explicit `String` path above.
+    Ok(classify_unquoted_atom(s))
+}
+
+/// `prefix:name` shape: a non-empty alphabetic-leading prefix (or the empty
+/// prefix `:name`), a colon, and a non-empty local part with no whitespace.
+fn looks_like_compact_iri(s: &str) -> bool {
+    let Some((prefix, local)) = s.split_once(':') else {
+        return false;
+    };
+    if local.is_empty() || local.chars().any(char::is_whitespace) {
+        return false;
+    }
+    prefix.is_empty()
+        || (prefix
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+            && prefix
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.')))
 }
 
 fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
@@ -409,7 +509,11 @@ fn list_tokens_to_expr(items: &[SexprToken]) -> Result<UnresolvedExpression> {
     let clone_expr = |e: &UnresolvedExpression| -> Result<UnresolvedExpression> { Ok(e.clone()) };
     let parsed: Result<Vec<UnresolvedExpression>> =
         arg_tokens.iter().map(expr_from_sexpr_token).collect();
-    let args = parsed?;
+    let mut args = parsed?;
+    if !compares_rdf_terms(&op_lower) {
+        demote_iri_atoms(&mut args);
+    }
+    let args = args;
 
     match op_lower.as_str() {
         op @ ("=" | "eq" | "!=" | "<>" | "ne" | "<" | "lt" | "<=" | "le" | ">" | "gt" | ">="
@@ -705,5 +809,74 @@ mod tests {
             }
             _ => panic!("Expected Call"),
         }
+    }
+
+    /// The second operand of `(= ?p <atom>)`, as the string-path parser sees it.
+    fn second_operand(expr: &str) -> UnresolvedFilterValue {
+        match parse_s_expression(expr).unwrap() {
+            UnresolvedExpression::Call { args, .. } => match &args[1] {
+                UnresolvedExpression::Const(v) => v.clone(),
+                other => panic!("expected a constant operand, got {other:?}"),
+            },
+            other => panic!("expected a call, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unquoted_iri_atoms_are_iris_not_strings() {
+        // `<…>` and http(s) atoms are absolute IRIs, as in SPARQL; they used
+        // to lower as the string "<http://…>" and could never equal an IRI.
+        assert!(matches!(
+            second_operand("(= ?p <http://example.org/knows>)"),
+            UnresolvedFilterValue::Iri(i) if i.as_ref() == "http://example.org/knows"
+        ));
+        assert!(matches!(
+            second_operand("(= ?p http://example.org/knows)"),
+            UnresolvedFilterValue::Iri(i) if i.as_ref() == "http://example.org/knows"
+        ));
+    }
+
+    #[test]
+    fn unquoted_prefixed_name_is_handed_over_as_curie() {
+        // The S-expression parser has no @context: `ex:knows` is neither an
+        // IRI nor a string yet. The WHERE-clause parser decides.
+        assert!(matches!(
+            second_operand("(= ?p ex:knows)"),
+            UnresolvedFilterValue::Curie(c) if c.as_ref() == "ex:knows"
+        ));
+        // Empty prefix (`:knows`) is a compact IRI too.
+        assert!(matches!(
+            second_operand("(= ?p :knows)"),
+            UnresolvedFilterValue::Curie(c) if c.as_ref() == ":knows"
+        ));
+    }
+
+    #[test]
+    fn strings_and_string_lookalikes_stay_strings() {
+        // Quoted operands are always strings, even when they spell an IRI.
+        assert!(matches!(
+            second_operand("(= ?p \"ex:knows\")"),
+            UnresolvedFilterValue::String(s) if s.as_ref() == "ex:knows"
+        ));
+        // A bare word with no prefix is the string it always was (tagged
+        // `Bare` so rule validation can tell it from a quoted literal).
+        assert!(matches!(
+            second_operand("(= ?status active)"),
+            UnresolvedFilterValue::Bare(s) if s.as_ref() == "active"
+        ));
+        // A numeric-looking "prefix" is not a compact IRI: `12:30` stays a string.
+        assert!(matches!(
+            second_operand("(= ?slot 12:30)"),
+            UnresolvedFilterValue::Bare(s) if s.as_ref() == "12:30"
+        ));
+        // The token path used by select expressions agrees with the string path.
+        assert!(matches!(
+            atom_token_to_expr("ex:knows").unwrap(),
+            UnresolvedExpression::Const(UnresolvedFilterValue::Curie(_))
+        ));
+        assert!(matches!(
+            atom_token_to_expr("12:30").unwrap(),
+            UnresolvedExpression::Const(UnresolvedFilterValue::Bare(_))
+        ));
     }
 }
