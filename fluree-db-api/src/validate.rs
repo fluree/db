@@ -520,7 +520,10 @@ async fn validate_view_inner(
             // `include_attached` is set, the attached shape dbs pushed above
             // contribute the union — never a double scan of graph 0.
             static NO_OVERLAY: NoOverlay = NoOverlay;
-            inline_snapshot = Some(LedgerSnapshot::genesis(&view.snapshot.ledger_id));
+            inline_snapshot = Some(LedgerSnapshot::genesis_with_split_mode(
+                &view.snapshot.ledger_id,
+                view.snapshot.ns_split_mode(),
+            ));
             inline_overlay = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
                 &NO_OVERLAY,
                 bundle,

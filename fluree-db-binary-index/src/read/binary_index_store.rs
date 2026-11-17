@@ -4188,12 +4188,18 @@ async fn build_dictionary_set(
         let mut dict = PredicateDict::new();
         let mut rev = HashMap::with_capacity(root.predicate_sids.len());
         for (p_id, (ns_code, suffix)) in root.predicate_sids.iter().enumerate() {
-            let prefix = root.namespace_codes.get(ns_code).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("predicate[{p_id}]: unknown ns_code {ns_code}"),
-                )
-            })?;
+            // A predicate whose prefix has no code is stored whole, under the
+            // overflow code on a full table.
+            let prefix = if fluree_vocab::namespaces::is_full_iri(*ns_code) {
+                ""
+            } else {
+                root.namespace_codes.get(ns_code).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("predicate[{p_id}]: unknown ns_code {ns_code}"),
+                    )
+                })?
+            };
             let iri = format!("{prefix}{suffix}");
             dict.get_or_insert(&iri);
             rev.insert(iri, p_id as u32);

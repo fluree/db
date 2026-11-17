@@ -1213,14 +1213,16 @@ where
             let id_stats_result = stats_hook.finalize();
 
             // ---- Build IndexStats for FIR6 root ----
-            let trie_for_stats =
-                fluree_db_core::PrefixTrie::from_namespace_codes(&shared.ns_prefixes);
+            let stats_encoder = fluree_db_core::StatsIriEncoder::from_namespace_codes(
+                &shared.ns_prefixes,
+                ledger_split_mode,
+            );
             let db_stats = {
                 use fluree_db_core::index_stats as is;
 
                 let properties = crate::stats::aggregate_property_entries_from_graphs(
                     &id_stats_result.graphs,
-                    &trie_for_stats,
+                    &stats_encoder,
                     |p_id| shared.predicates.resolve(p_id).map(ToString::to_string),
                 );
 
@@ -1228,11 +1230,7 @@ where
                 // existing build_class_stat_entries() (shared with import path).
                 let predicate_sids: Vec<(u16, String)> = (0..shared.predicates.len())
                     .map(|p_id| {
-                        let iri = shared.predicates.resolve(p_id).unwrap_or("");
-                        match trie_for_stats.longest_match(iri) {
-                            Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
-                            None => (0u16, iri.to_string()),
-                        }
+                        stats_encoder.encode_parts(shared.predicates.resolve(p_id).unwrap_or(""))
                     })
                     .collect();
 
@@ -1337,15 +1335,9 @@ where
                 .map(|(&k, v)| (k, v.clone()))
                 .collect();
 
-            // Build predicate_sids from shared.predicates + PrefixTrie.
-            let trie = fluree_db_core::PrefixTrie::from_namespace_codes(&shared.ns_prefixes);
             let predicate_sids: Vec<(u16, String)> = (0..shared.predicates.len())
                 .map(|p_id| {
-                    let iri = shared.predicates.resolve(p_id).unwrap_or("");
-                    match trie.longest_match(iri) {
-                        Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
-                        None => (0u16, iri.to_string()),
-                    }
+                    stats_encoder.encode_parts(shared.predicates.resolve(p_id).unwrap_or(""))
                 })
                 .collect();
 

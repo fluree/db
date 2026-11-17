@@ -193,7 +193,7 @@ pub use schema_hierarchy::{
     compute_schema_hierarchy_with_overlay, SchemaHierarchy, SchemaHierarchyCache,
 };
 pub use sid::{Sid, SidInterner};
-pub use stats_view::{PropertyStatData, StatsView};
+pub use stats_view::{PropertyStatData, StatsIriEncoder, StatsView};
 #[cfg(any(feature = "native", target_arch = "wasm32"))]
 pub use storage::CachedBackend;
 pub use storage::EncryptionAdmin;
