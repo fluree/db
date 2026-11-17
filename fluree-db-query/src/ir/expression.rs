@@ -626,6 +626,16 @@ impl Expression {
     // Query methods
     // =========================================================================
 
+    /// Whether this expression is a constant IRI, `IRI("…")`: what SPARQL
+    /// `<iri>` / `ex:x` and JSON-LD `["iri", "…"]` lower to.
+    pub fn is_constant_iri(&self) -> bool {
+        matches!(
+            self,
+            Expression::Call { func: Function::Iri, args }
+                if matches!(args.as_slice(), [Expression::Const(FlakeValue::String(_))])
+        )
+    }
+
     /// Whether this expression contains a `BNODE(...)` call.
     ///
     /// `BNODE` is *solution-scoped* (SPARQL 1.1 §17.4.2.9): its result
