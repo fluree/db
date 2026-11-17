@@ -972,10 +972,11 @@ fn json_literal(json: FlakeValue) -> ComparableValue {
 }
 
 /// Whether `a` and `b` are one `rdf:JSON` term: the same lexical form under
-/// `rdf:JSON`. A stored JSON value carries its form as a JSON value
-/// ([`json_literal`]); a typed constant or `STRDT` carries it as a string
-/// typed `rdf:JSON`. Derived equality tells the two apart; term identity
-/// must not.
+/// `rdf:JSON`, carried as a JSON value by one and as a string typed
+/// `rdf:JSON` by the other. A valid constant or `STRDT` is the canonical JSON
+/// value already; text that is not JSON is the string, while an import keeps
+/// that text as a JSON value ([`json_literal`]). Derived equality tells the
+/// two apart; term identity must not.
 pub(crate) fn same_json_term(a: &ComparableValue, b: &ComparableValue) -> bool {
     fn lexical(v: &ComparableValue) -> Option<&str> {
         match v {

@@ -524,20 +524,23 @@ mod tests {
         );
     }
 
-    /// A stored JSON value and a typed `rdf:JSON` constant of the same text
-    /// (which lowers to `STRDT`) are one term, for `sameTerm` and `=`; other
-    /// text, and a plain string, are not.
+    /// A stored JSON value and a typed `rdf:JSON` constant (which lowers to
+    /// `STRDT`) of the value are one term, for `sameTerm` and `=`, however the
+    /// constant spells it; another value, and a plain string, are not. So is
+    /// text that is not JSON, which an import keeps as a JSON value and the
+    /// constant carries as a string.
     #[test]
     fn a_stored_json_value_is_the_term_of_its_typed_constant() {
         use crate::eval::compare::{rdf_term_equal, EqOutcome};
         use crate::ir::Function;
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
-        let stored = Binding::lit(
-            FlakeValue::Json("[1,2]".into()),
-            Sid::new(fluree_vocab::namespaces::RDF, "JSON"),
-        );
-        let batch = Batch::new(schema, vec![vec![stored]]).unwrap();
-        let row = batch.row_view(0).unwrap();
+        let stored = |text: &str| {
+            Binding::lit(
+                FlakeValue::Json(text.into()),
+                Sid::new(fluree_vocab::namespaces::RDF, "JSON"),
+            )
+        };
+        let batch = Batch::new(schema, vec![vec![stored("[1,2]"), stored("not json")]]).unwrap();
         let typed = |text: &str| Expression::Call {
             func: Function::StrDt,
             args: vec![
@@ -545,12 +548,16 @@ mod tests {
                 Expression::Const(FlakeValue::String(fluree_vocab::rdf::JSON.into())),
             ],
         };
-        let plain = Expression::Const(FlakeValue::String("[1,2]".into()));
-        for (other, same) in [
-            (typed("[1,2]"), true),
-            (typed("[1, 2]"), false),
-            (plain, false),
+        let plain = |text: &str| Expression::Const(FlakeValue::String(text.into()));
+        for (row, other, same) in [
+            (0, typed("[1,2]"), true),
+            (0, typed("[1, 2]"), true),
+            (0, typed("[1,3]"), false),
+            (0, plain("[1,2]"), false),
+            (1, typed("not json"), true),
+            (1, plain("not json"), false),
         ] {
+            let row = batch.row_view(row).unwrap();
             let args = [Expression::Var(VarId(0)), other];
             assert_eq!(
                 eval_same_term(&args, &row, None).unwrap(),
