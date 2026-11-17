@@ -5,8 +5,7 @@ use fluree_graph_ir::datatype::iri as dt_iri;
 use fluree_graph_ir::{Dataset, Graph, Term, Triple};
 // The fold hashes every cell several times, and its output is looked up once
 // per triple written. hashbrown's default hasher (foldhash) is several times
-// faster than std's SipHash on short terms, and is still seeded at random,
-// so terms taken from stored data can't be chosen to collide.
+// faster than std's SipHash on short terms, and is still seeded at random.
 use hashbrown::{HashMap, HashSet};
 use std::collections::{HashMap as StdMap, HashSet as StdSet};
 
