@@ -912,3 +912,56 @@ async fn formatting_completes_through_its_own_residency_loop() {
     );
     assert_eq!(normalize_rows(&formatted), expected, "identical results");
 }
+
+// ============================================================================
+// 9. View construction reads the ledger config outside any query's retry
+//    frame. On a cold residency peer that read must recover its own misses:
+//    a bare `db()` is what the browser peer calls.
+// ============================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn cold_view_reads_its_ledger_config() {
+    let shared = MemoryStorage::new();
+    let ns = Arc::new(MemoryNameService::new());
+    let fluree_a = FlureeBuilder::memory().build_with(
+        shared.clone(),
+        NameServiceMode::ReadWrite(
+            ns.clone() as Arc<dyn fluree_db_nameservice::NameServicePublisher>
+        ),
+    );
+    let ledger0 = support::genesis_ledger_for_fluree(&fluree_a, LEDGER);
+    let ledger1 = fluree_a
+        .insert(ledger0, &people_txn())
+        .await
+        .expect("seed people")
+        .ledger;
+    let config = json!({
+        "@context": { "f": "https://ns.flur.ee/db#" },
+        "@id": "urn:it:residency:config",
+        "@type": "f:LedgerConfig",
+        "@graph": "config",
+        "f:policyDefaults": { "f:defaultAllow": true }
+    });
+    let _ = fluree_a
+        .insert(ledger1, &config)
+        .await
+        .expect("seed config");
+    support::rebuild_and_publish_index(&fluree_a, LEDGER).await;
+
+    let (fluree_b, storage) = residency_instance(&shared, &ns);
+    let misses_before = storage.miss_count();
+    let db = fluree_b
+        .db(LEDGER)
+        .await
+        .expect("a cold view reads its config without an outer retry round");
+    assert!(
+        storage.miss_count() > misses_before,
+        "the config read must actually miss (positive marker)"
+    );
+    let default_allow = db
+        .ledger_config()
+        .and_then(|c| c.policy.as_ref())
+        .and_then(|p| p.default_allow);
+    assert_eq!(default_allow, Some(true), "the indexed config is attached");
+    assert!(storage.register.is_empty(), "wants drained");
+}
