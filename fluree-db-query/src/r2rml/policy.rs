@@ -112,6 +112,36 @@ pub(crate) struct R2rmlPolicyGate {
 /// (`2^n` evaluations); a decision needing more refuses the query.
 const MAX_EXTRA_CLASSES: usize = 8;
 
+/// Every subset of `items`, as the members it holds: `2^n` of them, the
+/// empty one first. Counts on a vector of flags, so no width bounds `n`;
+/// callers bound the work (see [`MAX_EXTRA_CLASSES`]).
+fn subsets(items: &[String]) -> impl Iterator<Item = Vec<&String>> + '_ {
+    let mut chosen = vec![false; items.len()];
+    let mut done = false;
+    std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let subset: Vec<&String> = items
+            .iter()
+            .zip(&chosen)
+            .filter_map(|(item, &on)| on.then_some(item))
+            .collect();
+        // The next subset: add one to the flags read as a binary number.
+        done = true;
+        for flag in &mut chosen {
+            if *flag {
+                *flag = false;
+            } else {
+                *flag = true;
+                done = false;
+                break;
+            }
+        }
+        Some(subset)
+    })
+}
+
 /// What a subject of each map may hold beyond the classes one row of its map
 /// shows, from the mapping alone (and the keys of maps deriving classes).
 #[derive(Debug, Default)]
@@ -868,9 +898,9 @@ impl R2rmlPolicyGate {
         let all_allow = if self.enumerate {
             self.check_extra_cap(tm, extra.len())?;
             let mut all = true;
-            for subset in 0..(1u32 << extra.len()) {
+            for chosen in subsets(&extra) {
                 if !self
-                    .decide_with(ctx, subject, pred, object, &own, &extra, subset)
+                    .decide_with(ctx, subject, pred, object, &own, &chosen)
                     .await?
                 {
                     all = false;
@@ -879,18 +909,11 @@ impl R2rmlPolicyGate {
             }
             all
         } else {
-            self.decide_with(ctx, subject, pred, object, &own, &extra, 0)
+            let every: Vec<&String> = extra.iter().collect();
+            self.decide_with(ctx, subject, pred, object, &own, &[])
                 .await?
                 && self
-                    .decide_with(
-                        ctx,
-                        subject,
-                        pred,
-                        object,
-                        &own,
-                        &extra,
-                        (1u32 << extra.len()) - 1,
-                    )
+                    .decide_with(ctx, subject, pred, object, &own, &every)
                     .await?
         };
         let allowed = if all_allow {
@@ -900,9 +923,9 @@ impl R2rmlPolicyGate {
             false
         } else {
             self.check_extra_cap(tm, extra.len())?;
-            for subset in 0..(1u32 << extra.len()) {
+            for chosen in subsets(&extra) {
                 if self
-                    .decide_with(ctx, subject, pred, object, &own, &extra, subset)
+                    .decide_with(ctx, subject, pred, object, &own, &chosen)
                     .await?
                 {
                     return Err(QueryError::InvalidQuery(format!(
@@ -963,8 +986,7 @@ impl R2rmlPolicyGate {
         }
     }
 
-    /// One evaluation over `own` plus the members of `extra` that `subset`'s
-    /// bits select.
+    /// One evaluation over `own` plus `chosen`.
     #[allow(clippy::too_many_arguments)]
     async fn decide_with(
         &mut self,
@@ -973,16 +995,14 @@ impl R2rmlPolicyGate {
         pred: &str,
         object: Option<&str>,
         own: &[String],
-        extra: &[String],
-        subset: u32,
+        chosen: &[&String],
     ) -> Result<bool> {
         let snapshot = self.encoder.as_ref().unwrap_or(ctx.active_snapshot);
-        let mut classes: Vec<Sid> = own.iter().map(|c| encode(snapshot, c)).collect();
-        for (i, c) in extra.iter().enumerate() {
-            if subset & (1 << i) != 0 {
-                classes.push(encode(snapshot, c));
-            }
-        }
+        let classes: Vec<Sid> = own
+            .iter()
+            .chain(chosen.iter().copied())
+            .map(|c| encode(snapshot, c))
+            .collect();
         self.evaluate(ctx, subject, pred, object, &classes).await
     }
 
@@ -1381,11 +1401,20 @@ mod tests {
         restriction: fluree_db_policy::PolicyRestriction,
         default_allow: bool,
     ) -> R2rmlPolicyGate {
+        gate_for_all(mapping, vec![restriction], default_allow)
+    }
+
+    /// A gate over `mapping` for several view restrictions.
+    fn gate_for_all(
+        mapping: &CompiledR2rmlMapping,
+        restrictions: Vec<fluree_db_policy::PolicyRestriction>,
+        default_allow: bool,
+    ) -> R2rmlPolicyGate {
         use crate::policy::QueryPolicyEnforcer;
         use std::sync::Arc;
         let snapshot = LedgerSnapshot::genesis("gs:main");
         let vars = crate::var_registry::VarRegistry::new();
-        let view = build_policy_set(vec![restriction], None, PolicyAction::View, None);
+        let view = build_policy_set(restrictions, None, PolicyAction::View, None);
         let wrapper = PolicyWrapper::new(
             view,
             PolicySet::default(),
@@ -1530,6 +1559,103 @@ mod tests {
                 && text.contains(&format!("{}", MAX_EXTRA_CLASSES + 1)),
             "{text}"
         );
+    }
+
+    fn decide_result(
+        gate: &mut R2rmlPolicyGate,
+        tm: &TriplesMap,
+        pred: &str,
+    ) -> crate::error::Result<bool> {
+        let snapshot = LedgerSnapshot::genesis("gs:main");
+        let vars = crate::var_registry::VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        futures::executor::block_on(gate.allows(&ctx, tm, None, pred, None, &[]))
+    }
+
+    /// A classless map over one template, and `n` maps over the same template
+    /// each declaring one class `http://ex/K{i}`, with those class IRIs.
+    fn plain_and_classed(n: usize) -> (CompiledR2rmlMapping, TriplesMap, Vec<String>) {
+        let classes: Vec<String> = (0..n).map(|i| format!("http://ex/K{i}")).collect();
+        let plain = templated("http://ex/plain", "http://ex/c/{id}", &[], vec![]);
+        let mut maps = vec![plain.clone()];
+        for (i, c) in classes.iter().enumerate() {
+            maps.push(templated(
+                &format!("http://ex/m{i}"),
+                "http://ex/c/{id}",
+                &[c.as_str()],
+                vec![],
+            ));
+        }
+        (CompiledR2rmlMapping::new(maps), plain, classes)
+    }
+
+    /// Every class a subject might also hold takes part in its decision, past
+    /// any fixed width: with 33 and 70 classes other maps declare, all of them
+    /// targeted, the one denied class (beyond the first 32) still hides the
+    /// classless map's rows.
+    #[test]
+    fn a_decision_counts_every_extra_class_however_many() {
+        for n in [33usize, 70] {
+            let (mapping, plain, classes) = plain_and_classed(n);
+            let refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+            let denied = classes[n - 1].as_str();
+            let mut gate = gate_for_all(
+                &mapping,
+                vec![
+                    restriction(TargetMode::OnClass, &[], &refs, true),
+                    restriction(TargetMode::OnClass, &[], &[denied], false),
+                ],
+                true,
+            );
+            assert!(
+                !decide_result(&mut gate, &plain, "http://ex/name").expect("decided"),
+                "{n} extra classes: the denied one is among them"
+            );
+        }
+    }
+
+    /// Where every class set is evaluated, more extra classes than the cap
+    /// refuse the decision, however many: 33 and 70 classes a map deriving
+    /// classes from a column could also mint.
+    #[test]
+    fn an_enumeration_past_the_cap_is_refused_however_many_classes() {
+        for n in [33usize, 70] {
+            let classes: Vec<String> = (0..n).map(|i| format!("http://ex/K{i}")).collect();
+            let refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+            let typed = templated(
+                "http://ex/typed",
+                "http://ex/c/{id}",
+                &[],
+                vec![pom(rdf::TYPE, ObjectMap::column_iri("kind"))],
+            );
+            let mapping = CompiledR2rmlMapping::new(vec![typed.clone()]);
+            let mut gate = gate_for_all(
+                &mapping,
+                vec![
+                    restriction(TargetMode::OnClass, &[], &refs, true),
+                    restriction(TargetMode::OnClass, &[], &[refs[n - 1]], false),
+                ],
+                true,
+            );
+            let err = decide_result(&mut gate, &typed, "http://ex/name").expect_err("refused");
+            assert!(
+                err.to_string().contains(&format!("over {n} classes")),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn subsets_are_every_combination() {
+        let items: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
+        let mut all: Vec<Vec<&str>> = subsets(&items)
+            .map(|s| s.into_iter().map(String::as_str).collect())
+            .collect();
+        all.sort();
+        assert_eq!(all.len(), 8);
+        assert_eq!(all[0], Vec::<&str>::new());
+        assert!(all.contains(&vec!["a", "b", "c"]));
+        assert_eq!(subsets(&[]).count(), 1);
     }
 
     #[test]
