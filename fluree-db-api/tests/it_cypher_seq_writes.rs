@@ -2067,6 +2067,11 @@ async fn issue1873_hoisted_read_after_write_is_rejected_not_committed() {
             "errored: the hoisted WITH left `n` unbound",
             r#"CREATE (n:P {id: "c1"}) WITH n SET n.nm = "a""#,
         ),
+        (
+            "worked (2 flakes): the reordering happened not to be observable, but the \
+             statement is indistinguishable from the WHERE form above",
+            r#"MATCH (n:Person {name: "Alice"}) SET n.a = 1 WITH n SET n.b = 2"#,
+        ),
     ] {
         let l = seed_1873(&fluree, &format!("it/1873:r{}", stmt.len())).await;
         let err = fluree
@@ -2098,6 +2103,11 @@ async fn issue1873_reads_before_writes_still_commit_their_flakes() {
             r#"MATCH (n:Person) WITH n, n.name AS nm SET n.marker = nm"#,
         ),
         (3, r#"MERGE (n:P {id: "y"}) SET n.nm = "a""#),
+        // No read after the write: unaffected.
+        (
+            2,
+            r#"MATCH (n:Person {name: "Alice"}) SET n.a = 1 SET n.b = 2"#,
+        ),
         (2, r#"CREATE (n:P {id: "c9"})"#),
     ] {
         let l = seed_1873(&fluree, &format!("it/1873:a{}", stmt.len())).await;
