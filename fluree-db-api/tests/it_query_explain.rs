@@ -710,7 +710,7 @@ async fn explain_dedup_only_grouped_select_expression() {
 }
 
 async fn about_lang_ledger(fluree: &support::MemoryFluree, id: &str) -> support::MemoryLedger {
-    let ledger0 = genesis_ledger(fluree, id);
+    let ledger0 = genesis_ledger(fluree, id).await;
     fluree
         .insert(
             ledger0,
@@ -857,7 +857,7 @@ async fn jsonld_constant_iri_bind_seeds_the_triples_that_read_it() {
 async fn literal_bind_ahead_of_a_constant_iri_bind_still_compares_terms() {
     let _env = HashJoinEnv::acquire();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind-seed-literal-first:main");
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-literal-first:main").await;
     let ledger = fluree
         .insert(
             ledger0,
@@ -967,7 +967,7 @@ async fn constant_iri_bind_seed_keeps_bind_results() {
 async fn constant_iri_bind_leaves_a_star_its_property_join() {
     let _env = HashJoinEnv::acquire();
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger0 = genesis_ledger(&fluree, "bind-seed-star:main");
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-star:main").await;
     let ledger = fluree
         .insert(
             ledger0,
