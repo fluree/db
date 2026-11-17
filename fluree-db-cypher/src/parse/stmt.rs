@@ -9,7 +9,6 @@ use crate::ast::{
 use crate::ast::{Expr, MapLit, ParamRef, Variable};
 use crate::diag::{DiagCode, Diagnostic};
 use crate::lex::TokenKind;
-use crate::span::SourceSpan;
 
 use super::expr::{parse_expr, parse_map_lit};
 use super::pattern::parse_pattern;
@@ -68,31 +67,31 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
     // `MATCH … MERGE … WITH … SET`. It is also the only point every write
     // path passes through; the sequential driver's own validation never sees
     // the third case above, which does not route to it.
-    let mut first_write: Option<SourceSpan> = None;
+    let mut wrote = false;
 
     loop {
         match s.peek_kind() {
             TokenKind::Match => {
-                if first_write.is_some() {
+                if wrote {
                     return Err(hoisted_read_error(s, "MATCH"));
                 }
                 read_clauses.push(ReadClause::Match(parse_match(s, false)?));
             }
             TokenKind::Optional => {
-                if first_write.is_some() {
+                if wrote {
                     return Err(hoisted_read_error(s, "OPTIONAL MATCH"));
                 }
                 s.advance();
                 read_clauses.push(ReadClause::OptionalMatch(parse_match(s, true)?));
             }
             TokenKind::With => {
-                if first_write.is_some() {
+                if wrote {
                     return Err(hoisted_read_error(s, "WITH"));
                 }
                 read_clauses.push(ReadClause::With(parse_with(s)?));
             }
             TokenKind::Unwind => {
-                if first_write.is_some() {
+                if wrote {
                     return Err(hoisted_read_error(s, "UNWIND"));
                 }
                 read_clauses.push(ReadClause::Unwind(parse_unwind(s)?));
@@ -104,7 +103,7 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                 ));
             }
             TokenKind::Call => {
-                if first_write.is_some() {
+                if wrote {
                     return Err(hoisted_read_error(s, "CALL { … }"));
                 }
                 read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?));
@@ -114,43 +113,36 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                 break;
             }
             TokenKind::Create => {
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Create(parse_create(s)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Merge => {
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Merge(parse_merge(s)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Set => {
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Set(parse_set(s)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Remove => {
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Remove(parse_remove(s)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Delete => {
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Delete(parse_delete(s, false)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Detach => {
                 s.advance();
                 if !matches!(s.peek_kind(), TokenKind::Delete) {
                     return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
                 }
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Delete(parse_delete(s, true)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Ident(w) if w.eq_ignore_ascii_case("foreach") => {
-                let sp = s.peek_span();
                 write_clauses.push(WriteClause::Foreach(parse_foreach(s)?));
-                first_write.get_or_insert(sp);
+                wrote = true;
             }
             TokenKind::Eof => break,
             other => {
