@@ -27,6 +27,16 @@ keep their object identity, so `React.memo` down the tree keeps working.
 > [What's proven / what isn't](#whats-proven--what-isnt) before believing
 > anything else in this file.
 
+## Install
+
+```sh
+npm install @fluree/react                    # remote mode
+npm install @fluree/react @fluree/db-wasm    # peer mode as well
+```
+
+Both packages are released with the Fluree server, at its version; keep them
+on matching versions.
+
 ## Two modes, one API
 
 The hooks are identical in both. Only `createClient` differs — in the demo
