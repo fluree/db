@@ -24,6 +24,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::execute::build_where_operators_seeded;
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{Pattern, SubqueryPattern};
 use crate::object_binding::{equality_norm, EqualityNorm};
@@ -371,7 +372,14 @@ impl SubqueryOperator {
                 || subquery.grouping.is_some()
                 || !pass_through_ok);
 
-        let join_mode = if must_evaluate_once {
+        // Per-row mode seeds only `join_keys`, so with none every parent row
+        // runs the same body from the same empty seed and gets the same rows.
+        // Evaluating it once and joining is then the same answer at any parent
+        // size, sliced or not: a slice cuts that one evaluation either way.
+        // (A pinned import is always a join key, so none is lost here.)
+        let seeds_nothing = join_keys.is_empty();
+
+        let join_mode = if must_evaluate_once || seeds_nothing {
             true
         } else {
             // Evaluate-once + hash-join only when there is no inner slice and
@@ -615,7 +623,7 @@ impl SubqueryOperator {
                     self.materialized = Some(self.materialize(ctx).await?);
                 }
                 if self.probe.is_none() {
-                    self.probe = Some(self.start_probe());
+                    self.probe = Some(self.start_probe()?);
                 }
                 let mat = self.materialized.as_ref().unwrap();
                 let Some(idx) = self.probe.as_mut().unwrap().next(mat, ctx)? else {
@@ -623,7 +631,7 @@ impl SubqueryOperator {
                     self.parent_row += 1;
                     continue;
                 };
-                self.merge_row(parent, self.parent_row, |col| mat.rows[idx].get(col))
+                self.merge_row(parent, self.parent_row, |col| mat.rows[idx].get(col))?
             } else {
                 // Per-row correlations keep their pruning seed. An identity
                 // parent uses an independent empty seed and runs the body once.
@@ -661,7 +669,7 @@ impl SubqueryOperator {
                         .select
                         .get(col)
                         .and_then(|v| batch.get(row, *v))
-                })
+                })?
             };
             if let Some(row) = merged {
                 for (col, binding) in columns.iter_mut().zip(row) {
@@ -693,7 +701,7 @@ impl SubqueryOperator {
         ))
     }
 
-    fn start_probe(&self) -> MatchCursor {
+    fn start_probe(&self) -> Result<MatchCursor> {
         let parent = self.parent_batch.as_ref().unwrap();
         // Only actual Unbound values are wildcards. Poisoned also normalizes
         // to Absent but must retain the existing blocking semantics.
@@ -710,10 +718,11 @@ impl SubqueryOperator {
                 let (dicts, gv) = EqualityNorm::parts(&self.norm);
                 binding
                     .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                    .unwrap_or(GroupKeyOwned::Absent)
+                    .transpose()
+                    .map(|key| key.unwrap_or(GroupKeyOwned::Absent))
             })
-            .collect();
-        if unbound.is_empty() {
+            .try_collect_vec()?;
+        Ok(if unbound.is_empty() {
             self.materialized
                 .as_ref()
                 .unwrap()
@@ -735,7 +744,7 @@ impl SubqueryOperator {
                 bucket: 0,
                 row: 0,
             }
-        }
+        })
     }
 
     fn merge_row<'a>(
@@ -743,7 +752,7 @@ impl SubqueryOperator {
         parent_batch: &Batch,
         row_idx: usize,
         subquery_row: impl Fn(usize) -> Option<&'a Binding>,
-    ) -> Option<Vec<Binding>> {
+    ) -> Result<Option<Vec<Binding>>> {
         // Family B — reconcile OPTIONAL/UNION-produced correlation vars.
         // These are correlation vars the subquery does not self-produce,
         // so they are not hash join keys; the subquery binds them
@@ -757,22 +766,22 @@ impl SubqueryOperator {
         // no-op.
         if !self.reconcile_vars.is_empty() {
             let (dicts, gv) = EqualityNorm::parts(&self.norm);
-            let incompatible = self.reconcile_vars.iter().any(|v| {
+            for v in &self.reconcile_vars {
                 let parent = parent_batch.get(row_idx, *v);
                 let sub = self.select_index.get(v).and_then(|&i| subquery_row(i));
-                match (parent, sub) {
+                let incompatible = match (parent, sub) {
                     (Some(p), Some(s))
                         if !matches!(p, Binding::Unbound | Binding::Poisoned)
                             && !matches!(s, Binding::Unbound | Binding::Poisoned) =>
                     {
-                        binding_to_group_key_normalized(p, dicts, gv)
-                            != binding_to_group_key_normalized(s, dicts, gv)
+                        binding_to_group_key_normalized(p, dicts, gv)?
+                            != binding_to_group_key_normalized(s, dicts, gv)?
                     }
                     _ => false,
+                };
+                if incompatible {
+                    return Ok(None);
                 }
-            });
-            if incompatible {
-                return None;
             }
         }
 
@@ -812,7 +821,7 @@ impl SubqueryOperator {
             merged_row.push(binding);
         }
 
-        Some(merged_row)
+        Ok(Some(merged_row))
     }
 
     /// Seed only the inputs admitted by the existing correlation rules.
@@ -909,9 +918,10 @@ impl SubqueryOperator {
                         .get(v)
                         .and_then(|&col| row.get(col))
                         .map(|b| binding_to_group_key_normalized(b, dicts, gv))
-                        .unwrap_or(GroupKeyOwned::Absent)
+                        .transpose()
+                        .map(|key| key.unwrap_or(GroupKeyOwned::Absent))
                 })
-                .collect();
+                .try_collect_vec()?;
             let indices = mat.index.entry(key).or_insert_with(|| {
                 index_bytes += 2
                     * (std::mem::size_of::<Vec<GroupKeyOwned>>()
@@ -988,7 +998,7 @@ impl SubqueryOperator {
 const SUBQUERY_MATERIALIZE_MIN_PARENT_ROWS: usize = 8;
 
 /// Variables bound in *every* solution of `patterns` — produced by a top-level
-/// required pattern (triple / property path), or exported by a slice-free nested
+/// required pattern (triple / property path / R2RML scan), or exported by a slice-free nested
 /// sub-SELECT whose own body always-binds them. NOT vars bound only inside a
 /// `UNION` branch or `OPTIONAL` (conditional), nor a sub-SELECT's pass-throughs.
 /// These are the only correlation variables safe to use as evaluate-once
@@ -1001,6 +1011,11 @@ pub(crate) fn self_produced_vars(patterns: &[Pattern]) -> HashSet<VarId> {
             Pattern::Triple(_) | Pattern::ListView(_) | Pattern::PropertyPath(_) => {
                 produced.extend(p.produced_vars());
             }
+            // An R2RML scan: a graph-source sub-select body, lowered by the
+            // rewrite. It binds its variables in every row it emits, like the
+            // triples it replaces, with the one exception its own method
+            // leaves out.
+            Pattern::R2rml(rp) => produced.extend(rp.always_bound_vars()),
             // A nested sub-SELECT binds the SELECT vars its own body always
             // binds, so those are always-bound here too. A slice would make
             // per-row seeding of such a var result-sensitive, so skip it then.
@@ -1028,6 +1043,35 @@ mod tests {
     use crate::ir::SubqueryPattern;
     use crate::seed::SeedOperator;
     use crate::var_registry::VarId;
+
+    /// A graph-source sub-select body is R2RML scans after the rewrite. Their
+    /// variables are hash-join keys like a triple's, so a JSON-LD sub-select
+    /// joining on one is seeded per outer row with it rather than reading the
+    /// table per outer row unseeded. A type variable fused into a wildcard is
+    /// the exception: over a classless map it is left unbound.
+    #[test]
+    fn r2rml_scans_produce_their_always_bound_vars() {
+        use crate::ir::R2rmlPattern;
+        let (s, o, p, t, x) = (VarId(0), VarId(1), VarId(2), VarId(3), VarId(4));
+        let star = R2rmlPattern::new("gs:main", s, Some(o))
+            .with_predicate("http://example.org/customer")
+            .with_star_bindings(vec![("http://example.org/amount".into(), x)]);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(star)]),
+            HashSet::from([s, o, x])
+        );
+        let typed = R2rmlPattern::new("gs:main", s, None).with_type_var(t);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(typed)]),
+            HashSet::from([s, t])
+        );
+        let mut crawl = R2rmlPattern::new("gs:main", s, Some(o)).with_type_var(t);
+        crawl.predicate_var = Some(p);
+        assert_eq!(
+            self_produced_vars(&[Pattern::R2rml(crawl)]),
+            HashSet::from([s, o, p])
+        );
+    }
 
     #[tokio::test]
     async fn materialized_join_matches_partial_keys_without_reviving_poisoned_rows() {
@@ -1373,6 +1417,64 @@ mod tests {
                 assert_eq!(ctx.mem_used(), baseline + 123);
             }
         }
+    }
+
+    /// A sliced correlated sub-select runs per parent row, seeded with its join
+    /// keys. One that seeds nothing (no shared variable, or one bound only in
+    /// an OPTIONAL) would rerun the same body from the same empty seed for
+    /// every parent row, so it is evaluated once instead.
+    #[test]
+    fn a_slice_that_seeds_nothing_is_evaluated_once() {
+        use crate::ir::{Ref, Term, TriplePattern};
+        use fluree_db_core::Sid;
+        let (c, o, a) = (VarId(0), VarId(1), VarId(2));
+        let triple = |s, p: &str, o| {
+            Pattern::Triple(TriplePattern::new(
+                Ref::Var(s),
+                Ref::Sid(Sid::new(100, p)),
+                Term::Var(o),
+            ))
+        };
+        let plan = |select: Vec<VarId>, patterns: Vec<Pattern>| {
+            // Three parent rows binding ?c: not an identity parent.
+            let parent = Batch::new(
+                Arc::from(vec![c]),
+                vec![vec![Binding::Unbound, Binding::Unbound, Binding::Unbound]],
+            )
+            .unwrap();
+            SubqueryOperator::new(
+                Box::new(crate::seed::BatchReplayOperator::new(
+                    Arc::from(vec![c]),
+                    vec![parent],
+                )),
+                SubqueryPattern::new(select, patterns).with_limit(2),
+                None,
+                PlanningContext::current(),
+            )
+        };
+
+        let seeded = plan(
+            vec![c, o, a],
+            vec![triple(o, "customer", c), triple(o, "amount", a)],
+        );
+        assert_eq!(seeded.join_keys, vec![c]);
+        assert!(!seeded.join_mode, "a slice per seeded parent row");
+
+        let unshared = plan(vec![o, a], vec![triple(o, "amount", a)]);
+        assert!(unshared.correlation_vars.is_empty());
+        assert!(unshared.join_mode, "no shared variable: evaluated once");
+
+        let optional = plan(
+            vec![c, o, a],
+            vec![
+                triple(o, "amount", a),
+                Pattern::Optional(vec![triple(o, "customer", c)]),
+            ],
+        );
+        assert_eq!(optional.correlation_vars, vec![c]);
+        assert!(optional.join_keys.is_empty());
+        assert_eq!(optional.reconcile_vars, vec![c]);
+        assert!(optional.join_mode, "seeds nothing: evaluated once");
     }
 
     /// Verifies that correlation uses SELECT vars, not internal pattern vars.

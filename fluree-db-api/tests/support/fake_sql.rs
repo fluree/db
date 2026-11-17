@@ -78,12 +78,18 @@ impl FakeSql {
 
     pub async fn mount(self) -> MockServer {
         let server = MockServer::start().await;
+        self.mount_on(&server).await;
+        server
+    }
+
+    /// Serve these tables from `server`, which may have answered nothing
+    /// until now (an endpoint unreachable when a source was registered).
+    pub async fn mount_on(self, server: &MockServer) {
         Mock::given(wiremock::matchers::method("POST"))
             .and(wiremock::matchers::path("/v1/statement"))
             .respond_with(self)
-            .mount(&server)
+            .mount(server)
             .await;
-        server
     }
 
     fn table_for_source(&self, src: &str) -> Option<&Table> {

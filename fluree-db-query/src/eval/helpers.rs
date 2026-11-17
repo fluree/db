@@ -573,8 +573,8 @@ pub(crate) fn expression_is_duplication_safe(expr: &Expression) -> bool {
         } => expression_is_duplication_safe(list) && expression_is_duplication_safe(predicate),
         Expression::Member { target, .. } => expression_is_duplication_safe(target),
         // Resolved per-row against the execution context. The sink already
-        // declines these via `contains_exists`; excluded here too so the
-        // predicate stands on its own rather than relying on a caller's gate.
+        // declines these via `Expression::reads_dataset`; excluded here too so
+        // the predicate stands on its own rather than relying on a caller's gate.
         Expression::Exists { .. } | Expression::PatternComprehension { .. } => false,
         // Already resolved against one execution context; re-evaluating it
         // elsewhere is not obviously the same question, so decline rather than
@@ -820,6 +820,7 @@ pub fn parse_datetime_from_binding(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } => {
             let ctx = ctx?;
@@ -828,9 +829,10 @@ pub fn parse_datetime_from_binding(
             if !is_temporal_datatype(&dt_sid, datatypes) {
                 return None;
             }
-            let gv = ctx.graph_view()?;
-            let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+            let val = ctx
+                .with_term_view(|gv| {
+                    gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
+                })?
                 .ok()?;
             flake_value_to_datetime(&val, Some(&dt_sid), datatypes)
         }

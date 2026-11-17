@@ -113,6 +113,29 @@ impl PeerState {
     }
 
     /// Update ledger watermark from SSE event (returns true if changed)
+    /// Replace a ledger's watermark outright, for a remote that moved it
+    /// backwards (a rebase lowers a branch's index).
+    pub async fn reset_ledger(
+        &self,
+        ledger_id: &LedgerId,
+        commit_t: i64,
+        index_t: i64,
+        commit_head_id: Option<String>,
+        index_head_id: Option<String>,
+    ) {
+        self.ledgers.write().await.insert(
+            ledger_id.clone(),
+            RemoteLedgerWatermark {
+                ledger_id: ledger_id.to_string(),
+                commit_t,
+                index_t,
+                commit_head_id,
+                index_head_id,
+                last_updated: Instant::now(),
+            },
+        );
+    }
+
     pub async fn update_ledger(
         &self,
         ledger_id: &LedgerId,

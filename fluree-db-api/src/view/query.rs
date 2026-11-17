@@ -52,12 +52,7 @@ fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
 fn residency_content_store(
     db: &GraphDb,
 ) -> Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> {
-    let provider = db.snapshot.range_provider.as_ref()?;
-    let brp = provider
-        .as_any()
-        .downcast_ref::<fluree_db_query::BinaryRangeProvider>()?;
-    let cs = brp.store().content_store()?.clone();
-    cs.miss_register().is_some().then_some(cs)
+    crate::residency::content_store(&db.snapshot)
 }
 
 /// A JSON-LD query on a view reads that view's ledger, whole, at the view's
@@ -183,7 +178,18 @@ fn guard_graph_source_patterns_for(
     parsed: &fluree_db_query::ir::Query,
     syntax: QuerySyntax,
 ) -> Result<()> {
-    let unsupported = fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    let mut unsupported =
+        fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    // HAVING, ORDER BY and the binds after a trailing VALUES run outside
+    // every graph scope, wrapped or not.
+    unsupported.extend(fluree_db_query::r2rml::unsupported_query_modifiers(
+        parsed.grouping.as_ref(),
+        &parsed.order_binds,
+        parsed
+            .post_values
+            .as_ref()
+            .map_or(&[], |pv| pv.then.as_slice()),
+    ));
     if !unsupported.is_empty() {
         return Err(ApiError::Query(
             fluree_db_query::r2rml::unsupported_subscope_error(gs_ids, &unsupported),
@@ -1980,9 +1986,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
@@ -2060,9 +2064,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)

@@ -383,9 +383,11 @@ class Connection:
         to ``endpoint`` as SQL in ``dialect``.
 
         A mapped table whose subject key is not unique is reported with a
-        warning and refused at query time, unless
-        ``allow_duplicate_subjects``. ``model`` and ``default_allow`` are as
-        for :meth:`map_iceberg`.
+        warning and refused at query time. ``allow_duplicate_subjects`` skips
+        that probe: no table is refused, and queries answer over the set of
+        triples the mapping defines, removing repeated solutions wherever no
+        key declared in the mapping proves a map's subjects unique. ``model``
+        and ``default_allow`` are as for :meth:`map_iceberg`.
         """
         spec = {
             "endpoint": endpoint,

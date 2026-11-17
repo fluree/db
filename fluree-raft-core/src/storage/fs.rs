@@ -286,6 +286,9 @@ struct Segment {
     last_index: Option<u64>,
     path: PathBuf,
     len: u64,
+    /// Closed to appends by [`Inner::seal`]; the next append starts a
+    /// new segment. In memory only: a reopened segment takes appends.
+    sealed: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -344,6 +347,9 @@ impl Inner {
         };
         inner.migrate_legacy_entries()?;
         inner.scan_segments()?;
+        // A crash inside `purge_through` leaves segments the marker has
+        // passed, and a purge to the same index never runs again.
+        inner.unlink_purged_segments()?;
         inner.load_committed()?;
         Ok(inner)
     }
@@ -531,6 +537,7 @@ impl Inner {
                 last_index,
                 path,
                 len: at as u64,
+                sealed: false,
             });
             expected_next = Some(physical_next);
         }
@@ -647,6 +654,7 @@ impl Inner {
             last_index: None,
             path,
             len: SEGMENT_HEADER as u64,
+            sealed: false,
         });
         self.active = Some(file);
         Ok(())
@@ -692,7 +700,7 @@ impl Inner {
         let needs_segment = self
             .segments
             .last()
-            .is_none_or(|seg| seg.len >= self.segment_bytes);
+            .is_none_or(|seg| seg.sealed || seg.len >= self.segment_bytes);
         if needs_segment {
             self.start_segment(first)?;
         }
@@ -837,38 +845,63 @@ impl Inner {
         if self.last_purged.is_some_and(|p| p.index >= log_id.index) {
             return Ok(());
         }
-        // The marker first: a crash after it leaves entries the scan
-        // ignores, never a hole below a stale marker.
+        // The marker first: a crash after it leaves segments the next open
+        // unlinks, never a hole below a stale marker.
         let bytes = postcard::to_allocvec(&log_id).map_err(|e| ser_err("encode last_purged", e))?;
         atomic_write_blocking(&self.root.join("last_purged"), &bytes)?;
         self.last_purged = Some(log_id);
         self.index = self.index.split_off(&(log_id.index + 1));
-        self.active = None;
-        // Oldest first, each unlink durable before the next, so the segments
-        // on the device are a contiguous suffix at every crash point. A newer
-        // unlink outliving an older one would leave a hole the scan refuses,
-        // even below the marker.
-        let mut kept = Vec::with_capacity(self.segments.len());
-        for seg in self.segments.drain(..) {
-            // Whole segments at or below the marker go, and so does an empty
-            // one whose first index the marker has passed.
-            let obsolete = match seg.last_index {
-                Some(last) => last <= log_id.index,
-                None => seg.first_index <= log_id.index,
+        self.unlink_purged_segments()
+    }
+
+    /// Unlink every whole segment at or below the purge marker, and an
+    /// empty one whose first index the marker has passed. Oldest first,
+    /// each unlink durable before the next, so the segments on the device
+    /// are a contiguous suffix at every crash point: a newer unlink
+    /// outliving an older one would leave a hole the scan refuses, even
+    /// below the marker.
+    fn unlink_purged_segments(&mut self) -> Result<(), StorageError> {
+        let Some(cutoff) = self.cutoff() else {
+            return Ok(());
+        };
+        while let Some(seg) = self.segments.first() {
+            let purged = match seg.last_index {
+                Some(last) => last <= cutoff,
+                None => seg.first_index <= cutoff,
             };
-            if obsolete {
-                std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
-                #[cfg(test)]
-                self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
-                fsync_dir_blocking(&self.log_dir)?;
-                #[cfg(test)]
-                self.device_trace.push(DeviceStep::DirFsync);
-            } else {
-                kept.push(seg);
+            if !purged {
+                break;
+            }
+            self.active = None;
+            std::fs::remove_file(&seg.path).map_err(|e| io_err("remove segment", e))?;
+            #[cfg(test)]
+            self.device_trace.push(DeviceStep::Unlink(seg.path.clone()));
+            fsync_dir_blocking(&self.log_dir)?;
+            #[cfg(test)]
+            self.device_trace.push(DeviceStep::DirFsync);
+            self.segments.remove(0);
+        }
+        Ok(())
+    }
+
+    /// Close the segment holding the tail, so a purge through the tail
+    /// unlinks it: `purge_through` only removes whole segments, and one
+    /// that kept taking appends would outlive every purge point inside it.
+    /// A header-only segment holds nothing to protect and stays open.
+    fn seal(&mut self) -> Option<u64> {
+        if let Some(seg) = self.segments.last_mut() {
+            if seg.last_index.is_some() {
+                seg.sealed = true;
             }
         }
-        self.segments = kept;
-        Ok(())
+        self.segments.iter().rev().find_map(|seg| seg.last_index)
+    }
+
+    fn first_retained_index(&self) -> Option<u64> {
+        self.segments
+            .iter()
+            .find(|seg| seg.last_index.is_some())
+            .map(|seg| seg.first_index)
     }
 
     fn log_state(&self) -> LogState {
@@ -1003,11 +1036,24 @@ impl RaftLogStore for FsRaftLogStore {
     async fn read_committed(&self) -> Result<Option<LogId>, StorageError> {
         self.with_inner(|inner| Ok(inner.committed)).await
     }
+
+    async fn seal(&self) -> Result<Option<u64>, StorageError> {
+        self.with_inner(|inner| Ok(inner.seal())).await
+    }
+
+    async fn first_retained_index(&self) -> Result<Option<u64>, StorageError> {
+        self.with_inner(|inner| Ok(inner.first_retained_index()))
+            .await
+    }
 }
 
 /// Filesystem-backed implementation of [`RaftSnapshotStore`].
 pub struct FsRaftSnapshotStore {
     root: PathBuf,
+    /// Held across a write and across [`RaftSnapshotStore::discard_superseded`],
+    /// so a discard cannot remove the files of a snapshot staged but not
+    /// yet named `current`.
+    write_lock: tokio::sync::Mutex<()>,
 }
 
 impl FsRaftSnapshotStore {
@@ -1018,7 +1064,10 @@ impl FsRaftSnapshotStore {
         fs::create_dir_all(root.join("snapshots"))
             .await
             .map_err(|e| io_err("create snapshot dir", e))?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            write_lock: tokio::sync::Mutex::new(()),
+        })
     }
 
     fn snapshot_dir(&self) -> PathBuf {
@@ -1090,10 +1139,15 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
         let safe_id = validate_path_safe_id(&meta.id)?;
         let meta_bytes =
             postcard::to_allocvec(meta).map_err(|e| ser_err("encode snapshot meta", e))?;
+        let _guard = self.write_lock.lock().await;
         atomic_write(&self.meta_path(safe_id), &meta_bytes).await?;
         atomic_write(&self.data_path(safe_id), &data).await?;
         atomic_write(&self.current_path(), safe_id.as_bytes()).await?;
-        self.reclaim_superseded(safe_id).await;
+        // Best-effort here: a removal that fails leaves an orphan for the
+        // next write or `discard_superseded`, never a broken snapshot.
+        if let Err(e) = self.remove_superseded(Some(safe_id)).await {
+            warn!(error = %e, "snapshot reclamation incomplete");
+        }
         Ok(())
     }
 
@@ -1133,35 +1187,46 @@ impl RaftSnapshotStore for FsRaftSnapshotStore {
 
         Ok(Some((meta, data)))
     }
+
+    async fn discard_superseded(&self) -> Result<(), StorageError> {
+        let _guard = self.write_lock.lock().await;
+        let current = read_if_exists(&self.current_path()).await?;
+        let keep = match &current {
+            Some(bytes) => Some(std::str::from_utf8(bytes).map_err(|e| {
+                StorageError::corruption(format!("current snapshot id is not utf8: {e}"))
+            })?),
+            None => None,
+        };
+        self.remove_superseded(keep).await
+    }
 }
 
 impl FsRaftSnapshotStore {
     /// Remove every snapshot file except `keep_id`'s pair and the
     /// `current` pointer, plus any `*.tmp` staged by a crashed
-    /// `atomic_write`. Called after the pointer durably names
-    /// `keep_id`, so nothing removed here is reachable; without the
-    /// sweep every superseded snapshot (a full serialized state
-    /// machine) stays on disk forever. Best-effort — a failed
-    /// removal leaves an orphan for the next write's sweep, never a
-    /// broken snapshot — but completed removals get one directory
-    /// fsync so a crash can't resurrect a half-removed sibling.
-    async fn reclaim_superseded(&self, keep_id: &str) {
+    /// `atomic_write`; with no `keep_id`, every snapshot file. Call only
+    /// once the pointer durably names `keep_id`, so nothing removed is
+    /// reachable. Keeps going past a failed removal and returns the
+    /// first failure; completed removals get one directory fsync so a
+    /// crash can't resurrect a half-removed sibling.
+    async fn remove_superseded(&self, keep_id: Option<&str>) -> Result<(), StorageError> {
         let dir = self.snapshot_dir();
-        let mut entries = match fs::read_dir(&dir).await {
-            Ok(entries) => entries,
-            Err(e) => {
-                warn!(error = %e, "snapshot reclamation could not list directory");
-                return;
-            }
-        };
+        let mut entries = fs::read_dir(&dir)
+            .await
+            .map_err(|e| io_err("list snapshot dir", e))?;
         let mut removed = false;
-        while let Ok(Some(entry)) = entries.next_entry().await {
+        let mut first_failure = None;
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| io_err("list snapshot dir", e))?
+        {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let superseded = name
                 .strip_suffix(".meta")
                 .or_else(|| name.strip_suffix(".data"))
-                .is_some_and(|stem| stem != keep_id)
+                .is_some_and(|stem| keep_id != Some(stem))
                 || name.ends_with(".tmp");
             if !superseded {
                 continue;
@@ -1170,15 +1235,14 @@ impl FsRaftSnapshotStore {
                 Ok(()) => removed = true,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => {
-                    warn!(file = %name, error = %e, "snapshot reclamation failed to remove file");
+                    first_failure.get_or_insert(io_err(&format!("remove snapshot file {name}"), e));
                 }
             }
         }
         if removed {
-            if let Err(e) = fsync_dir(&dir).await {
-                warn!(error = %e, "snapshot reclamation directory sync failed");
-            }
+            fsync_dir(&dir).await?;
         }
+        first_failure.map_or(Ok(()), Err)
     }
 }
 
@@ -1217,6 +1281,7 @@ impl RaftStorage for FsRaftStorage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
 
     fn entry(term: u64, index: u64) -> LogEntry {
@@ -1289,6 +1354,158 @@ mod tests {
         FsRaftLogStore::open(dir.path().to_path_buf())
             .await
             .unwrap()
+    }
+
+    const SECRET: &[u8] = b"secret-0b7e41";
+
+    fn secret_entry(term: u64, index: u64) -> LogEntry {
+        LogEntry {
+            log_id: LogId::new(term, index),
+            payload: SECRET.to_vec(),
+        }
+    }
+
+    /// Every file under `root` whose bytes contain `needle`.
+    fn files_holding(root: &Path, needle: &[u8]) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if std::fs::read(&path)
+                    .unwrap()
+                    .windows(needle.len())
+                    .any(|w| w == needle)
+                {
+                    found.push(path);
+                }
+            }
+        }
+        found
+    }
+
+    async fn live_indexes(store: &FsRaftLogStore) -> Vec<u64> {
+        store
+            .read_range(0..u64::MAX)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| e.log_id.index)
+            .collect()
+    }
+
+    /// Why `seal` exists: a purge unlinks only whole segments, so the
+    /// segment that took appends past the purge point keeps every entry
+    /// below it on disk.
+    #[tokio::test]
+    async fn a_purge_keeps_the_bytes_of_the_segment_it_lands_in() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[secret_entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+
+        assert_eq!(live_indexes(&store).await, [3]);
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(1));
+        assert!(!files_holding(dir.path(), SECRET).is_empty());
+    }
+
+    /// The same sequence with a seal before the later append.
+    #[tokio::test]
+    async fn a_purge_through_a_sealed_tail_unlinks_its_segment() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[secret_entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        assert_eq!(store.seal().await.unwrap(), Some(2));
+        store.append(&[entry(1, 3)]).await.unwrap();
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+
+        assert_eq!(live_indexes(&store).await, [3]);
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(3));
+        assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
+    }
+
+    /// A seal is not persisted: the segment after it continues the
+    /// sealed one, so the log reopens whole, and the reopened tail
+    /// takes appends again.
+    #[tokio::test]
+    async fn a_sealed_segment_and_its_successor_reopen_as_one_log() {
+        let (dir, store) = fresh_log_store().await;
+        store.append(&[entry(1, 1), entry(1, 2)]).await.unwrap();
+        store.seal().await.unwrap();
+        store.append(&[entry(1, 3)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 2);
+        drop(store);
+
+        let store = reopen(&dir).await;
+        assert_eq!(live_indexes(&store).await, [1, 2, 3]);
+        store.append(&[entry(1, 4)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sealing_an_empty_log_reports_no_tail() {
+        let (_dir, store) = fresh_log_store().await;
+        assert_eq!(store.seal().await.unwrap(), None);
+        assert_eq!(store.first_retained_index().await.unwrap(), None);
+        store.append(&[entry(1, 1)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 1);
+    }
+
+    /// A truncation into a sealed segment shortens it in place; the
+    /// replacement entries still go to a new segment, which a purge
+    /// through the shortened one leaves alone.
+    #[tokio::test]
+    async fn entries_replacing_a_truncated_sealed_tail_start_a_new_segment() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[entry(1, 1), entry(1, 2), entry(1, 3)])
+            .await
+            .unwrap();
+        store.seal().await.unwrap();
+        store.truncate_from(3).await.unwrap();
+        store.append(&[entry(2, 3)]).await.unwrap();
+        assert_eq!(segment_files(&store).len(), 2);
+
+        store.purge_through(LogId::new(1, 2)).await.unwrap();
+        assert_eq!(store.first_retained_index().await.unwrap(), Some(3));
+        drop(store);
+
+        let store = reopen(&dir).await;
+        let live = store.read_range(0..u64::MAX).await.unwrap();
+        assert_eq!(
+            live.iter().map(|e| e.log_id).collect::<Vec<_>>(),
+            [LogId::new(2, 3)]
+        );
+    }
+
+    /// A crash between `purge_through`'s marker and its unlinks leaves
+    /// segments the marker has passed. A retry purges to the same index
+    /// and does nothing, so the open finishes the purge.
+    #[tokio::test]
+    async fn the_open_finishes_an_interrupted_purge() {
+        let (dir, store) = fresh_log_store().await;
+        store
+            .append(&[secret_entry(1, 1), entry(1, 2)])
+            .await
+            .unwrap();
+        let marker = postcard::to_allocvec(&LogId::new(1, 2)).unwrap();
+        atomic_write(&store.last_purged_path(), &marker)
+            .await
+            .unwrap();
+        drop(store);
+
+        let store = reopen(&dir).await;
+        assert_eq!(store.first_retained_index().await.unwrap(), None);
+        assert_eq!(files_holding(dir.path(), SECRET), Vec::<PathBuf>::new());
+        store.append(&[entry(1, 3)]).await.unwrap();
+        assert_eq!(live_indexes(&store).await, [3]);
     }
 
     /// Simulates a crash mid-`truncate_from` across segments: the later
@@ -1889,6 +2106,128 @@ mod tests {
         // The new snapshot itself is intact.
         let (current_meta, _) = store.current().await.unwrap().unwrap();
         assert_eq!(current_meta.id, SnapshotId::new("snap-1"));
+    }
+
+    fn snapshot_meta(id: &str) -> SnapshotMeta {
+        SnapshotMeta {
+            id: SnapshotId::new(id),
+            last_applied: Some(LogId::new(1, 5)),
+            membership: vec![],
+        }
+    }
+
+    fn snapshot_dir_names(dir: &TempDir) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir.path().join("snapshots"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Orphans a failed reclamation left behind are removed by the
+    /// next `discard_superseded`, and the current snapshot survives.
+    #[tokio::test]
+    async fn discard_superseded_keeps_only_the_current_snapshot() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        store
+            .write(&snapshot_meta("snap-2"), vec![2])
+            .await
+            .unwrap();
+        let snapshots = dir.path().join("snapshots");
+        std::fs::write(snapshots.join("snap-1.meta"), b"orphan").unwrap();
+        std::fs::write(snapshots.join("snap-1.data"), b"orphan").unwrap();
+        std::fs::write(snapshots.join("current.tmp"), b"orphan").unwrap();
+
+        store.discard_superseded().await.unwrap();
+
+        assert_eq!(
+            snapshot_dir_names(&dir),
+            ["current", "snap-2.data", "snap-2.meta"]
+        );
+        let (meta, data) = store.current().await.unwrap().unwrap();
+        assert_eq!((meta.id, data), (SnapshotId::new("snap-2"), vec![2]));
+    }
+
+    /// Snapshot files with no `current` pointer are unreachable.
+    #[tokio::test]
+    async fn discard_superseded_without_a_current_snapshot_removes_every_one() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        let snapshots = dir.path().join("snapshots");
+        std::fs::write(snapshots.join("snap-9.meta"), b"orphan").unwrap();
+        std::fs::write(snapshots.join("snap-9.data"), b"orphan").unwrap();
+
+        store.discard_superseded().await.unwrap();
+
+        assert_eq!(snapshot_dir_names(&dir), Vec::<String>::new());
+        assert!(store.current().await.unwrap().is_none());
+    }
+
+    /// A discard never sees a snapshot a write has staged but not yet
+    /// named current: unserialized, it removes the write's staged files.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn discard_superseded_waits_out_a_write_in_flight() {
+        let dir = TempDir::new().unwrap();
+        let store = Arc::new(
+            FsRaftSnapshotStore::open(dir.path().to_path_buf())
+                .await
+                .unwrap(),
+        );
+        let stop = Arc::new(AtomicBool::new(false));
+        let discarder = tokio::spawn({
+            let store = Arc::clone(&store);
+            let stop = Arc::clone(&stop);
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    store.discard_superseded().await.unwrap();
+                }
+            }
+        });
+        for i in 0..50 {
+            store
+                .write(&snapshot_meta(&format!("snap-{i}")), vec![7; 4096])
+                .await
+                .unwrap_or_else(|e| panic!("write {i}: {e}"));
+        }
+        stop.store(true, Ordering::Relaxed);
+        discarder.await.unwrap();
+
+        assert_eq!(
+            store.current().await.unwrap().unwrap().0.id,
+            SnapshotId::new("snap-49")
+        );
+    }
+
+    /// A removal that fails fails `discard_superseded`, but only warns
+    /// after a write, whose snapshot is already durable and current.
+    #[tokio::test]
+    async fn a_superseded_snapshot_that_cannot_be_removed_fails_only_the_discard() {
+        let dir = TempDir::new().unwrap();
+        let store = FsRaftSnapshotStore::open(dir.path().to_path_buf())
+            .await
+            .unwrap();
+        std::fs::create_dir(dir.path().join("snapshots").join("snap-1.data")).unwrap();
+
+        store
+            .write(&snapshot_meta("snap-2"), vec![2])
+            .await
+            .unwrap();
+        assert_eq!(
+            store.current().await.unwrap().unwrap().0.id,
+            SnapshotId::new("snap-2")
+        );
+        let err = store
+            .discard_superseded()
+            .await
+            .expect_err("an unremovable superseded file");
+        assert!(matches!(err, StorageError::Io(_)), "got {err:?}");
     }
 
     #[test]

@@ -43,11 +43,12 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
+use fluree_db_core::range::range_with_overlay_tracked;
 use fluree_db_core::{
-    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, IndexType, LedgerSnapshot,
-    RangeMatch, RangeOptions, RangeTest, Sid,
+    DatatypeConstraint, Flake, FlakeValue, IndexType, LedgerSnapshot, RangeMatch, RangeOptions,
+    RangeTest, Sid,
 };
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
 
@@ -451,7 +452,7 @@ impl PropertyPathOperator {
         index: IndexType,
         range_match: RangeMatch,
     ) -> Result<Vec<Flake>> {
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             graph.snapshot,
             graph.g_id,
             graph.overlay,
@@ -459,6 +460,7 @@ impl PropertyPathOperator {
             RangeTest::Eq,
             range_match,
             RangeOptions::new().with_to_t(graph.to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         ctx.tracker.consume_fuel(
@@ -856,8 +858,12 @@ impl PropertyPathOperator {
         // (predicate-indexed) and merge them into one adjacency map — for an
         // alternation path `(a|b)*` the closure spans both predicates' edges.
         let graphs = ctx.path_graphs()?;
-        let mut adj: std::collections::HashMap<Sid, Vec<Sid>> = std::collections::HashMap::new();
-        let mut nodes: HashSet<Sid> = HashSet::new();
+        // Fx-hashed: the closure below emits its pairs in `nodes` order, which
+        // is then fixed by the edges read, so an unordered answer pages with
+        // LIMIT/OFFSET without skipping or repeating a pair. A std set seeds
+        // each instance at random.
+        let mut adj: FxHashMap<Sid, Vec<Sid>> = FxHashMap::default();
+        let mut nodes: FxHashSet<Sid> = FxHashSet::default();
         let mut edge = |s: Sid, o: Sid| {
             nodes.insert(s.clone());
             nodes.insert(o.clone());
@@ -1093,9 +1099,12 @@ impl PropertyPathOperator {
     /// objects of all step predicates. This is the domain over which a `*`/`?`
     /// zero-length match pairs each node with itself (mirrors how the simple-path
     /// closure tracks both subjects and objects).
-    async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<HashSet<Sid>> {
+    ///
+    /// Fx-hashed for the same reason as the closure's node set: the caller
+    /// emits a self-pair per node in this set's order.
+    async fn composite_domain_nodes(&self, ctx: &ExecutionContext<'_>) -> Result<FxHashSet<Sid>> {
         let graphs = ctx.path_graphs()?;
-        let mut nodes: HashSet<Sid> = HashSet::new();
+        let mut nodes: FxHashSet<Sid> = FxHashSet::default();
         let all_preds = self.pattern.predicates.iter().chain(
             self.pattern
                 .sequence_steps
@@ -1272,6 +1281,7 @@ impl PropertyPathOperator {
                 g_id: ctx.binary_g_id,
                 to_t,
                 dirty,
+                tracker: ctx.tracker.clone(),
             },
             typed_pids,
             reserved_pids,
@@ -1596,14 +1606,13 @@ impl PropertyPathOperator {
 
     /// Whether a literal is a term of the path's graphs: the object of a
     /// triple the query can see. One read of the triples holding its value.
-    /// An encoded literal decodes through the graph view; with several graphs
-    /// active there is none, and the member scans have decoded it already.
+    /// An encoded literal decodes through the scope's term view.
     async fn literal_in_graph(&self, ctx: &ExecutionContext<'_>, term: &Binding) -> Result<bool> {
         let decoded;
         let term = match term {
             Binding::EncodedLit { .. } => {
                 decoded =
-                    crate::group_aggregate::materialize_encoded(term, ctx.graph_view().as_ref());
+                    crate::group_aggregate::materialize_encoded(term, ctx.term_view().as_ref())?;
                 &decoded
             }
             other => other,
@@ -1690,24 +1699,23 @@ impl PropertyPathOperator {
                     // (only meaningful within this single ledger, which property paths
                     // already require) to its IRI through the novelty-aware graph view,
                     // then re-encode against the same graph — matching the
-                    // `IriMatch`/`Iri` arms above. Subject ids are the ledger's, so with
-                    // several graphs active (no graph view) the store's view across them
-                    // resolves it. An id that cannot be resolved is an error, not an
-                    // unbound endpoint.
+                    // `IriMatch`/`Iri` arms above. Subject ids are the store's, the same
+                    // in every graph, so a decoder with no graph resolves it whatever
+                    // graphs are active. An id that cannot be resolved is an error, not
+                    // an unbound endpoint.
                     Some(b @ Binding::EncodedSid { s_id, .. }) => {
                         let view = ctx
-                            .graph_view()
+                            .term_view()
                             .or_else(|| {
                                 binary_store.map(|store| {
-                                    store
-                                        .graph_with_novelty(
-                                            ctx.binary_g_id,
-                                            ctx.dict_novelty.clone(),
-                                        )
-                                        .with_namespace_codes_fallback(
-                                            ctx.namespace_codes_fallback.clone(),
-                                        )
-                                        .with_tracker(ctx.tracker.clone())
+                                    fluree_db_binary_index::TermView::new(
+                                        Arc::clone(store),
+                                        ctx.dict_novelty.clone(),
+                                    )
+                                    .with_namespace_codes_fallback(
+                                        ctx.namespace_codes_fallback.clone(),
+                                    )
+                                    .with_tracker(ctx.tracker.clone())
                                 })
                             })
                             .ok_or_else(|| {

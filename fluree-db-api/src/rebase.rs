@@ -134,10 +134,11 @@ pub struct RebaseReport {
 /// - `Some(_)` → write all `pending_replays` then advance the branch
 ///   HEAD from `pre_rebase_head_id` to `new_head_id` (one operation
 ///   atomically; local: `publish_commit`; Raft: `AdvanceRef`).
-/// - `None` → all source commits were skipped (`Skip` strategy on
-///   every conflicting commit, or every commit's flake set was
-///   empty after resolution); nothing to apply, return the report
-///   with `replayed == 0`.
+/// - `None` → no branch commit survived (`Skip` strategy on every
+///   conflicting commit, or every commit's flake set was empty after
+///   resolution). Nothing is written; the local apply moves the branch
+///   onto the source's head and index, and the Raft path, whose heads
+///   only advance, completes the entry with the branch unchanged.
 pub struct StagedRebase {
     /// Branch being rebased (without ledger prefix).
     pub branch: String,
@@ -203,6 +204,15 @@ pub struct StagedRebase {
     /// content-addressed objects but aren't on the active head
     /// chain until that single advance commits.
     pub pending_replays: Vec<PendingReplay>,
+    /// The source's index as copied into the branch's namespace, or `None`
+    /// when the source has none or the copy failed. After a rebase that
+    /// replays commits it replaces the branch's own index, which indexes
+    /// the line the replay replaces.
+    pub source_index: Option<(ContentId, i64)>,
+    /// The source's published index, not copied. A rebase that replays
+    /// nothing makes the branch the source, and the local apply copies
+    /// this onto the branch with the source's head.
+    pub source_record_index: Option<(ContentId, i64)>,
 }
 
 /// Built-but-unwritten replay commit. Carried inside
@@ -298,8 +308,8 @@ impl crate::Fluree {
     ///   `needs_reindex` and the background indexer rebuilds.
     /// - All-skipped (every conflicting commit dropped by `Skip`,
     ///   or every replay produced empty flakes):
-    ///   [`StagedRebase::new_head_id`] is `None`; the apply step
-    ///   does nothing.
+    ///   [`StagedRebase::new_head_id`] is `None`, and the branch becomes
+    ///   the source: the local apply moves it onto the source's head.
     ///
     /// Errors with [`ApiError::InvalidBranch`] when called on a
     /// root branch, [`ApiError::NotFound`] when the source can't be
@@ -374,7 +384,8 @@ impl crate::Fluree {
         if is_fast_forward {
             // Copy the source index into the branch namespace
             // (best-effort, matches local single-node behavior).
-            self.copy_source_index(&source_id, &branch_id, &source_record)
+            let source_index = self
+                .copy_source_index(&source_id, &branch_id, &source_record)
                 .await;
 
             // Load the source's state under the branch's id so the
@@ -404,6 +415,8 @@ impl crate::Fluree {
                 write_guard,
                 final_state,
                 pending_replays: Vec::new(),
+                source_index,
+                source_record_index: None,
             });
         }
 
@@ -544,9 +557,16 @@ impl crate::Fluree {
         // rollback, nothing put it back. The branch then loaded the
         // source's index and its own commits dropped out of every read.
         // Replay itself reads the source's state, never the copied index,
-        // so nothing above needs this to have happened. Best-effort.
-        self.copy_source_index(&source_id, &branch_id, &source_record)
-            .await;
+        // so nothing above needs this to have happened. Best-effort. A
+        // rebase that replayed nothing publishes no index here: the local
+        // apply moves the branch onto the source's head and index together,
+        // and the Raft path leaves the branch where it was.
+        let source_index = if pending_replays.is_empty() {
+            None
+        } else {
+            self.copy_source_index(&source_id, &branch_id, &source_record)
+                .await
+        };
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
@@ -571,6 +591,11 @@ impl crate::Fluree {
             write_guard,
             final_state: current_state,
             pending_replays,
+            source_index,
+            source_record_index: source_record
+                .index_head_id
+                .clone()
+                .map(|id| (id, source_record.index_t)),
         })
     }
 
@@ -588,7 +613,7 @@ impl crate::Fluree {
             branch: _,
             branch_id,
             source: _,
-            source_id: _,
+            source_id,
             source_head_id,
             source_head_t,
             fast_forward,
@@ -604,6 +629,8 @@ impl crate::Fluree {
             write_guard,
             final_state,
             pending_replays,
+            source_index,
+            source_record_index,
         } = staged;
 
         if let Some(ref last_head_id) = new_head_id {
@@ -618,8 +645,66 @@ impl crate::Fluree {
                         })?;
                 }
             }
-            self.publisher()?
-                .publish_commit(&branch_id, new_head_t, last_head_id)
+            if fast_forward {
+                // The branch's own index is on the source's line already.
+                self.publisher()?
+                    .publish_commit(&branch_id, new_head_t, last_head_id)
+                    .await?;
+            } else {
+                // The new head and the index move in one write, so no reader
+                // sees the new head over the replaced line's index. The copy
+                // above published the source's index only if it was newer
+                // than the branch's own; the branch's own indexes the
+                // replaced line, so it goes whatever its `t`.
+                let (index_head_id, index_t) =
+                    source_index.map_or((None, 0), |(id, t)| (Some(id), t));
+                self.branch_admin()?
+                    .reset_head(
+                        &branch_id,
+                        NsRecordSnapshot {
+                            commit_head_id: Some(last_head_id.clone()),
+                            commit_t: new_head_t,
+                            index_head_id,
+                            index_t,
+                        },
+                    )
+                    .await?;
+            }
+        }
+
+        // No branch commit survived, so the branch becomes the source: its
+        // head and index move to the source's together. A reset, since the
+        // source's head can be at or below the branch's `t`.
+        let became_source = new_head_id.is_none() && !fast_forward;
+        if became_source {
+            let (index_head_id, index_t) = match source_record_index {
+                Some((index_cid, index_t)) => {
+                    match self
+                        .copy_index_to_branch(&source_id, &branch_id, &index_cid)
+                        .await
+                    {
+                        Ok(()) => (Some(index_cid), index_t),
+                        Err(e) => {
+                            tracing::warn!(
+                                %e, source = %source_id, branch = %branch_id,
+                                "failed to copy index during rebase; branch will replay from genesis"
+                            );
+                            (None, 0)
+                        }
+                    }
+                }
+                None => (None, 0),
+            };
+            self.branch_admin()?
+                .reset_head(
+                    &branch_id,
+                    NsRecordSnapshot {
+                        commit_head_id: Some(source_head_id.clone()),
+                        commit_t: source_head_t,
+                        index_head_id,
+                        index_t,
+                    },
+                )
                 .await?;
         }
 
@@ -628,7 +713,9 @@ impl crate::Fluree {
         // never a clone of the cached state, so the cache co-holds none of the
         // dictionaries the replay's `make_mut`s extend — the state threads
         // owned through the loop. This install performs no dictionary work.
-        if let Some(guard) = write_guard {
+        // `final_state` is the replay's last state, or the source's when
+        // nothing replayed: installed wherever the branch's head moved.
+        if let Some(guard) = write_guard.filter(|_| new_head_id.is_some() || became_source) {
             let needs_reindex = final_state.should_reindex(&self.index_config);
             let commit_t = final_state.t();
             self.finalize_commit(guard, final_state, commit_t, needs_reindex)
@@ -849,31 +936,35 @@ impl crate::Fluree {
         Ok(retractions)
     }
 
-    /// Copy index artifacts from source to branch (best-effort).
+    /// Copy index artifacts from source to branch (best-effort), and
+    /// publish them on the branch where newer than its own. The index now in
+    /// the branch's namespace, if any.
     async fn copy_source_index(
         &self,
         source_id: &str,
         branch_id: &str,
         source_record: &fluree_db_nameservice::NsRecord,
-    ) {
-        if let Some(ref index_cid) = source_record.index_head_id {
-            if let Err(e) = self
-                .copy_index_to_branch(source_id, branch_id, index_cid)
+    ) -> Option<(ContentId, i64)> {
+        let index_cid = source_record.index_head_id.as_ref()?;
+        if let Err(e) = self
+            .copy_index_to_branch(source_id, branch_id, index_cid)
+            .await
+        {
+            tracing::warn!(
+                %e, source = %source_id, branch = %branch_id,
+                "failed to copy index during rebase; branch will replay from genesis"
+            );
+            return None;
+        }
+        if let Some(publisher) = self.nameservice_mode.publisher() {
+            if let Err(e) = publisher
+                .publish_index(branch_id, source_record.index_t, index_cid)
                 .await
             {
-                tracing::warn!(
-                    %e, source = %source_id, branch = %branch_id,
-                    "failed to copy index during rebase; branch will replay from genesis"
-                );
-            } else if let Some(publisher) = self.nameservice_mode.publisher() {
-                if let Err(e) = publisher
-                    .publish_index(branch_id, source_record.index_t, index_cid)
-                    .await
-                {
-                    tracing::warn!(%e, "failed to publish index for rebased branch");
-                }
+                tracing::warn!(%e, "failed to publish index for rebased branch");
             }
         }
+        Some((index_cid.clone(), source_record.index_t))
     }
 }
 

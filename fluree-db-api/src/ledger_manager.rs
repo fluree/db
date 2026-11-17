@@ -1278,7 +1278,8 @@ use fluree_db_query::BinaryRangeProvider;
 
 /// Residency mode (F8): prewarm the reverse-dict leaves that overlay
 /// translation of this snapshot's novelty will touch, in one concurrent
-/// fetch round at load time. Novelty replay stays the load model; its
+/// fetch round after an index apply or a catch-up (a load warms these
+/// leaves before its own probes). Novelty replay stays the load model; its
 /// query-time miss sources (sync `find_subject_id_by_parts` /
 /// `find_string_id` per novelty entry) are prefetched here so a cold
 /// residency peer does not spend a retry round per reverse-tree leaf.
@@ -1295,6 +1296,44 @@ async fn prefetch_novelty_translation(
         .prefetch_novelty_reverse_wants(
             dict_novelty.subjects.iter_entries(),
             dict_novelty.strings.iter_values(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch"
+        );
+    }
+}
+
+/// Residency mode: fetch the reverse-dict leaves that
+/// `populate_dict_novelty_safe` probes for every novelty subject and string.
+/// Those probes are sync and a load runs in no retry frame, so a cold leaf
+/// fails the load. Covers the leaves [`prefetch_novelty_translation`] warms,
+/// since every DictNovelty entry comes from these flakes.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_dict_probes(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    novelty: &fluree_db_novelty::Novelty,
+) {
+    use fluree_db_core::FlakeValue;
+    let mut subjects: Vec<(u16, &str)> = Vec::new();
+    let mut strings: Vec<&str> = Vec::new();
+    for f in novelty.iter_flakes(fluree_db_core::IndexType::Post) {
+        subjects.push((f.s.namespace_code, &f.s.name));
+        match &f.o {
+            FlakeValue::Ref(sid) => subjects.push((sid.namespace_code, &sid.name)),
+            FlakeValue::String(s) | FlakeValue::Json(s) => strings.push(s),
+            _ => {}
+        }
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            subjects.into_iter(),
+            strings.into_iter(),
             fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
         )
         .await;
@@ -1404,6 +1443,8 @@ pub(crate) async fn load_and_attach_binary_store(
     // This prevents minting a second internal ID for an already-indexed IRI/string.
     if !state.novelty.is_empty() {
         let novelty = state.novelty.as_ref();
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        prefetch_novelty_dict_probes(&store, novelty).await;
         let dn = Arc::make_mut(&mut state.dict_novelty);
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
@@ -1439,9 +1480,6 @@ pub(crate) async fn load_and_attach_binary_store(
     // would always be false on snapshots loaded outside the
     // LedgerManager handle path.
     snap.content_store = Some(Arc::clone(&cs));
-
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
 
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
@@ -2372,7 +2410,16 @@ impl LedgerManager {
 /// Maximum number of commits to catch up incrementally before falling back to
 /// full reload. For gaps larger than this, the cost of N individual commit loads
 /// exceeds the cost of a single full reload.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_INCREMENTAL_COMMITS: i64 = 5;
+/// Browser peers: an SSE reconnect after a tab sleeps routinely wakes tens
+/// of commits behind, and a full re-open drops warm per-store state (the
+/// overlay-translation cache is store-id-keyed) that catch-up preserves.
+/// The parent-chain walk is one sequential fetch per commit, so the cap is
+/// where ~gap × RTT stops beating a re-open's concurrent artifact loads —
+/// past it, reload (which still fires the head-change signal) wins.
+#[cfg(target_arch = "wasm32")]
+const MAX_INCREMENTAL_COMMITS: i64 = 64;
 
 /// Decision from comparing cached state to nameservice record
 ///
@@ -2699,6 +2746,12 @@ impl LedgerManager {
 
                 commits.reverse(); // oldest → newest
 
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                let translation_prefetch: Option<(
+                    Arc<fluree_db_binary_index::BinaryIndexStore>,
+                    Arc<fluree_db_core::dict_novelty::DictNovelty>,
+                )>;
+
                 // Apply commits under write lock (brief — all sync).
                 // Re-check state.t() under lock to guard against concurrent updates.
                 {
@@ -2715,6 +2768,22 @@ impl LedgerManager {
                         drop(write_guard);
                         self.reload(&input.ledger_id).await?;
                         return Ok(NotifyResult::Reloaded);
+                    }
+                    // The walk stops at the cached `t`, not the cached head: after
+                    // a rebase the new line's commits sit on another commit at
+                    // that `t`, and applying them would mix the two lines.
+                    if let Some(cached_head) = write_guard.state().head_commit_id.as_ref() {
+                        let oldest_parent = commits.first().and_then(|c| c.parent_ids().next());
+                        if oldest_parent != Some(cached_head) {
+                            tracing::debug!(
+                                alias = %input.ledger_id,
+                                local_t,
+                                "incremental catch-up: commits are not on the cached line, falling back to reload"
+                            );
+                            drop(write_guard);
+                            self.reload(&input.ledger_id).await?;
+                            return Ok(NotifyResult::Reloaded);
+                        }
                     }
                     // Detach the range provider before the commit loop. A
                     // BinaryRangeProvider owns Arc clones of dict_novelty /
@@ -2757,6 +2826,16 @@ impl LedgerManager {
                     // (`apply_single_commit` mutates the dicts in place now that the
                     // provider no longer pins them.) Runs unconditionally — even
                     // after an apply error — so the provider is never left detached.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    {
+                        translation_prefetch = provider_store.as_ref().map(|store| {
+                            (
+                                Arc::clone(store),
+                                Arc::clone(&write_guard.state().dict_novelty),
+                            )
+                        });
+                    }
+
                     if let Some(store) = provider_store {
                         let dn = Arc::clone(&write_guard.state().dict_novelty);
                         let runtime_small_dicts =
@@ -2795,6 +2874,19 @@ impl LedgerManager {
                             self.config.leaflet_cache.clone(),
                         )
                         .await?;
+                }
+
+                // Caught-up commits introduced new novelty entries whose
+                // overlay translation reverse-looks-up the persisted dict
+                // trees at query time: prewarm those leaves now (the same F8
+                // treatment the load and index-apply paths get), so a
+                // head-change → re-query is a pure hit instead of a retry
+                // round. Runs outside the write guard; when an index update
+                // swapped the store above, its apply-path prefetch already
+                // covered the new store and this is a resident no-op.
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                if let Some((store, dict_novelty)) = translation_prefetch {
+                    prefetch_novelty_translation(&store, &dict_novelty).await;
                 }
 
                 Ok(NotifyResult::CommitsApplied { count: gap })

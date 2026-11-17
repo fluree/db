@@ -30,9 +30,10 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::BinaryIndexStore;
 use fluree_db_core::namespaces::{is_rdf_first, is_rdf_rest};
+use fluree_db_core::range::range_with_overlay_tracked;
 use fluree_db_core::{
-    range_with_overlay, DatatypeConstraint, Flake, FlakeValue, GraphId, IndexType, LedgerSnapshot,
-    OverlayProvider, RangeMatch, RangeOptions, RangeTest, Sid,
+    DatatypeConstraint, Flake, FlakeValue, GraphId, IndexType, LedgerSnapshot, OverlayProvider,
+    RangeMatch, RangeOptions, RangeTest, Sid,
 };
 use fluree_vocab::namespaces::{BLANK_NODE, RDF};
 use fluree_vocab::predicates::{RDF_FIRST, RDF_NIL, RDF_REST};
@@ -49,8 +50,12 @@ type List = (Owner, Vec<Flake>);
 #[derive(Debug)]
 pub struct ListView {
     /// Predicates whose values include list members; `None` when that is
-    /// not known, and any may. Ordered, so a read across them meets the
-    /// lists in the same order every time, and names their cells alike.
+    /// not known, and any may.
+    ///
+    /// Ordered: a read with an open predicate reads them in this order, which
+    /// is the order its lists are answered in and their cells are labelled in.
+    /// A std set seeded each view at random, so the same query answered its
+    /// lists in a different order on each execution.
     predicates: Option<BTreeSet<Sid>>,
     /// The index ids of `predicates`, sorted; `None` when they are not known.
     predicate_ids: Option<Vec<u32>>,
@@ -669,9 +674,9 @@ async fn list_rows(
     let mut cache: HashMap<(Want, Want, ObjectWant), Vec<ListTriple>> = HashMap::new();
     for row in 0..input.len() {
         let bound = |var: Option<VarId>| var.and_then(|v| input.get(row, v));
-        let s = node_want(ctx, bound(t.s.as_var()), &t.s);
-        let p = node_want(ctx, bound(t.p.as_var()), &t.p);
-        let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref());
+        let s = node_want(ctx, bound(t.s.as_var()), &t.s)?;
+        let p = node_want(ctx, bound(t.p.as_var()), &t.p)?;
+        let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref())?;
         let key = (s.clone(), p.clone(), o.clone());
         if !cache.contains_key(&key) {
             let found = list_triples(ctx, view, &graphs, &s, &p, &o).await?;
@@ -853,8 +858,11 @@ impl ObjectWant {
     }
 }
 
-fn decoded(ctx: &ExecutionContext<'_>, b: &Binding) -> Binding {
-    crate::group_aggregate::materialize_encoded(b, ctx.graph_view().as_ref())
+fn decoded(ctx: &ExecutionContext<'_>, b: &Binding) -> Result<Binding> {
+    Ok(crate::group_aggregate::materialize_encoded(
+        b,
+        ctx.term_view().as_ref(),
+    )?)
 }
 
 fn iri_sid(ctx: &ExecutionContext<'_>, iri: &str) -> Want {
@@ -864,9 +872,9 @@ fn iri_sid(ctx: &ExecutionContext<'_>, iri: &str) -> Want {
     }
 }
 
-fn node_want(ctx: &ExecutionContext<'_>, bound: Option<&Binding>, term: &Ref) -> Want {
-    match (bound, term) {
-        (Some(b), _) => match decoded(ctx, b) {
+fn node_want(ctx: &ExecutionContext<'_>, bound: Option<&Binding>, term: &Ref) -> Result<Want> {
+    Ok(match (bound, term) {
+        (Some(b), _) => match decoded(ctx, b)? {
             Binding::Unbound => Want::Any,
             Binding::Sid { sid, .. } => Want::Node(sid),
             Binding::IriMatch { iri, .. } | Binding::Iri(iri) => iri_sid(ctx, &iri),
@@ -875,7 +883,7 @@ fn node_want(ctx: &ExecutionContext<'_>, bound: Option<&Binding>, term: &Ref) ->
         (None, Ref::Var(_)) => Want::Any,
         (None, Ref::Sid(sid)) => Want::Node(sid.clone()),
         (None, Ref::Iri(iri)) => iri_sid(ctx, iri),
-    }
+    })
 }
 
 fn object_want(
@@ -883,14 +891,14 @@ fn object_want(
     bound: Option<&Binding>,
     term: &Term,
     dtc: Option<&DatatypeConstraint>,
-) -> ObjectWant {
+) -> Result<ObjectWant> {
     let node = |w: Want| match w {
         Want::Node(sid) => ObjectWant::Node(sid),
         Want::Any => ObjectWant::Any,
         Want::Nothing => ObjectWant::Nothing,
     };
-    match (bound, term) {
-        (Some(b), _) => match decoded(ctx, b) {
+    Ok(match (bound, term) {
+        (Some(b), _) => match decoded(ctx, b)? {
             Binding::Unbound => ObjectWant::Any,
             Binding::Sid { sid, .. } => ObjectWant::Node(sid),
             Binding::IriMatch { iri, .. } | Binding::Iri(iri) => node(iri_sid(ctx, &iri)),
@@ -902,7 +910,7 @@ fn object_want(
         (None, Term::Iri(iri)) => node(iri_sid(ctx, iri)),
         (None, Term::Value(FlakeValue::Ref(sid))) => ObjectWant::Node(sid.clone()),
         (None, Term::Value(v)) => ObjectWant::Value(v.clone(), dtc.cloned()),
-    }
+    })
 }
 
 /// A list member as the binding of its value.
@@ -1177,7 +1185,7 @@ async fn read_lists_in(
     let mut by_owner: Vec<List> = Vec::new();
     let mut slot: HashMap<Owner, usize> = HashMap::new();
     for (index, range_match) in reads {
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             graph.snapshot,
             graph.g_id,
             graph.overlay,
@@ -1185,6 +1193,7 @@ async fn read_lists_in(
             RangeTest::Eq,
             range_match,
             RangeOptions::new().with_to_t(graph.to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         let members: Vec<Flake> = flakes

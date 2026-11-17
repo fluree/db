@@ -468,10 +468,30 @@ fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> ValueOrder {
     cmp_values_inner(left, right, true)
 }
 
-/// Ordering of two comparable values. `temporal_string_coerce` enables parsing
-/// a plain string as a temporal to order it against a typed temporal (a LEX_ID
-/// storage aid, used for `<`/`>`); it is disabled for `=`/`!=`, where a plain
-/// string is never value-equal to a temporal (eq-dateTime).
+/// Whether `v`, when its value is a string (`fv`), is a plain string term: a
+/// simple literal or `xsd:string`, the one kind of string a temporal orders
+/// against. A language-tagged, custom-typed, `@fulltext` or JSON literal, and
+/// an IRI, are not. True for every non-string value.
+fn plain_if_string(v: &ComparableValue, fv: &FlakeValue) -> bool {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    if !matches!(fv, FlakeValue::String(_)) {
+        return true;
+    }
+    match v {
+        ComparableValue::String(_) => true,
+        ComparableValue::TypedLiteral { dtc: None, .. } => true,
+        ComparableValue::TypedLiteral {
+            dtc: Some(U::Explicit(iri)),
+            ..
+        } => iri.as_ref() == fluree_vocab::xsd::STRING,
+        _ => false,
+    }
+}
+
+/// Ordering of two comparable values. `temporal_string_coerce` enables reading
+/// a plain string as a temporal to order it against a typed temporal (used for
+/// `<`/`>`); it is disabled for `=`/`!=`, where a plain string is never
+/// value-equal to a temporal (eq-dateTime).
 fn cmp_values_inner(
     left: &ComparableValue,
     right: &ComparableValue,
@@ -511,8 +531,13 @@ fn cmp_values_inner(
     }
 
     // Cross-type coercion: when one side is a temporal type and the other is a
-    // string, try to parse the string as that temporal type (ordering only).
-    if temporal_string_coerce {
+    // plain string, read the string as a value of that temporal type
+    // (ordering only). A tagged or otherwise-typed literal is a term of its
+    // own type and is not read as a temporal.
+    if temporal_string_coerce
+        && plain_if_string(left, &left_fv)
+        && plain_if_string(right, &right_fv)
+    {
         if let Some(ordering) = fluree_db_core::temporal::cmp_with_lexical(&left_fv, &right_fv) {
             return ValueOrder::Ordered(ordering);
         }

@@ -2333,13 +2333,24 @@ impl BackgroundIndexerWorker {
         match result {
             Ok(index_result) => {
                 // Try to publish
-                if let Err(e) = crate::publish_index_result(
-                    &content_store,
+                let published = match crate::refuse_build_off_the_line(
                     self.nameservice.as_ref(),
-                    &index_result,
+                    content_store.as_ref(),
+                    &record,
                 )
                 .await
                 {
+                    Ok(()) => {
+                        crate::publish_index_result(
+                            &content_store,
+                            self.nameservice.as_ref(),
+                            &index_result,
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = published {
                     // Surface the build's fuel + index_t on publish failure —
                     // in background mode there is no caller, so this is the
                     // only place the (already-paid-for) work shows up.

@@ -232,7 +232,7 @@ Beyond XSD, Fluree supports RDF-specific datatypes:
 
 **rdf:langString** represents strings with language tags. This is distinct from plain strings and enables language-aware queries.
 
-> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a string joins only against its own term — the same language tag, or the same datatype, which holds for `xsd:anyURI`, `xsd:token` and customer-defined datatypes exactly as it does for `xsd:string`. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string **as a constant object** (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. That leniency is specific to the constant-object position: the same bare string in a `values` cell is an `xsd:string` term and matches only `xsd:string` rows. An explicitly typed literal is exact for its datatype in both surfaces: `"25"^^xsd:int` (or `{"@value": "25", "@type": "xsd:int"}`) matches `xsd:int` rows only, not the same number stored as `xsd:long`, and `"25"^^xsd:integer` written out matches `xsd:integer` rows only. Bare numeric literals (`25`, `25.0`, and a JSON number in a JSON-LD query) are the one lenient form — they match an equal value under any numeric datatype, so `25` finds `xsd:integer`, `xsd:long`, `xsd:int` and `xsd:double` values alike. Language tags are case-insensitive (BCP 47) and are stored and compared in lowercase: `"chat"@FR` is written, matched, and returned by `LANG()` as `fr`.
+> **Matching a string literal in a query.** `"bob"`, `"bob"@en` and `"bob"@fr` are three different RDF terms. In SPARQL a constant object matches only its own term: `?s ex:name "bob"@en` returns just the English value, `?s ex:name "bob"` (an `xsd:string`) does not match tagged values, and a variable bound to a string joins only against its own term — the same language tag, or the same datatype, which holds for `xsd:anyURI`, `xsd:token` and customer-defined datatypes exactly as it does for `xsd:string`. In a JSON-LD query, `{"@value": "bob", "@language": "en"}` and `{"@value": "bob", "@type": "xsd:string"}` are likewise exact, while a bare JSON string **as a constant object** (`"ex:name": "bob"`) matches the lexical value under any string datatype or language tag. That leniency is specific to the constant-object position: the same bare string in a `values` cell is an `xsd:string` term and matches only `xsd:string` rows, and a FILTER comparison is term-exact on every surface. `FILTER(?name = "bob")` in SPARQL, `(= ?name "bob")` in a JSON-LD filter and `WHERE n.name = "bob"` in Cypher compare the `xsd:string` term `"bob"`, so none of them matches `"bob"@en` or `"bob"^^ex:T`; the same holds for `<`, `<=`, `>` and `>=`. To compare the text whatever the tag, use `STR(?name) = "bob"`; to match one tag, compare with `"bob"@en`. An explicitly typed literal is exact for its datatype in both surfaces: `"25"^^xsd:int` (or `{"@value": "25", "@type": "xsd:int"}`) matches `xsd:int` rows only, not the same number stored as `xsd:long`, and `"25"^^xsd:integer` written out matches `xsd:integer` rows only. Bare numeric literals (`25`, `25.0`, and a JSON number in a JSON-LD query) are the one lenient form — they match an equal value under any numeric datatype, so `25` finds `xsd:integer`, `xsd:long`, `xsd:int` and `xsd:double` values alike. Language tags are case-insensitive (BCP 47) and are stored and compared in lowercase: `"chat"@FR` is written, matched, and returned by `LANG()` as `fr`.
 
 > **Annotating literal values.** Any literal — plain, typed, or language-tagged — can carry statement-level metadata (source, confidence, timestamp) via an edge annotation. Because a JSON scalar has no room for sibling keys, an annotated literal must be written in value-object form (`@value` plus `@annotation`); language-tagged annotations are language-pinned, so `"chat"@fr` and `"chat"@en` annotate independently. See [Edge annotations → Annotating literal-valued edges](edge-annotations.md#annotating-literal-valued-edges).
 
@@ -263,7 +263,7 @@ Two consequences are worth knowing:
 - **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
 - **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
 
-`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON is stored as written.
+`@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written, and it reads back as typed text (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
 
 Ledgers written before canonicalization keep the text their writers produced. Reindexing does not change that: it rebuilds the index from the commits, and the commits hold the original text. Those values stay readable, and new writes are canonical.
 
@@ -458,12 +458,27 @@ Numeric types (long, double, bigint, decimal) are mutually comparable via automa
 ### Text That Is Not a Value of Its Datatype
 
 A literal such as `"2024-02-30"^^xsd:date` or `"300"^^xsd:byte` names a
-built-in datatype but is not one of its values. JSON-LD transactions and
-SPARQL UPDATE reject it wherever it is written as a constant, in a DELETE as
-in an INSERT or a WHERE, naming the datatype in the error. Turtle
-transactions and bulk import keep it, as RDF allows: the literal is stored with
-its text and its datatype and reads back exactly as written, but it is not a
-date or a number, so it never equals one.
+built-in datatype but is not one of its values. Every transaction refuses it,
+naming the datatype in the error ("Cannot parse '2024-02-30' as xsd:date"),
+and commits nothing:
+
+- JSON-LD transactions and SPARQL UPDATE, wherever it is written as a
+  constant, in a DELETE as in an INSERT or a WHERE;
+- an update that builds one at run time (`STRDT`, JSON-LD `str-dt`), or that
+  copies one a ledger holds (`INSERT … WHERE`);
+- Turtle, TriG and N-Triples transactions, insert and upsert, graph insert
+  and graph sync.
+
+Bulk import (`fluree create --from`, `fluree graph import`) keeps it, as RDF
+allows, so a dataset from elsewhere loads in one pass: the literal is stored
+with its text and its datatype and reads back exactly as written, with its
+datatype (in JSON-LD results, `{"@value": "300", "@type": "xsd:byte"}`), but
+it is not a date or a number, so it never equals one. An `rdf:JSON` literal
+that is not JSON is kept as written too, and reads back as the typed literal
+it is, not as JSON: `"not json"^^rdf:JSON` in SPARQL results and RDF text,
+`{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`
+in JSON-LD. An `f:embeddingVector` literal that is not a vector fails the
+import, as it fails a transaction.
 
 To remove a stored one, bind it through a variable, or replace the
 property's values with an [upsert](../transactions/upsert.md) or a

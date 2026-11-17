@@ -63,6 +63,40 @@ fn mapped_source() -> TempDir {
     tmp
 }
 
+/// `map` prints an advisory per map no key proves subject-unique, naming it
+/// and the `f:key` that would prove it, on standard error; with the key
+/// declared, none. Registration succeeds either way.
+#[test]
+fn map_names_each_map_with_no_key() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let keyed = MAPPING.replace(
+        r#"rr:tableName "in_commit_time" ]"#,
+        r#"rr:tableName "in_commit_time" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#,
+    );
+    assert_ne!(keyed, MAPPING);
+    std::fs::write(tmp.path().join("items.ttl"), MAPPING).unwrap();
+    std::fs::write(tmp.path().join("keyed.ttl"), keyed).unwrap();
+    let map = |name: &str, file: &str| {
+        let mut cmd = fluree_cmd(&tmp);
+        cmd.args(["delta", "map", name, "--root", &fixtures(), "--r2rml", file]);
+        cmd
+    };
+    map("items", "items.ttl")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "advisory: in_commit_time: TriplesMap <http://example.org/mapping#Item>: no key",
+        ))
+        .stderr(predicate::str::contains(
+            r#"declare `f:key ( "id" )` on its logical table."#,
+        ));
+    map("keyed", "keyed.ttl")
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("advisory").not());
+}
+
 #[test]
 fn delta_source_is_listed_with_its_type() {
     let tmp = mapped_source();
