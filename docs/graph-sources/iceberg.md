@@ -1345,11 +1345,19 @@ only when the deriving template could mint it.
   classed pair in `model_warnings`.
 - **Classes other rows derive** (depending on rows the scan does not read):
   the query is refused with `400` `err:db/InvalidQuery`, naming the map, when
-  the decision depends on them. Declare the table's key (`f:key`) if no two
-  rows mint one subject; for a history table, map its current rows with an
-  `rr:sqlQuery` (`SELECT * FROM t WHERE <current-row condition>`) and declare
-  the key there; or target the policy by property or subject.
-- A decision needing more than 8 such classes is refused the same way.
+  the decision depends on them. Where the other map's classes alone deny the
+  row whatever classes other rows derive, it is hidden as above instead.
+  Declare the table's key (`f:key`) if no two rows mint one subject; for a
+  history table, map its current rows with an `rr:sqlQuery`
+  (`SELECT * FROM t WHERE <current-row condition>`) and declare the key
+  there; or target the policy by property or subject.
+- Some decisions evaluate every class set the subject could hold: one on a
+  predicate an `f:required` or `f:query` restriction can apply to (one
+  targeted by property applies to its properties, any other to every
+  predicate), and the check before a refusal. Such a decision over more than 8 extra classes
+  (declared by other maps or derived by other rows) is refused with `400`
+  `err:db/InvalidQuery`. Other decisions take two evaluations however many
+  classes other maps declare.
 
 A declared key (or an Iceberg table's identifier fields) is trusted here, as
 it is for [set semantics](r2rml.md#declaring-a-tables-keys-fkey): a table that
