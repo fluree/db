@@ -641,15 +641,17 @@ impl Fluree {
         );
 
         // 5. Build result
-        Ok(ViewRun::Executed(build_query_result(
-            vars,
-            parsed,
-            batches,
-            Some(read_view.t),
-            None,
-            read_view.binary_graph(),
-        )
-        .reading(read_view)))
+        Ok(ViewRun::Executed(
+            build_query_result(
+                vars,
+                parsed,
+                batches,
+                Some(read_view.t),
+                None,
+                read_view.binary_graph(),
+            )
+            .reading(read_view),
+        ))
     }
 
     /// Execute a Cypher (openCypher 9 subset) query against a GraphDb.

@@ -720,13 +720,12 @@ impl Stages {
             return;
         }
         let old = self.pools[from].get().expect("current stage built");
-        let new = self.pools[stage]
-            .get_or_init(|| {
-                leaflet_pool(
-                    self.budget.saturating_sub(self.reserved_at(stage)),
-                    self.cores,
-                )
-            });
+        let new = self.pools[stage].get_or_init(|| {
+            leaflet_pool(
+                self.budget.saturating_sub(self.reserved_at(stage)),
+                self.cores,
+            )
+        });
         // The new pool is larger: everything carries over, where pools can
         // be walked.
         #[cfg(not(target_arch = "wasm32"))]
