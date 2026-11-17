@@ -3081,13 +3081,20 @@ fn drain_ready_deferred(
             break;
         }
 
-        // Remove in reverse order to preserve indices, then sort by original position.
+        // Remove in reverse order to preserve indices, then sort by original
+        // position, constant-IRI BINDs first: nothing in a ready batch depends on
+        // another, and the plan builder seeds the triples only from a constant
+        // IRI that no literal BIND precedes (`where_plan::bind_seeds_block`).
         let mut ready: Vec<DeferredPattern> = ready_indices
             .into_iter()
             .rev()
             .map(|idx| deferred.remove(idx))
             .collect();
-        ready.sort_by_key(|dp| dp.orig_index);
+        ready.sort_by_key(|dp| {
+            let constant_iri_bind =
+                matches!(&dp.pattern, Pattern::Bind { expr, .. } if expr.is_constant_iri());
+            (!constant_iri_bind, dp.orig_index)
+        });
 
         for dp in ready {
             let nested = dp.nestable

@@ -258,7 +258,7 @@ mod tests {
             )),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(
             block.end_index,
             patterns.len(),
