@@ -956,3 +956,100 @@ async fn constant_iri_bind_seed_keeps_bind_results() {
         vec![json!(["ex:a1"]), json!(["ex:a3"])]
     );
 }
+
+/// A seed would take a star off the `PropertyJoinOperator` it plans as without
+/// one, which starts from the star's other bound object. Seeded, the chain
+/// starts at the triple reading the BIND's variable instead, which the planner
+/// prices as rare whatever the IRI: here `ex:Common` is on most subjects and
+/// `ex:lang "fr"` on one. A seed into the star's subject pins it to one subject,
+/// so that one stays.
+#[tokio::test]
+async fn constant_iri_bind_leaves_a_star_its_property_join() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-star:main");
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","@type":"ex:Thing","ex:about":{"@id":"ex:Common"},"ex:lang":"fr","ex:p1":"x1","ex:p2":"y1"},
+                    {"@id":"ex:a2","@type":"ex:Thing","ex:about":{"@id":"ex:Common"},"ex:lang":"en","ex:p1":"x2","ex:p2":"y2"},
+                    {"@id":"ex:a3","@type":"ex:Other","ex:about":{"@id":"ex:Common"},"ex:lang":"en","ex:p1":"x3","ex:p2":"y3"},
+                    {"@id":"ex:a4","@type":"ex:Thing","ex:about":{"@id":"ex:T1"},"ex:lang":"fr","ex:p1":"x4","ex:p2":"y4"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, bind, values, expect_rows) in [
+        (
+            "object, with a bound object to start from",
+            r#"BIND(ex:Common AS ?c) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            r#"VALUES ?c { ex:Common } ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            1,
+        ),
+        (
+            "object, after a literal BIND",
+            r#"BIND("x" AS ?k) BIND(ex:Common AS ?c) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            r#"VALUES ?k { "x" } VALUES ?c { ex:Common } ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            1,
+        ),
+        (
+            "class",
+            r#"BIND("fr" AS ?l) BIND(ex:Thing AS ?c) ?s a ?c ; ex:lang ?l ; ex:about ex:T1"#,
+            r#"VALUES ?l { "fr" } VALUES ?c { ex:Thing } ?s a ?c ; ex:lang ?l ; ex:about ex:T1"#,
+            1,
+        ),
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {bind} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        let physical = &resp["plan"]["physical"];
+        assert!(
+            physical_contains_op(physical, "PropertyJoinOperator"),
+            "{shape}: the star keeps its property join: {physical}"
+        );
+        let got = sparql_rows(&fluree, &ledger, bind).await;
+        assert_eq!(got.len(), expect_rows, "{shape}: {got:?}");
+        assert_eq!(got, sparql_rows(&fluree, &ledger, values).await, "{shape}");
+    }
+
+    let jsonld = json!({
+        "@context": {"ex":"http://example.org/"},
+        "select": ["?s"],
+        "where": [
+            ["bind", "?c", ["iri", "http://example.org/Common"]],
+            {"@id":"?s","ex:lang":"fr","ex:p1":"?a","ex:p2":"?b","ex:about":"?c"}
+        ]
+    });
+    let resp = fluree.explain(&db, &jsonld).await.expect("explain");
+    assert!(
+        physical_contains_op(&resp["plan"]["physical"], "PropertyJoinOperator"),
+        "JSON-LD: the star keeps its property join: {}",
+        resp["plan"]["physical"]
+    );
+    let rows = fluree
+        .query(&db, &jsonld)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([["ex:a1"]]));
+
+    let subject = r#"BIND(ex:a1 AS ?s) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?o"#;
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {subject} }}");
+    let resp = fluree
+        .explain_sparql(&db, &sparql)
+        .await
+        .expect("explain_sparql");
+    assert_bind_seeds_every_scan(&resp["plan"]["physical"], "subject of a star");
+    let got = sparql_rows(&fluree, &ledger, subject).await;
+    assert_eq!(got.len(), 1, "subject of a star: {got:?}");
+}

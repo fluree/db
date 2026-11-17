@@ -2180,10 +2180,21 @@ pub fn build_where_operators_with_needed(
 /// by its expression are already bound by preceding patterns (original order). BINDs
 /// with unbound inputs cannot be deferred - they must fail at their original position.
 /// A constant-IRI BIND ahead of the block's first triple that seeds the block ends
-/// it (`bind_seeds_block`).
+/// it (`bind_seeds_block`), unless the block would plan as a property join
+/// without it (`seed_defers_to_property_join`). `has_upstream_seed` says whether
+/// an operator feeds the block.
 ///
 /// `VALUES` is always safe to include because it is an inner-join constraint/seed.
-pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoinBlock {
+pub fn collect_inner_join_block(
+    patterns: &[Pattern],
+    start: usize,
+    has_upstream_seed: bool,
+) -> InnerJoinBlock {
+    collect_block(patterns, start, Some(has_upstream_seed))
+}
+
+/// `seeding` is `None` to collect a seeding BIND like any other.
+fn collect_block(patterns: &[Pattern], start: usize, seeding: Option<bool>) -> InnerJoinBlock {
     let mut i = start;
     let mut values: Vec<ValuesPattern> = Vec::new();
     let mut triples: Vec<TriplePattern> = Vec::new();
@@ -2218,11 +2229,14 @@ pub fn collect_inner_join_block(patterns: &[Pattern], start: usize) -> InnerJoin
                 // What precedes it then runs ahead of the block too, so only
                 // FILTERs, VALUES and constant-IRI BINDs may: an earlier literal
                 // BIND has to stay a term check rather than become a probe.
-                if triples.is_empty()
-                    && binds.iter().all(|b| b.expr.is_constant_iri())
-                    && bind_seeds_block(*var, expr, &patterns[i + 1..])
-                {
-                    break;
+                if let Some(has_upstream_seed) = seeding {
+                    if triples.is_empty()
+                        && binds.iter().all(|b| b.expr.is_constant_iri())
+                        && bind_seeds_block(*var, expr, &patterns[i + 1..])
+                        && !seed_defers_to_property_join(patterns, start, *var, has_upstream_seed)
+                    {
+                        break;
+                    }
                 }
                 if let Some(bind) = BindPattern::when_eligible(*var, expr, &bound_vars) {
                     bound_vars.insert(*var);
@@ -2286,6 +2300,40 @@ fn bind_seeds_block(var: VarId, expr: &Expression, rest: &[Pattern]) -> bool {
                 Pattern::ListView(lv) => lv.triple.referenced_vars().contains(&var),
                 _ => false,
             })
+}
+
+/// Does the block, with the BIND held back, plan as a property join that seeding
+/// would take it off?
+///
+/// A seed gives the block an upstream operator, and a `PropertyJoinOperator` needs
+/// none (`analyze_property_join_plan`). Held back, the join starts from the star's
+/// bound object. Seeded, the chain starts at the triple reading `?var`, which
+/// `count / ndv` prices as rare whatever the constant: `BIND(ex:Common AS ?c)
+/// ?s ex:lang "fr" ; … ex:about ?c`, with `ex:Common` on half the subjects, then
+/// probes `ex:lang` once per subject naming it. Outside a property join a seed only
+/// narrows the scan the held-back plan reads first, so it stays; so does one into
+/// the star's subject, which it pins to a single subject.
+fn seed_defers_to_property_join(
+    patterns: &[Pattern],
+    start: usize,
+    var: VarId,
+    has_upstream_seed: bool,
+) -> bool {
+    let held = collect_block(patterns, start, None);
+    if !held.list_views.is_empty() || held.triples.iter().any(|tp| tp.s.as_var() == Some(var)) {
+        return false;
+    }
+    let filters: Vec<Expression> = held.filters.iter().map(|f| f.expr.clone()).collect();
+    let (object_bounds, _) = extract_bounds_from_filters(&held.triples, &filters);
+    analyze_property_join_plan(
+        patterns,
+        held.end_index,
+        &held.triples,
+        &object_bounds,
+        has_upstream_seed,
+    )
+    .0
+    .can_property_join
 }
 
 /// What `seed` hands the group planned on top of it. An operator that cannot see
@@ -2761,7 +2809,7 @@ pub fn build_where_operators_seeded_with_needed(
                     guaranteed.extend(must_bind_vars(applied, BindTargets::MayBeUnbound));
                 }
                 guaranteed_through = start;
-                let block = collect_inner_join_block(patterns, start);
+                let block = collect_inner_join_block(patterns, start, operator.is_some());
                 let end = block.end_index;
 
                 // `collect_inner_join_block` may consume *zero* patterns when the
@@ -5455,7 +5503,7 @@ mod tests {
             )),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(
             block.end_index,
             patterns.len(),
@@ -5526,7 +5574,7 @@ mod tests {
             )),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(block.end_index, patterns.len());
         assert_eq!(block.values.len(), 1, "VALUES should be included in block");
         assert_eq!(block.binds.len(), 0, "expected 0 BINDs in the block");
@@ -5558,7 +5606,7 @@ mod tests {
             )),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(block.end_index, patterns.len());
         assert_eq!(block.values.len(), 0);
         assert_eq!(block.triples.len(), 1);
@@ -5872,7 +5920,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(1), "value", VarId(0))),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(block.end_index, 2, "should consume both filter and triple");
         assert_eq!(block.filters.len(), 1, "should include the filter");
         assert_eq!(block.triples.len(), 1, "should include the triple");
@@ -5902,7 +5950,7 @@ mod tests {
             Pattern::Triple(make_pattern(s, "name", name)),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(
             block.end_index,
             patterns.len(),
@@ -5927,7 +5975,7 @@ mod tests {
             Pattern::Triple(make_pattern(VarId(1), "value", VarId(0))),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(block.end_index, 3, "should consume all patterns");
         assert_eq!(block.filters.len(), 2, "should include both filters");
         assert_eq!(block.triples.len(), 1, "should include the triple");
@@ -5965,7 +6013,7 @@ mod tests {
             Pattern::Triple(make_pattern(s, "valueY", y)),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(
             block.end_index,
             patterns.len(),
