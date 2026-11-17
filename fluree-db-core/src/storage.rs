@@ -1015,7 +1015,7 @@ pub(crate) fn record_read(id: &ContentId, source: &'static str, bytes: &[u8]) {
             Some(2) => "term-pack".to_string(),
             _ => "pack".to_string(),
         },
-        (Some(ContentKind::DictBlob { .. }), Some(b"DLR1")) => "dict-leaf".to_string(),
+        (Some(ContentKind::DictBlob { .. }), Some(b"DLR1" | b"DLR2")) => "dict-leaf".to_string(),
         (Some(ContentKind::DictBlob { .. }), Some(b"DTB1")) => "dict-branch".to_string(),
         (Some(ContentKind::DictBlob { .. }), _) => "dictblob".to_string(),
         (Some(k), _) => format!("{k:?}").to_lowercase(),

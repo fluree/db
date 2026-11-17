@@ -422,6 +422,9 @@ where
 
 /// Build the subject reverse tree by draining `next_entry`. Entries must arrive
 /// in reverse-tree key order (`(ns_code, suffix)`). Key = `[ns_code BE][suffix]`.
+///
+/// Leaves are front-coded, cut where a `DLR1` leaf of the same entries would
+/// reach the target size.
 async fn build_subject_reverse_tree<F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
@@ -432,6 +435,7 @@ where
 {
     use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
     use fluree_db_binary_index::dict::builder;
+    use fluree_db_binary_index::dict::reverse_leaf::FrontCodedLeafWriter;
     use fluree_db_core::{ContentKind, DictKind};
 
     let kind = ContentKind::DictBlob {
@@ -440,97 +444,48 @@ where
     let mut leaf_cids: Vec<ContentId> = Vec::new();
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
 
-    let mut leaf_offsets: Vec<u32> = Vec::new();
-    let mut leaf_data: Vec<u8> = Vec::new();
+    let mut writer = FrontCodedLeafWriter::new(true);
     let mut chunk_bytes: usize = 0;
     let mut first_key: Option<Vec<u8>> = None;
-    // Track last key parts for branch boundary (avoid per-entry allocation).
-    let mut last_ns: u16 = 0;
-    let mut last_off: u64 = 0;
-    let mut last_len: u32 = 0;
+    let mut key: Vec<u8> = Vec::new();
 
-    while let Some(entry) = next_entry()? {
-        let ns = entry.ns_code;
-        let suffix =
-            &fwd[entry.suf_off as usize..(entry.suf_off as usize + entry.suf_len as usize)];
-        let sid = entry.sid;
-
-        // Key = [ns_code BE][suffix]
-        let key_len = 2 + suffix.len();
-        let entry_size = 12 + key_len;
-        leaf_offsets.push(chunk_bytes as u32);
-        chunk_bytes += entry_size;
-
-        leaf_data.extend_from_slice(&(key_len as u32).to_le_bytes());
-        leaf_data.extend_from_slice(&ns.to_be_bytes());
-        leaf_data.extend_from_slice(suffix);
-        leaf_data.extend_from_slice(&sid.to_le_bytes());
-
-        if first_key.is_none() {
-            let mut k = Vec::with_capacity(key_len);
-            k.extend_from_slice(&ns.to_be_bytes());
-            k.extend_from_slice(suffix);
-            first_key = Some(k);
-        }
-        last_ns = ns;
-        last_off = entry.suf_off;
-        last_len = entry.suf_len;
-
-        if chunk_bytes >= builder::DEFAULT_TARGET_LEAF_BYTES {
-            if let Some((leaf_bytes, fk, lk, entry_count)) = flush_reverse_leaf(
-                &mut leaf_offsets,
-                &mut leaf_data,
-                &mut first_key,
-                &mut chunk_bytes,
-                || {
-                    let suffix = &fwd[last_off as usize..(last_off as usize + last_len as usize)];
-                    let mut lk = Vec::with_capacity(2 + suffix.len());
-                    lk.extend_from_slice(&last_ns.to_be_bytes());
-                    lk.extend_from_slice(suffix);
-                    lk
-                },
-            ) {
-                let cas_result = content_store
-                    .put(kind, &leaf_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                let address = cas_result.to_string();
-                leaf_cids.push(cas_result);
-                branch_entries.push(BranchLeafEntry {
-                    first_key: fk,
-                    last_key: lk,
-                    entry_count,
-                    address,
-                });
+    loop {
+        let entry = next_entry()?;
+        if let Some(entry) = &entry {
+            let suffix =
+                &fwd[entry.suf_off as usize..(entry.suf_off as usize + entry.suf_len as usize)];
+            key.clear();
+            key.extend_from_slice(&entry.ns_code.to_be_bytes());
+            key.extend_from_slice(suffix);
+            writer.push(&key, entry.sid);
+            chunk_bytes += 12 + key.len();
+            if first_key.is_none() {
+                first_key = Some(key.clone());
             }
         }
-    }
-
-    if let Some((leaf_bytes, fk, lk, entry_count)) = flush_reverse_leaf(
-        &mut leaf_offsets,
-        &mut leaf_data,
-        &mut first_key,
-        &mut chunk_bytes,
-        || {
-            let suffix = &fwd[last_off as usize..(last_off as usize + last_len as usize)];
-            let mut lk = Vec::with_capacity(2 + suffix.len());
-            lk.extend_from_slice(&last_ns.to_be_bytes());
-            lk.extend_from_slice(suffix);
-            lk
-        },
-    ) {
-        let cas_result = content_store
-            .put(kind, &leaf_bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        let address = cas_result.to_string();
-        leaf_cids.push(cas_result);
-        branch_entries.push(BranchLeafEntry {
-            first_key: fk,
-            last_key: lk,
-            entry_count,
-            address,
-        });
+        let flush = match entry {
+            Some(_) => chunk_bytes >= builder::DEFAULT_TARGET_LEAF_BYTES,
+            None => !writer.is_empty(),
+        };
+        if flush {
+            let entry_count = writer.entry_count();
+            let leaf_bytes = writer.finish();
+            chunk_bytes = 0;
+            let cas_result = content_store
+                .put(kind, &leaf_bytes)
+                .await
+                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+            branch_entries.push(BranchLeafEntry {
+                first_key: first_key.take().unwrap_or_default(),
+                last_key: key.clone(),
+                entry_count,
+                address: cas_result.to_string(),
+            });
+            leaf_cids.push(cas_result);
+        }
+        if entry.is_none() {
+            break;
+        }
     }
 
     let branch = DictBranch {
@@ -1563,6 +1518,63 @@ mod tests {
         assert_dicts_equal(&mat, &streamed);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A full build writes the subject reverse tree front-coded and the
+    /// string tree plain, and every subject resolves to an id in its own
+    /// namespace.
+    #[tokio::test]
+    async fn subject_reverse_leaves_are_front_coded() {
+        use fluree_db_binary_index::dict::branch::DictBranch;
+        use fluree_db_binary_index::dict::reverse_leaf::{subject_reverse_key, ReverseLeaf};
+        use fluree_db_core::subject_id::SubjectId;
+
+        let ns = HashMap::from([
+            (5u16, "http://ex.org/".to_string()),
+            (10, "http://foo/".to_string()),
+            (20, "http://bar/".to_string()),
+        ]);
+        let dir = std::env::temp_dir().join("fluree_upload_dicts_front_coded");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        build_fixture(&dir, &ns, false);
+        let (store, out) = run_upload(&dir, &ns, true).await;
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let subjects = &out.dict_refs.subject_reverse;
+        let branch = DictBranch::decode(&store.get(&subjects.branch).await.unwrap()).unwrap();
+        let mut ids = Vec::new();
+        for (ns_code, name) in [
+            (5u16, "Alice"),
+            (5, "Bob"),
+            (5, "Carol"),
+            (5, "Dave"),
+            (10, "apple"),
+            (10, "mango"),
+            (10, "zebra"),
+            (20, "a"),
+            (20, "x"),
+        ] {
+            let key = subject_reverse_key(ns_code, name.as_bytes());
+            let leaf_idx = branch.find_leaf(&key).unwrap();
+            let bytes = store.get(&subjects.leaves[leaf_idx]).await.unwrap();
+            let leaf = ReverseLeaf::from_bytes(&bytes).unwrap();
+            assert!(leaf.is_front_coded());
+            let id = leaf
+                .lookup(&key)
+                .unwrap_or_else(|| panic!("{ns_code} {name}"));
+            assert_eq!(SubjectId::from_u64(id).ns_code(), ns_code);
+            ids.push(id);
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), 9);
+
+        let strings = &out.dict_refs.string_reverse;
+        let bytes = store.get(&strings.leaves[0]).await.unwrap();
+        let leaf = ReverseLeaf::from_bytes(&bytes).unwrap();
+        assert!(!leaf.is_front_coded());
+        assert!(leaf.lookup(b"banana").is_some());
     }
 
     /// Same oracle with no strings persisted (empty-strings branch).

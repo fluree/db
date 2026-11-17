@@ -10,8 +10,8 @@
 //!
 //! ## Reverse Trees (CoW update)
 //!
-//! Route new entries to affected DLR1 leaves by key range, fetch + decode +
-//! merge-insert + re-encode. Split oversized leaves. Unchanged leaves keep
+//! Route new entries to affected reverse leaves by key range, fetch + decode +
+//! merge-insert + re-encode in the tree's [`LeafFormat`]. Split oversized leaves. Unchanged leaves keep
 //! their existing CAS addresses. Produces a new DTB1 branch with mixed
 //! old (real) and new (`pending:hash`) addresses — caller finalizes via
 //! [`super::builder::finalize_branch`] after CAS upload.
@@ -23,7 +23,7 @@ use super::builder::LeafArtifact;
 use super::pack_builder::{
     build_string_forward_packs, PackArtifact, DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
 };
-use super::reverse_leaf::{encode_reverse_leaf, ReverseEntry, ReverseLeaf};
+use super::reverse_leaf::{LeafFormat, ReverseEntry, ReverseLeaf};
 use crate::format::wire_helpers::PackBranchEntry;
 
 // ============================================================================
@@ -331,15 +331,18 @@ pub struct IncrementalTreeResult {
 /// Unchanged leaves keep their existing CAS addresses in the branch.
 /// New/modified leaves get `pending:hash` addresses — use
 /// [`super::builder::finalize_branch`] after CAS upload to set real addresses.
+///
+/// Rewritten leaves are written in `format`, whatever format they were read in.
 pub fn update_reverse_tree(
     existing_branch: &DictBranch,
     new_entries: &[ReverseEntry],
     target_leaf_bytes: usize,
+    format: LeafFormat,
     fetch_leaf: &mut dyn FnMut(usize) -> Result<Vec<u8>, io::Error>,
 ) -> io::Result<IncrementalTreeResult> {
     // Empty branch: build from scratch using new entries only
     if existing_branch.leaves.is_empty() {
-        return build_fresh_tree(new_entries, target_leaf_bytes);
+        return build_fresh_tree(new_entries, target_leaf_bytes, format);
     }
 
     if new_entries.is_empty() {
@@ -374,10 +377,10 @@ pub fn update_reverse_tree(
                 let pieces = estimated_bytes.div_ceil(target_leaf_bytes).max(2);
                 for k in 0..pieces {
                     let piece = &merged[k * merged.len() / pieces..(k + 1) * merged.len() / pieces];
-                    branch_entries.push(encode_and_track(piece, &mut new_leaves));
+                    branch_entries.push(encode_and_track(piece, format, &mut new_leaves));
                 }
             } else {
-                let entry = encode_and_track(&merged, &mut new_leaves);
+                let entry = encode_and_track(&merged, format, &mut new_leaves);
                 branch_entries.push(entry);
             }
 
@@ -414,6 +417,7 @@ pub fn update_reverse_tree(
 pub fn remove_from_reverse_tree(
     existing_branch: &DictBranch,
     keys: &[Vec<u8>],
+    format: LeafFormat,
     fetch_leaf: &mut dyn FnMut(usize) -> Result<Vec<u8>, io::Error>,
 ) -> io::Result<IncrementalTreeResult> {
     if keys.is_empty() || existing_branch.leaves.is_empty() {
@@ -443,11 +447,11 @@ pub fn remove_from_reverse_tree(
             .iter()
             .filter(|(key, _)| {
                 slice
-                    .binary_search_by(|p| p.key.as_slice().cmp(key))
+                    .binary_search_by(|p| p.key.as_slice().cmp(key.as_ref()))
                     .is_err()
             })
             .map(|(key, id)| ReverseEntry {
-                key: key.to_vec(),
+                key: key.into_owned(),
                 id,
             })
             .collect();
@@ -456,7 +460,7 @@ pub fn remove_from_reverse_tree(
             continue;
         }
         if !kept.is_empty() {
-            branch_entries.push(encode_and_track(&kept, &mut new_leaves));
+            branch_entries.push(encode_and_track(&kept, format, &mut new_leaves));
         }
         replaced_indices.push(i);
     }
@@ -513,7 +517,7 @@ fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<Rever
     let existing: Vec<ReverseEntry> = leaf
         .iter()
         .map(|(key, id)| ReverseEntry {
-            key: key.to_vec(),
+            key: key.into_owned(),
             id,
         })
         .collect();
@@ -547,18 +551,20 @@ fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<Rever
     result
 }
 
-/// Estimate encoded leaf byte size for a set of entries.
+/// Estimate a set of entries' size as a `DLR1` leaf, the measure leaves are
+/// cut by in either format.
 fn estimate_leaf_bytes(entries: &[ReverseEntry]) -> usize {
     // header(8) + offset_table(4 × n) + data(12 + key_len per entry)
     8 + entries.len() * 4 + entries.iter().map(|e| 12 + e.key.len()).sum::<usize>()
 }
 
-/// Encode entries to a DLR1 leaf, compute hash, add to artifacts, return branch entry.
+/// Encode entries to a leaf in `format`, compute hash, add to artifacts, return branch entry.
 fn encode_and_track(
     entries: &[ReverseEntry],
+    format: LeafFormat,
     artifacts: &mut Vec<LeafArtifact>,
 ) -> BranchLeafEntry {
-    let leaf_bytes = encode_reverse_leaf(entries);
+    let leaf_bytes = format.encode(entries);
     let hash = fluree_db_core::sha256_hex(&leaf_bytes);
 
     let first_key = entries.first().unwrap().key.clone();
@@ -582,8 +588,9 @@ fn encode_and_track(
 fn build_fresh_tree(
     entries: &[ReverseEntry],
     target_leaf_bytes: usize,
+    format: LeafFormat,
 ) -> io::Result<IncrementalTreeResult> {
-    let tree = super::builder::build_reverse_tree(entries.to_vec(), target_leaf_bytes)?;
+    let tree = super::builder::build_reverse_tree_as(entries.to_vec(), target_leaf_bytes, format)?;
     Ok(IncrementalTreeResult {
         branch: tree.branch,
         branch_bytes: tree.branch_bytes,
@@ -742,9 +749,13 @@ mod tests {
         ];
         let (branch, _leaf_bytes) = build_test_tree(&entries);
 
-        let result = update_reverse_tree(&branch, &[], DEFAULT_TARGET_LEAF_BYTES, &mut |_| {
-            panic!("should not fetch")
-        })
+        let result = update_reverse_tree(
+            &branch,
+            &[],
+            DEFAULT_TARGET_LEAF_BYTES,
+            LeafFormat::Plain,
+            &mut |_| panic!("should not fetch"),
+        )
         .unwrap();
 
         assert!(result.new_leaves.is_empty());
@@ -765,6 +776,7 @@ mod tests {
             &branch,
             &new_entries,
             DEFAULT_TARGET_LEAF_BYTES,
+            LeafFormat::Plain,
             &mut |idx| Ok(leaf_bytes[idx].clone()),
         )
         .unwrap();
@@ -789,9 +801,12 @@ mod tests {
             make_reverse_entry("gamma", 3),
         ];
         let (branch, leaf_bytes) = build_test_tree(&entries);
-        let result = remove_from_reverse_tree(&branch, &[b"beta".to_vec()], &mut |idx| {
-            Ok(leaf_bytes[idx].clone())
-        })
+        let result = remove_from_reverse_tree(
+            &branch,
+            &[b"beta".to_vec()],
+            LeafFormat::Plain,
+            &mut |idx| Ok(leaf_bytes[idx].clone()),
+        )
         .unwrap();
         assert_eq!(result.replaced_leaf_indices, vec![0]);
         let leaf = ReverseLeaf::from_bytes(&result.new_leaves[0].bytes).unwrap();
@@ -800,9 +815,12 @@ mod tests {
         assert_eq!(leaf.lookup(b"gamma"), Some(3));
 
         // A key the tree does not hold changes nothing.
-        let result = remove_from_reverse_tree(&branch, &[b"delta".to_vec()], &mut |idx| {
-            Ok(leaf_bytes[idx].clone())
-        })
+        let result = remove_from_reverse_tree(
+            &branch,
+            &[b"delta".to_vec()],
+            LeafFormat::Plain,
+            &mut |idx| Ok(leaf_bytes[idx].clone()),
+        )
         .unwrap();
         assert!(result.new_leaves.is_empty() && result.replaced_leaf_indices.is_empty());
     }
@@ -819,6 +837,7 @@ mod tests {
             &branch,
             &new_entries,
             DEFAULT_TARGET_LEAF_BYTES,
+            LeafFormat::Plain,
             &mut |_| panic!("should not fetch"),
         )
         .unwrap();
@@ -849,9 +868,13 @@ mod tests {
 
         // Use a very small target to force split
         let tiny_target = 100;
-        let result = update_reverse_tree(&branch, &new_entries, tiny_target, &mut |idx| {
-            Ok(leaf_bytes[idx].clone())
-        })
+        let result = update_reverse_tree(
+            &branch,
+            &new_entries,
+            tiny_target,
+            LeafFormat::Plain,
+            &mut |idx| Ok(leaf_bytes[idx].clone()),
+        )
         .unwrap();
 
         // Should have split into 2 new leaves
@@ -880,9 +903,13 @@ mod tests {
             .map(|i| make_reverse_entry(&format!("key_{i:06}"), i))
             .collect();
         let target = 4096;
-        let result = update_reverse_tree(&branch, &new_entries, target, &mut |idx| {
-            Ok(leaf_bytes[idx].clone())
-        })
+        let result = update_reverse_tree(
+            &branch,
+            &new_entries,
+            target,
+            LeafFormat::Plain,
+            &mut |idx| Ok(leaf_bytes[idx].clone()),
+        )
         .unwrap();
 
         let limit = (target as f64 * SPLIT_FACTOR) as usize;
@@ -930,10 +957,11 @@ mod tests {
             id: 999,
         }];
 
-        let result = update_reverse_tree(&branch, &new_entries, 500, &mut |idx| {
-            Ok(leaf_bytes[idx].clone())
-        })
-        .unwrap();
+        let result =
+            update_reverse_tree(&branch, &new_entries, 500, LeafFormat::Plain, &mut |idx| {
+                Ok(leaf_bytes[idx].clone())
+            })
+            .unwrap();
 
         // Only the last leaf should be replaced
         assert_eq!(result.replaced_leaf_indices.len(), 1);
@@ -950,6 +978,76 @@ mod tests {
             last_entry.address.starts_with("pending:"),
             "new leaf should have pending address"
         );
+    }
+
+    /// A front-coded update over a plain tree rewrites only the leaves it
+    /// touches, in the new format, and leaves the rest as they were: every
+    /// key, old and new, still resolves in the mixed tree, and a removal
+    /// from a front-coded leaf rewrites it in that format too.
+    #[test]
+    fn front_coded_updates_over_a_plain_tree_rewrite_only_touched_leaves() {
+        use crate::dict::reverse_leaf::subject_reverse_key;
+        let subject = |i: u64| ReverseEntry {
+            key: subject_reverse_key(7, format!("Offer{:05}", i * 2).as_bytes()),
+            id: fluree_db_core::subject_id::SubjectId::new(7, i).as_u64(),
+        };
+        let tree = build_reverse_tree((0..400).map(subject).collect(), 2_000).unwrap();
+        let leaf_bytes: Vec<Vec<u8>> = tree.leaves.iter().map(|l| l.bytes.clone()).collect();
+        let mut branch = tree.branch;
+        for (i, leaf) in branch.leaves.iter_mut().enumerate() {
+            leaf.address = format!("real_addr_{i}");
+        }
+        assert!(branch.leaves.len() >= 4);
+        let format = LeafFormat::FrontCoded {
+            ns_relative_ids: true,
+        };
+
+        // Odd numbers fall between existing keys, in the first leaf only.
+        let added: Vec<ReverseEntry> = (0..5)
+            .map(|i| ReverseEntry {
+                key: subject_reverse_key(7, format!("Offer{:05}", i * 2 + 1).as_bytes()),
+                id: fluree_db_core::subject_id::SubjectId::new(7, 1_000 + i).as_u64(),
+            })
+            .collect();
+        let result = update_reverse_tree(&branch, &added, 2_000, format, &mut |idx| {
+            Ok(leaf_bytes[idx].clone())
+        })
+        .unwrap();
+        assert_eq!(result.replaced_leaf_indices, vec![0]);
+        assert_eq!(result.new_leaves.len(), 1);
+        let rewritten = &result.new_leaves[0].bytes;
+        assert!(ReverseLeaf::from_bytes(rewritten).unwrap().is_front_coded());
+        assert!(rewritten.len() * 2 < leaf_bytes[0].len());
+
+        let leaf_for = |i: usize| -> Vec<u8> {
+            let address = &result.branch.leaves[i].address;
+            if address.starts_with("pending:") {
+                rewritten.clone()
+            } else {
+                leaf_bytes[i].clone()
+            }
+        };
+        for e in (0..400).map(subject).chain(added.iter().cloned()) {
+            let i = result.branch.find_leaf(&e.key).unwrap();
+            let bytes = leaf_for(i);
+            let leaf = ReverseLeaf::from_bytes(&bytes).unwrap();
+            assert_eq!(leaf.is_front_coded(), i == 0);
+            assert_eq!(leaf.lookup(&e.key), Some(e.id));
+        }
+
+        let gone = added[2].key.clone();
+        let removed = remove_from_reverse_tree(
+            &result.branch,
+            std::slice::from_ref(&gone),
+            format,
+            &mut |i| Ok(leaf_for(i)),
+        )
+        .unwrap();
+        assert_eq!(removed.replaced_leaf_indices, vec![0]);
+        let leaf = ReverseLeaf::from_bytes(&removed.new_leaves[0].bytes).unwrap();
+        assert!(leaf.is_front_coded());
+        assert_eq!(leaf.lookup(&gone), None);
+        assert_eq!(leaf.lookup(&added[1].key), Some(added[1].id));
     }
 
     #[test]
