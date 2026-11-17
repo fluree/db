@@ -871,13 +871,15 @@ case pulls them in; each has a workaround:
   it is a **deliberate tightening of a shape that was previously accepted and
   silently miscompiled**: the statement was rearranged so that every read ran
   before every write, which is a different statement. What that cost depended
-  on the shape, and only two of the four classes failed loudly:
+  on the shape, and only one of these failed loudly — with an error that blamed
+  the wrong subsystem:
 
   | Written | Before | Now |
   |---|---|---|
   | `MERGE (n) WITH n SET n.x = 1` | error blaming a policy that was not involved | clear error |
   | `MERGE (n {name:"Z"}) WITH n.name AS nm SET n.marker = nm` | **committed wrong data** — one marker per *pre-`MERGE`* name, written onto the new node | clear error |
   | `MATCH (n) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2` | **committed nothing, silently** — the filter ran before the `SET` it reads | clear error |
+  | `CREATE (n:P {id: 1}) WITH n SET n.nm = "a"` | **committed nothing, silently** — not even the `CREATE` | clear error |
   | `MATCH (n) SET n.a = 1 WITH n SET n.b = 2` | worked | clear error |
 
   The last row is the one that will surprise people: it produced the right
