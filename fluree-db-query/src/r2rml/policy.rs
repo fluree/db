@@ -865,9 +865,12 @@ impl R2rmlPolicyGate {
     /// Where the decision is not "allow" for every `S`:
     /// - extra classes known from the mapping alone hide the flake, and the
     ///   map is recorded on the tracker and logged once;
-    /// - extra classes that depend on rows the scan does not see refuse the
-    ///   query when some `S` would allow it: the answer depends on data the
-    ///   decision cannot read.
+    /// - with extra classes that depend on rows the scan does not see, every
+    ///   `S` is evaluated (up to the same cap): where each choice of derived
+    ///   classes meets a choice of the other maps' classes that denies, the
+    ///   other-map rule hides the flake whatever the derived classes are;
+    ///   otherwise the derived classes decide it, and the query is refused,
+    ///   since the answer depends on data the decision cannot read.
     async fn allows(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -943,25 +946,48 @@ impl R2rmlPolicyGate {
             self.report_undecidable(ctx, tm);
             false
         } else {
+            // The row's answer is read from data the scan does not see only
+            // where some choice of derived classes allows it under every
+            // choice of the classes other maps declare: the subject then may
+            // or may not be shown, by its other rows. Where every choice of
+            // derived classes meets some declared choice that denies, the
+            // other-map rule hides the row whatever they are.
             self.check_extra_cap(tm, extra.len())?;
-            for chosen in subsets(&extra) {
-                if self
-                    .decide_with(ctx, subject, pred, object, &own, &chosen)
-                    .await?
-                {
-                    return Err(QueryError::InvalidQuery(format!(
-                        "Graph source '{}': a class-targeted view policy cannot be decided on the \
-                         rows of triples map <{}>: their subjects can hold classes rows the scan \
-                         does not read derive ({}), and the decision depends on them. If no two \
-                         rows of its table mint one subject, declare the table's key (f:key); \
-                         for a history table, map its current rows with an rr:sqlQuery \
-                         (`SELECT … WHERE <current-row condition>`) and declare the key there; \
-                         or target the policy by property or subject.",
-                        self.graph_source_id,
-                        tm.iri,
-                        data_extra.join(", ")
-                    )));
+            let mut hidden = true;
+            for derived in subsets(&data_extra) {
+                let mut some_denies = false;
+                for declared in subsets(&static_extra) {
+                    let mut chosen = declared;
+                    chosen.extend(derived.iter().copied());
+                    if !self
+                        .decide_with(ctx, subject, pred, object, &own, &chosen)
+                        .await?
+                    {
+                        some_denies = true;
+                        break;
+                    }
                 }
+                if !some_denies {
+                    hidden = false;
+                    break;
+                }
+            }
+            if !hidden {
+                return Err(QueryError::InvalidQuery(format!(
+                    "Graph source '{}': a class-targeted view policy cannot be decided on the \
+                     rows of triples map <{}>: their subjects can hold classes rows the scan \
+                     does not read derive ({}), and the decision depends on them. If no two \
+                     rows of its table mint one subject, declare the table's key (f:key); \
+                     for a history table, map its current rows with an rr:sqlQuery \
+                     (`SELECT … WHERE <current-row condition>`) and declare the key there; \
+                     or target the policy by property or subject.",
+                    self.graph_source_id,
+                    tm.iri,
+                    data_extra.join(", ")
+                )));
+            }
+            if !static_extra.is_empty() {
+                self.report_undecidable(ctx, tm);
             }
             false
         };
@@ -1704,6 +1730,55 @@ mod tests {
         );
         let err = decide_result(&mut gate, &plain, "http://ex/other").expect_err("refused");
         assert!(err.to_string().contains("at most"), "{err}");
+    }
+
+    /// When only the classes another map declares change the decision, the
+    /// row is hidden by that map's rule, not refused over derived classes that
+    /// change nothing.
+    #[test]
+    fn derived_classes_that_change_nothing_do_not_refuse() {
+        use fluree_db_r2rml::mapping::TermType;
+        let city = ObjectMap::Template {
+            template: "http://ex/city/{city}".to_string(),
+            columns: vec!["city".to_string()],
+            term_type: TermType::Iri,
+            datatype: None,
+            language: None,
+        };
+        let hist = templated(
+            "http://ex/hist",
+            "http://ex/c/{id}",
+            &[],
+            vec![pom(rdf::TYPE, city)],
+        );
+        let other = templated(
+            "http://ex/eu",
+            "http://ex/c/{id}",
+            &["http://ex/Restricted"],
+            vec![],
+        );
+        let mapping = CompiledR2rmlMapping::new(vec![hist.clone(), other]);
+        let mut gate = gate_for_all(
+            &mapping,
+            vec![
+                restriction(TargetMode::OnClass, &[], &["http://ex/Restricted"], false),
+                restriction(TargetMode::OnClass, &[], &["http://ex/city/Boston"], true),
+            ],
+            true,
+        );
+        assert!(!decide_result(&mut gate, &hist, "http://ex/name").expect("decided, not refused"),);
+        // A derived class that does change the decision still refuses.
+        let mut gate = gate_for_all(
+            &mapping,
+            vec![restriction(
+                TargetMode::OnClass,
+                &[],
+                &["http://ex/city/Boston"],
+                false,
+            )],
+            true,
+        );
+        assert!(decide_result(&mut gate, &hist, "http://ex/name").is_err());
     }
 
     #[test]
