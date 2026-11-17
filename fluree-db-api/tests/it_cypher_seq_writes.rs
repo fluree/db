@@ -2064,7 +2064,7 @@ async fn issue1873_hoisted_read_after_write_is_rejected_not_committed() {
             r#"MATCH (n:Person {name: "Alice"}) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2"#,
         ),
         (
-            "errored: the hoisted WITH left `n` unbound",
+            "COMMITTED 0 flakes, not even the CREATE",
             r#"CREATE (n:P {id: "c1"}) WITH n SET n.nm = "a""#,
         ),
         (
