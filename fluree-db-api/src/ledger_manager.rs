@@ -1278,7 +1278,8 @@ use fluree_db_query::BinaryRangeProvider;
 
 /// Residency mode (F8): prewarm the reverse-dict leaves that overlay
 /// translation of this snapshot's novelty will touch, in one concurrent
-/// fetch round at load time. Novelty replay stays the load model; its
+/// fetch round after an index apply or a catch-up (a load warms these
+/// leaves before its own probes). Novelty replay stays the load model; its
 /// query-time miss sources (sync `find_subject_id_by_parts` /
 /// `find_string_id` per novelty entry) are prefetched here so a cold
 /// residency peer does not spend a retry round per reverse-tree leaf.
@@ -1295,6 +1296,44 @@ async fn prefetch_novelty_translation(
         .prefetch_novelty_reverse_wants(
             dict_novelty.subjects.iter_entries(),
             dict_novelty.strings.iter_values(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch"
+        );
+    }
+}
+
+/// Residency mode: fetch the reverse-dict leaves that
+/// `populate_dict_novelty_safe` probes for every novelty subject and string.
+/// Those probes are sync and a load runs in no retry frame, so a cold leaf
+/// fails the load. Covers the leaves [`prefetch_novelty_translation`] warms,
+/// since every DictNovelty entry comes from these flakes.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_dict_probes(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    novelty: &fluree_db_novelty::Novelty,
+) {
+    use fluree_db_core::FlakeValue;
+    let mut subjects: Vec<(u16, &str)> = Vec::new();
+    let mut strings: Vec<&str> = Vec::new();
+    for f in novelty.iter_flakes(fluree_db_core::IndexType::Post) {
+        subjects.push((f.s.namespace_code, &f.s.name));
+        match &f.o {
+            FlakeValue::Ref(sid) => subjects.push((sid.namespace_code, &sid.name)),
+            FlakeValue::String(s) | FlakeValue::Json(s) => strings.push(s),
+            _ => {}
+        }
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            subjects.into_iter(),
+            strings.into_iter(),
             fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
         )
         .await;
@@ -1404,6 +1443,8 @@ pub(crate) async fn load_and_attach_binary_store(
     // This prevents minting a second internal ID for an already-indexed IRI/string.
     if !state.novelty.is_empty() {
         let novelty = state.novelty.as_ref();
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        prefetch_novelty_dict_probes(&store, novelty).await;
         let dn = Arc::make_mut(&mut state.dict_novelty);
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
@@ -1439,9 +1480,6 @@ pub(crate) async fn load_and_attach_binary_store(
     // would always be false on snapshots loaded outside the
     // LedgerManager handle path.
     snap.content_store = Some(Arc::clone(&cs));
-
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
 
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct

@@ -588,9 +588,14 @@ async fn novelty_ledger_prefetches_translation_and_completes() {
     );
     assert_eq!(expected.len(), (PEOPLE + EXTRA) as usize, "fixture sanity");
 
-    // Residency instance: LOAD runs the F8 reverse-leaf prefetch.
+    // Residency instance: LOAD runs the F8 reverse-leaf prefetch. A bare
+    // open, as the browser peer does: no recovery loop wraps a load, so the
+    // load must fetch what its own dictionary probes need.
     let (fluree_b, storage) = residency_instance(&shared, &ns);
-    let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
+    let ledger_b = fluree_b
+        .ledger(LEDGER)
+        .await
+        .expect("a cold open over novelty needs no retry round");
 
     // Direct proof the prefetch covered translation: a novelty subject's
     // reverse lookup — exactly what overlay translation performs per entry —
@@ -729,6 +734,10 @@ async fn beyond_gap_head_change_reloads_at_record_watermarks() {
     });
     let ledger_b = ledger_with_recovery(&fluree_b, &storage).await;
     assert_eq!(ledger_b.t(), expected_t, "fresh load at the same watermark");
+    assert!(
+        ledger_b.snapshot.range_provider.is_some(),
+        "the reloaded ledger keeps its binary store"
+    );
     let db_b = GraphDb::from_ledger_state(&ledger_b);
     let result = fluree_b
         .query(&db_b, &query)
