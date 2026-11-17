@@ -221,13 +221,46 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         }
     }
 
-    /// Resolve and reject reserved-system predicates.
+    /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`
+    /// system predicates, and the JSON-LD keywords (`@id`, `@type`, …) that
+    /// are not Cypher properties.
+    ///
+    /// The keyword check runs on the *bare* name, before `@vocab` expansion:
+    /// with a vocab set, `@id` would otherwise resolve to `<vocab>@id` and
+    /// lower as an ordinary predicate. Reading it yields `null` and writing it
+    /// stores a literal predicate spelled `@id` — see
+    /// [`crate::keywords`] for why rejecting is safe.
     pub fn resolve_predicate(&self, name: &str) -> Result<String> {
+        if let Some(msg) = crate::keywords::reserved_keyword_message(name) {
+            return Err(LowerError::generic(msg));
+        }
         let iri = self.resolve_iri(name);
+        // The bare-name check above misses a keyword reached through the
+        // ledger's context: `{"id": "@id"}` is a standard JSON-LD aliasing
+        // idiom, lands in `overrides`, and resolves `id` to `@id`. Checking
+        // the resolved term too closes that, while the bare-name check still
+        // catches `@id` before `@vocab` would turn it into `<vocab>@id`.
+        if let Some(msg) = crate::keywords::reserved_keyword_message(&iri) {
+            return Err(LowerError::generic(format!(
+                "`{name}` resolves through the ledger's context to `{iri}` — {msg}"
+            )));
+        }
         if fluree_vocab::reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerError::ReservedPredicate(iri));
         }
         Ok(iri)
+    }
+
+    /// Resolve a node label, rejecting the same reserved names a predicate
+    /// rejects.
+    ///
+    /// A label lowers to the OBJECT of an `rdf:type` triple rather than to a
+    /// predicate, so the label sites reached `resolve_iri` directly and routed
+    /// around the reserved-name check: ``MATCH (n:`@id`)`` read as zero rows
+    /// and ``SET n:`@type` `` committed a junk class. Delegating keeps one
+    /// choke point per crate instead of a second copy of the check.
+    pub fn resolve_label(&self, name: &str) -> Result<String> {
+        self.resolve_predicate(name)
     }
 
     /// rdf:type IRI.
@@ -235,36 +268,39 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
         rdf::TYPE
     }
 
-    /// Lower a resolved IRI to a pattern `Ref`, encoding to `Ref::Sid` when
-    /// the namespace is registered (parity with the SPARQL lowering — the
-    /// planner's stats lookups and the batched join lanes are Sid-gated and
-    /// silently degrade to per-row paths on `Ref::Iri`). Unregistered
-    /// namespaces stay `Ref::Iri`, which matches nothing at scan time.
+    /// Lower a resolved IRI to a pattern `Ref` through the shared
+    /// [`IriEncoder::encode_ref`] rule, with one Cypher-specific addition:
+    /// with no @vocab, a bare Cypher name (no scheme — identifiers can't
+    /// contain `:`) lives under namespace 0 (empty prefix), which
+    /// `encode_iri_strict` rejects by design, so it is constructed directly.
+    /// Scheme-ful strings (system IRIs like rdf:type, backticked IRIs) keep
+    /// the shared behavior: unregistered namespaces stay `Ref::Iri`.
     pub fn iri_ref(&self, iri: String) -> fluree_db_query::ir::Ref {
-        match self.encoder.encode_iri_strict(&iri) {
-            Some(sid) => fluree_db_query::ir::Ref::Sid(sid),
-            // No @vocab: a bare Cypher name (no scheme — identifiers
-            // can't contain `:`) lives under namespace 0 (empty
-            // prefix) — construct the Sid directly; `encode_iri_strict`
-            // rejects namespace 0 by design. Scheme-ful strings (system
-            // IRIs like rdf:type, backticked IRIs) keep the strict
-            // behavior: unregistered namespaces stay `Ref::Iri`.
-            None if self.vocab.is_none() && !iri.contains(':') => fluree_db_query::ir::Ref::Sid(
-                fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri),
-            ),
-            None => fluree_db_query::ir::Ref::Iri(iri.into()),
+        match self.encoder.encode_ref(&iri) {
+            fluree_db_query::ir::Ref::Iri(_) if self.is_bare_name(&iri) => {
+                fluree_db_query::ir::Ref::Sid(fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::EMPTY,
+                    iri,
+                ))
+            }
+            r => r,
         }
     }
 
     /// Object-position counterpart of [`Self::iri_ref`].
     pub fn iri_term(&self, iri: String) -> fluree_db_query::ir::Term {
-        match self.encoder.encode_iri_strict(&iri) {
-            Some(sid) => fluree_db_query::ir::Term::Sid(sid),
-            // Bare namespace-0 name — see [`Self::iri_ref`].
-            None if self.vocab.is_none() && !iri.contains(':') => fluree_db_query::ir::Term::Sid(
-                fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri),
-            ),
-            None => fluree_db_query::ir::Term::Iri(iri.into()),
+        match self.encoder.encode_term(&iri) {
+            fluree_db_query::ir::Term::Iri(_) if self.is_bare_name(&iri) => {
+                fluree_db_query::ir::Term::Sid(fluree_db_core::Sid::new(
+                    fluree_vocab::namespaces::EMPTY,
+                    iri,
+                ))
+            }
+            t => t,
         }
+    }
+
+    fn is_bare_name(&self, iri: &str) -> bool {
+        self.vocab.is_none() && !iri.contains(':')
     }
 }

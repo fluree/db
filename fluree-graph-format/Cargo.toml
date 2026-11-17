@@ -13,6 +13,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+fluree-graph-turtle = { path = "../fluree-graph-turtle" }
 fluree-vocab = { path = "../fluree-vocab" }
 pretty_assertions = "1.4"
 

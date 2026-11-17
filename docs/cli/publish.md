@@ -27,8 +27,10 @@ fluree publish <REMOTE> [LEDGER] [OPTIONS]
 
 1. Checks if the ledger exists on the remote (`GET /exists`)
 2. Creates it if not (`POST /create`)
-3. Pushes all local commits (`POST /push`)
+3. Pushes all local commits (`POST /push`, or `POST /push-merges` when the history contains a merge)
 4. Configures upstream tracking so subsequent `fluree push` and `fluree pull` work
+
+A history containing a merge needs a server that supports pushing merges. See [push](push.md#pushing-a-merge). Publish checks this before creating the remote ledger, so a refusal leaves the remote untouched.
 
 This is intended for the "create locally, deploy to server" workflow. If the remote ledger already has data (t > 0), the command will fail — use `fluree push` instead for incremental updates.
 

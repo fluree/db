@@ -8,7 +8,7 @@
 
 #![cfg(feature = "native")]
 
-use crate::support::genesis_ledger;
+use crate::support::{genesis_ledger, instances_sharing_storage};
 use fluree_db_api::{
     CommitOpts, FlureeBuilder, GovernanceOptions, IndexConfig, ReindexOptions, TxnOpts,
 };
@@ -151,6 +151,85 @@ async fn data_ledger_query_enforces_model_ledger_deny_policy() {
         json!([]),
         "defaultAllow=false with only M's deny rule must also block ex:Doc, got {docs_jsonld}"
     );
+}
+
+/// A selector naming a config graph IRI, the model ledger's own or another
+/// ledger's, is refused: any ledger's config graph IRI names M's config
+/// graph, which is never a cross-ledger governance target.
+#[tokio::test]
+async fn a_config_graph_selector_is_refused_in_any_ledgers_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let model_id = "test/cross-ledger-e2e/config-selector-model:main";
+    let model = genesis_ledger(&fluree, model_id);
+    let model_config = config_graph_iri(model_id);
+    fluree
+        .stage_owned(model)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:  <http://example.org/ns/> .
+
+            GRAPH <{model_config}> {{
+                ex:denyUsers rdf:type f:AccessPolicy ;
+                             f:action f:view ;
+                             f:onClass ex:User ;
+                             f:allow false .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed a policy in M's config graph");
+
+    for (n, selector) in [model_config.clone(), config_graph_iri("nowhere:main")]
+        .iter()
+        .enumerate()
+    {
+        let data_id = format!("test/cross-ledger-e2e/config-selector-data-{n}:main");
+        let data = genesis_ledger(&fluree, &data_id);
+        let data_config = config_graph_iri(&data_id);
+        fluree
+            .stage_owned(data)
+            .upsert_turtle(&format!(
+                r"
+                @prefix f:   <https://ns.flur.ee/db#> .
+                @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+                GRAPH <{data_config}> {{
+                    <urn:cfg:main> rdf:type f:LedgerConfig ;
+                                   f:policyDefaults <urn:cfg:policy> .
+                    <urn:cfg:policy> f:defaultAllow true ;
+                                     f:policyClass f:AccessPolicy ;
+                                     f:policySource <urn:cfg:policy-ref> .
+                    <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                         f:graphSource <urn:cfg:policy-src> .
+                    <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                         f:graphSelector <{selector}> .
+                }}
+            "
+            ))
+            .execute()
+            .await
+            .expect("seed D's cross-ledger config");
+
+        let Err(err) = fluree
+            .db_with_policy(&data_id, &GovernanceOptions::default())
+            .await
+        else {
+            panic!("{selector}: a config graph selector must be refused");
+        };
+        assert!(
+            matches!(
+                err,
+                fluree_db_api::ApiError::CrossLedger(
+                    fluree_db_api::cross_ledger::CrossLedgerError::ReservedGraphSelected { .. }
+                )
+            ),
+            "{selector}: {err:?}"
+        );
+    }
 }
 
 // =============================================================================
@@ -1279,4 +1358,229 @@ async fn multiple_targeted_query_rules_any_allow_grants_across_materializations(
             "round {round}: one-hop rule must grant acme-rome"
         );
     }
+}
+
+const USER_POLICY_GRAPH: &str = "http://example.org/m-policies";
+
+/// Commit model ledger `model`'s one policy, in a named graph: users are
+/// visible only if `allow`.
+async fn seed_user_policy(fluree: &fluree_db_api::Fluree, model: &str, allow: bool) {
+    fluree
+        .stage_owned(genesis_ledger(fluree, &format!("{model}:main")))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            @prefix ex:   <http://example.org/ns/> .
+
+            GRAPH <{USER_POLICY_GRAPH}> {{
+                ex:users
+                    rdf:type    f:AccessPolicy ;
+                    f:action    f:view ;
+                    f:onClass   ex:User ;
+                    f:allow     {allow} .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M");
+}
+
+/// Drop model ledger `model` and create it again with the policy `allow`
+/// picks. Its one commit puts the new ledger at the dropped one's `t`.
+async fn recreate_user_policy(fluree: &fluree_db_api::Fluree, model: &str, allow: bool) {
+    fluree
+        .drop_ledger(model, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop M");
+    seed_user_policy(fluree, model, allow).await;
+}
+
+/// Data ledger `data_id` holds one user, and enforces `model`'s user policy
+/// with nothing allowed by default.
+async fn seed_data_governed_by(fluree: &fluree_db_api::Fluree, data_id: &str, model: &str) {
+    let data = fluree
+        .insert(
+            genesis_ledger(fluree, data_id),
+            &json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@id": "ex:alice", "@type": "ex:User", "ex:name": "Alice"
+            }),
+        )
+        .await
+        .expect("seed D")
+        .ledger;
+    let config_iri = config_graph_iri(data_id);
+    fluree
+        .stage_owned(data)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:    <https://ns.flur.ee/db#> .
+            @prefix rdf:  <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow false .
+                <urn:cfg:policy> f:policyClass f:AccessPolicy .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model}:main> ;
+                                     f:graphSelector <{USER_POLICY_GRAPH}> .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed D config");
+}
+
+/// The users `fluree`'s policy view of `data_id` shows.
+async fn visible_users(fluree: &fluree_db_api::Fluree, data_id: &str) -> serde_json::Value {
+    let wrapped = fluree
+        .db_with_policy(data_id, &GovernanceOptions::default())
+        .await
+        .expect("db_with_policy");
+    fluree
+        .query(
+            &wrapped,
+            &json!({"@context": {"ex": "http://example.org/ns/"}, "select": "?u",
+                    "where": {"@id": "?u", "@type": "ex:User"}}),
+        )
+        .await
+        .expect("query")
+        .to_jsonld(&wrapped.snapshot)
+        .expect("jsonld")
+}
+
+/// A model ledger dropped and created again under its name restarts at the
+/// same `t`. The policies D enforces are the new ledger's, never the dropped
+/// one's cached at that `t`.
+#[tokio::test]
+async fn recreated_model_ledger_policies_replace_the_dropped_ones() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model = "test/cross-ledger-recreate/model";
+    let data_id = "test/cross-ledger-recreate/data:main";
+    seed_user_policy(&fluree, model, false).await;
+    seed_data_governed_by(&fluree, data_id, model).await;
+    assert_eq!(
+        visible_users(&fluree, data_id).await,
+        json!([]),
+        "M denies users"
+    );
+
+    recreate_user_policy(&fluree, model, true).await;
+    assert_eq!(
+        visible_users(&fluree, data_id).await,
+        json!(["ex:alice"]),
+        "the new M, at the dropped M's t, allows users"
+    );
+}
+
+/// The same, with M recreated by another instance sharing the storage and
+/// nameservice. Nothing clears this instance's cached handle of the dropped
+/// M, which sits at the `t` the new M reaches; the policies are still read
+/// from the new M.
+#[tokio::test]
+async fn model_ledger_recreated_by_another_instance_replaces_the_dropped_policies() {
+    let (writer, reader) = instances_sharing_storage();
+    let model = "test/cross-ledger-recreate-shared/model";
+    let data_id = "test/cross-ledger-recreate-shared/data:main";
+    seed_user_policy(&writer, model, true).await;
+    seed_data_governed_by(&writer, data_id, model).await;
+    assert_eq!(
+        visible_users(&reader, data_id).await,
+        json!(["ex:alice"]),
+        "M allows users, and the reader caches M"
+    );
+
+    recreate_user_policy(&writer, model, false).await;
+    assert_eq!(
+        visible_users(&writer, data_id).await,
+        json!([]),
+        "the writer enforces the new M"
+    );
+    assert_eq!(
+        visible_users(&reader, data_id).await,
+        json!([]),
+        "the reader enforces the new M, not its cached handle of the dropped one"
+    );
+}
+
+/// Policy is the exception to "a config write never depends on a model
+/// ledger": policy decides who may write the config, so a cross-ledger
+/// `f:policySource` whose model ledger is gone still fails every write
+/// closed, config writes included. Every surface that applies config policy
+/// to a write builds its context with `build_transact_policy_context`, which
+/// refuses here even for a request with no policy inputs of its own.
+#[tokio::test]
+async fn dropped_policy_model_still_fails_writes_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let model_name = "test/cross-ledger-e2e/dropped-policy-model";
+    let model_id = format!("{model_name}:main");
+    let policy_graph_iri = "http://example.org/governance/policy";
+    fluree
+        .stage_owned(genesis_ledger(&fluree, &model_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:  <https://ns.flur.ee/db#> .
+            @prefix ex: <http://example.org/ns/> .
+
+            GRAPH <{policy_graph_iri}> {{
+                ex:allowAll a f:AccessPolicy ;
+                            f:action f:view, f:modify ;
+                            f:allow true .
+            }}
+        "
+        ))
+        .execute()
+        .await
+        .expect("seed M policy graph");
+
+    let data_id = "test/cross-ledger-e2e/dropped-policy-data:main";
+    let data = fluree
+        .stage_owned(genesis_ledger(&fluree, data_id))
+        .upsert_turtle(&format!(
+            r"
+            @prefix f:   <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+
+            GRAPH <{config_iri}> {{
+                <urn:cfg:main> rdf:type f:LedgerConfig .
+                <urn:cfg:main> f:policyDefaults <urn:cfg:policy> .
+                <urn:cfg:policy> f:defaultAllow true .
+                <urn:cfg:policy> f:policySource <urn:cfg:policy-ref> .
+                <urn:cfg:policy-ref> rdf:type f:GraphRef ;
+                                     f:graphSource <urn:cfg:policy-src> .
+                <urn:cfg:policy-src> f:ledger <{model_id}> ;
+                                     f:graphSelector <{policy_graph_iri}> .
+            }}
+        ",
+            config_iri = config_graph_iri(data_id),
+        ))
+        .execute()
+        .await
+        .expect("seed D cross-ledger policy config")
+        .ledger;
+    fluree
+        .drop_ledger(model_name, fluree_db_api::DropMode::Soft)
+        .await
+        .expect("drop M");
+
+    let err = fluree_db_api::build_transact_policy_context(
+        &fluree,
+        &data.snapshot,
+        data.novelty.as_ref(),
+        Some(data.novelty.as_ref()),
+        data.t(),
+        &GovernanceOptions::default(),
+    )
+    .await
+    .expect_err("an unresolvable policy source fails every write closed");
+    assert!(
+        err.to_string().contains(model_name) || err.to_string().contains("not present"),
+        "the refusal names the missing model ledger: {err}"
+    );
 }

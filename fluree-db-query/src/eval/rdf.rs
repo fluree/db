@@ -6,7 +6,8 @@ use crate::binding::{Binding, RowAccess};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::ir::Expression;
-use fluree_db_binary_index::BinaryIndexStore;
+use crate::object_binding::{canonical_iri_id, TermDicts};
+use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeDictId, Sid};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -88,6 +89,40 @@ fn datatype_of_binding(
 ) -> Result<Option<ComparableValue>> {
     match binding {
         Binding::Lit { dtc, .. } => Ok(Some(ComparableValue::Sid(dtc.datatype().clone()))),
+        // A NUM_BIG `dt_id` reads DECIMAL for overflow integers too; only the
+        // decoded value names the datatype (issue #1329).
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } if *o_kind == ObjKind::NUM_BIG.as_u8() => {
+            let decoded = ctx.and_then(|c| {
+                let store = c.binary_store.as_deref()?;
+                let val = c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?;
+                Some((store, val))
+            });
+            let Some((store, val)) = decoded else {
+                return Err(QueryError::InvalidExpression(
+                    "DATATYPE requires a literal or IRI argument".to_string(),
+                ));
+            };
+            let val = val.map_err(|e| {
+                QueryError::execution(format!(
+                    "DATATYPE could not decode overflow numeric (o_key={o_key}, p_id={p_id}): {e}"
+                ))
+            })?;
+            let dt_sid = store
+                .resolve_dt_id_sid_for_value(*dt_id, &val)
+                .ok_or_else(|| {
+                    QueryError::InvalidExpression(format!(
+                        "DATATYPE could not resolve datatype id {dt_id}"
+                    ))
+                })?;
+            Ok(Some(ComparableValue::Sid(dt_sid)))
+        }
         Binding::EncodedLit { dt_id, .. } => {
             let dt_id = DatatypeDictId::from_u16(*dt_id);
             if let Some(sid) = reserved_datatype_sid(dt_id) {
@@ -224,8 +259,8 @@ pub fn eval_same_term<R: RowAccess>(
 
     // Fast path: avoid decoding EncodedSid/EncodedPid to IRI strings.
     if let Some(ctx) = ctx {
-        if let Some(store) = ctx.binary_store.as_deref() {
-            if let Some(b) = fast_same_term_encoded_ids(args, row, ctx, store)? {
+        if let Some(dicts) = TermDicts::of(ctx) {
+            if let Some(b) = fast_same_term_encoded_ids(args, row, ctx, dicts)? {
                 return Ok(Some(ComparableValue::Bool(b)));
             }
         }
@@ -235,18 +270,40 @@ pub fn eval_same_term<R: RowAccess>(
     let v2 = args[1].eval_to_comparable(row, ctx)?;
     let same = match (v1, v2) {
         (Some(a), Some(b)) => {
-            a == b || super::compare::resource_iri_eq(&a, &b, ctx).unwrap_or(false)
+            same_term(&a, &b) || super::compare::resource_iri_eq(&a, &b, ctx).unwrap_or(false)
         }
         _ => false,
     };
     Ok(Some(ComparableValue::Bool(same)))
 }
 
+/// Term equality of two evaluated values. Numbers are stored by value, so a
+/// double is the same term as an equal double; every NaN is the one term
+/// `"NaN"^^xsd:double`, which `f64` equality does not see.
+fn same_term(a: &ComparableValue, b: &ComparableValue) -> bool {
+    match (a, b) {
+        (ComparableValue::Double(x), ComparableValue::Double(y)) => {
+            x == y || (x.is_nan() && y.is_nan())
+        }
+        (ComparableValue::Float(x), ComparableValue::Float(y)) => {
+            x == y || (x.is_nan() && y.is_nan())
+        }
+        _ => a == b,
+    }
+}
+
+/// `SAMETERM` over an encoded IRI, answered by comparing ids: both sides
+/// resolve through [`canonical_iri_id`], the rule every equality surface
+/// keys IRIs by, so an IRI met as a predicate (`EncodedPid`), as a subject
+/// or object (`EncodedSid`, a novelty id included) or decoded is one term.
+/// `None` hands the call to the decoding comparison: neither side is an
+/// encoded IRI, the other side is no IRI, or it is an IRI no dictionary
+/// holds.
 fn fast_same_term_encoded_ids<R: RowAccess>(
     args: &[Expression],
     row: &R,
     ctx: &ExecutionContext<'_>,
-    store: &BinaryIndexStore,
+    dicts: TermDicts<'_>,
 ) -> Result<Option<bool>> {
     if args.len() != 2 {
         return Ok(None);
@@ -259,53 +316,42 @@ fn fast_same_term_encoded_ids<R: RowAccess>(
         let Some(binding) = row.get(*v) else {
             return Ok(Some(false));
         };
-
-        match binding {
-            Binding::EncodedSid { s_id, .. } => {
-                // If both sides are vars and both are EncodedSid, compare directly.
-                if let Expression::Var(v2) = other_expr {
-                    if let Some(Binding::EncodedSid { s_id: s2, .. }) = row.get(*v2) {
-                        return Ok(Some(*s_id == *s2));
-                    }
-                }
-
-                let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
-                    return Ok(Some(false));
-                };
-                let rhs_s_id_opt = match other {
-                    ComparableValue::Sid(sid) => store
-                        .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
-                        .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?,
-                    ComparableValue::Iri(iri) => store
-                        .find_subject_id(iri.as_ref())
-                        .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?,
-                    _ => return Ok(None),
-                };
-                let same = rhs_s_id_opt.is_some_and(|rhs| rhs == *s_id);
-                log_same_term_fastpath_hit_once("EncodedSid");
-                Ok(Some(same))
-            }
-            Binding::EncodedPid { p_id } => {
-                if let Expression::Var(v2) = other_expr {
-                    if let Some(Binding::EncodedPid { p_id: p2 }) = row.get(*v2) {
-                        return Ok(Some(*p_id == *p2));
-                    }
-                }
-
-                let Some(other) = other_expr.eval_to_comparable(row, Some(ctx))? else {
-                    return Ok(Some(false));
-                };
-                let rhs_p_id_opt = match other {
-                    ComparableValue::Sid(sid) => store.sid_to_p_id(&sid),
-                    ComparableValue::Iri(iri) => store.find_predicate_id(iri.as_ref()),
-                    _ => return Ok(None),
-                };
-                let same = rhs_p_id_opt.is_some_and(|rhs| rhs == *p_id);
-                log_same_term_fastpath_hit_once("EncodedPid");
-                Ok(Some(same))
-            }
-            _ => Ok(None),
+        if !matches!(
+            binding,
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. }
+        ) {
+            return Ok(None);
         }
+        let Some(lhs) = canonical_iri_id(binding, dicts) else {
+            return Ok(None);
+        };
+
+        let rhs = match other_expr {
+            Expression::Var(v2) => match row.get(*v2) {
+                Some(
+                    other @ (Binding::EncodedSid { .. }
+                    | Binding::EncodedPid { .. }
+                    | Binding::Sid { .. }
+                    | Binding::Iri(_)
+                    | Binding::IriMatch { .. }),
+                ) => canonical_iri_id(other, dicts),
+                _ => None,
+            },
+            _ => match other_expr.eval_to_comparable(row, Some(ctx))? {
+                None => return Ok(Some(false)),
+                Some(ComparableValue::Sid(sid)) => canonical_iri_id(&Binding::sid(sid), dicts),
+                Some(ComparableValue::Iri(iri)) => canonical_iri_id(&Binding::Iri(iri), dicts),
+                Some(_) => None,
+            },
+        };
+        let Some(rhs) = rhs else {
+            return Ok(None);
+        };
+        log_same_term_fastpath_hit_once(match binding {
+            Binding::EncodedPid { .. } => "EncodedPid",
+            _ => "EncodedSid",
+        });
+        Ok(Some(lhs == rhs))
     };
 
     if let Some(v) = try_side(&args[0], &args[1])? {

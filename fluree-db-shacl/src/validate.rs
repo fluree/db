@@ -14,6 +14,7 @@ use crate::constraints::value::{
     validate_min_exclusive, validate_min_inclusive,
 };
 use crate::constraints::{Constraint, ConstraintViolation, NestedShape, NodeConstraint};
+use crate::data_view::{DataSources, DataView};
 use crate::error::Result;
 use fluree_db_core::{
     FlakeValue, GraphDbRef, GraphId, IndexType, LedgerSnapshot, NoOverlay, RangeMatch, RangeTest,
@@ -99,6 +100,28 @@ struct ClassMembershipCtx<'a> {
     /// only installed when a cancellation is present, so without one a
     /// constraint body runs unbounded. `None` outside a request scope.
     cancellation: Option<&'a fluree_db_core::QueryCancellation>,
+    /// Where an `sh:sparql` constraint that cannot run is recorded instead
+    /// of raised. See [`ShaclEngine::with_constraint_failures`].
+    failures: Option<&'a crate::sparql::ConstraintFailures>,
+    /// While a nested shape is checked for conformance (`sh:node`, `sh:not`,
+    /// `sh:and`, `sh:or`, `sh:xone`, `sh:qualifiedValueShape`), the severity of
+    /// the outermost shape that reports the result: an `sh:sparql` constraint
+    /// inside that cannot run is recorded with it, as the nested shape's own
+    /// results surface only through that shape's. `None` outside nesting. Set
+    /// by [`ClassMembershipCtx::reported_under`].
+    failure_severity: Option<Severity>,
+}
+
+impl ClassMembershipCtx<'_> {
+    /// This context for checking a nested shape whose result `severity`
+    /// reports. The outermost reporting shape wins: a severity already set by
+    /// an enclosing nesting stays.
+    fn reported_under(self, severity: Severity) -> Self {
+        Self {
+            failure_severity: self.failure_severity.or(Some(severity)),
+            ..self
+        }
+    }
 }
 
 /// SHACL validation engine
@@ -119,11 +142,16 @@ pub struct ShaclEngine {
     /// vocabulary can live alongside the shapes. The focus node's own data
     /// graph is always consulted in addition to these.
     membership_g_ids: Vec<GraphId>,
+    /// Per data graph, the `f:additionalDataSource` graphs read with it when
+    /// checking its nodes. A graph absent here is read alone.
+    additional_data: HashMap<GraphId, DataSources>,
     /// Per-transaction memo of resolved `sh:class` membership verdicts.
     class_cache: ClassMembershipCache,
     /// Cooperative cancellation handed to `sh:sparql` constraint queries.
     /// See [`ShaclEngine::with_cancellation`].
     cancellation: Option<fluree_db_core::QueryCancellation>,
+    /// See [`ShaclEngine::with_constraint_failures`].
+    constraint_failures: Option<Arc<crate::sparql::ConstraintFailures>>,
 }
 
 impl ShaclEngine {
@@ -135,8 +163,10 @@ impl ShaclEngine {
             cache: Arc::new(cache),
             hierarchy: None,
             membership_g_ids: Vec::new(),
+            additional_data: HashMap::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -149,8 +179,10 @@ impl ShaclEngine {
             cache: Arc::new(cache),
             hierarchy: Some(hierarchy),
             membership_g_ids: Vec::new(),
+            additional_data: HashMap::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -163,8 +195,10 @@ impl ShaclEngine {
             cache,
             hierarchy,
             membership_g_ids: Vec::new(),
+            additional_data: HashMap::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         }
     }
 
@@ -233,8 +267,10 @@ impl ShaclEngine {
             cache: Arc::new(cache),
             hierarchy,
             membership_g_ids: Vec::new(),
+            additional_data: HashMap::new(),
             class_cache: Mutex::new(HashMap::new()),
             cancellation: None,
+            constraint_failures: None,
         })
     }
 
@@ -246,6 +282,24 @@ impl ShaclEngine {
     pub fn with_membership_graphs(mut self, g_ids: Vec<GraphId>) -> Self {
         self.membership_g_ids = g_ids;
         self
+    }
+
+    /// Set, per data graph, the graphs read with it when checking its nodes
+    /// (`f:additionalDataSource`). A data graph listed in its own entry is
+    /// read once, and its subclass edges count as a listed graph's do.
+    pub fn with_additional_data_graphs(mut self, graphs: HashMap<GraphId, Vec<GraphId>>) -> Self {
+        self.additional_data = graphs
+            .into_iter()
+            .map(|(g_id, listed)| (g_id, DataSources::new(g_id, listed)))
+            .filter(|(_, sources)| !sources.is_empty())
+            .collect();
+        self
+    }
+
+    /// What checking a node of `db`'s graph reads: that graph plus its
+    /// additional data graphs.
+    fn data_view<'a>(&'a self, db: GraphDbRef<'a>) -> DataView<'a> {
+        DataView::new(db, self.additional_data.get(&db.g_id))
     }
 
     /// Attach the request's cooperative cancellation handle, bounding
@@ -264,6 +318,21 @@ impl ShaclEngine {
     #[must_use]
     pub fn with_cancellation(mut self, cancellation: fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = Some(cancellation);
+        self
+    }
+
+    /// Record an `sh:sparql` constraint that cannot run (its query does not
+    /// parse, lower or plan) in `failures`, with its shape's severity (or,
+    /// when the shape is checked as a nested shape, the outermost reporting
+    /// shape's), instead of raising it; validation continues with the shape's other
+    /// constraints. For a caller that applies severity and validation mode to
+    /// such a failure (the transaction path). Without it the failure is
+    /// raised as `ShaclError::SparqlConstraint`.
+    pub fn with_constraint_failures(
+        mut self,
+        failures: Arc<crate::sparql::ConstraintFailures>,
+    ) -> Self {
+        self.constraint_failures = Some(failures);
         self
     }
 
@@ -378,16 +447,25 @@ impl ShaclEngine {
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
+            failures: self.constraint_failures.as_deref(),
+            failure_severity: None,
         };
         let active = ActiveShapeChecks::default();
+        let data = self.data_view(db);
         for shape in applicable_shapes {
             if shape.deactivated {
                 continue;
             }
 
-            let shape_results =
-                validate_shape(db, focus_node, shape, &all_shapes, Some(class_ctx), &active)
-                    .await?;
+            let shape_results = validate_shape(
+                data,
+                focus_node,
+                shape,
+                &all_shapes,
+                Some(class_ctx),
+                &active,
+            )
+            .await?;
             results.extend(shape_results);
         }
 
@@ -449,6 +527,8 @@ impl ShaclEngine {
             hierarchy: self.hierarchy.as_ref(),
             iri_encoder,
             cancellation: self.cancellation.as_ref(),
+            failures: self.constraint_failures.as_deref(),
+            failure_severity: None,
         };
         // Class-target focus nodes are constant across the shape loop (same
         // `db`, same hierarchy), so memoize them per class: several shapes
@@ -467,7 +547,7 @@ impl ShaclEngine {
             for focus_node in focus_nodes {
                 let active = ActiveShapeChecks::default();
                 let results = validate_shape(
-                    db,
+                    self.data_view(db),
                     &focus_node,
                     shape,
                     &all_shapes,
@@ -519,9 +599,15 @@ impl ShaclEngine {
             }
             for lit in &literal_targets {
                 let active = ActiveShapeChecks::default();
-                let results =
-                    validate_literal_focus(db, lit, shape, &all_shapes, Some(class_ctx), &active)
-                        .await?;
+                let results = validate_literal_focus(
+                    self.data_view(db),
+                    lit,
+                    shape,
+                    &all_shapes,
+                    Some(class_ctx),
+                    &active,
+                )
+                .await?;
                 all_results.extend(results);
             }
         }
@@ -762,7 +848,7 @@ async fn get_focus_nodes(
 ///
 /// Note: This function uses `Box::pin` for recursive calls to avoid infinitely-sized futures.
 fn validate_shape<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &'a Sid,
     shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
@@ -804,10 +890,12 @@ fn validate_shape<'a>(
             results.extend(node_results);
         }
 
-        // Validate structural constraints (closed, logical)
+        // Validate structural constraints (closed, logical). The nested shapes
+        // they check report through this shape's results.
+        let nested_ctx = class_ctx.map(|c| c.reported_under(shape.severity));
         for constraint in &shape.structural_constraints {
             let constraint_results = validate_structural_constraint(
-                db, focus_node, constraint, shape, all_shapes, class_ctx, active,
+                db, focus_node, constraint, shape, all_shapes, nested_ctx, active,
             )
             .await?;
             results.extend(constraint_results);
@@ -826,6 +914,8 @@ fn validate_shape<'a>(
                 crate::sparql::SparqlConstraintCtx {
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
+                    failures: class_ctx.and_then(|c| c.failures),
+                    failure_severity: class_ctx.and_then(|c| c.failure_severity),
                 },
             )
             .await?;
@@ -845,7 +935,7 @@ fn validate_shape<'a>(
 /// see an empty value set (so only `sh:minCount` / `sh:qualifiedMinCount`
 /// can fire).
 async fn validate_literal_focus<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     lit: &crate::compile::LiteralTarget,
     shape: &'a CompiledShape,
     all_shapes: &'a [&'a CompiledShape],
@@ -887,7 +977,9 @@ async fn validate_literal_focus<'a>(
         }
     }
 
-    // Structural constraints: test the literal against the nested shapes.
+    // Structural constraints: test the literal against the nested shapes,
+    // which report through this shape's results.
+    let nested_ctx = class_ctx.map(|c| c.reported_under(shape.severity));
     for constraint in &shape.structural_constraints {
         let conforms_to = |nested: &'a std::sync::Arc<crate::constraints::NestedShape>| {
             check_value_against_nested_shape(
@@ -898,7 +990,7 @@ async fn validate_literal_focus<'a>(
                 nested,
                 shape,
                 all_shapes,
-                class_ctx,
+                nested_ctx,
                 active,
             )
         };
@@ -1016,7 +1108,7 @@ async fn validate_literal_focus<'a>(
 /// exactly the focus node, so per-value constraints (`sh:in`, `sh:hasValue`,
 /// `sh:nodeKind`, `sh:class`, ranges, …) evaluate over `[focus]`.
 async fn validate_node_value_constraints<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &Sid,
     shape: &'a CompiledShape,
     class_ctx: Option<ClassMembershipCtx<'a>>,
@@ -1048,7 +1140,7 @@ async fn validate_node_value_constraints<'a>(
 /// value-only members of logical constraints (`sh:or ([ sh:class ex:C ])`).
 /// The focus is an IRI ref, so string facets match its full decoded IRI.
 async fn focus_value_violations<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &Sid,
     constraints: &[Constraint],
     class_ctx: Option<ClassMembershipCtx<'a>>,
@@ -1122,7 +1214,7 @@ async fn focus_value_violations<'a>(
 ///
 /// Note: This function uses `Box::pin` for recursive calls to avoid infinitely-sized futures.
 fn validate_structural_constraint<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &'a Sid,
     constraint: &'a crate::constraints::NodeConstraint,
     parent_shape: &'a CompiledShape,
@@ -1132,8 +1224,6 @@ fn validate_structural_constraint<'a>(
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ValidationResult>>> + Send + 'a>>
 {
     Box::pin(async move {
-        use crate::compile::Severity;
-
         let mut results = Vec::new();
 
         match constraint {
@@ -1201,10 +1291,7 @@ fn validate_structural_constraint<'a>(
                     active,
                 )
                 .await?;
-                let has_violations = nested_results
-                    .iter()
-                    .any(|r| r.severity == Severity::Violation);
-                if has_violations {
+                if !conforms(&nested_results) {
                     results.push(ValidationResult {
                         focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
@@ -1238,13 +1325,11 @@ fn validate_structural_constraint<'a>(
                     active,
                 )
                 .await?;
-                // If the nested shape has NO violations, that's a violation of sh:not.
-                // An "unresolved shape" violation from validate_nested_shape counts as
-                // a violation (the shape didn't match), so sh:not is satisfied.
-                let has_violations = nested_results
-                    .iter()
-                    .any(|r| r.severity == Severity::Violation);
-                if !has_violations {
+                // If the focus node conforms to the nested shape, that's a
+                // violation of sh:not. An "unresolved shape" result from
+                // validate_nested_shape counts against conformance (the shape
+                // didn't match), so sh:not is satisfied.
+                if conforms(&nested_results) {
                     results.push(ValidationResult {
                         focus_node: FocusNode::Node(focus_node.clone()),
                         result_path: None,
@@ -1267,7 +1352,7 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::And(nested_shapes) => {
-                // sh:and - ALL nested shapes must match (no violations).
+                // sh:and - the focus node must conform to ALL nested shapes.
                 // Per spec, a failed conjunction produces ONE result per value
                 // node (= the focus node) with sh:value = focus; the nested
                 // violations' messages are aggregated for diagnostics.
@@ -1283,10 +1368,8 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    for r in nested_results {
-                        if r.severity == Severity::Violation {
-                            failure_messages.push(r.message);
-                        }
+                    if !conforms(&nested_results) {
+                        failure_messages.extend(nested_results.into_iter().map(|r| r.message));
                     }
                 }
                 if !failure_messages.is_empty() {
@@ -1309,7 +1392,7 @@ fn validate_structural_constraint<'a>(
             }
 
             NodeConstraint::Or(nested_shapes) => {
-                // sh:or - at least ONE nested shape must match (have no violations)
+                // sh:or - the focus node must conform to at least ONE nested shape
                 let mut any_conforms = false;
                 let mut all_messages = Vec::new();
 
@@ -1324,18 +1407,13 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    let has_violations = nested_results
-                        .iter()
-                        .any(|r| r.severity == Severity::Violation);
-                    if !has_violations {
+                    if conforms(&nested_results) {
                         any_conforms = true;
                         break;
                     }
                     // Collect messages for reporting if none match
                     for r in nested_results {
-                        if r.severity == Severity::Violation {
-                            all_messages.push(format!("{}: {}", nested.id.name, r.message));
-                        }
+                        all_messages.push(format!("{}: {}", nested.id.name, r.message));
                     }
                 }
 
@@ -1377,10 +1455,7 @@ fn validate_structural_constraint<'a>(
                         active,
                     )
                     .await?;
-                    let has_violations = nested_results
-                        .iter()
-                        .any(|r| r.severity == Severity::Violation);
-                    if !has_violations {
+                    if conforms(&nested_results) {
                         conforming_count += 1;
                         conforming_shapes.push(nested.id.name.clone());
                     }
@@ -1435,7 +1510,7 @@ fn validate_structural_constraint<'a>(
 /// Unlike `validate_shape` which validates against a `CompiledShape`, this validates
 /// directly against the constraints embedded in a `NestedShape`.
 fn validate_nested_shape<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &'a Sid,
     nested: &'a NestedShape,
     parent_shape: &'a CompiledShape,
@@ -1782,7 +1857,7 @@ fn validate_nested_shape<'a>(
 /// Validate a focus node against a property shape
 #[allow(clippy::too_many_arguments)]
 async fn validate_property_shape<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &Sid,
     prop_shape: &PropertyShape,
     parent_shape: &'a CompiledShape,
@@ -1791,6 +1866,10 @@ async fn validate_property_shape<'a>(
     active: &'a ActiveShapeChecks,
 ) -> Result<Vec<ValidationResult>> {
     let mut results = Vec::new();
+    // The nested shapes this property shape checks (`sh:node`, the logical
+    // constraints, `sh:qualifiedValueShape`) report through its results; its
+    // own `sh:sparql` constraints are unaffected unless it is itself nested.
+    let class_ctx = class_ctx.map(|c| c.reported_under(prop_shape.severity));
 
     // A path that never compiled surfaces here (only for focus nodes this shape
     // actually targets) rather than as a ledger-wide compile failure.
@@ -1828,6 +1907,8 @@ async fn validate_property_shape<'a>(
                 crate::sparql::SparqlConstraintCtx {
                     iri_encoder: class_ctx.and_then(|c| c.iri_encoder),
                     cancellation: class_ctx.and_then(|c| c.cancellation),
+                    failures: class_ctx.and_then(|c| c.failures),
+                    failure_severity: class_ctx.and_then(|c| c.failure_severity),
                 },
             )
             .await?,
@@ -2125,7 +2206,7 @@ async fn validate_property_shape<'a>(
 /// this evaluates against each individual value of the property.
 #[allow(clippy::too_many_arguments)]
 async fn validate_property_value_structural_constraint<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     focus_node: &Sid,
     values: &[FlakeValue],
     datatypes: &[Sid],
@@ -2396,7 +2477,7 @@ async fn validate_property_value_structural_constraint<'a>(
 /// focus node in the database.
 #[allow(clippy::too_many_arguments)]
 async fn check_value_against_nested_shape<'a>(
-    db: GraphDbRef<'a>,
+    db: DataView<'a>,
     value: &FlakeValue,
     datatype: Option<&Sid>,
     lang: Option<&str>,
@@ -2454,10 +2535,7 @@ async fn check_value_against_nested_shape<'a>(
         let nested_results =
             validate_nested_shape(db, sid, nested, parent_shape, all_shapes, class_ctx, active)
                 .await?;
-        let has_violations = nested_results
-            .iter()
-            .any(|r| r.severity == Severity::Violation);
-        return Ok(!has_violations);
+        return Ok(conforms(&nested_results));
     }
 
     // Literal value with no value_constraints — can't evaluate meaningfully.
@@ -2465,16 +2543,29 @@ async fn check_value_against_nested_shape<'a>(
     Ok(false)
 }
 
+/// Whether a node conforms to a nested shape (`sh:node`, `sh:not`, `sh:and`,
+/// `sh:or`, `sh:xone`, `sh:qualifiedValueShape`), given the results of
+/// validating it against that shape. Every result counts, whatever its
+/// severity: SHACL §3.5 says a node conforms to a shape when validating it
+/// there reports no result, and §2.1.4 has severity only categorize results.
+/// The severity that decides a write is the outermost reporting shape's, on
+/// the result it reports. A constraint that cannot run is not a result. It is
+/// decided at that same outermost severity (`ClassMembershipCtx::failure_severity`).
+fn conforms(nested_results: &[ValidationResult]) -> bool {
+    nested_results.is_empty()
+}
+
 /// Replace IRI refs with their full-IRI string form for the string facets
 /// (`sh:pattern` / `sh:minLength` / `sh:maxLength`), per SPARQL `STR()`.
 /// Blank nodes stay refs (string facets fail on them, per spec); an IRI whose
 /// namespace can't be decoded (e.g. allocated in this very transaction) also
 /// stays a ref and fails closed.
-fn stringify_iri_values(db: GraphDbRef<'_>, values: &[FlakeValue]) -> Vec<FlakeValue> {
+fn stringify_iri_values(db: DataView<'_>, values: &[FlakeValue]) -> Vec<FlakeValue> {
     values
         .iter()
         .map(|v| match v {
             FlakeValue::Ref(sid) if sid.namespace_code != BLANK_NODE => db
+                .graph
                 .snapshot
                 .decode_sid(sid)
                 .map(FlakeValue::String)
@@ -2714,15 +2805,16 @@ fn validate_pair_constraint(
 /// via `class_ctx`, so a shared value-set (e.g. a list of US states defined in
 /// the shapes graph) is discoverable even when the referencing records live in
 /// a different graph. Resolution uses, in order:
-/// 1. Direct / indexed-hierarchy match against the `SchemaHierarchy`.
-/// 2. Live `rdfs:subClassOf` walk (schema graph 0 unioned with the vocabulary
-///    graphs) for novelty-added or vocabulary-local relations.
+/// 1. Direct / hierarchy match against the engine's current default-graph
+///    `SchemaHierarchy`.
+/// 2. Live `rdfs:subClassOf` walk (schema graph 0 unioned with the listed and
+///    vocabulary graphs) for source-local relations.
 ///
 /// When `class_ctx` is present its per-transaction memo collapses repeated
 /// `(value, class, focus graph)` checks to a single lookup. A value with no
 /// conforming `rdf:type` is a violation.
 async fn validate_class_constraint(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     values: &[FlakeValue],
     expected_class: &Sid,
     class_ctx: Option<ClassMembershipCtx<'_>>,
@@ -2740,9 +2832,10 @@ async fn validate_class_constraint(
     let cross_ledger: Option<CrossLedgerMembership<'_>> = class_ctx.and_then(|c| c.cross_ledger);
 
     // Fast-path acceptable set: expected_class + its descendants per the
-    // indexed-schema hierarchy. Misses novelty-added subclass relations;
-    // we fall through to `is_subclass_of` (a db walk) for those.
-    let hierarchy = db.snapshot.schema_hierarchy();
+    // engine's current default-graph hierarchy. Not the index root's schema:
+    // that one is extracted from every graph and keeps a retracted edge until
+    // the next build. Source-local edges fall through to `is_subclass_of`.
+    let hierarchy = class_ctx.and_then(|c| c.hierarchy);
     let mut hierarchy_accepted: HashSet<Sid> = HashSet::new();
     hierarchy_accepted.insert(expected_class.clone());
     if let Some(h) = &hierarchy {
@@ -2772,7 +2865,7 @@ async fn validate_class_constraint(
         // guard is dropped before any `.await` so the validation future stays
         // `Send`. Cache hits also skip the range scan (and its fuel charge), so
         // per-transaction fuel depends on intra-transaction value repetition.
-        let cache_key = (value_ref.clone(), expected_class.clone(), db.g_id);
+        let cache_key = (value_ref.clone(), expected_class.clone(), db.graph.g_id);
         let cached: Option<bool> = class_ctx.and_then(|c| {
             let guard = c.cache.lock();
             guard.get(&cache_key).copied()
@@ -2814,13 +2907,13 @@ async fn validate_class_constraint(
 }
 
 /// Resolve whether `value_ref` is (transitively) an instance of
-/// `expected_class`, consulting the focus node's data graph unioned with
+/// `expected_class`, consulting the graphs `db` reads unioned with
 /// `membership_g_ids` (the `f:shapesSource` vocabulary graph[s]). When a
 /// cross-ledger model handle is present, it is consulted on demand only after
 /// the local lookup misses (so locally-typed values never touch the model
 /// ledger).
 async fn value_conforms_to_class(
-    db: GraphDbRef<'_>,
+    db: DataView<'_>,
     membership_g_ids: &[GraphId],
     cross_ledger: Option<CrossLedgerMembership<'_>>,
     value_ref: &Sid,
@@ -2829,9 +2922,9 @@ async fn value_conforms_to_class(
 ) -> Result<bool> {
     let rdf_type = Sid::new(RDF, rdf_names::TYPE);
 
-    // Graphs to consult for the value's `rdf:type`: the focus data graph plus
-    // the configured vocabulary graphs, de-duplicated.
-    let mut lookup_g_ids: Vec<GraphId> = vec![db.g_id];
+    // Graphs to consult for the value's `rdf:type`: the graphs `db` reads
+    // plus the configured vocabulary graphs, de-duplicated.
+    let mut lookup_g_ids: Vec<GraphId> = db.g_ids().collect();
     for &g in membership_g_ids {
         if !lookup_g_ids.contains(&g) {
             lookup_g_ids.push(g);
@@ -2840,7 +2933,7 @@ async fn value_conforms_to_class(
 
     let mut value_types: Vec<Sid> = Vec::new();
     for &g in &lookup_g_ids {
-        let gdb = rescope_to_graph(db, g);
+        let gdb = rescope_to_graph(db.graph, g);
         let type_flakes = gdb
             .range(
                 IndexType::Spot,
@@ -2857,15 +2950,21 @@ async fn value_conforms_to_class(
         }
     }
 
-    // Fast path: any indexed-hierarchy match.
+    // Fast path: any hierarchy match.
     if value_types.iter().any(|t| hierarchy_accepted.contains(t)) {
         return Ok(true);
     }
 
     // Slow path: walk the live `rdfs:subClassOf` graph (schema graph 0 unioned
-    // with the vocabulary graphs) for novelty-added / vocabulary-local relations.
+    // with the listed data and vocabulary graphs) for novelty-added /
+    // source-local relations. The validated graph's own edges count only when
+    // it is listed.
+    let subclass_g_ids: Vec<GraphId> = db
+        .listed_g_ids()
+        .chain(membership_g_ids.iter().copied())
+        .collect();
     for t in &value_types {
-        if is_subclass_of(db, membership_g_ids, t, expected_class).await? {
+        if is_subclass_of(db.graph, &subclass_g_ids, t, expected_class).await? {
             return Ok(true);
         }
     }
@@ -2981,11 +3080,12 @@ fn rescope_to_graph(db: GraphDbRef<'_>, g_id: GraphId) -> GraphDbRef<'_> {
 /// is reachable.
 ///
 /// The walk consults the **schema graph** (`g_id = 0`) unioned with any
-/// `membership_g_ids` (the `f:shapesSource` vocabulary graph[s]). Rationale:
-/// `rdfs:subClassOf` is schema-level data — the indexed `SchemaHierarchy` is
-/// built from the default graph, and this fallback must match that semantic,
-/// while a value-set vocabulary configured via `f:shapesSource` may define a
-/// small class hierarchy in its own graph that must also be honoured.
+/// `extra_g_ids` (the `f:additionalDataSource` graphs and the `f:shapesSource`
+/// vocabulary graph[s]). Rationale: `rdfs:subClassOf` is schema-level data —
+/// the indexed `SchemaHierarchy` is built from the default graph, and this
+/// fallback must match that semantic, while a catalog or value-set vocabulary
+/// in its own graph may define a small class hierarchy that must also be
+/// honoured.
 ///
 /// Uses `db.range()` via rescoped `GraphDbRef`s so novelty-added subclass
 /// relations are visible — the indexed `SchemaHierarchy` can lag behind.
@@ -2995,7 +3095,7 @@ fn rescope_to_graph(db: GraphDbRef<'_>, g_id: GraphId) -> GraphDbRef<'_> {
 /// `visited` set, since `rdfs:subClassOf` graphs in user data can be malformed.
 async fn is_subclass_of(
     db: GraphDbRef<'_>,
-    membership_g_ids: &[GraphId],
+    extra_g_ids: &[GraphId],
     start: &Sid,
     target: &Sid,
 ) -> Result<bool> {
@@ -3005,11 +3105,11 @@ async fn is_subclass_of(
         return Ok(true);
     }
 
-    // Graphs holding subClassOf edges: the schema graph plus the vocabulary
+    // Graphs holding subClassOf edges: the schema graph plus the extra
     // graphs, de-duplicated. Rescoping preserves the caller's tracker — see
     // `rescope_to_graph` for why `GraphDbRef::new(..)` must NOT be used.
     let mut walk_g_ids: Vec<GraphId> = vec![0];
-    for &g in membership_g_ids {
+    for &g in extra_g_ids {
         if !walk_g_ids.contains(&g) {
             walk_g_ids.push(g);
         }

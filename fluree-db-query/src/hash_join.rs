@@ -53,7 +53,6 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryIndexStore;
 use rustc_hash::FxHashMap;
 
 use fluree_db_core::{ObjectBounds, StatsView};
@@ -68,6 +67,7 @@ use crate::group_aggregate::{
 };
 use crate::ir::triple::TriplePattern;
 use crate::join::NestedLoopJoinOperator;
+use crate::object_binding::{canonical_iri_id, IriId, TermDicts};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -130,6 +130,12 @@ const HASH_JOIN_MEDIUM_BUILD_MAX: f64 = 250_000.0;
 /// build side in `open()`, so a wide, high-row intermediate can defeat outer
 /// LIMIT.
 const HASH_JOIN_AUTO_NARROW_BUILD_SCHEMA: usize = 2;
+/// Largest requested prefix for preferring startup latency over a hash build.
+/// Matches the minimum batched probe window.
+const ROW_GOAL_MAX: usize = crate::operator::flush::MIN_FLUSH;
+/// Small builds still use the throughput cost model. Keep this tied to the
+/// first expansion of the probe window rather than a separate tuning value.
+const ROW_GOAL_MIN_BUILD: usize = ROW_GOAL_MAX * crate::operator::flush::FLUSH_GROWTH;
 /// Don't scan a probe predicate more than this many times the driving-set size —
 /// a guard against the pathological "scan a huge predicate for a handful of driving
 /// rows" case. It is deliberately loose: the alternative we replace is the scattered
@@ -178,6 +184,8 @@ pub(crate) enum HashJoinReason {
     /// The object-join shape matched, but the build side is already a wider
     /// intermediate. Auto hash join would drain it in open() and can defeat LIMIT.
     BuildSideTooWide,
+    /// A small output prefix favors a streaming probe over an eager build.
+    SmallRowGoal,
     /// The subject (not the object) is bound from the left, so this is a forward
     /// join the object→subject hash can't replace. Reordering to drive the other
     /// end is what helps (the BSBM-BI bowtie case).
@@ -194,6 +202,7 @@ impl HashJoinReason {
             HashJoinReason::ScanRatioTooHigh => "scan-ratio-too-high",
             HashJoinReason::NoProbeStats => "no-probe-stats",
             HashJoinReason::BuildSideTooWide => "build-side-too-wide",
+            HashJoinReason::SmallRowGoal => "small-row-goal",
             HashJoinReason::SubjectDriven => "subject-driven-forward-join",
         }
     }
@@ -323,6 +332,7 @@ pub(crate) struct HashJoinPlanner<'a> {
     /// `before_step` runs with stats present, so single-pattern / stats-less callers
     /// never auto-fire (force-`On` still does).
     step_est: Option<f64>,
+    row_goal: Option<usize>,
 }
 
 impl<'a> HashJoinPlanner<'a> {
@@ -348,7 +358,13 @@ impl<'a> HashJoinPlanner<'a> {
             force: hash_join_force(),
             driving_est: 1.0,
             step_est: None,
+            row_goal: None,
         }
+    }
+
+    pub(crate) fn with_row_goal(mut self, row_goal: Option<usize>) -> Self {
+        self.row_goal = row_goal;
+        self
     }
 
     /// Seed the running driving estimate from the block's incoming LEFT operator
@@ -450,6 +466,24 @@ impl<'a> HashJoinPlanner<'a> {
             _ => None,
         };
 
+        // A nested-loop join can emit after one small probe window. Keep the
+        // hash build for larger prefixes and small build sides; avoid draining
+        // a large build just to return a handful of rows. The goal is advisory:
+        // filters and dedup may require the streaming plan to read everything.
+        if self.force == HashJoinForce::Auto
+            && self.row_goal.is_some_and(|goal| goal <= ROW_GOAL_MAX)
+            && driving_est.is_some_and(|rows| rows > ROW_GOAL_MIN_BUILD as f64)
+        {
+            return Some(HashJoinDecision {
+                join_var: Some(join_var),
+                probe_count,
+                driving_est,
+                scan_ratio,
+                chosen: false,
+                reason: HashJoinReason::SmallRowGoal,
+            });
+        }
+
         let (chosen, reason) = match self.force {
             HashJoinForce::On => (true, HashJoinReason::ForcedOn),
             HashJoinForce::Off => unreachable!("handled above"),
@@ -523,33 +557,35 @@ enum JoinKeyClass {
 
 /// Classify a binding's join key, normalising refs to a `u64` s_id when a store is
 /// available. Unbound → wildcard; Poisoned → dead (drop); everything else → keyed.
+///
+/// IRIs key by [`canonical_iri_id`], the rule every equality surface shares: an
+/// IRI the scan reached as a predicate (`EncodedPid`) keys by its subject id when
+/// it is also a subject, so it joins the same IRI met as a subject or object.
 fn join_key(
     binding: &Binding,
-    store: Option<&BinaryIndexStore>,
+    dicts: Option<TermDicts<'_>>,
     gv: Option<&fluree_db_binary_index::BinaryGraphView>,
 ) -> JoinKeyClass {
-    let keyed_ref_or_group = |sid: &fluree_db_core::Sid| {
-        store
-            .and_then(|s| {
-                s.find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .ok()
-                    .flatten()
-            })
-            .map(JoinKey::Ref)
-            .unwrap_or_else(|| JoinKey::Other(binding_to_group_key_owned(binding)))
-    };
     match binding {
         Binding::EncodedSid { s_id, .. } => JoinKeyClass::Keyed(JoinKey::Ref(*s_id)),
-        Binding::Sid { sid, .. } => JoinKeyClass::Keyed(keyed_ref_or_group(sid)),
-        Binding::IriMatch { primary_sid, .. } => {
-            JoinKeyClass::Keyed(keyed_ref_or_group(primary_sid))
-        }
         Binding::Unbound => JoinKeyClass::Wildcard,
         Binding::Poisoned => JoinKeyClass::Dead,
+        Binding::Sid { .. }
+        | Binding::IriMatch { .. }
+        | Binding::Iri(_)
+        | Binding::EncodedPid { .. } => {
+            JoinKeyClass::Keyed(match dicts.and_then(|d| canonical_iri_id(binding, d)) {
+                Some(IriId::Subject(s_id)) => JoinKey::Ref(s_id),
+                Some(IriId::Predicate(p_id)) => {
+                    JoinKey::Other(binding_to_group_key_owned(&Binding::EncodedPid { p_id }))
+                }
+                None => JoinKey::Other(binding_to_group_key_owned(binding)),
+            })
+        }
         // Normalize decoded literals to their encoded form so they key
         // identically to late-materialized scan output.
         other => JoinKeyClass::Keyed(JoinKey::Other(binding_to_group_key_normalized(
-            other, store, gv,
+            other, dicts, gv,
         ))),
     }
 }
@@ -677,7 +713,7 @@ impl HashJoinOperator {
         ctx: &ExecutionContext<'_>,
         mut build: BoxedOperator,
     ) -> Result<()> {
-        let store = ctx.binary_store.as_deref();
+        let dicts = TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let ncols = self.build_schema.len();
         build.open(ctx).await?;
@@ -698,7 +734,7 @@ impl HashJoinOperator {
                     .collect();
                 match join_key(
                     batch.get_by_col(row, self.build_key_col),
-                    store,
+                    dicts,
                     gv.as_ref(),
                 ) {
                     JoinKeyClass::Keyed(key) => self.table.entry(key).or_default().push(row_vals),
@@ -786,7 +822,7 @@ impl Operator for HashJoinOperator {
         if let Some(fallback) = self.fallback.as_mut() {
             return fallback.next_batch(ctx).await;
         }
-        let store = ctx.binary_store.as_deref();
+        let dicts = TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let ncols = self.full_schema.len();
         let build_cols = self.build_schema.len();
@@ -824,7 +860,7 @@ impl Operator for HashJoinOperator {
                 // The probe scan always binds the join var, so a non-keyed probe row
                 // (unbound/poisoned) cannot match — skip it.
                 let JoinKeyClass::Keyed(key) =
-                    join_key(pb.get_by_col(row, self.probe_key_col), store, gv.as_ref())
+                    join_key(pb.get_by_col(row, self.probe_key_col), dicts, gv.as_ref())
                 else {
                     continue;
                 };
@@ -899,7 +935,7 @@ impl Operator for HashJoinOperator {
         if let Some(fallback) = self.fallback.as_mut() {
             return fallback.drain_count(ctx).await;
         }
-        let store = ctx.binary_store.as_deref();
+        let dicts = TermDicts::of(ctx);
         let gv = ctx.graph_view();
         let probe = self.probe.as_mut().expect("hash join probe");
         let mut count: u64 = 0;
@@ -909,7 +945,7 @@ impl Operator for HashJoinOperator {
                     for row in 0..batch.len() {
                         let JoinKeyClass::Keyed(key) = join_key(
                             batch.get_by_col(row, self.probe_key_col),
-                            store,
+                            dicts,
                             gv.as_ref(),
                         ) else {
                             continue;
@@ -998,7 +1034,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x"); // join var (bound object)
         let driver = vars.get_or_insert("?driver");
@@ -1076,7 +1112,7 @@ mod tests {
             FlakeValue, LedgerSnapshot, QueryCancellation, QueryCancellationReason,
         };
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");
@@ -1122,7 +1158,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");
@@ -1179,7 +1215,7 @@ mod tests {
         use crate::var_registry::VarRegistry;
         use fluree_db_core::{FlakeValue, LedgerSnapshot, QueryCancellation};
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let mut vars = VarRegistry::new();
         let x = vars.get_or_insert("?x");
         let driver = vars.get_or_insert("?driver");
@@ -1263,6 +1299,59 @@ mod tests {
             while hj2.next_batch(&ctx).await.expect("drain hj2").is_some() {}
             hj2.close();
         }
+    }
+
+    #[test]
+    fn small_row_goal_avoids_a_large_build_but_respects_force_mode() {
+        let subject = VarId(0);
+        let object = VarId(1);
+        let predicate = Sid::new(1, "knows");
+        let triple = TriplePattern::new(
+            Ref::Var(subject),
+            Ref::Sid(predicate.clone()),
+            Term::Var(object),
+        );
+        let mut stats = StatsView::default();
+        stats.properties.insert(
+            predicate,
+            PropertyStatData {
+                count: 150_000,
+                ndv_values: 50_000,
+                ndv_subjects: 50_000,
+            },
+        );
+        let mut planner = HashJoinPlanner::new(Some(&stats));
+        planner.force = HashJoinForce::Auto;
+        planner.step_est = Some(150_000.0);
+        let decision = |p: &HashJoinPlanner<'_>| {
+            p.explain_object_hash_join(&[object], &triple, false, true)
+                .unwrap()
+        };
+        assert!(decision(&planner).chosen);
+        for goal in [1, 1024] {
+            planner.row_goal = Some(goal);
+            let d = decision(&planner);
+            assert!(!d.chosen);
+            assert_eq!(d.reason, HashJoinReason::SmallRowGoal);
+        }
+        planner.row_goal = Some(1025);
+        assert!(
+            decision(&planner).chosen,
+            "larger prefixes keep the cost model"
+        );
+        planner.row_goal = Some(1);
+        planner.step_est = Some(8192.0);
+        assert!(
+            decision(&planner).chosen,
+            "small builds keep the cost model"
+        );
+        planner.step_est = Some(150_000.0);
+        planner.force = HashJoinForce::On;
+        assert_eq!(decision(&planner).reason, HashJoinReason::ForcedOn);
+        assert!(decision(&planner).chosen);
+        planner.force = HashJoinForce::Off;
+        assert_eq!(decision(&planner).reason, HashJoinReason::ForcedOff);
+        assert!(!decision(&planner).chosen);
     }
 
     #[test]
@@ -1490,6 +1579,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 10_980.0,
             step_est: Some(10_980.0),
         };
@@ -1528,6 +1618,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 237_440.0,
             step_est: Some(237_440.0),
         };
@@ -1558,6 +1649,7 @@ mod tests {
         let planner = HashJoinPlanner {
             stats: Some(&stats),
             force: HashJoinForce::Auto,
+            row_goal: None,
             driving_est: 1_085_090.0,
             step_est: Some(1_085_090.0),
         };

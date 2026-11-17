@@ -104,7 +104,7 @@ Each request can supply:
 - **`policy`** — an inline JSON-LD policy array.
 - **`default-allow`** — boolean fallback for flakes no policy targets.
 
-Over JSON-LD, these go inside `opts`. Over SPARQL, they're sent as `fluree-*` headers (SPARQL has no `opts` block). When the server is configured with a default policy class, a verified bearer token's identity is auto-applied — see the [policy cookbook](../guides/cookbook-policies.md#invoking-policies-via-http) for the request shapes and the server-side `data_auth_default_policy_class` option in [Configuration](../operations/configuration.md).
+Over JSON-LD, these go inside `opts`. Over SPARQL, they're sent as [`# PRAGMA` comments](../query/sparql.md#request-options--pragma) or `fluree-*` headers; the inline `policy` document is header-only. When the server is configured with a default policy class, a verified bearer token's identity is auto-applied — see the [policy cookbook](../guides/cookbook-policies.md#invoking-policies-via-http) for the request shapes and the server-side `data_auth_default_policy_class` option in [Configuration](../operations/configuration.md).
 
 ## Query enforcement vs transaction enforcement
 

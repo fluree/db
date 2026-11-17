@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::error::Result;
 use crate::rdf_list::{collect_chain_elements, collect_list_elements};
+use fluree_db_core::rdf_list::by_subject;
 
 /// Read `child <pred> parent` reference axioms (rdfs:subClassOf / rdfs:subPropertyOf)
 /// through the range provider — so committed-but-unindexed novelty is visible — and
@@ -441,16 +442,15 @@ impl OntologyRL {
             })
             .collect();
 
-        for flake in chain_flakes {
-            // Subject is the derived property P
-            let derived_prop = flake.s.clone();
-            // Object is the head of an RDF list containing chain properties (may include owl:inverseOf blanks)
-            if let FlakeValue::Ref(list_head) = &flake.o {
-                // Traverse the RDF list to get chain elements, resolving owl:inverseOf to ChainElements
-                if let Ok(chain_elements) = collect_chain_elements(db, list_head).await {
+        // Subject is the derived property P; each of its lists holds chain
+        // properties (may include owl:inverseOf blanks)
+        for (derived_prop, values) in by_subject(chain_flakes) {
+            if let Ok(chains) = collect_chain_elements(db, &values).await {
+                for chain_elements in chains {
                     // Only store chains with at least 2 elements
                     if chain_elements.len() >= 2 {
-                        property_chains.push(PropertyChain::new(derived_prop, chain_elements));
+                        property_chains
+                            .push(PropertyChain::new(derived_prop.clone(), chain_elements));
                     }
                     // Note: Chains with length < 2 are silently ignored (invalid)
                 }
@@ -522,13 +522,10 @@ impl OntologyRL {
             .filter(|f| f.p.namespace_code == OWL && f.p.name.as_ref() == HAS_KEY && f.op)
             .collect();
 
-        for flake in has_key_flakes {
-            // Subject is the class C
-            let class = &flake.s;
-            // Object is the head of an RDF list containing key properties
-            if let FlakeValue::Ref(list_head) = &flake.o {
-                // Traverse the RDF list to get key properties
-                if let Ok(key_properties) = collect_list_elements(db, list_head).await {
+        // Subject is the class C; each of its lists holds key properties
+        for (class, values) in by_subject(has_key_flakes) {
+            if let Ok(keys) = collect_list_elements(db, &values).await {
+                for key_properties in keys {
                     // Only store non-empty key lists
                     if !key_properties.is_empty() {
                         has_keys

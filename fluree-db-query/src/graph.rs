@@ -23,14 +23,17 @@
 //! In single-db mode (no dataset) every graph of the ledger lives in one
 //! snapshot, partitioned by `g_id`. Named graphs resolve against the snapshot's
 //! graph registry (user graphs, `g_id >= FIRST_USER_GRAPH_ID`) without an
-//! explicit `FROM NAMED` (issue #1279); the ledger alias EXPLICITLY addresses
-//! the default graph, and reserved system graphs (txn-meta, config) stay private.
+//! explicit `FROM NAMED` (issue #1279), through the table every graph position
+//! of a ledger shares (`TargetLedger::graph_position`): the ledger's own
+//! address, in any spelling, EXPLICITLY addresses the default graph, `L#<g>`
+//! the graph `<g>`, and reserved system graphs (txn-meta, config) stay private.
 //! - `GRAPH <iri>` / bound `GRAPH ?g`: executes for a registered user graph,
-//!   the ledger alias, or an R2RML graph source; otherwise empty
-//! - unbound `GRAPH ?g`: binds ?g to each registered user graph. The ledger
-//!   alias (default graph) is NOT enumerated — W3C-conformant since issue
-//!   #1442 (decision D-2); the #1279 implicit default-graph enumeration was
-//!   dropped, while explicit alias addressing above is retained
+//!   the ledger's own address, or an R2RML graph source; otherwise empty
+//! - unbound `GRAPH ?g`: binds ?g to each registered user graph, under a name
+//!   that reads it back (`L#<iri>` for a graph registered under the ledger's
+//!   own address). The default graph is NOT enumerated — W3C-conformant since
+//!   issue #1442; the #1279 implicit default-graph enumeration
+//!   was dropped, while explicit addressing above is retained
 //!
 //! # Architecture
 //!
@@ -48,7 +51,7 @@ use crate::execute::build_where_operators_seeded;
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::r2rml::{
-    r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml, unsupported_subscope_error,
+    r2rml_unsupported_pattern_error, rewrite_patterns_for_r2rml_source, unsupported_subscope_error,
 };
 use crate::seed::{BatchSeedOperator, SeedOperator};
 use crate::sort::SortSpec;
@@ -60,23 +63,29 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use std::sync::Arc;
 // Note: tracing::debug removed to fix compilation - add tracing dependency if needed
 
-/// Best-effort load of the compiled R2RML mapping for `graph_iri`, used only to
-/// let [`rewrite_patterns_for_r2rml`] decide whether a same-subject `rdf:type`
-/// may be safely fused into a star scan. Returns `None` (which disables class
-/// fusion but stays correct) when there is no provider or the load fails; the
-/// R2RML operator loads the mapping again at setup, so within a query this is a
-/// cache hit under the query-scoped catalog session.
+/// Load the compiled R2RML mapping for `graph_iri`, which the caller has just
+/// found to be an R2RML graph source, so [`rewrite_patterns_for_r2rml`] can
+/// decide whether a same-subject `rdf:type` may be safely fused into a star
+/// scan. `None` only when there is no provider. A failed load fails the query
+/// rather than silently disabling the rewrite; the R2RML operator loads the
+/// mapping again at setup, so within a query this is a cache hit under the
+/// query-scoped catalog session.
 async fn r2rml_mapping_for_rewrite(
     ctx: &ExecutionContext<'_>,
     graph_iri: &str,
-) -> Option<Arc<CompiledR2rmlMapping>> {
-    let provider = ctx.r2rml_provider?;
-    let as_of_t = if ctx.dataset.is_some() {
+) -> Result<Option<Arc<CompiledR2rmlMapping>>> {
+    let Some(provider) = ctx.r2rml_provider else {
+        return Ok(None);
+    };
+    let as_of_t = if ctx.explicit_dataset().is_some() {
         None
     } else {
         Some(ctx.to_t)
     };
-    provider.compiled_mapping(graph_iri, as_of_t).await.ok()
+    provider
+        .compiled_mapping(graph_iri, as_of_t)
+        .await
+        .map(Some)
 }
 
 /// GRAPH pattern operator - scopes inner patterns to a specific graph
@@ -94,16 +103,16 @@ pub struct GraphOperator {
     schema: Arc<[VarId]>,
     /// Operator state
     state: OperatorState,
-    /// Buffered output rows (row-based, like SubqueryOperator)
-    result_buffer: Vec<Vec<Binding>>,
-    /// Current position in result buffer
-    buffer_pos: usize,
+    /// The parent batch whose `(row, graph)` executions are queued in `work`.
+    parent_batch: Option<Batch>,
+    /// The inner subplans still to run for `parent_batch`, in order.
+    work: std::collections::VecDeque<GraphWork>,
     /// Planning context captured at planner-time for the per-row inner subplan.
     planning: PlanningContext,
     /// LIMIT budget forwarded from a downstream `LIMIT` (via row-preserving
     /// operators). Threaded into the per-parent-batch inner subplan so a scan
     /// under a GRAPH wrapper (notably an R2RML graph source) can early-terminate
-    /// instead of draining the whole table into `result_buffer`.
+    /// instead of reading the whole table.
     row_budget: Option<usize>,
     /// Scan-side top-k directive (PR-5): `(primary DESC sort var, LIMIT+OFFSET)`,
     /// threaded into the per-parent inner subplan exactly like `row_budget` so a
@@ -122,6 +131,43 @@ pub struct GraphOperator {
     /// time instead, preserving `?g`-not-in-scope semantics for FILTER-only /
     /// OPTIONAL / UNION references (W3C graph-variable-scope).
     seed_graph_var: bool,
+    /// The inner subplan being read, streaming its output batch by batch.
+    stream: Option<InnerStream>,
+}
+
+/// One queued inner execution: a parent row's subplan in one graph.
+struct GraphWork {
+    row_idx: usize,
+    graph_iri: Arc<str>,
+    /// The graph variable to bind to `graph_iri` (an enumerated `GRAPH ?g`).
+    bind_graph_var: Option<VarId>,
+    /// A data-bound `GRAPH ?g` naming a graph source no query reads as a graph:
+    /// a refusal of that class (`QueryError::is_unreadable_graph_source`) while
+    /// opening means no rows for this binding, not a failed query.
+    unreadable_is_empty: bool,
+}
+
+/// An inner subplan kept open across `next_batch` calls, so its rows stream
+/// out as it produces them instead of being buffered whole (a graph source's
+/// answer can be far larger than memory).
+struct InnerStream {
+    inner: BoxedOperator,
+    graph_iri: Arc<str>,
+    /// Provenance to stamp on each batch, for a multi-ledger dataset.
+    stamp_ledger_id: Option<Arc<str>>,
+    /// Whether the graph context also stamps scan output itself (the per-row
+    /// path arms it; see [`GraphOperator::open_in_graph`]).
+    arm_scan_provenance: bool,
+    /// The parent row each output row starts with (the per-row path). `None`
+    /// for the batched path, whose inner output carries the parent columns.
+    parent_row: Option<Vec<Binding>>,
+    /// The graph variable bound to `graph_iri` (per-row path, `GRAPH ?g`).
+    bind_graph_var: Option<VarId>,
+    /// Net bytes the subplan recorded against the query budget during its own
+    /// calls, released when it is exhausted: its build tables drop with it.
+    /// Measured inside each call, because the operators above run between
+    /// calls and record their own allocations on the same counter.
+    charged: isize,
 }
 
 impl GraphOperator {
@@ -183,12 +229,13 @@ impl GraphOperator {
             inner_patterns,
             schema,
             state: OperatorState::Created,
-            result_buffer: Vec::new(),
-            buffer_pos: 0,
+            parent_batch: None,
+            work: std::collections::VecDeque::new(),
             planning,
             row_budget: None,
             topk: None,
             seed_graph_var,
+            stream: None,
         }
     }
 
@@ -222,6 +269,13 @@ impl GraphOperator {
             // (Subject/string dictionaries are store-global, so decoding
             // against the outer view is sound; when extraction DOES run in
             // the non-seeded UNION/OPTIONAL merge shape it is per inner row.)
+            // A predicate IRI bound in predicate position (`ex:s1 ?g ?o .
+            // GRAPH ?g { … }`).
+            Binding::EncodedPid { p_id } => ctx
+                .binary_store
+                .as_ref()?
+                .resolve_predicate_iri(*p_id)
+                .map(Arc::from),
             Binding::EncodedSid { .. } | Binding::EncodedLit { .. } => {
                 let gv = ctx.graph_view()?;
                 match crate::group_aggregate::materialize_encoded(binding, Some(&gv)) {
@@ -238,7 +292,7 @@ impl GraphOperator {
     }
 
     /// Execute inner patterns in a specific graph, seeded with parent row
-    async fn execute_in_graph(
+    async fn open_in_graph(
         &mut self,
         ctx: &ExecutionContext<'_>,
         parent_batch: &Batch,
@@ -282,16 +336,20 @@ impl GraphOperator {
         }
 
         // Check if this graph is backed by an R2RML mapping.
-        // Prefer the precomputed set (populated in runner.rs for dataset queries),
-        // but fall back to asking the provider dynamically for the no-dataset
-        // single-source path where the GRAPH IRI may differ from the ledger_id.
+        // Prefer the precomputed set (populated in runner.rs from the query's
+        // graphs), but fall back to asking the provider dynamically for the
+        // no-dataset single-source path where the GRAPH IRI may differ from the
+        // ledger_id.
         let is_r2rml_gs = if ctx.r2rml_graph_ids.contains(graph_iri.as_ref()) {
             true
-        } else if ctx.single_db_user_graph_id(&graph_iri).is_some() {
-            // Registered native graph — never R2RML; skip the per-graph probe.
+        } else if ctx.single_db_user_graph_id(&graph_iri).is_some()
+            || ctx.graph_is_native(&graph_iri)
+        {
+            // A registered graph, or a graph loaded as a ledger graph: never
+            // R2RML, so skip the per-graph probe.
             false
         } else if let Some(provider) = ctx.r2rml_provider {
-            provider.has_r2rml_mapping(&graph_iri).await
+            provider.has_r2rml_mapping(&graph_iri).await?
         } else {
             false
         };
@@ -299,15 +357,15 @@ impl GraphOperator {
         // Determine which patterns to use (rewritten for R2RML or original)
         let patterns_to_execute: std::borrow::Cow<'_, [Pattern]> = if is_r2rml_gs {
             // Rewrite triple patterns to R2RML patterns
-            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
-            let rewrite_result = rewrite_patterns_for_r2rml(
-                &self.inner_patterns,
+            let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
+            let rewrite_result = rewrite_patterns_for_r2rml_source(
+                ctx,
+                &crate::list_view::without_list_view(&self.inner_patterns),
                 &graph_iri,
-                ctx.active_snapshot,
                 mapping.as_deref(),
-                ctx.reasoning_active,
                 ctx.trust_fk_refs,
-            );
+            )
+            .await?;
 
             // If there are unconverted patterns in an R2RML graph source, refuse
             // with a typed error. R2RML graph sources have no ledger-backed index,
@@ -344,14 +402,20 @@ impl GraphOperator {
         // away at merge time. Join-equivalent by construction; strictly
         // narrows the inner scan. All other shapes rely on the merge-time
         // `{?g → graph}` join below.
+        //
+        // The seeding row's arena handles (big numbers, vectors) name values
+        // in the outer graph, and the rows leaving carry handles into this
+        // graph's arenas: each is decoded through its own graph on the way.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        let mut row: Vec<Binding> = parent_batch
+            .row_view(row_idx)
+            .expect("row_idx must be valid for batch")
+            .to_vec();
+        crossing.enter(&mut row);
         let seed = match bind_graph_var {
             Some(var) if self.seed_graph_var && !parent_batch.schema().contains(&var) => {
                 let mut schema_vec = parent_batch.schema().to_vec();
                 schema_vec.push(var);
-                let mut row: Vec<Binding> = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for batch")
-                    .to_vec();
                 row.push(Binding::iri(graph_iri.clone()));
                 if stamp_ledger_id.is_some() {
                     row = crate::dataset_operator::stamp_seed_row(row, ctx);
@@ -360,17 +424,14 @@ impl GraphOperator {
             }
             // Across a ledger boundary the parent's raw `Sid`s are stamped in
             // the requester's ledger before seeding (see `stamp_seed_row`).
-            _ if stamp_ledger_id.is_some() => {
-                let row = parent_batch
-                    .row_view(row_idx)
-                    .expect("row_idx must be valid for batch")
-                    .to_vec();
-                SeedOperator::from_row(
-                    Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
-                    crate::dataset_operator::stamp_seed_row(row, ctx),
-                )
-            }
-            _ => SeedOperator::from_batch_row(parent_batch, row_idx),
+            _ if stamp_ledger_id.is_some() => SeedOperator::from_row(
+                Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                crate::dataset_operator::stamp_seed_row(row, ctx),
+            ),
+            _ => SeedOperator::from_row(
+                Arc::from(parent_batch.schema().to_vec().into_boxed_slice()),
+                row,
+            ),
         };
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -387,125 +448,34 @@ impl GraphOperator {
             inner.set_topk(ordering, *k);
         }
         // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
-        // rebuilt per parent row/batch and is genuinely dropped at the end of this
-        // call, so its recorded bytes (hash-join / GROUP BY / fused-dim build tables)
-        // are provably freed HERE. Snapshot the shared counter before the inner charges
-        // anything, then release exactly its delta after it drains and closes (below).
-        // This releases only what the finished inner charged — never a live/persistent
-        // build (the delta is 0 if the inner retained nothing) — and execution on one
-        // handle is sequential, so no other charger races the delta. Without it the
-        // counter grows ~N× the true one-build peak across N rebuilds and false-aborts
-        // a legitimate correlated query with a typed 507.
-        let mem_before_inner = graph_ctx.mem_used();
+        // rebuilt per parent row and is dropped when it is exhausted, so what it
+        // records (hash-join / GROUP BY / fused-dim build tables) is provably freed
+        // then and released in `next_streamed`. Without the release the counter
+        // grows ~N× the true one-build peak across N rebuilds and false-aborts a
+        // legitimate correlated query with a typed 507.
+        let mem_before = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
-
-        // NumBig arena handles are scoped per (graph, predicate). When this
-        // GRAPH scope runs against a different g_id than the surrounding
-        // query, encoded NUM_BIG bindings escaping the scope would later be
-        // decoded against the OUTER graph's arena — silently producing wrong
-        // values. Materialize them here, against this graph's view, before
-        // they leave the scope. (Subject/string/predicate dictionaries are
-        // store-global, so all other encoded kinds escape safely.)
-        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
-
-        while let Some(batch) = inner.next_batch(&graph_ctx).await? {
-            graph_ctx.check_cancelled()?;
-            // Stamp cross-ledger provenance before merging so the formatter
-            // decodes SIDs against this graph's home ledger (see above).
-            let batch = match &stamp_ledger_id {
-                Some(ledger_id) => {
-                    crate::dataset_operator::stamp_provenance(batch, ledger_id, &graph_ctx)?
-                }
-                None => batch,
-            };
-
-            // Merge each inner result with parent row
-            for inner_row_idx in 0..batch.len() {
-                // SPARQL algebra: the `{?g → graph}` binding is JOINED with
-                // the inner solutions. A row whose inner `?g` is bound to a
-                // different term than the active graph's name is incompatible
-                // and is dropped — never overwritten (W3C graph-optional /
-                // graph-variable-join). Runs only when the enumeration binds a
-                // graph var the inner body actually carries; when the value
-                // was seeded (`seed_graph_var`) it short-circuits on the
-                // `Binding::Iri` fast path.
-                //
-                // Two deliberate edges (PR-1454 review): (1) an inner `?g`
-                // whose binding fails extraction (`extract → None`: a
-                // non-string literal, or an encoded form with no graph view)
-                // compares unequal and the row drops — lossy-but-safe over
-                // erroring mid-merge; (2) extraction honors the documented
-                // string-literal back-compat, so a plain-string graph name
-                // joins the IRI-valued enumeration by VALUE across term
-                // kinds where strict SPARQL term-equality would drop it
-                // (kept for pre-IRI-migration data).
-                if let Some(gvar) = bind_graph_var {
-                    if let Some(b) = batch.get(inner_row_idx, gvar) {
-                        if !matches!(b, Binding::Unbound | Binding::Poisoned)
-                            && Self::extract_graph_iri_from_binding(&graph_ctx, b).as_deref()
-                                != Some(graph_iri.as_ref())
-                        {
-                            continue;
-                        }
-                    }
-                }
-
-                let mut merged_row = Vec::with_capacity(self.schema.len());
-
-                // Copy parent bindings first
-                for var in self.child.schema() {
-                    let binding = parent_batch
-                        .get(row_idx, *var)
-                        .cloned()
-                        .unwrap_or(Binding::Unbound);
-                    merged_row.push(binding);
-                }
-
-                // Append new variables from inner patterns
-                let parent_len = self.child.schema().len();
-                for (_i, var) in self.schema.iter().enumerate().skip(parent_len) {
-                    // Check if this is the graph variable we need to bind
-                    if bind_graph_var == Some(*var) {
-                        // Bind ?g to the graph name as an IRI term (SPARQL
-                        // requires an IRI, not a string literal). The inner
-                        // subplan was seeded with the same value, so this is
-                        // consistent with — not an overwrite of — any inner
-                        // occurrence of the variable.
-                        merged_row.push(Binding::iri(graph_iri.clone()));
-                    } else {
-                        // Get from inner batch
-                        let binding = batch
-                            .get(inner_row_idx, *var)
-                            .cloned()
-                            .unwrap_or(Binding::Unbound);
-                        let binding = if numbig_exit_gv.is_some()
-                            && crate::object_binding::is_numbig_encoded(&binding)
-                        {
-                            crate::group_aggregate::materialize_encoded(
-                                &binding,
-                                numbig_exit_gv.as_ref(),
-                            )
-                        } else {
-                            binding
-                        };
-                        merged_row.push(binding);
-                    }
-                }
-
-                self.result_buffer.push(merged_row);
-            }
-            graph_ctx.check_cancelled()?;
-        }
-
-        inner.close();
-        // Release this rebuild's charge (see the snapshot before `inner.open`). An
-        // early `?`-exit in the drain loop skips this — that only over-counts (the
-        // safe direction) and the query is aborting on that path anyway.
-        graph_ctx.release(graph_ctx.mem_used().saturating_sub(mem_before_inner));
+        let charged = graph_ctx.mem_used() as isize - mem_before as isize;
+        let parent_row = self
+            .child
+            .schema()
+            .iter()
+            .map(|var| {
+                parent_batch
+                    .get(row_idx, *var)
+                    .cloned()
+                    .unwrap_or(Binding::Unbound)
+            })
+            .collect();
+        self.stream = Some(InnerStream {
+            inner,
+            graph_iri,
+            arm_scan_provenance: stamp_ledger_id.is_some(),
+            stamp_ledger_id,
+            parent_row: Some(parent_row),
+            bind_graph_var,
+            charged,
+        });
         Ok(())
     }
 
@@ -518,7 +488,7 @@ impl GraphOperator {
     /// (the caller has verified the source and the rewrite rejects unconvertible
     /// patterns): running it once over the batch and hash-joining on the shared
     /// variables yields exactly the per-row correlated result.
-    async fn execute_in_graph_batched(
+    async fn open_graph_batched(
         &mut self,
         ctx: &ExecutionContext<'_>,
         parent_batch: &Batch,
@@ -536,15 +506,15 @@ impl GraphOperator {
             graph_ctx.eager_materialization = true;
         }
 
-        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await;
-        let rewrite_result = rewrite_patterns_for_r2rml(
-            &self.inner_patterns,
+        let mapping = r2rml_mapping_for_rewrite(ctx, &graph_iri).await?;
+        let rewrite_result = rewrite_patterns_for_r2rml_source(
+            ctx,
+            &crate::list_view::without_list_view(&self.inner_patterns),
             &graph_iri,
-            ctx.active_snapshot,
             mapping.as_deref(),
-            ctx.reasoning_active,
             ctx.trust_fk_refs,
-        );
+        )
+        .await?;
         if rewrite_result.unconverted_count > 0 {
             return Err(r2rml_unsupported_pattern_error(
                 &graph_iri,
@@ -561,6 +531,17 @@ impl GraphOperator {
             ));
         }
 
+        // The whole parent batch seeds the source undecoded: sound only
+        // because nothing crosses graphs here. This path runs without an
+        // explicit dataset: with none, the source scope inherits the outer
+        // graph id; under an implicit union default graph, the outer context
+        // has no graph view and the source is no member graph, so neither side
+        // has one. Either way the arena crossing is a no-op both ways.
+        let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+        debug_assert!(
+            crossing.is_noop(),
+            "batched R2RML GRAPH scope crosses graphs: {graph_iri}"
+        );
         let seed = BatchSeedOperator::from_batch(parent_batch.clone());
         let mut inner = build_where_operators_seeded(
             Some(Box::new(seed)),
@@ -570,7 +551,7 @@ impl GraphOperator {
             &self.planning,
         )?;
         // Forward a downstream LIMIT budget so the inner scan early-terminates
-        // instead of draining the whole table into `result_buffer`. Correctness
+        // instead of streaming the whole table out. Correctness
         // is bounded by the outer LIMIT; a per-parent-batch budget can over-read
         // across parent batches but never under-reads.
         if let Some(budget) = self.row_budget {
@@ -580,105 +561,156 @@ impl GraphOperator {
             inner.set_topk(ordering, *k);
         }
         // Rebuild-boundary memory accounting (D1): this correlated inner subplan is
-        // rebuilt per parent row/batch and is genuinely dropped at the end of this
-        // call, so its recorded bytes (hash-join / GROUP BY / fused-dim build tables)
-        // are provably freed HERE. Snapshot the shared counter before the inner charges
-        // anything, then release exactly its delta after it drains and closes (below).
-        // This releases only what the finished inner charged — never a live/persistent
-        // build (the delta is 0 if the inner retained nothing) — and execution on one
-        // handle is sequential, so no other charger races the delta. Without it the
-        // counter grows ~N× the true one-build peak across N rebuilds and false-aborts
-        // a legitimate correlated query with a typed 507.
-        let mem_before_inner = graph_ctx.mem_used();
+        // rebuilt per parent batch and is dropped when it is exhausted, so what it
+        // records (hash-join / GROUP BY / fused-dim / parent-lookup builds) is
+        // provably freed then and released in `close_batched`. Count only what it
+        // records during its own calls: the operators above run between calls.
+        let mem_before = graph_ctx.mem_used();
         inner.open(&graph_ctx).await?;
+        let charged = graph_ctx.mem_used() as isize - mem_before as isize;
+        self.stream = Some(InnerStream {
+            inner,
+            graph_iri,
+            stamp_ledger_id,
+            arm_scan_provenance: false,
+            parent_row: None,
+            bind_graph_var: None,
+            charged,
+        });
+        Ok(())
+    }
 
-        let numbig_exit_gv = if graph_ctx.binary_g_id != ctx.binary_g_id {
-            graph_ctx.graph_view()
-        } else {
-            None
-        };
-
-        while let Some(batch) = inner.next_batch(&graph_ctx).await? {
+    /// The next non-empty batch of the open inner subplan, in this operator's
+    /// schema, or `None` once it is exhausted (it is then closed and its charge
+    /// released) or when none is open.
+    async fn next_streamed(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        let parent_len = self.child.schema().len();
+        loop {
+            let Some(st) = self.stream.as_mut() else {
+                return Ok(None);
+            };
+            let mut graph_ctx = ctx.with_active_graph(st.graph_iri.clone());
+            if let Some(ledger_id) = &st.stamp_ledger_id {
+                graph_ctx.eager_materialization = true;
+                if st.arm_scan_provenance {
+                    graph_ctx.scan_provenance_ledger = Some(Arc::clone(ledger_id));
+                }
+            }
+            let mem_before = graph_ctx.mem_used();
+            let next = st.inner.next_batch(&graph_ctx).await;
+            st.charged += graph_ctx.mem_used() as isize - mem_before as isize;
             graph_ctx.check_cancelled()?;
-            let batch = match &stamp_ledger_id {
+            let Some(batch) = next? else {
+                if let Some(mut st) = self.stream.take() {
+                    st.inner.close();
+                    ctx.release(st.charged.max(0) as usize);
+                }
+                return Ok(None);
+            };
+            if batch.is_empty() {
+                continue;
+            }
+            // Stamp cross-ledger provenance before merging so the formatter
+            // decodes SIDs against this graph's home ledger (see `open_in_graph`).
+            let batch = match &st.stamp_ledger_id {
                 Some(ledger_id) => {
                     crate::dataset_operator::stamp_provenance(batch, ledger_id, &graph_ctx)?
                 }
                 None => batch,
             };
-
-            // The inner output already carries the parent columns (threaded
-            // through the multi-row seed) plus the new R2RML vars, so map each
-            // output variable of `self.schema` directly from it.
-            for inner_row_idx in 0..batch.len() {
-                let mut merged_row = Vec::with_capacity(self.schema.len());
-                for var in self.schema.iter() {
-                    let binding = batch
-                        .get(inner_row_idx, *var)
-                        .cloned()
-                        .unwrap_or(Binding::Unbound);
-                    let binding = if numbig_exit_gv.is_some()
-                        && crate::object_binding::is_numbig_encoded(&binding)
-                    {
-                        crate::group_aggregate::materialize_encoded(
-                            &binding,
-                            numbig_exit_gv.as_ref(),
-                        )
-                    } else {
-                        binding
-                    };
-                    merged_row.push(binding);
+            // Only the columns this scope binds leave through the crossing; the
+            // parent columns keep the outer graph's handles.
+            let crossing = crate::object_binding::ArenaCrossing::between(ctx, &graph_ctx);
+            let out = match &st.parent_row {
+                // Batched: the inner output already carries the parent columns
+                // (threaded through the multi-row seed) plus the new vars.
+                None => {
+                    let rows = batch.len();
+                    if self.schema.is_empty() {
+                        return Ok(Some(Batch::empty_schema_with_len(rows)));
+                    }
+                    let columns: Vec<Vec<Binding>> = self
+                        .schema
+                        .iter()
+                        .enumerate()
+                        .map(|(i, var)| match batch.column(*var) {
+                            Some(col) if i < parent_len => col.to_vec(),
+                            Some(col) => col.iter().map(|b| crossing.leave(b.clone())).collect(),
+                            None => vec![Binding::Unbound; rows],
+                        })
+                        .collect();
+                    Batch::new(self.schema.clone(), columns)?
                 }
-                self.result_buffer.push(merged_row);
-            }
-            graph_ctx.check_cancelled()?;
-        }
-
-        inner.close();
-        // Release this rebuild's charge (see the snapshot before `inner.open`). An
-        // early `?`-exit in the drain loop skips this — that only over-counts (the
-        // safe direction) and the query is aborting on that path anyway.
-        graph_ctx.release(graph_ctx.mem_used().saturating_sub(mem_before_inner));
-        Ok(())
-    }
-
-    /// Drain buffered results into a batch
-    fn drain_buffer(&mut self) -> Result<Option<Batch>> {
-        if self.buffer_pos >= self.result_buffer.len() {
-            return Ok(None);
-        }
-
-        // Number of rows about to be drained — needed to size an empty-schema
-        // batch, where there are no columns to infer the row count from.
-        let drained = self.result_buffer.len() - self.buffer_pos;
-
-        // Build batch from buffer
-        let num_cols = self.schema.len();
-        let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
-
-        for row in &self.result_buffer[self.buffer_pos..] {
-            for (col_idx, binding) in row.iter().enumerate() {
-                if col_idx < columns.len() {
-                    columns[col_idx].push(binding.clone());
+                // Per row: each inner solution joins the parent row.
+                Some(parent_row) => {
+                    // SPARQL algebra: the `{?g → graph}` binding is JOINED with
+                    // the inner solutions. A row whose inner `?g` is bound to a
+                    // different term than the active graph's name is incompatible
+                    // and is dropped — never overwritten (W3C graph-optional /
+                    // graph-variable-join). Runs only when the enumeration binds a
+                    // graph var the inner body actually carries; when the value
+                    // was seeded (`seed_graph_var`) it short-circuits on the
+                    // `Binding::Iri` fast path.
+                    //
+                    // Two deliberate edges (PR-1454 review): (1) an inner `?g`
+                    // whose binding fails extraction (`extract → None`: a
+                    // non-string literal, or an encoded form with no graph view)
+                    // compares unequal and the row drops — lossy-but-safe over
+                    // erroring mid-merge; (2) extraction honors the documented
+                    // string-literal back-compat, so a plain-string graph name
+                    // joins the IRI-valued enumeration by VALUE across term
+                    // kinds where strict SPARQL term-equality would drop it
+                    // (kept for pre-IRI-migration data).
+                    let kept: Vec<usize> = (0..batch.len())
+                        .filter(|&row| {
+                            let Some(gvar) = st.bind_graph_var else {
+                                return true;
+                            };
+                            match batch.get(row, gvar) {
+                                Some(Binding::Unbound | Binding::Poisoned) | None => true,
+                                Some(b) => {
+                                    Self::extract_graph_iri_from_binding(&graph_ctx, b).as_deref()
+                                        == Some(st.graph_iri.as_ref())
+                                }
+                            }
+                        })
+                        .collect();
+                    if kept.is_empty() {
+                        continue;
+                    }
+                    if self.schema.is_empty() {
+                        return Ok(Some(Batch::empty_schema_with_len(kept.len())));
+                    }
+                    let columns: Vec<Vec<Binding>> = self
+                        .schema
+                        .iter()
+                        .enumerate()
+                        .map(|(i, var)| {
+                            if i < parent_len {
+                                // Copy the parent binding into every row.
+                                vec![parent_row[i].clone(); kept.len()]
+                            } else if st.bind_graph_var == Some(*var) {
+                                // Bind ?g to the graph name as an IRI term (SPARQL
+                                // requires an IRI, not a string literal). The inner
+                                // subplan was seeded with the same value, so this is
+                                // consistent with — not an overwrite of — any inner
+                                // occurrence of the variable.
+                                vec![Binding::iri(st.graph_iri.clone()); kept.len()]
+                            } else {
+                                match batch.column(*var) {
+                                    Some(col) => kept
+                                        .iter()
+                                        .map(|&row| crossing.leave(col[row].clone()))
+                                        .collect(),
+                                    None => vec![Binding::Unbound; kept.len()],
+                                }
+                            }
+                        })
+                        .collect();
+                    Batch::new(self.schema.clone(), columns)?
                 }
-            }
-        }
-
-        self.buffer_pos = self.result_buffer.len();
-
-        // A ground GRAPH body (e.g. `GRAPH <g> { :a :p "1" }`) produces no
-        // variables, so the schema is empty. Each matched row is still one
-        // empty-binding solution and must be preserved — emit an empty-schema
-        // batch carrying the row count rather than collapsing to zero rows
-        // (which would wrongly turn a satisfied existence check into a no-match).
-        if num_cols == 0 {
-            return Ok(Some(Batch::empty_schema_with_len(drained)));
-        }
-
-        if columns[0].is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(Batch::new(self.schema.clone(), columns)?))
+            };
+            return Ok(Some(out));
         }
     }
 }
@@ -710,8 +742,9 @@ impl Operator for GraphOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
         self.state = OperatorState::Open;
-        self.result_buffer.clear();
-        self.buffer_pos = 0;
+        self.stream = None;
+        self.work.clear();
+        self.parent_batch = None;
         Ok(())
     }
 
@@ -720,15 +753,37 @@ impl Operator for GraphOperator {
             return Ok(None);
         }
 
-        // Return buffered results first
-        if self.buffer_pos < self.result_buffer.len() {
-            return self.drain_buffer();
-        }
-
-        // Clone graph_name to avoid borrow conflicts when calling execute_in_graph
+        // Clone graph_name to avoid borrow conflicts when queueing executions
         let graph_name = self.graph_name.clone();
 
         loop {
+            // The open inner subplan's next batch.
+            if let Some(batch) = self.next_streamed(ctx).await? {
+                return Ok(Some(batch));
+            }
+            // Then the next queued execution for the current parent batch.
+            if let Some(work) = self.work.pop_front() {
+                let parent_batch = self
+                    .parent_batch
+                    .take()
+                    .expect("queued GRAPH work has its parent batch");
+                let opened = self
+                    .open_in_graph(
+                        ctx,
+                        &parent_batch,
+                        work.row_idx,
+                        work.graph_iri,
+                        work.bind_graph_var,
+                    )
+                    .await;
+                self.parent_batch = Some(parent_batch);
+                match opened {
+                    Err(e) if work.unreadable_is_empty && e.is_unreadable_graph_source() => {}
+                    opened => opened?,
+                }
+                continue;
+            }
+
             // Get next batch from child
             let parent_batch = match self.child.next_batch(ctx).await? {
                 Some(b) if !b.is_empty() => b,
@@ -739,80 +794,72 @@ impl Operator for GraphOperator {
                 }
             };
 
-            // Clear buffer for new parent batch
-            self.result_buffer.clear();
-            self.buffer_pos = 0;
-
             // Fast path: a concrete-IRI R2RML graph source in single-db mode.
             // Run the whole parent batch through ONE uncorrelated scan so the
             // inner R2RML hash join joins all parent rows at once, instead of
             // re-scanning the table per parent row.
-            if ctx.dataset.is_none() {
+            if ctx.explicit_dataset().is_none() {
                 if let GraphName::Iri(iri) = &graph_name {
                     let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                    let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                    let is_alias = ctx.single_db_names_default_graph(iri);
                     let is_r2rml_gs = !is_user_graph
                         && !is_alias
                         && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                             true
                         } else if let Some(provider) = ctx.r2rml_provider {
-                            provider.has_r2rml_mapping(iri).await
+                            provider.has_r2rml_mapping(iri).await?
                         } else {
                             false
                         };
                     if is_r2rml_gs {
-                        self.execute_in_graph_batched(ctx, &parent_batch, iri.clone())
+                        self.open_graph_batched(ctx, &parent_batch, iri.clone())
                             .await?;
-                        if self.result_buffer.is_empty() {
-                            continue;
-                        }
-                        return self.drain_buffer();
+                        continue;
                     }
                 }
             }
 
-            // Process each parent row
+            // Queue each parent row's executions (run one at a time, streaming).
+            let mut work: std::collections::VecDeque<GraphWork> = std::collections::VecDeque::new();
             for row_idx in 0..parent_batch.len() {
                 match &graph_name {
                     GraphName::Iri(iri) => {
                         // Concrete graph: run inner patterns in that graph
                         // If graph doesn't exist in dataset → empty result
-                        if let Some(ds) = &ctx.dataset {
+                        if let Some(ds) = ctx.explicit_dataset() {
                             if ds.has_named_graph(iri) {
-                                self.execute_in_graph(
-                                    ctx,
-                                    &parent_batch,
+                                work.push_back(GraphWork {
                                     row_idx,
-                                    iri.clone(),
-                                    None,
-                                )
-                                .await?;
+                                    graph_iri: iri.clone(),
+                                    bind_graph_var: None,
+                                    unreadable_is_empty: false,
+                                });
                             }
                             // else: graph not found → no output for this row
                         } else {
-                            // Single-db: a registered user graph, the ledger
-                            // alias (default graph), or an R2RML graph source.
+                            // Single-db: a registered user graph, a name of
+                            // the default graph (`single_db_names_default_graph`),
+                            // or an R2RML graph source.
+                            ctx.refuse_dropped_graph(iri)?;
                             let is_user_graph = ctx.single_db_user_graph_id(iri).is_some();
-                            let is_alias = iri.as_ref() == ctx.active_snapshot.ledger_id;
+                            let is_alias = ctx.single_db_names_default_graph(iri);
                             let is_r2rml_gs = !is_user_graph
                                 && !is_alias
                                 && if ctx.r2rml_graph_ids.contains(iri.as_ref()) {
                                     true
                                 } else if let Some(provider) = ctx.r2rml_provider {
-                                    provider.has_r2rml_mapping(iri).await
+                                    provider.has_r2rml_mapping(iri).await?
                                 } else {
                                     false
                                 };
 
                             if is_user_graph || is_alias || is_r2rml_gs {
-                                self.execute_in_graph(
-                                    ctx,
-                                    &parent_batch,
+                                work.push_back(GraphWork {
                                     row_idx,
-                                    iri.clone(),
-                                    None,
-                                )
-                                .await?;
+                                    graph_iri: iri.clone(),
+                                    bind_graph_var: None,
+                                    unreadable_is_empty: false,
+                                });
                             }
                         }
                     }
@@ -823,78 +870,80 @@ impl Operator for GraphOperator {
                                 Self::extract_graph_iri_from_binding(ctx, binding)
                             {
                                 // ?g already bound: use only that graph
-                                if let Some(ds) = &ctx.dataset {
+                                if let Some(ds) = ctx.explicit_dataset() {
                                     if ds.has_named_graph(&bound_iri) {
-                                        self.execute_in_graph(
-                                            ctx,
-                                            &parent_batch,
+                                        work.push_back(GraphWork {
                                             row_idx,
-                                            bound_iri,
-                                            None, // Don't rebind - already bound
-                                        )
-                                        .await?;
+                                            graph_iri: bound_iri,
+                                            bind_graph_var: None,
+                                            unreadable_is_empty: false,
+                                        });
                                     }
                                     // else: graph not found → no output
                                 } else {
-                                    // Single-db: same resolution as the concrete arm.
+                                    // Single-db: same resolution as the concrete arm,
+                                    // except for an IRI the data supplied that names a
+                                    // graph source no query reads as a graph. A
+                                    // constant naming it is refused; here it is a graph
+                                    // outside the dataset, so this binding yields no
+                                    // rows (SPARQL's answer) and the query goes on.
                                     let is_user_graph =
                                         ctx.single_db_user_graph_id(&bound_iri).is_some();
-                                    let is_alias =
-                                        bound_iri.as_ref() == ctx.active_snapshot.ledger_id;
+                                    let is_alias = ctx.single_db_names_default_graph(&bound_iri);
                                     let is_r2rml_gs = !is_user_graph
                                         && !is_alias
                                         && if ctx.r2rml_graph_ids.contains(bound_iri.as_ref()) {
                                             true
                                         } else if let Some(provider) = ctx.r2rml_provider {
-                                            provider.has_r2rml_mapping(&bound_iri).await
+                                            match provider.has_r2rml_mapping(&bound_iri).await {
+                                                Err(e) if e.is_unreadable_graph_source() => false,
+                                                probed => probed?,
+                                            }
                                         } else {
                                             false
                                         };
 
                                     if is_user_graph || is_alias || is_r2rml_gs {
-                                        self.execute_in_graph(
-                                            ctx,
-                                            &parent_batch,
+                                        work.push_back(GraphWork {
                                             row_idx,
-                                            bound_iri,
-                                            None,
-                                        )
-                                        .await?;
+                                            graph_iri: bound_iri,
+                                            bind_graph_var: None,
+                                            // An empty mapping surfaces only when the
+                                            // rewrite compiles it, as the work opens.
+                                            unreadable_is_empty: is_r2rml_gs,
+                                        });
                                     }
                                 }
                             }
                             // else: binding exists but isn't a string IRI → no output
                         } else {
                             // ?g unbound: iterate ALL named graphs, bind ?g
-                            if let Some(ds) = &ctx.dataset {
+                            if let Some(ds) = ctx.explicit_dataset() {
                                 for iri in ds.named_graph_iris() {
-                                    self.execute_in_graph(
-                                        ctx,
-                                        &parent_batch,
+                                    work.push_back(GraphWork {
                                         row_idx,
-                                        iri,
-                                        Some(*var), // Bind ?g to graph IRI
-                                    )
-                                    .await?;
+                                        graph_iri: iri,
+                                        bind_graph_var: Some(*var),
+                                        unreadable_is_empty: false,
+                                    });
                                 }
                             } else {
                                 // Single-db: bind ?g to each registered user
-                                // graph (empty graphs emit no rows). The ledger
-                                // alias (default graph) is NOT enumerated: per
-                                // SPARQL 1.1, `GRAPH ?g` ranges over named
-                                // graphs only (D-2 / issue #1442 dropped the
-                                // #1279 implicit enumeration). The default
-                                // graph remains explicitly addressable via
-                                // `GRAPH <alias>` in the arms above.
+                                // graph (empty graphs emit no rows), under a
+                                // name that reads it back. The default graph is
+                                // NOT enumerated: per SPARQL 1.1, `GRAPH ?g`
+                                // ranges over named graphs only (issue
+                                // #1442 dropped the #1279 implicit
+                                // enumeration). It remains explicitly
+                                // addressable by the ledger's own address in
+                                // the arms above.
                                 for iri in ctx.single_db_user_graph_iris() {
-                                    self.execute_in_graph(
-                                        ctx,
-                                        &parent_batch,
+                                    work.push_back(GraphWork {
                                         row_idx,
-                                        iri,
-                                        Some(*var),
-                                    )
-                                    .await?;
+                                        graph_iri: iri,
+                                        bind_graph_var: Some(*var),
+                                        unreadable_is_empty: false,
+                                    });
                                 }
                             }
                         }
@@ -902,17 +951,23 @@ impl Operator for GraphOperator {
                 }
             }
 
-            // If we produced any results, return them
-            if !self.result_buffer.is_empty() {
-                return self.drain_buffer();
+            if !work.is_empty() {
+                self.work = work;
+                self.parent_batch = Some(parent_batch);
             }
-            // Otherwise, try next parent batch
         }
     }
 
     fn close(&mut self) {
+        if let Some(mut st) = self.stream.take() {
+            // Closed before its stream ran out (a LIMIT above was met): the
+            // subplan's tables drop here. The query is ending, so its charge is
+            // left with the handle.
+            st.inner.close();
+        }
+        self.work.clear();
+        self.parent_batch = None;
         self.child.close();
-        self.result_buffer.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -1082,7 +1137,7 @@ mod tests {
 
     #[test]
     fn test_extract_graph_iri_from_binding() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

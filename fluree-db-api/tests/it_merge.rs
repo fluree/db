@@ -8,8 +8,7 @@ use crate::support;
 use fluree_db_api::{ConflictStrategy, FlureeBuilder};
 use serde_json::json;
 
-#[path = "support/merge_race.rs"]
-mod race_nameservice;
+use crate::race_nameservice;
 
 /// Extract sorted name strings from query result rows.
 fn extract_names(rows: &serde_json::Value) -> Vec<String> {
@@ -268,7 +267,8 @@ async fn merge_fast_forward_multiple_commits() {
 // Error paths
 // =============================================================================
 
-/// Cannot merge a branch that has no branch point (e.g. main itself).
+/// A branch with no branch point (main itself) has no target to infer,
+/// so merging it without an explicit target is refused.
 #[tokio::test]
 async fn merge_main_as_source_refused() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -398,6 +398,72 @@ async fn merge_diverged_target_general_merge() {
     assert!(
         names.contains(&"Carol".to_string()),
         "expected Carol in {names:?}"
+    );
+}
+
+/// A commit that lands on the target after a general merge reads the target's
+/// head is in neither the merge's diff nor its conflicts. The merge is refused,
+/// as a fast-forward that loses the race is, rather than staged over it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn general_merge_loses_race_to_a_target_commit_during_its_preparation() {
+    use fluree_db_api::{ApiError, LedgerManagerConfig, NameServiceMode};
+    use fluree_db_core::MemoryStorage;
+    use fluree_db_nameservice::memory::MemoryNameService;
+    use std::{sync::Arc, time::Duration};
+
+    let storage = MemoryStorage::new();
+    let inner = Arc::new(MemoryNameService::new());
+    let fluree = FlureeBuilder::memory()
+        .build_with(storage.clone(), NameServiceMode::ReadWrite(inner.clone()));
+    let named = |id: &str, name: &str| json!({"@id": format!("http://example.org/ns/{id}"), "http://example.org/ns/name": name});
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let main = fluree
+        .insert(ledger, &named("alice", "Base"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    let dev = fluree.ledger("mydb:dev").await.unwrap();
+    fluree.upsert(dev, &named("alice", "Dev")).await.unwrap();
+    // Main diverges, so the merge is not a fast-forward.
+    fluree.insert(main, &named("carol", "Carol")).await.unwrap();
+
+    // The merging connection serializes with the target's writers through
+    // its cached handle's write lock.
+    let pause = Arc::new(race_nameservice::PausingNameService::new(inner));
+    pause.pause_after_next_lookup();
+    let merger = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_with(storage, NameServiceMode::ReadWrite(pause.clone()));
+    let merging = tokio::spawn(async move {
+        merger
+            .merge_branch("mydb", "dev", None, ConflictStrategy::Abort)
+            .await
+    });
+    tokio::time::timeout(Duration::from_secs(60), pause.entered.notified())
+        .await
+        .expect("the merge must read the target's head");
+
+    // Changes what dev changed: a conflict the merge's diff does not hold.
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    fluree.upsert(main, &named("alice", "Main")).await.unwrap();
+    pause.resume.notify_one();
+
+    let error = tokio::time::timeout(Duration::from_secs(60), merging)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert!(
+        matches!(&error, ApiError::BranchConflict(msg) if msg.contains("lost a race")),
+        "{error:?}"
+    );
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        vec!["Carol", "Main"]
     );
 }
 
@@ -1166,33 +1232,6 @@ async fn resolved_default_allow(fluree: &support::MemoryFluree, ledger_id: &str)
         .and_then(|policy| policy.default_allow)
 }
 
-/// Build and publish a real index root for `ledger_id`. The branch's
-/// pre-fork commits live in its source's namespace, so the rebuild needs
-/// the branch-aware store rather than the flat one the shared helper uses.
-async fn index_branch(fluree: &support::MemoryFluree, ledger_id: &str) {
-    let record = fluree
-        .nameservice()
-        .lookup(ledger_id)
-        .await
-        .unwrap()
-        .expect("branch is registered");
-    let store = fluree.branched_content_store(ledger_id).await.unwrap();
-    let built = fluree_db_indexer::rebuild_index_from_commits(
-        store,
-        ledger_id,
-        &record,
-        fluree_db_indexer::IndexerConfig::default(),
-    )
-    .await
-    .expect("branch index rebuild");
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index(ledger_id, built.index_t, &built.root_id)
-        .await
-        .unwrap();
-}
-
 /// A fast-forward merge must not publish the source's index root as the
 /// target's. An index root carries `graph_iris`, the slot → IRI table the
 /// registry is re-seeded from, and those IRIs are branch-qualified: slot 1
@@ -1317,7 +1356,7 @@ async fn governed_main_with_indexed_feature() -> fluree_db_api::Fluree {
         )
         .await
         .unwrap();
-    index_branch(&fluree, "mydb:feature").await;
+    support::rebuild_and_publish_index(&fluree, "mydb:feature").await;
 
     // Precondition for the regression: the branch's root labels its
     // reserved slots with the BRANCH's IRIs. Without this the publish
@@ -1372,16 +1411,11 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
         .put_with_id(&source_root, &root_bytes)
         .await
         .unwrap();
-    fluree
-        .publisher()
-        .unwrap()
-        .publish_index("mydb:main", source.index_t, &source_root)
-        .await
-        .unwrap();
+    crate::support::publish_built_index(&fluree, "mydb:main", source.index_t, &source_root).await;
     fluree
         .ledger_manager()
         .unwrap()
-        .disconnect("mydb:main")
+        .disconnect(&fluree_db_api::LedgerId::parse("mydb:main").unwrap())
         .await;
     let cached = fluree
         .ledger_cached("mydb:main")
@@ -1393,7 +1427,12 @@ async fn main_with_adopted_feature_index() -> fluree_db_api::Fluree {
         cached.snapshot.graph_registry.iri_for_graph_id(1),
         Some("urn:fluree:mydb:feature#txn-meta")
     );
-    assert_eq!(resolved_default_allow(&fluree, "mydb:main").await, None);
+    // Main's config still reads under the branch's labels: any ledger's
+    // config graph IRI is the config graph.
+    assert_eq!(
+        resolved_default_allow(&fluree, "mydb:main").await,
+        Some(false)
+    );
     fluree
 }
 
@@ -1449,8 +1488,10 @@ async fn reindex_repairs_adopted_branch_registry_in_cached_reads() {
     );
 }
 
+/// An incremental cycle over an index carrying a branch's labels writes the
+/// ledger's own, and the next cycle seeds from it.
 #[tokio::test]
-async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
+async fn adopted_branch_index_is_relabelled_by_the_next_cycle() {
     use fluree_db_binary_index::format::index_root::IndexRoot;
     use fluree_db_indexer::run_index::resolve::resolver::SharedResolverState;
 
@@ -1484,33 +1525,570 @@ async fn adopted_branch_index_second_cycle_falls_back_to_rebuild() {
         )
         .unwrap();
         assert_eq!(root.ledger_id, "mydb:main");
-        if cycle == 1 {
-            assert_eq!(
-                root.graph_iris[0], "urn:fluree:mydb:feature#txn-meta",
-                "first incremental cycle preserves the adopted labels"
-            );
-            let error = SharedResolverState::from_index_root(&root)
-                .err()
-                .expect("the next incremental cycle cannot seed from this root");
-            assert!(
-                error
-                    .to_string()
-                    .contains("graph_iris[0] must be txn-meta IRI"),
-                "{error}"
-            );
-        } else {
-            assert_eq!(
-                root.graph_iris[0], "urn:fluree:mydb:main#txn-meta",
-                "second cycle falls back to a full rebuild"
-            );
-            assert_eq!(root.graph_iris[1], "urn:fluree:mydb:main#config");
-            assert!(SharedResolverState::from_index_root(&root).is_ok());
-        }
+        assert_eq!(
+            root.graph_iris[0], "urn:fluree:mydb:main#txn-meta",
+            "cycle {cycle}"
+        );
+        assert_eq!(
+            root.graph_iris[1], "urn:fluree:mydb:main#config",
+            "cycle {cycle}"
+        );
+        assert!(SharedResolverState::from_index_root(&root, "mydb:main").is_ok());
+        crate::support::publish_built_index(&fluree, "mydb:main", result.index_t, &result.root_id)
+            .await;
+    }
+}
+
+// =============================================================================
+// Merges whose base was reached through an earlier merge
+// =============================================================================
+//
+// Every branch numbers its commits from its own fork point, so `t` values
+// from two branches are not comparable. These merges find their base through
+// an earlier merge, where the base's `t` is on the other branch's clock.
+
+/// Insert one named subject on a branch.
+async fn insert_named(fluree: &support::MemoryFluree, ledger_id: &str, id: &str, name: &str) {
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let data = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@graph": [{"@id": id, "ex:name": name}]
+    });
+    fluree.insert(ledger, &data).await.unwrap();
+}
+
+/// Replace `ex:alice`'s name on a branch.
+async fn rename_alice(fluree: &support::MemoryFluree, ledger_id: &str, name: &str) {
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    fluree
+        .update(ledger, &replace_name("ex:alice", name))
+        .await
+        .unwrap();
+}
+
+async fn head_t(fluree: &support::MemoryFluree, ledger_id: &str) -> i64 {
+    fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .unwrap()
+        .unwrap()
+        .commit_t
+}
+
+/// `x` is a child of `dev`. `x` is merged into `dev` once. Then both branches
+/// rename `ex:alice`. A second merge of `x` into `dev` has a real conflict.
+///
+/// `x` makes more commits than `dev` before the first merge, so the base of
+/// the second merge has a `t` above every commit `dev` makes afterwards.
+async fn merged_twice_with_conflict() -> support::MemoryFluree {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "x", Some("dev"), None)
+        .await
+        .unwrap();
+    for n in 2..=6 {
+        insert_named(&fluree, "mydb:x", &format!("ex:x{n}"), &format!("x{n}")).await;
+    }
+    insert_named(&fluree, "mydb:dev", "ex:d2", "d2").await;
+    fluree
+        .merge_branch("mydb", "x", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    rename_alice(&fluree, "mydb:x", "from-x").await;
+    // A change of x's that nothing conflicts with, so a resolution that
+    // drops x's side is told apart from a merge that applied nothing.
+    insert_named(&fluree, "mydb:x", "ex:x7", "x7").await;
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    fluree
+}
+
+#[tokio::test]
+async fn merge_again_detects_conflict_with_later_target_commits() {
+    let fluree = merged_twice_with_conflict().await;
+    let err = fluree
+        .merge_branch("mydb", "x", None, ConflictStrategy::Abort)
+        .await
+        .expect_err("both branches renamed alice, so `abort` must refuse");
+    assert!(
+        err.to_string().contains("conflict"),
+        "expected a conflict, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn merge_again_take_branch_keeps_the_target_value() {
+    let fluree = merged_twice_with_conflict().await;
+    fluree
+        .merge_branch("mydb", "x", None, ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    let names = query_all_names(&fluree, "mydb:dev").await;
+    assert!(names.contains(&"from-dev".to_string()), "{names:?}");
+    assert!(!names.contains(&"from-x".to_string()), "{names:?}");
+    assert!(
+        names.contains(&"x7".to_string()),
+        "x's other change still merges: {names:?}"
+    );
+}
+
+/// The preview must report the conflict the merge will meet.
+#[tokio::test]
+async fn preview_of_merge_again_reports_the_conflict() {
+    let fluree = merged_twice_with_conflict().await;
+    let preview = fluree.merge_preview("mydb", "x", None).await.unwrap();
+    assert_eq!(preview.conflicts.count, 1, "{:?}", preview.conflicts.keys);
+    assert!(!preview.fast_forward);
+    assert_eq!(preview.ahead.count, 2, "x's rename and its other change");
+    assert_eq!(
+        preview.behind.count, 3,
+        "dev's own two commits and its earlier merge of x"
+    );
+    // The base is the x commit dev merged the first time, which is on x's
+    // line, not the fork.
+    let ancestor = preview.ancestor.expect("both branches have commits");
+    assert_eq!(ancestor.t, 6, "x's sixth commit, on x's clock");
+}
+
+/// A parent merged into its child. Both have commits of their own.
+#[tokio::test]
+async fn merge_parent_into_child() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:a", "a").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "feature", Some("dev"), None)
+        .await
+        .unwrap();
+    insert_named(&fluree, "mydb:dev", "ex:d2", "d2").await;
+    insert_named(&fluree, "mydb:feature", "ex:f2", "f2").await;
+
+    let report = fluree
+        .merge_branch("mydb", "dev", Some("feature"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+    assert_eq!(
+        query_all_names(&fluree, "mydb:feature").await,
+        ["a", "d2", "f2"]
+    );
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["a", "d2"]);
+}
+
+/// `main` has no parent branch, but it can still be merged into a branch
+/// named with `--target`.
+#[tokio::test]
+async fn merge_main_into_branch_with_target() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:a", "a").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert_named(&fluree, "mydb:dev", "ex:d2", "d2").await;
+    insert_named(&fluree, "mydb:main", "ex:m2", "m2").await;
+
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        query_all_names(&fluree, "mydb:dev").await,
+        ["a", "d2", "m2"]
+    );
+}
+
+/// Sync a parent into its child, keep working on the child, then merge the
+/// child back while the parent has not moved.
+///
+/// The parent's head is reachable from the child only through the sync
+/// merge, so the merge back cannot fast-forward. Adopting the child's line
+/// would move the parent's head `t` backwards: the parent made more commits
+/// than the child before the sync.
+#[tokio::test]
+async fn merge_round_trip_between_parent_and_child() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:a", "a").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert_named(&fluree, "mydb:dev", "ex:d2", "d2").await;
+    for n in 2..=5 {
+        insert_named(&fluree, "mydb:main", &format!("ex:m{n}"), &format!("m{n}")).await;
+    }
+
+    // Sync main into dev.
+    let dev_before_sync = head_t(&fluree, "mydb:dev").await;
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(head_t(&fluree, "mydb:dev").await > dev_before_sync);
+    insert_named(&fluree, "mydb:dev", "ex:d4", "d4").await;
+
+    // Merge dev back into main.
+    let main_before = head_t(&fluree, "mydb:main").await;
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(
+        !report.fast_forward,
+        "main's head is only reachable through a merge"
+    );
+    assert!(head_t(&fluree, "mydb:main").await > main_before);
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        ["a", "d2", "d4", "m2", "m3", "m4", "m5"]
+    );
+}
+
+/// Two branches off `main`, each with commits, merged one into the other.
+#[tokio::test]
+async fn merge_sibling_branches() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:a", "a").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "feature", None, None)
+        .await
+        .unwrap();
+    insert_named(&fluree, "mydb:dev", "ex:d2", "d2").await;
+    insert_named(&fluree, "mydb:feature", "ex:f2", "f2").await;
+
+    fluree
+        .merge_branch("mydb", "feature", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        query_all_names(&fluree, "mydb:dev").await,
+        ["a", "d2", "f2"]
+    );
+}
+
+/// A sync that resolved a conflict must not be undone by merging back.
+///
+/// dev and main rename the same subject. dev merges main in with
+/// `take-source`, so main's value wins on dev. Merging dev back into main
+/// must leave main on its own value.
+#[tokio::test]
+async fn merge_back_keeps_a_resolution_the_sync_made() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    rename_alice(&fluree, "mydb:main", "from-main").await;
+
+    // Sync main into dev. main is the source, so its value wins.
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["from-main"]);
+
+    // Merging dev back must not resurrect dev's old value.
+    fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, ["from-main"]);
+}
+
+/// A key the sync already merged must not conflict again.
+///
+/// dev and main both rename `ex:alice`, dev syncs main in, and main does
+/// not move afterwards. The rename main made is now part of dev's history,
+/// so merging dev back has nothing to conflict with.
+#[tokio::test]
+async fn merge_back_after_a_sync_reports_no_conflict() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    rename_alice(&fluree, "mydb:main", "from-main").await;
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+    insert_named(&fluree, "mydb:dev", "ex:d3", "d3").await;
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::Abort)
+        .await
+        .expect("main has not changed since dev merged it in");
+    assert_eq!(report.conflict_count, 0);
+    assert_eq!(
+        query_all_names(&fluree, "mydb:main").await,
+        ["d3", "from-main"]
+    );
+}
+
+/// A parent merged into its child, with both renaming the same subject.
+#[tokio::test]
+async fn merge_parent_into_child_detects_conflict() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    rename_alice(&fluree, "mydb:main", "from-main").await;
+
+    let err = fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::Abort)
+        .await
+        .expect_err("both branches renamed alice");
+    assert!(err.to_string().contains("conflict"), "{err}");
+
+    // take-source: main is the source, so its value wins on dev.
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::TakeSource)
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["from-main"]);
+}
+
+/// Two branches off `main`, each renaming the same subject.
+#[tokio::test]
+async fn merge_sibling_detects_conflict() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    for branch in ["dev", "feature"] {
         fluree
-            .publisher()
-            .unwrap()
-            .publish_index("mydb:main", result.index_t, &result.root_id)
+            .create_branch("mydb", branch, None, None)
             .await
             .unwrap();
+    }
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    rename_alice(&fluree, "mydb:feature", "from-feature").await;
+
+    let err = fluree
+        .merge_branch("mydb", "feature", Some("dev"), ConflictStrategy::Abort)
+        .await
+        .expect_err("both branches renamed alice");
+    assert!(err.to_string().contains("conflict"), "{err}");
+
+    // take-branch: dev is the target, so its value survives.
+    fluree
+        .merge_branch("mydb", "feature", Some("dev"), ConflictStrategy::TakeBranch)
+        .await
+        .unwrap();
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["from-dev"]);
+}
+
+/// A parent merged into a child that has no commits of its own.
+#[tokio::test]
+async fn merge_parent_into_child_fast_forwards() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:a", "a").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    insert_named(&fluree, "mydb:main", "ex:m2", "m2").await;
+
+    let report = fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(report.fast_forward, "dev's head is on main's line");
+    assert_eq!(query_all_names(&fluree, "mydb:dev").await, ["a", "m2"]);
+}
+
+/// Preview of a parent merged into its child, with commits on both sides.
+#[tokio::test]
+async fn preview_parent_into_child() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:dev", "from-dev").await;
+    rename_alice(&fluree, "mydb:main", "from-main").await;
+    insert_named(&fluree, "mydb:main", "ex:m3", "m3").await;
+
+    let preview = fluree
+        .merge_preview("mydb", "main", Some("dev"))
+        .await
+        .unwrap();
+    assert!(!preview.fast_forward);
+    assert_eq!(preview.ahead.count, 2, "main's rename and its insert");
+    assert_eq!(preview.behind.count, 1, "dev's rename");
+    assert_eq!(preview.conflicts.count, 1, "{:?}", preview.conflicts.keys);
+}
+
+/// A key only the source ever changed must not conflict with the target's
+/// earlier merge of that same source.
+///
+/// x renames `ex:alice`, dev merges x in, then x renames it again. dev
+/// never touched the name itself, so the second merge has no conflict even
+/// though dev's history now carries the first rename.
+#[tokio::test]
+async fn merge_again_without_target_changes_reports_no_conflict() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    fluree
+        .create_branch("mydb", "x", Some("dev"), None)
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:x", "x-first").await;
+    insert_named(&fluree, "mydb:dev", "ex:d2", "d2").await;
+    fluree
+        .merge_branch("mydb", "x", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:x", "x-second").await;
+
+    let report = fluree
+        .merge_branch("mydb", "x", None, ConflictStrategy::Abort)
+        .await
+        .expect("dev never renamed alice itself");
+    assert_eq!(report.conflict_count, 0);
+    assert_eq!(
+        query_all_names(&fluree, "mydb:dev").await,
+        ["d2", "x-second"]
+    );
+}
+
+/// A sync that brought the target in must not carry the target's old values
+/// back when the branch is merged back.
+///
+/// dev syncs main in through a real merge commit, so that merge carries
+/// main's rename. main renames again afterwards. Merging dev back folds that
+/// merge, and its copy of main's earlier rename must not resurface.
+#[tokio::test]
+async fn merge_back_after_sync_keeps_the_targets_later_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree.create_ledger("mydb").await.unwrap();
+    insert_named(&fluree, "mydb:main", "ex:alice", "Alice").await;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    // A dev commit first, so the sync writes a merge commit rather than
+    // fast-forwarding.
+    insert_named(&fluree, "mydb:dev", "ex:d1", "d1").await;
+    rename_alice(&fluree, "mydb:main", "v1").await;
+    fluree
+        .merge_branch("mydb", "main", Some("dev"), ConflictStrategy::default())
+        .await
+        .unwrap();
+    rename_alice(&fluree, "mydb:main", "v2").await;
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::Abort)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.conflict_count, 0,
+        "dev never touched alice, so the merge has nothing to resolve"
+    );
+    assert_eq!(query_all_names(&fluree, "mydb:main").await, ["d1", "v2"]);
+}
+
+/// A branch whose commits each create a different named graph merges into a
+/// diverged target with every graph registered and routed. Commits used to
+/// record their graphs under transaction-local numbers, so two such commits
+/// both said "graph 2", and combining them kept only the first graph.
+#[tokio::test]
+async fn merge_registers_each_new_graph_from_separate_commits() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ctx = json!({"ex": "http://example.org/ns/"});
+    let main_ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx, "@id": "ex:alice", "ex:name": "Alice"}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    fluree
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+
+    let graphs = ["http://example.org/g1", "http://example.org/g2"];
+    for graph in graphs {
+        let dev = fluree.ledger("mydb:dev").await.unwrap();
+        fluree
+            .update(
+                dev,
+                &json!({
+                    "@context": ctx,
+                    "graph": graph,
+                    "insert": {"@id": "ex:bob", "ex:name": graph}
+                }),
+            )
+            .await
+            .unwrap();
+    }
+    // Diverge main so the merge folds the branch's commits into one.
+    fluree
+        .insert(
+            main_ledger,
+            &json!({"@context": ctx, "@id": "ex:carol", "ex:name": "Carol"}),
+        )
+        .await
+        .unwrap();
+
+    let report = fluree
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .expect("merge should register both graphs");
+    assert!(!report.fast_forward);
+
+    let main = fluree.ledger("mydb:main").await.unwrap();
+    for graph in graphs {
+        let q = json!({
+            "@context": ctx,
+            "from": format!("mydb:main#{graph}"),
+            "select": "?n",
+            "where": {"@id": "ex:bob", "ex:name": "?n"}
+        });
+        let rows = fluree
+            .query_connection(&q)
+            .await
+            .unwrap_or_else(|e| panic!("<{graph}> must be queryable on main: {e}"))
+            .to_jsonld(&main.snapshot)
+            .unwrap();
+        assert_eq!(rows, json!([graph]), "<{graph}> must hold its own data");
     }
 }

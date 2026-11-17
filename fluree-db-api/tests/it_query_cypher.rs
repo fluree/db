@@ -365,6 +365,70 @@ async fn transact_cypher_create_round_trips_to_jsonld_query() {
     assert_eq!(rows.row_count(), 1);
 }
 
+/// A variable named like another form's minted label stays its own node. Each
+/// statement here used to fuse two: `anon_7_11` with the anonymous node at
+/// that span, `rel_r` with relationship `r`'s annotation, and `ann_0` with the
+/// first anonymous relationship's annotation. A backticked variable holding a
+/// space is created and returned like any other.
+#[tokio::test]
+async fn transact_cypher_variables_never_spell_a_minted_label() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = genesis_ledger(&fluree, "it/cypher:minted-labels");
+    for stmt in [
+        "CREATE (:A), (anon_7_11:C)",
+        "CREATE (rel_r:P)-[r:KNOWS]->(b:Q)",
+        "CREATE (ann_0:R)-[:KNOWS]->(c:S)",
+    ] {
+        ledger = fluree
+            .transact_cypher(ledger, stmt)
+            .await
+            .expect(stmt)
+            .ledger;
+    }
+    let (result, returned) = fluree
+        .transact_cypher_returning(ledger, "CREATE (`my node`:T) RETURN `my node`", None)
+        .await
+        .expect("backticked variable");
+    let returned = returned.expect("RETURN produces rows");
+    let db = graphdb_from_ledger(&result.ledger);
+
+    let rows = |q: &'static str| {
+        let fluree = &fluree;
+        let db = &db;
+        async move {
+            let cj = fluree
+                .query_cypher(db, q)
+                .await
+                .expect(q)
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .expect(q);
+            cj["results"][0]["data"]
+                .as_array()
+                .expect("data")
+                .iter()
+                .map(|d| d["row"].clone())
+                .collect::<Vec<JsonValue>>()
+        }
+    };
+
+    assert_eq!(rows("MATCH (n:A) RETURN labels(n)").await, [json!([["A"]])]);
+    assert_eq!(rows("MATCH (n:C) RETURN labels(n)").await, [json!([["C"]])]);
+    for q in [
+        "MATCH (x:P)-[r:KNOWS]->(:Q) RETURN id(x), id(r)",
+        "MATCH (x:R)-[e:KNOWS]->(:S) RETURN id(x), id(e)",
+    ] {
+        let found = rows(q).await;
+        assert_eq!(found.len(), 1, "{q}: {found:?}");
+        assert_ne!(found[0][0], found[0][1], "{q}: a node is its own edge");
+    }
+    assert_eq!(
+        rows("MATCH (n:T) RETURN id(n)").await,
+        [returned["results"][0]["data"][0]["row"].clone()],
+        "the returned node is the one stored"
+    );
+}
+
 #[tokio::test]
 async fn transact_cypher_set_property_replaces_old_value() {
     // End-to-end: seed via JSON-LD, MATCH … SET via Cypher, read back.
@@ -974,7 +1038,7 @@ async fn transact_cypher_match_create_return_edge() {
         data[0]["row"][0]
             .as_str()
             .expect("edge id")
-            .contains("cy_rel_e"),
+            .ends_with("--cyre"),
         "{rows}"
     );
 
@@ -1339,20 +1403,62 @@ async fn cypher_collect_through_with() {
         .collect();
     assert_eq!(rows, vec![json!("Bob"), json!("Carol")], "{unwound}");
 
-    // ORDER BY directly on a collect() list in the same WITH is still rejected
-    // (sorting a list value is unsound in v1).
-    assert!(
-        fluree
-            .query_cypher(
-                &db,
-                r#"MATCH (p:Person)-[:KNOWS]->(f:Person)
-                   WITH p, collect(f.name) AS friends ORDER BY friends
-                   RETURN p.name, friends"#,
-            )
+    // ORDER BY on a collect() list in the same WITH, or on a list built from
+    // one, is still rejected (sorting a list value is unsound in v1).
+    for order_by in ["friends", "tail(friends)", "friends + ['x']"] {
+        let query = format!(
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY {order_by} RETURN p.name, friends"
+        );
+        assert!(
+            fluree.query_cypher(&db, &query).await.is_err(),
+            "ORDER BY on a collect() list in WITH is rejected: {query}"
+        );
+    }
+
+    // An ORDER BY key that reads the list and yields a scalar sorts after the
+    // aggregation, in a WITH and in a RETURN.
+    for (query, expected) in [
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY size(friends) \
+             RETURN p.name AS name, size(friends) AS n",
+            json!([["Bob", 1], ["Alice", 2]]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             RETURN p.name AS name, collect(f.name) AS friends ORDER BY size(friends) DESC",
+            json!(["Alice", "Bob"]),
+        ),
+        (
+            "MATCH (p:Person)-[:KNOWS]->(f:Person) \
+             WITH p, collect(f.name) AS friends ORDER BY any(x IN friends WHERE x = 'Bob') \
+             RETURN p.name AS name",
+            json!([["Bob"], ["Alice"]]),
+        ),
+    ] {
+        let cj = fluree
+            .query_cypher(&db, query)
             .await
-            .is_err(),
-        "ORDER BY on a collect() list in WITH is rejected"
-    );
+            .unwrap_or_else(|e| panic!("{e}\n{query}"))
+            .to_cypher_json_async(db.as_graph_db_ref())
+            .await
+            .expect("cypher json");
+        let rows: Vec<JsonValue> = cj["results"][0]["data"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .map(|r| r["row"].clone())
+            .collect();
+        let rows = match expected.as_array().and_then(|e| e.first()) {
+            // Names only: the friends list's order is unspecified.
+            Some(JsonValue::String(_)) => {
+                JsonValue::Array(rows.iter().map(|r| r[0].clone()).collect())
+            }
+            _ => JsonValue::Array(rows),
+        };
+        assert_eq!(rows, expected, "{query}");
+    }
 }
 
 #[tokio::test]
@@ -2807,6 +2913,82 @@ async fn cypher_call_subquery_import_all() {
             .is_err(),
         "RETURN re-binding an outer name is rejected even under (*)"
     );
+}
+
+/// `x AS x` projects `x` unchanged, on novelty and on an indexed ledger, at
+/// the top level and inside `CALL (a) { … }`. The five CALL shapes are
+/// #1894's: each person gets its own name, once.
+#[tokio::test]
+async fn cypher_with_aliasing_a_variable_to_itself_keeps_every_row() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:self-alias";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let committed = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": ctx(),
+                "@graph": [
+                    {"@id": "a1", "@type": "Person", "name": "Ann"},
+                    {"@id": "a2", "@type": "Person", "name": "Ben"},
+                    {"@id": "a3", "@type": "Person", "name": "Cy"},
+                    {"@id": "a4", "@type": "Person", "name": "Di"},
+                ]
+            }),
+        )
+        .await
+        .expect("seed");
+    let novelty_db = graphdb_from_ledger(&committed.ledger);
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed_db = fluree.db(ledger_id).await.expect("indexed view");
+
+    let names = json!([["Ann"], ["Ben"], ["Cy"], ["Di"]]);
+    let pairs = json!([["Ann", "Ann"], ["Ben", "Ben"], ["Cy", "Cy"], ["Di", "Di"]]);
+    const CALL: &str = "MATCH (a:Person) CALL (a) { ";
+    let mut cases: Vec<(String, &JsonValue)> = Vec::new();
+    for body in [
+        "WITH a.name AS n RETURN n AS z",
+        "WITH a.name AS n, 1 AS k RETURN n AS z",
+        "WITH a AS a RETURN a.name AS z",
+        "WITH a, a.name AS n RETURN n AS z",
+        "RETURN a.name AS z",
+        "WITH a AS a, a.name AS n RETURN n AS z",
+        "WITH a AS b RETURN b.name AS z",
+    ] {
+        cases.push((format!("{CALL}{body} }} RETURN z"), &names));
+        cases.push((format!("{CALL}{body} }} RETURN a.name AS an, z"), &pairs));
+    }
+    for query in [
+        "MATCH (a:Person) WITH a AS a RETURN a.name AS z",
+        "MATCH (a:Person) WITH a AS a, a.name AS n RETURN n AS z",
+        "MATCH (a:Person) WITH a AS b RETURN b.name AS z",
+    ] {
+        cases.push((query.to_string(), &names));
+    }
+
+    let mut wrong = Vec::new();
+    for (label, db) in [("novelty", &novelty_db), ("indexed", &indexed_db)] {
+        for (query, expected) in &cases {
+            let cj = fluree
+                .query_cypher(db, query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_cypher_json_async(db.as_graph_db_ref())
+                .await
+                .expect("cypher json");
+            let mut rows: Vec<JsonValue> = cj["results"][0]["data"]
+                .as_array()
+                .expect("rows")
+                .iter()
+                .map(|r| r["row"].clone())
+                .collect();
+            rows.sort_by_key(std::string::ToString::to_string);
+            if &JsonValue::Array(rows.clone()) != *expected {
+                wrong.push(format!("{label}: {query}\n  got {rows:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
 #[tokio::test]
@@ -4558,24 +4740,52 @@ async fn transact_cypher_delete_relationship_rejects_parallel_edges() {
 }
 
 #[tokio::test]
-async fn transact_cypher_delete_relationship_requires_named_endpoints() {
-    // `DELETE r` needs both endpoints named so the parallel-edge probe can
-    // group by them. An anonymous endpoint is rejected.
+async fn transact_cypher_delete_relationship_with_an_anonymous_endpoint() {
+    // `DELETE r` retracts the edge `r` was matched on, which the pattern
+    // names whether or not its endpoints have names (the parallel check runs
+    // where the edge is retracted). It deletes that relationship alone.
     let fluree = FlureeBuilder::memory().build_memory();
     let mut l = genesis_ledger(&fluree, "it/cypher:delete-rel-anon");
     for stmt in [
         r#"CREATE (a:Person {name: "Alice"})"#,
         r#"CREATE (b:Person {name: "Bob"})"#,
+        r#"CREATE (c:Person {name: "Cy"})"#,
         r#"MATCH (a:Person {name: "Alice"}), (b:Person {name: "Bob"}) CREATE (a)-[:KNOWS]->(b)"#,
+        r#"MATCH (a:Person {name: "Alice"}), (c:Person {name: "Cy"}) CREATE (a)-[:KNOWS]->(c)"#,
     ] {
         l = fluree.transact_cypher(l, stmt).await.expect(stmt).ledger;
     }
 
-    let err = fluree
-        .transact_cypher(l, "MATCH (a)-[r:KNOWS]->() DELETE r")
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a)-[r:KNOWS]->(:Person {name: "Bob"}) DELETE r"#,
+        )
         .await
-        .expect_err("DELETE r with an anonymous endpoint must error");
-    assert!(format!("{err}").contains("endpoint"), "{err}");
+        .expect("DELETE r with an anonymous endpoint")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+    let rows = fluree
+        .query_cypher(&db, "MATCH (a)-[r:KNOWS]->(b) RETURN a.name, b.name")
+        .await
+        .expect("relationships")
+        .to_cypher_json_async(db.as_graph_db_ref())
+        .await
+        .expect("format");
+    assert_eq!(
+        rows["results"][0]["data"],
+        json!([{"row": ["Alice", "Cy"], "meta": [null, null]}]),
+        "only the relationship to Bob is deleted"
+    );
+    assert_eq!(
+        fluree
+            .query_cypher(&db, "MATCH (n:Person) RETURN n")
+            .await
+            .expect("nodes")
+            .row_count(),
+        3,
+        "every node survives"
+    );
 }
 
 #[tokio::test]
@@ -7061,6 +7271,61 @@ async fn cypher_unwind_runtime_list() {
         vec!["Alice", "Bob", "Carol", "Dave"],
         "one name per path node: {names}"
     );
+}
+
+#[tokio::test]
+async fn cypher_unwind_runtime_list_binds_the_alias_a_later_match_reads() {
+    // A runtime list (one that does not lower to VALUES) unwound into an alias
+    // a later MATCH reads: one row per element. Run after that MATCH, the
+    // UNWIND overwrote the node or value it bound, so every match came back
+    // once per element.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_ic1_chain(&fluree, "it/cypher:unwind-alias-later-match").await;
+    let items: Vec<JsonValue> = (1..=5)
+        .map(|i| json!({"@id": format!("item{i}"), "@type": "Item", "idx": i}))
+        .collect();
+    let l = fluree
+        .insert(l, &json!({"@context": ctx(), "@graph": items}))
+        .await
+        .expect("seed items")
+        .ledger;
+    let db = graphdb_from_ledger(&l);
+
+    let mut wrong = Vec::new();
+    for (query, expected) in [
+        (
+            "UNWIND range(1, 3) AS i MATCH (n:Item {idx: i}) RETURN n.idx",
+            json!([[1], [2], [3]]),
+        ),
+        (
+            r#"UNWIND [x IN ["Alice", "Carol"] | x] AS nm
+               MATCH (p:Person {name: nm}) RETURN p.name"#,
+            json!([["Alice"], ["Carol"]]),
+        ),
+        (
+            r#"MATCH (a:Person {name:"Alice"}),(c:Person {name:"Carol"})
+               MATCH p = shortestPath((a)-[:KNOWS*]->(c))
+               UNWIND nodes(p) AS pn
+               MATCH (pn:Person)
+               RETURN pn.name"#,
+            json!([["Alice"], ["Bob"], ["Carol"]]),
+        ),
+    ] {
+        let out = fluree
+            .query_cypher(&db, query)
+            .await
+            .expect(query)
+            .to_jsonld_async(db.as_graph_db_ref())
+            .await
+            .expect("jsonld");
+        let mut rows = out.as_array().expect("rows").clone();
+        rows.sort_by_key(ToString::to_string);
+        let rows = JsonValue::Array(rows);
+        if rows != expected {
+            wrong.push(format!("{query}\n  got {rows}\n  expected {expected}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 #[tokio::test]
@@ -10928,5 +11193,703 @@ async fn cypher_var_length_probes_of_different_types_do_not_share_a_drain() {
         )
         .await,
         vec![json!([[0.9], [0.1]])],
+    );
+}
+
+/// Alice and Carol work somewhere located somewhere; Bob works nowhere.
+async fn seed_works_for_graph(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) -> fluree_db_api::LedgerState {
+    let l = genesis_ledger(fluree, ledger_id);
+    fluree
+        .transact_cypher(
+            l,
+            r#"CREATE (:Person {name: "Alice"})-[:WORKS_FOR]->(:Company {name: "Acme"})
+                        -[:LOCATED_IN]->(:City {name: "NYC"}),
+                      (:Person {name: "Bob"}),
+                      (:Person {name: "Carol"})-[:WORKS_FOR]->(:Company {name: "Globex"})
+                        -[:LOCATED_IN]->(:City {name: "SF"})"#,
+        )
+        .await
+        .expect("seed works-for graph")
+        .ledger
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_matches_nothing_in_later_match() {
+    // A null never matches, so Bob — whose `o` the OPTIONAL MATCH left null —
+    // drops out of the later MATCH instead of joining every located company.
+    // (SPARQL's unbound would be compatible with both.) Nor may the planner
+    // hoist the MATCH above the OPTIONAL MATCH: that seeded `o` with every
+    // located company and returned all six person×city pairs (#1924).
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-match").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           MATCH (o)-[:LOCATED_IN]->(c)
+           RETURN p.name AS person, c.name AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(rows, vec![json!(["Alice", "NYC"]), json!(["Carol", "SF"])]);
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_stays_null_in_later_optional_match() {
+    // Bob's null `o` must not let the second OPTIONAL MATCH bind it to every
+    // located company: he keeps one row with a null city.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-later-optional").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           OPTIONAL MATCH (o)-[:LOCATED_IN]->(c)
+           RETURN p.name AS person, c.name AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "NYC"]),
+            json!(["Bob", null]),
+            json!(["Carol", "SF"])
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cypher_write_where_null_from_optional_match_stays_null() {
+    // The write path plans its WHERE separately from reads, so it needs the
+    // same null semantics: Bob's null `o` must not bind the second OPTIONAL
+    // MATCH to every located company and SET both cities on him.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-write-where").await;
+    let ledger = fluree
+        .transact_cypher(
+            ledger,
+            r#"MATCH (p:Person)
+               OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+               OPTIONAL MATCH (o)-[:LOCATED_IN]->(c)
+               WITH p, c.name AS cityName
+               SET p.city = cityName"#,
+        )
+        .await
+        .expect("set city")
+        .ledger;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person) RETURN p.name AS person, p.city AS city ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", "NYC"]),
+            json!(["Bob", null]),
+            json!(["Carol", "SF"])
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cypher_null_from_optional_match_matches_nothing_inside_exists() {
+    // Cypher's null semantics hold inside an EXISTS body too: Bob's null `o`
+    // must not act as a free variable that finds some located company.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seed_works_for_graph(&fluree, "it/cypher:null-exists").await;
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"MATCH (p:Person)
+           OPTIONAL MATCH (p)-[:WORKS_FOR]->(o)
+           RETURN p.name AS person, EXISTS { (o)-[:LOCATED_IN]->(:City) } AS located
+           ORDER BY person"#,
+    )
+    .await;
+    assert_eq!(
+        rows,
+        vec![
+            json!(["Alice", true]),
+            json!(["Bob", false]),
+            json!(["Carol", true])
+        ]
+    );
+}
+
+/// A Cypher read honors the caller's execution options and tracker: a fuel
+/// limit stops it, the tracker reports what it cost, and a cancelled handle
+/// stops it — as for SPARQL and JSON-LD.
+#[tokio::test]
+async fn cypher_reads_honor_fuel_limits_and_cancellation() {
+    use fluree_db_api::{QueryCancellation, QueryExecutionOptions, Tracker, TrackingOptions};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/cypher:limits");
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    let committed = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let db = graphdb_from_ledger(&committed.ledger);
+    let cross = "MATCH (a:Person), (b:Person), (c:Person) RETURN count(*) AS n";
+    let options = QueryExecutionOptions::default();
+
+    let tracked = |max_fuel: Option<u64>| {
+        Tracker::new(TrackingOptions {
+            track_time: true,
+            track_fuel: true,
+            track_policy: false,
+            max_fuel,
+        })
+    };
+    let tracker = tracked(None);
+    let result = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracker)
+        .await
+        .expect("unlimited");
+    assert_eq!(result.row_count(), 1);
+    let fuel = tracker.tally().and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 0.0, "{fuel}");
+
+    let err = fluree
+        .query_cypher_with_tracker(&db, cross, None, &options, &tracked(Some(1)))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+
+    let cancellation = QueryCancellation::new();
+    cancellation.cancel();
+    let err = fluree
+        .query_cypher_with_options(
+            &db,
+            cross,
+            None,
+            &QueryExecutionOptions::new().with_cancellation(cancellation),
+        )
+        .await
+        .expect_err("cancelled");
+    assert!(err.to_string().to_lowercase().contains("cancel"), "{err}");
+}
+
+/// The reads a Cypher write makes count against its fuel limit, as its
+/// staging does: a write whose read is the costly part stops at a limit its
+/// writes alone fit under.
+#[tokio::test]
+async fn cypher_write_reads_count_against_its_fuel_limit() {
+    use fluree_db_api::cypher_seq::{detect_sequential, CypherSeqInput};
+    use fluree_db_api::TrackingOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:write-fuel";
+    let ledger0 = genesis_ledger(&fluree, ledger_id);
+    let people: Vec<JsonValue> = (0..60)
+        .map(|i| json!({"@id": format!("p{i}"), "@type": "Person", "n": i}))
+        .collect();
+    fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": people}))
+        .await
+        .expect("seed");
+    let write = |cypher: &'static str, max_fuel: Option<u64>| {
+        let fluree = &fluree;
+        async move {
+            let ast = fluree_db_cypher::parse_cypher(cypher).ast.expect("parse");
+            let plan = detect_sequential(&ast).expect("a sequential write");
+            let handle = fluree.ledger_cached(ledger_id).await.expect("handle");
+            fluree
+                .stage(&handle)
+                .cypher_sequential(CypherSeqInput {
+                    plan,
+                    governance: Default::default(),
+                    skolem_txn_id: None,
+                })
+                .tracking(TrackingOptions {
+                    track_time: false,
+                    track_fuel: true,
+                    track_policy: false,
+                    max_fuel,
+                })
+                .execute()
+                .await
+        }
+    };
+    // A one-row MERGE, read through a 60^3 cross product: its writes cost
+    // ~10 fuel, its read ~220.
+    let cypher = "MATCH (a:Person), (b:Person), (c:Person) WHERE a.n + b.n + c.n = 177 \
+                  MERGE (t:Tag {name: 'probe'})";
+    let fifty_fuel = 50 * fluree_db_core::tracking::MICRO_FUEL_PER_FUEL;
+    let err = write(cypher, Some(fifty_fuel))
+        .await
+        .expect_err("fuel limit");
+    assert!(err.to_string().to_lowercase().contains("fuel"), "{err}");
+    let committed = write(cypher, None).await.expect("unlimited");
+    let fuel = committed.tally.and_then(|t| t.fuel).expect("fuel tallied");
+    assert!(fuel > 50.0, "{fuel}");
+}
+
+/// `toFloat` reads a string as Cypher reads a float: `Infinity`, `-Infinity`
+/// and `NaN`, and `inf` in any case, as well as the numerals.
+#[tokio::test]
+async fn cypher_to_float_reads_infinity_and_nan() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "it/cypher:to-float");
+    let rows = cypher_rows(
+        &fluree,
+        &graphdb_from_ledger(&ledger),
+        r#"RETURN toFloat('Infinity') AS a, toFloat('-Infinity') AS b,
+                  toFloat('NaN') AS c, toFloat('inf') AS d, toFloat('INF') AS e,
+                  toFloat('2.5') AS f"#,
+    )
+    .await;
+    assert_eq!(rows, vec![json!(["INF", "-INF", "NaN", "INF", "INF", 2.5])]);
+}
+
+// ===========================================================================
+// fluree/db#1857 — RETURN/WITH alias colliding with a bound pattern variable.
+//
+// Keep new tests for this issue inside this block; other issue slates append
+// their own blocks below.
+//
+// Before the lowering guard, `RETURN expr AS v` where `v` is already bound
+// interned to `v`'s own VarId (the VarRegistry is a name<->id bijection) and
+// emitted `Pattern::Bind` onto it. `BindOperator`'s clobber prevention then
+// made the projection silently `WHERE v = expr`: every row dropped when the
+// expression evaluated to a value, or the stale binding kept when it
+// evaluated to null. The same lowering backs the read half of a Cypher
+// write, so `WITH … AS q SET p.marker = q` committed successfully and wrote
+// nothing.
+// ===========================================================================
+
+/// Run a Cypher query expected to fail, returning the rendered error.
+async fn cypher_query_error(
+    fluree: &fluree_db_api::Fluree,
+    db: &fluree_db_api::GraphDb,
+    q: &str,
+) -> String {
+    match fluree.query_cypher(db, q).await {
+        Ok(_) => panic!("expected query to be rejected: {q}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[tokio::test]
+async fn issue1857_return_alias_colliding_with_pattern_var_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-return-alias").await;
+    let db = graphdb_from_ledger(&l);
+
+    // Control: a fresh alias projects the property, three rows.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS aname"#,
+        )
+        .await
+        .len(),
+        3,
+        "fresh alias must keep working"
+    );
+
+    // Collision: rejected, and the message names the variable. Asserting only
+    // `is_err()` would pass against any unrelated error.
+    for (q, name) in [
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN r.confidence AS r"#, "r"),
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS a"#, "a"),
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS b"#, "b"),
+        (r#"MATCH (a)-[r:KNOWS]->(b) RETURN id(a) AS a"#, "a"),
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains(&format!("`{name}`")) && msg.contains("already bound"),
+            "error must name the collision: {msg} (for {q})"
+        );
+    }
+
+    // Duplicate output name: neither `x` is a pattern variable, but both
+    // projection items resolve to one VarId, which used to drop every row.
+    let msg = cypher_query_error(
+        &fluree,
+        &db,
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN a.name AS x, b.name AS x"#,
+    )
+    .await;
+    assert!(msg.contains("output name `x` twice"), "{msg}");
+}
+
+#[tokio::test]
+async fn issue1857_with_alias_colliding_with_pattern_var_is_rejected() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-with-alias").await;
+    let db = graphdb_from_ledger(&l);
+
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) WITH a.name AS aname RETURN aname"#,
+        )
+        .await
+        .len(),
+        3,
+        "fresh WITH alias must keep working"
+    );
+
+    for q in [
+        r#"MATCH (a)-[r:KNOWS]->(b) WITH a.name AS a RETURN a"#,
+        r#"MATCH (a)-[r:KNOWS]->(b) WITH r.confidence AS r RETURN r"#,
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("WITH alias") && msg.contains("already bound"),
+            "error must name WITH as the offending clause: {msg} (for {q})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn issue1857_identity_alias_still_projects_every_row() {
+    // `v AS v` binds v to itself — the benign shape the guard must not break.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-identity-alias").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN a AS a"#,
+        r#"MATCH (a)-[r:KNOWS]->(b) RETURN r AS r"#,
+    ] {
+        assert_eq!(
+            cypher_rows(&fluree, &db, q).await.len(),
+            3,
+            "identity projection must keep returning every row: {q}"
+        );
+    }
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) WITH a AS a, b AS b RETURN a.name AS n"#,
+        )
+        .await
+        .len(),
+        3,
+        "WITH a AS a, b AS b is the idiomatic scope carry"
+    );
+}
+
+#[tokio::test]
+async fn issue1857_alias_collision_does_not_silently_noop_a_write() {
+    // The read half of a Cypher write lowers through the same projection
+    // code, so the collision used to produce a transaction that COMMITTED,
+    // returned no error, and wrote nothing.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-write-noop").await;
+
+    // Control: a fresh alias writes one marker per KNOWS edge.
+    let written = fluree
+        .transact_cypher(
+            l.clone(),
+            r#"MATCH (p:Person)-[:KNOWS]->(q) WITH p, q.name AS qn SET p.marker = qn"#,
+        )
+        .await
+        .expect("fresh alias must commit");
+    let db = graphdb_from_ledger(&written.ledger);
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (p:Person) WHERE p.marker IS NOT NULL RETURN p.marker AS m"#,
+        )
+        .await
+        .len(),
+        3,
+        "control write must land three markers"
+    );
+
+    // Collision: must be rejected outright, not committed as a no-op.
+    let err = fluree
+        .transact_cypher(
+            l.clone(),
+            r#"MATCH (p:Person)-[:KNOWS]->(q) WITH p, q.name AS q SET p.marker = q"#,
+        )
+        .await
+        .err()
+        .unwrap_or_else(|| panic!("colliding alias must be rejected, not silently commit nothing"));
+    let msg = err.to_string();
+    assert!(
+        msg.contains("`q`") && msg.contains("already bound"),
+        "write-path error must name the collision: {msg}"
+    );
+}
+
+#[tokio::test]
+async fn issue1857_reserved_jsonld_key_is_rejected_on_read_and_write() {
+    // Part (b) of #1857. `n.`@id`` used to read as an absent property (null on
+    // every row); on the write path it was worse — `SET n.`@id` = "x"` and
+    // `CREATE (n {`@id`: "x"})` COMMITTED, storing a literal predicate spelled
+    // `@id` and leaving the node's real identity untouched.
+    //
+    // Ordering note: this must not land before the alias guard above. Making
+    // `@id` resolve instead of rejecting would have turned
+    // `RETURN a.`@id` AS a` from a plausible-looking wrong answer into zero
+    // rows, since the computed IRI would no longer be unbound.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-reserved-keys").await;
+    let db = graphdb_from_ledger(&l);
+
+    for (q, accessor) in [
+        (r#"MATCH (a:Person) RETURN a.`@id` AS v"#, "id(n)"),
+        (r#"MATCH (a:Person) RETURN a.`@type` AS t"#, "labels(n)"),
+        (
+            r#"MATCH (a:Person {`@id`: "alice"}) RETURN a.name AS n"#,
+            "id(n)",
+        ),
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("reserved JSON-LD keyword") && msg.contains(accessor),
+            "read error must name the keyword and the accessor: {msg} (for {q})"
+        );
+    }
+
+    // The documented accessors keep working — the error points somewhere real.
+    assert_eq!(
+        cypher_rows(&fluree, &db, r#"MATCH (a:Person) RETURN id(a) AS v"#)
+            .await
+            .len(),
+        4,
+    );
+    assert_eq!(
+        cypher_rows(&fluree, &db, r#"MATCH (a:Person) RETURN labels(a) AS l"#)
+            .await
+            .len(),
+        4,
+    );
+}
+
+#[tokio::test]
+async fn issue1857_reserved_jsonld_key_write_is_rejected_not_stored() {
+    // Split from the read half so each is independently non-vacuous. Before
+    // the guard every statement below COMMITTED and `keys(n)` came back
+    // containing a literal `@id` / `@type`, while the node's real identity and
+    // labels were untouched — a persisted wrong answer, not just a null read.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-reserved-write").await;
+
+    for stmt in [
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@id` = "zzz""#,
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@type` = "Q""#,
+        r#"CREATE (n:P {`@id`: "zzz", name: "N"})"#,
+        r#"MERGE (n:P {`@id`: "zzz"}) SET n.name = "N""#,
+    ] {
+        let err = fluree
+            .transact_cypher(l.clone(), stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("write must be rejected, not committed: {stmt}"));
+        assert!(
+            err.to_string().contains("reserved JSON-LD keyword"),
+            "write error must name the keyword: {err} (for {stmt})"
+        );
+    }
+
+    // The working spellings still commit: identity comes from the pattern, a
+    // type from a label.
+    let res = fluree
+        .transact_cypher(l.clone(), r#"MATCH (n:Person {name: "Alice"}) SET n:Staff"#)
+        .await
+        .expect("SET n:Label must still work");
+    let db = graphdb_from_ledger(&res.ledger);
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (n:Staff) RETURN id(n) AS i, labels(n) AS l"#,
+        )
+        .await
+        .len(),
+        1,
+        "SET n:Staff is the documented way to add a type"
+    );
+}
+
+#[tokio::test]
+async fn issue1857_reserved_jsonld_key_as_node_label_is_rejected() {
+    // The label position routed around the keyword check: labels lower to the
+    // OBJECT of an `rdf:type` triple and resolved through `resolve_iri`, not
+    // `resolve_predicate`. Measured before the fix: the reads returned 0 rows
+    // silently, `SET n:`@type`` COMMITTED and `labels(alice)` then read back
+    // ["Person", "@type"], and `CREATE (n:`@id` …)` committed a node whose
+    // only class was `@id`.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-label-keyword").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (n:`@id`) RETURN n"#,
+        r#"MATCH (n:`@type`) RETURN n"#,
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("reserved JSON-LD keyword"),
+            "read-side label must be rejected: {msg} (for {q})"
+        );
+    }
+
+    for stmt in [
+        r#"MATCH (n:Person {name: "Alice"}) SET n:`@type`"#,
+        r#"MATCH (n:Person {name: "Alice"}) REMOVE n:`@type`"#,
+        r#"CREATE (n:`@id` {name: "zz"})"#,
+        r#"MERGE (n:`@type` {name: "zz"})"#,
+    ] {
+        let err = fluree
+            .transact_cypher(l.clone(), stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("label write must be rejected, not committed: {stmt}"));
+        assert!(
+            err.to_string().contains("reserved JSON-LD keyword"),
+            "write-side label error must name the keyword: {err} (for {stmt})"
+        );
+    }
+
+    // Ordinary labels, including ones merely spelled like a keyword, still work
+    // on both paths.
+    assert_eq!(
+        cypher_rows(&fluree, &db, r#"MATCH (n:Person) RETURN id(n) AS i"#)
+            .await
+            .len(),
+        4
+    );
+    let res = fluree
+        .transact_cypher(l.clone(), r#"MATCH (n:Person {name: "Alice"}) SET n:Type"#)
+        .await
+        .expect("a label merely spelled like a keyword must still commit");
+    let db2 = graphdb_from_ledger(&res.ledger);
+    assert_eq!(
+        cypher_rows(&fluree, &db2, r#"MATCH (n:Type) RETURN labels(n) AS l"#)
+            .await
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn issue1857_unwind_onto_a_bound_var_is_rejected() {
+    // #1857's symptom one clause over. Before: 0 rows, no error, for both the
+    // constant-list and the uncorrelated-runtime forms.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-unwind-bound").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS a RETURN a"#,
+        r#"MATCH (a)-[r:KNOWS]->(b) UNWIND range(1, 3) AS a RETURN a"#,
+        r#"MATCH (a)-[r:KNOWS]->(b) UNWIND labels(a) AS a RETURN a"#,
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("UNWIND alias `a` is already bound"),
+            "must be rejected: {msg} (for {q})"
+        );
+    }
+
+    // A fresh alias is untouched: 3 match rows x 3 elements.
+    assert_eq!(
+        cypher_rows(
+            &fluree,
+            &db,
+            r#"MATCH (a)-[r:KNOWS]->(b) UNWIND [1, 2, 3] AS fresh RETURN fresh"#,
+        )
+        .await
+        .len(),
+        9,
+    );
+}
+
+// ---------------------------------------------------------------------------
+// fluree/db#1857 — review round (bplatz). Each test pins a finding that held.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn issue1857_call_body_alias_onto_imported_var_is_rejected() {
+    // #1857's own shape inside a CALL body. The projection snapshot was
+    // branch-local, and a CALL body starts with no patterns — the imported
+    // `a` is seeded per parent row by SubqueryOperator — so the imported name
+    // was invisible to the guard and `Bind{a, a.name}` clobber-dropped every
+    // row. This is the test that decides whether `Fixes #1857` holds.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-call-body").await;
+    let db = graphdb_from_ledger(&l);
+
+    for q in [
+        r#"MATCH (a:Person) CALL (a) { WITH a.name AS a RETURN a AS z } RETURN z"#,
+        r#"MATCH (a:Person) CALL (a) { UNWIND [1, 2, 3] AS a RETURN a AS z } RETURN z"#,
+        // After a `WITH` that does not read the import: the CALL's seed keeps
+        // `a` bound for the whole body, so these filtered to zero rows too.
+        r#"MATCH (a:Person) CALL (a) { MATCH (x:Person) WITH x WITH x.name AS a RETURN a AS z } RETURN z"#,
+        r#"MATCH (a:Person) CALL (a) { MATCH (x:Person) WITH x UNWIND [1, 2, 3] AS a RETURN a AS z } RETURN z"#,
+    ] {
+        let msg = cypher_query_error(&fluree, &db, q).await;
+        assert!(
+            msg.contains("`a`") && msg.contains("already bound"),
+            "CALL body must reject an alias onto an imported name: {msg} (for {q})"
+        );
+    }
+
+    // Fresh aliases and the identity carry inside a CALL are NOT rejected,
+    // and each yields one row per outer person.
+    for q in [
+        r#"MATCH (a:Person) CALL (a) { WITH a.name AS n RETURN n AS z } RETURN z"#,
+        r#"MATCH (a:Person) CALL (a) { WITH a AS a RETURN a.name AS z } RETURN z"#,
+    ] {
+        assert_eq!(cypher_rows(&fluree, &db, q).await.len(), 4, "{q}");
+    }
+}
+
+#[tokio::test]
+async fn issue1857_unlisted_at_prefixed_names_are_reserved() {
+    // The keyword list was the boundary, so any `@` name it missed got
+    // through — `@import` and `@annotation` committed literal predicates.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-at-prefix").await;
+    let db = graphdb_from_ledger(&l);
+
+    let msg = cypher_query_error(&fluree, &db, r#"MATCH (n:Person) RETURN n.`@import` AS v"#).await;
+    assert!(msg.contains("reserved JSON-LD"), "{msg}");
+
+    for stmt in [
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@import` = "x""#,
+        r#"MATCH (n:Person {name: "Alice"}) SET n.`@annotation` = "x""#,
+    ] {
+        let err = fluree
+            .transact_cypher(l.clone(), stmt)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("must be rejected, not committed: {stmt}"));
+        assert!(err.to_string().contains("reserved JSON-LD"), "{err}");
+    }
+}
+
+#[tokio::test]
+async fn issue1857_keyword_reached_through_a_context_alias_is_rejected() {
+    // `{"id": "@id"}` is a standard JSON-LD aliasing idiom. It lands in the
+    // Cypher override map and resolves `id` to `@id`, so a check on the bare
+    // name alone let `n.id` read and write the keyword.
+    let fluree = FlureeBuilder::memory().build_memory();
+    let l = seed_claims_chain(&fluree, "it/cypher:1857-context-alias").await;
+    let db = graphdb_from_ledger(&l).with_default_context(Some(json!({"id": "@id"})));
+
+    let msg = cypher_query_error(&fluree, &db, r#"MATCH (n:Person) RETURN n.id AS v"#).await;
+    assert!(
+        msg.contains("resolves through the ledger's context to `@id`"),
+        "must name both the spelling and what it resolved to: {msg}"
     );
 }

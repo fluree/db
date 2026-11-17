@@ -8,6 +8,7 @@ use crate::graph_source::config::VectorCreateConfig;
 #[cfg(feature = "vector")]
 use crate::graph_source::helpers::{
     expand_ids_in_results, expand_prefixed_iri, expand_properties_in_results, extract_prefix_map,
+    latest_drop_read,
 };
 #[cfg(feature = "vector")]
 use crate::graph_source::result::{
@@ -309,6 +310,7 @@ impl crate::Fluree {
     /// Vector indexes are head-only and do not support time-travel queries.
     pub async fn load_vector_index(&self, graph_source_id: &str) -> Result<Arc<VectorIndex>> {
         use fluree_db_query::vector::usearch::deserialize;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         // Look up graph source record
         let record = self
@@ -341,6 +343,7 @@ impl crate::Fluree {
         &self,
         graph_source_id: &str,
     ) -> Result<VectorStalenessCheck> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         // Look up graph source record
         let record = self
             .nameservice()
@@ -402,6 +405,7 @@ impl crate::Fluree {
         use fluree_db_query::bm25::{CompiledPropertyDeps, PropertyDeps};
         use fluree_db_query::vector::usearch::deserialize;
         use futures::StreamExt;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting vector index sync");
 
@@ -416,7 +420,7 @@ impl crate::Fluree {
 
         // Check if graph source has been dropped
         if record.retracted {
-            return Err(crate::ApiError::Drop(format!(
+            return Err(crate::ApiError::GraphSourceRetracted(format!(
                 "Cannot sync retracted graph source: {graph_source_id}"
             )));
         }
@@ -467,6 +471,21 @@ impl crate::Fluree {
                 new_watermark: old_watermark,
                 was_full_resync: false,
             });
+        }
+
+        // A drop since the last sync of a graph the query reads takes the full
+        // rebuild, as in `sync_bm25_index`: the commit walk cannot find what it
+        // took. The index keeps no history to retire.
+        if let Some(floor) =
+            latest_drop_read(&ledger.snapshot, &query).filter(|floor| *floor > old_watermark)
+        {
+            info!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                drop_t = floor,
+                "A graph the indexing query reads was dropped since the last sync; running a full resync"
+            );
+            return self.resync_vector_index(graph_source_id).await;
         }
 
         // 4. Get head commit CID for tracing
@@ -645,6 +664,7 @@ impl crate::Fluree {
     /// Rebuilds the entire index from scratch by re-running the indexing query.
     pub async fn resync_vector_index(&self, graph_source_id: &str) -> Result<VectorSyncResult> {
         use fluree_db_query::vector::usearch::deserialize;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting full vector index resync");
 
@@ -658,7 +678,7 @@ impl crate::Fluree {
             })?;
 
         if record.retracted {
-            return Err(crate::ApiError::Drop(format!(
+            return Err(crate::ApiError::GraphSourceRetracted(format!(
                 "Cannot resync retracted graph source: {graph_source_id}"
             )));
         }
@@ -799,6 +819,7 @@ impl crate::Fluree {
     /// This marks the graph source as retracted in the nameservice but does not
     /// immediately delete snapshot files (they may be needed for time-travel).
     pub async fn drop_vector_index(&self, graph_source_id: &str) -> Result<VectorDropResult> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         info!(graph_source_id = %graph_source_id, "Dropping vector index");
 
         // Look up graph source record

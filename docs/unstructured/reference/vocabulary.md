@@ -1,6 +1,6 @@
 # Vocabulary
 
-Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally use DoCO (`doco:`, `http://purl.org/spar/doco/`), the pattern ontology it extends (`po:`, `http://www.essepuntato.it/2008/12/pattern#`) and NIF (`nif:`, `http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#`). The structure terms are those of the parsing engine and are documented in full in [fluree-doc-parse](https://github.com/fluree/fluree-doc-parse); the terms below are what the ingest adds.
+Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally use DoCO (`doco:`, `http://purl.org/spar/doco/`), the pattern ontology it extends (`po:`, `http://www.essepuntato.it/2008/12/pattern#`), NIF (`nif:`, `http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#`), Dublin Core (`dcterms:`, `http://purl.org/dc/terms/`) and FOAF (`foaf:`, `http://xmlns.com/foaf/0.1/`) for the document root's class. The structure terms are those of the parsing engine and are documented in full in its [vocabulary reference](https://github.com/fluree/fluree-doc-parse/blob/main/docs/reference/vocabulary.md); the terms below are what the ingest adds.
 
 ## Classes
 
@@ -20,7 +20,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:text` | string | The chunk's text, whitespace collapsed. |
 | `doc:headerPath` | string | Section titles above it, outermost first, joined with ` / `. Absent when there are none. |
 | `doc:sourceElement` | IRI, repeated | The elements it was built from, in order. |
-| `doc:sourceDocument` | IRI | The document. Also on every element. |
+| `doc:sourceDocument` | IRI | The document. Also on every structure node but a table cell, which is reached through its table. |
 | `doc:embedding` | `@vector` | Its embedding, when produced. |
 
 ## Document properties
@@ -45,6 +45,8 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `doc:mentionCount` | integer | Mentions written. |
 | `doc:entityCount` | integer | Distinct entities mentioned, known and new. |
 | `doc:relationCount` | integer | Relations written, every verdict included. |
+| `doc:readerPredicate` | IRI | A predicate a reader wrote outside the pipeline's own; a re-ingest retracts these from the nodes the reader minted, and nothing else there. |
+| `doc:readingGraph` | IRI | The named graph an HTTP reader's reading of the document is committed in (`<document>/reading`), which a re-ingest clears before it commits the new reading. The reading itself is in the extraction vocabulary, `xt:` (`https://ns.flur.ee/extract#`). |
 
 ## Mention properties
 
@@ -67,6 +69,7 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 | `rdfs:label` | string | `subject | predicate label | object`. |
 | `doc:excerpt` | string | The text supporting it, as the model quoted it. |
 | `doc:verdict` | string | `valid`, `repaired` or `rejected`. |
+| `doc:assertionMode` | string | `asserted`, `hedged`, `attributed` or `negated`: how the source states it. Present only when a custom `--system-prompt` asked for it. Not a confidence score and not ordered — see [Assertion mode](../concepts/entities-and-relations.md#assertion-mode). |
 | `doc:asserted` | boolean | Whether a direct edge was written for it. |
 | `doc:originalPredicate`, `doc:repairNote` | string | On a repaired relation: what the model wrote, and how it was resolved. |
 | `doc:rejectionReason` | string | On a rejected relation. |
@@ -84,4 +87,4 @@ Namespace `doc:` is `https://ns.flur.ee/doc#`. Structure elements additionally u
 
 ## Structure terms used by the chunker
 
-`doco:Document`, `doco:BodyMatter`, `doco:Section`, `doco:SectionTitle`, `doco:Title`, `doco:Paragraph`, `doco:ListItem`, `doco:Caption`, `doco:Table`, `doc:TableCell` (`doc:cellValue`, `doc:rowHeader`, `doc:columnHeader`, `doc:rowIndex`, `doc:columnIndex`), `po:contains`, `nif:isString`, `nif:beginIndex`, `nif:endIndex`, `doc:sectionLevel`, `doc:pageIndex`, `doc:bbox`, `doc:pages`, `doc:evidence`, `doc:provenance`.
+The chunker starts at the `foaf:Document` root and follows `po:contains`, visiting a node's `po:containsAsHeader` child first. It takes text from `doco:Title` and `doco:Paragraph` (`nif:isString`, else `rdfs:label`), turns each `doco:Section`'s `doco:SectionTitle` and `doc:sectionLevel` into the header path, and reads each `doc:TableCell` as `doc:cellValue` with its `doc:rowHeader` and `doc:columnHeader`. Every other node is a container it walks through. See [What gets built](../concepts/what-gets-built.md#the-structure-graph) for the rest of the structure graph.

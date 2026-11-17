@@ -4,7 +4,7 @@ SHACL (Shapes Constraint Language) is a W3C standard for defining constraints on
 
 This guide covers:
 
-- [When SHACL runs](#when-shacl-runs) — with and without a config graph
+- [When SHACL runs](#when-shacl-runs) — only where the ledger config enables it
 - [Enabling SHACL via the config graph](#enabling-shacl-via-the-config-graph)
 - [Defining shapes](#defining-shapes) — node shapes, property shapes, targets
 - [Constraint patterns](#constraint-patterns) — cardinality, datatype, ranges, patterns, values, class, pair, logical
@@ -17,12 +17,11 @@ This guide covers:
 
 ## When SHACL runs
 
-Fluree decides whether to run SHACL validation on each transaction using this order:
+SHACL runs only where the ledger config enables it: a graph the transaction writes is validated when its effective `f:shaclDefaults` group (ledger-wide, or the graph's override) sets `f:shaclEnabled true`, in that group's `f:validationMode`. Shapes on their own never enable validation, and a ledger with no SHACL config validates nothing (at no cost). So the first step is always to [enable SHACL](#enabling-shacl-via-the-config-graph); then transact shapes, and they are enforced from the next transaction on.
 
-1. **If a config graph exists with `f:shaclDefaults`** — follow the configured settings per graph (enable/disable, mode).
-2. **If no config graph section is present** — fall back to the **shapes-exist heuristic**: if any SHACL shapes are present in the database (as regular RDF triples), validation runs in `Reject` mode. If no shapes are present, validation is skipped entirely (zero overhead).
+A ledger that holds shapes but enables SHACL nowhere reports `shapes present; SHACL enforcement not configured` in ledger info, and `fluree info` prints it.
 
-This means you can start using SHACL **without writing any config** — just transact shapes and they're enforced.
+The config graph itself is never validated, so a configuration change (including turning SHACL off, or pointing `f:shapesSource` somewhere else) is never blocked by the shapes it configures.
 
 **Bulk import is deliberately exempt.** The bulk-import pipeline never runs
 SHACL — it is a trusted, high-throughput load path. If your source data must
@@ -50,6 +49,23 @@ GRAPH <urn:fluree:mydb:main#config> {
     ] .
 }
 ```
+
+The same settings as JSON-LD, with `"@graph": "config"` naming the ledger's config graph:
+
+```json
+{
+  "@context": { "f": "https://ns.flur.ee/db#" },
+  "@id": "urn:fluree:mydb:main:config:ledger",
+  "@type": "f:LedgerConfig",
+  "@graph": "config",
+  "f:shaclDefaults": {
+    "f:shaclEnabled": true,
+    "f:validationMode": { "@id": "f:ValidationReject" }
+  }
+}
+```
+
+If the ledger already has a config subject, attach the group to it instead of writing a second `f:LedgerConfig` (which is refused); [Enabling SHACL](../ledger-config/writing-config.md#enabling-shacl) has a recipe that does either.
 
 Notes:
 - `f:shaclEnabled` defaults to `false` when a `f:shaclDefaults` section exists without it — make the enable decision explicit.
@@ -319,6 +335,15 @@ ex:PersonShape a sh:NodeShape ;
   ] .
 ```
 
+A node conforms to a referenced shape only when validating it there reports
+nothing, whatever the severity of what it reports (SHACL §3.5). This holds for
+`sh:node`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and `sh:qualifiedValueShape`
+alike. So a Warning shape referenced through `sh:node` still makes a node fail
+`sh:node`, and its result is reported under the referencing shape, at that
+shape's severity: a Violation outer shape rejects the write, and a Warning one
+logs it. A constraint that cannot run is reported at the outermost referencing
+shape's severity too.
+
 Recursive references are safe: a shape may reference itself (directly or via a
 chain), and validation over cyclic data (e.g. a mutual `ex:knows` graph)
 terminates — a node already being validated against a shape higher in the
@@ -428,11 +453,17 @@ entries (followed through `owl:imports`) — or simply write full IRIs.
 The spec's **pre-binding restrictions** are enforced: the query must be a
 SELECT and must not use `MINUS`, `SERVICE`, `VALUES`, reassign `$this`
 (`BIND (… AS $this)`), or use a sub-`SELECT` that fails to project `$this`
-(including `SELECT *`). A query that breaks these — or does not parse — is a
-validation *failure*: transactions on focus nodes the shape targets are
-rejected with the reason, scoped to that shape rather than wedging the
-ledger. `$shapesGraph` / `$currentShape` (optional per spec) are not
-supported.
+(including `SELECT *`). A query that breaks these, does not parse, or
+cannot be planned (for example, it projects a variable that is neither a
+`GROUP BY` key nor an aggregate) is a validation *failure*, reported with
+the reason and scoped to that shape rather than wedging the ledger. It
+follows the shape's `sh:severity` and the graph's validation mode, as a
+result does: on a Violation shape in a reject-mode graph, transactions on
+focus nodes the shape targets are rejected; on a Warning or Info shape, or
+in a warn-mode graph, the failure is logged and the transaction commits.
+That is a transaction's rule only: a [validation report](#validation-reports-fluree-validate)
+returns the failure as an error, whatever the shape's severity.
+`$shapesGraph` / `$currentShape` (optional per spec) are not supported.
 
 Like every other constraint, `sh:sparql` runs at transaction staging time
 against the staged view — the query sees the transaction's writes exactly as
@@ -489,8 +520,8 @@ A book whose `ex:author` is `ex:pratchett` conforms — `ex:pratchett` is a `sch
 
 Fluree resolves this in two tiers:
 
-1. **Fast path**: the ledger's indexed schema hierarchy (`SchemaHierarchy`). Expanded at engine build time so same-class and descendant-class matches are O(1) hashmap hits.
-2. **Live fallback**: when the subclass relation was asserted in the current transaction (or any earlier unindexed commit), the fast path misses. The engine then walks `rdfs:subClassOf` via a BFS on the database's SPOT index. This walk is **scoped to the default graph** regardless of the subject's own graph — matching how `SchemaHierarchy` is built and preventing cross-graph issues.
+1. **Fast path**: the ledger's current schema hierarchy (`SchemaHierarchy`), built from the default graph's committed and unindexed state. Expanded at engine build time so same-class and descendant-class matches are O(1) hashmap hits.
+2. **Live fallback**: when the subclass relation was asserted in the current transaction, or lives in a graph other than the default graph, the fast path misses. The engine then walks `rdfs:subClassOf` via a BFS on the database's SPOT index. This walk reads the **default graph**, matching how `SchemaHierarchy` is built, plus the `f:shapesSource` graphs and any [`f:additionalDataSource`](#validating-against-other-graphs) graphs, so a value-set or catalog can carry its own class hierarchy. The record's own named graph is not read automatically: its subclass edges count only when it is itself listed as an `f:additionalDataSource`, as a catalog listed ledger-wide is when a record is written to the catalog.
 
 ## Predicate-target shapes
 
@@ -607,16 +638,47 @@ With `f:shapesSource` pointing at `<http://example.org/shapes>`, a record writte
 
 Semantics and limits:
 
-- **Membership graph = focus data graph ∪ the `f:shapesSource` graph.** A value is an instance of the class if it is typed so in either the record's own graph or the vocabulary graph. When shapes live in the default graph, this is just an ordinary local lookup.
+- **Membership graph = focus data graph ∪ the `f:shapesSource` graph.** A value is an instance of the class if it is typed so in either the record's own graph or the vocabulary graph. When shapes live in the default graph, this is just an ordinary local lookup. To read a value-set kept in a graph of its own, see [Validating against other graphs](#validating-against-other-graphs).
 - **Per-transaction caching.** Repeated references to the same value within one transaction are memoized — bulk-inserting many records that share a state pays the membership lookup once.
 - **Cross-ledger too.** When `f:shapesSource` is cross-ledger (`f:ledger`), the controlled vocabulary lives in the model ledger alongside the shapes, and membership is resolved by querying that model ledger live (pinned at its latest committed state at transaction time). So a shared governance model can hold shapes *and* the value-sets they reference, and many data ledgers can point at it.
+
+## Validating against other graphs
+
+By default a record is checked against the graph it is written to. When the data a shape reads lives elsewhere (a shared catalog, a price list), list those graphs with `f:additionalDataSource` on `f:shaclDefaults`. Each value is an `f:GraphRef`, and the setting is repeatable ([SHACL across named graphs](cookbook-shacl-across-graphs.md) walks through it end to end):
+
+```trig
+GRAPH <urn:fluree:mydb:main#config> {
+  <urn:fluree:mydb:main:config:ledger> a f:LedgerConfig ;
+    f:shaclDefaults [
+      f:shaclEnabled true ;
+      f:shapesSource [ a f:GraphRef ; f:graphSource [ f:graphSelector <http://example.org/shapes> ] ] ;
+      f:additionalDataSource [ a f:GraphRef ; f:graphSource [ f:graphSelector <http://example.org/catalog> ] ]
+    ] .
+}
+```
+
+A write to `<http://example.org/org-a>` is then checked against `<org-a>` and `<catalog>` read as one graph. Every constraint reads it: `sh:class` finds a commodity typed in the catalog, a path such as `( ex:product ex:price )` steps from an order in `<org-a>` to a price in the catalog, `sh:node` checks the referenced product's own properties there, and an `sh:sparql` query runs with the two as its default graph. Validating a graph through the API reads the same graphs.
+
+Semantics and limits:
+
+- **Added, not substituted.** The graph being written is always read, and the listed graphs are read with it. Shapes still come only from `f:shapesSource`.
+- **Which records are checked does not change.** A transaction checks the records it writes, and which shapes apply to a record is decided from the graph being written: a type, or a `sh:targetSubjectsOf` / `sh:targetObjectsOf` edge, that only a listed graph gives a record does not make a shape apply to it. Nodes in a listed graph are not validated because another graph reads them.
+- **One graph, so a fact counts once.** A triple stored in both graphs is one value. A fact only a listed graph holds counts too, so a listed graph can make a record fail as well as pass: `sh:maxCount` sees its values and `sh:closed` sees its properties.
+- **Checked when written.** Removing an entry from the catalog does not re-check the records that reference it; a record is checked again the next time it is written.
+- **The transaction's own changes count.** A transaction that adds a catalog entry and a record referencing it passes; one that removes an entry and writes a record using it fails. A transaction may create a listed graph.
+- **Per graph.** An entry in `f:graphOverrides` can give a graph its own list, which replaces the ledger-wide list for that graph. List the ledger-wide graphs again if that graph should read them too. A per-graph group that sets no list inherits the ledger-wide one, so to have a graph read no other graph, list the graph itself: it is read anyway, and only its own subclass edges are added.
+- **Full reads.** Checks read the listed graphs whatever the writer's policy lets them read, so a violation can show a writer a value from a graph their policy hides.
+- **Errors, not skips.** A graph the ledger does not know, and the transaction is not creating, fails the write: a mistyped graph would otherwise hide data a shape should see. The config and txn-meta graphs cannot be listed. Only this ledger's graphs can be listed for now, so `f:ledger`, `f:atT`, `f:trustPolicy` and `f:rollbackGuard` are refused. A cross-ledger `f:shapesSource` works with it.
+- **Config only.** No request can change the list.
 
 ## Inline shapes per transaction
 
 In addition to shapes stored in a ledger, a transaction can supply
 **inline shapes** via the `opts.shapes` field. The shapes are
 enforced only for that one transaction and never written into the
-ledger.
+ledger. The field is read wherever the transaction is sent: over HTTP,
+through the embedded API, and by the CLI in local mode. It must be a
+JSON-LD object or an array of them; anything else is refused.
 
 ```json
 {
@@ -651,21 +713,31 @@ ledger.
 
 Semantics:
 
-- **Additive with the configured source.** Inline shapes enforce
-  *alongside* whatever `f:shapesSource` resolves to. A subject
-  must satisfy every shape from both sources. Note that
-  `f:shapesSource` is itself singular — its `f:graphSource` is
-  either local (no `f:ledger`) or cross-ledger (with `f:ledger`),
-  not both at the same time. Inline shapes don't change that;
-  they layer on top of whichever variant is configured.
+- **A request setting, applied on their own.** Inline shapes validate
+  every graph the transaction writes (except the config and
+  `#txn-meta` graphs), in the request's `opts.validationMode`
+  (default reject), in a pass of their own. They apply on a ledger
+  with no config, and alongside whatever stored shapes the ledger's
+  config enables; they never switch stored shapes on for a graph
+  where config leaves SHACL off. A subject must satisfy every shape
+  that applies to it.
+- **Gated by override control, not by `f:shaclEnabled`.** Inline
+  shapes apply on a ledger with no config, and on any graph whose
+  effective `f:overrideControl` permits request overrides (the
+  default `f:OverrideAll`), even when `f:shaclEnabled false`. Under
+  `f:OverrideNone`, or `f:IdentityRestricted` without a matching
+  verified identity, the transaction is refused (HTTP 400) with an
+  error naming the graph and the control, and nothing commits.
+- **Not supported in a policy-scoped request.** A transaction that
+  carries inline shapes is refused (HTTP 400, `inline request shapes
+  are not supported in a policy-scoped request`) when it runs under
+  a policy context: an identity or policy inputs on the request, or
+  policy defaults anywhere in the ledger config (ledger-wide or for a
+  graph) other than an unrestricted `f:defaultAllow true`. Support for
+  inline shapes in policy-scoped requests is a follow-up.
 - **Transient.** The shapes never appear in the ledger's data and
   vanish after the transaction completes. The next transaction
   without `opts.shapes` runs without them.
-- **Gated by config.** If `f:shaclEnabled false` (or no graph is
-  enabled), inline shapes do not bypass that posture — operator
-  config wins. To use inline shapes on a fresh ledger with no
-  config, the shapes-exist heuristic enables validation
-  automatically.
 - **No audit trail.** Because inline shapes don't persist, it
   isn't possible to reconstruct "which shapes validated which
   commit" from ledger history. If auditability matters, store
@@ -735,9 +807,9 @@ SHACL validation runs consistently on every write surface:
 - JSON-LD / SPARQL transactions (`fluree insert`, `fluree upsert`, `fluree update`)
 - Turtle / TriG ingest (`fluree insert-turtle`, `stage_turtle_insert`)
 - Commit replay (`push_commits_with_handle`, followers applying upstream commits)
-- Branch operations (`fluree branch merge`, `rebase`, `revert`): the merged, replayed, or inverted state is validated against the target branch's shapes before anything is written, and `fluree branch diff` reports the same outcome ahead of time
+- Branch operations (`fluree branch merge`, `rebase`, `revert`): the merged, replayed, or inverted state is validated against the target branch's shapes before anything is written, and `fluree branch diff` reports the same outcome ahead of time. A fast-forward merge is validated too when the target's config enables SHACL: the target checks the change it adopts as it would a transaction's
 
-All of these routes go through the same post-stage helper, so the ledger's configured SHACL posture (enable/disable, mode, per-graph, shapes source) applies uniformly. A `take-both` merge whose "both values coexist" resolution would breach a `sh:maxCount`, or a revert that removes a value a `sh:minCount` requires, is rejected with the same report a transaction gets.
+All of these routes go through the same post-stage helper, so the ledger's configured SHACL posture (enable/disable, mode, per-graph, shapes source) applies uniformly, and none of them validates where config leaves SHACL off. A shapes source (including one in another ledger) is resolved only when a graph the write touches has SHACL enabled. A `take-both` merge whose "both values coexist" resolution would breach a `sh:maxCount`, or a revert that removes a value a `sh:minCount` requires, is rejected with the same report a transaction gets.
 
 ## Validation reports (`fluree validate`)
 
@@ -832,6 +904,7 @@ Because shapes live as regular RDF in your ledger:
 
 ## Related documentation
 
+- [SHACL across named graphs](cookbook-shacl-across-graphs.md) — Walkthrough: validating records against a shared catalog in another graph
 - [Setting Groups — SHACL](../ledger-config/setting-groups.md#shacl-defaults) — Configuration reference for `f:shaclDefaults`
 - [Override Control](../ledger-config/override-control.md) — Per-graph / query-time override rules
 - [Writing Config Data](../ledger-config/writing-config.md) — How to transact into the config graph

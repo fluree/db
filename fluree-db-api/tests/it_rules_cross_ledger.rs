@@ -233,6 +233,7 @@ fn parsed_rules_fails_closed_on_malformed_json() {
             model_ledger_id: "test/m:main".into(),
             graph_iri: "http://example.org/rules".into(),
             resolved_t: 1,
+            commit_id: None,
         },
         rules: vec!["{ valid: false".into()],
     };

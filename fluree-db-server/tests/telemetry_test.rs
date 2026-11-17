@@ -1,9 +1,10 @@
 //! Integration tests for telemetry functionality.
 //!
 //! These tests verify that `create_request_span` and `set_span_error_code` produce
-//! the expected span metadata. They use a local `SpanCaptureLayer` (via `set_default`)
-//! rather than `init_logging` (which sets a global subscriber) to avoid global state
-//! conflicts between tests.
+//! the expected span metadata. They use a local `SpanCaptureLayer` installed as the
+//! thread's default (via `fluree_test_support::scoped_default`) rather than
+//! `init_logging` (which sets a global subscriber) to avoid global state conflicts
+//! between tests.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,7 +35,7 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
     }
     let events = Events::default();
     let subscriber = tracing_subscriber::registry().with(EventCapture(events.clone()));
-    tracing::subscriber::with_default(subscriber, || {
+    fluree_test_support::with_scoped_default(subscriber, || {
         for mode in [
             "controller",
             "delegated",
@@ -69,16 +70,16 @@ fn authorization_events_record_scope_decisions_without_policy_payloads() {
                 subject: Some("user".into()),
                 identity,
                 read_all: false,
-                read_ledgers: ["allowed:main".into()].into(),
+                read_ledgers: [id("allowed:main")].into(),
                 write_all: false,
-                write_ledgers: ["allowed:main".into()].into(),
+                write_ledgers: [id("allowed:main")].into(),
                 expires_unix: u64::MAX,
                 policy_authorization: authorization,
             };
-            assert!(principal.can_read("allowed:main"));
-            assert!(!principal.can_read("denied:main"));
-            assert!(principal.can_write("allowed:main"));
-            assert!(!principal.can_write("denied:main"));
+            assert!(principal.can_read(&id("allowed:main")));
+            assert!(!principal.can_read(&id("denied:main")));
+            assert!(principal.can_write(&id("allowed:main")));
+            assert!(!principal.can_write(&id("denied:main")));
         }
     });
     let events = events.lock().unwrap();
@@ -220,7 +221,7 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Capture {
 fn init_capture() -> (Store, tracing::subscriber::DefaultGuard) {
     let store = Store::default();
     let sub = tracing_subscriber::Registry::default().with(Capture(store.clone()));
-    let guard = tracing::subscriber::set_default(sub);
+    let guard = fluree_test_support::scoped_default(sub);
     (store, guard)
 }
 
@@ -405,4 +406,7 @@ async fn error_code_is_empty_on_success() {
         error_code.is_none() || error_code == Some(&String::new()),
         "error_code should be empty/absent on success path, got: {error_code:?}"
     );
+}
+fn id(s: &str) -> fluree_db_api::LedgerId {
+    fluree_db_api::LedgerId::parse(s).unwrap()
 }

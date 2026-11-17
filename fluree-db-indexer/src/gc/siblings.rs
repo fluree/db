@@ -9,7 +9,7 @@
 use crate::error::Result;
 use crate::gc::collector::{is_shared_across_branches, PrevIndexChainWalk};
 use crate::gc::{BranchIndexHead, SharedBlobPolicy};
-use fluree_db_core::{ContentId, StorageBackend};
+use fluree_db_core::{ContentId, LedgerId, StorageBackend};
 use fluree_db_nameservice::{NameServiceLookup, NsRecord};
 use std::collections::{BTreeSet, HashSet};
 use std::path::Path;
@@ -18,22 +18,10 @@ use std::path::Path;
 /// need them: every record sharing the ledger name except `ledger_id` itself,
 /// **retracted branches included**. A soft-dropped branch is restorable
 /// until its name is purged, so its dictionaries must survive.
-pub fn siblings_of(records: &[NsRecord], ledger_id: &str) -> Vec<BranchIndexHead> {
-    let name = records
-        .iter()
-        .find(|r| r.ledger_id == ledger_id)
-        .map(|r| r.name.clone())
-        .or_else(|| {
-            fluree_db_core::ledger_id::split_ledger_id(ledger_id)
-                .ok()
-                .map(|(name, _)| name)
-        });
-    let Some(name) = name else {
-        return Vec::new();
-    };
+pub fn siblings_of(records: &[NsRecord], ledger_id: &LedgerId) -> Vec<BranchIndexHead> {
     records
         .iter()
-        .filter(|r| r.name == name && r.ledger_id != ledger_id)
+        .filter(|r| r.ledger_id.name() == ledger_id.name() && r.ledger_id != *ledger_id)
         .map(|r| BranchIndexHead {
             ledger_id: r.ledger_id.clone(),
             index_head_id: r.index_head_id.clone(),
@@ -95,19 +83,12 @@ pub async fn shared_refs_of_branches(
 /// sibling would release blobs it still reads.
 pub async fn current_sibling_heads(
     nameservice: &(impl NameServiceLookup + ?Sized),
-    ledger_id: &str,
-    candidates: &[String],
+    ledger_id: &LedgerId,
+    candidates: &[LedgerId],
 ) -> fluree_db_nameservice::Result<Vec<BranchIndexHead>> {
-    let Ok((name, _)) = fluree_db_core::ledger_id::split_ledger_id(ledger_id) else {
-        return Ok(Vec::new());
-    };
-    let siblings: BTreeSet<&String> = candidates
+    let siblings: BTreeSet<&LedgerId> = candidates
         .iter()
-        .filter(|id| {
-            id.as_str() != ledger_id
-                && fluree_db_core::ledger_id::split_ledger_id(id)
-                    .is_ok_and(|(candidate, _)| candidate == name)
-        })
+        .filter(|id| *id != ledger_id && id.name() == ledger_id.name())
         .collect();
     let mut heads = Vec::with_capacity(siblings.len());
     for id in siblings {
@@ -131,7 +112,7 @@ pub async fn current_sibling_heads(
 pub async fn shared_blob_policy_for(
     backend: &StorageBackend,
     siblings: &[BranchIndexHead],
-    ledger_id: &str,
+    ledger_id: &LedgerId,
     artifact_cache_dir: Option<&Path>,
 ) -> SharedBlobPolicy {
     if siblings.is_empty() {
@@ -142,7 +123,7 @@ pub async fn shared_blob_policy_for(
     match shared_refs_of_branches(backend, siblings, artifact_cache_dir).await {
         Ok(referenced_elsewhere) => {
             tracing::debug!(
-                ledger_id,
+                ledger_id = %ledger_id,
                 siblings = siblings.len(),
                 referenced_elsewhere = referenced_elsewhere.len(),
                 "sibling branches' dictionary refs collected"
@@ -153,7 +134,7 @@ pub async fn shared_blob_policy_for(
         }
         Err(e) => {
             tracing::warn!(
-                ledger_id,
+                ledger_id = %ledger_id,
                 error = %e,
                 "could not read a sibling branch's index chain; deferring shared blobs this pass"
             );
@@ -165,14 +146,17 @@ pub async fn shared_blob_policy_for(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn id(s: &str) -> LedgerId {
+        LedgerId::parse(s).unwrap()
+    }
     use crate::gc::test_support::{cid_and_addr_for, minimal_fir6_for};
     use fluree_db_binary_index::BinaryPrevIndexRef;
     use fluree_db_core::{ContentKind, DictKind, MemoryStorage, StorageWrite};
     use std::sync::Arc;
 
     fn record(ledger_id: &str, head: Option<ContentId>, retracted: bool) -> NsRecord {
-        let (name, branch) = fluree_db_core::ledger_id::split_ledger_id(ledger_id).unwrap();
-        let mut record = NsRecord::new(name, branch);
+        let mut record = NsRecord::new(ledger_id);
         record.index_head_id = head;
         record.retracted = retracted;
         record
@@ -197,7 +181,7 @@ mod tests {
             record("db:old", None, true),
             record("other:main", None, false),
         ];
-        let mut siblings: Vec<String> = siblings_of(&records, "db:main")
+        let mut siblings: Vec<LedgerId> = siblings_of(&records, &id("db:main"))
             .into_iter()
             .map(|b| b.ledger_id)
             .collect();
@@ -221,7 +205,7 @@ mod tests {
         ns.publish_index("db:dev", 7, &head).await.unwrap();
         ns.retract("db:old").await.unwrap();
 
-        let candidates: Vec<String> = [
+        let candidates: Vec<LedgerId> = [
             "db:dev",
             "db:dev",
             "db:main",
@@ -229,9 +213,9 @@ mod tests {
             "db:gone",
             "other:main",
         ]
-        .map(String::from)
+        .map(id)
         .to_vec();
-        let mut heads = current_sibling_heads(&ns, "db:main", &candidates)
+        let mut heads = current_sibling_heads(&ns, &id("db:main"), &candidates)
             .await
             .unwrap();
         heads.sort_by(|a, b| a.ledger_id.cmp(&b.ledger_id));
@@ -303,7 +287,7 @@ mod tests {
         let refs = shared_refs_of_branches(
             &backend,
             &[BranchIndexHead {
-                ledger_id: "db:dev".into(),
+                ledger_id: id("db:dev"),
                 index_head_id: Some(dev_t3),
             }],
             None,
@@ -331,7 +315,7 @@ mod tests {
 
         let alone = vec![record("db:main", None, false)];
         assert!(matches!(
-            shared_blob_policy_for(&backend, &siblings_of(&alone, "db:main"), "db:main", None).await,
+            shared_blob_policy_for(&backend, &siblings_of(&alone, &id("db:main")), &id("db:main"), None).await,
             SharedBlobPolicy::Release { referenced_elsewhere } if referenced_elsewhere.is_empty()
         ));
 
@@ -344,8 +328,8 @@ mod tests {
         assert!(matches!(
             shared_blob_policy_for(
                 &backend,
-                &siblings_of(&with_unreadable, "db:main"),
-                "db:main",
+                &siblings_of(&with_unreadable, &id("db:main")),
+                &id("db:main"),
                 None
             )
             .await,

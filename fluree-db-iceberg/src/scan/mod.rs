@@ -13,8 +13,8 @@ pub mod pruning;
 pub mod send_planner;
 pub mod topk;
 
-pub use planner::{FileScanTask, ScanConfig, ScanPlan, ScanPlanner};
-pub use predicate::{ComparisonOp, Expression, LiteralValue};
+pub use planner::{FileScanTask, KeptFiles, ScanConfig, ScanPlan, ScanPlanner};
+pub use predicate::{ComparisonOp, ExactPredicate, ExactRowFilter, Expression, LiteralValue};
 pub use pruning::{can_contain_file, can_contain_partition};
 #[cfg(feature = "aws")]
 pub use send_planner::SendScanPlanner;

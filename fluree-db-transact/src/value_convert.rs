@@ -74,10 +74,9 @@ pub(crate) fn convert_string_literal(
         | xsd::POSITIVE_INTEGER
         | xsd::NON_POSITIVE_INTEGER
         | xsd::NEGATIVE_INTEGER => parse_integer(value),
-        xsd::DOUBLE | xsd::FLOAT => value
-            .parse::<f64>()
+        xsd::DOUBLE | xsd::FLOAT => fluree_graph_ir::parse_xsd_double(value)
             .map(FlakeValue::Double)
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
+            .unwrap_or_else(|| FlakeValue::String(value.to_string())),
         xsd::DECIMAL => value
             .parse::<bigdecimal::BigDecimal>()
             .map(|d| FlakeValue::Decimal(Box::new(d)))
@@ -210,10 +209,9 @@ pub fn parse_xsd_lexical(value: &str, dt_iri: &str) -> Result<Option<FlakeValue>
             }
             other => other,
         },
-        xsd::DOUBLE | xsd::FLOAT => value
-            .parse::<f64>()
+        xsd::DOUBLE | xsd::FLOAT => fluree_graph_ir::parse_xsd_double(value)
             .map(FlakeValue::Double)
-            .map_err(|e| format!("invalid {dt_iri} lexical `{value}`: {e}"))?,
+            .ok_or_else(|| format!("invalid {dt_iri} lexical `{value}`"))?,
         xsd::DECIMAL => value
             .parse::<bigdecimal::BigDecimal>()
             .map(|d| FlakeValue::Decimal(Box::new(d)))

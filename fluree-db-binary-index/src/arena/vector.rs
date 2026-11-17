@@ -42,6 +42,7 @@
 //! }
 //! ```
 
+use fluree_db_core::vector::VectorError;
 use serde::{Deserialize, Serialize};
 use std::io;
 use std::ops::ControlFlow;
@@ -115,31 +116,13 @@ impl VectorArena {
 
     /// Insert an f32 vector, returning its handle.
     ///
-    /// Non-finite values (NaN, ±Inf) are rejected. The coercion layer
-    /// should have already validated this, but we check here as a safety net.
-    pub fn insert_f32(&mut self, vec: &[f32]) -> Result<u32, String> {
-        if vec.is_empty() {
-            return Err("vector must not be empty".into());
-        }
-        // Reject non-finite elements
-        if let Some(pos) = vec.iter().position(|v| !v.is_finite()) {
-            return Err(format!(
-                "vector element [{}] is not finite: {}",
-                pos, vec[pos]
-            ));
-        }
-        if self.dims == 0 {
-            if vec.len() > u16::MAX as usize {
-                return Err(format!("vector dims {} exceeds u16::MAX", vec.len()));
-            }
-            self.dims = vec.len() as u16;
-        } else if vec.len() != self.dims as usize {
-            return Err(format!(
-                "vector dims mismatch: expected {}, got {}",
-                self.dims,
-                vec.len()
-            ));
-        }
+    /// Refuses what [`fluree_db_core::vector::check_vector`] refuses: an
+    /// empty vector, more than `u16::MAX` elements, a length other than the
+    /// arena's, or a non-finite element. The write paths check the same rule
+    /// before they commit.
+    pub fn insert_f32(&mut self, vec: &[f32]) -> Result<u32, VectorError> {
+        let dims = (self.dims != 0).then_some(self.dims);
+        self.dims = fluree_db_core::vector::check_vector(dims, vec.iter().copied())?;
 
         // Check unit norm
         if self.all_unit_norm {
@@ -156,7 +139,7 @@ impl VectorArena {
     }
 
     /// Insert an f64 vector by downcasting to f32, returning its handle.
-    pub fn insert_f64(&mut self, vec: &[f64]) -> Result<u32, String> {
+    pub fn insert_f64(&mut self, vec: &[f64]) -> Result<u32, VectorError> {
         let f32_vec: Vec<f32> = vec.iter().map(|&x| x as f32).collect();
         self.insert_f32(&f32_vec)
     }
@@ -716,12 +699,10 @@ impl LazyVectorArena {
             return Ok(shard);
         }
         let source = self.get_source(shard_idx)?;
-        self.ensure_on_disk(source, shard_idx)?;
-        let path = source.path.clone();
         let shard = self
             .cache
             .try_get_or_load_vector_shard(source.cid_hash, || {
-                let bytes = std::fs::read(&path)?;
+                let bytes = self.shard_bytes(source, shard_idx)?;
                 let parsed = read_vector_shard_from_bytes(&bytes)?;
                 Ok(Arc::new(parsed))
             })?;
@@ -741,8 +722,7 @@ impl LazyVectorArena {
             return Ok(shard);
         }
         let source = self.get_source(shard_idx)?;
-        self.ensure_on_disk(source, shard_idx)?;
-        let bytes = std::fs::read(&source.path)?;
+        let bytes = self.shard_bytes(source, shard_idx)?;
         let shard = Arc::new(read_vector_shard_from_bytes(&bytes)?);
         self.validate_shard_dims(&shard, shard_idx)?;
         Ok(shard)
@@ -792,16 +772,18 @@ impl LazyVectorArena {
         })
     }
 
-    /// Ensure a shard file exists on local disk, fetching from remote if needed.
+    /// Bytes of shard `idx`: read from its local file when one exists, else
+    /// fetched from the CAS.
     ///
-    /// For FileStorage (all shards `on_disk: true` at construction), this is
-    /// a fast Acquire-load no-op. For remote backends, uses the same sync→async
-    /// bridge as `ensure_index_leaf_cached`: spawns an OS thread that calls
-    /// `tokio::Handle::block_on(cs.get(&cid))`, writes the result to disk,
-    /// then flips `on_disk`.
-    fn ensure_on_disk(&self, source: &ShardSource, idx: usize) -> io::Result<()> {
+    /// For FileStorage (all shards `on_disk: true` at construction) this is
+    /// a fast Acquire-load and a file read. For remote backends it uses the
+    /// same sync→async bridge as `ensure_index_leaf_cached`, then keeps the
+    /// fetched shard on disk for the next miss — unless the store forbids a
+    /// plaintext copy outside it (encrypted storage), in which case the
+    /// bytes stay in memory and the next miss fetches again.
+    fn shard_bytes(&self, source: &ShardSource, idx: usize) -> io::Result<Vec<u8>> {
         if source.on_disk.load(Ordering::Acquire) {
-            return Ok(());
+            return std::fs::read(&source.path);
         }
         // Shard not on disk — try lazy fetch from remote CAS.
         let cas = self.cas.as_ref().ok_or_else(|| {
@@ -827,7 +809,6 @@ impl LazyVectorArena {
         // search against remote (S3) stores.
         let cs = Arc::clone(cas);
         let cid = cid.clone();
-        let path = source.path.clone();
         // Bound the fetch with the same `cas_sync_timeout()` the index-leaf and
         // dict-pack bridges use, so a stalled remote (S3) GET fails fast instead
         // of blocking the waiting thread indefinitely.
@@ -849,19 +830,22 @@ impl LazyVectorArena {
                 fut.await.map_err(|e| io::Error::other(e.to_string()))
             }
         })?;
-        if let Some(parent) = path.parent() {
+        if !crate::read::artifact_cache::uses_disk_cache(cas.as_ref()) {
+            return Ok(bytes);
+        }
+        if let Some(parent) = source.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         // Publish atomically: write to a unique temp file in the same directory,
         // then rename onto the final path. Without this, two concurrent
-        // `ensure_on_disk` calls for the same shard (e.g. a cached `lookup_vector`
-        // racing a transient streaming scan) both `fs::write` the same path, and a
+        // fetches for the same shard (e.g. a cached `lookup_vector` racing a
+        // transient streaming scan) both `fs::write` the same path, and a
         // reader can observe a half-written file — surfacing as
         // "vector shard too small for header". A POSIX rename is atomic, so a
         // reader always sees a complete shard once this returns.
-        write_atomic(&path, &bytes)?;
+        write_atomic(&source.path, &bytes)?;
         source.on_disk.store(true, Ordering::Release);
-        Ok(())
+        Ok(bytes)
     }
 
     fn validate_shard_dims(&self, shard: &VectorShard, idx: usize) -> io::Result<()> {
@@ -1064,7 +1048,13 @@ mod tests {
         let mut arena = VectorArena::new();
         arena.insert_f32(&[1.0, 2.0, 3.0]).unwrap();
         let err = arena.insert_f32(&[1.0, 2.0]).unwrap_err();
-        assert!(err.contains("dims mismatch"));
+        assert_eq!(
+            err,
+            VectorError::LengthMismatch {
+                expected: 3,
+                len: 2
+            }
+        );
     }
 
     #[test]
@@ -1192,18 +1182,27 @@ mod tests {
     fn test_nan_rejected() {
         let mut arena = VectorArena::new();
         let err = arena.insert_f32(&[1.0, f32::NAN, 3.0]).unwrap_err();
-        assert!(err.contains("not finite"), "got: {err}");
+        assert!(
+            matches!(err, VectorError::NotFinite { index: 1, .. }),
+            "got: {err}"
+        );
     }
 
     #[test]
     fn test_infinity_rejected() {
         let mut arena = VectorArena::new();
         let err = arena.insert_f32(&[f32::INFINITY, 0.0]).unwrap_err();
-        assert!(err.contains("not finite"), "got: {err}");
+        assert!(
+            matches!(err, VectorError::NotFinite { index: 0, .. }),
+            "got: {err}"
+        );
 
         let mut arena2 = VectorArena::new();
         let err2 = arena2.insert_f32(&[0.0, f32::NEG_INFINITY]).unwrap_err();
-        assert!(err2.contains("not finite"), "got: {err2}");
+        assert!(
+            matches!(err2, VectorError::NotFinite { index: 1, .. }),
+            "got: {err2}"
+        );
     }
 
     #[test]
@@ -1211,7 +1210,10 @@ mod tests {
         let mut arena = VectorArena::new();
         // f64::MAX overflows to f32::INFINITY
         let err = arena.insert_f64(&[1.0, f64::MAX]).unwrap_err();
-        assert!(err.contains("not finite"), "got: {err}");
+        assert!(
+            matches!(err, VectorError::NotFinite { index: 1, .. }),
+            "got: {err}"
+        );
     }
 
     // ========================================================================

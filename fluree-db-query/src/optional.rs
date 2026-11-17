@@ -2,7 +2,8 @@
 //!
 //! This module provides `OptionalOperator` which implements left outer join
 //! (OPTIONAL) semantics. When the optional pattern has no matches, the operator
-//! emits `Binding::Poisoned` for optional-only variables rather than dropping the row.
+//! keeps the row and fills optional-only variables per the query's
+//! [`UnmatchedOptional`] mode.
 //!
 //! # Correlated Optional Builder
 //!
@@ -13,29 +14,33 @@
 //! - Multi-pattern OPTIONAL clauses with joins, filters, property-joins
 //! - Arbitrary operator subtrees planned from `Vec<Pattern>`
 //!
-//! # Poison Binding Semantics
+//! # Unmatched-variable semantics
 //!
-//! A key feature of this implementation is `Binding::Poisoned`:
-//! - When an OPTIONAL clause has no matches, variables that are unique to
-//!   the optional side are marked as Poisoned (not Unbound)
-//! - Poisoned bindings **block** future pattern matching - any pattern that
-//!   uses a Poisoned variable yields no matches (not "match anything")
-//! - This matches SPARQL OPTIONAL semantics where unbound optional vars
-//!   prevent subsequent patterns from matching
+//! What an unmatched OPTIONAL writes depends on the surface language
+//! ([`PlanningContext::unmatched_optional`]):
+//! - SPARQL / JSON-LD write `Binding::Unbound` (§18.2.4). An unbound variable
+//!   is compatible with anything, so a later OPTIONAL or join may still bind it.
+//! - Cypher writes `Binding::Poisoned`, its null: any later pattern that uses
+//!   the variable matches nothing.
 
-use crate::binding::{Batch, Binding};
+use crate::binding::{Batch, Binding, UnmatchedOptional};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
-use crate::fast_path_common::{subject_probe_lane_plan, ProbeLanePlan, ProbeOps};
+use crate::fast_path_common::{
+    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, LaneOutput,
+    ObjectProbeOps, ProbeLanePlan, ProbeOps,
+};
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
 use crate::join::{
-    batched_subject_probe_binary, BindInstruction, PatternPosition, SubjectProbeParams,
+    batched_subject_probe_binary, charge_probe_rows, for_each_object_probe_match,
+    substitute_binding, BindInstruction, PatternPosition, SubjectProbeParams, Substitution,
     UnifyInstruction,
 };
-use crate::object_binding::{equality_norm, EqualityNorm};
+use crate::object_binding::{equality_norm, same_term, EqualityNorm, TermDicts};
+use crate::operator::flush::{pull_window, FlushSchedule};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
 };
@@ -44,8 +49,9 @@ use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::clock::Instant;
-use fluree_db_core::StatsView;
+use fluree_db_core::{ObjKind, Sid, StatsView};
 use lru::LruCache;
+use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
@@ -53,6 +59,10 @@ use std::sync::Arc;
 /// Keep OPTIONAL diagnostics concise during perf captures by surfacing only
 /// expensive batches or obvious cache/planning churn at debug level.
 const OPTIONAL_DEBUG_MIN_WORK: usize = 8;
+/// Routing stamp of the bound-object lane (`?x <p> ?o`, `?o` from the
+/// required side), so a test can pin that the lane answered rather than the
+/// per-row lookups it replaces.
+pub(crate) const OBJECT_PROBE_SITE: &str = "optional_object_probe";
 const OPTIONAL_DEBUG_MIN_MS: u64 = 25;
 
 /// Per-row result of a batched optional build: `(row_index, batches)`.
@@ -98,14 +108,21 @@ pub trait OptionalBuilder: Send + Sync {
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<BoxedOperator>>;
 
-    /// Optionally build *and execute* all remaining required rows in the current
-    /// batch in one pass, returning each row's optional-side result batches.
+    /// Optionally build *and execute* the remaining required rows in the current
+    /// batch in one pass, returning each answered row's optional-side result
+    /// batches.
     ///
     /// Builders override this to implement batched paths for hot correlated
     /// OPTIONAL shapes — either synchronous index probes (see
     /// `GroupedPatternOptionalBuilder`) or a single seeded subplan execution
     /// hash-partitioned across rows (see `PlanTreeOptionalBuilder`). The method
     /// is `async` so the latter can drive a real operator subtree.
+    ///
+    /// A builder answers the rows it can, in row order, and leaves out a row it
+    /// cannot (an unbound or unresolvable correlation value, say): the operator
+    /// answers that row per row and keeps the lane's answers for the rest. The
+    /// operator offers each required batch once, so a row left out is never
+    /// walked again. `None` answers no row.
     /// Default: no batched execution (operator falls back to per-row `build`).
     async fn build_batch(
         &self,
@@ -129,6 +146,11 @@ pub trait OptionalBuilder: Send + Sync {
     /// coalescing and must keep streaming.
     fn supports_seed_coalescing(&self, _ctx: &ExecutionContext<'_>) -> bool {
         false
+    }
+
+    /// Most driving rows one coalesced seed holds.
+    fn seed_coalesce_cap(&self) -> usize {
+        optional_seed_coalesce_cap()
     }
 
     /// Optional cache key for correlated OPTIONAL evaluation.
@@ -156,6 +178,53 @@ pub trait OptionalBuilder: Send + Sync {
 
     /// Get instructions for unification checks on shared vars
     fn unify_instructions(&self) -> &[UnifyInstruction];
+
+    /// What optional-only variables are bound to when nothing matches.
+    fn unmatched_optional(&self) -> UnmatchedOptional;
+}
+
+/// Encoded id of a subject binding, for the batched probes; `None` when the
+/// binding has none.
+fn resolve_subject_id(binding: &Binding, ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+    match binding {
+        Binding::EncodedSid { s_id, .. } => Ok(ctx.binary_store.is_some().then_some(*s_id)),
+        // Subjects minted after the last index resolve to novelty s_ids, the
+        // same id space the overlay ops are translated into. The dictionaries
+        // are read only for a decoded subject.
+        Binding::Sid { sid, .. } => match TermDicts::of(ctx) {
+            Some(dicts) => dicts
+                .subject_id(sid.namespace_code, &sid.name)
+                .map_err(|e| QueryError::execution(format!("subject id lookup: {e}"))),
+            None => Ok(None),
+        },
+        _ => Ok(None),
+    }
+}
+
+/// The rows of a window a batched lane leaves to the per-row path, flagged
+/// by slot. The flags are allocated at the first such row, so a window the
+/// lane answers whole allocates nothing.
+#[derive(Default)]
+struct LeftRows {
+    flags: Vec<bool>,
+    count: usize,
+}
+
+impl LeftRows {
+    /// Leave `slot` of a `slots`-row window to the per-row path.
+    fn leave(&mut self, slot: usize, slots: usize) {
+        if self.flags.is_empty() {
+            self.flags = vec![false; slots];
+        }
+        self.flags[slot] = true;
+        self.count += 1;
+    }
+
+    /// Whether `slot` was left to the per-row path.
+    #[inline]
+    fn contains(&self, slot: usize) -> bool {
+        self.flags.get(slot).copied().unwrap_or(false)
+    }
 }
 
 /// Builder for single-pattern OPTIONAL
@@ -298,183 +367,307 @@ impl PatternOptionalBuilder {
     /// True when the pattern's object variable is also a REQUIRED variable, so
     /// the per-row object substitution is load-bearing.
     ///
-    /// The batched probe keys on `(subject, predicate)` and reads the object
-    /// slot off the plan-time template, never off the row — sound while the
-    /// object variable is optional-only, wrong the moment the required side
-    /// carries values for it. Left in, it answered one bare existence row per
-    /// matching triple: a required row binding the variable was duplicated
-    /// instead of filtered, and a required row leaving it unbound was passed
-    /// through instead of extended. The per-row `build` path substitutes the
-    /// row's own object (and leaves an unbound one free), so it is exactly
-    /// right here; this shape declines the probe and takes it.
+    /// The subject-keyed batched probe keys on `(subject, predicate)` and reads
+    /// the object slot off the plan-time template, never off the row — sound
+    /// while the object variable is optional-only, wrong the moment the
+    /// required side carries values for it. Left in, it answered one bare
+    /// existence row per matching triple: a required row binding the variable
+    /// was duplicated instead of filtered, and a required row leaving it
+    /// unbound was passed through instead of extended. That shape takes the
+    /// bound-object probe instead when the object is a ref the subject of the
+    /// pattern is free for, and the per-row `build` path otherwise, which
+    /// substitutes the row's own object in whatever form it arrives (and
+    /// leaves an unbound one free).
     ///
     /// The alternative — widen the probe to materialise the object and let
     /// `unify_check` filter — was declined because `Binding`'s `PartialEq`
     /// answers `false`, not an error, across representations (`EncodedSid` vs
-    /// `Sid`, `Sid` vs `Iri`, `EncodedLit` vs `Lit`), so a cross-representation
-    /// object correlation would silently DROP rows; #1729 is a live instance on
-    /// the literal/datatype arm. Note this narrows the exposure rather than
-    /// removing it: `substitute_pattern` leaves a late-materialised
-    /// `EncodedSid`/`EncodedPid`/`EncodedLit` object free, and `unify_check`'s
-    /// `left_val == right_val` is then what enforces the correlation on the
-    /// per-row path too.
+    /// `Sid`, `EncodedPid` vs `EncodedSid`, `EncodedLit` vs `Lit`), so a
+    /// cross-representation object correlation would silently DROP rows; #1729
+    /// is a live instance on the literal/datatype arm.
     fn object_var_shared_with_required(&self) -> bool {
         matches!(&self.pattern.o, Term::Var(v) if !self.optional_only_vars.contains(v))
     }
 
-    fn resolve_subject_id(
+    /// The required column of a pattern the bound-object lane can answer:
+    /// `?x <p> ?o` correlated on its object alone — `?o` comes from the
+    /// required side, `?x` is optional-only, `<p>` is not correlated, and no
+    /// datatype constraint narrows the object.
+    fn object_probe_column(&self) -> Option<usize> {
+        if self.pattern.dtc.is_some() {
+            return None;
+        }
+        let Ref::Var(subject) = &self.pattern.s else {
+            return None;
+        };
+        if !self.optional_only_vars.contains(subject) {
+            return None;
+        }
+        let mut object_col = None;
+        for instr in &self.bind_instructions {
+            match instr.position {
+                PatternPosition::Object => object_col = Some(instr.left_col),
+                PatternPosition::Subject | PatternPosition::Predicate => return None,
+            }
+        }
+        object_col
+    }
+
+    /// Runtime admission of the bound-object lane: single-ledger binary
+    /// execution that may emit encoded subjects (the lane answers with
+    /// `EncodedSid`, as the join's bound-object lane does), a constant
+    /// predicate, and an overlay the probe can merge.
+    fn object_probe_plan(
         &self,
-        required_batch: &Batch,
-        row: usize,
-        subject_left_col: usize,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<u64>> {
-        let binding = required_batch.get_by_col(row, subject_left_col);
-        let Some(store) = ctx.binary_store.as_deref() else {
+    ) -> Result<
+        Option<(
+            Arc<fluree_db_binary_index::BinaryIndexStore>,
+            Sid,
+            ProbeLanePlan,
+        )>,
+    > {
+        if ctx.is_multi_ledger() || ctx.eager_materialization {
+            return Ok(None);
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
             return Ok(None);
         };
-        match binding {
-            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => {
-                // Persisted reverse dict first, then DictNovelty — subjects
-                // minted after the last index resolve to novelty s_ids, the
-                // same id space the overlay ops are translated into.
-                let persisted = store
-                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-                Ok(persisted.or_else(|| {
-                    ctx.dict_novelty
-                        .as_ref()
-                        .filter(|dn| dn.is_initialized())
-                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-                }))
+        let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
+            return Ok(None);
+        };
+        Ok(
+            match object_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)? {
+                ProbeLanePlan::Decline => None,
+                plan => Some((Arc::clone(store), pred_sid, plan)),
+            },
+        )
+    }
+
+    /// The bound-object lane: one sorted POST pass over every required row's
+    /// object answers the whole batch, binding the optional-only subject.
+    /// Without it each row ran its own lookup, and before the substitution
+    /// covered encoded objects, its own scan of the whole predicate (#1973).
+    ///
+    /// Declines — to the per-row path, which handles every form — when the
+    /// lane is not admitted. Leaves to the per-row path each row whose object
+    /// is not a ref with an id: an unbound object (the triple's object is then
+    /// free), a literal (the probe reads only ref objects), or an
+    /// IRI the dictionaries do not hold.
+    fn build_object_probe_batch(
+        &self,
+        required_batch: &Batch,
+        start_row: usize,
+        object_left_col: usize,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Vec<OptionalBatchRow>>> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        let declined = || {
+            stamp_fast_path(
+                OBJECT_PROBE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
+            Ok(None)
+        };
+        let Some((store, pred_sid, lane_plan)) = self.object_probe_plan(ctx)? else {
+            return declined();
+        };
+        let Ref::Var(subject_var) = self.pattern.s else {
+            return declined();
+        };
+
+        let slots = required_batch.len() - start_row;
+        let mut object_slots: FxHashMap<u64, Vec<usize>> = FxHashMap::default();
+        let mut left = LeftRows::default();
+        for row in start_row..required_batch.len() {
+            if self.has_poisoned_binding(required_batch, row) {
+                // A poisoned correlation value matches nothing.
+                continue;
             }
-            _ => Ok(None),
+            match resolve_subject_id(required_batch.get_by_col(row, object_left_col), ctx)? {
+                Some(o_id) => object_slots.entry(o_id).or_default().push(row - start_row),
+                None => left.leave(row - start_row, slots),
+            }
+        }
+        if left.count == slots {
+            return declined();
+        }
+
+        let mut objects: Vec<u64> = object_slots.keys().copied().collect();
+        objects.sort_unstable();
+        let mut values: Vec<Vec<Binding>> = vec![Vec::new(); slots];
+        let mut matched = 0usize;
+        let merging = matches!(lane_plan, ProbeLanePlan::Merge(_));
+        let branch = branch_or_none(
+            &store,
+            ctx.binary_g_id,
+            fluree_db_binary_index::RunSortOrder::Post,
+            merging,
+        )?;
+        let p_id = p_id_or_none(&store, &pred_sid, || Ok(merging))?;
+        if let (Some(p_id), Some(branch)) = (p_id, branch) {
+            let slots_by_object: Vec<&[usize]> =
+                objects.iter().map(|o| object_slots[o].as_slice()).collect();
+            let ref_type = fluree_db_core::o_type::OType::IRI_REF.as_u16();
+            let mut probe_ops = match &lane_plan {
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::for_type(ops, ref_type),
+                _ => None,
+            };
+            for_each_object_probe_match(
+                ctx,
+                &store,
+                branch,
+                (p_id, ref_type),
+                &objects,
+                probe_ops.as_mut(),
+                |obj_idx, s_ids| {
+                    for &slot in slots_by_object[obj_idx] {
+                        values[slot].extend(s_ids.iter().copied().map(Binding::encoded_sid));
+                        matched += s_ids.len();
+                    }
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )?;
+        }
+        // Lanes that read leaflets directly pay their rows' fuel here.
+        charge_probe_rows(ctx, matched)?;
+        stamp_fast_path(OBJECT_PROBE_SITE, FastPathOutcome::Proceed);
+        if left.count > 0 {
+            // The rows left to the per-row path are this window's fallback.
+            stamp_fast_path(
+                OBJECT_PROBE_SITE,
+                FastPathOutcome::Fallback(FastPathFallback::GateDeclined),
+            );
+        }
+
+        let schema: Arc<[VarId]> = Arc::from(vec![subject_var].into_boxed_slice());
+        let mut pending = Vec::with_capacity(slots - left.count);
+        for (slot, subjects) in values.into_iter().enumerate() {
+            if left.contains(slot) {
+                continue;
+            }
+            let optional_batches = if subjects.is_empty() {
+                Vec::new()
+            } else {
+                vec![Batch::new(schema.clone(), vec![subjects])?]
+            };
+            pending.push((start_row + slot, optional_batches));
+        }
+        tracing::debug!(
+            rows = pending.len(),
+            per_row = left.count,
+            objects = objects.len(),
+            matched,
+            "optional bound-object probe complete"
+        );
+        Ok(Some(pending))
+    }
+
+    /// Whether this row's object value is left to `unify_check` instead of
+    /// decoded into the scan: an encoded object when the row also binds the
+    /// subject. The scan is then already a seek on that subject, and decoding
+    /// the object (a dictionary lookup per row) would only narrow a lookup
+    /// that is already narrow; `unify_check` compares it with `same_term`,
+    /// which treats the encoded and decoded forms of one term as one. That is
+    /// the substitution's own match for every encoded value but a numeric
+    /// one: a substituted numeric matches by value across numeric datatypes,
+    /// and `same_term` would not, so numerics are still substituted.
+    /// [`Self::substitute_pattern`] and the cache key both follow this, so a
+    /// row keys its object as free exactly when its scan leaves it free.
+    fn object_left_to_unify(&self, required_batch: &Batch, row: usize) -> bool {
+        let Some(subject_col) = self.subject_left_col() else {
+            return false;
+        };
+        let Some(object_col) = self
+            .bind_instructions
+            .iter()
+            .find(|instr| instr.position == PatternPosition::Object)
+            .map(|instr| instr.left_col)
+        else {
+            return false;
+        };
+        matches!(
+            required_batch.get_by_col(row, subject_col),
+            Binding::Sid { .. }
+                | Binding::IriMatch { .. }
+                | Binding::Iri(_)
+                | Binding::EncodedSid { .. }
+                | Binding::EncodedPid { .. }
+        ) && match required_batch.get_by_col(row, object_col) {
+            Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => true,
+            Binding::EncodedLit { o_kind, .. } => ![
+                ObjKind::NUM_INT.as_u8(),
+                ObjKind::NUM_F64.as_u8(),
+                ObjKind::NUM_BIG.as_u8(),
+            ]
+            .contains(o_kind),
+            _ => false,
         }
     }
 
-    /// Substitute required bindings into pattern
+    /// This row's correlated values bound into the pattern, through the
+    /// substitution every correlated scan shares ([`substitute_binding`]):
+    /// encoded values decode into their slot in any position, so the scan is
+    /// a bound lookup whichever form the row carries a term in. `None` when no
+    /// triple can match the row — a correlated value that can never fill its
+    /// slot (a literal as a subject or predicate, a list or map value).
     ///
-    /// For IriMatch bindings in subject/predicate positions, uses `Ref::Iri` to carry
-    /// the canonical IRI. For IriMatch bindings in object position, uses `Term::Iri`.
-    /// The scan operator will encode this IRI for each target ledger's namespace
-    /// table, enabling correct cross-ledger OPTIONAL matching.
+    /// A value the context cannot decode (it has no graph view: several graphs
+    /// are active, whose member scans decode their rows) stays a variable, and
+    /// `unify_check` correlates it by term equality.
     fn substitute_pattern(
         &self,
         required_batch: &Batch,
         row: usize,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<TriplePattern> {
+    ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.pattern.clone();
-
+        // Built only when a row carries an encoded value: decoded rows (the
+        // novelty lane) never need it.
+        let mut view: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
+            if object_to_unify && instr.position == PatternPosition::Object {
+                continue;
+            }
             let binding = required_batch.get_by_col(row, instr.left_col);
-
-            match instr.position {
-                PatternPosition::Subject => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.s = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.s = Ref::Iri(iri.clone());
-                        }
-                        Binding::EncodedSid { s_id, .. } => {
-                            // Late materialized subject ID: resolve to IRI for correlation.
-                            // Uses novelty-aware BinaryGraphView via ctx.graph_view().
-                            let gv = ctx.graph_view().ok_or_else(|| {
-                                QueryError::Internal(
-                                    "OPTIONAL correlation requires binary store for EncodedSid"
-                                        .into(),
-                                )
-                            })?;
-                            let iri = gv.resolve_subject_iri(*s_id).map_err(|e| {
-                                QueryError::Internal(format!("resolve subject iri: {e}"))
-                            })?;
-                            pattern.s = Ref::Iri(Arc::<str>::from(iri));
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Predicate => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.p = Ref::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Ref::Iri so scan can encode for each target ledger
-                            pattern.p = Ref::Iri(iri.clone());
-                        }
-                        _ => {
-                            // Leave as variable
-                        }
-                    }
-                }
-                PatternPosition::Object => {
-                    match binding {
-                        Binding::Sid { sid, .. } => {
-                            pattern.o = Term::Sid(sid.clone());
-                        }
-                        Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
-                            // Use Term::Iri so scan can encode for each target ledger
-                            pattern.o = Term::Iri(iri.clone());
-                        }
-                        Binding::Lit { val, dtc, .. } => {
-                            pattern.o = Term::Value(val.clone());
-                            // A string binding is one RDF term: `"bob"`,
-                            // `"bob"@en`, `"bob"^^xsd:anyURI` and
-                            // `"bob"^^ex:custom` share a dictionary key and
-                            // must not probe each other's rows. Numeric/other
-                            // constraints are left off so cross-subtype
-                            // matching stays as before.
-                            if crate::binding::is_string_dict_term(binding) {
-                                pattern.dtc = Some(dtc.clone());
-                            }
-                        }
-                        Binding::EncodedLit { .. } => {
-                            // Late materialized literal: no decode context here; leave unbound.
-                        }
-                        Binding::EncodedSid { .. } | Binding::EncodedPid { .. } => {
-                            // Late materialized IRI: no decode context here; leave unbound.
-                        }
-                        Binding::Unbound | Binding::Poisoned => {
-                            // Leave as variable
-                        }
-                        Binding::Grouped(_) => {
-                            debug_assert!(
-                                false,
-                                "Grouped binding in optional pattern substitution"
-                            );
-                            // Leave as variable
-                        }
-                        Binding::Path { .. }
-                        | Binding::Rel(_)
-                        | Binding::List(_)
-                        | Binding::Map(_) => {
-                            // A path/list value is never substituted into a triple slot.
-                        }
-                    }
-                }
+            let encoded = matches!(
+                binding,
+                Binding::EncodedSid { .. }
+                    | Binding::EncodedPid { .. }
+                    | Binding::EncodedLit { .. }
+            );
+            let view = if encoded {
+                view.get_or_insert_with(|| ctx.graph_view()).as_ref()
+            } else {
+                None
+            };
+            if substitute_binding(&mut pattern, instr.position, binding, view)?
+                == Substitution::Unmatchable
+            {
+                return Ok(None);
             }
         }
-
-        Ok(pattern)
+        Ok(Some(pattern))
     }
 }
 
-/// Append one correlation binding to a cache key, or return `false` when it
-/// has no stable encoding (the caller then declines to cache).
+/// Append one correlation value to a cache key, or return `false` to leave the
+/// row uncached.
 ///
-/// The key is the SUBSTITUTED PATTERN, not the row: this mirrors
-/// [`PatternOptionalBuilder::substitute_pattern`] position by position, so a
-/// slot that substitution pushes a value into is keyed by that value, and a
-/// slot it leaves free gets the same `u` token whatever the row held. Two rows whose
-/// substituted patterns are identical then share one scan — which is what the
-/// cache is for, since `unify_check` re-applies the row's own correlation when
-/// the pending match is drained.
+/// Rows that key alike share one scan, so the key must determine the
+/// SUBSTITUTED PATTERN: every value [`substitute_binding`] binds into a slot is
+/// keyed by an identity that fixes what it binds, in every position. Encoded
+/// values key by their encoded identity, which is cheaper than decoding and
+/// determines the decode. A slot substitution leaves free (an unbound value)
+/// gets its own `u` token rather than colliding with any bound value;
+/// `unify_check` re-applies the row's own correlation when the pending match
+/// drains. Keying a bound value as free would hand one row's lookup to every
+/// row.
+///
+/// Rows with no scan to share are not keyed: a poisoned value, and a value
+/// substitution reports unmatchable (a literal as a subject or predicate, a
+/// list or map value), for which `build` answers no match.
 ///
 /// Every variable-length component is length-prefixed so two different
 /// correlation tuples can never concatenate to the same bytes.
@@ -489,16 +682,11 @@ fn push_cache_key_component(
         key.extend_from_slice(bytes);
     }
 
-    // `substitute_pattern` leaves the slot a variable, so "free here" is a
-    // correlation state in its own right and gets its own token rather than
-    // colliding with any bound value.
-    fn push_free(key: &mut Vec<u8>) -> bool {
-        key.push(b'u');
-        true
-    }
-
     match binding {
-        Binding::Poisoned => false,
+        Binding::Unbound => {
+            key.push(b'u');
+            true
+        }
         Binding::Sid { sid, .. } => {
             // Fallback stable key: namespace code + suffix bytes.
             key.push(b's');
@@ -510,22 +698,40 @@ fn push_cache_key_component(
             push_bytes(key, b'i', iri.as_bytes());
             true
         }
-        // Only the SUBJECT slot resolves an encoded id to an IRI and pushes it
-        // down; elsewhere substitution leaves the slot free.
-        Binding::EncodedSid { s_id, .. } if position == PatternPosition::Subject => {
+        Binding::EncodedSid { s_id, .. } => {
             key.push(b'S');
             key.extend_from_slice(&s_id.to_le_bytes());
+            true
+        }
+        Binding::EncodedPid { p_id } => {
+            key.push(b'P');
+            key.extend_from_slice(&p_id.to_le_bytes());
+            true
+        }
+        // The fields the decode reads; `i_val` and `t` are metadata.
+        Binding::EncodedLit {
+            o_kind,
+            o_key,
+            p_id,
+            dt_id,
+            lang_id,
+            ..
+        } if position == PatternPosition::Object => {
+            key.push(b'L');
+            key.push(*o_kind);
+            key.extend_from_slice(&o_key.to_le_bytes());
+            key.extend_from_slice(&p_id.to_le_bytes());
+            key.extend_from_slice(&dt_id.to_le_bytes());
+            key.extend_from_slice(&lang_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term
         // constraint), so rows carrying different literals must not share an
         // entry. Keying it would need a stable byte encoding of every
-        // `FlakeValue`/datatype pair — more than this fix is buying — so the
-        // row goes uncached instead. In every other slot a literal is left
-        // free, like any other unsubstitutable binding.
-        Binding::Lit { .. } if position == PatternPosition::Object => false,
-        // Everything else: substitution's own `_ => leave as variable` arms.
-        _ => push_free(key),
+        // `FlakeValue`/datatype pair, so the row goes uncached instead.
+        Binding::Lit { .. } => false,
+        // Poisoned, and values substitution reports unmatchable.
+        _ => false,
     }
 }
 
@@ -542,7 +748,11 @@ impl OptionalBuilder for PatternOptionalBuilder {
     /// True only when `build_batch`'s own admission gates hold, so the
     /// operator never buffers the driving side just to fall back per-row.
     fn supports_seed_coalescing(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if self.object_probe_column().is_some() {
+            return matches!(self.object_probe_plan(ctx), Ok(Some(_)));
+        }
         if ctx.is_multi_ledger()
+            || ctx.eager_materialization
             || self.pattern.dtc.is_some()
             || self.subject_left_col().is_none()
             || self.object_var_shared_with_required()
@@ -556,9 +766,21 @@ impl OptionalBuilder for PatternOptionalBuilder {
             return false;
         };
         !matches!(
-            subject_probe_lane_plan(ctx, store, &pred_sid),
+            subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
             Err(_) | Ok(ProbeLanePlan::Decline)
         )
+    }
+
+    /// The bound-object lane coalesces at most the window the join's own
+    /// bound-object lane flushes at: the POST pass costs a seek per distinct
+    /// object, so a larger window saves little, while main answered these
+    /// OPTIONALs row by row and buffered nothing.
+    fn seed_coalesce_cap(&self) -> usize {
+        if self.object_probe_column().is_some() {
+            fluree_db_core::BATCHED_JOIN_SIZE.min(optional_seed_coalesce_cap())
+        } else {
+            optional_seed_coalesce_cap()
+        }
     }
 
     fn build(
@@ -574,7 +796,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         // Substitute bindings into pattern and create scan operator
-        let bound_pattern = self.substitute_pattern(required_batch, row, ctx)?;
+        let Some(bound_pattern) = self.substitute_pattern(required_batch, row, ctx)? else {
+            return Ok(None);
+        };
         Ok(Some(Box::new(
             crate::dataset_operator::DatasetOperator::scan(
                 bound_pattern,
@@ -593,8 +817,14 @@ impl OptionalBuilder for PatternOptionalBuilder {
         start_row: usize,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Vec<OptionalBatchRow>>> {
-        if start_row >= required_batch.len()
-            || ctx.is_multi_ledger()
+        if start_row >= required_batch.len() {
+            return Ok(None);
+        }
+        if let Some(object_left_col) = self.object_probe_column() {
+            return self.build_object_probe_batch(required_batch, start_row, object_left_col, ctx);
+        }
+        if ctx.is_multi_ledger()
+            || ctx.eager_materialization
             || self.object_var_shared_with_required()
         {
             return Ok(None);
@@ -613,26 +843,30 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
         // Novelty merges per probed subject; unmergeable overlays fall back
         // to the per-row scan (whose cursor merges the overlay).
-        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
         if matches!(lane_plan, ProbeLanePlan::Decline) {
             return Ok(None);
         }
 
         let emit_object_var = self.emit_object_var();
-        let mut row_slots: Vec<Option<Vec<Binding>>> =
-            vec![None; required_batch.len().saturating_sub(start_row)];
+        let slots = required_batch.len().saturating_sub(start_row);
+        let mut row_slots: Vec<Option<Vec<Binding>>> = vec![None; slots];
         let mut subject_rows: std::collections::HashMap<u64, Vec<usize>> =
             std::collections::HashMap::new();
         let mut subject_ids: Vec<u64> = Vec::new();
+        // Rows whose subject has no id: the per-row path answers them.
+        let mut left = LeftRows::default();
 
         for row in start_row..required_batch.len() {
             let slot = row - start_row;
             if self.has_poisoned_binding(required_batch, row) {
                 continue;
             }
-            let Some(s_id) = self.resolve_subject_id(required_batch, row, subject_left_col, ctx)?
+            let Some(s_id) =
+                resolve_subject_id(required_batch.get_by_col(row, subject_left_col), ctx)?
             else {
-                return Ok(None);
+                left.leave(slot, slots);
+                continue;
             };
             subject_rows.entry(s_id).or_insert_with(|| {
                 subject_ids.push(s_id);
@@ -642,6 +876,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
                 .get_mut(&s_id)
                 .expect("entry inserted")
                 .push(slot);
+        }
+        if left.count == slots {
+            return Ok(None);
         }
 
         // One reconciler per probe call; the dict overlay decodes
@@ -681,6 +918,9 @@ impl OptionalBuilder for PatternOptionalBuilder {
 
         let mut pending = Vec::with_capacity(row_slots.len());
         for (slot, maybe_values) in row_slots.into_iter().enumerate() {
+            if left.contains(slot) {
+                continue;
+            }
             let optional_batches = match maybe_values {
                 Some(values) if !values.is_empty() => {
                     if let Some(object_var) = emit_object_var {
@@ -724,12 +964,18 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         let mut key = Vec::with_capacity(16 * self.bind_instructions.len());
+        let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             key.push(match instr.position {
                 PatternPosition::Subject => b'0',
                 PatternPosition::Predicate => b'1',
                 PatternPosition::Object => b'2',
             });
+            if object_to_unify && instr.position == PatternPosition::Object {
+                // Left free by the scan: rows sharing the subject share it.
+                key.push(b'u');
+                continue;
+            }
             let binding = required_batch.get_by_col(row, instr.left_col);
             if !push_cache_key_component(&mut key, instr.position, binding) {
                 return Ok(None);
@@ -749,6 +995,10 @@ impl OptionalBuilder for PatternOptionalBuilder {
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
+    }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
     }
 }
 
@@ -835,36 +1085,6 @@ impl GroupedPatternOptionalBuilder {
             .is_poisoned()
     }
 
-    fn resolve_subject_id(
-        &self,
-        required_batch: &Batch,
-        row: usize,
-        ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<u64>> {
-        let binding = required_batch.get_by_col(row, self.subject_left_col);
-        let Some(store) = ctx.binary_store.as_deref() else {
-            return Ok(None);
-        };
-        match binding {
-            Binding::EncodedSid { s_id, .. } => Ok(Some(*s_id)),
-            Binding::Sid { sid, .. } => {
-                // Persisted reverse dict first, then DictNovelty — subjects
-                // minted after the last index resolve to novelty s_ids, the
-                // same id space the overlay ops are translated into.
-                let persisted = store
-                    .find_subject_id_by_parts(sid.namespace_code, &sid.name)
-                    .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))?;
-                Ok(persisted.or_else(|| {
-                    ctx.dict_novelty
-                        .as_ref()
-                        .filter(|dn| dn.is_initialized())
-                        .and_then(|dn| dn.subjects.find_subject(sid.namespace_code, &sid.name))
-                }))
-            }
-            _ => Ok(None),
-        }
-    }
-
     fn grouped_schema(&self) -> Arc<[VarId]> {
         Arc::from(self.optional_only_vars.clone().into_boxed_slice())
     }
@@ -895,7 +1115,7 @@ impl GroupedPatternOptionalBuilder {
         Ok(Some(op))
     }
 
-    fn generate_rows(values_per_pred: &[Vec<Binding>]) -> Vec<Vec<Binding>> {
+    fn generate_rows(values_per_pred: &[Vec<Binding>], unmatched: &Binding) -> Vec<Vec<Binding>> {
         if values_per_pred.is_empty() {
             return vec![Vec::new()];
         }
@@ -910,7 +1130,7 @@ impl GroupedPatternOptionalBuilder {
             let mut row = Vec::with_capacity(values_per_pred.len());
             for (pred_idx, values) in values_per_pred.iter().enumerate() {
                 if values.is_empty() {
-                    row.push(Binding::Poisoned);
+                    row.push(unmatched.clone());
                 } else {
                     row.push(values[indices[pred_idx]].clone());
                 }
@@ -964,7 +1184,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 return false;
             };
             !matches!(
-                subject_probe_lane_plan(ctx, store, &pred_sid),
+                subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
                 Err(_) | Ok(ProbeLanePlan::Decline)
             )
         })
@@ -1016,11 +1236,24 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             );
             return Ok(None);
         }
+        // Admission declines this encoded lane for an eager caller at
+        // planning; say so before resolving every row's subject id.
+        if crate::fast_path_common::eager_with_overlay(ctx) {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                reason = "eager-materialization",
+                "grouped optional builder fallback"
+            );
+            return Ok(None);
+        }
 
         let mut subject_ids = Vec::new();
-        let mut row_subject_slots: Vec<Option<u64>> =
-            Vec::with_capacity(required_batch.len().saturating_sub(start_row));
+        let slots = required_batch.len().saturating_sub(start_row);
+        let mut row_subject_slots: Vec<Option<u64>> = Vec::with_capacity(slots);
         let mut subject_rows: HashMap<u64, Vec<usize>> = HashMap::new();
+        // Rows the per-row chain answers instead.
+        let mut left = LeftRows::default();
 
         for row in start_row..required_batch.len() {
             let slot = row - start_row;
@@ -1033,32 +1266,21 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
             // optional side bound. A per-subject probe has no subject to probe
             // with, and this lane's batches carry only optional-only vars, so
             // there would be nothing for `combine_rows` to read the subject
-            // back off. Hand the whole batch to the per-row chain, whose output
-            // does carry it. `resolve_subject_id` already declines here; saying
-            // so explicitly keeps the invariant `unify_instructions` relies on
-            // visible at the place that establishes it.
-            if matches!(
-                required_batch.get_by_col(row, self.subject_left_col),
-                Binding::Unbound
-            ) {
-                tracing::debug!(
-                    predicate_count = self.triples.len(),
-                    start_row,
-                    row,
-                    reason = "unbound-subject",
-                    "grouped optional builder fallback"
-                );
-                return Ok(None);
-            }
-            let Some(s_id) = self.resolve_subject_id(required_batch, row, ctx)? else {
-                tracing::debug!(
-                    predicate_count = self.triples.len(),
-                    start_row,
-                    row,
-                    reason = "unresolved-subject-id",
-                    "grouped optional builder fallback"
-                );
-                return Ok(None);
+            // back off. Hand the row to the per-row chain, whose output does
+            // carry it. `resolve_subject_id` already leaves it out; saying so
+            // explicitly keeps the invariant `unify_instructions` relies on
+            // visible at the place that establishes it. A subject with no id
+            // goes per row too.
+            let subject = required_batch.get_by_col(row, self.subject_left_col);
+            let s_id = if matches!(subject, Binding::Unbound) {
+                None
+            } else {
+                resolve_subject_id(subject, ctx)?
+            };
+            let Some(s_id) = s_id else {
+                left.leave(slot, slots);
+                row_subject_slots.push(None);
+                continue;
             };
             row_subject_slots.push(Some(s_id));
             subject_rows.entry(s_id).or_insert_with(|| {
@@ -1069,6 +1291,18 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 .get_mut(&s_id)
                 .expect("entry inserted")
                 .push(slot);
+        }
+        if left.count > 0 {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                rows = left.count,
+                reason = "unbound-or-unresolved-subject",
+                "grouped optional builder leaves rows to the per-row chain"
+            );
+        }
+        if left.count == slots {
+            return Ok(None);
         }
 
         let dict_overlay = crate::join::make_dict_overlay(ctx, store);
@@ -1085,7 +1319,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             };
-            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
             if matches!(lane_plan, ProbeLanePlan::Decline) {
                 tracing::debug!(
                     predicate_count = self.triples.len(),
@@ -1126,9 +1360,13 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
         }
 
         let schema = self.grouped_schema();
+        let unmatched = self.planning.unmatched_optional.binding();
         let mut pending = Vec::with_capacity(row_values.len());
         for (slot, values_per_pred) in row_values.into_iter().enumerate() {
-            let rows = Self::generate_rows(&values_per_pred);
+            if left.contains(slot) {
+                continue;
+            }
+            let rows = Self::generate_rows(&values_per_pred, &unmatched);
             let optional_batches = if rows.is_empty() {
                 Vec::new()
             } else {
@@ -1198,6 +1436,10 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
+    }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
     }
 }
 
@@ -1494,13 +1736,19 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let seed_vars: Vec<VarId> = seed_cols.iter().map(|&c| req_schema[c]).collect();
 
         let norm = equality_norm(ctx);
-        let (store, gv) = EqualityNorm::parts(&norm);
+        let (dicts, gv) = EqualityNorm::parts(&norm);
 
         // Per row: full correlation key (for matching) + distinct seed tuple
         // over the seeded subset. A poisoned/unbound correlation var can never
         // match -> no-match row.
+        enum RowKey {
+            Keyed(Vec<GroupKeyOwned>),
+            Unmatchable,
+            /// The per-row path answers this row.
+            PerRow,
+        }
         let n = required_batch.len();
-        let mut row_keys: Vec<Option<Vec<GroupKeyOwned>>> = Vec::with_capacity(n - start_row);
+        let mut row_keys: Vec<RowKey> = Vec::with_capacity(n - start_row);
         let mut seed_rows: Vec<Vec<Binding>> = Vec::new();
         let mut seen_seed: HashSet<Vec<GroupKeyOwned>> = HashSet::new();
         for row in start_row..n {
@@ -1509,8 +1757,8 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             // correlation key cannot express — the key would have to match
             // every bucket at once, and the optional-side batches carry only
             // optional-only vars, so there is nothing for the merge to read the
-            // value back off. Hand the whole batch to the per-row path, which
-            // seeds the inner from the row and leaves the variable free.
+            // value back off. Hand the row to the per-row path, which seeds the
+            // inner from the row and leaves the variable free.
             //
             // Scoped to what the inner can bind, not to every correlation
             // column: `corr_cols` is every required column REFERENCED by the
@@ -1541,22 +1789,23 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 unmatchable |= b.is_poisoned();
             }
             if unbound_bindable {
-                return Ok(None);
+                row_keys.push(RowKey::PerRow);
+                continue;
             }
             if unmatchable {
-                row_keys.push(None);
+                row_keys.push(RowKey::Unmatchable);
                 continue;
             }
             let key: Vec<GroupKeyOwned> = corr_cols
                 .iter()
                 .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
                 .collect();
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
-                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), store, gv)
+                    binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
                 .collect();
             if seen_seed.insert(seed_key) {
@@ -1567,12 +1816,17 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                         .collect(),
                 );
             }
-            row_keys.push(Some(key));
+            row_keys.push(RowKey::Keyed(key));
         }
 
         if seed_rows.is_empty() {
-            // Every row had an unmatchable correlation var.
-            return Ok(Some((start_row..n).map(|row| (row, Vec::new())).collect()));
+            // Every row the lane can answer had an unmatchable correlation var.
+            let unmatched: Vec<OptionalBatchRow> = (start_row..n)
+                .zip(&row_keys)
+                .filter(|(_, key)| matches!(key, RowKey::Unmatchable))
+                .map(|(row, _)| (row, Vec::new()))
+                .collect();
+            return Ok((!unmatched.is_empty()).then_some(unmatched));
         }
 
         // Build the inner subplan ONCE seeded by the distinct subject-driving
@@ -1632,7 +1886,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
             for r in 0..batch.len() {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
-                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), store, gv))
+                    .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
                     .collect();
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
@@ -1670,11 +1924,12 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
         let mut pending: Vec<OptionalBatchRow> = Vec::with_capacity(n - start_row);
         for (offset, row) in (start_row..n).enumerate() {
             let batches = match &row_keys[offset] {
-                Some(key) => key_batches
+                RowKey::Keyed(key) => key_batches
                     .get(key)
                     .map(|b| vec![b.clone()])
                     .unwrap_or_default(),
-                None => Vec::new(),
+                RowKey::Unmatchable => Vec::new(),
+                RowKey::PerRow => continue,
             };
             pending.push((row, batches));
         }
@@ -1699,6 +1954,10 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
 
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         &self.unify_instructions
+    }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
     }
 }
 
@@ -2095,6 +2354,10 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
     fn unify_instructions(&self) -> &[UnifyInstruction] {
         self.fallback.unify_instructions()
     }
+
+    fn unmatched_optional(&self) -> UnmatchedOptional {
+        self.planning.unmatched_optional
+    }
 }
 
 /// True iff `v` occurs in the inner patterns ONLY as the object of one or more
@@ -2236,6 +2499,13 @@ impl Operator for MaterializedSeedOperator {
     fn estimated_rows(&self) -> Option<usize> {
         Some(self.batches.iter().map(Batch::len).sum())
     }
+
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        Some(crate::seed::vars_bound_in_every_row(
+            &self.schema,
+            self.batches.iter(),
+        ))
+    }
 }
 
 /// Left-join operator for OPTIONAL semantics
@@ -2272,10 +2542,18 @@ pub struct OptionalOperator {
     current_required_batch: Option<Batch>,
     /// Current row index in required batch
     current_required_row: usize,
+    /// The batched lane's answers for rows of the current required batch not
+    /// yet reached, in row order; a row between them is answered per row.
+    lane_answers: VecDeque<OptionalBatchRow>,
+    /// Whether the current required batch has been offered to the batched
+    /// lane, which happens once per batch.
+    lane_offered: bool,
     /// Pending output: (required_row_idx, optional_batches, current_batch_idx, current_row_in_batch)
     /// Empty vec means no matches for that required row.
     /// The batch_idx and row_idx track progress for resuming when batch_size limit is hit.
     pending_output: VecDeque<PendingOptionalMatch>,
+    /// Binding written for optional-only vars when nothing matches.
+    unmatched: Binding,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
     /// Required columns holding a variable the optional side can also bind,
@@ -2294,6 +2572,15 @@ pub struct OptionalOperator {
     /// This prevents repeated OPTIONAL evaluation when the left side has fan-out
     /// on the correlation key (common for `?s <p1> ?o1 OPTIONAL { ?s <p2> ?o2 }`).
     result_cache: LruCache<Box<[u8]>, Arc<Vec<Batch>>>,
+    /// Required rows coalesced into each seed: the coalesce cap, unless a
+    /// row budget sizes the first seed. Every required row yields an output
+    /// row, so a budget-sized seed satisfies the `LIMIT` on its own.
+    coalesce_schedule: FlushSchedule,
+    /// A required batch a budget-sized seed stopped partway through, and the
+    /// first row it left unread.
+    required_pending: Option<(Batch, usize)>,
+    /// Term normalization for `unify_check`, built once at open.
+    norm: Option<EqualityNorm>,
 }
 
 /// Tracks a required row's optional matches with progress cursor
@@ -2309,7 +2596,7 @@ struct PendingOptionalMatch {
 }
 
 impl OptionalOperator {
-    /// PR-4d: pull and CONCATENATE required batches (up to the coalesce cap) into
+    /// PR-4d: pull and CONCATENATE required batches (up to the coalesce window) into
     /// one combined batch, so a batched-OPTIONAL inner is seeded — and scanned —
     /// ONCE over the whole (bounded) driving side rather than once per outer batch
     /// (the F14 per-window re-scan). All required batches share one schema, so this
@@ -2320,34 +2607,31 @@ impl OptionalOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
     ) -> Result<Option<Batch>> {
-        let cap = optional_seed_coalesce_cap();
-        let mut schema: Option<Arc<[VarId]>> = None;
-        let mut columns: Vec<Vec<Binding>> = Vec::new();
-        let mut rows = 0usize;
-        while rows < cap {
-            match self.required.next_batch(ctx).await? {
-                Some(batch) => {
-                    if schema.is_none() {
-                        schema = Some(batch.schema_arc());
-                        columns = (0..batch.schema().len()).map(|_| Vec::new()).collect();
-                    }
-                    for (c, col) in columns.iter_mut().enumerate() {
-                        col.extend_from_slice(
-                            batch.column_by_idx(c).expect("column index within schema"),
-                        );
-                    }
-                    rows += batch.len();
-                }
-                None => break,
+        let window = self.coalesce_schedule.size();
+        // A scan batch can be a whole leaflet, so a budget-sized window takes
+        // only the rows it needs; a cap-sized one keeps its last batch whole,
+        // as before.
+        let exact = window < self.optional_builder.seed_coalesce_cap();
+        self.coalesce_schedule.advance();
+        pull_window(
+            &mut self.required,
+            &mut self.required_pending,
+            window,
+            exact,
+            ctx,
+        )
+        .await
+    }
+
+    /// The next required batch, starting with rows a seed left unread.
+    async fn next_required(&mut self, ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+        match self.required_pending.take() {
+            Some((batch, 0)) => Ok(Some(batch)),
+            Some((batch, start)) => {
+                let keep: Vec<bool> = (0..batch.len()).map(|row| row >= start).collect();
+                Ok(batch.filter_rows(&keep))
             }
-        }
-        match schema {
-            // Empty-schema (0-column) driving side still carries a row count.
-            Some(schema) if rows > 0 && schema.is_empty() => {
-                Ok(Some(Batch::empty_schema_with_len(rows)))
-            }
-            Some(schema) if rows > 0 => Ok(Some(Batch::new(schema, columns)?)),
-            _ => Ok(None),
+            None => self.required.next_batch(ctx).await,
         }
     }
 
@@ -2381,18 +2665,27 @@ impl OptionalOperator {
             })
             .collect();
 
+        let unmatched = optional_builder.unmatched_optional().binding();
+        let coalesce_cap = optional_builder.seed_coalesce_cap();
+
         Self {
             required,
             optional_builder,
             required_schema,
             combined_schema,
             shared_merge_cols,
+            unmatched,
             state: OperatorState::Created,
             current_required_batch: None,
+            lane_answers: VecDeque::new(),
+            lane_offered: false,
             current_required_row: 0,
             pending_output: VecDeque::new(),
             out_schema: None,
             result_cache: LruCache::new(NonZeroUsize::new(8192).expect("8192 is non-zero")),
+            coalesce_schedule: FlushSchedule::fixed(coalesce_cap),
+            required_pending: None,
+            norm: None,
         }
     }
 
@@ -2423,8 +2716,9 @@ impl OptionalOperator {
         Self::with_builder(required, required_schema, Box::new(builder))
     }
 
-    /// Create a row with Poisoned bindings for optional-only vars
-    fn create_poisoned_row(&self, required_batch: &Batch, required_row: usize) -> Vec<Binding> {
+    /// Create a no-match row: required columns plus the unmatched binding for
+    /// each optional-only var.
+    fn create_unmatched_row(&self, required_batch: &Batch, required_row: usize) -> Vec<Binding> {
         let mut result = Vec::with_capacity(self.combined_schema.len());
 
         // Copy all required columns
@@ -2432,50 +2726,50 @@ impl OptionalOperator {
             result.push(required_batch.get_by_col(required_row, col).clone());
         }
 
-        // Add Poisoned for optional-only vars
         for _ in self.optional_builder.optional_only_vars() {
-            result.push(Binding::Poisoned);
+            result.push(self.unmatched.clone());
         }
 
         result
     }
 
     /// Check if required row bindings match optional row bindings for shared vars
+    ///
+    /// A shared value is one RDF term whichever form each side carries it in
+    /// ([`same_term`]): the required side may hold an IRI encoded as a
+    /// predicate while the optional side decoded it, or found it as a subject.
     fn unify_check(
         &self,
         required_batch: &Batch,
         required_row: usize,
         optional_batch: &Batch,
         optional_row: usize,
-    ) -> bool {
+    ) -> Result<bool> {
         // Unification must be resilient to optional operator schemas that do not
         // include substituted correlation vars.
         //
         // If the optional-side batch doesn't have the shared var column, we treat
         // it as already enforced by correlation/substitution and skip the check.
-        self.optional_builder
-            .unify_instructions()
-            .iter()
-            .all(|instr| {
-                let var = self.required_schema[instr.left_col];
-                let opt_col = optional_batch.schema().iter().position(|v| *v == var);
-                if let Some(opt_col) = opt_col {
-                    let left_val = required_batch.get_by_col(required_row, instr.left_col);
-                    let right_val = optional_batch.get_by_col(optional_row, opt_col);
+        for instr in self.optional_builder.unify_instructions() {
+            let var = self.required_schema[instr.left_col];
+            let Some(opt_col) = optional_batch.schema().iter().position(|v| *v == var) else {
+                continue;
+            };
+            let left_val = required_batch.get_by_col(required_row, instr.left_col);
+            let right_val = optional_batch.get_by_col(optional_row, opt_col);
 
-                    // Poisoned blocks matching; Unbound is compatible with anything.
-                    if left_val.is_poisoned() || right_val.is_poisoned() {
-                        return false;
-                    }
-                    if matches!(left_val, Binding::Unbound) || matches!(right_val, Binding::Unbound)
-                    {
-                        return true;
-                    }
-                    left_val == right_val
-                } else {
-                    true
-                }
-            })
+            // Poisoned blocks matching; Unbound is compatible with anything.
+            if left_val.is_poisoned() || right_val.is_poisoned() {
+                return Ok(false);
+            }
+            if matches!(left_val, Binding::Unbound) || matches!(right_val, Binding::Unbound) {
+                continue;
+            }
+            if !same_term(left_val, right_val, &self.norm)? {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Combine required row with optional row into output row
@@ -2523,8 +2817,8 @@ impl OptionalOperator {
             if let Some(opt_col) = optional_schema.iter().position(|v| v == var) {
                 result.push(optional_batch.get_by_col(optional_row, opt_col).clone());
             } else {
-                // Shouldn't happen, but fallback to Poisoned
-                result.push(Binding::Poisoned);
+                // Shouldn't happen, but fall back to the no-match binding.
+                result.push(self.unmatched.clone());
             }
         }
 
@@ -2548,10 +2842,13 @@ impl Operator for OptionalOperator {
     /// required rows — bounding the required side to `k` is sound (the `LIMIT`
     /// above truncates any surplus). The optional (inner) side is deliberately NOT
     /// budgeted: it must still produce every match for a given required row.
+    /// The budget also sizes the first coalesced seed.
     /// Gated by `FLUREE_R2RML_BUDGET_OPTIONAL`; OFF swallows the budget (the
     /// pre-item-11 full outer scan — byte-identical results).
     fn set_row_budget(&mut self, budget: usize) {
         if crate::r2rml::optional_budget_enabled() {
+            self.coalesce_schedule =
+                FlushSchedule::budgeted(budget, self.optional_builder.seed_coalesce_cap());
             self.required.set_row_budget(budget);
         } else {
             tracing::debug!(budget, "OPTIONAL row-budget forwarding disabled by switch");
@@ -2568,6 +2865,7 @@ impl Operator for OptionalOperator {
 
         // Open required operator
         self.required.open(ctx).await?;
+        self.norm = equality_norm(ctx);
 
         self.state = OperatorState::Open;
         Ok(())
@@ -2621,8 +2919,8 @@ impl Operator for OptionalOperator {
                     };
 
                     if is_empty {
-                        // No matches - emit row with Poisoned for optional-only vars
-                        let row = self.create_poisoned_row(required_batch, required_row);
+                        // No matches - emit the no-match row
+                        let row = self.create_unmatched_row(required_batch, required_row);
                         for (col, val) in row.into_iter().enumerate() {
                             output_columns[col].push(val);
                         }
@@ -2676,7 +2974,7 @@ impl Operator for OptionalOperator {
                                 required_row,
                                 &self.pending_output.front().unwrap().optional_batches[batch_idx],
                                 opt_row,
-                            ) {
+                            )? {
                                 continue;
                             }
 
@@ -2733,12 +3031,14 @@ impl Operator for OptionalOperator {
                 let next = if coalesce {
                     self.pull_coalesced_required(ctx).await?
                 } else {
-                    self.required.next_batch(ctx).await?
+                    self.next_required(ctx).await?
                 };
                 match next {
                     Some(batch) => {
                         self.current_required_batch = Some(batch);
                         self.current_required_row = 0;
+                        self.lane_answers.clear();
+                        self.lane_offered = false;
                     }
                     None => {
                         // Required exhausted
@@ -2753,31 +3053,73 @@ impl Operator for OptionalOperator {
 
             // Process current required row
             if self.current_required_row < required_batch.len() {
-                if self.pending_output.is_empty() {
-                    if let Some(batched_pending) = self
+                if !self.lane_offered && self.pending_output.is_empty() {
+                    self.lane_offered = true;
+                    if let Some(answers) = self
                         .optional_builder
                         .build_batch(required_batch, self.current_required_row, ctx)
                         .await?
                     {
+                        debug_assert!(
+                            answers.windows(2).all(|w| w[0].0 < w[1].0)
+                                && answers
+                                    .first()
+                                    .is_none_or(|(row, _)| *row >= self.current_required_row),
+                            "a batched lane answers rows in order, from its start row"
+                        );
                         batched_builds += 1;
-                        batched_rows += batched_pending.len();
-                        required_rows_seen += batched_pending.len();
-                        optional_result_batches += batched_pending
-                            .iter()
-                            .map(|(_, optional_batches)| optional_batches.len())
-                            .sum::<usize>();
-                        self.current_required_row = required_batch.len();
-                        self.pending_output.extend(batched_pending.into_iter().map(
-                            |(required_row, optional_batches)| PendingOptionalMatch {
-                                required_row,
-                                optional_batches,
-                                batch_idx: 0,
-                                row_idx: 0,
-                                matched: false,
-                            },
-                        ));
-                        continue;
+                        batched_rows += answers.len();
+                        if answers.len() == required_batch.len() - self.current_required_row {
+                            // Every row answered (the rows are in order, from
+                            // the start row): the window goes to the pending
+                            // queue at once.
+                            required_rows_seen += answers.len();
+                            optional_result_batches += answers
+                                .iter()
+                                .map(|(_, optional_batches)| optional_batches.len())
+                                .sum::<usize>();
+                            self.current_required_row = required_batch.len();
+                            self.pending_output.extend(answers.into_iter().map(
+                                |(required_row, optional_batches)| PendingOptionalMatch {
+                                    required_row,
+                                    optional_batches,
+                                    batch_idx: 0,
+                                    row_idx: 0,
+                                    matched: false,
+                                },
+                            ));
+                            continue;
+                        }
+                        // The answers reach the pending queue a run at a time;
+                        // room for all of them keeps it from growing per run.
+                        self.pending_output.reserve(answers.len());
+                        self.lane_answers = answers.into();
                     }
+                }
+                // The rows the lane answered, up to the next row it left to
+                // the per-row path.
+                let mut answered = false;
+                while self
+                    .lane_answers
+                    .front()
+                    .is_some_and(|(row, _)| *row == self.current_required_row)
+                {
+                    let (required_row, optional_batches) =
+                        self.lane_answers.pop_front().expect("front answer");
+                    required_rows_seen += 1;
+                    optional_result_batches += optional_batches.len();
+                    self.current_required_row += 1;
+                    self.pending_output.push_back(PendingOptionalMatch {
+                        required_row,
+                        optional_batches,
+                        batch_idx: 0,
+                        row_idx: 0,
+                        matched: false,
+                    });
+                    answered = true;
+                }
+                if answered {
+                    continue;
                 }
 
                 let required_row = self.current_required_row;
@@ -2810,8 +3152,8 @@ impl Operator for OptionalOperator {
                 {
                     None => {
                         builder_none += 1;
-                        // Builder returned None (e.g., poisoned correlation var)
-                        // Emit with Poisoned for optional-only vars
+                        // Builder returned None (e.g., poisoned correlation var):
+                        // emit the no-match row
                         self.pending_output.push_back(PendingOptionalMatch {
                             required_row,
                             optional_batches: Vec::new(),
@@ -2900,6 +3242,18 @@ impl Operator for OptionalOperator {
             return Ok(None);
         }
 
+        // The per-row path returns as soon as one required row's matches are
+        // drained, so its batches hold a row or a few. Columns sized for
+        // `batch_size` would keep ~1,000 slots per column per required row
+        // alive in every consumer that buffers the output (#1973: 160+ KB
+        // per required row). Size those to their rows; a batch at least half
+        // full keeps its columns. (Keeping the columns of batches down to an
+        // eighth full cost more, not less: measured on the hash-join lane.)
+        if rows_added < batch_size / 2 {
+            for column in &mut output_columns {
+                column.shrink_to_fit();
+            }
+        }
         let batch = Batch::new(self.combined_schema.clone(), output_columns)?;
         if should_debug {
             tracing::debug!(
@@ -2938,7 +3292,9 @@ impl Operator for OptionalOperator {
     fn close(&mut self) {
         self.required.close();
         self.current_required_batch = None;
+        self.required_pending = None;
         self.pending_output.clear();
+        self.lane_answers.clear();
         self.state = OperatorState::Closed;
     }
 
@@ -3041,6 +3397,54 @@ mod tests {
             50,
             "the budget must reach the required (outer) side (switch default-on)"
         );
+    }
+
+    /// A budget-sized seed is cut out of an oversized scan batch, and the rest
+    /// comes back, in order, as the next seed.
+    #[tokio::test]
+    async fn budget_sized_seed_cuts_an_oversized_batch() {
+        use crate::context::ExecutionContext;
+        use crate::operator::flush::MIN_FLUSH;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+
+        struct OneBatch(Option<Batch>);
+        #[async_trait]
+        impl Operator for OneBatch {
+            fn schema(&self) -> &[VarId] {
+                &[VarId(0)]
+            }
+            async fn open(&mut self, _: &ExecutionContext<'_>) -> Result<()> {
+                Ok(())
+            }
+            async fn next_batch(&mut self, _: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+                Ok(self.0.take())
+            }
+            fn close(&mut self) {}
+        }
+
+        const ROWS: usize = 3000;
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let subject = |i: usize| Binding::sid(Sid::new(1, format!("s{i}")));
+        let batch =
+            Batch::new(Arc::clone(&schema), vec![(0..ROWS).map(subject).collect()]).expect("batch");
+        let mut op = OptionalOperator::new(
+            Box::new(OneBatch(Some(batch))),
+            schema,
+            make_optional_pattern(),
+            crate::temporal_mode::PlanningContext::current(),
+        );
+        op.set_row_budget(10);
+
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let first = op.pull_coalesced_required(&ctx).await.unwrap().unwrap();
+        assert_eq!(first.len(), MIN_FLUSH);
+        let second = op.pull_coalesced_required(&ctx).await.unwrap().unwrap();
+        assert_eq!(second.len(), ROWS - MIN_FLUSH);
+        assert_eq!(second.get_by_col(0, 0), &subject(MIN_FLUSH));
+        assert!(op.pull_coalesced_required(&ctx).await.unwrap().is_none());
     }
 
     #[test]
@@ -3219,8 +3623,8 @@ mod tests {
         struct MapProvider(Arc<CompiledR2rmlMapping>);
         #[async_trait]
         impl R2rmlProvider for MapProvider {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -3308,7 +3712,7 @@ mod tests {
 
         let map_provider = MapProvider(Arc::clone(&mapping));
         let table_provider = TableProvider;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let mut ctx = ExecutionContext::new(&snapshot, &vars);
         ctx = ctx.with_r2rml_providers(&map_provider, &table_provider);
@@ -3439,8 +3843,8 @@ mod tests {
         struct MapProvider(Arc<CompiledR2rmlMapping>);
         #[async_trait]
         impl R2rmlProvider for MapProvider {
-            async fn has_r2rml_mapping(&self, _gs: &str) -> bool {
-                true
+            async fn has_r2rml_mapping(&self, _gs: &str) -> crate::error::Result<bool> {
+                Ok(true)
             }
             async fn compiled_mapping(
                 &self,
@@ -3535,7 +3939,7 @@ mod tests {
 
         let map_provider = MapProvider(Arc::clone(&mapping));
         let table_provider = TableProvider;
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let mut ctx = ExecutionContext::new(&snapshot, &vars);
         ctx = ctx.with_r2rml_providers(&map_provider, &table_provider);
@@ -3634,7 +4038,7 @@ mod tests {
         use fluree_db_core::FlakeValue;
         use fluree_db_core::LedgerSnapshot;
 
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -3675,7 +4079,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_poisoned_row() {
+    fn test_create_unmatched_row() {
         use fluree_db_core::FlakeValue;
 
         let required_schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
@@ -3696,13 +4100,6 @@ mod tests {
             fn close(&mut self) {}
         }
 
-        let op = OptionalOperator::new(
-            Box::new(MockOp),
-            required_schema.clone(),
-            optional_pattern,
-            crate::temporal_mode::PlanningContext::current(),
-        );
-
         // Create a required batch with one row
         let columns = vec![
             vec![Binding::sid(Sid::new(1, "alice"))],
@@ -3711,15 +4108,24 @@ mod tests {
                 Sid::new(2, "string"),
             )],
         ];
-        let batch = Batch::new(required_schema, columns).unwrap();
+        let batch = Batch::new(required_schema.clone(), columns).unwrap();
 
-        let row = op.create_poisoned_row(&batch, 0);
+        for unmatched in [UnmatchedOptional::Unbound, UnmatchedOptional::Poisoned] {
+            let op = OptionalOperator::new(
+                Box::new(MockOp),
+                required_schema.clone(),
+                optional_pattern.clone(),
+                crate::temporal_mode::PlanningContext::current().with_unmatched_optional(unmatched),
+            );
 
-        // Should have 3 columns: ?s, ?name, ?email (Poisoned)
-        assert_eq!(row.len(), 3);
-        assert!(row[0].is_sid()); // ?s
-        assert!(row[1].is_lit()); // ?name
-        assert!(row[2].is_poisoned()); // ?email
+            let row = op.create_unmatched_row(&batch, 0);
+
+            // Should have 3 columns: ?s, ?name, ?email (the no-match binding)
+            assert_eq!(row.len(), 3);
+            assert!(row[0].is_sid()); // ?s
+            assert!(row[1].is_lit()); // ?name
+            assert_eq!(row[2], unmatched.binding()); // ?email
+        }
     }
 
     #[test]
@@ -3834,6 +4240,80 @@ mod tests {
         fn unify_instructions(&self) -> &[UnifyInstruction] {
             &[]
         }
+
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
+        }
+    }
+
+    /// A builder that answers every row on the per-row path, as a miss.
+    struct PerRowMissBuilder {
+        schema: Arc<[VarId]>,
+        opt_only: Vec<VarId>,
+    }
+    #[async_trait]
+    impl OptionalBuilder for PerRowMissBuilder {
+        fn build(
+            &self,
+            _r: &Batch,
+            _row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<BoxedOperator>> {
+            Ok(None)
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        fn optional_only_vars(&self) -> &[VarId] {
+            &self.opt_only
+        }
+        fn unify_instructions(&self) -> &[UnifyInstruction] {
+            &[]
+        }
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
+        }
+    }
+
+    /// #1973: the per-row path hands back a batch per required row; those
+    /// batches must not carry columns sized for a full `batch_size`.
+    #[test]
+    fn per_row_output_batches_are_sized_to_their_rows() {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [iri_batch(&rs, &["a", "b", "c"])].into_iter().collect(),
+        };
+        let opt = VarId(1);
+        let builder = PerRowMissBuilder {
+            schema: Arc::from(vec![VarId(0), opt].into_boxed_slice()),
+            opt_only: vec![opt],
+        };
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        assert!(ctx.batch_size >= 100, "batch size {}", ctx.batch_size);
+
+        let rows = futures::executor::block_on(async {
+            op.open(&ctx).await.unwrap();
+            let mut rows = 0;
+            while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+                let (_, columns, len) = batch.into_parts();
+                for column in &columns {
+                    assert!(
+                        column.capacity() <= len.max(4) * 2,
+                        "{len}-row batch keeps a column of capacity {}",
+                        column.capacity()
+                    );
+                }
+                rows += len;
+            }
+            rows
+        });
+        assert_eq!(rows, 3);
     }
 
     fn iri_batch(schema: &Arc<[VarId]>, vals: &[&str]) -> Batch {
@@ -3862,7 +4342,7 @@ mod tests {
             CountingCoalesceBuilder::new(&rs, Arc::new(std::sync::atomic::AtomicUsize::new(0)));
         let mut op =
             OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -3904,7 +4384,7 @@ mod tests {
         let builder = CountingCoalesceBuilder::new(&rs, Arc::clone(&calls));
         let mut op =
             OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -3927,6 +4407,142 @@ mod tests {
         );
         // Left-join preserves every driving row (all OPTIONAL misses).
         assert_eq!(out_rows, 6, "every driving row survives the left join");
+    }
+
+    /// A batched lane that answers the rows it can key and leaves out the
+    /// ones it cannot (here: the IRI `x`), counting its offers and the per-row
+    /// builds of the rows it left. Each answered row is a hit on `hit`.
+    struct PartialLaneBuilder {
+        schema: Arc<[VarId]>,
+        opt_only: Vec<VarId>,
+        offers: Arc<std::sync::atomic::AtomicUsize>,
+        per_row: Arc<std::sync::atomic::AtomicUsize>,
+        /// Decline the whole window when any row cannot be keyed, as the
+        /// lanes did before they answered part of one.
+        all_or_nothing: bool,
+    }
+    #[async_trait]
+    impl OptionalBuilder for PartialLaneBuilder {
+        fn build(
+            &self,
+            _r: &Batch,
+            _row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<BoxedOperator>> {
+            self.per_row
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(None)
+        }
+        async fn build_batch(
+            &self,
+            required_batch: &Batch,
+            start_row: usize,
+            _ctx: &ExecutionContext<'_>,
+        ) -> Result<Option<Vec<OptionalBatchRow>>> {
+            self.offers
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let keyed = |row: usize| required_batch.get_by_col(row, 0) != &Binding::iri("x");
+            if self.all_or_nothing && !(start_row..required_batch.len()).all(keyed) {
+                return Ok(None);
+            }
+            let hit = Batch::new(
+                Arc::from(self.opt_only.clone().into_boxed_slice()),
+                vec![vec![Binding::iri("hit")]],
+            )?;
+            Ok(Some(
+                (start_row..required_batch.len())
+                    .filter(|row| keyed(*row))
+                    .map(|row| (row, vec![hit.clone()]))
+                    .collect(),
+            ))
+        }
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+        fn optional_only_vars(&self) -> &[VarId] {
+            &self.opt_only
+        }
+        fn unify_instructions(&self) -> &[UnifyInstruction] {
+            &[]
+        }
+        fn unmatched_optional(&self) -> UnmatchedOptional {
+            UnmatchedOptional::default()
+        }
+    }
+
+    /// Run a [`PartialLaneBuilder`] over one required batch of `vals`; the
+    /// output's `(required, optional)` rows in order, the lane's offers, and
+    /// the per-row builds.
+    fn run_partial_lane(vals: &[&str], all_or_nothing: bool) -> (Vec<String>, usize, usize) {
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::LedgerSnapshot;
+        let rs: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let required = MultiBatchOp {
+            batches: [iri_batch(&rs, vals)].into_iter().collect(),
+        };
+        let offers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let per_row = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let opt = VarId(1);
+        let builder = PartialLaneBuilder {
+            schema: Arc::from(vec![VarId(0), opt].into_boxed_slice()),
+            opt_only: vec![opt],
+            offers: Arc::clone(&offers),
+            per_row: Arc::clone(&per_row),
+            all_or_nothing,
+        };
+        let mut op =
+            OptionalOperator::with_builder(Box::new(required), rs.clone(), Box::new(builder));
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars);
+        let rows = futures::executor::block_on(async {
+            op.open(&ctx).await?;
+            let mut rows = Vec::new();
+            while let Some(b) = op.next_batch(&ctx).await? {
+                for r in 0..b.len() {
+                    let cell = |v: VarId| match b.get(r, v) {
+                        Some(Binding::Iri(iri)) => iri.to_string(),
+                        _ => "-".to_string(),
+                    };
+                    rows.push(format!("{}:{}", cell(VarId(0)), cell(opt)));
+                }
+            }
+            Result::<Vec<String>>::Ok(rows)
+        })
+        .unwrap();
+        (
+            rows,
+            offers.load(std::sync::atomic::Ordering::SeqCst),
+            per_row.load(std::sync::atomic::Ordering::SeqCst),
+        )
+    }
+
+    /// A row the batched lane cannot key is answered per row, in its place,
+    /// and the lane keeps its answers for the rest of the window.
+    #[test]
+    fn rows_a_lane_leaves_out_are_answered_per_row_in_order() {
+        let (rows, offers, per_row) = run_partial_lane(&["a", "x", "b", "c", "x", "d"], false);
+        assert_eq!(
+            rows,
+            ["a:hit", "x:-", "b:hit", "c:hit", "x:-", "d:hit"],
+            "every row, in order"
+        );
+        assert_eq!(offers, 1, "one offer answers the window");
+        assert_eq!(per_row, 2, "only the rows the lane left out go per row");
+    }
+
+    /// A lane is offered each required batch once. One that declines the
+    /// window does not see it again from each later row, which walked the
+    /// window's prefix once per row before the lane could take it.
+    #[test]
+    fn a_lane_is_offered_each_required_batch_once() {
+        let vals: Vec<String> = (0..200).map(|i| format!("r{i}")).collect();
+        let mut vals: Vec<&str> = vals.iter().map(String::as_str).collect();
+        vals.push("x");
+        let (rows, offers, per_row) = run_partial_lane(&vals, true);
+        assert_eq!(rows.len(), 201, "every row survives the left join");
+        assert_eq!(offers, 1, "the declined window is not offered again");
+        assert_eq!(per_row, 201, "a declined window goes per row");
     }
 
     /// A grouped chain of single-triple OPTIONALs shares its SUBJECT with the
@@ -4061,45 +4677,84 @@ mod tests {
         )));
     }
 
-    /// The cache key is the SUBSTITUTED PATTERN, so a slot substitution leaves
-    /// free keys as free whatever the row held, and two rows that would drive
-    /// the identical scan share one entry.
+    /// The cache key determines the SUBSTITUTED PATTERN. Substitution binds
+    /// every term value into its slot in every position, encoded or decoded,
+    /// so each keys by its own identity: keying a bound value as free would
+    /// hand one row's lookup to every row (the trap an encoded object used to
+    /// sit in, when substitution left it free). Only an unbound value keys as
+    /// free; rows with no scan to share are not keyed at all.
     #[test]
-    fn cache_key_keys_a_free_slot_as_free() {
+    fn cache_key_keys_every_bound_value_by_identity() {
         fn key(position: PatternPosition, binding: &Binding) -> Option<Vec<u8>> {
             let mut k = Vec::new();
             push_cache_key_component(&mut k, position, binding).then_some(k)
         }
-
-        let encoded = Binding::EncodedSid {
-            s_id: 42,
+        let sid = |s_id| Binding::EncodedSid {
+            s_id,
             t: None,
             op: None,
         };
-        // Object: substitution leaves a late-materialised IRI free, so this must
-        // key identically to an unbound object — N objects, ONE scan.
-        assert_eq!(
-            key(PatternPosition::Object, &encoded),
-            key(PatternPosition::Object, &Binding::Unbound),
+        let pid = |p_id| Binding::EncodedPid { p_id };
+        let lit = |o_key| Binding::EncodedLit {
+            o_kind: fluree_db_core::ObjKind::LEX_ID.as_u8(),
+            o_key,
+            p_id: 3,
+            dt_id: fluree_db_core::DatatypeDictId::STRING.as_u16(),
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+        };
+        let free = Some(vec![b'u']);
+        let positions = [
+            PatternPosition::Subject,
+            PatternPosition::Predicate,
+            PatternPosition::Object,
+        ];
+
+        for position in positions {
+            assert_eq!(key(position, &Binding::Unbound), free, "{position:?}");
+            assert_eq!(key(position, &Binding::Poisoned), None, "{position:?}");
+            for (a, b) in [
+                (sid(42), sid(43)),
+                (pid(7), pid(8)),
+                (
+                    Binding::sid(Sid::new(9, "a")),
+                    Binding::sid(Sid::new(9, "b")),
+                ),
+            ] {
+                let (ka, kb) = (key(position, &a), key(position, &b));
+                assert!(
+                    ka.is_some() && ka != free,
+                    "{position:?}: {a:?} keys by value"
+                );
+                assert_ne!(ka, kb, "{position:?}: {a:?} vs {b:?}");
+            }
+            // One IRI in two encoded forms decodes to the same constant, but
+            // the forms key apart: a cache miss, never a shared wrong entry.
+            assert_ne!(
+                key(position, &sid(7)),
+                key(position, &pid(7)),
+                "{position:?}"
+            );
+        }
+
+        // An encoded literal object keys by the fields its decode reads...
+        let (a, b) = (
+            key(PatternPosition::Object, &lit(1)),
+            key(PatternPosition::Object, &lit(2)),
         );
-        // Subject: substitution resolves it and pushes it down, so it keys by value.
-        assert_ne!(
-            key(PatternPosition::Subject, &encoded),
-            key(PatternPosition::Subject, &Binding::Unbound),
-        );
-        assert_ne!(
-            key(PatternPosition::Subject, &encoded),
-            key(
-                PatternPosition::Subject,
-                &Binding::EncodedSid {
-                    s_id: 43,
-                    t: None,
-                    op: None
-                }
-            ),
-        );
-        // A literal OBJECT is pushed down by value; declining to cache is how
-        // rows carrying different literals are kept apart.
+        assert!(a.is_some() && a != free);
+        assert_ne!(a, b);
+        // ...and not by list index or assertion time.
+        let mut c = lit(1);
+        if let Binding::EncodedLit { i_val, t, .. } = &mut c {
+            *i_val = 4;
+            *t = 9;
+        }
+        assert_eq!(key(PatternPosition::Object, &c), a);
+
+        // A decoded literal object is pushed down by value; declining to cache
+        // is how rows carrying different literals are kept apart.
         assert_eq!(
             key(
                 PatternPosition::Object,
@@ -4107,5 +4762,17 @@ mod tests {
             ),
             None
         );
+        // A literal as a subject or predicate cannot match: no scan to share.
+        for position in [PatternPosition::Subject, PatternPosition::Predicate] {
+            assert_eq!(key(position, &lit(1)), None, "{position:?}");
+            assert_eq!(
+                key(
+                    position,
+                    &Binding::lit(fluree_db_core::FlakeValue::Long(7), Sid::new(0, "integer"))
+                ),
+                None,
+                "{position:?}"
+            );
+        }
     }
 }

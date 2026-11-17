@@ -15,6 +15,8 @@ mod it_policy_cypher_conditions;
 mod it_policy_federation;
 #[path = "it_policy_fquery.rs"]
 mod it_policy_fquery;
+#[path = "it_policy_graph_builder.rs"]
+mod it_policy_graph_builder;
 #[path = "it_policy_identity_based.rs"]
 mod it_policy_identity_based;
 #[path = "it_policy_indexed.rs"]

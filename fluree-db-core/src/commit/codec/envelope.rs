@@ -25,18 +25,33 @@ const FLAG_PARENT: u8 = 0x02;
 const FLAG_NAMESPACE_DELTA: u8 = 0x04;
 const FLAG_TXN: u8 = 0x08;
 const FLAG_TIME: u8 = 0x10;
-// Bits 5 and 6 are reserved (previously FLAG_DATA / FLAG_INDEX, never shipped).
+/// The commit drops graphs ([`CodecEnvelope::graph_drops`]). A flag rather
+/// than a trailing extension so that a decoder predating DROP refuses the
+/// commit ("unknown envelope flags") instead of replaying the dropped graph's
+/// facts as if they were still there. Only a commit that drops sets it, so
+/// every other commit stays readable by those decoders.
+const FLAG_GRAPH_DROPS: u8 = 0x20;
+// Bit 6 is reserved (previously FLAG_INDEX, never shipped).
 const FLAG_TXN_SIGNATURE: u8 = 0x80;
 
 /// Mask of all flag bits the current encoder/decoder understands.
-const KNOWN_FLAGS: u8 =
-    FLAG_TXN_META | FLAG_PARENT | FLAG_NAMESPACE_DELTA | FLAG_TXN | FLAG_TIME | FLAG_TXN_SIGNATURE;
+const KNOWN_FLAGS: u8 = FLAG_TXN_META
+    | FLAG_PARENT
+    | FLAG_NAMESPACE_DELTA
+    | FLAG_TXN
+    | FLAG_TIME
+    | FLAG_GRAPH_DROPS
+    | FLAG_TXN_SIGNATURE;
 
 /// Maximum number of named graph entries per commit.
 pub const MAX_GRAPH_DELTA_ENTRIES: usize = 256;
 
 /// Maximum length of a graph IRI in bytes.
 pub const MAX_GRAPH_IRI_LENGTH: usize = 8192;
+
+/// Maximum number of graphs one commit drops: every graph id there is, so a
+/// `DROP ALL` is never refused for its size.
+pub const MAX_GRAPH_DROP_ENTRIES: usize = u16::MAX as usize + 1;
 
 /// Maximum byte length for a length-prefixed CID blob.
 /// Fluree SHA-256 CIDs are exactly 39 bytes; 128 provides headroom
@@ -69,6 +84,9 @@ pub struct CodecEnvelope {
     pub txn_meta: Vec<TxnMetaEntry>,
     /// Named graph IRI to g_id mappings introduced by this commit.
     pub graph_delta: HashMap<u16, String>,
+    /// Graphs this commit drops, by IRI, ascending. See
+    /// [`crate::Commit::graph_drops`].
+    pub graph_drops: Vec<String>,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<NsSplitMode>,
@@ -86,6 +104,7 @@ impl CodecEnvelope {
             txn_signature: commit.txn_signature.clone(),
             txn_meta: commit.txn_meta.clone(),
             graph_delta: commit.graph_delta.clone(),
+            graph_drops: commit.graph_drops.clone(),
             ns_split_mode: commit.ns_split_mode,
         }
     }
@@ -130,6 +149,9 @@ pub fn encode_envelope_fields(
     if envelope.time.is_some() {
         flags |= FLAG_TIME;
     }
+    if !envelope.graph_drops.is_empty() {
+        flags |= FLAG_GRAPH_DROPS;
+    }
     if envelope.txn_signature.is_some() {
         flags |= FLAG_TXN_SIGNATURE;
     }
@@ -159,6 +181,9 @@ pub fn encode_envelope_fields(
     }
     if let Some(time) = &envelope.time {
         encode_len_str(time, buf);
+    }
+    if !envelope.graph_drops.is_empty() {
+        encode_graph_drops(&envelope.graph_drops, buf)?;
     }
     if let Some(txn_sig) = &envelope.txn_signature {
         encode_len_str(&txn_sig.signer, buf);
@@ -297,6 +322,12 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
         None
     };
 
+    let graph_drops = if flags & FLAG_GRAPH_DROPS != 0 {
+        decode_graph_drops(data, &mut pos)?
+    } else {
+        Vec::new()
+    };
+
     let txn_signature = if flags & FLAG_TXN_SIGNATURE != 0 {
         let signer = decode_len_str(data, &mut pos)?;
         if signer.len() > 256 {
@@ -365,6 +396,7 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
         txn_signature,
         txn_meta,
         graph_delta,
+        graph_drops,
         ns_split_mode,
     })
 }
@@ -483,6 +515,61 @@ fn decode_graph_delta(
         map.insert(g_id, iri);
     }
     Ok(map)
+}
+
+// =============================================================================
+// graph_drops (Vec<String>, ascending and distinct)
+// =============================================================================
+
+fn encode_graph_drops(drops: &[String], buf: &mut Vec<u8>) -> Result<(), CommitCodecError> {
+    if drops.len() > MAX_GRAPH_DROP_ENTRIES {
+        return Err(CommitCodecError::LimitExceeded(format!(
+            "graph_drops has {} entries, max is {MAX_GRAPH_DROP_ENTRIES}",
+            drops.len()
+        )));
+    }
+    if drops.windows(2).any(|pair| pair[0] >= pair[1]) {
+        return Err(CommitCodecError::EnvelopeEncode(
+            "graph_drops must be ascending and distinct".to_string(),
+        ));
+    }
+    encode_varint(drops.len() as u64, buf);
+    for iri in drops {
+        if iri.len() > MAX_GRAPH_IRI_LENGTH {
+            return Err(CommitCodecError::LimitExceeded(format!(
+                "graph_drops IRI is {} bytes, max is {MAX_GRAPH_IRI_LENGTH}",
+                iri.len()
+            )));
+        }
+        encode_len_str(iri, buf);
+    }
+    Ok(())
+}
+
+fn decode_graph_drops(data: &[u8], pos: &mut usize) -> Result<Vec<String>, CommitCodecError> {
+    let count = decode_varint(data, pos)? as usize;
+    if count == 0 || count > MAX_GRAPH_DROP_ENTRIES {
+        return Err(CommitCodecError::EnvelopeDecode(format!(
+            "graph_drops count {count} is outside 1..={MAX_GRAPH_DROP_ENTRIES}"
+        )));
+    }
+    let mut drops: Vec<String> = Vec::with_capacity(count.min(1024));
+    for _ in 0..count {
+        let iri = decode_len_str(data, pos)?;
+        if iri.is_empty() || iri.len() > MAX_GRAPH_IRI_LENGTH {
+            return Err(CommitCodecError::EnvelopeDecode(format!(
+                "graph_drops IRI length {} is outside 1..={MAX_GRAPH_IRI_LENGTH}",
+                iri.len()
+            )));
+        }
+        if drops.last().is_some_and(|last| *last >= iri) {
+            return Err(CommitCodecError::EnvelopeDecode(
+                "graph_drops must be ascending and distinct".to_string(),
+            ));
+        }
+        drops.push(iri);
+    }
+    Ok(drops)
 }
 
 // =============================================================================
@@ -755,18 +842,50 @@ mod tests {
     }
 
     #[test]
-    fn test_unknown_flags_rejected() {
-        // Bit 5 (0x20, formerly FLAG_DATA)
+    fn test_round_trip_graph_drops() {
+        let mut commit = make_minimal_commit();
+        commit.graph_drops = vec!["http://example.org/g".into(), "urn:default".into()];
+
+        let mut buf = Vec::new();
+        encode_envelope(&commit, &mut buf).unwrap();
+        // The flag decoders predating DROP refuse as unknown.
+        assert_eq!(buf[1] & FLAG_GRAPH_DROPS, FLAG_GRAPH_DROPS);
+
+        let d = decode_envelope(&buf).unwrap();
+        assert_eq!(d.graph_drops, commit.graph_drops);
+    }
+
+    #[test]
+    fn test_no_graph_drops_leaves_the_envelope_as_before() {
+        let mut commit = make_minimal_commit();
+        commit.graph_delta = HashMap::from([(3, "http://example.org/g".into())]);
+        let mut buf = Vec::new();
+        encode_envelope(&commit, &mut buf).unwrap();
+        assert_eq!(buf[1] & FLAG_GRAPH_DROPS, 0);
+        assert!(decode_envelope(&buf).unwrap().graph_drops.is_empty());
+    }
+
+    #[test]
+    fn test_graph_drops_out_of_order_rejected() {
+        let mut commit = make_minimal_commit();
+        commit.graph_drops = vec!["urn:b".into(), "urn:a".into()];
+        let mut buf = Vec::new();
+        assert!(encode_envelope(&commit, &mut buf).is_err());
+
         let mut buf = Vec::new();
         encode_varint(zigzag_encode(2), &mut buf);
-        buf.push(0x20);
+        buf.push(FLAG_GRAPH_DROPS);
+        encode_varint(2, &mut buf);
+        encode_len_str("urn:a", &mut buf);
+        encode_len_str("urn:a", &mut buf);
         buf.push(0); // no graph_delta
+        buf.push(0); // no ns_split_mode
         let err = decode_envelope(&buf).unwrap_err();
-        assert!(
-            err.to_string().contains("unknown envelope flags"),
-            "unexpected error: {err}"
-        );
+        assert!(err.to_string().contains("ascending"), "{err}");
+    }
 
+    #[test]
+    fn test_unknown_flags_rejected() {
         // Bit 6 (0x40, formerly FLAG_INDEX)
         let mut buf = Vec::new();
         encode_varint(zigzag_encode(2), &mut buf);

@@ -201,9 +201,9 @@ impl Ord for LiteralValue {
             (LiteralValue::String(a), LiteralValue::String(b)) => a.cmp(b),
             (LiteralValue::Boolean(a), LiteralValue::Boolean(b)) => a.cmp(b),
             (LiteralValue::Integer(a), LiteralValue::Integer(b)) => a.cmp(b),
-            (LiteralValue::Double(a), LiteralValue::Double(b)) => a
-                .partial_cmp(b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits())),
+            // IEEE total order: total with NaN, and Equal exactly when the
+            // bits are equal, as `PartialEq` compares them.
+            (LiteralValue::Double(a), LiteralValue::Double(b)) => a.total_cmp(b),
             (LiteralValue::Json(a), LiteralValue::Json(b)) => a.cmp(b),
             _ => Ordering::Equal, // Should not happen
         }
@@ -462,21 +462,43 @@ impl Ord for Term {
     }
 }
 
+/// N-Triples syntax, escapes included.
 impl std::fmt::Display for Term {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Term::Iri(iri) => write!(f, "<{iri}>"),
+            Term::Iri(iri) => {
+                f.write_str("<")?;
+                crate::syntax::escape_iri(iri, |seg| f.write_str(seg))?;
+                f.write_str(">")
+            }
             Term::BlankNode(id) => write!(f, "{id}"),
             Term::Literal {
                 value,
                 datatype,
                 language,
             } => {
-                write!(f, "\"{}\"", value.lexical())?;
+                f.write_str("\"")?;
+                crate::syntax::escape_string(&value.lexical(), |seg| f.write_str(seg))?;
+                f.write_str("\"")?;
                 if let Some(lang) = language {
-                    write!(f, "@{lang}")
+                    f.write_str("@")?;
+                    if crate::syntax::is_lang_tag(lang) {
+                        f.write_str(lang)
+                    } else {
+                        // No escape form exists; %-encoding keeps a bad tag
+                        // from ending the literal and reading as more triples.
+                        lang.bytes().try_for_each(|b| {
+                            if b.is_ascii_alphanumeric() || b == b'-' {
+                                std::fmt::Write::write_char(f, b as char)
+                            } else {
+                                write!(f, "%{b:02X}")
+                            }
+                        })
+                    }
                 } else if !datatype.is_xsd_string() {
-                    write!(f, "^^<{}>", datatype.as_iri())
+                    f.write_str("^^<")?;
+                    crate::syntax::escape_iri(datatype.as_iri(), |seg| f.write_str(seg))?;
+                    f.write_str(">")
                 } else {
                     Ok(())
                 }
@@ -495,6 +517,23 @@ mod tests {
         assert_eq!(id.as_str(), "b0");
         assert_eq!(id.to_ntriples(), "_:b0");
         assert_eq!(format!("{id}"), "_:b0");
+    }
+
+    #[test]
+    fn display_is_escaped_ntriples() {
+        assert_eq!(
+            Term::iri("http://ex.org/a b").to_string(),
+            r"<http://ex.org/a\u0020b>"
+        );
+        assert_eq!(
+            Term::string("say \"hi\"\n").to_string(),
+            r#""say \"hi\"\n""#
+        );
+        assert_eq!(Term::lang_string("chat", "fr").to_string(), r#""chat"@fr"#);
+        assert_eq!(
+            Term::integer(5).to_string(),
+            r#""5"^^<http://www.w3.org/2001/XMLSchema#integer>"#
+        );
     }
 
     #[test]
@@ -589,5 +628,37 @@ mod tests {
         let t1 = Term::double(f64::NAN);
         let t2 = Term::double(f64::NAN);
         assert_eq!(t1, t2);
+    }
+
+    /// `LiteralValue`'s order is a total order that agrees with its equality
+    /// (which compares doubles by bits), NaN of either sign and both zeros
+    /// included, so sorting triples by it is well defined.
+    #[test]
+    fn literal_double_order_is_total_and_matches_equality() {
+        let values: Vec<LiteralValue> = [
+            f64::NEG_INFINITY,
+            -2.5,
+            -0.0,
+            0.0,
+            1.5,
+            f64::INFINITY,
+            f64::NAN,
+            -f64::NAN,
+            f64::from_bits(0x7FF0_0000_0000_0001),
+        ]
+        .into_iter()
+        .map(LiteralValue::Double)
+        .collect();
+        for a in &values {
+            for b in &values {
+                assert_eq!(a.cmp(b) == Ordering::Equal, a == b, "{a:?} vs {b:?}");
+                assert_eq!(a.cmp(b), b.cmp(a).reverse(), "{a:?} vs {b:?}");
+                for c in &values {
+                    if a.cmp(b) != Ordering::Greater && b.cmp(c) != Ordering::Greater {
+                        assert_ne!(a.cmp(c), Ordering::Greater, "{a:?} <= {b:?} <= {c:?}");
+                    }
+                }
+            }
+        }
     }
 }

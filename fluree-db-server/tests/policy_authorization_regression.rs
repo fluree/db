@@ -183,7 +183,7 @@ async fn configured_model_policy_controls_delegated_reads_and_writes() {
                 if allowed {
                     StatusCode::OK
                 } else {
-                    StatusCode::BAD_REQUEST
+                    StatusCode::FORBIDDEN
                 },
                 "{control}: {result}"
             );
@@ -726,9 +726,17 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
         "select": ["?name", "?class"],
         "where": {"@id": "?s", "http://schema.org/name": "?name", "http://example.org/classification": "?class"}
     });
-    for uri in [
-        "/v1/fluree/query".to_string(),
-        format!("/v1/fluree/query/{ledger}"),
+    // The redirected query's `opts.from` is the source the dataset parser
+    // reads. The connection route resolves it to `other`, which the token does
+    // not cover: not found, as if it did not exist. The ledger route refuses a
+    // lone `from` naming another ledger before loading anything: a 400 that
+    // says no more than the request did.
+    for (uri, redirected_status) in [
+        ("/v1/fluree/query".to_string(), StatusCode::NOT_FOUND),
+        (
+            format!("/v1/fluree/query/{ledger}"),
+            StatusCode::BAD_REQUEST,
+        ),
     ] {
         let resp = app
             .clone()
@@ -764,7 +772,12 @@ async fn dataset_options_and_envelope_defaults_cannot_replace_authority() {
             )
             .await
             .unwrap();
-        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let (status, body) = json_body(resp).await;
+        assert_eq!(status, redirected_status, "{uri}: {body}");
+        assert!(
+            !body.to_string().contains("Executive Salaries"),
+            "{uri}: {body}"
+        );
     }
     let envelope = serde_json::json!({
         "opts": {"policy-class": ["http://example.org/ManagerClass"], "policy": [{"f:required": true, "f:action": "f:view", "f:allow": true}], "default-allow": true},
@@ -920,7 +933,7 @@ async fn controller_selects_dynamic_policies_without_changing_credential() {
     );
 
     for (class, expected) in [
-        ("EmployeeClass", StatusCode::BAD_REQUEST),
+        ("EmployeeClass", StatusCode::FORBIDDEN),
         ("ManagerClass", StatusCode::OK),
     ] {
         let mut update = modify_public_doc_content_body();
@@ -1141,7 +1154,7 @@ async fn scope_only_preserves_delimited_output_and_ledger_write_defaults() {
             modify_public_doc_content_body().to_string(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(
             body.to_string().contains("Employees may not modify"),
             "{body}"
@@ -1164,7 +1177,7 @@ async fn anonymous_transaction_policy_headers_apply_without_tracking() {
         // No tracking headers or opts: the employee header must still restrict
         // this write. A body selection takes precedence over that default.
         for (body_class, expected) in [
-            (None, StatusCode::BAD_REQUEST),
+            (None, StatusCode::FORBIDDEN),
             (Some("http://example.org/ManagerClass"), StatusCode::OK),
         ] {
             let mut body = modify_public_doc_content_body();
@@ -1186,7 +1199,7 @@ async fn anonymous_transaction_policy_headers_apply_without_tracking() {
                 .unwrap();
             let (status, body) = json_body(response).await;
             assert_eq!(status, expected, "{mode:?}: {body}");
-            if expected == StatusCode::BAD_REQUEST {
+            if expected == StatusCode::FORBIDDEN {
                 assert!(
                     body.to_string().contains("Employees may not modify"),
                     "{body}"
@@ -1369,7 +1382,7 @@ async fn authority_alone_authenticates_and_missing_request_context_denies() {
         "<http://example.org/new> <http://schema.org/name> \"New\" .".into(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
     // Omitting auth still supports the private-server direct-option contract.
     let (status, result) = query_docs_tri_state(app, ledger, None, None, None).await;
     assert_eq!(status, StatusCode::OK, "{result}");
@@ -1433,7 +1446,7 @@ async fn missing_controller_selection_with_locked_defaults_denies() {
         "<http://example.org/blocked> <http://schema.org/name> \"Blocked\" .".into(),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{result}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{result}");
 
     // A fixed empty selection must not acquire the identity's or config's grants.
     let fixed = delegated_token(
@@ -1495,5 +1508,69 @@ async fn explain_uses_final_body_policy_selection_on_both_routes() {
                 "{result}"
             );
         }
+    }
+}
+
+/// A multi-query sub-query's options reach it on the server whichever layer
+/// sets them: `default-allow: false` in the envelope's or the sub-query's
+/// `opts` narrows a credential's default-allow selection for a JSON-LD
+/// sub-query exactly as it does in the body's own `opts`.
+#[tokio::test]
+async fn multi_query_outer_opts_narrow_a_jsonld_sub_query_as_its_own_do() {
+    let (_tmp, state) = policy_test_state().await;
+    let ledger = "outer-opts-narrow:main";
+    let app = setup_policy_ledger(build_router(state), ledger).await;
+    let token = delegated_token(
+        "http://example.org/new-application-user",
+        ledger,
+        serde_json::json!({"default-allow": true}),
+    );
+    let docs = |body_opts: JsonValue| {
+        let mut query = serde_json::json!({
+            "@context": {"ex": "http://example.org/", "schema": "http://schema.org/"},
+            "from": ledger,
+            "select": ["?name", "?class"],
+            "where": [
+                {"@id": "?doc", "@type": "ex:Document"},
+                {"@id": "?doc", "schema:name": "?name"},
+                {"@id": "?doc", "ex:classification": "?class"}
+            ]
+        });
+        if !body_opts.is_null() {
+            query["opts"] = body_opts;
+        }
+        query
+    };
+    let deny = serde_json::json!({"default-allow": false});
+    let null = JsonValue::Null;
+    for (layer, envelope_opts, alias_opts, body_opts, expected) in [
+        ("none", null.clone(), null.clone(), null.clone(), 3),
+        ("body", null.clone(), null.clone(), deny.clone(), 0),
+        ("alias", null.clone(), deny.clone(), null.clone(), 0),
+        ("envelope", deny.clone(), null.clone(), null.clone(), 0),
+    ] {
+        let mut envelope = serde_json::json!({
+            "queries": {"docs": {"language": "jsonld", "query": docs(body_opts)}}
+        });
+        if !envelope_opts.is_null() {
+            envelope["opts"] = envelope_opts;
+        }
+        if !alias_opts.is_null() {
+            envelope["queries"]["docs"]["opts"] = alias_opts;
+        }
+        let (status, body) = post_policy_request(
+            &app,
+            "/v1/fluree/multi-query",
+            Some(&token),
+            "application/json",
+            envelope.to_string(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{layer}: {body}");
+        let rows = body["results"]["docs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{layer}: {body}"))
+            .len();
+        assert_eq!(rows, expected, "{layer}: {body}");
     }
 }

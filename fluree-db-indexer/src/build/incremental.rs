@@ -35,7 +35,8 @@ use crate::run_index::build::incremental_branch::{
 };
 use crate::run_index::build::incremental_leaf::NewLeafBlob;
 use crate::run_index::build::incremental_resolve::{
-    resolve_incremental_commits_v6, IncrementalResolveConfig,
+    resolve_incremental_commits_v6, IncrementalNovelty, IncrementalResolveConfig,
+    IncrementalResolveError,
 };
 use crate::run_index::build::incremental_root::IncrementalRootBuilder;
 use crate::{IndexResult, IndexStats, IndexerConfig};
@@ -89,24 +90,30 @@ impl Phase2FetchStats {
     }
 }
 
+/// Seed the read-through artifact cache with bytes this build just uploaded,
+/// so the first reader does not re-fetch them — when the store is one the
+/// cache serves at all (see `uses_disk_cache`).
 fn cache_artifact_bytes(
+    content_store: &dyn ContentStore,
     cache_dir: &std::path::Path,
     cid: &ContentId,
     bytes: &[u8],
     artifact_kind: &'static str,
 ) {
-    fluree_db_binary_index::read::artifact_cache::best_effort_cache_bytes_to_path(
+    if fluree_db_binary_index::read::artifact_cache::seed_disk_cache(
+        content_store,
+        cid,
         cache_dir,
-        &cache_dir.join(cid.to_string()),
         bytes,
-    );
-    tracing::trace!(
-        %cid,
-        artifact_kind,
-        bytes = bytes.len(),
-        cache_dir = %cache_dir.display(),
-        "V6 incremental: seeded artifact cache"
-    );
+    ) {
+        tracing::trace!(
+            %cid,
+            artifact_kind,
+            bytes = bytes.len(),
+            cache_dir = %cache_dir.display(),
+            "V6 incremental: seeded artifact cache"
+        );
+    }
 }
 
 async fn fetch_cached_index_bytes(
@@ -125,6 +132,83 @@ async fn fetch_cached_index_bytes(
     .map_err(|e| IndexerError::StorageRead(format!("{context}: {e}")))
 }
 
+/// Append the geometries a spatial index holds as `SpatialEntry`s, one per
+/// distinct (subject, geometry, t, op). The cell index has one entry per
+/// covering cell, so re-adding per cell entry would multiply the index by its
+/// covering size on every rebuild.
+async fn load_prior_spatial_entries(
+    content_store: &dyn ContentStore,
+    cache_dir: &std::path::Path,
+    g_id: u16,
+    sp_ref: &fluree_db_binary_index::SpatialArenaRef,
+    out: &mut Vec<crate::spatial_hook::SpatialEntry>,
+) -> Result<()> {
+    let p_id = sp_ref.p_id;
+    let root_bytes = fetch_cached_index_bytes(
+        content_store,
+        &sp_ref.root_cid,
+        cache_dir,
+        format!("spatial root load for g{g_id}:p{p_id}"),
+    )
+    .await?;
+    let spatial_root: fluree_db_spatial::SpatialIndexRoot = serde_json::from_slice(&root_bytes)
+        .map_err(|e| {
+            IndexerError::StorageRead(format!("spatial root decode for g{g_id}:p{p_id}: {e}"))
+        })?;
+
+    // Pre-fetch all blobs for the sync load_from_cas closure.
+    let mut blob_cache: HashMap<String, Vec<u8>> = HashMap::new();
+    for cid in [&sp_ref.manifest, &sp_ref.arena]
+        .into_iter()
+        .chain(&sp_ref.leaflets)
+    {
+        let bytes =
+            fetch_cached_index_bytes(content_store, cid, cache_dir, "spatial blob fetch").await?;
+        blob_cache.insert(cid.digest_hex(), bytes);
+    }
+    let blob_cache = Arc::new(blob_cache);
+    let snapshot =
+        fluree_db_spatial::SpatialIndexSnapshot::load_from_cas(spatial_root, move |hash| {
+            blob_cache.get(hash).cloned().ok_or_else(|| {
+                fluree_db_spatial::error::SpatialError::ChunkNotFound(hash.to_string())
+            })
+        })
+        .map_err(|e| {
+            IndexerError::IncrementalAbort(format!(
+                "spatial snapshot load failed for g_id={g_id}, p_id={p_id}: {e}; \
+                 falling back to full rebuild for correctness"
+            ))
+        })?;
+
+    let cell_entries = snapshot.cell_index().scan_range(0, u64::MAX).map_err(|e| {
+        IndexerError::IncrementalAbort(format!(
+            "spatial cell scan failed for g_id={g_id}, p_id={p_id}: {e}; \
+                 falling back to full rebuild for correctness"
+        ))
+    })?;
+    let mut seen = std::collections::HashSet::new();
+    for ce in cell_entries {
+        if !seen.insert((ce.subject_id, ce.geo_handle, ce.t, ce.op)) {
+            continue;
+        }
+        let Some(arena_entry) = snapshot.arena().get(ce.geo_handle) else {
+            continue;
+        };
+        let Ok(wkt) = std::str::from_utf8(&arena_entry.wkt) else {
+            continue;
+        };
+        out.push(crate::spatial_hook::SpatialEntry {
+            g_id,
+            subject_id: ce.subject_id,
+            p_id,
+            wkt: wkt.to_string(),
+            t: ce.t,
+            is_assert: ce.is_assert(),
+        });
+    }
+    Ok(())
+}
+
 async fn upload_dict_blob_cached(
     content_store: &dyn ContentStore,
     dict: fluree_db_core::DictKind,
@@ -133,7 +217,7 @@ async fn upload_dict_blob_cached(
     cache_dir: &std::path::Path,
 ) -> Result<ContentId> {
     let cid = super::upload::upload_dict_blob(content_store, dict, bytes, msg).await?;
-    cache_artifact_bytes(cache_dir, &cid, bytes, "dict_blob");
+    cache_artifact_bytes(content_store, cache_dir, &cid, bytes, "dict_blob");
     Ok(cid)
 }
 
@@ -238,7 +322,7 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let leaf_map: HashMap<ContentId, Vec<u8>> = leaf_pairs.into_iter().collect();
+    let leaf_map = Prefetched::new(leaf_pairs, touched.iter().map(|(leaf, _)| leaf));
 
     // Sidecars: NotFound => absent (None); other errors abort (preserved).
     let sidecar_pairs: Vec<(ContentId, Option<Vec<u8>>)> = stream::iter(sidecar_cids)
@@ -282,10 +366,12 @@ async fn run_update_branch(
         .buffer_unordered(fetch_width)
         .try_collect()
         .await?;
-    let sidecar_map: HashMap<ContentId, Vec<u8>> = sidecar_pairs
-        .into_iter()
-        .filter_map(|(cid, opt)| opt.map(|b| (cid, b)))
-        .collect();
+    let sidecar_map = Prefetched::new(
+        sidecar_pairs
+            .into_iter()
+            .filter_map(|(cid, opt)| opt.map(|b| (cid, b))),
+        touched.iter().filter_map(|(_, sidecar)| sidecar.as_ref()),
+    );
 
     // Bounded channel from the blocking CoW to the async uploader. The bound
     // gives backpressure: the CoW parks on `blocking_send` (it's already on a
@@ -293,7 +379,7 @@ async fn run_update_branch(
     // uploader is behind, capping resident blobs to the channel depth + the
     // in-flight puts. Depth tracks the upload budget so the CoW can run a few
     // leaves ahead without unbounded buffering.
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
+    let (tx, rx) = tokio::sync::mpsc::channel::<NewLeafBlob>(upload_buffer.max(1));
 
     // CPU-bound CoW update on a blocking thread. The fetch closures read the
     // prefetched in-memory maps — no `block_on`, no S3 inside the closure. Each
@@ -309,11 +395,11 @@ async fn run_update_branch(
             &branch_config,
             &|cid| {
                 leaf_map
-                    .get(cid)
-                    .cloned()
+                    .take(cid)?
                     .ok_or_else(|| std::io::Error::other(format!("leaf {cid} not prefetched")))
             },
-            &|cid| Ok(sidecar_map.get(cid).cloned()),
+            // A sidecar storage did not hold was never prefetched: absent.
+            &|cid| sidecar_map.take(cid),
             &mut |blob| {
                 tx.blocking_send(blob)
                     .map_err(|_| std::io::Error::other("leaf upload channel closed"))
@@ -321,32 +407,37 @@ async fn run_update_branch(
         )
     });
 
-    // Async uploader: drain the channel, uploading each blob under the global
-    // budget and freeing its bytes. Runs concurrently with the CoW.
+    // Async uploader: drain the channel, uploading up to `upload_buffer` blobs
+    // at once under the global budget and freeing each one's bytes as its put
+    // completes. Runs concurrently with the CoW. Upload order is free: the
+    // branch records each leaf's CID from the CoW, not from the put.
     let upload_budget_ref = upload_budget.as_ref();
     let uploader = {
         let content_store = content_store.as_ref();
         let tracker = &tracker;
         let cache_dir = &cache_dir;
         let warm_cache = warm_cache.as_ref();
-        async move {
-            let mut totals = LeafUploadCounts::default();
-            while let Some(blob) = rx.recv().await {
-                let c = upload_one_leaf_blob(
-                    content_store,
-                    tracker,
-                    upload_budget_ref,
-                    cache_dir,
-                    blob,
-                    warm_cache,
-                )
-                .await?;
-                totals.leaf_bytes += c.leaf_bytes;
-                totals.sidecar_bytes += c.sidecar_bytes;
-                totals.sidecar_count += c.sidecar_count;
-            }
-            Ok::<LeafUploadCounts, IndexerError>(totals)
-        }
+        // The stream owns `rx`, so a failed put drops it (see the join below).
+        stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|blob| (blob, rx))
+        })
+        .map(move |blob| {
+            upload_one_leaf_blob(
+                content_store,
+                tracker,
+                upload_budget_ref,
+                cache_dir,
+                blob,
+                warm_cache,
+            )
+        })
+        .buffer_unordered(upload_buffer.max(1))
+        .try_fold(LeafUploadCounts::default(), |mut totals, c| async move {
+            totals.leaf_bytes += c.leaf_bytes;
+            totals.sidecar_bytes += c.sidecar_bytes;
+            totals.sidecar_count += c.sidecar_count;
+            Ok(totals)
+        })
     };
 
     // Drive both to completion. If the uploader fails it drops `rx`, so the
@@ -369,6 +460,106 @@ async fn run_update_branch(
     Ok((meta, stats.snapshot()))
 }
 
+/// A batch re-typing more than this fraction (1/n) of the base index's typed
+/// subjects defers class stats to a full rebuild; see
+/// `IndexerConfig::incremental_retype_max_subjects` for the floor.
+const RETYPE_REBUILD_SHARE: u64 = 8;
+
+/// Run a batched base-index lookup over `ids` on the rayon pool.
+///
+/// The batched lookups answer per requested id, and each slice here is a
+/// contiguous run of the sorted ids, so slices scan disjoint key ranges and
+/// their answers union without overlap. Scattered ids (hash-named subjects)
+/// make each lookup sweep most of a predicate's or order's leaflets, which
+/// one thread did serially for every build.
+fn par_batched_lookup<V: Send>(
+    ids: &[u64],
+    lookup: impl Fn(&[u64]) -> std::io::Result<HashMap<u64, V>> + Sync,
+) -> std::io::Result<HashMap<u64, V>> {
+    use rayon::prelude::*;
+
+    // Below this a slice's cursor descents cost more than they save.
+    const MIN_SLICE: usize = 512;
+    let mut sorted = ids.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
+    let slices = (sorted.len() / MIN_SLICE).clamp(1, rayon::current_num_threads() * 4);
+    if slices == 1 {
+        return lookup(&sorted);
+    }
+    sorted
+        .par_chunks(sorted.len().div_ceil(slices))
+        .map(&lookup)
+        .try_reduce(HashMap::new, |mut a, mut b| {
+            if a.len() < b.len() {
+                std::mem::swap(&mut a, &mut b);
+            }
+            a.extend(b);
+            Ok(a)
+        })
+}
+
+/// Prefetched blobs for one branch's copy-on-write, each handed over on its
+/// last read: the CoW owns what it reads, so a blob it reads once is moved,
+/// not copied, and leaves memory as its leaf is rewritten instead of when the
+/// whole order finishes.
+struct Prefetched {
+    blobs: std::sync::Mutex<HashMap<ContentId, PrefetchSlot>>,
+}
+
+/// A prefetched blob (`None` once handed over) and the reads still expected.
+type PrefetchSlot = (Option<Vec<u8>>, usize);
+
+impl Prefetched {
+    /// `blobs` as fetched, and the CID of every read the CoW will make, one
+    /// per touched leaf (two leaves can share a CID).
+    fn new<'a>(
+        blobs: impl IntoIterator<Item = (ContentId, Vec<u8>)>,
+        reads: impl IntoIterator<Item = &'a ContentId>,
+    ) -> Self {
+        let mut expected: HashMap<&ContentId, usize> = HashMap::new();
+        for cid in reads {
+            *expected.entry(cid).or_insert(0) += 1;
+        }
+        let blobs = blobs
+            .into_iter()
+            .map(|(cid, bytes)| {
+                let reads = expected.get(&cid).copied().unwrap_or(1);
+                (cid, (Some(bytes), reads))
+            })
+            .collect();
+        Self {
+            blobs: std::sync::Mutex::new(blobs),
+        }
+    }
+
+    /// The blob at `cid`, `None` if it was not prefetched. A read past the
+    /// last expected one is an error, never `None`: for a sidecar `None`
+    /// means "this leaf has no history".
+    fn take(&self, cid: &ContentId) -> std::io::Result<Option<Vec<u8>>> {
+        let mut blobs = self
+            .blobs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some((bytes, reads)) = blobs.get_mut(cid) else {
+            return Ok(None);
+        };
+        match (*reads, bytes.as_ref()) {
+            (_, None) => Err(std::io::Error::other(format!(
+                "{cid} read more often than prefetched"
+            ))),
+            (1, Some(_)) => {
+                *reads = 0;
+                Ok(bytes.take())
+            }
+            (_, Some(b)) => {
+                *reads -= 1;
+                Ok(Some(b.clone()))
+            }
+        }
+    }
+}
+
 enum Phase2TaskKind {
     DefaultExisting { leaves: Vec<LeafEntry> },
     DefaultFresh,
@@ -384,7 +575,7 @@ struct Phase2Task {
     sorted_ops: Vec<u8>,
     /// Superseded events for this (graph, order), sorted like
     /// `sorted_records`. Their real-transition subset becomes history-sidecar
-    /// entries in the leaf merge.
+    /// entries in the leaf merge, or in the fresh branch's writer.
     sorted_superseded: Vec<RunRecordV2>,
     sorted_superseded_ops: Vec<u8>,
     kind: Phase2TaskKind,
@@ -404,15 +595,38 @@ fn fact_identity_key(rec: &RunRecordV2) -> FactIdentityKey {
     )
 }
 
+/// Where a task's novelty goes once its base branch is known.
+enum Phase2Route {
+    DefaultMerge {
+        leaves: Vec<LeafEntry>,
+    },
+    NamedMerge {
+        branch_bytes: Vec<u8>,
+    },
+    /// No base facts in this graph and order: no branch, or one with no leaves.
+    Fresh,
+}
+
 enum Phase2TaskUpdate {
-    Default { leaf_entries: Vec<LeafEntry> },
-    Named { branch_cid: ContentId },
+    Default {
+        leaf_entries: Vec<LeafEntry>,
+    },
+    Named {
+        branch_cid: ContentId,
+    },
+    /// A fresh branch with nothing to hold: the root keeps what it had for
+    /// this order (no branch, or one with no leaves), which the next build
+    /// again finds no base facts in.
+    Unchanged,
 }
 
 struct Phase2TaskOutput {
     seq: usize,
     g_id: u16,
     order: RunSortOrder,
+    /// The task merged into a base branch with leaves, rather than building
+    /// fresh. A graph's four tasks must agree ([`check_base_facts_agree`]).
+    base_facts: bool,
     update: Phase2TaskUpdate,
     replaced_leaf_cids: Vec<ContentId>,
     replaced_sidecar_cids: Vec<ContentId>,
@@ -466,8 +680,40 @@ async fn execute_phase2_task(
         .warm_cache_source
         .as_ref()
         .and_then(|s| s.warm_cache());
-    let output = match kind {
-        Phase2TaskKind::DefaultExisting { leaves } => {
+    // A branch with no leaves holds no base facts, exactly like no branch at
+    // all, so it is built fresh too: the merge has no leaf to route its
+    // novelty into.
+    let route = match kind {
+        Phase2TaskKind::DefaultExisting { leaves } if !leaves.is_empty() => {
+            Phase2Route::DefaultMerge { leaves }
+        }
+        Phase2TaskKind::NamedExisting { branch_cid } => {
+            let branch_bytes = fetch_cached_index_bytes(
+                content_store.as_ref(),
+                &branch_cid,
+                &cache_dir,
+                format!("fetch V3 branch g_id={g_id} {order:?}"),
+            )
+            .await?;
+            let manifest =
+                fluree_db_binary_index::format::branch::read_branch_from_bytes(&branch_bytes)
+                    .map_err(|e| {
+                        IndexerError::StorageRead(format!(
+                            "decode V3 branch g_id={g_id} {order:?}: {e}"
+                        ))
+                    })?;
+            if manifest.leaves.is_empty() {
+                Phase2Route::Fresh
+            } else {
+                Phase2Route::NamedMerge { branch_bytes }
+            }
+        }
+        Phase2TaskKind::DefaultExisting { .. }
+        | Phase2TaskKind::DefaultFresh
+        | Phase2TaskKind::NamedFresh => Phase2Route::Fresh,
+    };
+    let output = match route {
+        Phase2Route::DefaultMerge { leaves } => {
             let branch_bytes =
                 fluree_db_binary_index::format::branch::build_branch_bytes(order, g_id, &leaves);
             let (meta, fetch_stats) = run_update_branch(
@@ -489,6 +735,7 @@ async fn execute_phase2_task(
                 seq,
                 g_id,
                 order,
+                base_facts: true,
                 update: Phase2TaskUpdate::Default {
                     leaf_entries: meta.leaf_entries,
                 },
@@ -499,58 +746,7 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::DefaultFresh => {
-            if !sorted_superseded.is_empty() {
-                // Permanent gap: these are real in-window transitions (e.g. a
-                // fact born and deleted between two index builds) and the next
-                // window's novelty never re-sees them. Reachable beyond
-                // genesis — the root format permits graphs with fewer than
-                // four materialized orders, so a newly added order takes this
-                // arm for an existing graph, leaving that order's replay
-                // without history its sibling orders have.
-                tracing::warn!(
-                    g_id,
-                    ?order,
-                    dropped = sorted_superseded.len(),
-                    "fresh default-graph order has no sidecar to merge into; \
-                     dropping this window's intra-window transition history"
-                );
-            }
-            let BranchUpdateResult {
-                leaf_entries,
-                new_leaf_blobs,
-                ..
-            } = build_fresh_default_graph_v3(&sorted_records, &sorted_ops, order, g_id, config)?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget.as_ref(),
-                upload_buffer,
-                new_leaf_blobs,
-                &cache_dir,
-            )
-            .await?;
-            Phase2TaskOutput {
-                seq,
-                g_id,
-                order,
-                update: Phase2TaskUpdate::Default { leaf_entries },
-                replaced_leaf_cids: Vec::new(),
-                replaced_sidecar_cids: Vec::new(),
-                new_leaf_count,
-                fetch_stats: Phase2FetchStatsSnapshot::default(),
-                matched: Vec::new(),
-            }
-        }
-        Phase2TaskKind::NamedExisting { branch_cid } => {
-            let branch_bytes = fetch_cached_index_bytes(
-                content_store.as_ref(),
-                &branch_cid,
-                &cache_dir,
-                format!("fetch V3 branch g_id={g_id} {order:?}"),
-            )
-            .await?;
+        Phase2Route::NamedMerge { branch_bytes } => {
             let (meta, fetch_stats) = run_update_branch(
                 branch_bytes,
                 sorted_records,
@@ -571,11 +767,18 @@ async fn execute_phase2_task(
                 .await
                 .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
             debug_assert!(branch_cid == meta.branch_cid);
-            cache_artifact_bytes(&cache_dir, &branch_cid, &meta.branch_bytes, "index_branch");
+            cache_artifact_bytes(
+                &*content_store,
+                &cache_dir,
+                &branch_cid,
+                &meta.branch_bytes,
+                "index_branch",
+            );
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
+                base_facts: true,
                 update: Phase2TaskUpdate::Named { branch_cid },
                 replaced_leaf_cids: meta.replaced_leaf_cids,
                 replaced_sidecar_cids: meta.replaced_sidecar_cids,
@@ -584,48 +787,60 @@ async fn execute_phase2_task(
                 matched: meta.matched,
             }
         }
-        Phase2TaskKind::NamedFresh => {
-            if !sorted_superseded.is_empty() {
-                // Permanent gap; see the DefaultFresh arm above.
-                tracing::warn!(
-                    g_id,
-                    ?order,
-                    dropped = sorted_superseded.len(),
-                    "fresh named-graph order has no sidecar to merge into; \
-                     dropping this window's intra-window transition history"
-                );
-            }
-            let BranchUpdateResult {
-                new_leaf_blobs,
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
-                branch_bytes,
-                branch_cid: expected_branch_cid,
-                ..
-            } = build_fresh_named_graph_v3(&sorted_records, order, g_id, config)?;
-            let new_leaf_count = new_leaf_blobs.len();
-            upload_leaf_blobs(
-                content_store.as_ref(),
-                &tracker,
-                upload_budget.as_ref(),
-                upload_buffer,
-                new_leaf_blobs,
-                &cache_dir,
-            )
-            .await?;
-            let branch_cid = content_store
-                .put(ContentKind::IndexBranch, &branch_bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            debug_assert!(branch_cid == expected_branch_cid);
-            cache_artifact_bytes(&cache_dir, &branch_cid, &branch_bytes, "index_branch");
+        Phase2Route::Fresh => {
+            let fresh = build_fresh_branch_v3(
+                &sorted_records,
+                &sorted_ops,
+                &sorted_superseded,
+                &sorted_superseded_ops,
+                order,
+                g_id,
+                config,
+            )?;
+            let new_leaf_count = fresh.new_leaf_blobs.len();
+            let update = if fresh.leaf_entries.is_empty() {
+                // Every fact in the window netted to no row and no history. A
+                // root lists no order with no leaves, so the empty branch
+                // isn't published.
+                Phase2TaskUpdate::Unchanged
+            } else {
+                upload_leaf_blobs(
+                    content_store.as_ref(),
+                    &tracker,
+                    upload_budget.as_ref(),
+                    upload_buffer,
+                    fresh.new_leaf_blobs,
+                    &cache_dir,
+                )
+                .await?;
+                if g_id == 0 {
+                    Phase2TaskUpdate::Default {
+                        leaf_entries: fresh.leaf_entries,
+                    }
+                } else {
+                    let branch_cid = content_store
+                        .put(ContentKind::IndexBranch, &fresh.branch_bytes)
+                        .await
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                    debug_assert!(branch_cid == fresh.branch_cid);
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &branch_cid,
+                        &fresh.branch_bytes,
+                        "index_branch",
+                    );
+                    Phase2TaskUpdate::Named { branch_cid }
+                }
+            };
             Phase2TaskOutput {
                 seq,
                 g_id,
                 order,
-                update: Phase2TaskUpdate::Named { branch_cid },
-                replaced_leaf_cids,
-                replaced_sidecar_cids,
+                base_facts: false,
+                update,
+                replaced_leaf_cids: Vec::new(),
+                replaced_sidecar_cids: Vec::new(),
                 new_leaf_count,
                 fetch_stats: Phase2FetchStatsSnapshot::default(),
                 matched: Vec::new(),
@@ -685,15 +900,16 @@ pub async fn incremental_index(
     let cache_dir = config.artifact_cache_dir();
     let _ = std::fs::create_dir_all(&cache_dir);
 
-    // Single global S3 budget shared across the whole fold: the reconcile
-    // leaf prefetch (Phase 1), and the Phase 2 leaf prefetch + leaf/sidecar
-    // uploads all acquire from this one semaphore, so total in-flight S3 reads
-    // and writes are capped here regardless of phase.
+    // S3 budget for the reconcile leaf prefetch (Phase 1). `index_novelty`
+    // caps the Phase 2 leaf prefetch and leaf/sidecar uploads with one of the
+    // same size; the phases run one after the other, so total in-flight S3
+    // reads and writes stay under this cap throughout the fold.
     let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
     let upload_budget = Arc::new(Semaphore::new(upload_buffer));
 
     // ---- Phase 1: Resolve incremental commits ----
     let resolve_config = IncrementalResolveConfig {
+        ledger_id: ledger_id.to_string(),
         base_root_id: base_root_id.clone(),
         head_commit_id,
         from_t,
@@ -709,15 +925,21 @@ pub async fn incremental_index(
         Arc::clone(&upload_budget),
     )
     .await
-    .map_err(|e| IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")))?;
+    .map_err(|e| match e {
+        IncrementalResolveError::Resolve(crate::run_index::ResolverError::Unindexable(msg)) => {
+            IndexerError::Unindexable(msg)
+        }
+        IncrementalResolveError::NeedsRebuild(why) => IndexerError::IncrementalAbort(why),
+        e => IndexerError::StorageWrite(format!("V6 incremental resolve: {e}")),
+    })?;
 
-    if novelty.records.is_empty() {
+    if novelty.records.is_empty() && novelty.purged_graphs.is_empty() {
         tracing::debug!("no new records resolved; returning existing V6 root");
         // fuel is filled in by the outer entry point from the tracker tally.
         return Ok(IndexResult {
             root_id: base_root_id,
             index_t: novelty.max_t,
-            ledger_id: ledger_id.to_string(),
+            ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
             stats: IndexStats::default(),
             fuel: None,
         });
@@ -731,7 +953,51 @@ pub async fn incremental_index(
         "V6 Phase 1 complete: incremental resolve"
     );
 
+    // A drop can take annotated edges, and the annotation arena is
+    // ledger-wide: drop it rather than seal one that may still hold them.
+    // Annotation reads fall back to scanning until a full reindex seals one.
+    let mut config = config;
+    if !novelty.purged_graphs.is_empty() {
+        config.attachment_events = None;
+    }
+    let purged_cids = std::mem::take(&mut novelty.purged_cids);
+    index_novelty(
+        content_store,
+        tracker,
+        ledger_id,
+        base_root_id,
+        novelty,
+        config,
+        purged_cids,
+    )
+    .await
+}
+
+/// Phases 2–4 of an incremental build: merge resolved `novelty` into its
+/// `novelty.base_root` (whose id is `base_root_id`) and write the new root.
+///
+/// `replaced_cids` are artifacts of `base_root_id` that a caller already
+/// superseded before handing over a base root it built itself, so the new
+/// root's garbage manifest retires them too.
+pub(crate) async fn index_novelty(
+    content_store: Arc<dyn ContentStore>,
+    tracker: fluree_db_core::tracking::Tracker,
+    ledger_id: &str,
+    base_root_id: ContentId,
+    mut novelty: IncrementalNovelty,
+    config: IndexerConfig,
+    replaced_cids: Vec<ContentId>,
+) -> Result<IndexResult> {
+    let cache_dir = config.artifact_cache_dir();
+    let _ = std::fs::create_dir_all(&cache_dir);
+    let upload_buffer = config.incremental_leaf_upload_concurrency.max(1);
+    let upload_budget = Arc::new(Semaphore::new(upload_buffer));
+
     // ---- Phase 2: Per-(graph, order) branch updates ----
+    check_order_sets(
+        &novelty.base_root.default_graph_orders,
+        &novelty.base_root.named_graphs,
+    )?;
     let all_orders = [
         RunSortOrder::Spot,
         RunSortOrder::Psot,
@@ -754,6 +1020,7 @@ pub async fn incremental_index(
     let base_root = &novelty.base_root;
     let mut root_builder =
         IncrementalRootBuilder::from_old_root(novelty.base_root.clone(), ledger_id);
+    root_builder.add_replaced_cids(replaced_cids);
     root_builder.set_index_t(novelty.max_t);
     root_builder.add_commit_stats(
         novelty.delta_commit_size,
@@ -869,6 +1136,7 @@ pub async fn incremental_index(
     let mut phase2_outputs: Vec<Phase2TaskOutput> =
         phase2_results.into_iter().collect::<Result<Vec<_>>>()?;
     phase2_outputs.sort_unstable_by_key(|output| output.seq);
+    check_base_facts_agree(&phase2_outputs)?;
 
     // Fact identities the SPOT merges matched against existing base rows.
     // Phase 3b derives materialized-state stat deltas from this: an assert of
@@ -898,6 +1166,7 @@ pub async fn incremental_index(
             Phase2TaskUpdate::Named { branch_cid } => {
                 root_builder.set_named_graph_branch(output.g_id, output.order, branch_cid);
             }
+            Phase2TaskUpdate::Unchanged => {}
         }
         root_builder.add_replaced_cids(output.replaced_leaf_cids);
         root_builder.add_replaced_cids(output.replaced_sidecar_cids);
@@ -922,11 +1191,6 @@ pub async fn incremental_index(
     );
 
     // ---- Phase 3: Dict updates ----
-    // Incremental dict tree updates.
-    use super::dicts::{
-        upload_incremental_reverse_tree_async, upload_incremental_reverse_tree_async_strings,
-    };
-    let mut new_dict_refs = base_root.dict_refs.clone();
     // Resolve the warm-on-write cache once (co-located only); seeds the
     // reverse-dict leaves we rewrite so a reader resolving a just-added
     // IRI/string hits the cache instead of a cold read.
@@ -934,324 +1198,17 @@ pub async fn incremental_index(
         .warm_cache_source
         .as_ref()
         .and_then(|s| s.warm_cache());
-
-    if !novelty.new_subjects.is_empty() {
-        tracing::debug!(
-            count = novelty.new_subjects.len(),
-            "V6 Phase 3: updating subject reverse tree"
-        );
-        let updated = upload_incremental_reverse_tree_async(
-            content_store.as_ref(),
-            fluree_db_core::DictKind::SubjectReverse,
-            &base_root.dict_refs.subject_reverse,
-            novelty.new_subjects.clone(),
-            warm_cache.as_deref(),
-        )
-        .await?;
-        root_builder.add_replaced_cids(updated.replaced_cids);
-        new_dict_refs.subject_reverse = updated.tree_refs;
-    }
-
-    if !novelty.new_strings.is_empty() {
-        tracing::debug!(
-            count = novelty.new_strings.len(),
-            "V6 Phase 3: updating string reverse tree"
-        );
-        let updated = upload_incremental_reverse_tree_async_strings(
-            content_store.as_ref(),
-            fluree_db_core::DictKind::StringReverse,
-            &base_root.dict_refs.string_reverse,
-            novelty.new_strings.clone(),
-            warm_cache.as_deref(),
-        )
-        .await?;
-        root_builder.add_replaced_cids(updated.replaced_cids);
-        new_dict_refs.string_reverse = updated.tree_refs;
-    }
-
-    // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings,
-    // then compact the tail of each stream that was touched. Appending alone adds a
-    // routing entry per build forever; compaction is what bounds the table by data size.
-    {
-        use fluree_db_binary_index::dict::incremental::{
-            build_incremental_string_packs, build_incremental_subject_packs_for_ns,
-        };
-        use fluree_db_binary_index::PackBranchEntry;
-
-        let mut compaction_budget = if compaction_enabled() {
-            CompactionBudget::new()
-        } else {
-            CompactionBudget::disabled()
-        };
-        let mut pack_sizes = PackSizeCache::new();
-        // Every pack CID this cycle uploads, so any that compaction consumes
-        // before publication can be garbaged explicitly.
-        let mut uploaded_pack_cids: Vec<ContentId> = Vec::new();
-        // Streams compacted alongside their own novelty; the rest are swept
-        // afterwards with whatever budget survives.
-        let mut compacted_streams: std::collections::HashSet<Option<u16>> =
-            std::collections::HashSet::new();
-
-        // String forward packs.
-        // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
-        if !novelty.new_strings.is_empty() {
-            debug_assert!(
-                novelty.new_strings.windows(2).all(|w| w[0].0 < w[1].0),
-                "new_strings must be sorted by string_id ascending"
-            );
-
-            let existing_refs = &base_root.dict_refs.forward_packs.string_fwd_packs;
-            let entries: Vec<(u32, &[u8])> = novelty
-                .new_strings
-                .iter()
-                .map(|(id, val)| (*id, val.as_slice()))
-                .collect();
-
-            let pack_result = build_incremental_string_packs(existing_refs, &entries)
-                .map_err(|e| IndexerError::StorageWrite(format!("string fwd pack build: {e}")))?;
-
-            // Upload new pack artifacts and build updated refs.
-            let mut updated_refs = existing_refs.clone();
-            let kind = ContentKind::DictBlob {
-                dict: fluree_db_core::DictKind::StringForward,
-            };
-            for pack in &pack_result.new_packs {
-                let pack_cid = content_store
-                    .put(kind, &pack.bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                uploaded_pack_cids.push(pack_cid.clone());
-                updated_refs.push(PackBranchEntry {
-                    first_id: pack.first_id,
-                    last_id: pack.last_id,
-                    pack_cid,
-                });
-            }
-
-            uploaded_pack_cids.extend(
-                compact_forward_packs(
-                    content_store.as_ref(),
-                    kind,
-                    &mut updated_refs,
-                    &mut pack_sizes,
-                    &mut compaction_budget,
-                    CompactionSpans::default(),
-                    "string",
-                )
-                .await?,
-            );
-            compacted_streams.insert(None);
-
-            let total_packs = updated_refs.len();
-            new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
-
-            tracing::debug!(
-                new_packs = pack_result.new_packs.len(),
-                new_strings = novelty.new_strings.len(),
-                total_packs,
-                "V6 Phase 3: string forward packs updated"
-            );
-        }
-
-        // Subject forward packs (per namespace).
-        // Invariant: new_subjects is sorted by (ns_code, local_id) ascending (enforced by resolver).
-        if !novelty.new_subjects.is_empty() {
-            debug_assert!(
-                novelty
-                    .new_subjects
-                    .windows(2)
-                    .all(|w| (w[0].0, w[0].1) <= (w[1].0, w[1].1)),
-                "new_subjects must be sorted by (ns_code, local_id) ascending"
-            );
-
-            // Group by namespace. BTreeMap preserves ns_code order;
-            // within each namespace, local_ids are already sorted.
-            let mut by_ns: std::collections::BTreeMap<u16, Vec<(u64, Vec<u8>)>> =
-                std::collections::BTreeMap::new();
-            for (ns_code, local_id, suffix) in &novelty.new_subjects {
-                by_ns
-                    .entry(*ns_code)
-                    .or_default()
-                    .push((*local_id, suffix.clone()));
-            }
-
-            let kind = ContentKind::DictBlob {
-                dict: fluree_db_core::DictKind::SubjectForward,
-            };
-
-            for (ns_code, entries) in &by_ns {
-                // Find existing refs for this namespace.
-                let existing_ns_refs: Vec<PackBranchEntry> = new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter()
-                    .find(|(ns, _)| ns == ns_code)
-                    .map(|(_, refs)| refs.clone())
-                    .unwrap_or_default();
-
-                let entry_refs: Vec<(u64, &[u8])> = entries
-                    .iter()
-                    .map(|(id, val)| (*id, val.as_slice()))
-                    .collect();
-
-                let pack_result = build_incremental_subject_packs_for_ns(
-                    *ns_code,
-                    &existing_ns_refs,
-                    &entry_refs,
-                )
-                .map_err(|e| {
-                    IndexerError::StorageWrite(format!("subject fwd pack build ns={ns_code}: {e}"))
-                })?;
-
-                // Upload new packs and build updated refs.
-                let mut updated_refs = existing_ns_refs;
-                for pack in &pack_result.new_packs {
-                    let pack_cid = content_store
-                        .put(kind, &pack.bytes)
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    pack_sizes.insert(pack_cid.clone(), pack.bytes.len() as u64);
-                    uploaded_pack_cids.push(pack_cid.clone());
-                    updated_refs.push(PackBranchEntry {
-                        first_id: pack.first_id,
-                        last_id: pack.last_id,
-                        pack_cid,
-                    });
-                }
-
-                uploaded_pack_cids.extend(
-                    compact_forward_packs(
-                        content_store.as_ref(),
-                        kind,
-                        &mut updated_refs,
-                        &mut pack_sizes,
-                        &mut compaction_budget,
-                        CompactionSpans::default(),
-                        &format!("subject ns={ns_code}"),
-                    )
-                    .await?,
-                );
-                compacted_streams.insert(Some(*ns_code));
-
-                let total_packs = updated_refs.len();
-
-                // Update or insert namespace entry.
-                if let Some(entry) = new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter_mut()
-                    .find(|(ns, _)| ns == ns_code)
-                {
-                    entry.1 = updated_refs;
-                } else {
-                    new_dict_refs
-                        .forward_packs
-                        .subject_fwd_ns_packs
-                        .push((*ns_code, updated_refs));
-                }
-
-                tracing::debug!(
-                    ns_code,
-                    new_packs = pack_result.new_packs.len(),
-                    new_subjects = entries.len(),
-                    total_packs,
-                    "V6 Phase 3: subject forward packs updated"
-                );
-            }
-        }
-
-        // Maintenance: a stream that received no novelty this cycle still
-        // carries whatever fragmentation it accumulated, and its packs are
-        // still loaded and mapped with the index. A namespace that goes quiet
-        // would otherwise keep its tiny packs forever. Sweep those with the
-        // leftover budget.
-        //
-        // Coverage rotates with `index_t` so that a ledger with more streams
-        // than one cycle's budget can service still reaches all of them over
-        // time, without persisting a cursor anywhere.
-        {
-            let mut pending: Vec<Option<u16>> = Vec::new();
-            if !compacted_streams.contains(&None) {
-                pending.push(None);
-            }
-            pending.extend(
-                new_dict_refs
-                    .forward_packs
-                    .subject_fwd_ns_packs
-                    .iter()
-                    .map(|(ns, _)| Some(*ns))
-                    .filter(|key| !compacted_streams.contains(key)),
-            );
-
-            if !pending.is_empty() {
-                let offset = (base_root.index_t.unsigned_abs() as usize) % pending.len();
-                pending.rotate_left(offset);
-            }
-
-            for key in pending {
-                if compaction_budget.exhausted() {
-                    break;
-                }
-                let (kind, label, refs) = match key {
-                    None => (
-                        ContentKind::DictBlob {
-                            dict: fluree_db_core::DictKind::StringForward,
-                        },
-                        "string (maintenance)".to_string(),
-                        &mut new_dict_refs.forward_packs.string_fwd_packs,
-                    ),
-                    Some(ns_code) => {
-                        let Some(entry) = new_dict_refs
-                            .forward_packs
-                            .subject_fwd_ns_packs
-                            .iter_mut()
-                            .find(|(ns, _)| *ns == ns_code)
-                        else {
-                            continue;
-                        };
-                        (
-                            ContentKind::DictBlob {
-                                dict: fluree_db_core::DictKind::SubjectForward,
-                            },
-                            format!("subject ns={ns_code} (maintenance)"),
-                            &mut entry.1,
-                        )
-                    }
-                };
-
-                uploaded_pack_cids.extend(
-                    compact_forward_packs(
-                        content_store.as_ref(),
-                        kind,
-                        refs,
-                        &mut pack_sizes,
-                        &mut compaction_budget,
-                        CompactionSpans::default(),
-                        &label,
-                    )
-                    .await?,
-                );
-            }
-        }
-
-        // Packs created and consumed within this cycle are referenced by no
-        // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
-        let transient = unreferenced_uploads(
-            &uploaded_pack_cids,
-            &new_dict_refs.forward_packs,
-            &base_root.dict_refs.forward_packs,
-        );
-        if !transient.is_empty() {
-            tracing::debug!(
-                count = transient.len(),
-                "V6 Phase 3: forward packs created and compacted within one cycle"
-            );
-            root_builder.add_replaced_cids(transient);
-        }
-    }
-
-    root_builder.set_dict_refs(new_dict_refs);
+    let dict_update = apply_dict_novelty(
+        content_store.as_ref(),
+        &base_root.dict_refs,
+        base_root.index_t,
+        &novelty.new_subjects,
+        &novelty.new_strings,
+        warm_cache.as_deref(),
+    )
+    .await?;
+    root_builder.add_replaced_cids(dict_update.replaced_cids);
+    root_builder.set_dict_refs(dict_update.dict_refs);
 
     // Update metadata from resolver state.
     let new_ns_codes: std::collections::BTreeMap<u16, String> = novelty
@@ -1306,9 +1263,7 @@ pub async fn incremental_index(
     // and patching any (g_id, p_id) that have new/extended data.
     // The resolver already populated shared.numbigs/vectors/spatial_hook/fulltext_hook.
     {
-        use fluree_db_binary_index::{
-            FulltextArenaRef, GraphArenaRefs, SpatialArenaRef, VectorDictRef,
-        };
+        use fluree_db_binary_index::{FulltextArenaRef, GraphArenaRefs, VectorDictRef};
         use std::collections::BTreeMap;
 
         let mut arenas_by_gid: BTreeMap<u16, GraphArenaRefs> = BTreeMap::new();
@@ -1790,7 +1745,13 @@ pub async fn incremental_index(
                         .map_err(|e| {
                             IndexerError::StorageWrite(format!("fulltext CAS write: {e}"))
                         })?;
-                    cache_artifact_bytes(&cache_dir, &arena_cid, &blob, "fulltext_arena");
+                    cache_artifact_bytes(
+                        &*content_store,
+                        &cache_dir,
+                        &arena_cid,
+                        &blob,
+                        "fulltext_arena",
+                    );
 
                     let new_ref = FulltextArenaRef {
                         p_id,
@@ -1833,213 +1794,55 @@ pub async fn incremental_index(
 
             // ---- Spatial arena rebuild (per affected predicate) ----
             //
-            // For each (g_id, p_id) with novelty spatial entries, rebuild the
-            // spatial index from scratch: load all prior entries from the existing
-            // snapshot, combine with novelty, build + upload a new index.
+            // Each (g_id, p_id) with novelty spatial entries is rebuilt from its
+            // prior entries plus novelty, by the builder the full rebuild uses.
             // Unchanged spatial arenas carry forward by CID.
             if has_new_spatial {
-                let spatial_entries = novelty
+                let novelty_entries = novelty
                     .shared
                     .spatial_hook
                     .as_ref()
                     .map(super::super::spatial_hook::SpatialHook::entries)
                     .unwrap_or(&[]);
+                let touched: std::collections::BTreeSet<(u16, u32)> =
+                    novelty_entries.iter().map(|e| (e.g_id, e.p_id)).collect();
 
-                // Group novelty entries by (g_id, p_id).
-                let mut grouped: BTreeMap<(u16, u32), Vec<&crate::spatial_hook::SpatialEntry>> =
-                    BTreeMap::new();
-                for entry in spatial_entries {
-                    grouped
-                        .entry((entry.g_id, entry.p_id))
-                        .or_default()
-                        .push(entry);
-                }
-
-                for ((g_id, p_id), new_entries) in grouped {
-                    let pred_iri = novelty
-                        .shared
-                        .predicates
-                        .resolve(p_id)
-                        .unwrap_or("unknown")
-                        .to_string();
-
-                    let config = fluree_db_spatial::SpatialCreateConfig::new(
-                        format!("spatial:g{g_id}p{p_id}"),
-                        ledger_id.to_string(),
-                        pred_iri.clone(),
-                    );
-                    let mut builder = fluree_db_spatial::SpatialIndexBuilder::new(config);
-
-                    // Load prior entries from the existing spatial snapshot (if any).
-                    let ga = arenas_by_gid.get(&g_id);
-                    let existing_ref = ga.and_then(|a| a.spatial.iter().find(|s| s.p_id == p_id));
-                    let mut prior_count = 0u64;
-
-                    if let Some(sp_ref) = existing_ref {
-                        // Load the SpatialIndexRoot + snapshot from CAS.
-                        let root_bytes = fetch_cached_index_bytes(
+                let mut entries = Vec::new();
+                for &(g_id, p_id) in &touched {
+                    let prior = arenas_by_gid
+                        .get(&g_id)
+                        .and_then(|ga| ga.spatial.iter().find(|s| s.p_id == p_id));
+                    if let Some(sp_ref) = prior {
+                        load_prior_spatial_entries(
                             content_store.as_ref(),
-                            &sp_ref.root_cid,
                             &cache_dir,
-                            format!("spatial root load for g{g_id}:p{p_id}"),
+                            g_id,
+                            sp_ref,
+                            &mut entries,
                         )
                         .await?;
-                        let spatial_root: fluree_db_spatial::SpatialIndexRoot =
-                            serde_json::from_slice(&root_bytes).map_err(|e| {
-                                IndexerError::StorageRead(format!(
-                                    "spatial root decode for g{g_id}:p{p_id}: {e}"
-                                ))
-                            })?;
-
-                        // Pre-fetch all blobs for the sync load_from_cas closure.
-                        let mut blob_cache: std::collections::HashMap<String, Vec<u8>> =
-                            std::collections::HashMap::new();
-                        for cid in [&sp_ref.manifest, &sp_ref.arena] {
-                            let bytes = fetch_cached_index_bytes(
-                                content_store.as_ref(),
-                                cid,
-                                &cache_dir,
-                                "spatial blob fetch",
-                            )
-                            .await?;
-                            blob_cache.insert(cid.digest_hex(), bytes);
-                        }
-                        for leaflet_cid in &sp_ref.leaflets {
-                            let bytes = fetch_cached_index_bytes(
-                                content_store.as_ref(),
-                                leaflet_cid,
-                                &cache_dir,
-                                "spatial leaflet fetch",
-                            )
-                            .await?;
-                            blob_cache.insert(leaflet_cid.digest_hex(), bytes);
-                        }
-
-                        let cache_arc = std::sync::Arc::new(blob_cache);
-                        match fluree_db_spatial::SpatialIndexSnapshot::load_from_cas(
-                            spatial_root,
-                            move |hash| {
-                                cache_arc.get(hash).cloned().ok_or_else(|| {
-                                    fluree_db_spatial::error::SpatialError::ChunkNotFound(
-                                        hash.to_string(),
-                                    )
-                                })
-                            },
-                        ) {
-                            Ok(snapshot) => {
-                                let all_entries = snapshot
-                                    .cell_index()
-                                    .scan_range(0, u64::MAX)
-                                    .unwrap_or_default();
-                                for ce in &all_entries {
-                                    if let Some(arena_entry) = snapshot.arena().get(ce.geo_handle) {
-                                        if let Ok(wkt_str) = std::str::from_utf8(&arena_entry.wkt) {
-                                            let _ = builder.add_geometry(
-                                                ce.subject_id,
-                                                wkt_str,
-                                                ce.t,
-                                                ce.is_assert(),
-                                            );
-                                            prior_count += 1;
-                                        }
-                                    }
-                                }
-                            }
-                            Err(e) => {
-                                return Err(IndexerError::IncrementalAbort(format!(
-                                    "spatial snapshot load failed for g_id={g_id}, \
-                                     p_id={p_id}: {e}; falling back to full rebuild \
-                                     for correctness"
-                                )));
-                            }
-                        }
                     }
+                }
+                entries.extend(novelty_entries.iter().cloned());
 
-                    // Feed novelty entries.
-                    for entry in &new_entries {
-                        let _ = builder.add_geometry(
-                            entry.subject_id,
-                            &entry.wkt,
-                            entry.t,
-                            entry.is_assert,
+                let built = super::spatial::build_and_upload_spatial_indexes(
+                    &entries,
+                    &novelty.shared.predicates,
+                    ledger_id,
+                    content_store.as_ref(),
+                    |cid, bytes| {
+                        cache_artifact_bytes(
+                            content_store.as_ref(),
+                            &cache_dir,
+                            cid,
+                            bytes,
+                            "spatial",
                         );
-                    }
+                    },
+                )
+                .await?;
 
-                    let build_result = builder.build().map_err(|e| {
-                        IndexerError::Other(format!("spatial build g{g_id}:p{p_id}: {e}"))
-                    })?;
-
-                    if build_result.entries.is_empty() {
-                        continue;
-                    }
-
-                    // Upload via the same two-phase pattern as the full build.
-                    let mut pending_blobs: Vec<(String, Vec<u8>)> = Vec::new();
-                    let write_result = build_result
-                        .write_to_cas(|bytes| {
-                            use sha2::{Digest, Sha256};
-                            let hash_hex = hex::encode(Sha256::digest(bytes));
-                            pending_blobs.push((hash_hex.clone(), bytes.to_vec()));
-                            Ok(hash_hex)
-                        })
-                        .map_err(|e| IndexerError::Other(format!("spatial CAS build: {e}")))?;
-
-                    for (_hash, blob_bytes) in &pending_blobs {
-                        let cid = content_store
-                            .put(ContentKind::SpatialIndex, blob_bytes)
-                            .await
-                            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                        cache_artifact_bytes(&cache_dir, &cid, blob_bytes, "spatial_blob");
-                    }
-
-                    // Build CIDs.
-                    let spatial_codec = ContentKind::SpatialIndex.to_codec();
-                    let root_json = serde_json::to_vec(&write_result.root)
-                        .map_err(|e| IndexerError::Other(format!("spatial root serialize: {e}")))?;
-                    let root_cid = content_store
-                        .put(ContentKind::SpatialIndex, &root_json)
-                        .await
-                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                    cache_artifact_bytes(&cache_dir, &root_cid, &root_json, "spatial_root");
-                    let manifest_cid =
-                        ContentId::from_hex_digest(spatial_codec, &write_result.manifest_address)
-                            .ok_or_else(|| {
-                            IndexerError::StorageWrite(format!(
-                                "invalid spatial manifest hash for g_id={g_id}, p_id={p_id}: {}",
-                                write_result.manifest_address
-                            ))
-                        })?;
-                    let arena_cid =
-                        ContentId::from_hex_digest(spatial_codec, &write_result.arena_address)
-                            .ok_or_else(|| {
-                                IndexerError::StorageWrite(format!(
-                                    "invalid spatial arena hash for g_id={g_id}, p_id={p_id}: {}",
-                                    write_result.arena_address
-                                ))
-                            })?;
-                    let leaflet_cids: Vec<ContentId> = write_result
-                        .leaflet_addresses
-                        .iter()
-                        .enumerate()
-                        .map(|(i, h)| {
-                            ContentId::from_hex_digest(spatial_codec, h).ok_or_else(|| {
-                                IndexerError::StorageWrite(format!(
-                                    "invalid spatial leaflet hash [{i}] for \
-                                     g_id={g_id}, p_id={p_id}: {h}"
-                                ))
-                            })
-                        })
-                        .collect::<Result<Vec<_>>>()?;
-
-                    let new_ref = SpatialArenaRef {
-                        p_id,
-                        root_cid,
-                        manifest: manifest_cid,
-                        arena: arena_cid,
-                        leaflets: leaflet_cids,
-                    };
-
-                    // Replace or insert in graph arenas.
+                for (g_id, refs) in built {
                     let ga = arenas_by_gid.entry(g_id).or_insert_with(|| GraphArenaRefs {
                         g_id,
                         numbig: Vec::new(),
@@ -2047,30 +1850,20 @@ pub async fn incremental_index(
                         spatial: Vec::new(),
                         fulltext: vec![],
                     });
-
-                    if let Some(pos) = ga.spatial.iter().position(|s| s.p_id == p_id) {
-                        // GC old spatial CIDs.
-                        let old = &ga.spatial[pos];
-                        root_builder.add_replaced_cids(vec![
-                            old.root_cid.clone(),
-                            old.manifest.clone(),
-                            old.arena.clone(),
-                        ]);
-                        root_builder.add_replaced_cids(old.leaflets.clone());
-                        ga.spatial[pos] = new_ref;
-                    } else {
-                        ga.spatial.push(new_ref);
-                        ga.spatial.sort_by_key(|s| s.p_id);
+                    for new_ref in refs {
+                        if let Some(pos) = ga.spatial.iter().position(|s| s.p_id == new_ref.p_id) {
+                            let old = std::mem::replace(&mut ga.spatial[pos], new_ref);
+                            root_builder.add_replaced_cids(vec![
+                                old.root_cid,
+                                old.manifest,
+                                old.arena,
+                            ]);
+                            root_builder.add_replaced_cids(old.leaflets);
+                        } else {
+                            ga.spatial.push(new_ref);
+                            ga.spatial.sort_by_key(|s| s.p_id);
+                        }
                     }
-
-                    tracing::debug!(
-                        g_id,
-                        p_id,
-                        predicate = %pred_iri,
-                        prior_entries = prior_count,
-                        novelty_entries = new_entries.len(),
-                        "incremental V6: spatial index rebuilt for (graph, predicate)"
-                    );
                 }
             }
 
@@ -2112,10 +1905,9 @@ pub async fn incremental_index(
             )
             .await
             {
-                Ok(bytes) => match stats::HllSketchBlob::from_json_bytes(&bytes)
-                    .and_then(stats::HllSketchBlob::into_properties)
-                {
-                    Ok(props) => {
+                Ok(bytes) => match stats::HllSketchBlob::from_bytes(&bytes) {
+                    Ok(blob) => {
+                        let props = blob.into_properties();
                         tracing::debug!(
                             entries = props.len(),
                             bytes = bytes.len(),
@@ -2123,19 +1915,16 @@ pub async fn incremental_index(
                         );
                         props
                     }
+                    // A newer format means a downgraded indexer. Reseeding
+                    // would silently thin NDV on every build; fail instead.
+                    Err(e @ stats::SketchDecodeError::Unsupported(_)) => return Err(e.into()),
                     Err(e) => {
-                        tracing::warn!(error = %e, "failed to decode prior sketches, starting fresh");
+                        tracing::error!(error = %e, %cid, "failed to decode prior sketches, starting fresh");
                         std::collections::HashMap::new()
                     }
                 },
-                Err(IndexerError::StorageRead(e)) if e.contains("not found") => {
-                    tracing::debug!(
-                        "sketch blob CID present but content not found, starting fresh"
-                    );
-                    std::collections::HashMap::new()
-                }
                 Err(e) => {
-                    tracing::warn!(error = %e, "failed to load sketch blob, starting fresh");
+                    tracing::error!(error = %e, %cid, "failed to load sketch blob, starting fresh");
                     std::collections::HashMap::new()
                 }
             }
@@ -2157,6 +1946,9 @@ pub async fn incremental_index(
         // clamp applies on every incremental (not just the fallback) so ndv
         // survives register loss in a previously fallback-seeded sketch.
         let mut prior_properties = prior_properties;
+        // A purged graph starts from nothing: what the sketch counted of it
+        // the drop took.
+        prior_properties.retain(|key, _| !novelty.purged_graphs.contains(&key.g_id));
         let mut base_ndv_floor: std::collections::HashMap<stats::GraphPropertyKey, (u64, u64)> =
             std::collections::HashMap::new();
         if let Some(graphs) = base_root.stats.as_ref().and_then(|s| s.graphs.as_ref()) {
@@ -2245,28 +2037,18 @@ pub async fn incremental_index(
         }
 
         // Upload HLL sketches (before finalize consumes the hook).
-        let sketch_ref = {
-            let sketch_blob =
-                stats::HllSketchBlob::from_properties(novelty.max_t, stats_hook.properties());
-            if !sketch_blob.entries.is_empty() {
-                let sketch_bytes = sketch_blob
-                    .to_json_bytes()
-                    .map_err(|e| IndexerError::StorageWrite(format!("sketch serialize: {e}")))?;
-                let cid = content_store
-                    .put(ContentKind::StatsSketch, &sketch_bytes)
-                    .await
-                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-                cache_artifact_bytes(&cache_dir, &cid, &sketch_bytes, "stats_sketch");
-                tracing::debug!(
-                    %cid,
-                    bytes = sketch_bytes.len(),
-                    entries = sketch_blob.entries.len(),
-                    "incremental V6: HLL sketch uploaded"
-                );
+        let sketch_ref = match super::upload::upload_stats_sketch(
+            content_store.as_ref(),
+            novelty.max_t,
+            stats_hook.properties(),
+        )
+        .await?
+        {
+            Some((cid, bytes)) => {
+                cache_artifact_bytes(&*content_store, &cache_dir, &cid, &bytes, "stats_sketch");
                 Some(cid)
-            } else {
-                None
             }
+            None => None,
         };
 
         // Move per-subject maps out of the hook (avoids cloning).
@@ -2534,13 +2316,15 @@ pub async fn incremental_index(
                             "Phase 3b: starting batched PSOT rdf:type lookup"
                         );
                         let started = Instant::now();
-                        match fluree_db_binary_index::batched_lookup_predicate_refs(
-                            store,
-                            scan_g_id,
-                            rdf_type_p_id,
-                            scan_sids,
-                            base_root.index_t,
-                        ) {
+                        match par_batched_lookup(scan_sids, |part| {
+                            fluree_db_binary_index::batched_lookup_predicate_refs(
+                                store,
+                                scan_g_id,
+                                rdf_type_p_id,
+                                part,
+                                base_root.index_t,
+                            )
+                        }) {
                             Ok(base_map) => {
                                 tracing::debug!(
                                     g_id = scan_g_id,
@@ -2622,22 +2406,63 @@ pub async fn incremental_index(
                 // let the caller fall back to rebuild. Only count subjects that existed in
                 // the base index (those drive the re-scan work); brand-new typed subjects
                 // are free. An IncrementalAbort is caught in lib.rs and routed to rebuild.
+                //
+                // The rebuild re-reads the whole index, so the cap scales with
+                // it: the configured count is the floor, and a ledger with more
+                // typed subjects aborts only once a share of them changed type.
+                // A fixed count sent every large batch of entity deletes on a
+                // large ledger (each retracts its subject's types) to a rebuild
+                // costing minutes where the re-scan costs seconds.
                 let retype_workload = changed_membership
                     .iter()
                     .filter(|key| base_subject_classes.contains_key(*key))
                     .count();
-                if retype_workload > config.incremental_retype_max_subjects {
+                // Subjects, as the workload counts them: per graph, the
+                // distinct subjects of rdf:type, or with no estimate for it the
+                // largest class (a lower bound, which only defers sooner).
+                // Summing class counts would count a subject once per type.
+                let base_typed_subjects: u64 = base_root
+                    .stats
+                    .as_ref()
+                    .and_then(|stats| stats.graphs.as_ref())
+                    .map(|graphs| {
+                        graphs
+                            .iter()
+                            .map(|graph| {
+                                graph
+                                    .properties
+                                    .iter()
+                                    .find(|p| p.p_id == rdf_type_p_id)
+                                    .map(|p| p.ndv_subjects)
+                                    .filter(|&n| n > 0)
+                                    .unwrap_or_else(|| {
+                                        graph
+                                            .classes
+                                            .iter()
+                                            .flatten()
+                                            .map(|class| class.count)
+                                            .max()
+                                            .unwrap_or(0)
+                                    })
+                            })
+                            .sum()
+                    })
+                    .unwrap_or(0);
+                let retype_threshold = config.incremental_retype_max_subjects.max(
+                    usize::try_from(base_typed_subjects / RETYPE_REBUILD_SHARE)
+                        .unwrap_or(usize::MAX),
+                );
+                if retype_workload > retype_threshold {
                     tracing::warn!(
                         retype_workload,
-                        threshold = config.incremental_retype_max_subjects,
+                        threshold = retype_threshold,
                         "Phase 3b: existing-subject rdf:type changes exceed threshold; \
                          aborting incremental for full rebuild (class stats recomputed \
                          from the SPOT pass)"
                     );
                     return Err(IndexerError::IncrementalAbort(format!(
-                        "re-type workload {retype_workload} exceeds threshold {} \
-                         (deferring class-stat recompute to full rebuild)",
-                        config.incremental_retype_max_subjects
+                        "re-type workload {retype_workload} exceeds threshold {retype_threshold} \
+                         (deferring class-stat recompute to full rebuild)"
                     )));
                 }
 
@@ -2806,30 +2631,31 @@ pub async fn incremental_index(
                             changed_by_graph.entry(g_id).or_default().push(s_id);
                         }
                         for (&g_id, sids) in &changed_by_graph {
-                            let base_props =
-                                match fluree_db_binary_index::batched_lookup_subject_properties(
+                            let base_props = match par_batched_lookup(sids, |part| {
+                                fluree_db_binary_index::batched_lookup_subject_properties(
                                     store,
                                     g_id,
-                                    sids,
+                                    part,
                                     base_root.index_t,
-                                ) {
-                                    Ok(m) => m,
-                                    Err(e) => {
-                                        // This scan drives the datatype/language
-                                        // re-attribution that makes the now-ungated
-                                        // class-stat folds current-state-exact. A
-                                        // warn-and-continue here would silently leave
-                                        // re-typed subjects with stale per-(class,
-                                        // property) stats, so abort to a full rebuild
-                                        // (which recomputes class stats from the SPOT
-                                        // pass). Caught in lib.rs and routed to rebuild.
-                                        return Err(IndexerError::IncrementalAbort(format!(
-                                            "Phase 3b base subject-property scan failed \
+                                )
+                            }) {
+                                Ok(m) => m,
+                                Err(e) => {
+                                    // This scan drives the datatype/language
+                                    // re-attribution that makes the now-ungated
+                                    // class-stat folds current-state-exact. A
+                                    // warn-and-continue here would silently leave
+                                    // re-typed subjects with stale per-(class,
+                                    // property) stats, so abort to a full rebuild
+                                    // (which recomputes class stats from the SPOT
+                                    // pass). Caught in lib.rs and routed to rebuild.
+                                    return Err(IndexerError::IncrementalAbort(format!(
+                                        "Phase 3b base subject-property scan failed \
                                              for graph {g_id}: {e} (deferring class-stat \
                                              recompute to full rebuild)"
-                                        )));
-                                    }
-                                };
+                                    )));
+                                }
+                            };
                             for &s_id in sids {
                                 let base_cls = base_subject_classes
                                     .get(&(g_id, s_id))
@@ -2994,12 +2820,14 @@ pub async fn incremental_index(
                             }
                             // Case B: inbound edges of re-typed objects (reverse OPST). Skip
                             // edges whose subject also changed — Case A already owns those.
-                            match fluree_db_binary_index::batched_lookup_inbound_refs(
-                                store,
-                                g_id,
-                                sids,
-                                base_root.index_t,
-                            ) {
+                            match par_batched_lookup(sids, |part| {
+                                fluree_db_binary_index::batched_lookup_inbound_refs(
+                                    store,
+                                    g_id,
+                                    part,
+                                    base_root.index_t,
+                                )
+                            }) {
                                 Ok(inbound) => {
                                     for (&obj, ins) in &inbound {
                                         for &(p, subj) in ins {
@@ -3061,13 +2889,15 @@ pub async fn incremental_index(
                                 // would mis-attribute (or drop) ref-class edges; abort to a
                                 // full rebuild rather than `unwrap_or_default()` (which would
                                 // silently treat every endpoint as class-less).
-                                match fluree_db_binary_index::batched_lookup_predicate_refs(
-                                    store,
-                                    g_id,
-                                    rdf_type_p_id,
-                                    &external_sids,
-                                    base_root.index_t,
-                                ) {
+                                match par_batched_lookup(&external_sids, |part| {
+                                    fluree_db_binary_index::batched_lookup_predicate_refs(
+                                        store,
+                                        g_id,
+                                        rdf_type_p_id,
+                                        part,
+                                        base_root.index_t,
+                                    )
+                                }) {
                                     Ok(m) => m,
                                     Err(e) => {
                                         return Err(IndexerError::IncrementalAbort(format!(
@@ -3807,10 +3637,10 @@ pub async fn incremental_index(
     //   Unknown / None        → defensive drop when base has arena;
     //                            no-op when base has none.
     //
-    // Events are clipped to `t <= record.commit_t` so a concurrent
-    // commit's events can't leak into a root whose `index_t` is still
-    // `commit_t`. Keeps `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
-    let job_t = record.commit_t;
+    // Events are clipped to the new root's `index_t` so a concurrent
+    // commit's events can't leak into it. Keeps
+    // `AnnotationIndexRoot.max_t <= IndexRoot.index_t`.
+    let job_t = novelty.max_t;
     use crate::config::AttachmentEventCoverage;
     let coverage = config.attachment_events.clone();
     let prev_arena = base_root.annotation_index.as_ref();
@@ -4001,7 +3831,13 @@ pub async fn incremental_index(
         .put(ContentKind::IndexRoot, &root_bytes)
         .await
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-    cache_artifact_bytes(&cache_dir, &root_id, &root_bytes, "index_root");
+    cache_artifact_bytes(
+        &*content_store,
+        &cache_dir,
+        &root_id,
+        &root_bytes,
+        "index_root",
+    );
 
     tracing::debug!(
         %root_id,
@@ -4016,7 +3852,7 @@ pub async fn incremental_index(
     Ok(IndexResult {
         root_id,
         index_t: final_root.index_t,
-        ledger_id: ledger_id.to_string(),
+        ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
         stats: IndexStats {
             flake_count: novelty.records.len(),
             leaf_count: total_new_leaves,
@@ -4031,6 +3867,380 @@ pub async fn incremental_index(
 // ============================================================================
 // Helpers
 // ============================================================================
+
+/// Dictionary trees and forward packs after [`apply_dict_novelty`].
+pub struct DictNoveltyUpdate {
+    pub dict_refs: fluree_db_binary_index::DictRefs,
+    /// Artifacts the update superseded that a base-vs-new diff of `dict_refs`
+    /// cannot see: rewritten reverse-tree leaves, and packs created and
+    /// compacted away within this update.
+    pub replaced_cids: Vec<ContentId>,
+}
+
+/// Add new subjects and strings to the dictionaries `base_dict_refs` names:
+/// update both reverse trees and append (then compact) forward packs.
+///
+/// `new_subjects` must be sorted by `(ns_code, local_id)` and `new_strings`
+/// by id, each id above the base watermark, as an
+/// [`IncrementalNovelty`] holds them. `base_index_t` rotates which untouched
+/// streams this cycle's leftover compaction budget sweeps.
+pub async fn apply_dict_novelty(
+    content_store: &dyn ContentStore,
+    base_dict_refs: &fluree_db_binary_index::DictRefs,
+    base_index_t: i64,
+    new_subjects: &[(u16, u64, Vec<u8>)],
+    new_strings: &[(u32, Vec<u8>)],
+    warm_cache: Option<&LeafletCache>,
+) -> Result<DictNoveltyUpdate> {
+    let mut replaced_cids: Vec<ContentId> = Vec::new();
+    // Incremental dict tree updates.
+    use super::dicts::{
+        upload_incremental_reverse_tree_async, upload_incremental_reverse_tree_async_strings,
+    };
+    let mut new_dict_refs = base_dict_refs.clone();
+
+    if !new_subjects.is_empty() {
+        tracing::debug!(
+            count = new_subjects.len(),
+            "V6 Phase 3: updating subject reverse tree"
+        );
+        let updated = upload_incremental_reverse_tree_async(
+            content_store,
+            fluree_db_core::DictKind::SubjectReverse,
+            &base_dict_refs.subject_reverse,
+            new_subjects.to_vec(),
+            warm_cache,
+        )
+        .await?;
+        replaced_cids.extend(updated.replaced_cids);
+        new_dict_refs.subject_reverse = updated.tree_refs;
+    }
+
+    if !new_strings.is_empty() {
+        tracing::debug!(
+            count = new_strings.len(),
+            "V6 Phase 3: updating string reverse tree"
+        );
+        let updated = upload_incremental_reverse_tree_async_strings(
+            content_store,
+            fluree_db_core::DictKind::StringReverse,
+            &base_dict_refs.string_reverse,
+            new_strings.to_vec(),
+            warm_cache,
+        )
+        .await?;
+        replaced_cids.extend(updated.replaced_cids);
+        new_dict_refs.string_reverse = updated.tree_refs;
+    }
+
+    // Forward pack updates (FPK1): append new pack artifacts for new subjects/strings,
+    // then compact the tail of each stream that was touched. Appending alone adds a
+    // routing entry per build forever; compaction is what bounds the table by data size.
+    {
+        use fluree_db_binary_index::dict::incremental::{
+            build_incremental_string_packs, build_incremental_subject_packs_for_ns,
+        };
+        use fluree_db_binary_index::PackBranchEntry;
+
+        let mut appends = ForwardPackAppends::default();
+
+        // String forward packs.
+        // Invariant: new_strings is sorted by string_id ascending (enforced by resolver).
+        if !new_strings.is_empty() {
+            debug_assert!(
+                new_strings.windows(2).all(|w| w[0].0 < w[1].0),
+                "new_strings must be sorted by string_id ascending"
+            );
+
+            let existing_refs = &base_dict_refs.forward_packs.string_fwd_packs;
+            let entries: Vec<(u32, &[u8])> = new_strings
+                .iter()
+                .map(|(id, val)| (*id, val.as_slice()))
+                .collect();
+
+            let pack_result = build_incremental_string_packs(existing_refs, &entries)
+                .map_err(|e| IndexerError::StorageWrite(format!("string fwd pack build: {e}")))?;
+
+            // Upload new pack artifacts and build updated refs.
+            let mut updated_refs = existing_refs.clone();
+            let kind = ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::StringForward,
+            };
+            for pack in &pack_result.new_packs {
+                let pack_cid = content_store
+                    .put(kind, &pack.bytes)
+                    .await
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                appends.record(&pack_cid, pack.bytes.len());
+                updated_refs.push(PackBranchEntry {
+                    first_id: pack.first_id,
+                    last_id: pack.last_id,
+                    pack_cid,
+                });
+            }
+            new_dict_refs.forward_packs.string_fwd_packs = updated_refs;
+            appends.streams.push(None);
+
+            tracing::debug!(
+                new_packs = pack_result.new_packs.len(),
+                new_strings = new_strings.len(),
+                "V6 Phase 3: string forward packs appended"
+            );
+        }
+
+        // Subject forward packs (per namespace).
+        // Invariant: new_subjects is sorted by (ns_code, local_id) ascending (enforced by resolver).
+        if !new_subjects.is_empty() {
+            debug_assert!(
+                new_subjects
+                    .windows(2)
+                    .all(|w| (w[0].0, w[0].1) <= (w[1].0, w[1].1)),
+                "new_subjects must be sorted by (ns_code, local_id) ascending"
+            );
+
+            // Group by namespace. BTreeMap preserves ns_code order;
+            // within each namespace, local_ids are already sorted.
+            let mut by_ns: std::collections::BTreeMap<u16, Vec<(u64, Vec<u8>)>> =
+                std::collections::BTreeMap::new();
+            for (ns_code, local_id, suffix) in new_subjects {
+                by_ns
+                    .entry(*ns_code)
+                    .or_default()
+                    .push((*local_id, suffix.clone()));
+            }
+
+            let kind = ContentKind::DictBlob {
+                dict: fluree_db_core::DictKind::SubjectForward,
+            };
+
+            for (ns_code, entries) in &by_ns {
+                let refs = subject_ns_packs_mut(&mut new_dict_refs, *ns_code);
+
+                let entry_refs: Vec<(u64, &[u8])> = entries
+                    .iter()
+                    .map(|(id, val)| (*id, val.as_slice()))
+                    .collect();
+
+                let pack_result = build_incremental_subject_packs_for_ns(
+                    *ns_code,
+                    refs,
+                    &entry_refs,
+                )
+                .map_err(|e| {
+                    IndexerError::StorageWrite(format!("subject fwd pack build ns={ns_code}: {e}"))
+                })?;
+
+                // Upload new packs and append their refs.
+                for pack in &pack_result.new_packs {
+                    let pack_cid = content_store
+                        .put(kind, &pack.bytes)
+                        .await
+                        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                    appends.record(&pack_cid, pack.bytes.len());
+                    refs.push(PackBranchEntry {
+                        first_id: pack.first_id,
+                        last_id: pack.last_id,
+                        pack_cid,
+                    });
+                }
+                appends.streams.push(Some(*ns_code));
+
+                tracing::debug!(
+                    ns_code,
+                    new_packs = pack_result.new_packs.len(),
+                    new_subjects = entries.len(),
+                    "V6 Phase 3: subject forward packs appended"
+                );
+            }
+        }
+
+        replaced_cids.extend(
+            compact_forward_streams(
+                content_store,
+                &mut new_dict_refs,
+                &base_dict_refs.forward_packs,
+                base_index_t,
+                appends,
+            )
+            .await?,
+        );
+    }
+
+    Ok(DictNoveltyUpdate {
+        dict_refs: new_dict_refs,
+        replaced_cids,
+    })
+}
+
+/// Forward packs one cycle appended, awaiting [`compact_forward_streams`].
+#[derive(Default)]
+pub(super) struct ForwardPackAppends {
+    /// Every pack uploaded, so any that compaction consumes before
+    /// publication can be garbaged explicitly.
+    uploaded: Vec<ContentId>,
+    sizes: PackSizeCache,
+    /// The streams appended to, in the order they are compacted: `None`
+    /// for strings, `Some(ns_code)` for a subject namespace.
+    pub(super) streams: Vec<Option<u16>>,
+}
+
+impl ForwardPackAppends {
+    pub(super) fn record(&mut self, cid: &ContentId, encoded_len: usize) {
+        self.sizes.insert(cid.clone(), encoded_len as u64);
+        self.uploaded.push(cid.clone());
+    }
+}
+
+/// The subject forward pack routing for `ns_code`, created empty if the
+/// namespace has none yet.
+pub(super) fn subject_ns_packs_mut(
+    dict_refs: &mut fluree_db_binary_index::DictRefs,
+    ns_code: u16,
+) -> &mut Vec<fluree_db_binary_index::PackBranchEntry> {
+    let streams = &mut dict_refs.forward_packs.subject_fwd_ns_packs;
+    let at = match streams.iter().position(|(ns, _)| *ns == ns_code) {
+        Some(at) => at,
+        None => {
+            streams.push((ns_code, Vec::new()));
+            streams.len() - 1
+        }
+    };
+    &mut streams[at].1
+}
+
+/// Compact the forward-pack streams a cycle appended to, then sweep the
+/// rest with whatever budget survives. Returns the packs created and
+/// consumed within the cycle, which no root references.
+pub(super) async fn compact_forward_streams(
+    content_store: &dyn ContentStore,
+    dict_refs: &mut fluree_db_binary_index::DictRefs,
+    base: &fluree_db_binary_index::DictPackRefs,
+    base_index_t: i64,
+    appends: ForwardPackAppends,
+) -> Result<Vec<ContentId>> {
+    let ForwardPackAppends {
+        mut uploaded,
+        sizes: mut pack_sizes,
+        streams,
+    } = appends;
+    let mut compaction_budget = if compaction_enabled() {
+        CompactionBudget::new()
+    } else {
+        CompactionBudget::disabled()
+    };
+
+    fn stream_refs(
+        dict_refs: &mut fluree_db_binary_index::DictRefs,
+        key: Option<u16>,
+    ) -> Option<(
+        ContentKind,
+        &mut Vec<fluree_db_binary_index::PackBranchEntry>,
+    )> {
+        match key {
+            None => Some((
+                ContentKind::DictBlob {
+                    dict: fluree_db_core::DictKind::StringForward,
+                },
+                &mut dict_refs.forward_packs.string_fwd_packs,
+            )),
+            Some(ns_code) => dict_refs
+                .forward_packs
+                .subject_fwd_ns_packs
+                .iter_mut()
+                .find(|(ns, _)| *ns == ns_code)
+                .map(|(_, refs)| {
+                    (
+                        ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::SubjectForward,
+                        },
+                        refs,
+                    )
+                }),
+        }
+    }
+    fn stream_label(key: Option<u16>) -> String {
+        match key {
+            None => "string".to_string(),
+            Some(ns_code) => format!("subject ns={ns_code}"),
+        }
+    }
+
+    // Streams compacted alongside their own novelty.
+    for &key in &streams {
+        let Some((kind, refs)) = stream_refs(dict_refs, key) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind,
+                refs,
+                &mut pack_sizes,
+                &mut compaction_budget,
+                CompactionSpans::default(),
+                &stream_label(key),
+            )
+            .await?,
+        );
+    }
+
+    // Maintenance: a stream that received no novelty this cycle still
+    // carries whatever fragmentation it accumulated, and its packs are
+    // still loaded and mapped with the index. A namespace that goes quiet
+    // would otherwise keep its tiny packs forever. Sweep those with the
+    // leftover budget.
+    //
+    // Coverage rotates with `index_t` so that a ledger with more streams
+    // than one cycle's budget can service still reaches all of them over
+    // time, without persisting a cursor anywhere.
+    let mut pending: Vec<Option<u16>> = Vec::new();
+    if !streams.contains(&None) {
+        pending.push(None);
+    }
+    pending.extend(
+        dict_refs
+            .forward_packs
+            .subject_fwd_ns_packs
+            .iter()
+            .map(|(ns, _)| Some(*ns))
+            .filter(|key| !streams.contains(key)),
+    );
+    if !pending.is_empty() {
+        let offset = (base_index_t.unsigned_abs() as usize) % pending.len();
+        pending.rotate_left(offset);
+    }
+    for key in pending {
+        if compaction_budget.exhausted() {
+            break;
+        }
+        let Some((kind, refs)) = stream_refs(dict_refs, key) else {
+            continue;
+        };
+        uploaded.extend(
+            compact_forward_packs(
+                content_store,
+                kind,
+                refs,
+                &mut pack_sizes,
+                &mut compaction_budget,
+                CompactionSpans::default(),
+                &format!("{} (maintenance)", stream_label(key)),
+            )
+            .await?,
+        );
+    }
+
+    // Packs created and consumed within this cycle are referenced by no
+    // root, so the base-vs-new diff in `set_dict_refs` cannot see them.
+    let transient = unreferenced_uploads(&uploaded, &dict_refs.forward_packs, base);
+    if !transient.is_empty() {
+        tracing::debug!(
+            count = transient.len(),
+            "V6 Phase 3: forward packs created and compacted within one cycle"
+        );
+    }
+    Ok(transient)
+}
 
 /// Byte/object counts from a single leaf-blob upload, accumulated for tracing.
 #[derive(Default, Clone, Copy)]
@@ -4475,7 +4685,11 @@ async fn upload_one_leaf_blob(
         .await
         .map_err(|e| IndexerError::StorageWrite(format!("upload budget closed: {e}")))?;
 
-    let info = blob.info;
+    let NewLeafBlob {
+        info,
+        leaflet_origins,
+        replaced_leaf_cid,
+    } = blob;
     let mut counts = LeafUploadCounts::default();
 
     let leaf_cid = content_store
@@ -4484,28 +4698,26 @@ async fn upload_one_leaf_blob(
         .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
     crate::fuel::charge_extra_leaflets(tracker, info.re_encoded_leaflet_count)?;
     debug_assert!(leaf_cid == info.leaf_cid);
-    cache_artifact_bytes(cache_dir, &leaf_cid, &info.leaf_bytes, "index_leaf");
+    cache_artifact_bytes(
+        content_store,
+        cache_dir,
+        &leaf_cid,
+        &info.leaf_bytes,
+        "index_leaf",
+    );
     counts.leaf_bytes = info.leaf_bytes.len() as u64;
 
-    // Warm-on-write (co-located only): seed the shared read cache with the
-    // leaflets we just wrote, from bytes already in hand, so the query server's
-    // immediate read of this new-CID leaf hits the cache instead of cold decode.
-    //
-    // The zstd decode runs on a blocking thread, not this async uploader task —
-    // in the co-located deployment the same runtime serves queries, and a churn
-    // build must not stall a query worker on decompression. Warming is
-    // best-effort and fire-and-forget: a read that races a not-yet-finished warm
-    // just cold-decodes as before, and the remaining build steps (branch + root
-    // write, head swap) almost always outlast the decode, so the immediate
-    // post-swap read still hits. `leaf_bytes` is at its last use here, so it
-    // moves into the task rather than being copied.
-    if let Some(cache) = warm_cache {
-        let cache = Arc::clone(cache);
-        let leaf_cid = info.leaf_cid.clone();
-        let leaf_bytes = info.leaf_bytes;
-        tokio::task::spawn_blocking(move || {
-            warm_leaf_into_cache(&cache, &leaf_cid, &leaf_bytes);
-        });
+    // Warm-on-write (co-located only): carry what readers had cached for the
+    // replaced leaf over to the new one, so a query reading it after the swap
+    // hits the cache. See `warm_replaced_leaflets`.
+    if let (Some(cache), Some(replaced)) = (warm_cache, replaced_leaf_cid.as_ref()) {
+        warm_replaced_leaflets(
+            cache,
+            replaced,
+            &info.leaf_cid,
+            info.leaf_bytes,
+            &leaflet_origins,
+        );
     }
 
     if let Some(sc_bytes) = info.sidecar_bytes.as_deref() {
@@ -4516,25 +4728,119 @@ async fn upload_one_leaf_blob(
         if let Some(expected) = &info.sidecar_cid {
             debug_assert!(&sidecar_cid == expected);
         }
-        cache_artifact_bytes(cache_dir, &sidecar_cid, sc_bytes, "history_sidecar");
+        cache_artifact_bytes(
+            content_store,
+            cache_dir,
+            &sidecar_cid,
+            sc_bytes,
+            "history_sidecar",
+        );
         counts.sidecar_bytes = sc_bytes.len() as u64;
         counts.sidecar_count = 1;
     }
     // `info`'s sidecar buffer drops here; `leaf_bytes` was moved into the warm
-    // task above (or already dropped when no warm cache is configured).
+    // step above (or already dropped when no warm cache is configured).
     Ok(counts)
 }
 
-/// Warm-on-write: seed the shared read cache with the leaflets this build just
-/// wrote so a co-located query server's immediate read of the freshly-rewritten
-/// (new-CID) leaf hits the cache instead of re-reading + re-decoding from disk.
+/// Warm-on-write: give a rewritten leaf the cache entries readers had for the
+/// leaf it replaced, so a co-located query reading it after the swap hits the
+/// cache instead of decoding from disk.
 ///
-/// Decodes from the bytes already in hand (no re-fetch) and inserts each leaflet
-/// under `ColumnSet::ALL`; the read-side superset fallback projects that down to
-/// any narrower request, so we never have to guess a reader's projection. The
-/// `leaf_id` derivation matches the reader's (`xxh3_128(leaf_cid.to_bytes())`).
-/// Best-effort: a decode error just leaves the reader to cold-decode as before.
-fn warm_leaf_into_cache(cache: &LeafletCache, leaf_cid: &ContentId, leaf_bytes: &[u8]) {
+/// Only leaflets whose source leaflet was cached are warmed, with the columns
+/// that were cached:
+/// - a byte-copied leaflet decodes to the same columns, so it takes the cached
+///   batch under its new key without a decode;
+/// - a re-encoded leaflet is decoded from the bytes in hand, on a blocking
+///   thread from a small pool (see [`warm_decode_permits`]). When the pool is
+///   busy the leaf is skipped and its first reader decodes it, so a large
+///   build cannot queue decode work, or fill the cache, beyond what readers
+///   were using.
+///
+/// The leaf directory is seeded whenever a leaflet is.
+fn warm_replaced_leaflets(
+    cache: &Arc<LeafletCache>,
+    replaced_cid: &ContentId,
+    leaf_cid: &ContentId,
+    leaf_bytes: Vec<u8>,
+    origins: &[crate::run_index::LeafletOrigin],
+) {
+    use fluree_db_binary_index::V3BatchCacheKey;
+
+    let replaced_id = LeafletCache::cid_cache_key(&replaced_cid.to_bytes());
+    let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
+    let mut copied = false;
+    let mut to_decode = Vec::new();
+    for (idx, origin) in origins.iter().enumerate() {
+        let Some((columns, batch)) = cache.v3_leaflet_entry(replaced_id, origin.leaflet_idx) else {
+            continue;
+        };
+        if origin.copied {
+            cache.insert_v3_batch(
+                V3BatchCacheKey {
+                    leaf_id,
+                    leaflet_idx: idx as u32,
+                    columns: columns.0,
+                },
+                batch,
+            );
+            copied = true;
+        } else {
+            to_decode.push((idx, columns));
+        }
+    }
+    if to_decode.is_empty() {
+        if copied {
+            warm_leaf_dir(cache, leaf_id, &leaf_bytes);
+        }
+        return;
+    }
+    let Ok(permit) = Arc::clone(warm_decode_permits()).try_acquire_owned() else {
+        tracing::debug!(
+            leaflets = to_decode.len(),
+            "warm-on-write pool busy; leaving the leaf to its first reader"
+        );
+        if copied {
+            warm_leaf_dir(cache, leaf_id, &leaf_bytes);
+        }
+        return;
+    };
+    let cache = Arc::clone(cache);
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        decode_into_cache(&cache, leaf_id, &leaf_bytes, &to_decode);
+    });
+}
+
+/// Blocking threads warm-on-write may decode on at once: a quarter of the
+/// cores, at least one.
+fn warm_decode_permits() -> &'static Arc<Semaphore> {
+    static PERMITS: std::sync::OnceLock<Arc<Semaphore>> = std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| {
+        let cores = std::thread::available_parallelism().map_or(4, std::num::NonZeroUsize::get);
+        Arc::new(Semaphore::new((cores / 4).max(1)))
+    })
+}
+
+fn warm_leaf_dir(cache: &LeafletCache, leaf_id: u128, leaf_bytes: &[u8]) {
+    use fluree_db_binary_index::format::leaf::{
+        decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
+    };
+    if let Ok(dir) =
+        decode_leaf_header_v3(leaf_bytes).and_then(|h| decode_leaf_dir_v3_with_base(leaf_bytes, &h))
+    {
+        cache.insert_leaf_dir(leaf_id, Arc::new(dir));
+    }
+}
+
+/// Decode `leaflets` (index, columns) of a just-written leaf into the cache.
+/// Best-effort: a decode error leaves the reader to decode it as before.
+fn decode_into_cache(
+    cache: &LeafletCache,
+    leaf_id: u128,
+    leaf_bytes: &[u8],
+    leaflets: &[(usize, fluree_db_binary_index::read::column_types::ColumnSet)],
+) {
     use fluree_db_binary_index::format::leaf::{
         decode_leaf_dir_v3_with_base, decode_leaf_header_v3,
     };
@@ -4545,34 +4851,38 @@ fn warm_leaf_into_cache(cache: &LeafletCache, leaf_cid: &ContentId, leaf_bytes: 
     let Ok(header) = decode_leaf_header_v3(leaf_bytes) else {
         return;
     };
-    let order = header.order;
     let Ok(dir) = decode_leaf_dir_v3_with_base(leaf_bytes, &header) else {
         return;
     };
-    let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
-    for (idx, entry) in dir.entries.iter().enumerate() {
+    for &(idx, columns) in leaflets {
+        let Some(entry) = dir.entries.get(idx) else {
+            continue;
+        };
         if entry.row_count == 0 {
             continue;
         }
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
         if let Ok(batch) = load_leaflet_columns(
             leaf_bytes,
             entry,
             dir.payload_base,
-            &ColumnProjection::all(),
-            order,
+            &projection,
+            header.order,
         ) {
             cache.insert_v3_batch(
                 V3BatchCacheKey {
                     leaf_id,
                     leaflet_idx: idx as u32,
-                    columns: ColumnSet::ALL.0,
+                    columns: columns.0,
                 },
                 batch,
             );
         }
     }
-    // Seed the directory too (used once the local scan path consults it).
-    cache.insert_leaf_dir(leaf_id, std::sync::Arc::new(dir));
+    cache.insert_leaf_dir(leaf_id, Arc::new(dir));
 }
 
 /// Upload a fully-materialized set of leaf blobs (the fresh-build paths produce
@@ -4614,19 +4924,122 @@ async fn upload_leaf_blobs(
     Ok(())
 }
 
-/// Build a fresh V3 branch from pure novelty for the default graph.
-fn build_fresh_default_graph_v3(
+/// Refuse a base root in which a graph has base facts in some of the four
+/// orders but not all of them.
+///
+/// A graph's four orders hold one fact set, so they have facts in all of them
+/// or none. An order without them takes the fresh path and is built from this
+/// window's novelty alone, without the graph's base facts. Aborting falls back
+/// to a full rebuild, which builds every order from the commits.
+///
+/// An order with no leaves holds no facts, the same as a missing one. Bulk
+/// import used to write such an order: a SPOT with no leaves for a graph it had
+/// no quads for, such as the default graph of a TriG file whose quads are all
+/// in named graphs, or a named graph from an empty `GRAPH` block. An
+/// incremental build then used to leave that SPOT empty while writing the
+/// window's facts to the other three orders, which this refuses.
+///
+/// The default graph's leaves are inline in the root. A named graph's are in
+/// its branches, but a branch with no leaves is exactly
+/// `build_branch_bytes(order, g_id, &[])` (the decoder reads one branch
+/// version, and every writer builds branches with that function), so its CID
+/// identifies it without a fetch. That costs a hash per branch, about as much
+/// as decoding the root, so it's done only for a named graph with some orders
+/// but not all, like the older import's. One with all four is taken as having
+/// facts in all four here, and [`check_base_facts_agree`] checks the graphs
+/// this window writes to once Phase 2 has fetched their branches.
+fn check_order_sets(
+    default_graph_orders: &[fluree_db_binary_index::format::index_root::DefaultGraphOrder],
+    named_graphs: &[fluree_db_binary_index::format::index_root::NamedGraphRouting],
+) -> Result<()> {
+    use fluree_db_binary_index::format::branch::build_branch_bytes;
+    let mut all = RunSortOrder::all_build_orders().to_vec();
+    all.sort_unstable();
+    let complete = |mut orders: Vec<RunSortOrder>| {
+        orders.sort_unstable();
+        orders.dedup();
+        orders.is_empty() || orders == all
+    };
+    let default_orders = default_graph_orders
+        .iter()
+        .filter(|o| !o.leaves.is_empty())
+        .map(|o| o.order)
+        .collect();
+    let named_complete = |ng: &fluree_db_binary_index::format::index_root::NamedGraphRouting| {
+        complete(ng.orders.iter().map(|(order, _)| *order).collect())
+            || complete(
+                ng.orders
+                    .iter()
+                    .filter(|(order, cid)| {
+                        *cid != ContentId::new(
+                            ContentKind::IndexBranch,
+                            &build_branch_bytes(*order, ng.g_id, &[]),
+                        )
+                    })
+                    .map(|(order, _)| *order)
+                    .collect(),
+            )
+    };
+    let partial = if complete(default_orders) {
+        named_graphs
+            .iter()
+            .find(|ng| !named_complete(ng))
+            .map(|ng| ng.g_id)
+    } else {
+        Some(0)
+    };
+    match partial {
+        Some(g_id) => Err(IndexerError::IncrementalAbort(format!(
+            "base root has facts in some but not all sort orders for graph {g_id}"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Refuse a window in which a graph's four tasks disagree on whether the base
+/// holds facts for it: some merged into a branch with leaves while others were
+/// built fresh.
+///
+/// This is [`check_order_sets`] for a named graph with all four orders, which
+/// it leaves alone: whether each branch has leaves is known here, once Phase 2
+/// has fetched it, at no extra cost. An incremental build used to leave such a
+/// graph a SPOT with no leaves beside three orders that hold its facts, so the
+/// graph's next write is refused and the full rebuild restores SPOT; until then
+/// it's carried as it is, as an untouched graph always is. It runs after the
+/// tasks, so an abort here leaves this build's uploads unreferenced, as an
+/// abort in Phase 3 does.
+fn check_base_facts_agree(outputs: &[Phase2TaskOutput]) -> Result<()> {
+    let mut base_facts: std::collections::BTreeMap<u16, bool> = std::collections::BTreeMap::new();
+    for output in outputs {
+        if *base_facts.entry(output.g_id).or_insert(output.base_facts) != output.base_facts {
+            return Err(IndexerError::IncrementalAbort(format!(
+                "base root has facts in some but not all sort orders for graph {}",
+                output.g_id
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Build a fresh V3 branch from pure novelty, for a graph (default or
+/// named) or order that has no branch in the base root.
+///
+/// Nothing precedes the window in this branch, so each fact's in-window
+/// events — its net op plus the events lifecycle dedup superseded — resolve
+/// from absent, exactly as a full rebuild resolves its complete log: the
+/// transitions go to the history sidecar and only a final assert becomes a
+/// row. A fact whose net op is a retraction leaves history and no row.
+fn build_fresh_branch_v3(
     sorted_records: &[RunRecordV2],
-    // Kept for: filtering retractions in fresh branches once the rebuild
-    // pipeline supports retraction-aware builds. Currently only assertions
-    // appear in fresh branches so ops are not consulted.
     sorted_ops: &[u8],
+    sorted_superseded: &[RunRecordV2],
+    sorted_superseded_ops: &[u8],
     order: RunSortOrder,
     g_id: u16,
     config: &IndexerConfig,
 ) -> Result<BranchUpdateResult> {
-    let _ = sorted_ops;
     use crate::run_index::build::incremental_leaf::NewLeafBlob;
+    use crate::run_index::build::novelty_merge::gather_identity_events;
     use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
     use fluree_db_binary_index::format::leaf::LeafWriter;
     use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
@@ -4635,10 +5048,32 @@ fn build_fresh_default_graph_v3(
     let leaf_target = leaflet_target.saturating_mul(config.leaflets_per_leaf.max(1));
 
     let mut writer = LeafWriter::new(order, leaflet_target, leaf_target, 1);
-    for rec in sorted_records {
+    let mut events = Vec::new();
+    let mut si = 0;
+    for (rec, &op) in sorted_records.iter().zip(sorted_ops) {
+        gather_identity_events(
+            sorted_superseded,
+            sorted_superseded_ops,
+            &mut si,
+            rec,
+            op,
+            &mut events,
+        );
         writer
-            .push_record(*rec)
+            .push_lifecycle(&mut events)
             .map_err(|e| IndexerError::StorageWrite(format!("V3 fresh branch writer: {e}")))?;
+    }
+    // Every superseded event's identity has a winner in this graph's
+    // novelty, so the cursor must have consumed them all; a stranded event
+    // would mean lost history.
+    if sorted_records.len() != sorted_ops.len() || si != sorted_superseded.len() {
+        return Err(IndexerError::StorageWrite(format!(
+            "V3 fresh branch g_id={g_id} {order:?}: {} records with {} ops, \
+             {si} of {} superseded events matched a record",
+            sorted_records.len(),
+            sorted_ops.len(),
+            sorted_superseded.len(),
+        )));
     }
 
     let leaf_infos = writer
@@ -4662,7 +5097,7 @@ fn build_fresh_default_graph_v3(
             sidecar_cid: info.sidecar_cid.clone(),
         });
 
-        new_blobs.push(NewLeafBlob { info });
+        new_blobs.push(NewLeafBlob::fresh(info));
     }
 
     let branch_bytes = build_branch_bytes(order, g_id, &leaf_entries);
@@ -4684,21 +5119,22 @@ fn build_fresh_default_graph_v3(
     })
 }
 
-/// Build a fresh V3 branch from pure novelty for a named graph.
-///
-/// Same as `build_fresh_default_graph_v3` — the build pipeline is graph-agnostic.
-fn build_fresh_named_graph_v3(
-    sorted_records: &[RunRecordV2],
-    order: RunSortOrder,
-    g_id: u16,
-    config: &IndexerConfig,
-) -> Result<BranchUpdateResult> {
-    build_fresh_default_graph_v3(sorted_records, &[], order, g_id, config)
-}
-
 /// Build predicate SIDs from resolver state for the index root.
 fn build_predicate_sids(
     shared: &crate::run_index::resolve::resolver::SharedResolverState,
+    namespace_codes: &std::collections::BTreeMap<u16, String>,
+) -> Vec<(u16, String)> {
+    predicate_sids(
+        (0..shared.predicates.len()).map(|p_id| shared.predicates.resolve(p_id).unwrap_or("")),
+        namespace_codes,
+    )
+}
+
+/// An index root's `predicate_sids`: each predicate IRI, in p_id order,
+/// split at its longest namespace prefix (whole, under code 0, when none
+/// matches).
+pub fn predicate_sids<'a>(
+    iris: impl IntoIterator<Item = &'a str>,
     namespace_codes: &std::collections::BTreeMap<u16, String>,
 ) -> Vec<(u16, String)> {
     use fluree_db_core::PrefixTrie;
@@ -4709,9 +5145,8 @@ fn build_predicate_sids(
         .collect();
     let trie = PrefixTrie::from_namespace_codes(&ns_map);
 
-    (0..shared.predicates.len())
-        .map(|p_id| {
-            let iri = shared.predicates.resolve(p_id).unwrap_or("");
+    iris.into_iter()
+        .map(|iri| {
             if let Some((ns_code, prefix_len)) = trie.longest_match(iri) {
                 let suffix = &iri[prefix_len..];
                 (ns_code, suffix.to_string())
@@ -4916,5 +5351,531 @@ mod compaction_tests {
             budget.requests < 64,
             "storage operations were not charged to the shared budget"
         );
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use crate::run_index::{update_leaf, LeafUpdateInput};
+    use fluree_db_binary_index::format::leaf::{
+        decode_leaf_dir_v3_with_base, decode_leaf_header_v3, LeafWriter,
+    };
+    use fluree_db_binary_index::read::column_loader::load_leaflet_columns;
+    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+    use fluree_db_binary_index::V3BatchCacheKey;
+    use fluree_db_core::o_type::OType;
+    use fluree_db_core::subject_id::SubjectId;
+    use fluree_db_core::value_id::ObjKey;
+
+    fn record(s_id: u64, t: u32) -> RunRecordV2 {
+        RunRecordV2 {
+            s_id: SubjectId(s_id),
+            o_key: ObjKey::encode_i64(0).as_u64(),
+            p_id: 1,
+            t,
+            o_i: u32::MAX,
+            o_type: OType::XSD_INTEGER.as_u16(),
+            g_id: 0,
+        }
+    }
+
+    /// A fresh branch materializes only facts whose window ends asserted;
+    /// a fact asserted then retracted leaves its two transitions in the
+    /// sidecar and no row.
+    #[test]
+    fn fresh_branch_writes_no_row_for_a_retracted_fact() {
+        let config = IndexerConfig::small();
+        // Net ops: s=2 asserted at t=2; s=4 retracted at t=3, after its
+        // superseded assert at t=2.
+        let records = [record(2, 2), record(4, 3)];
+        let superseded = [record(4, 2)];
+        let fresh = build_fresh_branch_v3(
+            &records,
+            &[1, 0],
+            &superseded,
+            &[1],
+            RunSortOrder::Spot,
+            0,
+            &config,
+        )
+        .expect("fresh branch");
+        let rows: u64 = fresh.leaf_entries.iter().map(|e| e.row_count).sum();
+        assert_eq!(rows, 1, "only the asserted fact is a row");
+        let sidecars = fresh
+            .new_leaf_blobs
+            .iter()
+            .filter(|b| b.info.sidecar_bytes.is_some())
+            .count();
+        assert_eq!(sidecars, 1, "the retracted fact's history is kept");
+
+        // A superseded event with no winner is lost history: refuse.
+        let stranded = build_fresh_branch_v3(
+            &records[..1],
+            &[1],
+            &superseded,
+            &[1],
+            RunSortOrder::Spot,
+            0,
+            &config,
+        );
+        assert!(stranded.is_err(), "a stranded superseded event must fail");
+    }
+
+    /// A fresh task whose facts net to no row and no history publishes no
+    /// branch: a branch with no leaves would route no later novelty.
+    #[tokio::test]
+    async fn fresh_task_with_nothing_to_hold_publishes_no_branch() {
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let store: Arc<dyn fluree_db_core::storage::ContentStore> =
+            Arc::new(fluree_db_core::storage::content_store_for(
+                fluree_db_core::MemoryStorage::new(),
+                "test/fresh-empty:main",
+            ));
+        for (g_id, kind) in [
+            (0, Phase2TaskKind::DefaultFresh),
+            (3, Phase2TaskKind::NamedFresh),
+        ] {
+            // A retraction of a fact that was never asserted: no transition.
+            let task = Phase2Task {
+                seq: 0,
+                g_id,
+                order: RunSortOrder::Spot,
+                sorted_records: vec![record(2, 2)],
+                sorted_ops: vec![0],
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                kind,
+            };
+            let output = execute_phase2_task(
+                task,
+                &IndexerConfig::small(),
+                Arc::clone(&store),
+                fluree_db_core::tracking::Tracker::disabled(),
+                Arc::new(Semaphore::new(4)),
+                4,
+                cache_dir.path().to_path_buf(),
+            )
+            .await
+            .expect("phase 2 task");
+            assert!(
+                matches!(output.update, Phase2TaskUpdate::Unchanged),
+                "g_id={g_id}: an empty fresh branch must not be published"
+            );
+        }
+    }
+
+    /// A branch with no leaves holds no base facts, so its novelty is built
+    /// fresh, for the default graph and for a named graph alike.
+    #[tokio::test]
+    async fn leafless_branch_is_built_fresh() {
+        use fluree_db_binary_index::format::branch::{build_branch_bytes, read_branch_from_bytes};
+        let cache_dir = tempfile::tempdir().expect("cache dir");
+        let store: Arc<dyn fluree_db_core::storage::ContentStore> =
+            Arc::new(fluree_db_core::storage::content_store_for(
+                fluree_db_core::MemoryStorage::new(),
+                "test/leafless:main",
+            ));
+        let leafless = build_branch_bytes(RunSortOrder::Spot, 3, &[]);
+        let leafless_cid = store
+            .put(ContentKind::IndexBranch, &leafless)
+            .await
+            .expect("put leafless branch");
+        let kinds = [
+            (0, Phase2TaskKind::DefaultExisting { leaves: Vec::new() }),
+            (
+                3,
+                Phase2TaskKind::NamedExisting {
+                    branch_cid: leafless_cid,
+                },
+            ),
+        ];
+        for (g_id, kind) in kinds {
+            let task = Phase2Task {
+                seq: 0,
+                g_id,
+                order: RunSortOrder::Spot,
+                sorted_records: vec![record(2, 2)],
+                sorted_ops: vec![1],
+                sorted_superseded: Vec::new(),
+                sorted_superseded_ops: Vec::new(),
+                kind,
+            };
+            let output = execute_phase2_task(
+                task,
+                &IndexerConfig::small(),
+                Arc::clone(&store),
+                fluree_db_core::tracking::Tracker::disabled(),
+                Arc::new(Semaphore::new(4)),
+                4,
+                cache_dir.path().to_path_buf(),
+            )
+            .await
+            .unwrap_or_else(|e| panic!("g_id={g_id}: {e}"));
+            assert!(
+                !output.base_facts,
+                "g_id={g_id}: a branch with no leaves holds no base facts"
+            );
+            let rows: u64 = match output.update {
+                Phase2TaskUpdate::Default { leaf_entries } => {
+                    leaf_entries.iter().map(|e| e.row_count).sum()
+                }
+                Phase2TaskUpdate::Named { branch_cid } => {
+                    let bytes = store.get(&branch_cid).await.expect("new branch");
+                    read_branch_from_bytes(&bytes)
+                        .expect("decode branch")
+                        .leaves
+                        .iter()
+                        .map(|e| e.row_count)
+                        .sum()
+                }
+                Phase2TaskUpdate::Unchanged => 0,
+            };
+            assert_eq!(rows, 1, "g_id={g_id}: the asserted fact must land");
+        }
+    }
+
+    /// Every graph in a base root has facts in all four orders or none, and an
+    /// order with no leaves has none.
+    #[test]
+    fn partial_order_root_is_refused() {
+        use fluree_db_binary_index::format::branch::{build_branch_bytes, LeafEntry};
+        use fluree_db_binary_index::format::index_root::{DefaultGraphOrder, NamedGraphRouting};
+        let leaf = LeafEntry {
+            first_key: record(1, 1),
+            last_key: record(1, 1),
+            row_count: 1,
+            leaf_cid: ContentId::new(ContentKind::IndexLeaf, b"leaf"),
+            sidecar_cid: None,
+        };
+        // Each order with `leaves` leaves.
+        let default = |orders: &[(RunSortOrder, usize)]| -> Vec<DefaultGraphOrder> {
+            orders
+                .iter()
+                .map(|&(order, leaves)| DefaultGraphOrder {
+                    order,
+                    leaves: vec![leaf.clone(); leaves],
+                })
+                .collect()
+        };
+        // Each order with a branch that has leaves (`true`) or none (`false`),
+        // the latter written as every writer writes one.
+        let named = |orders: &[(RunSortOrder, bool)]| NamedGraphRouting {
+            g_id: 3,
+            orders: orders
+                .iter()
+                .map(|&(order, leaves)| {
+                    let bytes = if leaves {
+                        b"branch".to_vec()
+                    } else {
+                        build_branch_bytes(order, 3, &[])
+                    };
+                    (order, ContentId::new(ContentKind::IndexBranch, &bytes))
+                })
+                .collect(),
+        };
+        let [spot, psot, post, opst] = [
+            RunSortOrder::Spot,
+            RunSortOrder::Psot,
+            RunSortOrder::Post,
+            RunSortOrder::Opst,
+        ];
+
+        for (defaults, named_graphs) in [
+            (default(&[]), vec![]),
+            (
+                default(&[(spot, 1), (psot, 1), (post, 1), (opst, 1)]),
+                vec![named(&[
+                    (spot, true),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
+            // No facts anywhere: what bulk import wrote for a graph it had no
+            // quads for, or a rebuild for a graph that netted to nothing.
+            (default(&[(spot, 0)]), vec![named(&[(spot, false)])]),
+            (
+                default(&[(spot, 0), (psot, 0), (post, 0), (opst, 0)]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, false),
+                    (post, false),
+                    (opst, false),
+                ])],
+            ),
+            // A named graph with all four orders is left to
+            // `check_base_facts_agree`, which sees its branches' leaves.
+            (
+                default(&[]),
+                vec![named(&[
+                    (spot, false),
+                    (psot, true),
+                    (post, true),
+                    (opst, true),
+                ])],
+            ),
+        ] {
+            assert!(check_order_sets(&defaults, &named_graphs).is_ok());
+        }
+        for (defaults, named_graphs) in [
+            (default(&[(spot, 1), (psot, 1)]), vec![]),
+            // SPOT left with no leaves while the window's facts went to the
+            // other three orders.
+            (
+                default(&[(spot, 0), (psot, 1), (post, 1), (opst, 1)]),
+                vec![],
+            ),
+            (default(&[]), vec![named(&[(spot, true), (psot, true)])]),
+            (default(&[]), vec![named(&[(spot, false), (psot, true)])]),
+        ] {
+            assert!(matches!(
+                check_order_sets(&defaults, &named_graphs),
+                Err(IndexerError::IncrementalAbort(_))
+            ));
+        }
+    }
+
+    /// A graph whose tasks disagree on whether the base holds its facts is an
+    /// abort; agreement either way is fine.
+    #[test]
+    fn tasks_that_disagree_on_base_facts_are_refused() {
+        let output = |g_id: u16, base_facts: bool| Phase2TaskOutput {
+            seq: 0,
+            g_id,
+            order: RunSortOrder::Spot,
+            base_facts,
+            update: Phase2TaskUpdate::Unchanged,
+            replaced_leaf_cids: Vec::new(),
+            replaced_sidecar_cids: Vec::new(),
+            new_leaf_count: 0,
+            fetch_stats: Phase2FetchStatsSnapshot::default(),
+            matched: Vec::new(),
+        };
+        assert!(check_base_facts_agree(&[
+            output(0, true),
+            output(0, true),
+            output(3, false),
+            output(3, false),
+        ])
+        .is_ok());
+        assert!(matches!(
+            check_base_facts_agree(&[output(0, true), output(3, false), output(3, true)]),
+            Err(IndexerError::IncrementalAbort(_))
+        ));
+    }
+
+    fn cache_leaflet(
+        cache: &LeafletCache,
+        leaf_cid: &ContentId,
+        leaf_bytes: &[u8],
+        leaflet_idx: u32,
+        columns: ColumnSet,
+    ) {
+        let header = decode_leaf_header_v3(leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(leaf_bytes, &header).unwrap();
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        let batch = load_leaflet_columns(
+            leaf_bytes,
+            &dir.entries[leaflet_idx as usize],
+            dir.payload_base,
+            &projection,
+            header.order,
+        )
+        .unwrap();
+        let leaf_id = LeafletCache::cid_cache_key(&leaf_cid.to_bytes());
+        cache.insert_v3_batch(
+            V3BatchCacheKey {
+                leaf_id,
+                leaflet_idx,
+                columns: columns.0,
+            },
+            batch,
+        );
+    }
+
+    /// A rewritten leaf gets only what readers had cached for the leaf it
+    /// replaced: a copied leaflet takes its cached batch and columns without a
+    /// decode, a re-encoded one is decoded for the cached columns, and a
+    /// leaflet no reader touched stays cold.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn warm_carries_only_cached_leaflets_to_the_rewritten_leaf() {
+        // Three leaflets of 100 rows; the insert lands in leaflet 1 and splits it.
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 10_000, 1);
+        writer.set_skip_history(true);
+        for i in 1..=300 {
+            writer.push_record(record(i * 2, 1)).unwrap();
+        }
+        let old = writer.finish().unwrap().remove(0);
+        let novelty = [record(301, 5)];
+        let output = update_leaf(&LeafUpdateInput {
+            leaf_bytes: &old.leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &[1],
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10_000,
+            sidecar_bytes: None,
+        })
+        .unwrap();
+        let blob = output.leaves.into_iter().next().unwrap();
+
+        let cache = Arc::new(LeafletCache::with_max_bytes(64 << 20));
+        cache_leaflet(&cache, &old.leaf_cid, &old.leaf_bytes, 0, ColumnSet::CORE);
+        cache_leaflet(&cache, &old.leaf_cid, &old.leaf_bytes, 1, ColumnSet::ALL);
+        let new_id = LeafletCache::cid_cache_key(&blob.info.leaf_cid.to_bytes());
+        warm_replaced_leaflets(
+            &cache,
+            &old.leaf_cid,
+            &blob.info.leaf_cid,
+            blob.info.leaf_bytes.clone(),
+            &blob.leaflet_origins,
+        );
+
+        let columns = |idx| cache.v3_leaflet_entry(new_id, idx).map(|(c, _)| c);
+        assert_eq!(columns(0), Some(ColumnSet::CORE), "copied without a decode");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while (columns(1).is_none() || columns(2).is_none()) && std::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(
+            columns(1),
+            Some(ColumnSet::ALL),
+            "re-encoded halves decoded"
+        );
+        assert_eq!(columns(2), Some(ColumnSet::ALL));
+        assert_eq!(columns(3), None, "never read, never warmed");
+        assert!(cache.get_leaf_dir(new_id).is_some());
+
+        let header = decode_leaf_header_v3(&blob.info.leaf_bytes).unwrap();
+        let dir = decode_leaf_dir_v3_with_base(&blob.info.leaf_bytes, &header).unwrap();
+        for idx in 0..3 {
+            let (columns, warmed) = cache.v3_leaflet_entry(new_id, idx).unwrap();
+            let fresh = load_leaflet_columns(
+                &blob.info.leaf_bytes,
+                &dir.entries[idx as usize],
+                dir.payload_base,
+                &ColumnProjection {
+                    output: columns,
+                    internal: ColumnSet::EMPTY,
+                },
+                header.order,
+            )
+            .unwrap();
+            let rows = |b: &fluree_db_binary_index::read::column_types::ColumnBatch| {
+                (0..b.row_count)
+                    .map(|i| (b.s_id.get(i), b.o_key.get(i)))
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                rows(&warmed),
+                rows(&fresh),
+                "leaflet {idx} holds the new leaf's rows"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod par_batched_lookup_tests {
+    use super::par_batched_lookup;
+    use std::collections::HashMap;
+
+    /// Answers like a batched lookup: every even id it is asked about, with
+    /// the slice it was asked in recorded, so a test can see slices formed.
+    fn lookup(part: &[u64]) -> std::io::Result<HashMap<u64, Vec<u64>>> {
+        assert!(
+            part.windows(2).all(|w| w[0] < w[1]),
+            "slices are sorted, deduped runs"
+        );
+        Ok(part
+            .iter()
+            .filter(|id| *id % 2 == 0)
+            .map(|&id| (id, vec![id * 3, part[0]]))
+            .collect())
+    }
+
+    #[test]
+    fn parallel_slices_answer_as_one_lookup_does() {
+        // Scattered, shuffled, with duplicates: as Phase 3b hands them over.
+        let mut ids: Vec<u64> = (0..50_000u64)
+            .map(|i| i.wrapping_mul(2_654_435_761) % 1_000_003)
+            .collect();
+        ids.extend_from_within(..1_000);
+
+        let got = par_batched_lookup(&ids, lookup).unwrap();
+        let mut sorted = ids.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        let want = lookup(&sorted).unwrap();
+
+        assert_eq!(got.len(), want.len());
+        for (id, classes) in &want {
+            assert_eq!(got[id][0], classes[0], "answer for {id}");
+        }
+        let slice_starts: std::collections::HashSet<u64> = got.values().map(|v| v[1]).collect();
+        assert!(
+            slice_starts.len() > 1,
+            "the lookup ran in more than one slice"
+        );
+    }
+
+    #[test]
+    fn a_failed_slice_fails_the_lookup() {
+        let ids: Vec<u64> = (0..10_000).collect();
+        let err = par_batched_lookup(&ids, |part| {
+            if part.contains(&7_777) {
+                Err(std::io::Error::other("leaf unreadable"))
+            } else {
+                lookup(part)
+            }
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "leaf unreadable");
+    }
+}
+
+#[cfg(test)]
+mod prefetched_tests {
+    use super::Prefetched;
+    use fluree_db_core::{ContentId, ContentKind};
+
+    #[test]
+    fn each_expected_read_gets_the_blob_and_an_extra_read_fails() {
+        let shared = ContentId::new(ContentKind::IndexLeaf, b"empty leaf");
+        let once = ContentId::new(ContentKind::IndexLeaf, b"leaf");
+        let prefetched = Prefetched::new(
+            [
+                (shared.clone(), b"empty leaf".to_vec()),
+                (once.clone(), b"leaf".to_vec()),
+            ],
+            [&shared, &once, &shared],
+        );
+        assert_eq!(
+            prefetched.take(&shared).unwrap().as_deref(),
+            Some(&b"empty leaf"[..])
+        );
+        assert_eq!(
+            prefetched.take(&once).unwrap().as_deref(),
+            Some(&b"leaf"[..])
+        );
+        assert_eq!(
+            prefetched.take(&shared).unwrap().as_deref(),
+            Some(&b"empty leaf"[..])
+        );
+        assert!(
+            prefetched.take(&shared).is_err(),
+            "a read past the expected ones must not read as an absent blob"
+        );
+        let never = ContentId::new(ContentKind::HistorySidecar, b"absent");
+        assert_eq!(prefetched.take(&never).unwrap(), None);
     }
 }

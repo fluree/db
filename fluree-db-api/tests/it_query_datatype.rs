@@ -107,7 +107,6 @@ async fn datatype_query_explicit_typed_value_object_matches() {
     let q = json!({
         "@context": ctx,
         "select": "?name",
-        // Rust normalizes xsd:int to xsd:integer.
         "where": {"ex:name":"?name","ex:age":{"@value":36,"@type":"xsd:integer"}}
     });
 
@@ -116,13 +115,9 @@ async fn datatype_query_explicit_typed_value_object_matches() {
         .unwrap()
         .to_jsonld(&ledger.snapshot)
         .unwrap();
-    // NOTE(parity): Rust currently normalizes numeric datatypes so untyped integers and
-    // explicitly-typed integer-family values share `xsd:integer`. This means both Homer
-    // (untyped 36) and Marge (typed xsd:int → normalized) match here.
-    assert_eq!(
-        normalize_rows(&rows),
-        normalize_rows(&json!(["Homer", "Marge"]))
-    );
+    // A typed constant matches its own datatype only: Homer's untyped 36 is
+    // `xsd:integer`; Marge's 36 is `xsd:int`, a different term (#1737).
+    assert_eq!(normalize_rows(&rows), normalize_rows(&json!(["Homer"])));
 }
 
 #[cfg(feature = "native")]

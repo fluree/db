@@ -4,7 +4,7 @@
 //! Call `dedupe()` explicitly if you want set semantics.
 
 use crate::{Term, Triple};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// A collection of RDF triples
 ///
@@ -85,6 +85,11 @@ impl Graph {
         self.prefixes.insert(prefix.into(), namespace.into());
     }
 
+    /// Reserve room for at least `additional` more triples.
+    pub fn reserve(&mut self, additional: usize) {
+        self.triples.reserve(additional);
+    }
+
     /// Add a triple to the graph
     pub fn add(&mut self, triple: Triple) {
         self.triples.push(triple);
@@ -116,6 +121,19 @@ impl Graph {
     /// Reifier attachments, in emission order.
     pub fn reifications(&self) -> &[Reification] {
         &self.reifications
+    }
+
+    /// Index reifiers by their base triple for graph serialization.
+    ///
+    /// Borrows the triples and reifiers without cloning them, preserving
+    /// attachment order within each triple's reifier list.
+    #[inline]
+    pub fn reifiers_by_triple(&self) -> HashMap<&Triple, Vec<&Term>> {
+        let mut reifiers: HashMap<&Triple, Vec<&Term>> = HashMap::new();
+        for r in &self.reifications {
+            reifiers.entry(&r.triple).or_default().push(&r.reifier);
+        }
+        reifiers
     }
 
     /// Number of reifier attachments.

@@ -121,6 +121,7 @@ async fn push_preserves_signed_policy_and_rejected_commit_can_be_retried_with_a_
         commits: vec![Base64Bytes(bytes)],
         blobs: Default::default(),
         missing_blobs: vec![],
+        merged_commits: vec![],
     })
     .unwrap();
     for allow in [false, true] {
@@ -267,7 +268,7 @@ async fn oidc_delegation_requires_authority_and_constrains_reads_and_writes() {
             modify_public_doc_content_body().to_string(),
         )
         .await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
         assert!(
             body.to_string().contains("Employees may not modify"),
             "{body}"

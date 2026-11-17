@@ -35,7 +35,7 @@ pub mod fuel;
 pub mod fulltext_hook;
 pub mod gc;
 /// The per-(graph, property) cardinality sketch: the stats kernel's
-/// 256-register HyperLogLog, persisted as exactly 256 bytes.
+/// 256-register HyperLogLog. Persisted by [`stats::sketch_cas`].
 pub mod hll {
     pub use fluree_db_stats::Hll256 as HllSketch256;
 }
@@ -54,10 +54,11 @@ pub use config::{
 pub use drop::collect_ledger_cids;
 pub use error::{IndexerError, Result};
 pub use gc::{
-    clean_garbage, current_sibling_heads, execute_sweep, plan_garbage, plan_sweep,
-    release_garbage_plan, shared_blob_policy_for, shared_refs_of_branches, siblings_of,
-    write_garbage_record, BranchIndexHead, CleanGarbageConfig, CleanGarbageResult, GarbagePlan,
-    GarbageRecord, SharedBlobPolicy, SweepPlan, SweepResult, DEFAULT_MAX_OLD_INDEXES,
+    clean_garbage, current_sibling_heads, execute_sweep, nested_ledgers, nested_prefixes,
+    plan_garbage, plan_sweep, release_garbage_plan, shared_blob_policy_for,
+    shared_refs_of_branches, siblings_of, write_garbage_record, BranchIndexHead,
+    CleanGarbageConfig, CleanGarbageResult, GarbagePlan, GarbageRecord, SharedBlobPolicy,
+    SweepPlan, SweepResult, DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES,
     DEFAULT_MIN_TIME_GARBAGE_MINS,
 };
 pub use orchestrator::{
@@ -92,7 +93,7 @@ pub struct IndexResult {
     /// Transaction time the index is current through
     pub index_t: i64,
     /// Ledger ID (name:branch format)
-    pub ledger_id: String,
+    pub ledger_id: fluree_db_core::LedgerId,
     /// Index build statistics
     pub stats: IndexStats,
     /// Total fuel charged for this build. `Some(_)` when fuel tracking was
@@ -203,7 +204,7 @@ pub async fn build_index_for_record_with_tracker(
                 return Ok(IndexResult {
                     root_id: root_id.clone(),
                     index_t: record.index_t,
-                    ledger_id: ledger_id.to_string(),
+                    ledger_id: fluree_db_core::IntoLedgerId::into_ledger_id(ledger_id),
                     stats: IndexStats::default(),
                     fuel,
                 });
@@ -237,6 +238,8 @@ pub async fn build_index_for_record_with_tracker(
                     result.fuel = tally_fuel(&tracker);
                     return Ok(result);
                 }
+                // A full rebuild resolves the same commit and fails the same way.
+                Err(e) if !e.is_retryable() => return Err(e),
                 Err(e) => {
                     tracing::warn!(
                         error = %e,
@@ -406,6 +409,26 @@ where
     .await
 }
 
+/// Build `record`'s index incrementally over its published index, as
+/// [`build_index_for_record`] tries first, but with no fallback to a full
+/// rebuild: an incremental failure is returned. For tests that must know the
+/// incremental path ran. Only with the `test-utils` feature.
+#[cfg(feature = "test-utils")]
+pub async fn build_incremental_index_for_record(
+    content_store: std::sync::Arc<dyn ContentStore>,
+    record: &fluree_db_nameservice::NsRecord,
+    config: IndexerConfig,
+) -> Result<IndexResult> {
+    incremental_index(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        record.ledger_id.as_str(),
+        record,
+        config,
+    )
+    .await
+}
+
 /// Incremental index from an existing FIR6 root.
 ///
 /// Loads the existing `IndexRoot`, resolves only new commits, merges
@@ -419,6 +442,37 @@ async fn incremental_index(
 ) -> Result<IndexResult> {
     build::incremental::incremental_index(content_store, tracker, ledger_id, record, config).await
 }
+
+/// Merge already-resolved `novelty` into its base root and write the new
+/// root: the phases of an incremental build after commit resolution.
+///
+/// For a caller that produces novelty itself rather than from the commits
+/// after the published index — a bulk import into an existing ledger.
+/// `base_root_id` is the published root `novelty.base_root` derives from,
+/// and `replaced_cids` its artifacts the caller already superseded.
+pub async fn index_novelty(
+    content_store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    ledger_id: &str,
+    base_root_id: fluree_db_core::ContentId,
+    novelty: run_index::IncrementalNovelty,
+    config: IndexerConfig,
+    replaced_cids: Vec<fluree_db_core::ContentId>,
+) -> Result<IndexResult> {
+    build::incremental::index_novelty(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        base_root_id,
+        novelty,
+        config,
+        replaced_cids,
+    )
+    .await
+}
+
+pub use build::dict_extend::extend_dicts;
+pub use build::incremental::{predicate_sids, DictNoveltyUpdate};
+pub use build::upload_dicts::{upload_numbig_arenas_from_disk, upload_vector_arenas_from_disk};
 
 /// Upload index artifacts (FLI3 leaves, FHS1 sidecars, FBR3 branches) to CAS.
 pub async fn upload_indexes_to_cas(
@@ -447,6 +501,40 @@ pub async fn upload_dicts_from_disk(
         trust_sorted_order_invariants,
     )
     .await
+}
+
+/// Refuse to publish a build of `built` whose head is no longer on the
+/// branch's line: a rebase moved the branch while it was built. Published,
+/// the index would serve the replaced line under the new head, and when the
+/// rebase left the head at the index's `t`, no later build would replace it.
+/// Walks the commits the branch gained during the build, usually none.
+pub async fn refuse_build_off_the_line(
+    nameservice: &dyn NameServiceLookup,
+    cs: &dyn ContentStore,
+    built: &fluree_db_nameservice::NsRecord,
+) -> Result<()> {
+    let Some(built_head) = built.commit_head_id.as_ref() else {
+        return Ok(());
+    };
+    let current = nameservice
+        .lookup(built.ledger_id.as_str())
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))?;
+    let Some(current_head) = current.as_ref().and_then(|r| r.commit_head_id.as_ref()) else {
+        return Ok(());
+    };
+    if current_head == built_head {
+        return Ok(());
+    }
+    let line =
+        fluree_db_core::collect_first_parent_cids(cs, current_head, built.commit_t - 1).await?;
+    match line.last() {
+        Some((t, cid)) if *t == built.commit_t && cid == built_head => Ok(()),
+        _ => Err(IndexerError::Other(format!(
+            "the branch moved off the built head {built_head} at t={} during the build",
+            built.commit_t
+        ))),
+    }
 }
 
 /// Publish index result to nameservice. Takes the narrower
@@ -537,7 +625,7 @@ mod publish_barrier_tests {
         let result = IndexResult {
             root_id,
             index_t: 1,
-            ledger_id: "l:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("l:main").unwrap(),
             stats: IndexStats::default(),
             fuel: None,
         };

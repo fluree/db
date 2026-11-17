@@ -216,10 +216,10 @@ Or as JSON-LD:
 }
 ```
 
-**HTTP / Docker:** the same JSON-LD config goes into a regular `/update` transaction. Wrap it in `@graph` and POST to the ledger:
+**HTTP / Docker:** the same JSON-LD config is a regular insert. POST it to the ledger's `/insert` endpoint:
 
 ```bash
-curl -X POST 'http://localhost:8090/v1/fluree/update?ledger=mydb:main' \
+curl -X POST 'http://localhost:8090/v1/fluree/insert?ledger=mydb:main' \
   -H 'Content-Type: application/json' \
   -d @- <<'JSON'
 {
@@ -246,7 +246,7 @@ curl -X POST 'http://localhost:8090/v1/fluree/update?ledger=mydb:main' \
 JSON
 ```
 
-The config is stored in the ledger's `#config` named graph (note the `"@graph": "urn:fluree:mydb:main#config"` placement directive on the resource). To verify, query the config graph:
+The config is stored in the ledger's `#config` named graph: the `"@graph": "urn:fluree:mydb:main#config"` placement directive on the resource places it, and the nested `f:fullTextDefaults` group and its `f:property` entries, there (`"@graph": "config"` names the same graph). To verify, query the config graph:
 
 ```bash
 curl -X POST http://localhost:8090/v1/fluree/query \
@@ -416,7 +416,7 @@ Each language becomes its own arena; queries automatically look up the right one
 
 ## The `fulltext()` Scoring Function
 
-The `fulltext()` function computes a BM25 relevance score for a bound text value against a query string. Use it in `bind` expressions within JSON-LD queries.
+The `fulltext()` function computes a BM25 relevance score for a bound text value against a query string. Use it in `bind` expressions in JSON-LD queries, or in `BIND` in SPARQL (see [SPARQL Support](#sparql-support)).
 
 ### Basic usage
 
@@ -490,6 +490,18 @@ Fulltext scoring works naturally with standard graph patterns. Filter by type, c
 
 Placing the category filter before the `fulltext()` bind reduces the number of documents scored, improving query performance.
 
+`fulltext()` scores against the graph its own group reads. To score values held in a named graph, write the `fulltext()` filter or bind inside that `GRAPH` block, not after it:
+
+```sparql
+SELECT ?title ?score WHERE {
+  GRAPH <http://example.org/catalog> {
+    ?doc ex:title ?title .
+    BIND(fulltext(?title, "zapato") AS ?score)
+    FILTER(?score > 0)
+  }
+}
+```
+
 ## How Scoring Works
 
 The `fulltext()` function uses **BM25** (Best Match 25), the standard information retrieval scoring algorithm used by search engines.
@@ -513,6 +525,10 @@ score(q,d) = SUM( IDF(t) * TF_norm(t) )  for each query term t
 - **Term frequency saturation** -- Diminishing returns for repeated terms, controlled by parameter *k1* (default 1.2). The 5th occurrence of "database" in a document contributes less than the 1st.
 
 - **Corpus-wide average document length** (`avgdl`) -- Anchors the length normalization across the entire collection.
+
+### Scoring under a policy
+
+The corpus statistics (*N*, *df*, *avgdl*) cover every document of the property, including documents a [policy](../security/policy-in-queries.md) hides from the identity running the query. Hidden documents are never returned as hits, and a visible document scores the same for a policy-scoped reader as for an unrestricted request. Because the statistics include hidden documents, though, a reader can tell from their scores when hidden documents containing a term are added or removed. The BM25 graph source behaves the same way: it scores against the whole index, then drops hits the identity cannot see.
 
 ### Text analysis pipeline
 
@@ -698,29 +714,28 @@ Expected results (ordered by relevance):
 
 ### Inserting data
 
-Fulltext annotation works in SPARQL UPDATE today using the `^^f:fullText` typed literal syntax (see the Turtle/SPARQL insertion examples above).
+Annotate values in SPARQL UPDATE (and Turtle) with the `^^f:fullText` typed literal, as in the insertion examples above, or configure the property with [`f:fullTextDefaults`](#configured-full-text-properties-ffulltextdefaults) and insert plain strings.
 
 ### Querying
 
-The `fulltext()` scoring function is currently available in **JSON-LD Query only**. SPARQL query support is planned for a future release, with anticipated syntax like:
+`fulltext()` is a SPARQL function, used in `BIND` like the vector similarity functions:
 
 ```sparql
 PREFIX ex: <http://example.org/>
-PREFIX f: <https://ns.flur.ee/db#>
 
 SELECT ?title ?score
 WHERE {
   ?doc a ex:Article ;
        ex:content ?content ;
        ex:title ?title .
-  BIND(f:fulltext(?content, "Rust programming") AS ?score)
+  BIND(fulltext(?content, "Rust programming") AS ?score)
   FILTER(?score > 0)
 }
 ORDER BY DESC(?score)
 LIMIT 10
 ```
 
-This mirrors the pattern established by inline vector similarity functions (`dotProduct`, `cosineSimilarity`, `euclideanDistance`), which also support JSON-LD Query today with SPARQL planned.
+It scores exactly as the JSON-LD form does, over indexed and unindexed documents alike, for both `@fulltext` values and `f:fullTextDefaults` properties. The name is case-insensitive (`fulltext`, `FULLTEXT`, `full_text`), and the namespaced `f:fulltext(...)` (`<https://ns.flur.ee/db#fulltext>`) is the same function.
 
 ## Related Documentation
 

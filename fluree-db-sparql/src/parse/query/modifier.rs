@@ -354,6 +354,9 @@ impl super::Parser<'_> {
             }
             let span = start.union(int_span);
             Some(LimitClause::new(n as u64, span))
+        } else if let Some((_, int_span)) = self.stream.consume_big_integer() {
+            self.stream.error_at(&too_large("LIMIT"), int_span);
+            None
         } else {
             self.stream.error_at_current("expected integer after LIMIT");
             None
@@ -373,10 +376,21 @@ impl super::Parser<'_> {
             }
             let span = start.union(int_span);
             Some(OffsetClause::new(n as u64, span))
+        } else if let Some((_, int_span)) = self.stream.consume_big_integer() {
+            self.stream.error_at(&too_large("OFFSET"), int_span);
+            None
         } else {
             self.stream
                 .error_at_current("expected integer after OFFSET");
             None
         }
     }
+}
+
+/// The error for a `LIMIT` or `OFFSET` beyond the largest value it takes.
+fn too_large(clause: &str) -> String {
+    format!(
+        "{clause} is too large: the largest supported value is {}",
+        i64::MAX
+    )
 }

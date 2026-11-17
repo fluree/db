@@ -62,18 +62,5 @@ pub enum CredentialError {
     KeyNotFound(String),
 }
 
-impl CredentialError {
-    /// HTTP status code for this error
-    ///
-    /// - 400: Invalid format, signature, algorithm, etc.
-    /// - 401: Could not verify identity
-    pub fn status_code(&self) -> u16 {
-        match self {
-            Self::NoIdentity(_) => 401,
-            _ => 400,
-        }
-    }
-}
-
 /// Result type alias for credential operations
 pub type Result<T> = std::result::Result<T, CredentialError>;

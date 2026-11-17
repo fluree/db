@@ -78,32 +78,7 @@ impl Default for ValidateOptions {
     }
 }
 
-/// One validation result with all identifiers resolved to IRIs.
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct ReportResult {
-    /// The node that failed validation (`sh:focusNode`): a JSON string for
-    /// IRIs / blank-node labels, or a JSON-LD value object (or native
-    /// scalar) for literal `sh:targetNode` targets.
-    pub focus_node: JsonValue,
-    /// The property path, when it is a single predicate (`sh:resultPath`).
-    /// Complex paths are omitted rather than misrepresented.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub result_path: Option<String>,
-    /// The node shape that produced this result.
-    pub source_shape: String,
-    /// The property shape that produced this result, when applicable.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub source_constraint: Option<String>,
-    /// The constraint component IRI (`sh:sourceConstraintComponent`).
-    pub constraint_component: String,
-    /// Severity IRI: `sh:Violation`, `sh:Warning`, or `sh:Info`.
-    pub severity: String,
-    /// Human-readable message (`sh:resultMessage`).
-    pub message: String,
-    /// The offending value, when applicable (`sh:value`).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub value: Option<JsonValue>,
-}
+pub use fluree_db_transact::ReportResult;
 
 /// A resolved validation report, ready for serialization.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -273,31 +248,19 @@ fn turtle_term(iri_or_bnode: &str) -> String {
     }
 }
 
-/// Render an IRI as a Turtle IRIREF, `\uXXXX`-escaping the characters the Turtle
-/// grammar forbids inside `<…>` (controls, space, and ``<>"{}|^`\``). The parser
-/// unescapes these back to the original codepoint, so the IRI round-trips —
-/// unlike percent-encoding, which would change the IRI's identity.
+/// Render an IRI as a Turtle IRIREF; characters the grammar forbids inside
+/// `<…>` are `\uXXXX`-escaped, which the parser reads back as the same IRI.
 fn turtle_iri(iri: &str) -> String {
-    use std::fmt::Write;
     let mut out = String::with_capacity(iri.len() + 2);
-    out.push('<');
-    for c in iri.chars() {
-        match c {
-            '\u{00}'..='\u{20}' | '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\' => {
-                let _ = write!(out, "\\u{:04X}", c as u32);
-            }
-            _ => out.push(c),
-        }
-    }
-    out.push('>');
+    fluree_graph_ir::syntax::push_iri_ref(&mut out, iri);
     out
 }
 
 /// Render an IRI as `sh:Name` when it lives in the SHACL namespace.
 fn turtle_sh_term(iri: &str) -> String {
     match iri.strip_prefix("http://www.w3.org/ns/shacl#") {
-        Some(local) => format!("sh:{local}"),
-        None => turtle_term(iri),
+        Some(local) if fluree_graph_ir::syntax::is_pn_local(local) => format!("sh:{local}"),
+        _ => turtle_term(iri),
     }
 }
 
@@ -309,7 +272,13 @@ fn turtle_value_term(value: &JsonValue) -> String {
                 return turtle_term(iri);
             }
             if let Some(lex) = obj.get("@value").and_then(|v| v.as_str()) {
-                if let Some(lang) = obj.get("@language").and_then(|v| v.as_str()) {
+                // A tag has no escape form; an invalid one would end the
+                // literal and forge triples, so the report drops it.
+                if let Some(lang) = obj
+                    .get("@language")
+                    .and_then(|v| v.as_str())
+                    .filter(|lang| fluree_graph_ir::syntax::is_lang_tag(lang))
+                {
                     return format!("{}@{lang}", turtle_string(lex));
                 }
                 if let Some(dt) = obj.get("@type").and_then(|v| v.as_str()) {
@@ -330,16 +299,7 @@ fn turtle_value_term(value: &JsonValue) -> String {
 fn turtle_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '"' => out.push_str("\\\""),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            _ => out.push(c),
-        }
-    }
+    fluree_graph_ir::syntax::push_string(&mut out, s);
     out.push('"');
     out
 }
@@ -370,49 +330,47 @@ impl crate::Fluree {
 
         let use_attached =
             matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
-        let (config, cross) = if use_attached {
-            let config = resolve_config_for_validate(&view).await;
+        // Read whatever the shapes: the config also says which graphs are
+        // read with the validated one.
+        let config = resolve_config_for_validate(&view).await?;
+        let cross = if use_attached {
             let is_cross_ledger = config
                 .as_ref()
                 .and_then(|c| c.shacl.as_ref())
                 .and_then(|s| s.shapes_source.as_ref())
                 .is_some_and(|s| s.ledger.is_some());
             let cross = if is_cross_ledger {
-                let mut resolve_ctx = crate::cross_ledger::ResolveCtx::new(ledger_id, self);
+                let mut resolve_ctx =
+                    crate::cross_ledger::ResolveCtx::new(&view.snapshot.ledger_id, self);
                 crate::tx::open_cross_ledger_shapes_model(config.as_ref(), &mut resolve_ctx)
                     .await
                     .map_err(ApiError::from)?
             } else {
                 None
             };
-            (config, cross)
+            cross
         } else {
-            (None, None)
+            None
         };
 
         validate_view_inner(&view, ledger_id, options, config, cross).await
     }
 }
 
-/// Resolve the ledger config for validation. Mirrors the transaction path's
-/// degrade semantics: a broken config graph read falls back to defaults
-/// (default-graph shapes) rather than failing validation.
+/// Resolve the ledger config for validation. A read failure fails validation,
+/// as it fails a transaction: the config says which shapes apply and which
+/// graphs are read, so validating without it would report against the wrong
+/// rules or the wrong data.
 async fn resolve_config_for_validate(
     view: &LedgerView,
-) -> Option<fluree_db_core::ledger_config::LedgerConfig> {
-    match crate::config_resolver::resolve_ledger_config(
+) -> Result<Option<fluree_db_core::ledger_config::LedgerConfig>> {
+    crate::config_resolver::resolve_ledger_config(
         view.snapshot.as_ref(),
         view.novelty.as_ref(),
         view.t,
     )
     .await
-    {
-        Ok(config) => config,
-        Err(e) => {
-            tracing::debug!(error = %e, "Config graph read failed during validate — using defaults");
-            None
-        }
-    }
+    .map_err(|e| ApiError::ConfigUnavailable(e.to_string()))
 }
 
 /// Validate a ledger view against SHACL shapes.
@@ -428,12 +386,7 @@ pub async fn validate_view(
     ledger_id: &str,
     options: &ValidateOptions,
 ) -> Result<ValidateReport> {
-    let use_attached = matches!(options.shapes, ShapesSource::Attached) || options.include_attached;
-    let config = if use_attached {
-        resolve_config_for_validate(view).await
-    } else {
-        None
-    };
+    let config = resolve_config_for_validate(view).await?;
     validate_view_inner(view, ledger_id, options, config, None).await
 }
 
@@ -465,7 +418,7 @@ async fn validate_view_inner(
 
     let data_g_id = match options.graph.as_deref() {
         None => 0u16,
-        Some(iri) => resolve_graph_iri(snapshot, iri)?,
+        Some(iri) => resolve_graph_iri(snapshot, iri, to_t)?,
     };
 
     // Holders declared before `shape_dbs` so the borrows they hand out
@@ -518,18 +471,10 @@ async fn validate_view_inner(
             // `sh:class` value-sets living alongside M's shapes: probe M's
             // shapes graph after a local membership miss, translating D-term
             // Sids through the snapshot namespace map.
-            cross_membership = Some(fluree_db_shacl::CrossLedgerMembership {
-                model_db: GraphDbRef::new(
-                    &model.model_db.snapshot,
-                    model.model_g_id,
-                    model.model_db.overlay.as_ref(),
-                    model.model_db.t,
-                ),
-                data_ns_map: snapshot.namespaces(),
-                same_term_space: false,
-            });
+            cross_membership = Some(model.membership(snapshot.namespaces()));
         } else {
-            let shapes_g_ids = crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot)?;
+            let shapes_g_ids =
+                crate::tx::resolve_shapes_source_g_ids(config.as_ref(), snapshot, to_t)?;
             for g_id in &shapes_g_ids {
                 shape_dbs.push(GraphDbRef::new(snapshot, *g_id, novelty, to_t));
             }
@@ -540,7 +485,7 @@ async fn validate_view_inner(
     match &options.shapes {
         ShapesSource::Attached => {}
         ShapesSource::Graph(iri) => {
-            let g_id = resolve_graph_iri(snapshot, iri)?;
+            let g_id = resolve_graph_iri(snapshot, iri, to_t)?;
             if !membership.contains(&g_id) {
                 shape_dbs.push(GraphDbRef::new(snapshot, g_id, novelty, to_t));
                 membership.push(g_id);
@@ -575,7 +520,7 @@ async fn validate_view_inner(
             // `include_attached` is set, the attached shape dbs pushed above
             // contribute the union — never a double scan of graph 0.
             static NO_OVERLAY: NoOverlay = NoOverlay;
-            inline_snapshot = Some(LedgerSnapshot::genesis(ledger_id));
+            inline_snapshot = Some(LedgerSnapshot::genesis(&view.snapshot.ledger_id));
             inline_overlay = Some(fluree_db_query::schema_bundle::SchemaBundleOverlay::new(
                 &NO_OVERLAY,
                 bundle,
@@ -617,11 +562,27 @@ async fn validate_view_inner(
         shapes,
         hierarchy.as_ref(),
     );
+    // The graphs read with the validated graph, from its effective SHACL
+    // group, as on the transaction path.
+    let additional_data_g_ids = match &config {
+        Some(config) => {
+            let graph_iri = (data_g_id != fluree_db_core::DEFAULT_GRAPH_ID)
+                .then(|| snapshot.graph_registry.iri_for_graph_id(data_g_id))
+                .flatten();
+            let resolved = crate::config_resolver::resolve_effective_config(config, graph_iri);
+            crate::tx::resolve_additional_data_g_ids(resolved.shacl.as_ref(), snapshot, to_t, None)?
+        }
+        None => Vec::new(),
+    };
     let mut engine = match hierarchy {
         Some(h) => ShaclEngine::new_with_hierarchy(cache, h),
         None => ShaclEngine::new(cache),
     }
-    .with_membership_graphs(membership);
+    .with_membership_graphs(membership)
+    .with_additional_data_graphs(std::collections::HashMap::from([(
+        data_g_id,
+        additional_data_g_ids,
+    )]));
     if let Some(cancellation) = options.cancellation.clone() {
         engine = engine.with_cancellation(cancellation);
     }
@@ -653,54 +614,7 @@ async fn validate_view_inner(
         .map_err(TransactError::from)?;
 
     let resolve = |sid: &Sid| resolve_sid(snapshot, inline_registry.as_ref(), sid);
-    let mut results: Vec<ReportResult> = raw
-        .results
-        .iter()
-        .map(|r| ReportResult {
-            focus_node: match &r.focus_node {
-                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
-                fluree_db_shacl::FocusNode::Literal(lit) => {
-                    match value_json(
-                        &lit.value,
-                        Some(&lit.datatype),
-                        lit.lang.as_deref(),
-                        &resolve,
-                    ) {
-                        // A bare string would be ambiguous with an IRI focus —
-                        // wrap plain string literals as a value object.
-                        JsonValue::String(s) => json!({"@value": s}),
-                        other => other,
-                    }
-                }
-            },
-            result_path: r.result_path.as_ref().map(&resolve),
-            source_shape: resolve(&r.source_shape),
-            source_constraint: r.source_constraint.as_ref().map(&resolve),
-            constraint_component: r.constraint_component.to_string(),
-            severity: severity_iri(r.severity).to_string(),
-            message: r.message.clone(),
-            value: r.value.as_ref().map(|v| {
-                value_json(
-                    v,
-                    r.value_datatype.as_ref(),
-                    r.value_lang.as_deref(),
-                    &resolve,
-                )
-            }),
-        })
-        .collect();
-    results.sort_by(|a, b| {
-        (
-            a.focus_node.to_string(),
-            &a.constraint_component,
-            &a.message,
-        )
-            .cmp(&(
-                b.focus_node.to_string(),
-                &b.constraint_component,
-                &b.message,
-            ))
-    });
+    let results = report_results(&raw.results, &resolve);
 
     Ok(ValidateReport {
         conforms: raw.conforms,
@@ -716,13 +630,23 @@ fn empty_shapes_doc() -> ApiError {
     ))
 }
 
-fn resolve_graph_iri(snapshot: &LedgerSnapshot, iri: &str) -> Result<GraphId> {
+/// The graph `iri` names as of `t`: one a drop after `t` took is refused, as
+/// a query naming it as of `t` is, and one that does not exist then is not
+/// found.
+fn resolve_graph_iri(snapshot: &LedgerSnapshot, iri: &str, t: i64) -> Result<GraphId> {
     if iri == config_iris::DEFAULT_GRAPH {
         return Ok(0);
     }
     snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .existing_graph_id(iri, t)
+        .map_err(|floor| {
+            ApiError::Query(fluree_db_query::QueryError::GraphDropped {
+                graph: iri.to_string(),
+                floor,
+                t,
+            })
+        })?
         .ok_or_else(|| {
             ApiError::NotFound(format!(
                 "graph '{iri}' not found in this ledger's graph registry"
@@ -748,6 +672,62 @@ fn resolve_sid(
             })
         })
         .unwrap_or_else(|| sid.name.to_string())
+}
+
+/// Validation results with every identifier resolved by `resolve`, sorted by
+/// (focus node, component, message).
+pub(crate) fn report_results<'a>(
+    results: impl IntoIterator<Item = &'a fluree_db_shacl::ValidationResult>,
+    resolve: &impl Fn(&Sid) -> String,
+) -> Vec<ReportResult> {
+    let mut results: Vec<ReportResult> = results
+        .into_iter()
+        .map(|r| ReportResult {
+            focus_node: match &r.focus_node {
+                fluree_db_shacl::FocusNode::Node(sid) => JsonValue::String(resolve(sid)),
+                fluree_db_shacl::FocusNode::Literal(lit) => {
+                    match value_json(
+                        &lit.value,
+                        Some(&lit.datatype),
+                        lit.lang.as_deref(),
+                        resolve,
+                    ) {
+                        // A bare string would be ambiguous with an IRI focus —
+                        // wrap plain string literals as a value object.
+                        JsonValue::String(s) => json!({"@value": s}),
+                        other => other,
+                    }
+                }
+            },
+            result_path: r.result_path.as_ref().map(resolve),
+            source_shape: resolve(&r.source_shape),
+            source_constraint: r.source_constraint.as_ref().map(resolve),
+            constraint_component: r.constraint_component.to_string(),
+            severity: severity_iri(r.severity).to_string(),
+            message: r.message.clone(),
+            value: r.value.as_ref().map(|v| {
+                value_json(
+                    v,
+                    r.value_datatype.as_ref(),
+                    r.value_lang.as_deref(),
+                    resolve,
+                )
+            }),
+        })
+        .collect();
+    results.sort_by(|a, b| {
+        (
+            a.focus_node.to_string(),
+            &a.constraint_component,
+            &a.message,
+        )
+            .cmp(&(
+                b.focus_node.to_string(),
+                &b.constraint_component,
+                &b.message,
+            ))
+    });
+    results
 }
 
 fn severity_iri(severity: Severity) -> &'static str {

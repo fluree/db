@@ -4,7 +4,7 @@ use crate::auth::token::CachedToken;
 use crate::auth::{CatalogAuth, SendCatalogAuth};
 use crate::error::{IcebergError, Result};
 use async_trait::async_trait;
-use chrono::{Duration, Utc};
+use reqwest::header::HeaderMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::Instrument;
@@ -142,8 +142,10 @@ impl OAuth2ClientCredentials {
             .map_err(|e| IcebergError::Auth(format!("Failed to parse token response: {e}")))?;
 
         // Default to 1 hour if not specified
+        // The token URL is the source's own choice, so its `expires_in` is
+        // untrusted: clamped rather than added raw (a huge value would panic).
         let expires_in = token_resp.expires_in.unwrap_or(3600);
-        let expires_at = Utc::now() + Duration::seconds(expires_in);
+        let expires_at = crate::auth::token::expires_at_in(expires_in);
 
         tracing::debug!(
             expires_in = expires_in,
@@ -185,9 +187,9 @@ impl OAuth2ClientCredentials {
 
 #[async_trait(?Send)]
 impl CatalogAuth for OAuth2ClientCredentials {
-    async fn authorization_header(&self) -> Result<Option<String>> {
+    async fn request_headers(&self, _url: &str) -> Result<HeaderMap> {
         let token = self.get_token().await?;
-        Ok(Some(token.authorization_header()))
+        crate::auth::authorization(&token.authorization_header())
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -200,9 +202,9 @@ impl CatalogAuth for OAuth2ClientCredentials {
 
 #[async_trait]
 impl SendCatalogAuth for OAuth2ClientCredentials {
-    async fn authorization_header(&self) -> Result<Option<String>> {
+    async fn request_headers(&self, _url: &str) -> Result<HeaderMap> {
         let token = self.get_token().await?;
-        Ok(Some(token.authorization_header()))
+        crate::auth::authorization(&token.authorization_header())
     }
 
     async fn refresh(&self) -> Result<()> {
@@ -216,6 +218,7 @@ impl SendCatalogAuth for OAuth2ClientCredentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::{Duration, Utc};
 
     #[test]
     fn test_token_expiration_check() {
@@ -320,6 +323,38 @@ mod tests {
             .mount(&server)
             .await;
         server
+    }
+
+    /// The token URL is the source's choice, so its `expires_in` is untrusted:
+    /// the largest one is clamped to the ceiling, never added raw (a panic).
+    #[tokio::test]
+    async fn a_huge_expires_in_is_clamped_not_a_panic() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/oauth/tokens"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/json")
+                    .set_body_string(
+                        r#"{"access_token":"abc","token_type":"Bearer","expires_in":9223372036854775807}"#,
+                    ),
+            )
+            .mount(&server)
+            .await;
+        let auth = OAuth2ClientCredentials::new(OAuth2Config {
+            token_url: format!("{}/v1/oauth/tokens", server.uri()),
+            client_id: String::new(),
+            client_secret: "s".to_string(),
+            scope: None,
+            audience: None,
+        })
+        .unwrap();
+        let token = auth.fetch_token().await.unwrap();
+        let ceiling = Utc::now()
+            + Duration::seconds(crate::auth::token::MAX_TOKEN_LIFETIME_SECS)
+            + Duration::seconds(5);
+        assert!(token.expires_at <= ceiling, "{:?}", token.expires_at);
+        assert!(!token.is_expired());
     }
 
     #[tokio::test]

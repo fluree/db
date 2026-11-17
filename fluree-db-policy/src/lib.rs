@@ -19,7 +19,8 @@
 //!
 //! Policy evaluation follows the expected semantics:
 //!
-//! 1. **Schema bypass**: Schema flakes (rdfs:subClassOf, etc.) always allowed
+//! 1. **Schema bypass**: view lets schema flakes (rdfs:subClassOf, etc.)
+//!    through; modify judges them like any other
 //! 2. **Candidate collection**: Policies gathered in order (property → subject → default)
 //! 3. **Class filtering**: Class policies filtered by subject membership
 //! 4. **Required subset**: if any `f:required` policy applies, only required

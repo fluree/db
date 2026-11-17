@@ -548,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_union_coalesces_fragmented_branch_output() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let mut ctx = ExecutionContext::new(&snapshot, &vars);
         ctx.batch_size = 4;
@@ -728,7 +728,7 @@ mod tests {
     #[tokio::test]
     async fn union_budget_preserves_limit_result() {
         use crate::limit::LimitOperator;
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -810,7 +810,7 @@ mod tests {
 
     #[tokio::test]
     async fn lever_budget_met_skips_later_branch() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         // branch-1 yields 2 rows == budget 2 → branch-2 must never be built.
@@ -832,7 +832,7 @@ mod tests {
 
     #[tokio::test]
     async fn lever_underfilled_branch_still_runs_later_branch() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         // branch-1 yields 2 < budget 3 → branch-2 IS built and drained (total 3).
@@ -854,7 +854,7 @@ mod tests {
 
     #[tokio::test]
     async fn lever_absent_budget_runs_all_branches() {
-        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test/main");
+        let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
         // No budget set → the lever never trips; both branches always run.

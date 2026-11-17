@@ -87,22 +87,16 @@ pub struct PropertyPathPattern {
     pub max_hops: Option<u32>,
     /// Object ref (Var or Sid — literals not allowed)
     pub object: Ref,
+    /// SPARQL's view of RDF lists, when the path's predicates can step
+    /// through a list (see [`crate::list_view`]): the path follows a list's
+    /// owner edge and cells rather than its members.
+    pub list_view: Option<std::sync::Arc<crate::list_view::ListView>>,
 }
 
 impl PropertyPathPattern {
     /// Create a single-predicate property path pattern (`p*` / `p+`).
     pub fn new(subject: Ref, predicate: Sid, modifier: PathModifier, object: Ref) -> Self {
-        Self {
-            subject,
-            predicates: vec![predicate],
-            first_inverse: false,
-            sequence_steps: Vec::new(),
-            wildcard: false,
-            modifier,
-            min_hops: None,
-            max_hops: None,
-            object,
-        }
+        Self::new_alternatives(subject, vec![predicate], modifier, object)
     }
 
     /// Create an alternation-transitive path `(a|b|…)*` over `predicates`
@@ -125,6 +119,7 @@ impl PropertyPathPattern {
             min_hops: None,
             max_hops: None,
             object,
+            list_view: None,
         }
     }
 
@@ -149,6 +144,7 @@ impl PropertyPathPattern {
             min_hops,
             max_hops,
             object,
+            list_view: None,
         }
     }
 
@@ -168,15 +164,9 @@ impl PropertyPathPattern {
         );
         let first = steps.remove(0);
         Self {
-            subject,
-            predicates: first.predicates,
             first_inverse: first.inverse,
             sequence_steps: steps,
-            wildcard: false,
-            modifier,
-            min_hops: None,
-            max_hops: None,
-            object,
+            ..Self::new_alternatives(subject, first.predicates, modifier, object)
         }
     }
 

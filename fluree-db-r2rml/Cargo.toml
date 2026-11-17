@@ -39,6 +39,9 @@ once_cell.workspace = true
 # Serialization (for config)
 serde = { workspace = true, features = ["derive"] }
 
+# Insertion-ordered map: TriplesMaps keep their document order
+indexmap.workspace = true
+
 # Async traits
 async-trait.workspace = true
 

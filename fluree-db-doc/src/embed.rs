@@ -9,11 +9,24 @@ use std::time::Duration;
 const BATCH: usize = 64;
 const ATTEMPTS: u32 = 4;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct EmbeddingClient {
     client: reqwest::Client,
     endpoint: ModelEndpoint,
     api_key: Option<String>,
+}
+
+/// Hand-written, like [`crate::llm::LlmClient`]'s, because this one holds
+/// the **resolved** token — `$NAME` already expanded — so a derived `Debug`
+/// prints the live bearer value itself rather than the config indirection.
+impl std::fmt::Debug for EmbeddingClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmbeddingClient")
+            .field("url", &self.endpoint.url)
+            .field("model", &self.endpoint.model)
+            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 impl EmbeddingClient {

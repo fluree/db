@@ -40,14 +40,14 @@ pub use path::{NegatedPredicate, PropertyPath};
 pub use pattern::{GraphName, GraphPattern, TriplePattern};
 pub use query::{
     AskQuery, BaseDecl, ConstructQuery, ConstructTemplate, DatasetClause, DescribeQuery,
-    DescribeTarget, GroupByClause, GroupCondition, HavingClause, LimitClause, OffsetClause,
-    OrderByClause, OrderCondition, OrderDirection, OrderExpr, Pragmas, PrefixDecl, Prologue,
-    QueryBody, SelectClause, SelectModifier, SelectQuery, SelectVariable, SelectVariables,
-    SolutionModifiers, SparqlAst, VarOrIri, WhereClause,
+    DescribeTarget, GroupByClause, GroupCondition, HavingClause, LimitClause, MetaPragma,
+    OffsetClause, OrderByClause, OrderCondition, OrderDirection, OrderExpr, Pragmas, PrefixDecl,
+    Prologue, QueryBody, SelectClause, SelectModifier, SelectQuery, SelectVariable,
+    SelectVariables, SolutionModifiers, SparqlAst, VarOrIri, WhereClause,
 };
 pub use term::{
-    BlankNode, BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm,
-    QtReifier, QuotedTriple, Spanned, SubjectTerm, Term, Var,
+    BlankNode, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, QtReifier,
+    QuotedTriple, Spanned, SubjectTerm, Term, Var,
 };
 pub use update::{
     Create, DeleteData, DeleteWhere, GraphMgmtRef, GraphOrDefault, GraphRefAll, GraphTransfer,

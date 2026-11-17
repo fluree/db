@@ -705,7 +705,9 @@ async fn delegated_policy_survives_follower_forwarding_and_the_raft_command_queu
         if allow {
             assert_eq!(status, StatusCode::OK, "{body}");
         } else {
-            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+            assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+            assert_eq!(body["status"], 403, "{body}");
+            assert_eq!(body["@type"], "err:policy/AccessDenied", "{body}");
             assert!(
                 body.to_string().contains("Delegated Raft write denied"),
                 "{body}"
@@ -822,6 +824,332 @@ async fn happy_path_follower_forwards_to_leader() {
             .wait_for_names(node.node_id, ledger, &["Alice", "Bob"], DEFAULT_TIMEOUT)
             .await;
     }
+}
+
+/// A TriG graph sync sent to a follower is forwarded, staged by the leader's
+/// commit worker as an RDF sync body, and replicated: an identical resync
+/// commits nothing, and a smaller payload retracts what it leaves out.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rdf_graph_sync_commits_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:sync";
+    let graph = "urn:example:tools";
+    cluster.create_ledger(follower, ledger).await;
+
+    let sync = |triples: &'static str| {
+        let trig =
+            format!("@prefix ex: <http://example.org/> .\nGRAPH <{graph}> {{ {triples} }}\n");
+        let request = cluster
+            .client
+            .post(format!(
+                "{}/v1/fluree/sync/{ledger}?graph={graph}",
+                cluster.public_url(follower)
+            ))
+            .header("content-type", "application/trig")
+            .body(trig);
+        async move {
+            let resp = request.send().await.expect("sync request");
+            let status = resp.status();
+            let body: serde_json::Value = resp.json().await.expect("sync json");
+            assert!(status.is_success(), "sync returned {status}: {body}");
+            body["t"].as_i64()
+        }
+    };
+    let names_everywhere = |expected: serde_json::Value| {
+        let query = json!({
+            "@context": { "ex": "http://example.org/" },
+            "from": format!("{ledger}#{graph}"),
+            "select": "?name",
+            "where": { "@id": "?s", "ex:name": "?name" },
+            "orderBy": "?name"
+        });
+        let cluster = &cluster;
+        async move {
+            for node in &cluster.nodes {
+                let deadline = Instant::now() + DEFAULT_TIMEOUT;
+                let mut last = serde_json::Value::Null;
+                while Instant::now() < deadline {
+                    let resp = cluster
+                        .client
+                        .post(format!("{}/v1/fluree/query", node.public_url))
+                        .header("content-type", "application/json")
+                        .body(query.to_string())
+                        .send()
+                        .await
+                        .expect("query request");
+                    last = resp.json().await.expect("query json");
+                    if last == expected {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+                assert_eq!(last, expected, "node {}", node.node_id);
+            }
+        }
+    };
+
+    let full = r#"ex:search ex:name "search" ; ex:param [ ex:name "q" ]"#;
+    assert_eq!(sync(full).await, Some(1));
+    // Same triples, different bytes: a byte-identical keyless resubmission
+    // shares the first's content-addressed queue envelope, which the first's
+    // apply releases, so the second's worker can find it gone (#1931).
+    let resync = r#"ex:search  ex:name "search" ; ex:param [ ex:name "q" ]"#;
+    assert_eq!(
+        sync(resync).await,
+        Some(1),
+        "an identical resync must not commit"
+    );
+    names_everywhere(json!(["q", "search"])).await;
+
+    assert_eq!(sync(r#"ex:search ex:name "search""#).await, Some(2));
+    names_everywhere(json!(["search"])).await;
+
+    // A block naming another graph fails identically on every attempt, so
+    // the worker poisons it at once instead of retrying, and the queue moves
+    // on to the next sync.
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/sync/{ledger}?graph={graph}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/trig")
+        .body("GRAPH <urn:example:other> { <urn:x> <urn:p> \"x\" }\n")
+        .send()
+        .await
+        .expect("refused sync request");
+    let status = resp.status();
+    let body = resp.text().await.expect("refused sync body");
+    assert_eq!(status.as_u16(), 422, "{body}");
+    assert!(
+        body.contains("BodyMalformed"),
+        "refused without the retry budget: {body}"
+    );
+    assert_eq!(
+        sync(r#"ex:search ex:name "search" ; ex:tag "t""#).await,
+        Some(3)
+    );
+}
+
+/// Graph Store Protocol writes sent to a follower are forwarded to the
+/// leader (the forwarding layer sits on the write methods only), and the
+/// graph-insert body stages through the leader's commit worker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn graph_store_writes_forward_through_the_raft_queue() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:gsp";
+    cluster.create_ledger(follower, ledger).await;
+    let uri = format!(
+        "{}/v1/fluree/data/{ledger}?graph=urn:example:tools",
+        cluster.public_url(follower)
+    );
+    let send = |method: reqwest::Method, body: &'static str| {
+        let request = cluster
+            .client
+            .request(method, &uri)
+            .header("content-type", "text/turtle")
+            .body(body);
+        async move {
+            let resp = request.send().await.expect("graph store request");
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            (status, body)
+        }
+    };
+
+    let (status, body) = send(
+        reqwest::Method::PUT,
+        "<http://example.org/search> <http://example.org/name> \"search\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = send(
+        reqwest::Method::POST,
+        "<http://example.org/fetch> <http://example.org/name> \"fetch\" .",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    for node in &cluster.nodes {
+        let url = format!(
+            "{}/v1/fluree/data/{ledger}?graph=urn:example:tools",
+            node.public_url
+        );
+        let deadline = Instant::now() + DEFAULT_TIMEOUT;
+        let mut last = String::new();
+        while Instant::now() < deadline {
+            let resp = cluster.client.get(&url).send().await.expect("GET");
+            last = resp.text().await.unwrap_or_default();
+            if last.contains("fetch") && last.contains("search") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            last.contains("fetch") && last.contains("search"),
+            "node {}: {last}",
+            node.node_id
+        );
+    }
+
+    let (status, body) = send(reqwest::Method::DELETE, "").await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+}
+
+/// Build, in a local in-memory instance, a main branch that ends in a
+/// general merge of `dev`. Return the push a client would send for it: the
+/// first-parent line plus the commit `dev` made.
+async fn merged_history_push() -> fluree_db_api::PushCommitsRequest {
+    use fluree_db_api::{Base64Bytes, ConflictStrategy, FlureeBuilder};
+    use fluree_db_core::ContentStore;
+
+    let local = FlureeBuilder::memory().build_memory();
+    let insert = |ledger: &'static str, subject: &'static str, name: &'static str| {
+        let local = &local;
+        async move {
+            let state = local.ledger(ledger).await.unwrap();
+            let data = json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": format!("ex:{subject}"),
+                "ex:name": name,
+            });
+            local.insert(state, &data).await.unwrap();
+        }
+    };
+    local.create_ledger("mydb").await.unwrap();
+    insert("mydb:main", "alice", "Alice").await;
+    local
+        .create_branch("mydb", "dev", None, None)
+        .await
+        .unwrap();
+    // Dev's commit keeps its raw transaction, so it references a txn blob
+    // that has to travel with the push.
+    let dev = local.ledger("mydb:dev").await.unwrap();
+    local
+        .transact(
+            dev,
+            fluree_db_api::TxnType::Insert,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "@id": "ex:bob",
+                "ex:name": "Bob",
+            }),
+            fluree_db_api::TxnOpts::default().store_raw_txn(true),
+            fluree_db_api::CommitOpts::default(),
+            &fluree_db_api::IndexConfig {
+                reindex_min_bytes: 100_000,
+                reindex_max_bytes: 1_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+    insert("mydb:main", "carol", "Carol").await;
+    let report = local
+        .merge_branch("mydb", "dev", None, ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(!report.fast_forward);
+
+    let store = local.branched_content_store("mydb:main").await.unwrap();
+    let head = local
+        .ledger("mydb:main")
+        .await
+        .unwrap()
+        .head_commit_id
+        .clone()
+        .unwrap();
+    let plan = fluree_db_core::plan_commit_transfer(store.as_ref(), &head, None)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let mut request = fluree_db_api::PushCommitsRequest::default();
+    for (cids, out) in [
+        (&plan.lineage, &mut request.commits),
+        (&plan.merged, &mut request.merged_commits),
+    ] {
+        for cid in cids {
+            let bytes = store.get(cid).await.unwrap();
+            let commit = fluree_db_core::commit::codec::read_commit(&bytes).unwrap();
+            if let Some(txn) = &commit.txn {
+                let txn_bytes = store.get(txn).await.unwrap();
+                request
+                    .blobs
+                    .insert(txn.to_string(), Base64Bytes(txn_bytes));
+            }
+            out.push(Base64Bytes(bytes));
+        }
+    }
+    request
+}
+
+/// A push containing a merge, sent to a follower, is forwarded to the
+/// leader and applied through the Raft queue's `PushWithMerges` envelope.
+/// Every node then sees the merged data.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn push_with_merges_through_a_follower() {
+    init_test_tracing();
+    let cluster = TestCluster::spawn(3).await;
+    cluster.bootstrap().await;
+
+    let follower = cluster.pick_follower().await;
+    let ledger = "raft:push-merges";
+    cluster.create_ledger(follower, ledger).await;
+
+    let request = merged_history_push().await;
+    assert_eq!(request.merged_commits.len(), 1, "dev's commit");
+    let resp = cluster
+        .client
+        .post(format!(
+            "{}/v1/fluree/push-merges/{ledger}",
+            cluster.public_url(follower)
+        ))
+        .header("content-type", "application/json")
+        .body(serde_json::to_string(&request).unwrap())
+        .send()
+        .await
+        .expect("push request");
+    assert!(
+        resp.status().is_success(),
+        "push-merges via follower returned {}: {}",
+        resp.status(),
+        resp.text().await.unwrap_or_default()
+    );
+
+    for node in &cluster.nodes {
+        cluster
+            .wait_for_names(
+                node.node_id,
+                ledger,
+                &["Alice", "Bob", "Carol"],
+                DEFAULT_TIMEOUT,
+            )
+            .await;
+    }
+
+    // The worker also writes the merged-in commit's txn blob. Storage is
+    // shared, so any node can read it.
+    use fluree_db_core::ContentStore;
+    let side = fluree_db_core::commit::codec::read_commit(&request.merged_commits[0].0).unwrap();
+    let txn = side.txn.expect("dev's commit has a txn blob");
+    let stored = cluster.nodes[0]
+        ._state
+        .fluree
+        .content_store(ledger)
+        .get(&txn)
+        .await;
+    assert!(
+        stored.is_ok(),
+        "txn blob {txn} of dev's commit is not stored"
+    );
 }
 
 /// Regression test for the event-bus wiring bug fixed in this branch.

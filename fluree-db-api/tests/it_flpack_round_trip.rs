@@ -582,6 +582,53 @@ async fn flpack_restore_ledger_api_round_trip() {
     assert_eq!(dst_json.as_array().expect("array").len(), 2);
 }
 
+/// The first read through the cached-handle path sees the restored data.
+///
+/// `restore_ledger` creates the target with `create_ledger`, which caches its
+/// empty genesis state, then moves the heads in the nameservice. A stale cached
+/// handle answered the first in-process read from that empty state.
+#[tokio::test]
+async fn flpack_restore_first_cached_read_sees_restored_data() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+
+    let src_ledger = "flpack-test/cached-source:main";
+    let src_fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build source");
+    let src_db = fluree_db_core::LedgerSnapshot::genesis(src_ledger);
+    let src_state = fluree_db_api::LedgerState::new(src_db, fluree_db_api::Novelty::new(0));
+    let insert = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "@id": "ex:test", "ex:value": "hello"
+    });
+    src_fluree.insert(src_state, &insert).await.expect("insert");
+    let pack_bytes = export_ledger_to_bytes(&src_fluree, src_ledger).await;
+
+    let dst_fluree = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(pack_bytes);
+    dst_fluree
+        .restore_ledger("flpack-test/cached-restored", &mut reader)
+        .await
+        .expect("restore_ledger");
+
+    let query = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": "?v",
+        "where": {"@id": "ex:test", "ex:value": "?v"}
+    });
+    let first = dst_fluree
+        .graph("flpack-test/cached-restored:main")
+        .query()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("first cached read");
+    assert_eq!(first, json!(["hello"]));
+}
+
 /// Restoring under a bare name (no `:branch` suffix) must normalize to
 /// `name:main` consistently across ingest, head finalization, and load.
 #[tokio::test]

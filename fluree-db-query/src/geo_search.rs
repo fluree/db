@@ -58,6 +58,9 @@ pub struct GeoSearchOperator {
     overlay_ops: std::sync::Arc<[OverlayOp]>,
     /// Dict overlay for ephemeral ID translation and forward resolution.
     dict_overlay: Option<crate::dict_overlay::DictOverlay>,
+    /// POST branch of the active graph, resolved at open. Empty for a graph
+    /// the index has no branch for, whose points are all in `overlay_ops`.
+    branch: Option<Arc<BranchManifest>>,
     /// Operator lifecycle state
     state: OperatorState,
     /// Variables required by downstream operators; if set, output is trimmed.
@@ -76,8 +79,11 @@ impl GeoSearchOperator {
             schema_vars.push(pattern.subject_var);
         }
 
-        // Add distance variable if present
-        if let Some(v) = pattern.distance_var {
+        // Add distance and point variables if present
+        for v in [pattern.distance_var, pattern.location_var]
+            .into_iter()
+            .flatten()
+        {
             if seen.insert(v) {
                 schema_vars.push(v);
             }
@@ -96,6 +102,7 @@ impl GeoSearchOperator {
             p_id: None,
             overlay_ops: Vec::new().into(),
             dict_overlay: None,
+            branch: None,
             state: OperatorState::Created,
             out_schema: None,
         }
@@ -156,15 +163,13 @@ impl GeoSearchOperator {
             return Ok(vec![]);
         };
 
-        let mut results: Vec<(u64, f64)> = Vec::new(); // (s_id, distance)
+        let Some(branch) = self.branch.as_ref() else {
+            return Err(QueryError::Internal(
+                "GeoSearch: searched before open".to_string(),
+            ));
+        };
 
-        // Get branch manifest for POST order.
-        let branch_ref = store
-            .branch_for_order(g_id, RunSortOrder::Post)
-            .ok_or_else(|| {
-                QueryError::Internal(format!("GeoSearch: no POST branch for g_id={g_id}"))
-            })?;
-        let branch: Arc<BranchManifest> = Arc::clone(branch_ref);
+        let mut results: Vec<(u64, u64, f64)> = Vec::new(); // (s_id, o_key, distance)
 
         let geo_otype = OType::GEO_POINT.as_u16();
 
@@ -236,31 +241,21 @@ impl GeoSearchOperator {
                     // Apply haversine post-filter
                     let distance = haversine_distance(center_lat, center_lng, point_lat, point_lng);
                     if distance <= radius {
-                        results.push((s_id, distance));
+                        results.push((s_id, o_key, distance));
                     }
                 }
             }
         }
 
-        // Deduplicate by subject_id, keeping min distance.
-        // This handles:
-        // 1. Antimeridian crossing (same subject in multiple latitude bands)
-        // 2. Multiple GeoPoint values per subject for the same predicate
-        let mut deduped: HashMap<u64, f64> = HashMap::new();
-        for (s_id, distance) in results {
-            deduped
-                .entry(s_id)
-                .and_modify(|existing| {
-                    if distance < *existing {
-                        *existing = distance;
-                    }
-                })
-                .or_insert(distance);
-        }
-        let mut results: Vec<(u64, f64)> = deduped.into_iter().collect();
+        // One row per (subject, point), as the triple pattern this replaces
+        // would give: a subject with several points within the radius matches
+        // once for each. A point seen in two latitude bands (antimeridian
+        // crossing) is the same match.
+        let mut seen_points: HashSet<(u64, u64)> = HashSet::new();
+        results.retain(|(s_id, o_key, _)| seen_points.insert((*s_id, *o_key)));
 
         // Sort by distance and apply limit
-        results.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal));
         if let Some(lim) = limit {
             results.truncate(lim);
         }
@@ -269,7 +264,7 @@ impl GeoSearchOperator {
         let num_cols = self.in_schema.len();
         let mut output_rows: Vec<Vec<Binding>> = Vec::with_capacity(results.len());
 
-        for (s_id, distance) in results {
+        for (s_id, o_key, distance) in results {
             let mut row = vec![Binding::Unbound; num_cols];
 
             // Copy child columns
@@ -303,6 +298,14 @@ impl GeoSearchOperator {
                 row[dist_pos] = Binding::lit(
                     FlakeValue::Double(distance),
                     self.datatypes.xsd_double.clone(),
+                );
+            }
+
+            if let Some(loc_var) = self.pattern.location_var {
+                let loc_pos = *self.out_pos.get(&loc_var).unwrap();
+                row[loc_pos] = Binding::lit(
+                    FlakeValue::GeoPoint(GeoPointBits(o_key)),
+                    self.datatypes.geo_wkt_literal.clone(),
                 );
             }
 
@@ -353,6 +356,7 @@ impl Operator for GeoSearchOperator {
 
         // Overlay translation + DictOverlay setup (matches BinaryScanOperator's binary path).
         let g_id = ctx.binary_g_id;
+        let mut novelty_p_id = None;
         if let Some(ovl) = ctx.overlay {
             // Correctness first: GeoSearch depends on a predicate+o_type constrained overlay.
             // If we cannot translate a geo overlay flake into V3 ID space, returning
@@ -397,6 +401,8 @@ impl Operator for GeoSearchOperator {
                     "GeoSearch: failed to translate overlay flake to V3".to_string(),
                 ));
             }
+            // The id the ops carry for a predicate the index doesn't hold.
+            novelty_p_id = ephemeral_preds.get(&self.pattern.predicate).copied();
             if !ops.is_empty() {
                 sort_overlay_ops(&mut ops, RunSortOrder::Post);
                 resolve_overlay_ops(&mut ops);
@@ -411,21 +417,21 @@ impl Operator for GeoSearchOperator {
             }
         }
 
-        // Resolve predicate ID once at open (may allocate ephemeral ID if overlay present).
-        self.p_id = match self.dict_overlay.as_mut() {
-            Some(dict_ov) => {
-                let iri = ctx
-                    .active_snapshot
-                    .decode_sid(&self.pattern.predicate)
-                    .ok_or_else(|| {
-                        QueryError::Internal(
-                            "GeoSearch predicate Sid could not be decoded to an IRI".to_string(),
-                        )
-                    })?;
-                Some(dict_ov.assign_predicate_id(&iri))
-            }
-            None => store.sid_to_p_id(&self.pattern.predicate),
-        };
+        // Resolve predicate ID once at open. A predicate only novelty holds
+        // has the id the overlay translation gave its ops, the only id that
+        // finds them; none at all means neither the index nor the graph's
+        // novelty holds it.
+        self.p_id = store.sid_to_p_id(&self.pattern.predicate).or(novelty_p_id);
+
+        // A graph the index has no POST branch for (a named graph first
+        // written after the last index, or a default graph whose indexed facts
+        // are all in named graphs) has nothing indexed: its points are all in
+        // `overlay_ops`. An empty manifest gives the cursor no leaves, so it
+        // reads the overlay alone.
+        self.branch = Some(match store.branch_for_order(g_id, RunSortOrder::Post) {
+            Some(branch) => Arc::clone(branch),
+            None => Arc::new(BranchManifest { leaves: Vec::new() }),
+        });
 
         self.state = OperatorState::Open;
         Ok(())

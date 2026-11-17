@@ -850,9 +850,15 @@ async fn scaffolder_write_profile_grants_class_ownership_only() {
         "delete": [{"@id": "ex:bob", "ex:nickname": "?n"}],
         "insert": [{"@id": "ex:bob", "ex:nickname": "Robert"}]
     });
-    let denied = try_txn(&fluree, ledger, TxnType::Update, &update_person, &ctx).await;
-    assert!(
-        denied.is_err(),
-        "Lead write profile must NOT edit a Person: {denied:?}"
+    // The profile cannot see a Person, so the WHERE matches nothing: the
+    // update is a no-op that writes nothing and does not advance the ledger.
+    let before_t = ledger.t();
+    let after = try_txn(&fluree, ledger, TxnType::Update, &update_person, &ctx)
+        .await
+        .expect("a view-filtered no-match update is a no-op, not an error");
+    assert_eq!(
+        after.t(),
+        before_t,
+        "Lead write profile must NOT edit a Person"
     );
 }

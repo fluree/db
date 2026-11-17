@@ -32,5 +32,5 @@ mod stream;
 
 pub use expr::parse_expression;
 pub use path::parse_property_path;
-pub use query::parse_sparql;
+pub use query::{parse_sparql, pragma_names, request_pragmas};
 pub use stream::TokenStream;

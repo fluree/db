@@ -432,6 +432,34 @@ async fn nameservice_ledger_lifecycle() {
     assert!(rec.is_some(), "retracted record still visible via lookup");
 }
 
+/// `branch_records` narrows GSI1 to one ledger's `name:` key prefix. A
+/// retracted branch stays listed; a nested ledger and a ledger whose name
+/// only starts the same do not.
+#[tokio::test]
+async fn nameservice_branch_records() {
+    let (_lock, _container, ns) = setup_localstack_ns().await;
+
+    for id in [
+        "br-test:main",
+        "br-test:dev",
+        "br-test/nested:main",
+        "br-test2:main",
+    ] {
+        ns.init(id).await.unwrap();
+    }
+    ns.retract("br-test:dev").await.unwrap();
+
+    let mut branches: Vec<String> = ns
+        .branch_records("br-test")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.branch)
+        .collect();
+    branches.sort();
+    assert_eq!(branches, ["dev", "main"]);
+}
+
 #[tokio::test]
 async fn nameservice_admin_publisher() {
     let (_lock, _container, ns) = setup_localstack_ns().await;

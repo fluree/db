@@ -53,7 +53,7 @@ pub trait IcebergStorage: Debug {
     /// List the immediate child FILE names under `prefix` (no recursion, no
     /// directories). Used by catalog-less Direct mode to discover the current
     /// `*.metadata.json` when `version-hint.text` is absent. Default:
-    /// unsupported — local-filesystem storage overrides it.
+    /// unsupported.
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
         let _ = prefix;
         Err(IcebergError::storage(
@@ -123,6 +123,17 @@ pub struct S3IcebergStorage {
     credentials_expiry: Option<chrono::DateTime<chrono::Utc>>,
     /// Max concurrent range-read requests (default: 4)
     max_concurrent_reads: usize,
+    /// Whether this client reads `gs://` paths: only through Google's S3
+    /// interoperability endpoint (see [`crate::io::location::s3_serves`]).
+    serves_gs: bool,
+    /// The buckets this client may read (the operator's ambient-AWS bucket
+    /// allowlist); `None` reads any bucket its credentials reach.
+    buckets: Option<std::sync::Arc<[String]>>,
+    /// The endpoint override this client was built with, if any. An endpoint
+    /// can address a bucket of its own (a virtual-hosted
+    /// `https://<bucket>.s3.…` host read path-style), so with one the bucket a
+    /// path names is not the bucket read: an allowlisted client refuses it.
+    endpoint: Option<String>,
 }
 
 #[cfg(feature = "aws")]
@@ -131,6 +142,9 @@ impl Debug for S3IcebergStorage {
         f.debug_struct("S3IcebergStorage")
             .field("credentials_expiry", &self.credentials_expiry)
             .field("max_concurrent_reads", &self.max_concurrent_reads)
+            .field("serves_gs", &self.serves_gs)
+            .field("buckets", &self.buckets)
+            .field("endpoint", &self.endpoint)
             .finish()
     }
 }
@@ -178,7 +192,7 @@ fn http1_only_http_client() -> aws_sdk_s3::config::SharedHttpClient {
 /// failures) lives in the source chain. Walking it turns opaque failures into
 /// actionable messages — important for diagnosing GCS S3-interop misconfig.
 #[cfg(feature = "aws")]
-fn error_chain(err: &dyn std::error::Error) -> String {
+pub(crate) fn error_chain(err: &dyn std::error::Error) -> String {
     use std::fmt::Write;
     let mut msg = err.to_string();
     let mut source = err.source();
@@ -203,6 +217,18 @@ fn is_s3_access_denied(error_code: Option<&str>, http_status: Option<u16>) -> bo
         || http_status == Some(403)
 }
 
+/// The scheme `path` is written in (`s3`, `s3a`, `gs`), for messages.
+#[cfg(feature = "aws")]
+fn scheme_of(path: &str) -> &'static str {
+    if path.starts_with("s3a://") {
+        "s3a"
+    } else if path.starts_with("gs://") {
+        "gs"
+    } else {
+        "s3"
+    }
+}
+
 /// Build an [`IcebergError`] from a failed S3 read.
 ///
 /// Returns the structured [`IcebergError::StorageAccessDenied`] (which the API/
@@ -211,8 +237,10 @@ fn is_s3_access_denied(error_code: Option<&str>, http_status: Option<u16>) -> bo
 /// `"S3 {op} failed: …"` message — so every non-denial failure is byte-for-byte
 /// unchanged from before.
 #[cfg(any(feature = "aws", test))]
+#[allow(clippy::too_many_arguments)] // every field of the denial it builds
 fn s3_read_error(
     op: &str,
+    scheme: &'static str,
     bucket: &str,
     key: &str,
     region: Option<String>,
@@ -222,6 +250,7 @@ fn s3_read_error(
 ) -> IcebergError {
     if is_s3_access_denied(error_code, http_status) {
         IcebergError::StorageAccessDenied {
+            scheme,
             bucket: bucket.to_string(),
             key: key.to_string(),
             region,
@@ -249,7 +278,7 @@ impl S3IcebergStorage {
     /// without touching SDK internals (the built `aws_sdk_s3::Config` exposes only
     /// `region()`, not endpoint/path-style).
     fn resolve_io(
-        creds: &crate::credential::VendedCredentials,
+        creds: &crate::credential::S3Credentials,
         region_override: Option<&str>,
         endpoint_override: Option<&str>,
         path_style_override: bool,
@@ -277,11 +306,14 @@ impl S3IcebergStorage {
     ///
     /// Path-style (`io.s3_path_style`) is the exception: it is the logical OR of the
     /// vended and override flags, so an override can only force it on, never back to
-    /// `false`. See [`resolve_io`](Self::resolve_io).
+    /// `false` (see `resolve_io`).
+    ///
+    /// The credentials are used as given until they expire; see
+    /// [`Self::from_renewing_vended`] for a store that renews them.
     ///
     /// [`from_default_chain`]: Self::from_default_chain
     pub async fn from_vended_credentials(
-        creds: &crate::credential::VendedCredentials,
+        creds: &crate::credential::S3Credentials,
         region_override: Option<&str>,
         endpoint_override: Option<&str>,
         path_style_override: bool,
@@ -308,50 +340,49 @@ impl S3IcebergStorage {
             path_style_override,
         );
 
-        // Build config with vended credentials
-        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest())
-            .credentials_provider(aws_creds);
+        Self::build(
+            Some(aws_credential_types::provider::SharedCredentialsProvider::new(aws_creds)),
+            region.as_deref(),
+            endpoint.as_deref(),
+            path_style,
+            creds.expires_at,
+        )
+        .await
+    }
 
-        // Set region only when resolved; leaving it None preserves SDK default resolution.
-        if let Some(region) = &region {
-            config_loader = config_loader.region(aws_config::Region::new(region.clone()));
-        }
-
-        let sdk_config = config_loader.load().await;
-
-        // Build S3 client, optionally with endpoint override. Pin the transport
-        // to HTTP/1.1 so GCS-backed tables (S3-interop endpoint) can be read via
-        // this same SDK path — see `http1_only_http_client`.
-        let mut s3_config = aws_sdk_s3::config::Builder::from(&sdk_config)
-            .http_client(http1_only_http_client())
-            // Range reads (Parquet footer + column chunks) can't be validated
-            // against an object-level checksum: the checksum covers the whole
-            // object, not the returned byte range. GCS returns such a checksum on
-            // every response, so the SDK's default `WhenSupported` validation
-            // fails every ranged GET with a body-checksum mismatch. Only validate
-            // when the operation explicitly requires it (never, for range GETs).
-            .response_checksum_validation(
-                aws_sdk_s3::config::ResponseChecksumValidation::WhenRequired,
-            );
-
-        if let Some(endpoint) = &endpoint {
-            // SSRF: reject a metadata/link-local endpoint (loopback/private are
-            // allowed here for MinIO / LocalStack).
-            crate::net::validate_s3_endpoint(endpoint)?;
-            s3_config = s3_config.endpoint_url(endpoint);
-        }
-
-        if path_style {
-            s3_config = s3_config.force_path_style(true);
-        }
-
-        let client = aws_sdk_s3::Client::from_conf(s3_config.build());
-
-        Ok(Self {
-            client,
-            credentials_expiry: creds.expires_at,
-            max_concurrent_reads: 4, // Default bounded concurrency
-        })
+    /// S3 storage over vended credentials that renew themselves: every request
+    /// signs with `renewing`'s current keys, which re-vends from the catalog
+    /// inside a margin before they expire, so a scan that outlives one set of
+    /// keys keeps reading. `initial` is the set `renewing` was built with; its
+    /// region, endpoint and path-style resolve as in
+    /// [`Self::from_vended_credentials`].
+    pub async fn from_renewing_vended(
+        renewing: std::sync::Arc<crate::credential::RenewingVendedCredentials>,
+        initial: &crate::credential::S3Credentials,
+        region_override: Option<&str>,
+        endpoint_override: Option<&str>,
+        path_style_override: bool,
+    ) -> Result<Self> {
+        let (region, endpoint, path_style) = Self::resolve_io(
+            initial,
+            region_override,
+            endpoint_override,
+            path_style_override,
+        );
+        // The key only labels the resolver's cache entry; the renewing holder
+        // serves one table.
+        let provider = crate::credential::VendedAwsCredentialProvider::new(
+            crate::credential::CredentialCacheKey::for_read("vended", "table"),
+            renewing,
+        );
+        Self::build(
+            Some(aws_credential_types::provider::SharedCredentialsProvider::new(provider)),
+            region.as_deref(),
+            endpoint.as_deref(),
+            path_style,
+            None,
+        )
+        .await
     }
 
     /// Create S3 storage using the default AWS credential chain.
@@ -361,15 +392,40 @@ impl S3IcebergStorage {
     /// 2. Shared credentials file (~/.aws/credentials)
     /// 3. IAM role for EC2/ECS/Lambda
     ///
-    /// Use this when vended credentials are not available from the catalog.
+    /// **Not for graph-source reads.** The host's own identity is an operator
+    /// decision ([`crate::host_identity::HostIdentityPolicy`]), applied by
+    /// `fluree_db_api::Fluree::graph_source_storage`, which decides a source's
+    /// storage identity from its configuration and builds the store. A store
+    /// built here bypasses that decision.
+    #[doc(hidden)]
+    #[deprecated(
+        note = "build graph-source storage with `Fluree::graph_source_storage`, which applies \
+                the instance's host-identity policy"
+    )]
     pub async fn from_default_chain(
         region: Option<&str>,
         endpoint: Option<&str>,
         path_style: bool,
     ) -> Result<Self> {
-        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        Self::build(None, region, endpoint, path_style, None).await
+    }
 
-        // Set region if provided, otherwise use SDK default resolution
+    /// The one S3 client build behind every constructor: `credentials` (or the
+    /// AWS SDK default chain when `None`), the HTTP/1.1-pinned transport, and
+    /// the endpoint, which also decides whether `gs://` paths are served.
+    async fn build(
+        credentials: Option<aws_credential_types::provider::SharedCredentialsProvider>,
+        region: Option<&str>,
+        endpoint: Option<&str>,
+        path_style: bool,
+        credentials_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<Self> {
+        let mut config_loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
+        if let Some(credentials) = credentials {
+            config_loader = config_loader.credentials_provider(credentials);
+        }
+
+        // Set region only when resolved; leaving it None preserves SDK default resolution.
         if let Some(r) = region {
             config_loader = config_loader.region(aws_config::Region::new(r.to_string()));
         }
@@ -406,9 +462,23 @@ impl S3IcebergStorage {
 
         Ok(Self {
             client,
-            credentials_expiry: None, // Ambient creds don't have explicit expiry
+            credentials_expiry,
             max_concurrent_reads: 4,
+            serves_gs: endpoint.is_some_and(crate::io::location::is_gcs_interop_endpoint),
+            buckets: None,
+            endpoint: endpoint.map(str::to_string),
         })
+    }
+
+    /// Restrict reads to `buckets` (the operator's ambient-AWS allowlist; `None`
+    /// leaves every bucket readable). A read of any other bucket is refused
+    /// with [`IcebergError::AmbientBucketRefused`] before a request is made,
+    /// and so is every read when this client has an endpoint override
+    /// ([`IcebergError::AmbientEndpointRefused`]): the endpoint, not the path,
+    /// would decide the bucket.
+    pub fn with_bucket_allowlist(mut self, buckets: Option<Vec<String>>) -> Self {
+        self.buckets = buckets.map(std::sync::Arc::from);
+        self
     }
 
     /// Create with custom concurrency limit.
@@ -468,8 +538,51 @@ impl S3IcebergStorage {
         Ok((bucket, key))
     }
 
+    /// The `(bucket, key)` this client reads `path` at, or a refusal: a scheme
+    /// this client does not serve (`gs://` without the GCS interop endpoint, or
+    /// anything not an object URI) is [`IcebergError::SchemeNotServed`], and a
+    /// bucket outside its allowlist [`IcebergError::AmbientBucketRefused`].
+    /// Every read goes through here.
+    pub(crate) fn locate<'a>(&self, path: &'a str) -> Result<(&'a str, &'a str)> {
+        let rest = path
+            .strip_prefix("s3://")
+            .or_else(|| path.strip_prefix("s3a://"))
+            .or_else(|| path.strip_prefix("gs://").filter(|_| self.serves_gs))
+            .ok_or_else(|| {
+                crate::io::location::scheme_not_served(
+                    path,
+                    "AWS S3",
+                    if self.serves_gs {
+                        "s3://, s3a:// and gs:// (through the GCS interop endpoint)"
+                    } else {
+                        "s3:// and s3a://"
+                    },
+                )
+            })?;
+        let (bucket, key) = crate::io::location::split_bucket_key(path, rest)?;
+        if let (Some(_), Some(endpoint)) = (&self.buckets, &self.endpoint) {
+            return Err(IcebergError::AmbientEndpointRefused {
+                endpoint: endpoint.clone(),
+            });
+        }
+        if let Some(buckets) = &self.buckets {
+            if !buckets.iter().any(|allowed| allowed == bucket) {
+                return Err(IcebergError::AmbientBucketRefused {
+                    bucket: bucket.to_string(),
+                });
+            }
+        }
+        Ok((bucket, key))
+    }
+
     /// Read a byte range from S3.
-    async fn get_object_range(&self, bucket: &str, key: &str, range: Range<u64>) -> Result<Bytes> {
+    async fn get_object_range(
+        &self,
+        scheme: &'static str,
+        bucket: &str,
+        key: &str,
+        range: Range<u64>,
+    ) -> Result<Bytes> {
         let range_header = format!("bytes={}-{}", range.start, range.end.saturating_sub(1));
 
         let response = self
@@ -484,6 +597,7 @@ impl S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "GetObject",
+                    scheme,
                     bucket,
                     key,
                     self.configured_region(),
@@ -516,12 +630,13 @@ impl S3IcebergStorage {
         use std::sync::Arc;
         use tokio::sync::Semaphore;
 
-        let (bucket, key) = Self::parse_s3_uri(path)?;
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
 
         if !parallel_range_gets_enabled() {
             let mut out = Vec::with_capacity(ranges.len());
             for range in ranges {
-                out.push(self.get_object_range(bucket, key, range).await?);
+                out.push(self.get_object_range(scheme, bucket, key, range).await?);
             }
             return Ok(out);
         }
@@ -537,7 +652,7 @@ impl S3IcebergStorage {
                         .acquire()
                         .await
                         .map_err(|_| IcebergError::storage("Semaphore closed"))?;
-                    self.get_object_range(&bucket, &key, range).await
+                    self.get_object_range(scheme, &bucket, &key, range).await
                 }
             })
             // `buffered` (not `buffer_unordered`) yields IN INPUT ORDER, so the
@@ -554,7 +669,7 @@ impl S3IcebergStorage {
 /// When off, `read_ranges_bounded` reads the coalesced ranges sequentially —
 /// byte-identical to the pre-item-12 loop. Read once (process-wide).
 #[cfg(feature = "aws")]
-fn parallel_range_gets_enabled() -> bool {
+pub(crate) fn parallel_range_gets_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(
         || match std::env::var("FLUREE_ICEBERG_PARALLEL_RANGE_GETS") {
@@ -568,164 +683,29 @@ fn parallel_range_gets_enabled() -> bool {
 }
 
 #[cfg(feature = "aws")]
-#[async_trait(?Send)]
-impl IcebergStorage for S3IcebergStorage {
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        let (bucket, key) = Self::parse_s3_uri(path)?;
-
-        let response = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                use aws_sdk_s3::error::ProvideErrorMetadata;
-                s3_read_error(
-                    "GetObject",
-                    bucket,
-                    key,
-                    self.configured_region(),
-                    e.code(),
-                    e.raw_response().map(|r| r.status().as_u16()),
-                    error_chain(&e),
-                )
-            })?;
-
-        let body = response.body.collect().await.map_err(|e| {
-            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
-        })?;
-
-        Ok(body.into_bytes())
-    }
-
-    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
-        let (bucket, key) = Self::parse_s3_uri(path)?;
-        self.get_object_range(bucket, key, range).await
-    }
-
-    async fn file_size(&self, path: &str) -> Result<u64> {
-        let (bucket, key) = Self::parse_s3_uri(path)?;
-
-        let response = self
-            .client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                use aws_sdk_s3::error::ProvideErrorMetadata;
-                s3_read_error(
-                    "HeadObject",
-                    bucket,
-                    key,
-                    self.configured_region(),
-                    e.code(),
-                    e.raw_response().map(|r| r.status().as_u16()),
-                    error_chain(&e),
-                )
-            })?;
-
-        response
-            .content_length()
-            .map(|l| l as u64)
-            .ok_or_else(|| IcebergError::storage("No content-length in HEAD response"))
-    }
-
-    /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
-    /// [`S3IcebergStorage::read_ranges_bounded`], which honors the
-    /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
-    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
-        self.read_ranges_bounded(path, ranges).await
-    }
-}
-
-#[cfg(feature = "aws")]
-#[async_trait]
-impl SendIcebergStorage for S3IcebergStorage {
-    async fn read(&self, path: &str) -> Result<Bytes> {
-        let (bucket, key) = Self::parse_s3_uri(path)?;
-
-        let response = self
-            .client
-            .get_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                use aws_sdk_s3::error::ProvideErrorMetadata;
-                s3_read_error(
-                    "GetObject",
-                    bucket,
-                    key,
-                    self.configured_region(),
-                    e.code(),
-                    e.raw_response().map(|r| r.status().as_u16()),
-                    error_chain(&e),
-                )
-            })?;
-
-        let body = response.body.collect().await.map_err(|e| {
-            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
-        })?;
-
-        Ok(body.into_bytes())
-    }
-
-    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
-        let (bucket, key) = Self::parse_s3_uri(path)?;
-        self.get_object_range(bucket, key, range).await
-    }
-
-    async fn file_size(&self, path: &str) -> Result<u64> {
-        let (bucket, key) = Self::parse_s3_uri(path)?;
-
-        let response = self
-            .client
-            .head_object()
-            .bucket(bucket)
-            .key(key)
-            .send()
-            .await
-            .map_err(|e| {
-                use aws_sdk_s3::error::ProvideErrorMetadata;
-                s3_read_error(
-                    "HeadObject",
-                    bucket,
-                    key,
-                    self.configured_region(),
-                    e.code(),
-                    e.raw_response().map(|r| r.status().as_u16()),
-                    error_chain(&e),
-                )
-            })?;
-
-        response
-            .content_length()
-            .map(|l| l as u64)
-            .ok_or_else(|| IcebergError::storage("No content-length in HEAD response"))
-    }
-
-    /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
-    /// [`S3IcebergStorage::read_ranges_bounded`], which honors the
-    /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
-    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
-        self.read_ranges_bounded(path, ranges).await
-    }
-
-    /// One `ListObjectsV2` with a `/` delimiter → the immediate child directory
-    /// names under `prefix` (from the response's common prefixes), paginated.
-    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
-        let (bucket, key) = Self::parse_s3_uri(prefix)?;
+impl S3IcebergStorage {
+    /// `ListObjectsV2` with a `/` delimiter, paginated → the immediate children
+    /// of `prefix` as `(directory names, file names)`: the response's common
+    /// prefixes and its object keys, each reduced to the child segment.
+    async fn list_children(&self, prefix: &str) -> Result<(Vec<String>, Vec<String>)> {
+        // A bare bucket (`s3://bucket`) lists its top level.
+        let bucket_root;
+        let prefix = match prefix.split_once("://") {
+            Some((_, rest)) if !rest.is_empty() && !rest.contains('/') => {
+                bucket_root = format!("{prefix}/");
+                bucket_root.as_str()
+            }
+            _ => prefix,
+        };
+        let (bucket, key) = self.locate(prefix)?;
+        let scheme = scheme_of(prefix);
         let list_prefix = if key.is_empty() || key.ends_with('/') {
             key.to_string()
         } else {
             format!("{key}/")
         };
-        let mut names = Vec::new();
+        let mut dirs = Vec::new();
+        let mut files = Vec::new();
         let mut continuation: Option<String> = None;
         loop {
             let mut req = self
@@ -741,6 +721,7 @@ impl SendIcebergStorage for S3IcebergStorage {
                 use aws_sdk_s3::error::ProvideErrorMetadata;
                 s3_read_error(
                     "ListObjectsV2",
+                    scheme,
                     bucket,
                     &list_prefix,
                     self.configured_region(),
@@ -756,7 +737,16 @@ impl SendIcebergStorage for S3IcebergStorage {
                         .unwrap_or(p)
                         .trim_end_matches('/');
                     if !child.is_empty() {
-                        names.push(child.to_string());
+                        dirs.push(child.to_string());
+                    }
+                }
+            }
+            for object in response.contents() {
+                if let Some(k) = object.key() {
+                    let child = k.strip_prefix(&list_prefix).unwrap_or(k);
+                    // A zero-byte `prefix/` placeholder object lists as itself.
+                    if !child.is_empty() {
+                        files.push(child.to_string());
                     }
                 }
             }
@@ -768,7 +758,179 @@ impl SendIcebergStorage for S3IcebergStorage {
             }
             break;
         }
-        Ok(names)
+        Ok((dirs, files))
+    }
+}
+
+#[cfg(feature = "aws")]
+#[async_trait(?Send)]
+impl IcebergStorage for S3IcebergStorage {
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "GetObject",
+                    scheme,
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+
+        let body = response.body.collect().await.map_err(|e| {
+            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
+        })?;
+
+        Ok(body.into_bytes())
+    }
+
+    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
+        self.get_object_range(scheme, bucket, key, range).await
+    }
+
+    async fn file_size(&self, path: &str) -> Result<u64> {
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
+
+        let response = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "HeadObject",
+                    scheme,
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+
+        response
+            .content_length()
+            .map(|l| l as u64)
+            .ok_or_else(|| IcebergError::storage("No content-length in HEAD response"))
+    }
+
+    /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
+    /// `S3IcebergStorage::read_ranges_bounded`, which honors the
+    /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        self.read_ranges_bounded(path, ranges).await
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_children(prefix).await?.1)
+    }
+}
+
+#[cfg(feature = "aws")]
+#[async_trait]
+impl SendIcebergStorage for S3IcebergStorage {
+    async fn read(&self, path: &str) -> Result<Bytes> {
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
+
+        let response = self
+            .client
+            .get_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "GetObject",
+                    scheme,
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+
+        let body = response.body.collect().await.map_err(|e| {
+            IcebergError::storage(format!("Failed to read S3 body: {}", error_chain(&e)))
+        })?;
+
+        Ok(body.into_bytes())
+    }
+
+    async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
+        self.get_object_range(scheme, bucket, key, range).await
+    }
+
+    async fn file_size(&self, path: &str) -> Result<u64> {
+        let (bucket, key) = self.locate(path)?;
+        let scheme = scheme_of(path);
+
+        let response = self
+            .client
+            .head_object()
+            .bucket(bucket)
+            .key(key)
+            .send()
+            .await
+            .map_err(|e| {
+                use aws_sdk_s3::error::ProvideErrorMetadata;
+                s3_read_error(
+                    "HeadObject",
+                    scheme,
+                    bucket,
+                    key,
+                    self.configured_region(),
+                    e.code(),
+                    e.raw_response().map(|r| r.status().as_u16()),
+                    error_chain(&e),
+                )
+            })?;
+
+        response
+            .content_length()
+            .map(|l| l as u64)
+            .ok_or_else(|| IcebergError::storage("No content-length in HEAD response"))
+    }
+
+    /// Item 12 (B1-AppD): concurrent, ORDER-PRESERVING range GETs (delegates to
+    /// `S3IcebergStorage::read_ranges_bounded`, which honors the
+    /// `FLUREE_ICEBERG_PARALLEL_RANGE_GETS` switch).
+    async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
+        self.read_ranges_bounded(path, ranges).await
+    }
+
+    async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_children(prefix).await?.0)
+    }
+
+    async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
+        Ok(self.list_children(prefix).await?.1)
     }
 }
 
@@ -907,14 +1069,18 @@ impl<S: IcebergStorage> IcebergStorage for RangeOnlyStorage<S> {
 /// The scan surface (`SendScanPlanner`, `SendParquetReader`, the provider's
 /// session caches) is generic over `S: SendIcebergStorage + Clone` and the
 /// provider threads ONE storage type through all of them — this enum is that
-/// type, chosen per table location (`s3://`/`gs://` → S3, `file://`/absolute
-/// path → local filesystem). An enum rather than `Arc<dyn ...>` to keep the
-/// call sites concrete (workspace convention) and `Clone` trivially satisfied.
+/// type, chosen by the source's storage identity (S3 for AWS and vended S3
+/// keys, GCS for a Google identity or a vended GCS token, the local filesystem
+/// for a `file://`/absolute-path table). An enum rather than `Arc<dyn ...>` to
+/// keep the call sites concrete (workspace convention) and `Clone` trivially
+/// satisfied. Each backend refuses a path outside the schemes it serves.
 #[cfg(feature = "aws")]
 #[derive(Clone, Debug)]
 pub enum IcebergStorageBackend {
     /// Object-store reads (S3 / S3-compatible / GCS interop).
     S3(S3IcebergStorage),
+    /// Google Cloud Storage reads with a Google identity or vended token.
+    Gcs(crate::io::gcs::GcsIcebergStorage),
     /// Local-filesystem reads (catalog-less local tables).
     File(crate::io::file_storage::FileIcebergStorage),
 }
@@ -925,6 +1091,7 @@ impl SendIcebergStorage for IcebergStorageBackend {
     async fn read(&self, path: &str) -> Result<Bytes> {
         match self {
             Self::S3(s) => SendIcebergStorage::read(s, path).await,
+            Self::Gcs(g) => SendIcebergStorage::read(g, path).await,
             Self::File(f) => SendIcebergStorage::read(f, path).await,
         }
     }
@@ -932,6 +1099,7 @@ impl SendIcebergStorage for IcebergStorageBackend {
     async fn read_range(&self, path: &str, range: Range<u64>) -> Result<Bytes> {
         match self {
             Self::S3(s) => SendIcebergStorage::read_range(s, path, range).await,
+            Self::Gcs(g) => SendIcebergStorage::read_range(g, path, range).await,
             Self::File(f) => SendIcebergStorage::read_range(f, path, range).await,
         }
     }
@@ -939,6 +1107,7 @@ impl SendIcebergStorage for IcebergStorageBackend {
     async fn file_size(&self, path: &str) -> Result<u64> {
         match self {
             Self::S3(s) => SendIcebergStorage::file_size(s, path).await,
+            Self::Gcs(g) => SendIcebergStorage::file_size(g, path).await,
             Self::File(f) => SendIcebergStorage::file_size(f, path).await,
         }
     }
@@ -946,6 +1115,7 @@ impl SendIcebergStorage for IcebergStorageBackend {
     async fn read_ranges(&self, path: &str, ranges: Vec<Range<u64>>) -> Result<Vec<Bytes>> {
         match self {
             Self::S3(s) => SendIcebergStorage::read_ranges(s, path, ranges).await,
+            Self::Gcs(g) => SendIcebergStorage::read_ranges(g, path, ranges).await,
             Self::File(f) => SendIcebergStorage::read_ranges(f, path, ranges).await,
         }
     }
@@ -953,6 +1123,7 @@ impl SendIcebergStorage for IcebergStorageBackend {
     async fn list_dir(&self, prefix: &str) -> Result<Vec<String>> {
         match self {
             Self::S3(s) => SendIcebergStorage::list_dir(s, prefix).await,
+            Self::Gcs(g) => SendIcebergStorage::list_dir(g, prefix).await,
             Self::File(f) => SendIcebergStorage::list_dir(f, prefix).await,
         }
     }
@@ -960,6 +1131,7 @@ impl SendIcebergStorage for IcebergStorageBackend {
     async fn list_files(&self, prefix: &str) -> Result<Vec<String>> {
         match self {
             Self::S3(s) => SendIcebergStorage::list_files(s, prefix).await,
+            Self::Gcs(g) => SendIcebergStorage::list_files(g, prefix).await,
             Self::File(f) => SendIcebergStorage::list_files(f, prefix).await,
         }
     }
@@ -1029,8 +1201,8 @@ mod tests {
     }
 
     #[cfg(feature = "aws")]
-    fn vended_creds(region: Option<&str>) -> crate::credential::VendedCredentials {
-        crate::credential::VendedCredentials {
+    fn vended_creds(region: Option<&str>) -> crate::credential::S3Credentials {
+        crate::credential::S3Credentials {
             access_key_id: "AKIATEST".to_string(),
             secret_access_key: "secret123".to_string(),
             session_token: Some("session456".to_string()),
@@ -1131,6 +1303,166 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn an_s3_client_reads_only_the_schemes_its_endpoint_serves() {
+        let aws = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(aws.locate("s3://b/k").unwrap(), ("b", "k"));
+        assert_eq!(aws.locate("s3a://b/k").unwrap(), ("b", "k"));
+        // Without the GCS interop endpoint, `gs://b/k` is not `s3://b/k` on AWS.
+        for path in ["gs://b/k", "file:///t/k", "/t/k", "abfss://c@a/k"] {
+            assert!(
+                matches!(aws.locate(path), Err(IcebergError::SchemeNotServed { .. })),
+                "{path}"
+            );
+        }
+        let interop = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("auto")),
+            None,
+            Some("https://storage.googleapis.com"),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(interop.locate("gs://b/k").unwrap(), ("b", "k"));
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn an_allowlisted_client_reads_only_the_allowed_buckets() {
+        let base = || async {
+            S3IcebergStorage::from_vended_credentials(
+                &vended_creds(Some("us-east-1")),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap()
+        };
+        let allowed = base()
+            .await
+            .with_bucket_allowlist(Some(vec!["lake".to_string()]));
+        assert!(allowed.locate("s3://lake/k").is_ok());
+        match allowed.locate("s3://lakehouse/k") {
+            Err(IcebergError::AmbientBucketRefused { bucket }) => assert_eq!(bucket, "lakehouse"),
+            other => panic!("expected AmbientBucketRefused, got {other:?}"),
+        }
+        let none = base().await.with_bucket_allowlist(Some(Vec::new()));
+        assert!(none.locate("s3://lake/k").is_err());
+        assert!(base()
+            .await
+            .with_bucket_allowlist(None)
+            .locate("s3://any/k")
+            .is_ok());
+        let message = IcebergError::AmbientBucketRefused {
+            bucket: "b".to_string(),
+        }
+        .to_string();
+        assert!(
+            message.contains(crate::host_identity::AMBIENT_BUCKETS_ENV),
+            "{message}"
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn an_allowlisted_client_with_an_endpoint_override_reads_nothing() {
+        // `s3://lake/k` path-style against a virtual-hosted endpoint reads
+        // `secret-bucket/lake/k`: the endpoint decides the bucket.
+        let endpointed = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            Some("https://secret-bucket.s3.us-east-1.amazonaws.com"),
+            true,
+        )
+        .await
+        .unwrap();
+        let allowlisted = endpointed
+            .clone()
+            .with_bucket_allowlist(Some(vec!["lake".to_string()]));
+        match allowlisted.locate("s3://lake/k") {
+            Err(IcebergError::AmbientEndpointRefused { endpoint }) => {
+                assert_eq!(endpoint, "https://secret-bucket.s3.us-east-1.amazonaws.com");
+            }
+            other => panic!("expected AmbientEndpointRefused, got {other:?}"),
+        }
+        let message = allowlisted.locate("s3://lake/k").unwrap_err().to_string();
+        assert!(
+            message.contains(crate::host_identity::AMBIENT_BUCKETS_ENV),
+            "{message}"
+        );
+        // Without an allowlist the endpoint is the operator's to use.
+        assert!(endpointed.locate("s3://lake/k").is_ok());
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn renewing_vended_s3_keys_keep_a_long_scan_reading_across_their_expiry() {
+        use crate::credential::{
+            RenewingVendedCredentials, VendedCredentialSource, VendedCredentials,
+        };
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        #[derive(Debug)]
+        struct Revend;
+        #[async_trait]
+        impl VendedCredentialSource for Revend {
+            async fn revend(&self) -> Result<VendedCredentials> {
+                let mut fresh = vended_creds(Some("us-east-1"));
+                fresh.access_key_id = "AKIASECOND".to_string();
+                fresh.expires_at = Some(chrono::Utc::now() + chrono::Duration::hours(1));
+                Ok(VendedCredentials::S3(fresh))
+            }
+        }
+
+        let s3 = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/lake/ns/t/data/f.parquet"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"0123456789".to_vec()))
+            .mount(&s3)
+            .await;
+        let mut initial = vended_creds(Some("us-east-1"));
+        initial.access_key_id = "AKIAFIRST".to_string();
+        initial.expires_at = Some(chrono::Utc::now() + chrono::Duration::milliseconds(4_000));
+        let renewing = std::sync::Arc::new(
+            RenewingVendedCredentials::new(
+                VendedCredentials::S3(initial.clone()),
+                Some(std::sync::Arc::new(Revend)),
+            )
+            .with_margin(std::time::Duration::from_millis(2_000)),
+        );
+        let storage =
+            S3IcebergStorage::from_renewing_vended(renewing, &initial, None, Some(&s3.uri()), true)
+                .await
+                .unwrap();
+        let file = "s3://lake/ns/t/data/f.parquet";
+        SendIcebergStorage::read(&storage, file).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(2_300)).await;
+        SendIcebergStorage::read(&storage, file).await.unwrap();
+
+        let signed_with: Vec<String> = s3
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter_map(|r| {
+                let auth = r.headers.get("authorization")?.to_str().ok()?;
+                let credential = auth.split("Credential=").nth(1)?;
+                Some(credential.split('/').next()?.to_string())
+            })
+            .collect();
+        assert_eq!(signed_with, vec!["AKIAFIRST", "AKIASECOND"]);
+    }
+
+    #[tokio::test]
     async fn test_memory_storage() {
         let mut storage = MemoryStorage::new();
         storage.add_file("test.txt", "Hello, World!");
@@ -1217,6 +1549,7 @@ mod tests {
     fn s3_read_error_maps_denied_to_structured_variant() {
         let err = s3_read_error(
             "GetObject",
+            "s3",
             "my-bucket",
             "path/to/data.parquet",
             Some("us-east-2".to_string()),
@@ -1226,11 +1559,13 @@ mod tests {
         );
         match err {
             IcebergError::StorageAccessDenied {
+                scheme,
                 bucket,
                 key,
                 region,
                 message,
             } => {
+                assert_eq!(scheme, "s3");
                 assert_eq!(bucket, "my-bucket");
                 assert_eq!(key, "path/to/data.parquet");
                 assert_eq!(region.as_deref(), Some("us-east-2"));
@@ -1242,21 +1577,38 @@ mod tests {
         // Display is actionable: names the object, the region, and the
         // ListBucket caveat (no-permission OR object-moved).
         let shown = IcebergError::StorageAccessDenied {
+            scheme: "s3",
             bucket: "b".into(),
             key: "k".into(),
             region: Some("us-west-1".into()),
             message: "svc".into(),
         }
         .to_string();
+        assert!(shown.starts_with("Storage access denied"), "shown: {shown}");
         assert!(shown.contains("s3://b/k"), "shown: {shown}");
         assert!(shown.contains("region us-west-1"), "shown: {shown}");
         assert!(shown.contains("s3:ListBucket"), "shown: {shown}");
+
+        // A GCS object is named by its own scheme, with GCS's own hint.
+        let gcs = IcebergError::StorageAccessDenied {
+            scheme: "gs",
+            bucket: "lake".into(),
+            key: "d/f.parquet".into(),
+            region: None,
+            message: "403".into(),
+        }
+        .to_string();
+        assert!(gcs.starts_with("Storage access denied"), "shown: {gcs}");
+        assert!(gcs.contains("gs://lake/d/f.parquet"), "shown: {gcs}");
+        assert!(!gcs.contains("s3://"), "shown: {gcs}");
+        assert!(gcs.contains("storage.objects.get"), "shown: {gcs}");
     }
 
     #[test]
     fn s3_read_error_preserves_legacy_message_for_non_denied() {
         let err = s3_read_error(
             "HeadObject",
+            "s3",
             "b",
             "k",
             None,
@@ -1268,6 +1620,145 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Storage error: S3 HeadObject failed: chain"
+        );
+    }
+
+    /// One delimited `ListObjectsV2` yields both listings: common prefixes are
+    /// the child directories, object keys the child files. The file listing is
+    /// A listing longer than one page is read to its end. `v10` sorts below
+    /// `v9` and arrives on the second page, so a listing that stopped at the
+    /// first would resolve a stale metadata file.
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn s3_lists_every_page_of_a_prefix() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let contents: String = (1..=9)
+            .map(|v| format!("<Contents><Key>wh/t/metadata/v{v}.metadata.json</Key><Size>1</Size></Contents>"))
+            .collect();
+        let first = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>wh/t/metadata/</Prefix><Delimiter>/</Delimiter>
+  <KeyCount>9</KeyCount><MaxKeys>9</MaxKeys><IsTruncated>true</IsTruncated>
+  <NextContinuationToken>page-2</NextContinuationToken>
+  {contents}
+</ListBucketResult>"#
+        );
+        let second = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>wh/t/metadata/</Prefix><Delimiter>/</Delimiter>
+  <KeyCount>1</KeyCount><MaxKeys>9</MaxKeys><IsTruncated>false</IsTruncated>
+  <ContinuationToken>page-2</ContinuationToken>
+  <Contents><Key>wh/t/metadata/v10.metadata.json</Key><Size>1</Size></Contents>
+</ListBucketResult>"#;
+        Mock::given(method("GET"))
+            .and(path("/b/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("continuation-token", "page-2"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(second, "application/xml"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/b/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "wh/t/metadata/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(first, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let storage = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            Some(&server.uri()),
+            true,
+        )
+        .await
+        .unwrap();
+        let files = SendIcebergStorage::list_files(&storage, "s3://b/wh/t/metadata")
+            .await
+            .unwrap();
+        assert_eq!(files.len(), 10, "{files:?}");
+        assert!(files.iter().any(|f| f == "v10.metadata.json"), "{files:?}");
+    }
+
+    /// what resolves a table with no `version-hint.text`.
+    #[tokio::test]
+    #[cfg(feature = "aws")]
+    async fn s3_lists_the_child_files_and_directories_of_a_prefix() {
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>b</Name><Prefix>wh/t/metadata/</Prefix><Delimiter>/</Delimiter>
+  <KeyCount>4</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
+  <Contents><Key>wh/t/metadata/</Key><Size>0</Size></Contents>
+  <Contents><Key>wh/t/metadata/00001-aaaa.metadata.json</Key><Size>1</Size></Contents>
+  <Contents><Key>wh/t/metadata/00002-bbbb.metadata.json</Key><Size>1</Size></Contents>
+  <CommonPrefixes><Prefix>wh/t/metadata/stats/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        Mock::given(method("GET"))
+            .and(path("/b/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("prefix", "wh/t/metadata/"))
+            .and(query_param("delimiter", "/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/xml"))
+            .mount(&server)
+            .await;
+
+        let storage = S3IcebergStorage::from_vended_credentials(
+            &vended_creds(Some("us-east-1")),
+            None,
+            Some(&server.uri()),
+            true,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            SendIcebergStorage::list_files(&storage, "s3://b/wh/t/metadata")
+                .await
+                .unwrap(),
+            ["00001-aaaa.metadata.json", "00002-bbbb.metadata.json"]
+        );
+        assert_eq!(
+            IcebergStorage::list_files(&storage, "s3://b/wh/t/metadata")
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            SendIcebergStorage::list_dir(&storage, "s3://b/wh/t/metadata")
+                .await
+                .unwrap(),
+            ["stats"]
+        );
+
+        // A bare bucket lists its top level.
+        let body = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>c</Name><Prefix></Prefix><Delimiter>/</Delimiter>
+  <KeyCount>2</KeyCount><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>
+  <CommonPrefixes><Prefix>orders/</Prefix></CommonPrefixes>
+  <CommonPrefixes><Prefix>people/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        Mock::given(method("GET"))
+            .and(path("/c/"))
+            .and(query_param("list-type", "2"))
+            .and(query_param("delimiter", "/"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(body, "application/xml"))
+            .mount(&server)
+            .await;
+        assert_eq!(
+            SendIcebergStorage::list_dir(&storage, "s3://c")
+                .await
+                .unwrap(),
+            ["orders", "people"]
         );
     }
 }

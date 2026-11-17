@@ -22,6 +22,7 @@ use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
+use crate::exists::any_solution;
 use crate::ir::triple::Ref;
 use crate::ir::{Expression, FlakeValue, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -45,72 +46,23 @@ use fluree_db_core::Sid;
 ///
 /// Returns `None` if no rows pass the filter.
 pub fn filter_batch(
-    batch: &Batch,
+    batch: Batch,
     expr: &PreparedBoolExpression,
-    schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Option<Batch>> {
-    let mut keep_indices: Vec<usize> = Vec::new();
-    for row_idx in 0..batch.len() {
-        let Some(row) = batch.row_view(row_idx) else {
-            continue;
-        };
-        if expr.eval_to_bool_non_strict(&row, Some(ctx))? {
-            keep_indices.push(row_idx);
-        }
+    let mut keep = Vec::with_capacity(batch.len());
+    for row in batch.rows() {
+        keep.push(expr.eval_to_bool_non_strict(&row, Some(ctx))?);
     }
-
-    if keep_indices.is_empty() {
-        return Ok(None);
-    }
-
-    // A zero-column batch (e.g. the unit solution from `ASK { FILTER(true) }`)
-    // carries its row count explicitly — `Batch::new` would infer len = 0 from
-    // the absent first column and silently drop the surviving rows (#1439).
-    if schema.is_empty() {
-        return Ok(Some(Batch::empty_schema_with_len(keep_indices.len())));
-    }
-
-    let columns: Vec<Vec<Binding>> = (0..schema.len())
-        .map(|col_idx| {
-            let src_col = batch
-                .column_by_idx(col_idx)
-                .expect("batch schema must match operator schema");
-            keep_indices
-                .iter()
-                .map(|&row_idx| src_col[row_idx].clone())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema.clone(), columns)?))
+    Ok(batch.filter_rows(&keep))
 }
 
-/// Check if an expression tree contains any `Expression::Exists` nodes.
+/// Whether the expression embeds a pattern list — EXISTS, NOT EXISTS or a
+/// pattern comprehension — which is resolved asynchronously per row.
 pub fn contains_exists(expr: &Expression) -> bool {
-    match expr {
-        Expression::Exists { .. } => true,
-        Expression::Call { args, .. } => args.iter().any(contains_exists),
-        Expression::Map(entries) => entries.iter().any(|(_, v)| contains_exists(v)),
-        Expression::ListComprehension {
-            list, filter, map, ..
-        } => {
-            contains_exists(list)
-                || filter.as_deref().is_some_and(contains_exists)
-                || map.as_deref().is_some_and(contains_exists)
-        }
-        Expression::Reduce {
-            init, list, body, ..
-        } => contains_exists(init) || contains_exists(list) || contains_exists(body),
-        Expression::ListPredicate {
-            list, predicate, ..
-        } => contains_exists(list) || contains_exists(predicate),
-        Expression::Member { target, .. } => contains_exists(target),
-        // A pattern comprehension is an async subquery resolved on the same
-        // per-row path as EXISTS, so it must trip this gate too.
-        Expression::PatternComprehension { .. } => true,
-        Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => false,
-    }
+    let mut found = false;
+    expr.for_each_embedded_patterns(&mut |_| found = true);
+    found
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -293,59 +245,36 @@ fn is_uncorrelated_exists(patterns: &[Pattern], batch_schema: &[VarId]) -> bool 
     pattern_vars.is_disjoint(&schema_vars)
 }
 
-/// Evaluate an EXISTS subquery once (uncorrelated) using an empty seed.
-async fn eval_exists_uncorrelated(
-    patterns: &[Pattern],
-    negated: bool,
-    ctx: &ExecutionContext<'_>,
-    planning: &crate::temporal_mode::PlanningContext,
-) -> Result<bool> {
-    #[expect(clippy::box_default)]
-    let seed: BoxedOperator = Box::new(EmptyOperator::new());
-    let mut exists_op = build_where_operators_seeded(Some(seed), patterns, None, None, planning)?;
-
-    exists_op.open(ctx).await?;
-
-    let has_match = loop {
-        match exists_op.next_batch(ctx).await? {
-            Some(b) if !b.is_empty() => break true,
-            Some(_) => continue,
-            None => break false,
-        }
-    };
-
-    exists_op.close();
-    Ok(if negated { !has_match } else { has_match })
-}
-
-/// Evaluate an EXISTS subquery for a given row (correlated).
+/// The seed an `EXISTS` body or a pattern comprehension correlates with: the
+/// row's bindings, except that a per-group list (`Binding::Grouped`) seeds as
+/// unbound. A list is not a term the pattern can match, and the group row does
+/// not bind that variable to one value, so it is free in the pattern, as any
+/// variable the grouping does not produce is ([`Expression::row_reads`]).
 ///
-/// Seeds the subquery with the current row's bindings and checks if any
-/// result is produced.
-async fn eval_exists_for_row(
-    patterns: &[Pattern],
-    negated: bool,
-    batch: &Batch,
-    row_idx: usize,
-    ctx: &ExecutionContext<'_>,
-    planning: &crate::temporal_mode::PlanningContext,
-) -> Result<bool> {
-    let seed = SeedOperator::from_batch_row(batch, row_idx);
-    let mut exists_op =
-        build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
-
-    exists_op.open(ctx).await?;
-
-    let has_match = loop {
-        match exists_op.next_batch(ctx).await? {
-            Some(b) if !b.is_empty() => break true,
-            Some(_) => continue,
-            None => break false,
-        }
-    };
-
-    exists_op.close();
-    Ok(if negated { !has_match } else { has_match })
+/// No query reaches the list case today, so a debug build asserts it away: a
+/// change that makes it reachable fails loudly there and needs its own test.
+/// Release builds keep the spec reading above.
+fn correlation_seed(batch: &Batch, row_idx: usize) -> SeedOperator {
+    let width = batch.schema().len();
+    let carries_list =
+        (0..width).any(|col| matches!(batch.get_by_col(row_idx, col), Binding::Grouped(_)));
+    // Unreachable today: a variable only an EXISTS or comprehension body reads
+    // is not a row read, so dependency tracing keeps it out of the group row.
+    debug_assert!(
+        !carries_list,
+        "a per-group list reached an EXISTS / pattern-comprehension seed"
+    );
+    if !carries_list {
+        return SeedOperator::from_batch_row(batch, row_idx);
+    }
+    let schema: Arc<[VarId]> = Arc::from(batch.schema().to_vec().into_boxed_slice());
+    let row = (0..width)
+        .map(|col| match batch.get_by_col(row_idx, col) {
+            Binding::Grouped(_) => Binding::Unbound,
+            other => other.clone(),
+        })
+        .collect();
+    SeedOperator::from_row(schema, row)
 }
 
 /// Evaluate a pattern comprehension for a given row (always correlated): run the
@@ -359,7 +288,7 @@ async fn eval_pattern_comprehension_for_row(
     ctx: &ExecutionContext<'_>,
     planning: &crate::temporal_mode::PlanningContext,
 ) -> Result<Binding> {
-    let seed = SeedOperator::from_batch_row(batch, row_idx);
+    let seed = correlation_seed(batch, row_idx);
     let mut op =
         build_where_operators_seeded(Some(Box::new(seed)), patterns, None, None, planning)?;
     op.open(ctx).await?;
@@ -405,9 +334,10 @@ fn pre_resolve_uncorrelated<'a>(
         match expr {
             Expression::Exists { patterns, negated } => {
                 if is_uncorrelated_exists(patterns, batch_schema) {
-                    let result =
-                        eval_exists_uncorrelated(patterns, *negated, ctx, planning).await?;
-                    Ok(Expression::Const(FlakeValue::Boolean(result)))
+                    #[expect(clippy::box_default)]
+                    let seed: BoxedOperator = Box::new(EmptyOperator::new());
+                    let found = any_solution(seed, patterns, None, planning, ctx).await?;
+                    Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
                 } else {
                     Ok(expr.clone())
                 }
@@ -502,14 +432,17 @@ fn try_eval_simple_exists_semijoin(
     let Some(binding) = batch.get(row_idx, *subject_var) else {
         return Ok(Some(false));
     };
-    let Binding::Sid { sid, .. } = binding else {
-        // Only handle the common single-ledger SID binding here.
-        return Ok(None);
+    let s_id = match binding {
+        // The cache holds persisted subject ids, and with the cache built
+        // (no live novelty) an encoded subject carries one — the common
+        // case on an indexed ledger, so it must not drop to the per-row path.
+        Binding::EncodedSid { s_id, .. } => Some(*s_id),
+        Binding::Sid { sid, .. } => store
+            .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
+            .map_err(|e| crate::error::QueryError::Internal(format!("sid->s_id: {e}")))?,
+        // Anything else keeps the per-row correlated evaluation.
+        _ => return Ok(None),
     };
-
-    let s_id = store
-        .find_subject_id_by_parts(sid.namespace_code, sid.name.as_ref())
-        .map_err(|e| crate::error::QueryError::Internal(format!("sid->s_id: {e}")))?;
 
     let has_match = s_id.is_some_and(|id| subjects.contains(&id));
     Ok(Some(if negated { !has_match } else { has_match }))
@@ -538,9 +471,9 @@ fn resolve_exists_for_row<'a>(
                     }
                 }
 
-                let result =
-                    eval_exists_for_row(patterns, *negated, batch, row_idx, ctx, planning).await?;
-                Ok(Expression::Const(FlakeValue::Boolean(result)))
+                let seed = correlation_seed(batch, row_idx);
+                let found = any_solution(Box::new(seed), patterns, None, planning, ctx).await?;
+                Ok(Expression::Const(FlakeValue::Boolean(found != *negated)))
             }
             Expression::PatternComprehension {
                 patterns,
@@ -612,9 +545,8 @@ pub(crate) async fn resolve_row_exists(
 /// If ALL EXISTS subexpressions are uncorrelated, phase 2 skips async work
 /// entirely and uses the fast synchronous `filter_batch` path.
 async fn filter_batch_with_exists(
-    batch: &Batch,
+    batch: Batch,
     expr: &Expression,
-    schema: &Arc<[VarId]>,
     ctx: &ExecutionContext<'_>,
     cache: Option<&ExistsSemijoinCache>,
     planning: &crate::temporal_mode::PlanningContext,
@@ -627,52 +559,98 @@ async fn filter_batch_with_exists(
     // to resolve, we can use the fast synchronous path.
     if !needs_metadata && !contains_exists(&partially_resolved) {
         let prepared = PreparedBoolExpression::new(partially_resolved);
-        return filter_batch(batch, &prepared, schema, ctx);
+        return filter_batch(batch, &prepared, ctx);
     }
 
     // Phase 2: resolve remaining correlated EXISTS (and metadata) per-row
-    let mut keep_indices: Vec<usize> = Vec::new();
-
-    for row_idx in 0..batch.len() {
+    let mut keep = Vec::with_capacity(batch.len());
+    for (row_idx, row) in batch.rows().enumerate() {
         let resolved_expr =
-            resolve_exists_for_row(&partially_resolved, batch, row_idx, ctx, cache, planning)
+            resolve_exists_for_row(&partially_resolved, &batch, row_idx, ctx, cache, planning)
                 .await?;
-        let Some(row) = batch.row_view(row_idx) else {
-            continue;
-        };
         let resolved_expr = if needs_metadata {
             crate::eval::metadata_resolve::resolve_row_metadata(&resolved_expr, &row, ctx).await?
         } else {
             resolved_expr
         };
-        let pass = resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?;
-        if pass {
-            keep_indices.push(row_idx);
+        keep.push(resolved_expr.eval_to_bool_non_strict(&row, Some(ctx))?);
+    }
+
+    Ok(batch.filter_rows(&keep))
+}
+
+/// The row predicate of a FILTER or a HAVING: one evaluator for both.
+///
+/// EXISTS subexpressions resolve through the planner (uncorrelated ones once
+/// per batch, correlated ones per row, simple correlated ones through a
+/// semijoin cache built at `open`), and a Cypher metadata read under a
+/// non-root view policy through the policy-filtered async path. Everything
+/// else evaluates synchronously.
+pub(crate) struct RowPredicate {
+    expr: Expression,
+    prepared_expr: PreparedBoolExpression,
+    /// Whether the expression contains EXISTS subexpressions (cached)
+    has_exists: bool,
+    /// Whether the expression contains a Cypher metadata read that must be
+    /// policy-filtered asynchronously when a non-root view policy is active.
+    has_metadata: bool,
+    /// Optional semijoin caches for simple correlated EXISTS patterns.
+    exists_semijoin: Option<ExistsSemijoinCache>,
+    /// Planning context captured at planner-time for EXISTS subplans.
+    planning: crate::temporal_mode::PlanningContext,
+}
+
+impl RowPredicate {
+    pub(crate) fn new(expr: Expression, planning: crate::temporal_mode::PlanningContext) -> Self {
+        let has_exists = contains_exists(&expr);
+        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
+        let prepared_expr = PreparedBoolExpression::new(expr.clone());
+        Self {
+            expr,
+            prepared_expr,
+            has_exists,
+            has_metadata,
+            exists_semijoin: None,
+            planning,
         }
     }
 
-    if keep_indices.is_empty() {
-        return Ok(None);
+    pub(crate) fn expr(&self) -> &Expression {
+        &self.expr
     }
 
-    // See `filter_batch`: a zero-column batch carries its row count explicitly.
-    if schema.is_empty() {
-        return Ok(Some(Batch::empty_schema_with_len(keep_indices.len())));
+    /// Prepare for rows of `schema` (the semijoin cache for simple EXISTS).
+    pub(crate) fn open(&mut self, schema: &[VarId], ctx: &ExecutionContext<'_>) -> Result<()> {
+        if self.has_exists {
+            self.exists_semijoin = build_exists_semijoin_cache(&self.expr, schema, ctx)?;
+        }
+        Ok(())
     }
 
-    let columns: Vec<Vec<Binding>> = (0..schema.len())
-        .map(|col_idx| {
-            let src_col = batch
-                .column_by_idx(col_idx)
-                .expect("batch schema must match operator schema");
-            keep_indices
-                .iter()
-                .map(|&row_idx| src_col[row_idx].clone())
-                .collect()
-        })
-        .collect();
-
-    Ok(Some(Batch::new(schema.clone(), columns)?))
+    /// Keep the rows of `batch` the predicate holds for; `None` when none do.
+    pub(crate) async fn filter(
+        &self,
+        batch: Batch,
+        ctx: &ExecutionContext<'_>,
+    ) -> Result<Option<Batch>> {
+        // Cypher metadata reads must be resolved through the policy-filtered
+        // async path when a non-root view policy is active (the synchronous
+        // readers are fail-closed there).
+        let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
+        if self.has_exists || needs_metadata {
+            filter_batch_with_exists(
+                batch,
+                &self.expr,
+                ctx,
+                self.exists_semijoin.as_ref(),
+                &self.planning,
+                needs_metadata,
+            )
+            .await
+        } else {
+            filter_batch(batch, &self.prepared_expr, ctx)
+        }
+    }
 }
 
 /// Filter operator - applies a predicate to each row from child
@@ -682,22 +660,12 @@ async fn filter_batch_with_exists(
 pub struct FilterOperator {
     /// Child operator providing input rows
     child: BoxedOperator,
-    /// Filter expression to evaluate
-    expr: Expression,
-    prepared_expr: PreparedBoolExpression,
+    /// The predicate, shared with HAVING
+    predicate: RowPredicate,
     /// Output schema (same as child)
     schema: Arc<[VarId]>,
     /// Operator state
     state: OperatorState,
-    /// Whether the expression contains EXISTS subexpressions (cached)
-    has_exists: bool,
-    /// Whether the expression contains a Cypher metadata read that must be
-    /// policy-filtered asynchronously when a non-root view policy is active.
-    has_metadata: bool,
-    /// Optional semijoin caches for simple correlated EXISTS patterns.
-    exists_semijoin: Option<ExistsSemijoinCache>,
-    /// Planning context captured at planner-time for FILTER EXISTS subplans.
-    planning: crate::temporal_mode::PlanningContext,
 }
 
 impl FilterOperator {
@@ -722,25 +690,17 @@ impl FilterOperator {
         planning: crate::temporal_mode::PlanningContext,
     ) -> Self {
         let schema = Arc::from(child.schema().to_vec().into_boxed_slice());
-        let has_exists = contains_exists(&expr);
-        let has_metadata = crate::eval::metadata_resolve::contains_metadata_read(&expr);
-        let prepared_expr = PreparedBoolExpression::new(expr.clone());
         Self {
             child,
-            expr,
-            prepared_expr,
+            predicate: RowPredicate::new(expr, planning),
             schema,
             state: OperatorState::Created,
-            has_exists,
-            has_metadata,
-            exists_semijoin: None,
-            planning,
         }
     }
 
     /// Get the filter expression
     pub fn expr(&self) -> &Expression {
-        &self.expr
+        self.predicate.expr()
     }
 }
 
@@ -765,9 +725,7 @@ impl Operator for FilterOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
-        if self.has_exists {
-            self.exists_semijoin = build_exists_semijoin_cache(&self.expr, &self.schema, ctx)?;
-        }
+        self.predicate.open(&self.schema, ctx)?;
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -790,26 +748,7 @@ impl Operator for FilterOperator {
                 continue;
             }
 
-            // Cypher metadata reads in a WHERE expression must be resolved
-            // through the policy-filtered async path when a non-root view
-            // policy is active (the synchronous readers are fail-closed there).
-            let needs_metadata = self.has_metadata && !ctx.allow_unfiltered();
-            let filtered = if self.has_exists || needs_metadata {
-                filter_batch_with_exists(
-                    &batch,
-                    &self.expr,
-                    &self.schema,
-                    ctx,
-                    self.exists_semijoin.as_ref(),
-                    &self.planning,
-                    needs_metadata,
-                )
-                .await?
-            } else {
-                filter_batch(&batch, &self.prepared_expr, &self.schema, ctx)?
-            };
-
-            if let Some(filtered) = filtered {
+            if let Some(filtered) = self.predicate.filter(batch, ctx).await? {
                 return Ok(Some(filtered));
             }
         }

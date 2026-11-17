@@ -31,9 +31,10 @@ pub enum ShaclError {
 
     /// Invalid or unsupported `sh:sparql` constraint query — raised as a
     /// validation *failure* (per SHACL, distinct from a violation) when the
-    /// owning shape fires on a focus node.
+    /// owning shape fires on a focus node. `constraint` is the constraint
+    /// node's IRI, or its SID when the namespace cannot be decoded.
     #[error("Invalid sh:sparql constraint {constraint}: {message}")]
-    SparqlConstraint { constraint: Sid, message: String },
+    SparqlConstraint { constraint: String, message: String },
 
     /// Shape references unknown shape
     #[error("Shape {referrer} references unknown shape {referenced}")]

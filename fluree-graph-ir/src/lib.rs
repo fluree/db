@@ -37,14 +37,17 @@
 //! graph.sort();
 //! ```
 
+mod dataset;
 pub mod datatype;
 mod graph;
 pub mod json_canonical;
 mod sink;
+pub mod syntax;
 mod term;
 mod triple;
 pub mod xsd_double;
 
+pub use dataset::Dataset;
 pub use datatype::Datatype;
 pub use graph::{Graph, Reification};
 pub use json_canonical::{canonicalize_json, canonicalize_json_value};
@@ -52,6 +55,6 @@ pub use sink::{GraphCollectorSink, GraphSink, SinkError, SinkResult, TermId};
 pub use term::{BlankId, LiteralValue, Term};
 pub use triple::Triple;
 pub use xsd_double::{
-    canonical_xsd_double, canonical_xsd_float, push_canonical_xsd_double,
-    write_canonical_xsd_double, XsdFloat,
+    canonical_xsd_double, canonical_xsd_float, parse_xsd_double, parse_xsd_float,
+    push_canonical_xsd_double, write_canonical_xsd_double, XsdFloat,
 };

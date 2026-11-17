@@ -1,7 +1,9 @@
 //! The vocabulary the chunk graph is written in.
 //!
-//! Structure elements come from the engine already typed with DoCO / NIF
-//! terms under `https://ns.flur.ee/doc#` (`doc:`). Chunks extend that same
+//! Structure elements come from the engine already typed: DoCO wherever it
+//! has a class, `foaf:Document` for the root, Dublin Core for what a file
+//! declares about itself, NIF for offsets, and `https://ns.flur.ee/doc#`
+//! (`doc:`) for the parts no standard ontology names. Chunks extend that same
 //! namespace so a ledger built here and one built by Fluree AI's hosted
 //! pipeline describe documents with one vocabulary.
 
@@ -15,6 +17,8 @@ pub const RDF_NS: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 pub const XSD_NS: &str = "http://www.w3.org/2001/XMLSchema#";
 pub const SKOS_NS: &str = "http://www.w3.org/2004/02/skos/core#";
 pub const SCHEMA_NS: &str = "https://schema.org/";
+pub const DCTERMS_NS: &str = "http://purl.org/dc/terms/";
+pub const FOAF_NS: &str = "http://xmlns.com/foaf/0.1/";
 
 /// A retrieval unit cut from a document's structure.
 pub const CHUNK: &str = "doc:Chunk";
@@ -63,6 +67,15 @@ pub const VERDICT: &str = "doc:verdict";
 /// True when a direct edge was written for the relation, so a re-ingest
 /// knows which edges to reconsider.
 pub const ASSERTED: &str = "doc:asserted";
+/// `asserted`, `hedged`, `attributed` or `negated`: how the source text
+/// states the relation, when the extraction was asked for it.
+///
+/// A classification of text the model is holding, not an introspection —
+/// "does the source assert this, hedge it, attribute it to a third party,
+/// or negate it" is answerable from the excerpt, where "how confident are
+/// you" is a self-report. An enum for the same reason `doc:verdict` is one:
+/// it cannot be thresholded as though it were a probability.
+pub const ASSERTION_MODE: &str = "doc:assertionMode";
 pub const EXCERPT: &str = "doc:excerpt";
 pub const ORIGINAL_PREDICATE: &str = "doc:originalPredicate";
 pub const REPAIR_NOTE: &str = "doc:repairNote";
@@ -72,6 +85,12 @@ pub const EXTRACTION_MODEL: &str = "doc:extractionModel";
 /// Hash of everything that shaped extraction, so an unchanged document is
 /// re-extracted only when the ontology, gazetteer or model changed.
 pub const EXTRACTION_FINGERPRINT: &str = "doc:extractionFingerprint";
+/// A predicate a reader wrote that this pipeline does not own: what a
+/// re-ingest retracts from the nodes that reader minted, and nothing else.
+pub const READER_PREDICATE: &str = "doc:readerPredicate";
+/// The named graph an HTTP reader's reading of the document is committed
+/// in, which a re-ingest clears before it commits the new reading.
+pub const READING_GRAPH: &str = "doc:readingGraph";
 pub const MENTION_COUNT: &str = "doc:mentionCount";
 pub const ENTITY_COUNT: &str = "doc:entityCount";
 pub const RELATION_COUNT: &str = "doc:relationCount";
@@ -94,8 +113,10 @@ pub fn source_document_iri() -> String {
     format!("{DOC_NS}sourceDocument")
 }
 
-/// The `@context` every emitted graph carries. A superset of the engine's
-/// DoCO context so the structure and chunk graphs can share one transaction.
+/// The `@context` for what this pipeline adds to the engine's graph. The
+/// transaction merges it over the engine's own context, which carries the
+/// structure graph's prefixes and coercions, so neither has to repeat the
+/// other.
 pub fn context() -> serde_json::Value {
     serde_json::json!({
         "doc": DOC_NS,
@@ -108,6 +129,8 @@ pub fn context() -> serde_json::Value {
         "xsd": XSD_NS,
         "skos": SKOS_NS,
         "schema": SCHEMA_NS,
+        "dcterms": DCTERMS_NS,
+        "foaf": FOAF_NS,
         "po:contains": { "@type": "@id" },
         "doc:sourceElement": { "@type": "@id" },
         "doc:sourceDocument": { "@type": "@id" },

@@ -35,6 +35,7 @@ use fluree_db_query::parse::{
     UnresolvedTriplePattern, UnresolvedValue,
 };
 use fluree_db_query::VarRegistry;
+use fluree_graph_ir::syntax::reserved_blank_label;
 use fluree_vocab::{rdf, reifies_iris};
 use thiserror::Error;
 
@@ -44,8 +45,60 @@ use fluree_db_cypher::ast::{
     RemoveItem, SetClause, SetItem, Statement, Update, Variable, WithClause, WriteClause,
 };
 
-use crate::ir::{TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
+use crate::ir::{RelationshipDelete, TemplateTerm, TripleTemplate, Txn, TxnOpts, TxnType};
 use crate::namespace::NamespaceRegistry;
+
+/// What a Cypher `CREATE` mints a blank node for.
+#[derive(Clone, Copy, Debug)]
+pub enum CypherBlank<'a> {
+    /// A node bound to a variable the statement creates.
+    NodeVar(&'a str),
+    /// An anonymous node, keyed by its pattern's source span.
+    AnonNode { start: usize, end: usize },
+    /// A created relationship's annotation, bound to a variable.
+    RelVar(&'a str),
+    /// A created relationship's annotation with no variable, numbered in
+    /// order.
+    AnonRel(u32),
+}
+
+/// The blank-node label (without `_:`) Cypher mints for `blank`: the `{label}`
+/// of the stored id `fdb-{txn}-{solution}-{label}`, which a write's `RETURN`
+/// rebuilds with this same function.
+///
+/// Each form has its own reserved kind, all of one width, so no form can spell
+/// another's label. A variable name is the user's, so it is encoded: any name,
+/// a backticked one included, gives a legal label, and two names never give
+/// the same one.
+pub fn cypher_blank_label(blank: CypherBlank<'_>) -> String {
+    match blank {
+        CypherBlank::NodeVar(name) => reserved_blank_label("cyv", encode_var_name(name)),
+        CypherBlank::AnonNode { start, end } => {
+            reserved_blank_label("cya", format_args!("{start}_{end}"))
+        }
+        CypherBlank::RelVar(name) => reserved_blank_label("cyr", encode_var_name(name)),
+        CypherBlank::AnonRel(n) => reserved_blank_label("cye", n),
+    }
+}
+
+/// `name` with every byte outside `[A-Za-z0-9]`, `_` included, written as `_`
+/// and two hex digits.
+fn encode_var_name(name: &str) -> String {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(name.len());
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() {
+            out.push(char::from(b));
+        } else {
+            let _ = write!(out, "_{b:02x}");
+        }
+    }
+    out
+}
+
+fn blank_term(blank: CypherBlank<'_>) -> TemplateTerm {
+    TemplateTerm::BlankNode(format!("_:{}", cypher_blank_label(blank)))
+}
 
 /// Errors raised by Cypher → Txn lowering.
 #[derive(Debug, Error)]
@@ -160,7 +213,7 @@ struct CypherLowering<'a> {
     /// the bundle).
     rel_var_edges: std::collections::HashMap<String, (String, Sid, String)>,
     /// Relationship variables already used for a CREATE relationship — each
-    /// names one created edge's annotation (label `_:cy_rel_{name}`), so a
+    /// names one created edge's annotation ([`CypherBlank::RelVar`]), so a
     /// reuse would silently merge two edges' annotations.
     created_rel_vars: std::collections::HashSet<String>,
     /// Stable per-pattern-occurrence node labels, keyed by node span.
@@ -211,12 +264,14 @@ impl<'a> CypherLowering<'a> {
             delete_templates: self.delete_templates,
             insert_templates: self.insert_templates,
             values: None,
+            unmatched_optional: fluree_db_query::UnmatchedOptional::Poisoned,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
+            update_where_names_ledger_default: false,
             opts: self.opts,
             vars: self.vars,
             txn_meta: Vec::new(),
-            graph_delta: Default::default(),
+            write_graphs: Default::default(),
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
@@ -435,6 +490,47 @@ impl<'a> CypherLowering<'a> {
         Ok(())
     }
 
+    /// Reject a `WITH … AS v` before a write clause when `v` is already bound
+    /// by a preceding read clause, or already assigned by an earlier item in
+    /// the same `WITH`.
+    ///
+    /// Same defect as the read-path guard in `fluree-db-cypher`
+    /// (`lower/stmt.rs`, `ProjectionState::check_alias`), reached through a
+    /// second, independent lowering: the alias interns to the already-bound
+    /// variable's own VarId, so the projection emits a `Pattern::Bind` onto a
+    /// bound variable and `BindOperator`'s clobber prevention turns it into
+    /// `WHERE v = expr`. On the write path that is strictly worse than a wrong
+    /// answer — every row is dropped, so the Update's WHERE matches nothing and
+    /// the transaction COMMITS, reports no error, and writes nothing.
+    ///
+    /// `self.bound_vars` is still the pre-`WITH` scope here (it is narrowed to
+    /// `horizon` only after the whole projection is lowered), so this is the
+    /// clause-entry snapshot the check needs. The pass-through forms `WITH a`
+    /// and `WITH a AS a` never reach here — they carry the binding forward
+    /// unchanged rather than assigning onto it.
+    fn check_with_alias(
+        &self,
+        alias: &str,
+        horizon: &std::collections::HashSet<String>,
+    ) -> Result<(), LowerCypherError> {
+        if horizon.contains(alias) {
+            return Err(LowerCypherError::rejected(format!(
+                "WITH assigns `{alias}` twice — two projected columns cannot share one output \
+                 name, the second would silently overwrite the first. Give each item a distinct \
+                 name (e.g. `AS {alias}2`)."
+            )));
+        }
+        if self.bound_vars.contains(alias) {
+            return Err(LowerCypherError::rejected(format!(
+                "WITH alias `{alias}` is already bound by an earlier clause — assigning onto it \
+                 would silently drop every row, so the write would commit without error and \
+                 without writing anything. Alias to a name that is not already bound (e.g. \
+                 `AS {alias}_value`)."
+            )));
+        }
+        Ok(())
+    }
+
     /// Lower a `WITH` projection that precedes a write clause. This is the
     /// **horizon subset** that maps cleanly onto the where-pattern stream:
     /// pass-through variables, renames, and computed (non-aggregate) aliases
@@ -479,6 +575,7 @@ impl<'a> CypherLowering<'a> {
                         }
                         // Rename (`WITH a AS b`).
                         Some(a) => {
+                            self.check_with_alias(&a, &horizon)?;
                             binds.push(UnresolvedPattern::Bind {
                                 var: Arc::from(var_name(&a).as_str()),
                                 expr: UnresolvedExpression::var(var_name(&v.name)),
@@ -497,6 +594,7 @@ impl<'a> CypherLowering<'a> {
                              (`<expr> AS name`)",
                         ));
                     };
+                    self.check_with_alias(&a, &horizon)?;
                     let mut aux = Vec::new();
                     let expr = self.lower_filter_expr(other, &mut aux)?;
                     self.where_patterns.append(&mut aux);
@@ -582,7 +680,7 @@ impl<'a> CypherLowering<'a> {
 
         // Labels — `?n rdf:type <label>`.
         for Label { name, .. } in &n.labels {
-            let label_iri = self.resolve_iri(name);
+            let label_iri = self.resolve_label(name)?;
             out.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
                 s: subj.clone(),
                 p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
@@ -979,7 +1077,7 @@ impl<'a> CypherLowering<'a> {
                     let subj = self.var_term(&target.name);
                     let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                     for label in labels {
-                        let iri = self.resolve_iri(label);
+                        let iri = self.resolve_label(label)?;
                         let label_sid = self.ns.sid_for_iri(&iri);
                         self.insert_templates.push(TripleTemplate::new(
                             subj.clone(),
@@ -1101,7 +1199,7 @@ impl<'a> CypherLowering<'a> {
                     let subj = self.var_term(&target.name);
                     let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                     for label in labels {
-                        let iri = self.resolve_iri(label);
+                        let iri = self.resolve_label(label)?;
                         let label_sid = self.ns.sid_for_iri(&iri);
                         self.delete_templates.push(TripleTemplate::new(
                             subj.clone(),
@@ -1128,10 +1226,20 @@ impl<'a> CypherLowering<'a> {
             // `DELETE r` — retract the base edge the relationship reifies; the
             // cascade then removes the `f:reifies*` bundle. Parallel-edge safety
             // (a shared `(s,p,o)` carrying multiple annotation SIDs) is enforced
-            // by the API-level conditional probe before this lowering runs.
+            // where the cascade runs, at staging (`relationship_deletes`).
             if let Some((s_name, p_sid, o_name)) = self.rel_var_edges.get(&target.name).cloned() {
                 let s = TemplateTerm::Var(self.vars.get_or_insert(&s_name));
                 let o = TemplateTerm::Var(self.vars.get_or_insert(&o_name));
+                // Staging refuses an edge this template retracts when it
+                // carries another relationship, which the base-edge
+                // retraction would take too.
+                self.opts
+                    .relationship_deletes
+                    .get_or_insert_with(Vec::new)
+                    .push(RelationshipDelete {
+                        var: target.name.clone(),
+                        template: self.delete_templates.len(),
+                    });
                 self.delete_templates
                     .push(TripleTemplate::new(s, TemplateTerm::Sid(p_sid), o));
                 continue;
@@ -1465,7 +1573,7 @@ impl<'a> CypherLowering<'a> {
     ) -> Result<Vec<UnresolvedPattern>, LowerCypherError> {
         let mut guard = Vec::new();
         for Label { name, .. } in &node.labels {
-            let label_iri = self.resolve_iri(name);
+            let label_iri = self.resolve_label(name)?;
             guard.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
                 s: probe.clone(),
                 p: UnresolvedTerm::Iri(Arc::from(rdf::TYPE)),
@@ -1550,7 +1658,7 @@ impl<'a> CypherLowering<'a> {
                 }
                 let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
                 for label in labels {
-                    let iri = self.resolve_iri(label);
+                    let iri = self.resolve_label(label)?;
                     let sid = self.ns.sid_for_iri(&iri);
                     self.insert_templates.push(TripleTemplate::new(
                         subj.clone(),
@@ -1677,7 +1785,7 @@ impl<'a> CypherLowering<'a> {
         // Labels — emit (n, rdf:type, label_iri).
         let rdf_type_sid = self.ns.sid_for_iri(rdf::TYPE);
         for Label { name, .. } in &n.labels {
-            let iri = self.resolve_iri(name);
+            let iri = self.resolve_label(name)?;
             let label_sid = self.ns.sid_for_iri(&iri);
             self.insert_templates.push(TripleTemplate::new(
                 subj.clone(),
@@ -1741,8 +1849,7 @@ impl<'a> CypherLowering<'a> {
         //
         // A named relationship (`CREATE (a)-[e:T]->(b)`) uses a label derived
         // from the variable so a trailing `RETURN e` can reconstruct the
-        // created annotation's Sid (the `cy_rel_` prefix keeps it disjoint
-        // from node-variable labels `cy_{name}`).
+        // created annotation's Sid.
         let ann = match &rel.var {
             Some(v) => {
                 if !self.created_rel_vars.insert(v.name.clone()) {
@@ -1752,7 +1859,7 @@ impl<'a> CypherLowering<'a> {
                         v.name
                     )));
                 }
-                TemplateTerm::BlankNode(format!("_:cy_rel_{}", v.name))
+                blank_term(CypherBlank::RelVar(&v.name))
             }
             None => self.fresh_bnode(),
         };
@@ -1971,23 +2078,25 @@ impl<'a> CypherLowering<'a> {
             if self.bound_vars.contains(&var.name) {
                 return self.var_term(&var.name);
             }
-            return TemplateTerm::BlankNode(format!("_:cy_{}", var.name));
+            return blank_term(CypherBlank::NodeVar(&var.name));
         }
         // Anonymous node — cache by span.
         let key = (n.span.start, n.span.end);
         if let Some(t) = self.node_subject_cache.get(&key) {
             return t.clone();
         }
-        let label = format!("_:cy_anon_{}_{}", n.span.start, n.span.end);
-        let t = TemplateTerm::BlankNode(label);
+        let t = blank_term(CypherBlank::AnonNode {
+            start: n.span.start,
+            end: n.span.end,
+        });
         self.node_subject_cache.insert(key, t.clone());
         t
     }
 
     fn fresh_bnode(&mut self) -> TemplateTerm {
-        let label = format!("_:cy_ann_{}", self.bnode_counter);
+        let t = blank_term(CypherBlank::AnonRel(self.bnode_counter));
         self.bnode_counter += 1;
-        TemplateTerm::BlankNode(label)
+        t
     }
 
     fn resolve_iri(&self, name: &str) -> String {
@@ -2003,8 +2112,36 @@ impl<'a> CypherLowering<'a> {
         }
     }
 
+    /// Resolve a node label, rejecting the same reserved names a predicate
+    /// rejects. See `LoweringContext::resolve_label` in `fluree-db-cypher`;
+    /// the write path had the same gap at six sites, and ``SET n:`@type` ``
+    /// was the sharp end — it committed, after which `labels(n)` read back
+    /// `["Person", "@type"]`.
+    fn resolve_label(&self, name: &str) -> Result<String, LowerCypherError> {
+        self.resolve_predicate(name)
+    }
+
+    /// Resolve and reject reserved predicates — Fluree's own `f:reifies*`
+    /// system predicates, and the JSON-LD keywords (`@id`, `@type`, …) that
+    /// are not Cypher properties.
+    ///
+    /// The keyword check matters more here than on the read side: unchecked,
+    /// `CREATE (n {`@id`: "x"})` and `SET n.`@type` = "T"` COMMIT, storing a
+    /// literal predicate spelled `@id` / `@type` while leaving the node's real
+    /// identity and labels untouched. It runs on the *bare* name, before
+    /// `@vocab` expansion. See `fluree_db_cypher::keywords`.
     fn resolve_predicate(&self, name: &str) -> Result<String, LowerCypherError> {
+        if let Some(msg) = fluree_db_cypher::reserved_keyword_message(name) {
+            return Err(LowerCypherError::rejected(msg));
+        }
         let iri = self.resolve_iri(name);
+        // A keyword reached through the context (`{"id": "@id"}`) — see the
+        // read-side twin in `fluree-db-cypher`'s `LoweringContext`.
+        if let Some(msg) = fluree_db_cypher::reserved_keyword_message(&iri) {
+            return Err(LowerCypherError::rejected(format!(
+                "`{name}` resolves through the ledger's context to `{iri}` — {msg}"
+            )));
+        }
         if reifies_iris::ALL.iter().any(|x| *x == iri) {
             return Err(LowerCypherError::ReservedPredicate(iri));
         }
@@ -2127,4 +2264,39 @@ fn lower_literal_value(lit: &Literal) -> Result<FlakeValue, LowerCypherError> {
             ));
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_graph_ir::syntax::is_blank_node_label;
+
+    /// Each form has its own kind, so no variable spells another form's label,
+    /// and an encoded name is a legal label whatever the user wrote.
+    #[test]
+    fn a_variable_name_never_spells_another_label() {
+        let pairs = [
+            (CypherBlank::NodeVar("rel_r"), CypherBlank::RelVar("r")),
+            (
+                CypherBlank::NodeVar("anon_7_11"),
+                CypherBlank::AnonNode { start: 7, end: 11 },
+            ),
+            (CypherBlank::NodeVar("ann_0"), CypherBlank::AnonRel(0)),
+            (CypherBlank::NodeVar("x"), CypherBlank::RelVar("x")),
+            (CypherBlank::NodeVar("a_b"), CypherBlank::NodeVar("a b")),
+        ];
+        for (a, b) in pairs {
+            assert_ne!(
+                cypher_blank_label(a),
+                cypher_blank_label(b),
+                "{a:?} and {b:?}"
+            );
+        }
+        for name in ["n", "my node", "a#b", "ends.", "\u{e9}", ""] {
+            let label = cypher_blank_label(CypherBlank::NodeVar(name));
+            assert!(!is_blank_node_label(&label), "{label} can be written");
+            let stored = format!("fdb-01h-0-{label}");
+            assert!(is_blank_node_label(&stored), "{stored} does not serialize");
+        }
+    }
 }

@@ -28,7 +28,7 @@
 
 use crate::extract::ChunkExtraction;
 use crate::parse::ParsedDocument;
-use crate::Result;
+use crate::{DocError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -46,11 +46,16 @@ struct ParseMeta {
     escalated_crops: usize,
     #[serde(default)]
     escalation_skipped: Option<String>,
+    #[serde(default)]
+    notes: Vec<String>,
 }
 
 /// Bumped when the way an extraction is asked changes without the prompt
-/// text changing (v2: system prompt as a system message, not `instructions`).
-const EXTRACTION_CACHE_VERSION: &str = "v2";
+/// text changing (v2: system prompt as a system message, not `instructions`;
+/// v3: `max_completion_tokens` in place of `max_tokens`, and no
+/// `temperature` or `response_format`, so answers given while the wire body
+/// was malformed are not reused).
+const EXTRACTION_CACHE_VERSION: &str = "v3";
 
 pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
@@ -84,18 +89,27 @@ impl DocCache {
             elements: meta.elements,
             escalated_crops: meta.escalated_crops,
             escalation_skipped: meta.escalation_skipped,
+            notes: meta.notes,
             from_cache: true,
         })
     }
 
     pub fn store_parse(&self, sha256: &str, fingerprint: &str, doc: &ParsedDocument) -> Result<()> {
         let dir = self.parse_dir(sha256, fingerprint);
-        fs::create_dir_all(&dir)?;
+        // An unwritable cache names itself: a bare "Permission denied"
+        // doesn't say which directory to fix.
+        self.write_parse(&dir, doc)
+            .map_err(|e| DocError::Io(format!("parse cache {}: {e}", dir.display())))
+    }
+
+    fn write_parse(&self, dir: &Path, doc: &ParsedDocument) -> std::io::Result<()> {
+        fs::create_dir_all(dir)?;
         let meta = ParseMeta {
             pages: doc.pages,
             elements: doc.elements,
             escalated_crops: doc.escalated_crops,
             escalation_skipped: doc.escalation_skipped.clone(),
+            notes: doc.notes.clone(),
         };
         // Write into place last so a torn write never reads as a hit.
         fs::write(dir.join("text.txt"), &doc.text)?;
@@ -109,7 +123,6 @@ impl DocCache {
         Ok(())
     }
 
-    /// Key for one crop reading: the pixels, what was asked, and who was asked.
     pub fn reading_key(model: &str, prompt: &str, png: &[u8]) -> String {
         let mut h = Sha256::new();
         h.update(model.as_bytes());
@@ -188,6 +201,7 @@ mod tests {
             elements: 3,
             escalated_crops: 1,
             escalation_skipped: None,
+            notes: vec!["page 2 unread".into()],
             from_cache: false,
         };
         assert!(cache.load_parse("abc", "fp").is_none());
@@ -196,7 +210,33 @@ mod tests {
         assert!(hit.from_cache);
         assert_eq!(hit.text, "hello");
         assert_eq!(hit.pages, 2);
+        assert_eq!(hit.notes, doc.notes);
         assert!(cache.load_parse("abc", "other").is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_cache_that_cant_be_written_names_itself() {
+        let dir = tempdir();
+        // A file where the cache directory should be.
+        let root = dir.join("cache");
+        fs::write(&root, "").unwrap();
+        let doc = ParsedDocument {
+            doco: "{}".into(),
+            text: "hello".into(),
+            pages: 0,
+            elements: 0,
+            escalated_crops: 0,
+            escalation_skipped: None,
+            notes: Vec::new(),
+            from_cache: false,
+        };
+        let err = DocCache::new(&root)
+            .store_parse("abc", "fp", &doc)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("parse cache "), "{err}");
+        assert!(err.contains(&root.display().to_string()), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 
@@ -226,11 +266,43 @@ mod tests {
             }],
             relations: vec![],
             from_cache: false,
+            ..Default::default()
         };
         cache.store_extraction(&key, &x).unwrap();
         let hit = cache.load_extraction(&key).unwrap();
         assert_eq!(hit.entities, x.entities);
         assert_ne!(key, DocCache::extraction_key("m", "sys", "other"));
+        fs::remove_dir_all(dir).ok();
+    }
+
+    /// An answer given while the wire body was wrong must not be served
+    /// back after the transport is fixed. The version is the only thing
+    /// standing between a corpus extracted through a malformed wire body
+    /// and a silent reuse of it — the prompts did not change, so nothing
+    /// else in the key did either.
+    #[test]
+    fn a_version_bump_invalidates_every_stored_answer() {
+        let dir = tempdir();
+        let cache = DocCache::new(&dir);
+        let key = DocCache::extraction_key("m", "sys", "user");
+        cache
+            .store_extraction(&key, &ChunkExtraction::default())
+            .unwrap();
+        assert!(cache.load_extraction(&key).is_some());
+
+        // What the previous version's key was, verbatim, so this fails if
+        // EXTRACTION_CACHE_VERSION is ever reverted or left behind.
+        let mut h = Sha256::new();
+        for part in ["v2", "\0m\0sys\0user"] {
+            h.update(part.as_bytes());
+        }
+        let v2 = hex::encode(h.finalize());
+        assert_ne!(key, v2, "the version is not in the key at all");
+        assert!(
+            cache.load_extraction(&v2).is_none(),
+            "a v2 answer is still reachable"
+        );
+        assert_eq!(EXTRACTION_CACHE_VERSION, "v3");
         fs::remove_dir_all(dir).ok();
     }
 

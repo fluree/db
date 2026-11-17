@@ -48,6 +48,36 @@ pub trait AwsNameServiceDyn:
 
 impl<T: NameServicePublisher> AwsNameServiceDyn for T {}
 
+/// Translate a parsed [`S3StorageConfig`](crate::config::S3StorageConfig)
+/// into the storage crate's `S3Config`.
+///
+/// The one place for the two normalisations every S3 build path needs: the
+/// per-operation timeouts collapse to a single SDK operation timeout (the
+/// maximum, so no slow operation is shortened), and an empty `s3Endpoint`
+/// reads as unset so the SDK default endpoint applies.
+pub fn s3_config_from(s3: &crate::config::S3StorageConfig) -> fluree_db_storage_aws::S3Config {
+    fluree_db_storage_aws::S3Config {
+        bucket: s3.bucket.to_string(),
+        prefix: s3.prefix.as_deref().map(str::to_owned),
+        endpoint: s3
+            .endpoint
+            .as_deref()
+            .filter(|e| !e.is_empty())
+            .map(str::to_owned),
+        force_path_style: s3.force_path_style,
+        timeout_ms: s3
+            .read_timeout_ms
+            .into_iter()
+            .chain(s3.write_timeout_ms)
+            .chain(s3.list_timeout_ms)
+            .max(),
+        max_retries: s3.max_retries.map(|n| n as u32),
+        retry_base_delay_ms: s3.retry_base_delay_ms,
+        retry_max_delay_ms: s3.retry_max_delay_ms,
+        max_concurrent_requests: s3.max_concurrent_requests,
+    }
+}
+
 /// AWS-specific connection handle for Lambda deployments
 ///
 /// S3Storage and nameservice are Clone (via `Arc`), so this handle can be

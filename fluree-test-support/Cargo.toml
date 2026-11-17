@@ -1,6 +1,6 @@
 [package]
 name = "fluree-test-support"
-description = "Shared guard for crates that group their integration tests: asserts every tests/*.rs is reachable under `autotests = false`"
+description = "Shared test tooling: the reachability guard for crates that group their integration tests, and thread-local tracing captures that see every event"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -12,6 +12,7 @@ dist = false
 
 [dependencies]
 toml = "0.8"
+tracing.workspace = true
 
 [lints]
 workspace = true

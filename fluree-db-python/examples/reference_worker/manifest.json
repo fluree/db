@@ -1,0 +1,16 @@
+{
+  "format": "fluree-reference-worker/experimental-1",
+  "program": "http://example.org/programs/claims-review",
+  "programVersion": "2026.06",
+  "ledger": "claims",
+  "inputT": null,
+  "clock": "2026-06-30T00:00:00Z",
+  "extract": {
+    "graph": "http://example.org/claims-review/extractions",
+    "model": "toy-extractor-1"
+  },
+  "gate": {
+    "graph": "http://example.org/claims-review/decisions",
+    "version": "v1"
+  }
+}

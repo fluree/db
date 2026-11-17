@@ -222,6 +222,12 @@ so broken ontology references surface early. Sources of this error:
   `f:schemaSource` (raised by `view/query.rs` before dispatch — the
   cross-ledger materializer does not walk `owl:imports`).
 
+A named source graph that a commit after the query's `to_t` dropped
+raises `ApiError::GraphNotFound` (404) instead, as a `GRAPH` naming it
+as of `to_t` does. The check runs on cached bundles too: the caches key
+on `to_t`, and a bundle cached as of `to_t` before the drop still lists
+the graph.
+
 ## Wiring at query time
 
 `Fluree::query(&db, ...)` calls `build_executable_for_view`, and the

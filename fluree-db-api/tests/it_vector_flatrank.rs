@@ -540,7 +540,7 @@ async fn vector_search_post_indexing() {
                 .expect("insert_with_opts");
 
             // Trigger indexing and wait for completion
-            let completion = handle.trigger(ledger_id, result.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), result.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { index_t, .. } => {
                     assert!(index_t >= result.receipt.t);
@@ -658,7 +658,7 @@ async fn vector_search_novelty_plus_indexed() {
                 .expect("batch1");
 
             // Index batch 1
-            let completion = handle.trigger(ledger_id, r1.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), r1.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -854,7 +854,7 @@ async fn vector_cosine_normalized_optimization() {
                 .expect("insert");
 
             // Index
-            let completion = handle.trigger(ledger_id, r.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), r.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),

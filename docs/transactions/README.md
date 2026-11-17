@@ -22,7 +22,7 @@ Adding new data to the database:
 
 ### [Upsert](upsert.md)
 
-Idempotent transactions that replace values for supplied predicates:
+Transactions that replace values for supplied predicates, idempotent:
 - Upsert semantics
 - Use cases for upsert
 - Idempotent operations
@@ -219,10 +219,10 @@ POST /upsert?ledger=mydb:main
 
 ## Transaction Types
 
-- **Insert** (`POST /insert`) — add triples (JSON-LD or Turtle)
+- **Insert** (`POST /insert`) — add triples (JSON-LD, Turtle, TriG)
 - **Update** (`POST /update`) — WHERE/DELETE/INSERT (JSON-LD) or SPARQL UPDATE
 - **Upsert** (`POST /upsert`) — replace values for the predicates you supply (JSON-LD, Turtle, TriG)
-- **Sync** (`POST /sync`) — make one named graph's contents exactly the payload, committing only the delta (JSON-LD)
+- **Sync** (`POST /sync`) — make one graph's contents exactly the payload, committing only the delta (JSON-LD, Turtle, N-Triples or TriG)
 
 ## Transaction Validation
 

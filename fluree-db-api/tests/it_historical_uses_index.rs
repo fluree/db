@@ -19,8 +19,14 @@
 
 #![cfg(feature = "native")]
 
-use fluree_db_api::{FlureeBuilder, FormatterConfig, ReindexOptions};
+use crate::support::hooked_storage::{HookedStorage, StorageHooks};
+use async_trait::async_trait;
+use fluree_db_api::{FlureeBuilder, FormatterConfig, NameServiceMode, ReindexOptions};
+use fluree_db_nameservice::memory::MemoryNameService;
 use serde_json::json;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 fn ctx() -> serde_json::Value {
     json!({
@@ -162,4 +168,174 @@ async fn historical_view_uses_index_when_target_below_index_t() {
         .expect("expansion at t=2");
     let value_t2 = serde_json::to_value(&result_t2.result).expect("serialize");
     assert_eq!(value_t2.as_array().expect("array").len(), 21);
+}
+
+/// Pause one root read after the historical loader has captured its nameservice
+/// record, so an index can publish before the binary store is attached (#2265).
+#[derive(Debug, Default)]
+struct HistoricalRootGate {
+    digest: Mutex<Option<String>>,
+    parked: Notify,
+    release: Notify,
+}
+
+#[async_trait]
+impl StorageHooks for HistoricalRootGate {
+    async fn before_read(&self, address: &str) {
+        let pause = {
+            let mut digest = self.digest.lock().unwrap();
+            if digest.as_ref().is_some_and(|hex| address.contains(hex)) {
+                digest.take();
+                true
+            } else {
+                false
+            }
+        };
+        if pause {
+            self.parked.notify_one();
+            tokio::time::timeout(Duration::from_secs(60), self.release.notified())
+                .await
+                .expect("release historical root read");
+        }
+    }
+}
+
+fn historical_items(t: i64) -> Vec<serde_json::Value> {
+    (0..2)
+        .map(|i| {
+            let key = format!("item-{t}-{i}");
+            json!({
+                "@id": format!("ex:{key}"),
+                "@type": "ex:Item",
+                "ex:group": "g1",
+                "ex:key": key,
+                "ex:digest": format!("digest-{key}-0123456789abcdef"),
+                "ex:doc": format!(r#"{{"key":"{key}","txn":{t}}}"#),
+                "ex:version": "v1",
+            })
+        })
+        .collect()
+}
+
+async fn assert_historical_publish_keeps_strings(sparql: bool) {
+    let storage = HookedStorage::new(HistoricalRootGate::default());
+    let fluree = FlureeBuilder::memory().build_with(
+        storage.clone(),
+        NameServiceMode::ReadWrite(Arc::new(MemoryNameService::new())),
+    );
+    let ledger_id = "test/historical-publish:main";
+    let mut ledger = fluree.create_ledger(ledger_id).await.expect("create");
+    ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": ctx(), "@graph": historical_items(1)}),
+        )
+        .await
+        .expect("t=1")
+        .ledger;
+    let old_root = fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("index t=1")
+        .root_id;
+    for t in [2, 3] {
+        ledger = fluree
+            .insert(
+                ledger,
+                &json!({"@context": ctx(), "@graph": historical_items(t)}),
+            )
+            .await
+            .expect("insert")
+            .ledger;
+        assert_eq!(ledger.t(), t);
+    }
+    // The head path must be warm before arming: the gate belongs specifically
+    // to the historical snapshot load, not the cached handle's initial load.
+    let handle = fluree.ledger_cached(ledger_id).await.expect("cached head");
+    assert_eq!(handle.t().await, 3);
+    let query = json!({
+        "@context": ctx(),
+        "select": {"?s": ["ex:group", "ex:key", "ex:digest", "ex:doc", "ex:version"]},
+        "where": {"@id": "?s", "@type": "ex:Item", "ex:group": "g1"},
+        "orderBy": "?s",
+    });
+    let sparql_query = r#"
+        PREFIX ex: <http://example.org/>
+        SELECT ?group ?key ?digest ?doc ?version WHERE {
+            ?s a ex:Item; ex:group ?group; ex:key ?key; ex:digest ?digest;
+                ex:doc ?doc; ex:version ?version.
+            FILTER (?group = "g1")
+        } ORDER BY ?s
+    "#;
+    // Pin through the public historical loader directly so query preflight
+    // (e.g. virtual-dataset probes) cannot consume the one-shot race gate.
+    let read = || async {
+        let view = fluree.db_at_t(ledger_id, 2).await.expect("historical view");
+        let answer = if sparql {
+            fluree.query(&view, sparql_query).await
+        } else {
+            fluree.query(&view, &query).await
+        }
+        .expect("historical query");
+        answer
+            .to_jsonld_async(view.as_graph_db_ref())
+            .await
+            .expect("query JSON")
+    };
+    // Check against the actual transacted values, not just two reads agreeing.
+    let fields = ["ex:group", "ex:key", "ex:digest", "ex:doc", "ex:version"];
+    let expected = serde_json::Value::Array(
+        (1..=2)
+            .flat_map(historical_items)
+            .map(|mut item| {
+                if sparql {
+                    serde_json::Value::Array(fields.iter().map(|key| item[*key].clone()).collect())
+                } else {
+                    let object = item.as_object_mut().unwrap();
+                    object.remove("@id");
+                    object.remove("@type");
+                    item
+                }
+            })
+            .collect(),
+    );
+    assert_eq!(read().await, expected, "before publication");
+
+    *storage.hooks().digest.lock().unwrap() = Some(old_root.digest_hex());
+    let publish = async {
+        tokio::time::timeout(Duration::from_secs(60), storage.hooks().parked.notified())
+            .await
+            .expect("historical loader must read the old root");
+        let new_root = fluree
+            .reindex(ledger_id, ReindexOptions::default())
+            .await
+            .expect("publish index t=3")
+            .root_id;
+        assert_ne!(new_root, old_root, "index must actually advance");
+        let record = fluree
+            .nameservice()
+            .lookup(ledger_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.index_t, 3);
+        assert_eq!(record.index_head_id.as_ref(), Some(&new_root));
+        storage.hooks().release.notify_one();
+    };
+    let (during_publish, ()) = tokio::join!(read(), publish);
+    assert_eq!(
+        during_publish, expected,
+        "publishing an index must not replace historical data strings with commit metadata"
+    );
+    assert_eq!(read().await, expected, "the next pinned read must agree");
+}
+
+#[tokio::test]
+async fn historical_publish_keeps_jsonld_strings() {
+    assert_historical_publish_keeps_strings(false).await;
+}
+
+#[tokio::test]
+async fn historical_publish_keeps_sparql_strings() {
+    assert_historical_publish_keeps_strings(true).await;
 }

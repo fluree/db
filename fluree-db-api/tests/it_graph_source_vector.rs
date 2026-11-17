@@ -610,6 +610,54 @@ async fn vector_collection_exists() {
     assert!(!after_drop, "dropped collection should not exist");
 }
 
+/// A dropped vector index stays as a tombstone, and its snapshots are kept,
+/// but a search no longer resolves it.
+#[tokio::test]
+async fn vector_search_after_drop_is_not_found() {
+    use fluree_db_query::vector::{VectorIndexProvider, VectorSearchParams};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/dropped:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [
+            { "@id":"ex:doc1", "@type":"ex:Doc",
+              "ex:embedding": { "@value": [0.9, 0.1, 0.0], "@type": "@vector" } },
+            { "@id":"ex:doc2", "@type":"ex:Doc",
+              "ex:embedding": { "@value": [0.1, 0.9, 0.0], "@type": "@vector" } }
+        ]
+    });
+    fluree.insert(ledger0, &tx).await.unwrap();
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let cfg = VectorCreateConfig::new("dropped-vectors", ledger_id, query, "ex:embedding", 3);
+    let created = fluree.create_vector_index(cfg).await.unwrap();
+
+    let provider = FlureeIndexProvider::new(&fluree);
+    let query_vector = [1.0_f32, 0.0, 0.0];
+    let search = || {
+        provider.search(
+            &created.graph_source_id,
+            VectorSearchParams::new(&query_vector, DistanceMetric::Cosine, 10),
+        )
+    };
+    assert_eq!(search().await.expect("search before drop").len(), 2);
+
+    fluree
+        .drop_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    let err = search().await.expect_err("search after drop");
+    assert!(
+        err.to_string().contains("Graph source not found"),
+        "search after drop: {err}"
+    );
+}
+
 /// End-to-end test for f:queryVector query syntax through the query pipeline.
 ///
 /// This test verifies that vector search patterns in queries work correctly:
@@ -1020,4 +1068,145 @@ async fn vector_sync_with_nested_pattern_rebuilds_when_membership_changes() {
         0,
         "the document no longer matches the indexing query and must be gone"
     );
+}
+
+/// A drop names graphs, not the facts it took, so the commit walk finds
+/// nothing to remove: the sync after a drop of the graph the index reads
+/// rebuilds it from what the ledger still holds, keeping what was written
+/// since.
+#[tokio::test]
+async fn vector_sync_after_a_drop_rebuilds_from_what_the_ledger_holds() {
+    let fluree = FlureeBuilder::memory().build_memory();
+
+    let ledger_id = "vector/drop:main";
+    let doc = |id: &str, embedding: [f64; 3]| {
+        json!({
+            "@context": { "ex":"http://example.org/" },
+            "@graph": [ {
+                "@id": id, "@type":"ex:Doc",
+                "ex:embedding": { "@value": embedding, "@type": "@vector" }
+            } ]
+        })
+    };
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    fluree
+        .insert(ledger0, &doc("ex:doc1", [0.5, 0.5, 0.0]))
+        .await
+        .unwrap();
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let created = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "drop-test",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(created.vector_count, 1);
+
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update("DROP DEFAULT")
+        .commit()
+        .await
+        .unwrap();
+    let written = doc("ex:doc2", [0.0, 0.5, 0.5]);
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .insert(&written)
+        .commit()
+        .await
+        .unwrap();
+
+    let synced = fluree
+        .sync_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert!(synced.was_full_resync, "a drop takes the full rebuild");
+
+    let idx = fluree
+        .load_vector_index(&created.graph_source_id)
+        .await
+        .unwrap();
+    assert_eq!(idx.len(), 1);
+    assert!(idx.contains(ledger_id, "http://example.org/doc2"));
+    assert!(!idx.contains(ledger_id, "http://example.org/doc1"));
+}
+
+/// A vector index has no triples: named as the dataset it is refused, naming
+/// the `f:graphSource` form, not read as an empty graph.
+#[tokio::test]
+async fn a_vector_index_is_refused_as_a_dataset() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "vector/notagraph:main";
+    let ledger0 = support::genesis_ledger(&fluree, ledger_id);
+    let tx = json!({
+        "@context": { "ex":"http://example.org/" },
+        "@graph": [{
+            "@id":"ex:doc1", "@type":"ex:Doc",
+            "ex:embedding": { "@value": [0.1, 0.2, 0.3], "@type": "@vector" }
+        }]
+    });
+    let _ledger = fluree.insert(ledger0, &tx).await.unwrap().ledger;
+
+    let query = json!({
+        "@context": { "ex":"http://example.org/" },
+        "where": [{ "@id":"?x", "@type":"ex:Doc" }],
+        "select": { "?x": ["@id", "ex:embedding"] }
+    });
+    let gs = fluree
+        .create_vector_index(VectorCreateConfig::new(
+            "vector-notagraph",
+            ledger_id,
+            query,
+            "ex:embedding",
+            3,
+        ))
+        .await
+        .unwrap()
+        .graph_source_id;
+
+    for (route, result) in [
+        (
+            "SPARQL FROM",
+            fluree
+                .query_from()
+                .sparql(&format!("SELECT * FROM <{gs}> WHERE {{ ?s ?p ?o }}"))
+                .execute_formatted()
+                .await,
+        ),
+        (
+            "JSON-LD from",
+            fluree
+                .query_from()
+                .jsonld(&json!({
+                    "from": gs, "select": ["?s"], "where": {"@id": "?s", "?p": "?o"}
+                }))
+                .execute_formatted()
+                .await,
+        ),
+    ] {
+        let err = result.expect_err(route);
+        assert_eq!(
+            err.error_type(),
+            "err:db/GraphSourceNotAGraph",
+            "{route}: {err}"
+        );
+        assert!(
+            err.to_string().contains(&format!(
+                "graph source '{gs}' is a vector index, not a graph: query it with an \
+                 f:graphSource pattern"
+            )),
+            "{route}: {err}"
+        );
+    }
 }

@@ -488,6 +488,23 @@ impl ProxyStorage {
 
 #[async_trait]
 impl StorageRead for ProxyStorage {
+    /// Reads return what the upstream server sends, which is plaintext even
+    /// when that server encrypts at rest: this peer holds no key and cannot
+    /// tell. Encryption at rest is a property of the server's storage; a
+    /// peer's disk cache is outside it (see `docs/security/encryption.md`).
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    /// Reads are fetched from the upstream server.
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         match self.mode {
             // Raw mode: canonical CAS bytes, CID-verified client-side.

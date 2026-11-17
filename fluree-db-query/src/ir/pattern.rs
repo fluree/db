@@ -2,6 +2,7 @@
 //! `SubqueryPattern`, `ServicePattern`, plus the small `GraphName` /
 //! `ServiceEndpoint` types they depend on.
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use super::adapters::{
@@ -152,6 +153,10 @@ impl SubqueryPattern {
         for p in &mut self.patterns {
             p.substitute_var(old, new);
         }
+        let rename_order_bind: fn(&mut Expression, VarId, VarId) = self
+            .grouping
+            .as_ref()
+            .map_or(Expression::substitute_var, |g| g.group_row_renamer(old));
         if let Some(g) = &mut self.grouping {
             g.substitute_var(old, new);
         }
@@ -164,7 +169,7 @@ impl SubqueryPattern {
             if *v == old {
                 *v = new;
             }
-            expr.substitute_var(old, new);
+            rename_order_bind(expr, old, new);
         }
     }
 
@@ -357,6 +362,13 @@ pub enum Pattern {
     /// A basic triple pattern (subject, predicate, object)
     Triple(TriplePattern),
 
+    /// A triple pattern answered in SPARQL's view of RDF lists: its stored
+    /// triples that are not list members, and the list triples that match it
+    /// (see [`crate::list_view`]). Introduced by
+    /// [`crate::list_view::rewrite_patterns`] just before planning; no
+    /// lowering produces one.
+    ListView(crate::list_view::ListViewPattern),
+
     /// A filter expression to evaluate against each solution
     /// Positioned in where clause order for inline attachment
     Filter(Expression),
@@ -537,7 +549,129 @@ pub enum Pattern {
     },
 }
 
+/// Columns of a VALUES table that bind their variable on every row: those with
+/// no UNDEF cell. A table with no rows binds every column vacuously.
+pub fn values_bound_in_every_row<'a>(
+    vars: &'a [VarId],
+    rows: &'a [Vec<Binding>],
+) -> impl Iterator<Item = VarId> + 'a {
+    vars.iter()
+        .enumerate()
+        .filter(|(col, _)| {
+            rows.iter()
+                .all(|row| row.get(*col).is_some_and(Binding::is_bound))
+        })
+        .map(|(_, var)| *var)
+}
+
+/// Whether column `col` of a VALUES table is UNDEF on every row. A table with
+/// no rows has no such column: it emits no solution, not one of any value.
+pub fn values_column_all_undef(rows: &[Vec<Binding>], col: usize) -> bool {
+    !rows.is_empty()
+        && rows
+            .iter()
+            .all(|row| matches!(row.get(col), Some(Binding::Unbound)))
+}
+
+/// Variables some pattern of `patterns` may bind (the planner's
+/// `must_bind_vars` gives the ones bound on every row).
+pub fn produced_vars_of(patterns: &[Pattern]) -> HashSet<VarId> {
+    patterns.iter().flat_map(Pattern::produced_vars).collect()
+}
+
+/// How a pattern constrains the order of the other patterns in its group.
+///
+/// Every pass that reorders a group asks this rather than keeping its own list.
+/// Hand-kept lists drifted narrower than the planner's, each time as silent
+/// wrong rows around a left join or anti-join: #1924, #1690, the R2RML
+/// rewrite's OPTIONAL-only sort, then its fusions lifting a scan past a MINUS.
+/// [`Pattern::order_role`] is an exhaustive match, so a new kind of pattern is
+/// a decision made here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderRole {
+    /// Joins its group; free to move among the other joins.
+    Join,
+    /// OPTIONAL: a left join whose left side is what is written before it.
+    LeftJoin,
+    /// MINUS: an anti-join whose left side is what is written before it.
+    AntiJoin,
+    /// FILTER: constrains the whole group wherever it is written.
+    GroupFilter,
+    /// EXISTS / NOT EXISTS: a test over the whole group, which the planner
+    /// places after the patterns written before it.
+    GroupTest,
+}
+
+impl OrderRole {
+    /// Whether the patterns written before this one are its left side, so a
+    /// pattern written after it that shares one of its variables cannot move
+    /// above it (nor one written before it below).
+    pub fn is_positional(self) -> bool {
+        matches!(self, OrderRole::LeftJoin | OrderRole::AntiJoin)
+    }
+}
+
 impl Pattern {
+    /// This pattern's [`OrderRole`] in its group.
+    pub fn order_role(&self) -> OrderRole {
+        match self {
+            Pattern::Optional(_) => OrderRole::LeftJoin,
+            Pattern::Minus(_) => OrderRole::AntiJoin,
+            Pattern::Filter(_) => OrderRole::GroupFilter,
+            Pattern::Exists(_) | Pattern::NotExists(_) => OrderRole::GroupTest,
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Union(_)
+            | Pattern::Bind { .. }
+            | Pattern::Unwind { .. }
+            | Pattern::Values { .. }
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
+            | Pattern::Subquery(_)
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::DefaultGraphSource { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => OrderRole::Join,
+        }
+    }
+
+    /// Whether this pattern reads the dataset rather than its row alone. One
+    /// that does answers for the graph it runs in, so it cannot move into a
+    /// GRAPH or SERVICE body written beside it.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Pattern::Filter(expr) | Pattern::Bind { expr, .. } => expr.reads_dataset(),
+            Pattern::Unwind { list, .. } => list.reads_dataset(),
+            Pattern::Values { .. } => false,
+            Pattern::Triple(_)
+            | Pattern::ListView(_)
+            | Pattern::Optional(_)
+            | Pattern::Union(_)
+            | Pattern::Minus(_)
+            | Pattern::Exists(_)
+            | Pattern::NotExists(_)
+            | Pattern::PropertyPath(_)
+            | Pattern::ShortestPath(_)
+            | Pattern::Subquery(_)
+            | Pattern::IndexSearch(_)
+            | Pattern::VectorSearch(_)
+            | Pattern::R2rml(_)
+            | Pattern::GeoSearch(_)
+            | Pattern::S2Search(_)
+            | Pattern::Graph { .. }
+            | Pattern::Service(_)
+            | Pattern::DefaultGraphSource { .. }
+            | Pattern::EdgeAnnotation { .. }
+            | Pattern::AnnotationTarget { .. } => true,
+        }
+    }
+
     /// Apply `f` once to every immediate nested pattern list inside this
     /// pattern, reconstructing the surrounding container around the result.
     ///
@@ -614,6 +748,7 @@ impl Pattern {
         };
         match self {
             Pattern::Triple(tp) => tp.substitute_var(old, new),
+            Pattern::ListView(lv) => lv.triple.substitute_var(old, new),
             Pattern::Filter(expr) => expr.substitute_var(old, new),
             Pattern::Bind { var, expr } => {
                 rename(var);
@@ -745,6 +880,7 @@ impl Pattern {
                 inner.iter().flat_map(Pattern::referenced_vars).collect()
             }
             Pattern::PropertyPath(pp) => pp.referenced_vars(),
+            Pattern::ListView(lv) => lv.referenced_vars(),
             Pattern::ShortestPath(sp) => sp.referenced_vars(),
             Pattern::Subquery(sq) => sq.referenced_vars(),
             Pattern::IndexSearch(isp) => isp.referenced_vars(),
@@ -805,6 +941,7 @@ impl Pattern {
             Pattern::Values { vars, .. } => vars.clone(),
             Pattern::Minus(_) | Pattern::Exists(_) | Pattern::NotExists(_) => Vec::new(),
             Pattern::PropertyPath(pp) => pp.produced_vars(),
+            Pattern::ListView(lv) => lv.produced_vars(),
             Pattern::ShortestPath(sp) => sp.produced_vars(),
             Pattern::Subquery(sq) => sq.produced_vars(),
             Pattern::IndexSearch(isp) => isp.produced_vars(),

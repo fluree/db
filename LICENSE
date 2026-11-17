@@ -13,20 +13,37 @@ Licensed Work: Fluree DB version 4.0.0, and each subsequent version of
 Additional Use Grant: You may make use of the Licensed Work, provided that
  you may not use the Licensed Work for a Database Service.
 
- A "Database Service" is a commercial offering that allows third parties
- (other than your employees, contractors, and service providers acting
- solely on your behalf) to access a substantial portion of the
- functionality of the Licensed Work as a hosted or managed service,
- including where such third parties create, manage, query, transact
- against, or administer databases, ledgers, graphs, datasets, or similar
- data stores whose structure, contents, or access patterns are controlled
- by such third parties.
+ A "Database Service" is a commercial offering that provides third
+ parties (other than your employees, contractors, and service providers
+ acting solely on your behalf) with the Licensed Work, or a substantial
+ portion of its functionality, as a hosted or managed database for their
+ own purposes. This includes any offering in which such third parties
+ can:
 
- For clarity, using the Licensed Work as an internal component of your
- own application or service is permitted so long as your offering does
- not provide third parties with access to a substantial portion of the
- functionality of the Licensed Work itself as a database, graph database,
- ledger, or query service.
+   (a) create, provision, or administer their own databases, ledgers,
+       graphs, or similar data stores; or
+
+   (b) define their own schemas, ontologies, or data models and use the
+       Licensed Work to store, query, and manage data under them, as a
+       database for their own applications or purposes.
+
+ The purpose of this restriction is to prevent offering the Licensed Work
+ itself as a database product. It is not intended to restrict offerings
+ whose product is your data or your application. Accordingly, the
+ following are not a Database Service and are permitted:
+
+   (i)  using the Licensed Work as an internal component of your own
+        application or service, including where third parties query and
+        transact against that application's data directly through the
+        Licensed Work's interfaces, so long as you, not those third
+        parties, define the schema or data model of that data; and
+
+   (ii) offering third parties access to data whose contents you
+        determine, such as a dataset you collect, curate, or license,
+        including read-only query access to that data through predefined
+        queries, APIs, tools for AI agents, or a query endpoint (such as
+        a SPARQL endpoint) that accepts arbitrary read-only queries
+        written by those third parties.
 
 Change Date: The fourth anniversary of the first publicly available
  distribution of each specific version of the Licensed Work.

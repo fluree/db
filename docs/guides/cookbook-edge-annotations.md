@@ -12,7 +12,7 @@ Throughout, the running example is employment: a `worksFor` edge that needs a `r
 |---|---|---|
 | JSON-LD writes, or you need named-graph edges, or literal-valued edges | **JSON-LD `@annotation`** | Most complete surface — covers everything below. |
 | A SPARQL 1.1/1.2 pipeline, or you're porting RDF-star data | **SPARQL 1.2 annotation tail** (`{\| \|}`, `~`, `rdf:reifies`) | Standards syntax. Default-graph only today. |
-| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `upsert` / `import`) | Same on-disk shape as `@annotation`; the reified triple is asserted; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
+| A Turtle / N-Triples / TriG / N-Quads file with RDF 1.2 annotations | **Ingest it as-is** — `insert`, `upsert`, `import` and `graph sync` all accept `{\| \|}`, `~`, `<< >>` and `rdf:reifies <<( )>>`, and TriG `GRAPH { }` blocks accept them too (TriG via `insert` / `upsert` / `import` / `/sync`) | Same on-disk shape as `@annotation`; the reified triple is asserted; re-`upsert` the file to update claim bodies (see [Turtle ingest](../transactions/turtle.md#edge-annotations-rdf-12--turtle-star)). |
 
 ## Attach metadata to a relationship
 
@@ -239,7 +239,7 @@ The triple term `<<( s p o )>>` is accepted **only** as the object of `rdf:reifi
 
 ## Annotate an edge inside a named graph
 
-Edge annotations live in the same graph as the edge they reify. On the JSON-LD surface, name the target graph with a node-level `@graph` selector — the annotation is written into that same graph and carries the graph identity automatically:
+Edge annotations live in the same graph as the edge they reify. On the JSON-LD surface, name the target graph with a node-level `@graph` selector — the annotation is written into that same graph and carries the graph identity automatically. The selector covers the nodes nested under it too, so an annotated edge on a nested node lands in the same graph; an update's top-level `graph` key (or a `["graph", <iri>, ...]` template) scopes annotations the same way:
 
 ```json
 {

@@ -225,6 +225,7 @@ impl crate::Fluree {
             branch_store,
             plan,
             conflict_keys,
+            mut config,
             ..
         } = self
             .build_revert_context(ledger_name, branch, selection)
@@ -277,27 +278,30 @@ impl crate::Fluree {
             if opts.include_validation && !opts.conflict_strategy.aborts_on(conflicts.count) {
                 let mut commits = Vec::with_capacity(plan.ordered_commits.len());
                 for commit_id in plan.ordered_commits.iter().rev() {
-                    commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+                    let mut commit = load_commit_by_id(&branch_store, commit_id).await?;
+                    config.flakes(&mut commit.flakes);
+                    commits.push(commit);
                 }
                 let CollectedCommitData {
-                    flakes: inverted,
+                    net: undo,
                     namespace_delta,
-                    ..
+                    graph_iris,
                 } = collect_from_commits(commits, Fold::Undo);
                 let branch_state = self.ledger(&branch_id).await?;
                 let staged = self
                     .stage_revert(
                         branch_state,
-                        inverted,
+                        undo,
                         &all_conflict_keys,
                         &opts.conflict_strategy,
                         &namespace_delta,
+                        &graph_iris,
                     )
                     .await?;
                 Some(match staged {
                     Some((_view, outcome)) => ValidationSummary {
                         conforms: outcome.conforms(),
-                        report: outcome.report,
+                        report: outcome.report(),
                     },
                     // The strategy left nothing to apply, so nothing can reject
                     // it.

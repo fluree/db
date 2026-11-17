@@ -15,7 +15,7 @@
 //! use fluree_db_api::{FlureeBuilder, GraphDb};
 //!
 //! // Create a file-backed Fluree instance
-//! let fluree = FlureeBuilder::file("/data/fluree").build()?;
+//! let fluree = FlureeBuilder::file("/data/fluree").build_async().await?;
 //!
 //! // Create a new ledger
 //! let ledger = fluree.create_ledger("mydb").await?;
@@ -37,13 +37,16 @@
 pub mod admin;
 pub mod authorization;
 pub use authorization::PolicyAuthorization;
+pub mod advisory;
 pub mod block_fetch;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod bm25_worker;
 mod branch_validation;
 mod commit_data;
 pub mod commit_transfer;
+mod config_guard;
 pub mod config_resolver;
+mod config_vocab;
 #[cfg(feature = "credential")]
 pub mod credential;
 pub mod cross_ledger;
@@ -58,10 +61,13 @@ pub mod dataset;
 mod error;
 pub mod explain;
 pub mod export;
+pub mod export_annotations;
 pub mod export_builder;
 pub mod format;
 pub mod graph;
 pub mod graph_commit_builder;
+#[cfg(not(target_arch = "wasm32"))]
+mod graph_import;
 pub mod graph_query_builder;
 pub mod graph_snapshot;
 pub mod graph_source;
@@ -77,6 +83,7 @@ mod indexer_fulltext_provider;
 mod inline_ontology;
 #[cfg(feature = "shacl")]
 mod inline_shapes;
+pub mod key_rotation;
 mod ledger;
 pub mod ledger_info;
 #[cfg(not(target_arch = "wasm32"))]
@@ -96,12 +103,18 @@ pub mod profile;
 pub mod query;
 mod rebase;
 pub mod remote_service;
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+pub(crate) mod residency;
 mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
 pub mod server_defaults;
+#[cfg(feature = "native")]
+pub mod shared;
 pub(crate) mod sparql_lang;
+pub mod target_dataset;
 mod time_resolve;
+mod transaction;
 pub mod tx;
 pub mod tx_builder;
 #[cfg(feature = "shacl")]
@@ -149,8 +162,9 @@ pub use commit_transfer::{
     PushCommitsRequest, PushCommitsResponse, PushedHead, RestoreResult, StagedPush,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
-    TimeSpec,
+    sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
+    DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource, TimeSpec,
+    ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
@@ -161,10 +175,17 @@ pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
     ConflictKey, QueryCancellation, QueryCancellationReason,
 };
-pub use fluree_db_core::{CommitId, ContentId};
-pub use format::{AgentJsonContext, FormatError, FormatterConfig, OutputFormat, QueryOutput};
+pub use fluree_db_core::{
+    CommitId, ContentId, LedgerId, LedgerIdParseError, LedgerName, LedgerRef,
+};
+pub use format::{
+    sparql_service_description, AgentJsonContext, FormatError, FormatterConfig, OutputFormat,
+    QueryOutput,
+};
 pub use graph::Graph;
 pub use graph_commit_builder::{CommitBuilder, CommitDetail, ResolvedFlake, ResolvedValue};
+#[cfg(not(target_arch = "wasm32"))]
+pub use graph_import::graph_import_target;
 pub use graph_query_builder::{GraphQueryBuilder, GraphSnapshotQueryBuilder};
 pub use graph_snapshot::GraphSnapshot;
 pub use graph_source::{
@@ -175,17 +196,19 @@ pub use graph_transact_builder::{GraphTransactBuilder, StagedGraph};
 #[cfg(not(target_arch = "wasm32"))]
 pub use import::{
     is_bulk_import_file, scan_directory_format, CreateBuilder, DirectoryFormat,
-    EffectiveImportSettings, ImportBuilder, ImportConfig, ImportError, ImportPhase, ImportResult,
-    ImportSummary, RemoteSource,
+    EffectiveImportSettings, GraphImportTarget, ImportBuilder, ImportConfig, ImportError,
+    ImportPhase, ImportResult, ImportSummary, ImportedGraph, RemoteSource,
 };
-pub use ledger_info::{redact_graph_source_config, LedgerInfoBuilder};
+pub use ledger_info::{
+    redact_graph_source_config, redact_graph_source_record_config, LedgerInfoBuilder,
+};
 pub use ledger_manager::GuardedStagedCommit;
 pub use ledger_manager::{
     FreshnessCheck, FreshnessSource, LedgerHandle, LedgerManager, LedgerManagerConfig,
     LedgerWriteGuard, NotifyResult, NsNotify, RefreshOpts, RefreshResult, RemoteWatermark,
-    UpdatePlan, WritePathStats,
+    UpdatePlan, WritePathStats, WriterExclusion,
 };
-pub use ledger_view::{CommitRef, LedgerView, COMMIT_PREFIX_MIN_LEN};
+pub use ledger_view::{CommitRef, GraphNames, LedgerView, COMMIT_PREFIX_MIN_LEN};
 pub use merge::{MergeReport, StagedMerge};
 pub use merge_preview::{
     AncestorRef, BranchDelta, ChangeSummary, ConflictDetail, ConflictResolutionPreview,
@@ -204,6 +227,7 @@ pub use policy_view::{
 pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
+pub use query::helpers::sparql_pragma_tracking;
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{
@@ -211,38 +235,100 @@ pub use rebase::{
 };
 pub use revert::{RevertReport, RevertSelection, StagedRevert};
 pub use revert_preview::{RevertConflictSummary, RevertPreview, RevertPreviewOpts};
+#[cfg(feature = "native")]
+pub use shared::{SharedFluree, SharedOptions};
+pub use target_dataset::{
+    jsonld_dataset_ledger, jsonld_lane, jsonld_names_dataset, jsonld_view_ledger,
+    resolve_in_target, resolve_jsonld_dataset_in_target, GraphLookup, InTarget, JsonLdInTarget,
+    JsonLdLane, SingleFrom,
+};
+pub use transaction::{CypherReturn, Savepoint, Transaction, TransactionOptions, TxnOperation};
 pub use tx::{
     IndexingMode, IndexingStatus, StageResult, TrackedTransactionInput, TransactResult,
     TransactResultRef,
 };
-pub use tx_builder::{OwnedTransactBuilder, RefTransactBuilder, Staged};
+pub use tx_builder::{GraphPayload, OwnedTransactBuilder, RefTransactBuilder, Staged};
 pub use verify::{LedgerVerifyReport, VerifyProblem, VerifySeverity};
 pub use view::{
     ConfigReasoningBudget, DataSetDb, GraphDb, OwnedStreamQuery, QueryInput,
     ReasoningModePrecedence, StreamDatasetPlan, StreamQueryPlan,
 };
 
+#[cfg(feature = "sql")]
+pub use graph_source::sql_auth_from_json;
+/// A graph source's connection check, as a server reports it. Plain data, so
+/// a client built without `iceberg` can still read a server's outcome.
+pub use graph_source::ConnectionCheck;
+#[cfg(feature = "delta")]
+pub use graph_source::{azure_auth, delta_connection_from_json, unity_config, DeltaConnection};
+/// The one codec every surface turns its graph-source input into the
+/// persisted config with; see [`graph_source::surface`].
 #[cfg(feature = "iceberg")]
 pub use graph_source::{
-    browse_iceberg_catalog, guard_iceberg_connection_urls, preview_iceberg_table,
-    sample_column_values, sample_iceberg_rows, verify_storage_access, BrowseDepth, CatalogBrowse,
-    CatalogMode, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider, GenerateOptions,
-    GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig, IcebergCreateConfig,
-    IcebergCreateResult, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
-    R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, RestCatalogMode, SnapshotRef,
-    SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StructuredR2rmlMapping,
-    SubjectStrategy, TableIdentifier, TableOverride, TablePreview, TableRef, TableSchema,
-    ValidateR2rmlResponse,
+    default_google_quota_project, default_storage_auth, iceberg_connection_from_json,
+    iceberg_create_from_json, secret_field, AuthProfile, CatalogAuthFields, GraphSourceInputError,
+    IcebergConnectionFields, InputErrorKind, SecretRules, StorageAuthFields, SECRET_ENV_VARS_ENV,
+};
+#[cfg(feature = "iceberg")]
+pub use graph_source::{
+    guard_iceberg_connection_urls, BrowseDepth, CatalogBrowse, CatalogGrant, CatalogMode,
+    CatalogModeArgs, CatalogModeError, ColumnInfo, ColumnStats, Diagnostic, FlureeR2rmlProvider,
+    GenerateOptions, GenerateR2rmlRequest, GenerateR2rmlResponse, IcebergConnectionConfig,
+    IcebergCreateConfig, MaterializeResult, PartitionFieldInfo, PersistedMaterializeJob,
+    R2rmlCreateConfig, R2rmlCreateResult, R2rmlMappingInput, ResolvedStorage, RestCatalogMode,
+    SnapshotRef, SortFieldInfo, StatsCompleteness, StatsTier, StorageAccessReport, StorageDecision,
+    StructuredR2rmlMapping, SubjectStrategy, TableIdentifier, TableOverride, TablePreview,
+    TableRef, TableSchema, ValidateR2rmlResponse,
 };
 
+#[cfg(feature = "delta")]
+pub use fluree_db_delta::{
+    AzureAuth as DeltaAzureAuth, DeltaIoConfig, UnityConfig as DeltaUnityConfig,
+};
+#[cfg(feature = "delta")]
+pub use fluree_db_delta::{
+    BrowseDepth as DeltaBrowseDepth, DeclaredForeignKey as DeltaDeclaredForeignKey,
+    ListedTable as DeltaListedTable, UnityListing as DeltaUnityListing,
+};
+#[cfg(feature = "delta")]
+pub use fluree_db_iceberg::ConfigValue as DeltaConfigValue;
 #[cfg(feature = "sql")]
 pub use fluree_db_sql::{
     validate_sql_endpoint, AuthConfig as SqlAuthConfig, ConfigValue as SqlConfigValue, SqlDialect,
     SqlGsConfig, WireProtocol,
 };
+#[cfg(feature = "delta")]
+pub use graph_source::{
+    DeltaAzureFields, DeltaColumnInfo, DeltaCreateConfig, DeltaCreateResult, DeltaTableAccess,
+    DeltaTablePreview, DeltaUnityFields, GenerateDeltaR2rmlRequest, GenerateDeltaR2rmlResponse,
+};
 #[cfg(feature = "sql")]
 pub use graph_source::{SqlCheckResult, SqlCreateConfig, SqlCreateResult};
 
+/// A REST catalog's (or SQL endpoint's) auth, in its stored shape.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::auth::AuthConfig as IcebergAuthConfig;
+/// A Workload Identity Federation credential configuration, inline or held by
+/// a [`IcebergConfigValue`].
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::auth::ExternalAccountConfig;
+/// A graph-source secret: a literal, a secret reference, or the name of an
+/// environment variable of the reading process.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::ConfigValue as IcebergConfigValue;
+/// Which host-derived identities graph sources may use, and the AWS subject
+/// that signs Workload Identity Federation exchanges — injected per instance
+/// via [`Fluree::with_host_identity_policy`] /
+/// [`Fluree::with_aws_subject_credentials`].
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::{
+    AwsCredentials, AwsSubjectCredentials, HostIdentityKind, HostIdentityPolicy,
+    AMBIENT_BUCKETS_ENV, HOST_IDENTITIES_ENV,
+};
+/// A Google identity's credential source, and which identity reads a graph
+/// source's storage.
+#[cfg(feature = "iceberg")]
+pub use fluree_db_iceberg::{GoogleCredentials, StorageAuth};
 /// Secret-resolution injection point for `ConfigValue::SecretRef` in Iceberg
 /// graph-source auth. The host constructs a [`SecretResolver`] with the tenant
 /// captured and injects it via [`Fluree::with_secret_resolver`]; db stays
@@ -324,19 +410,24 @@ pub use fluree_db_query::{fast_paths_disabled, set_fast_paths_disabled};
 // Re-export for lower-level pattern-based queries (internal/advanced use)
 pub use fluree_db_query::{Term, TriplePattern};
 // Re-export parse types for query results
+pub use fluree_db_query::datalog_rules::{
+    Absence, Derivation, ExplainedFact, Explanation, GroupInputs, Premise,
+};
 pub use fluree_db_query::ir::Query;
 pub use fluree_db_query::parse::ParseError;
 pub use fluree_db_transact::{
     build_commit, lower_sparql_update, lower_sparql_update_ast, CommitOpts, CommitOptsRequest,
-    CommitReceipt, LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit,
+    CommitReceipt, GraphSel, LowerError as SparqlUpdateLowerError, NamespaceRegistry, StagedCommit,
     TransactError, Txn, TxnOpts, TxnType,
 };
 
 // Re-export SPARQL types (product feature; always enabled)
+pub use advisory::QueryAdvisory;
 pub use fluree_db_sparql::{
-    lower_sparql, parse_sparql, validate as validate_sparql, Capabilities as SparqlCapabilities,
-    Diagnostic as SparqlDiagnostic, LowerError as SparqlLowerError,
-    ParseOutput as SparqlParseOutput, Prologue as SparqlPrologue, QueryBody as SparqlQueryBody,
+    lower_sparql, parse_sparql, resolve_dataset_clause, validate as validate_sparql,
+    Capabilities as SparqlCapabilities, Diagnostic as SparqlDiagnostic,
+    LowerError as SparqlLowerError, ParamMap as SparqlParamMap, ParseOutput as SparqlParseOutput,
+    Prologue as SparqlPrologue, QueryBody as SparqlQueryBody, ResolvedDatasetClause,
     Severity as SparqlSeverity, SourceSpan as SparqlSourceSpan, SparqlAst,
     UpdateOperation as SparqlUpdateOperation,
 };
@@ -404,7 +495,7 @@ use fluree_db_nameservice::StorageNameService;
 use std::sync::Arc;
 
 // Re-export encryption types for convenient access
-pub use fluree_db_crypto::{EncryptedStorage, EncryptionKey, StaticKeyProvider};
+pub use fluree_db_crypto::{EncryptedStorage, EncryptionKey, MultiKeyProvider, StaticKeyProvider};
 pub use fluree_graph_json_ld::ParsedContext;
 // Appears in `ImportConfig` / `ImportBuilder::ndjson_first_line_context`, so
 // API consumers must be able to name it without a direct dependency on the
@@ -646,6 +737,16 @@ impl fluree_db_nameservice::NameServiceLookup for NameServiceMode {
         self.reader().all_records().await
     }
 
+    async fn branch_records(
+        &self,
+        ledger_name: &str,
+    ) -> std::result::Result<
+        Vec<fluree_db_nameservice::NsRecord>,
+        fluree_db_nameservice::NameServiceError,
+    > {
+        self.reader().branch_records(ledger_name).await
+    }
+
     async fn heads(
         &self,
         ledger_id: &str,
@@ -766,11 +867,57 @@ impl<S> TieredStorage<S> {
     }
 
     fn route_to_commit(address: &str) -> bool {
-        // Extract the path portion after :// if present (fluree:*://path)
-        let path = address.split("://").nth(1).unwrap_or(address);
+        tier_routes_to_commit(address)
+    }
+}
 
-        // Commit blobs + txn blobs go to commit storage.
-        path.contains("/commit/") || path.contains("/txn/")
+fn tier_routes_to_commit(address: &str) -> bool {
+    // Extract the path portion after :// if present (fluree:*://path)
+    let path = address.split("://").nth(1).unwrap_or(address);
+
+    // Commit blobs + txn blobs go to commit storage.
+    path.contains("/commit/") || path.contains("/txn/")
+}
+
+/// Encryption admin for a [`TieredStorage`] whose tiers both encrypt: each
+/// address goes to the tier that holds it, as reads and writes do.
+struct TieredEncryptionAdmin {
+    commit: Arc<dyn fluree_db_core::EncryptionAdmin>,
+    index: Arc<dyn fluree_db_core::EncryptionAdmin>,
+}
+
+impl TieredEncryptionAdmin {
+    fn tier(&self, address: &str) -> &Arc<dyn fluree_db_core::EncryptionAdmin> {
+        if tier_routes_to_commit(address) {
+            &self.commit
+        } else {
+            &self.index
+        }
+    }
+}
+
+#[async_trait]
+impl fluree_db_core::EncryptionAdmin for TieredEncryptionAdmin {
+    fn key_ids(&self) -> Vec<u32> {
+        self.commit.key_ids()
+    }
+
+    fn current_key_id(&self) -> u32 {
+        self.commit.current_key_id()
+    }
+
+    async fn key_id_at(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<u32>, fluree_db_core::Error> {
+        self.tier(address).key_id_at(address).await
+    }
+
+    async fn reencrypt(
+        &self,
+        address: &str,
+    ) -> std::result::Result<Option<u64>, fluree_db_core::Error> {
+        self.tier(address).reencrypt(address).await
     }
 }
 
@@ -817,6 +964,27 @@ where
     fn supports_ranged_reads(&self) -> bool {
         // No address to route on — claim support only if both tiers have it.
         self.commit.supports_ranged_reads() && self.index.supports_ranged_reads()
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.commit.permits_plaintext_cache() && self.index.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.commit.is_remote() || self.index.is_remote()
+    }
+
+    /// Both tiers encrypted under the same key set rotate as one store.
+    /// Otherwise there is no single key set to rotate to: `None`. In-repo
+    /// builds encrypt above the tiers instead, where this is not consulted.
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        let commit = self.commit.encryption_admin()?;
+        let index = self.index.encryption_admin()?;
+        if commit.key_ids() != index.key_ids() || commit.current_key_id() != index.current_key_id()
+        {
+            return None;
+        }
+        Some(Arc::new(TieredEncryptionAdmin { commit, index }))
     }
 
     async fn exists(&self, address: &str) -> std::result::Result<bool, fluree_db_core::Error> {
@@ -1044,6 +1212,35 @@ impl StorageRead for AddressIdentifierResolverStorage {
     fn resolve_local_path(&self, address: &str) -> Option<std::path::PathBuf> {
         self.route(address).resolve_local_path(address)
     }
+
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        self.route(address).resolve_local_bytes(address)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        // No address to route on — permit only if every routable storage does.
+        self.default.permits_plaintext_cache()
+            && self
+                .identifier_map
+                .values()
+                .all(fluree_db_core::StorageRead::permits_plaintext_cache)
+    }
+
+    fn is_remote(&self) -> bool {
+        self.default.is_remote()
+            || self
+                .identifier_map
+                .values()
+                .any(fluree_db_core::StorageRead::is_remote)
+    }
+
+    /// The default storage's admin. Every write and every listing goes to
+    /// the default, so it is the whole of what this node can rotate. Routed
+    /// storages are read-only here and carry their own keys; a routing admin
+    /// would rewrite blobs in storage this node only reads.
+    fn encryption_admin(&self) -> Option<Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        self.default.encryption_admin()
+    }
 }
 
 #[async_trait]
@@ -1111,25 +1308,87 @@ impl StorageMethod for AddressIdentifierResolverStorage {
 /// kept for backward compatibility.
 pub type FlureeClient = Fluree;
 
-// Callers live in the native-feature storage builders; the no-native shape
-// (wasm, or a native host building e.g. fluree-db-wasm's dep graph) has none.
-#[cfg_attr(not(feature = "native"), allow(dead_code))]
-fn decode_encryption_key_base64(key_str: &str) -> Result<[u8; 32]> {
-    use base64::Engine;
-    let decoded = base64::engine::general_purpose::STANDARD
-        .decode(key_str)
-        .map_err(|e| ApiError::config(format!("Invalid base64 encryption key: {e}")))?;
+/// The key provider a builder carries once a key is configured: the one
+/// place raw bytes or base64 become a provider, and the one place a
+/// storage gets wrapped. A newtype so the builder stays `Debug` without
+/// ever printing key material.
+#[derive(Clone)]
+struct ConfiguredKey(Arc<MultiKeyProvider>);
 
-    if decoded.len() != 32 {
-        return Err(ApiError::config(format!(
-            "Encryption key must be 32 bytes, got {} bytes",
-            decoded.len()
-        )));
+impl std::fmt::Debug for ConfiguredKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ConfiguredKey(<redacted>)")
+    }
+}
+
+impl ConfiguredKey {
+    fn from_bytes(key: [u8; 32]) -> Self {
+        Self::from_keys(vec![EncryptionKey::new(key, 0)], 0).expect("one key, id 0, is current")
     }
 
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&decoded);
-    Ok(key)
+    /// Base64 (standard or URL-safe), decoding to exactly 32 bytes.
+    fn from_base64(key_str: &str) -> Result<Self> {
+        let key = EncryptionKey::from_base64(key_str, 0)
+            .map_err(|e| ApiError::config(format!("Invalid encryption key: {e}")))?;
+        Self::from_keys(vec![key], 0)
+    }
+
+    fn from_keys(keys: Vec<EncryptionKey>, current_id: u32) -> Result<Self> {
+        MultiKeyProvider::new(keys, current_id)
+            .map(|provider| Self(Arc::new(provider)))
+            .map_err(|e| ApiError::config(format!("Invalid encryption key set: {e}")))
+    }
+
+    /// The key or key set a storage config carries, already validated by
+    /// the config parser for exclusivity and a current id.
+    fn from_storage_config(
+        storage_config: &fluree_db_connection::config::StorageConfig,
+    ) -> Result<Option<Self>> {
+        if let Some(key_str) = storage_config.aes256_key.as_deref() {
+            return Self::from_base64(key_str).map(Some);
+        }
+        if storage_config.aes256_keys.is_empty() {
+            return Ok(None);
+        }
+        let mut keys = Vec::with_capacity(storage_config.aes256_keys.len());
+        for entry in &storage_config.aes256_keys {
+            keys.push(
+                EncryptionKey::from_base64(&entry.key, entry.id).map_err(|e| {
+                    ApiError::config(format!("Invalid encryption key {}: {e}", entry.id))
+                })?,
+            );
+        }
+        let current = storage_config
+            .aes256_current_key
+            .ok_or_else(|| ApiError::config("AES256Keys requires AES256CurrentKey"))?;
+        Self::from_keys(keys, current).map(Some)
+    }
+
+    fn key_ids(&self) -> Vec<u32> {
+        fluree_db_crypto::KeyProvider::key_ids(&*self.0)
+    }
+
+    fn wrap(&self, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
+        Arc::new(EncryptedStorage::with_arc_keys(
+            storage,
+            Arc::clone(&self.0),
+        ))
+    }
+}
+
+/// Wrap `storage` in [`EncryptedStorage`] when the storage config carries
+/// an `AES256Key`.
+// Callers live in the native/aws storage builders; the no-native shape
+// (wasm, or a native host building e.g. fluree-db-wasm's dep graph) has none.
+#[cfg_attr(not(feature = "native"), allow(dead_code))]
+fn encrypt_storage_from_config(
+    storage: Arc<dyn Storage>,
+    storage_config: &fluree_db_connection::config::StorageConfig,
+) -> Result<Arc<dyn Storage>> {
+    match ConfiguredKey::from_storage_config(storage_config)? {
+        Some(key) => Ok(key.wrap(storage)),
+        None => Ok(storage),
+    }
 }
 
 /// Build an S3 storage instance from a StorageConfig.
@@ -1142,7 +1401,7 @@ async fn build_s3_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
-    use fluree_db_storage_aws::{S3Config as RawS3Config, S3Storage};
+    use fluree_db_storage_aws::S3Storage;
 
     let StorageType::S3(s3_config) = &storage_config.storage_type else {
         return Err(ApiError::config("Expected S3 storage config"));
@@ -1152,63 +1411,27 @@ async fn build_s3_storage_from_config(
         .await
         .map_err(|e| ApiError::config(format!("Failed to get AWS SDK config: {e}")))?;
 
-    let raw_config = RawS3Config {
-        bucket: s3_config.bucket.to_string(),
-        prefix: s3_config
-            .prefix
-            .as_ref()
-            .map(std::string::ToString::to_string),
-        endpoint: s3_config
-            .endpoint
-            .as_ref()
-            .map(std::string::ToString::to_string),
-        force_path_style: s3_config.force_path_style,
-        // Consolidate per-op timeouts to a single SDK operation timeout.
-        // Use the maximum to avoid unexpectedly shortening slower operations.
-        timeout_ms: {
-            let mut max_ms: Option<u64> = None;
-            for ms in [
-                s3_config.read_timeout_ms,
-                s3_config.write_timeout_ms,
-                s3_config.list_timeout_ms,
-            ]
-            .into_iter()
-            .flatten()
-            {
-                max_ms = Some(max_ms.map(|cur| cur.max(ms)).unwrap_or(ms));
-            }
-            max_ms
-        },
-        max_retries: s3_config.max_retries.map(|n| n as u32),
-        retry_base_delay_ms: s3_config.retry_base_delay_ms,
-        retry_max_delay_ms: s3_config.retry_max_delay_ms,
-        max_concurrent_requests: s3_config.max_concurrent_requests,
-    };
+    let storage = S3Storage::new(
+        sdk_config,
+        fluree_db_connection::aws::s3_config_from(s3_config),
+    )
+    .await
+    .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
-    let storage = S3Storage::new(sdk_config, raw_config)
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
-
-    // Wrap with encryption if key is configured
-    if let Some(key_str) = storage_config.aes256_key.as_ref() {
-        let key = decode_encryption_key_base64(key_str.as_ref())?;
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        Ok(Arc::new(EncryptedStorage::new(storage, key_provider)))
-    } else {
-        Ok(Arc::new(storage))
-    }
+    encrypt_storage_from_config(Arc::new(storage), storage_config)
 }
 
 /// Build a local (memory/file) storage instance from a StorageConfig.
 #[cfg(feature = "native")]
-fn build_local_storage_from_config(
+async fn build_local_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
 
     match &storage_config.storage_type {
-        StorageType::Memory => Ok(Arc::new(MemoryStorage::new())),
+        StorageType::Memory => {
+            encrypt_storage_from_config(Arc::new(MemoryStorage::new()), storage_config)
+        }
         StorageType::File => {
             let path = storage_config
                 .path
@@ -1219,15 +1442,8 @@ fn build_local_storage_from_config(
             // is startup, so the startup sweep of crash-orphaned staging
             // files is taken here explicitly.
             storage.sweep_orphaned_staging();
-            storage.recover_wal()?;
-            if let Some(key_str) = storage_config.aes256_key.as_ref() {
-                let key = decode_encryption_key_base64(key_str.as_ref())?;
-                let encryption_key = EncryptionKey::new(key, 0);
-                let key_provider = StaticKeyProvider::new(encryption_key);
-                Ok(Arc::new(EncryptedStorage::new(storage, key_provider)))
-            } else {
-                Ok(Arc::new(storage))
-            }
+            storage.recover_wal_async().await?;
+            encrypt_storage_from_config(Arc::new(storage), storage_config)
         }
         StorageType::S3(_) => Err(ApiError::config(
             "S3 storage in addressIdentifiers is only supported with 'aws' feature",
@@ -1240,7 +1456,7 @@ fn build_local_storage_from_config(
 
 /// Build a memory storage instance from a StorageConfig (non-native fallback).
 #[cfg(not(feature = "native"))]
-fn build_local_storage_from_config(
+async fn build_local_storage_from_config(
     storage_config: &fluree_db_connection::config::StorageConfig,
 ) -> Result<Arc<dyn Storage>> {
     use fluree_db_connection::config::StorageType;
@@ -1295,6 +1511,15 @@ fn build_indexer_config(config: &ConnectionConfig) -> wasm_compat::IndexerConfig
         .and_then(|i| i.gc_min_time_mins)
     {
         indexer_config.gc_min_time_mins = min_time.min(u32::MAX as u64) as u32;
+    }
+
+    if let Some(ceiling) = config
+        .defaults
+        .as_ref()
+        .and_then(|d| d.indexing.as_ref())
+        .and_then(|i| i.gc_hard_max_old_indexes)
+    {
+        indexer_config.gc_hard_max_old_indexes = Some(ceiling.min(u32::MAX as u64) as u32);
     }
 
     indexer_config
@@ -1352,8 +1577,12 @@ pub struct FlureeBuilder {
     /// several processes. See `FileStorage::with_wal_owner`.
     #[cfg(feature = "native")]
     storage_wal_owner: Option<String>,
+    /// Hold the file storage root's lock for the instance's lifetime.
+    /// See [`FlureeBuilder::with_storage_lock`].
+    #[cfg(feature = "native")]
+    storage_lock: bool,
     /// Optional encryption key (base64-encoded or raw 32 bytes)
-    encryption_key: Option<[u8; 32]>,
+    encryption_key: Option<ConfiguredKey>,
     /// Optional ledger cache configuration (enables LedgerManager)
     ledger_cache_config: Option<LedgerManagerConfig>,
     /// Optional background indexing configuration.
@@ -1387,10 +1616,26 @@ pub struct FlureeBuilder {
     event_bus: Option<Arc<fluree_db_nameservice::LedgerEventBus>>,
     /// Read-only remote mounts applied at build time (alias-prefixed).
     remote_mounts: Vec<RemoteMountSpec>,
-    /// Optional secret resolver forwarded to the built `Fluree` for
-    /// `ConfigValue::SecretRef` hydration. See [`FlureeBuilder::with_secret_resolver`].
+    /// The identity context forwarded to the built `Fluree`: the secret
+    /// resolver for `ConfigValue::SecretRef` hydration, the host-identity
+    /// policy, and the AWS subject for Workload Identity Federation. See
+    /// [`FlureeBuilder::with_secret_resolver`],
+    /// [`FlureeBuilder::with_host_identity_policy`] and
+    /// [`FlureeBuilder::with_aws_subject_credentials`].
     #[cfg(feature = "iceberg")]
-    secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    identity: fluree_db_iceberg::IdentityContext,
+}
+
+/// The identity context an instance starts with: no secret resolver, and the
+/// operator's host-identity policy from the environment
+/// ([`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env)),
+/// which allows every host identity when its variables are unset.
+#[cfg(feature = "iceberg")]
+fn default_identity_context() -> fluree_db_iceberg::IdentityContext {
+    fluree_db_iceberg::IdentityContext {
+        policy: fluree_db_iceberg::HostIdentityPolicy::from_env(),
+        ..fluree_db_iceberg::IdentityContext::default()
+    }
 }
 
 /// Configuration for background indexing in `FlureeBuilder`.
@@ -1565,10 +1810,10 @@ pub fn spawn_local_cache_event_listener(
 /// Reconcile one cached ledger against the current nameservice head.
 /// A no-op when the cache is already current or the ledger isn't
 /// loaded. Shared by the per-event path and the lag catch-up sweep.
-async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &str) {
+async fn reconcile_cached_ledger(ledger_manager: &LedgerManager, ledger_id: &LedgerId) {
     match ledger_manager
         .notify(NsNotify {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: ledger_id.clone(),
             record: None,
         })
         .await
@@ -1622,12 +1867,14 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         }
     }
 
@@ -1645,12 +1892,14 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         }
     }
 
@@ -1692,6 +1941,8 @@ impl FlureeBuilder {
             storage_type: StorageType::S3(s3),
             path: None,
             aes256_key: None,
+            aes256_keys: Vec::new(),
+            aes256_current_key: None,
             address_identifier: None,
             durability: None,
         };
@@ -1722,12 +1973,14 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         }
     }
 
@@ -1827,10 +2080,10 @@ impl FlureeBuilder {
     /// let key = [0u8; 32]; // Use a secure key in production
     /// let fluree = FlureeBuilder::file("/data")
     ///     .with_encryption_key(key)
-    ///     .build_encrypted()?;
+    ///     .build()?;
     /// ```
     pub fn with_encryption_key(mut self, key: [u8; 32]) -> Self {
-        self.encryption_key = Some(key);
+        self.encryption_key = Some(ConfiguredKey::from_bytes(key));
         self
     }
 
@@ -1844,25 +2097,41 @@ impl FlureeBuilder {
     /// ```ignore
     /// let fluree = FlureeBuilder::file("/data")
     ///     .with_encryption_key_base64("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")?
-    ///     .build_encrypted()?;
+    ///     .build()?;
     /// ```
     pub fn with_encryption_key_base64(mut self, base64_key: &str) -> Result<Self> {
-        use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(base64_key)
-            .map_err(|e| ApiError::config(format!("Invalid base64 encryption key: {e}")))?;
-
-        if decoded.len() != 32 {
-            return Err(ApiError::config(format!(
-                "Encryption key must be 32 bytes, got {} bytes",
-                decoded.len()
-            )));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        self.encryption_key = Some(key);
+        self.encryption_key = Some(ConfiguredKey::from_base64(base64_key)?);
         Ok(self)
+    }
+
+    /// Set a rotation key set: every key in `keys` decrypts, the one with
+    /// id `current_id` encrypts new writes. Ids are recorded in envelope
+    /// headers, so they must stay stable across restarts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `keys` is empty, two keys share an id, or no key
+    /// has `current_id`.
+    pub fn with_encryption_keys(
+        mut self,
+        keys: Vec<(u32, [u8; 32])>,
+        current_id: u32,
+    ) -> Result<Self> {
+        let keys = keys
+            .into_iter()
+            .map(|(id, bytes)| EncryptionKey::new(bytes, id))
+            .collect();
+        self.encryption_key = Some(ConfiguredKey::from_keys(keys, current_id)?);
+        Ok(self)
+    }
+
+    /// Ids of the configured encryption keys, current first; empty when
+    /// the builder carries no key. Never the key material.
+    pub fn encryption_key_ids(&self) -> Vec<u32> {
+        self.encryption_key
+            .as_ref()
+            .map(ConfiguredKey::key_ids)
+            .unwrap_or_default()
     }
 
     /// Create a builder from JSON-LD configuration.
@@ -1880,19 +2149,25 @@ impl FlureeBuilder {
     ///
     /// ```json
     /// {
-    ///   "@context": {"@vocab": "https://ns.flur.ee/system#"},
-    ///   "@graph": [{
-    ///     "@type": "Connection",
-    ///     "indexStorage": {
+    ///   "@context": {
+    ///     "@base": "https://ns.flur.ee/config/connection/",
+    ///     "@vocab": "https://ns.flur.ee/system#"
+    ///   },
+    ///   "@graph": [
+    ///     {
+    ///       "@id": "storage",
     ///       "@type": "Storage",
     ///       "filePath": "/data/fluree",
     ///       "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-    ///     }
-    ///   }]
+    ///     },
+    ///     {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+    ///   ]
     /// }
     /// ```
     ///
-    /// The key should be base64-encoded, 32 bytes when decoded.
+    /// Nodes are located by `@id`, so every node needs one. The key should
+    /// be base64-encoded, 32 bytes when decoded, and is honoured by every
+    /// terminal build method.
     pub fn from_json_ld(json: &serde_json::Value) -> Result<Self> {
         let config = ConnectionConfig::from_json_ld(json)
             .map_err(|e| ApiError::config(format!("Invalid JSON-LD config: {e}")))?;
@@ -1905,12 +2180,7 @@ impl FlureeBuilder {
             .as_ref()
             .map(std::string::ToString::to_string);
 
-        // Extract encryption key if configured
-        let encryption_key = if let Some(key_str) = &config.index_storage.aes256_key {
-            Some(Self::decode_encryption_key(key_str)?)
-        } else {
-            None
-        };
+        let encryption_key = ConfiguredKey::from_storage_config(&config.index_storage)?;
 
         // Extract indexing config if enabled in JSON-LD defaults
         let indexing_config = if is_indexing_enabled(&config) {
@@ -1936,32 +2206,15 @@ impl FlureeBuilder {
             storage_durability: None,
             #[cfg(feature = "native")]
             storage_wal_owner: None,
+            #[cfg(feature = "native")]
+            storage_lock: false,
             indexer_config_user_set: false,
             remote_connections: remote_service::RemoteConnectionRegistry::new(),
             event_bus: None,
             remote_mounts: Vec::new(),
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
         })
-    }
-
-    /// Decode a base64-encoded encryption key to 32 bytes.
-    fn decode_encryption_key(key_str: &str) -> Result<[u8; 32]> {
-        use base64::Engine;
-        let decoded = base64::engine::general_purpose::STANDARD
-            .decode(key_str)
-            .map_err(|e| ApiError::config(format!("Invalid base64 encryption key: {e}")))?;
-
-        if decoded.len() != 32 {
-            return Err(ApiError::config(format!(
-                "Encryption key must be 32 bytes, got {} bytes",
-                decoded.len()
-            )));
-        }
-
-        let mut key = [0u8; 32];
-        key.copy_from_slice(&decoded);
-        Ok(key)
     }
 
     /// Set the maximum cache size in MB.
@@ -2061,6 +2314,61 @@ impl FlureeBuilder {
     pub fn with_storage_wal_owner(mut self, owner: impl Into<String>) -> Self {
         self.storage_wal_owner = Some(owner.into());
         self
+    }
+
+    /// Hold an exclusive lock on the file storage root for as long as the
+    /// built instance is open, so nothing else opens the root meanwhile.
+    ///
+    /// One instance owns a root: a second instance on it, in another
+    /// process or this one, does not see the first's commits, and both run
+    /// indexing and sweeps over the same files. With the lock, building that
+    /// second instance fails with [`ApiError::StorageInUse`]. Share the
+    /// built `Fluree` by cloning it within a process, and run a server to
+    /// share the root across processes.
+    ///
+    /// The lock lasts as long as the instance: it is released once the
+    /// instance and every clone of it are dropped, or its process exits,
+    /// however it exits. Any error taking it fails the build, including a
+    /// filesystem that cannot lock, unless
+    /// [`fluree_db_core::ALLOW_UNLOCKED_ENV_VAR`] allows opening such a root
+    /// unprotected. Only file storage is locked. A root shared on purpose
+    /// under per-process WALs ([`Self::with_storage_wal_owner`]) cannot take
+    /// it.
+    #[cfg(feature = "native")]
+    pub fn with_storage_lock(mut self) -> Self {
+        self.storage_lock = true;
+        self
+    }
+
+    /// The root lock [`Self::with_storage_lock`] asked for, taken before the
+    /// root is swept or its WAL replayed.
+    #[cfg(feature = "native")]
+    fn lock_storage_root(&self, path: &str) -> Result<Option<Arc<fluree_db_core::RootLock>>> {
+        if !self.storage_lock {
+            return Ok(None);
+        }
+        if self.storage_wal_owner.is_some() {
+            return Err(ApiError::config(
+                "a storage lock cannot be combined with a shared WAL owner: \
+                 the owner exists for roots that several processes open",
+            ));
+        }
+        use fluree_db_core::RootLockError;
+        match fluree_db_core::RootLock::acquire(std::path::Path::new(path)) {
+            Ok(lock) => Ok(Some(Arc::new(lock))),
+            Err(RootLockError::Held { holder }) => Err(ApiError::StorageInUse {
+                root: path.to_string(),
+                holder,
+            }),
+            Err(RootLockError::Unsupported(error)) => Err(ApiError::config(format!(
+                "storage '{path}' is on a filesystem that cannot lock it ({error}); set \
+                 {}=true to open it without protection from a second process",
+                fluree_db_core::ALLOW_UNLOCKED_ENV_VAR
+            ))),
+            Err(RootLockError::Io(error)) => Err(ApiError::Core(fluree_db_core::Error::io(
+                format!("cannot lock storage '{path}': {error}"),
+            ))),
+        }
     }
 
     /// Apply the builder's durability and log owner, if chosen, to a storage
@@ -2217,13 +2525,15 @@ impl FlureeBuilder {
     /// default; order relative to [`Self::with_indexing_thresholds`] does not
     /// matter, since each preserves the other's half of the config.
     ///
-    /// `max_old_indexes` and `min_time_mins` are ANDed, so under a fast publish
-    /// rate the age guard always wins and the count target bounds nothing.
-    /// `hard_max_old_indexes` is an opt-in ceiling past which the guard is
-    /// overridden. It bounds retained versions, not bytes, and overriding the
-    /// guard can release artifacts a query still reading an older version
-    /// needs; see `CleanGarbageConfig::hard_max_old_indexes` in
-    /// `fluree_db_indexer::gc` for the trade-off.
+    /// `min_time_mins` is the age guard: a superseded version is kept that long
+    /// so a query that started on it can finish. `hard_max_old_indexes` is a
+    /// ceiling (default 10) past which versions go whatever their age, and
+    /// `max_old_indexes` an optional floor (default 0) kept whatever its age.
+    /// The ceiling bounds retained versions, not bytes, and can release
+    /// artifacts a query still reading an older version needs; see
+    /// `CleanGarbageConfig::hard_max_old_indexes` in `fluree_db_indexer::gc`
+    /// for the trade-off. To remove it, set
+    /// `IndexerConfig::gc_hard_max_old_indexes` to `None`.
     pub fn with_gc_settings(
         mut self,
         max_old_indexes: Option<u32>,
@@ -2335,46 +2645,121 @@ impl FlureeBuilder {
         mut self,
         resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
     ) -> Self {
-        self.secret_resolver = Some(resolver);
+        self.identity.secret_resolver = Some(resolver);
+        self
+    }
+
+    /// Set which host-derived identities graph sources built by this instance
+    /// may use (the ambient AWS chain, the GCE metadata server, the host's
+    /// gcloud ADC, host-signed Workload Identity Federation). Defaults to
+    /// [`HostIdentityPolicy::from_env`](fluree_db_iceberg::HostIdentityPolicy::from_env),
+    /// the operator's `FLUREE_GRAPH_SOURCE_HOST_IDENTITIES` and
+    /// `FLUREE_GRAPH_SOURCE_AMBIENT_BUCKETS`, which allows all of them when
+    /// neither is set.
+    /// Forwarded to the finalized `Fluree`; see [`Fluree::with_host_identity_policy`].
+    #[cfg(feature = "iceberg")]
+    pub fn with_host_identity_policy(
+        mut self,
+        policy: fluree_db_iceberg::HostIdentityPolicy,
+    ) -> Self {
+        self.identity.policy = policy;
+        self
+    }
+
+    /// Set the AWS credentials that sign Workload Identity Federation subject
+    /// tokens for Google graph-source identities, instead of the host's own
+    /// aws-config chain. Forwarded to the finalized `Fluree`; see
+    /// [`Fluree::with_aws_subject_credentials`].
+    #[cfg(feature = "iceberg")]
+    pub fn with_aws_subject_credentials(
+        mut self,
+        subject: Arc<dyn fluree_db_iceberg::AwsSubjectCredentials>,
+    ) -> Self {
+        self.identity.aws_subject = Some(subject);
         self
     }
 
     /// Build a file-backed Fluree instance
     ///
-    /// Returns an error if storage_path is not set.
+    /// Returns an error if storage_path is not set. A key set on the builder
+    /// (`with_encryption_key*()` or `AES256Key` in JSON-LD) encrypts the
+    /// storage; the file nameservice stays plaintext.
     ///
     /// Indexing is enabled by default for `file`-constructed builders; call
     /// `without_indexing()` to opt out (see that method for when that's
     /// appropriate). When indexing is enabled, a `BackgroundIndexerWorker` is
     /// spawned on the tokio runtime, so `build()` must be called within a
     /// tokio context.
+    ///
+    /// It recovers the storage root's WAL on the calling thread.
+    /// From async code, use [`Self::build_async`].
     #[cfg(feature = "native")]
     pub fn build(mut self) -> Result<Fluree> {
+        let (storage, root_lock) = self.open_file_storage()?;
+        storage.recover_wal()?;
+        Ok(self.build_file(storage).holding(root_lock))
+    }
+
+    /// Build a file-backed Fluree instance, recovering the storage root's WAL
+    /// without blocking the caller.
+    ///
+    /// It builds the same instance as [`Self::build`].
+    #[cfg(feature = "native")]
+    pub async fn build_async(mut self) -> Result<Fluree> {
+        let (storage, root_lock) = self.open_file_storage()?;
+        let root_lock = Self::recover_holding(&storage, root_lock).await?;
+        Ok(self.build_file(storage).holding(root_lock))
+    }
+
+    /// Replay `storage`'s WAL in a task that holds `root_lock` until the
+    /// replay ends. The replay runs on the blocking pool and goes on when the
+    /// caller stops waiting, so the lock must not go with the caller's future.
+    #[cfg(feature = "native")]
+    async fn recover_holding(
+        storage: &FileStorage,
+        root_lock: Option<Arc<fluree_db_core::RootLock>>,
+    ) -> Result<Option<Arc<fluree_db_core::RootLock>>> {
+        let storage = storage.clone();
+        tokio::spawn(async move { storage.recover_wal_async().await.map(|()| root_lock) })
+            .await
+            .map_err(|e| ApiError::internal(format!("WAL recovery task failed: {e}")))?
+            .map_err(Into::into)
+    }
+
+    /// Takes the builder's storage path and opens its file storage, with
+    /// the root's lock when one was asked for.
+    ///
+    /// Building an instance is startup, so this starts the sweep of staging
+    /// files a crash left behind. The sweep runs once per base path per
+    /// process. The file nameservice shares the tree and needs no sweep of its own.
+    #[cfg(feature = "native")]
+    fn open_file_storage(
+        &mut self,
+    ) -> Result<(FileStorage, Option<Arc<fluree_db_core::RootLock>>)> {
         let path = self
             .storage_path
             .take()
             .ok_or_else(|| ApiError::config("File storage requires a path"))?;
-
+        let root_lock = self.lock_storage_root(&path)?;
         let storage = self.file_storage(&path);
-        // Building the instance is startup: reclaim staging files a crash
-        // left behind. Explicit here rather than a side effect of `new`, and
-        // once per base path per process — the nameservice below shares this
-        // tree and needs no sweep of its own.
         storage.sweep_orphaned_staging();
-        // Likewise the WAL: acknowledged writes a crash left unflushed
-        // are applied before anything reads this tree.
-        storage.recover_wal()?;
+        Ok((storage, root_lock))
+    }
+
+    /// Assembles a file-backed instance over `storage`, whose WAL is already recovered.
+    #[cfg(feature = "native")]
+    fn build_file(self, storage: FileStorage) -> Fluree {
         let nameservice = FileNameService::with_storage(storage.clone());
         let event_bus = self.resolve_event_bus();
         let notifying =
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let backend = StorageBackend::Managed(Arc::new(storage));
+        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
         let index_config = self.derive_indexing();
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Ok(Self::finalize_with_backend(
+        Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2388,8 +2773,8 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        ))
+            self.identity,
+        )
     }
 
     /// Build a Fluree instance with custom storage and nameservice.
@@ -2429,6 +2814,14 @@ impl FlureeBuilder {
         nameservice: NameServiceMode,
     ) -> Fluree {
         self.warn_if_discarding_indexer_config("build_with");
+        // Wrapping here could double-encrypt a storage the caller already
+        // wrapped, so the key is left to the caller — but not silently.
+        if self.has_encryption_key() {
+            tracing::warn!(
+                build_path = "build_with",
+                "a configured encryption key is ignored: this path uses the storage you supplied"
+            );
+        }
         let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
         Self::finalize_with_backend(
@@ -2445,14 +2838,15 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         )
     }
 
     /// Build a file-backed Fluree instance with AES-256-GCM encryption.
     ///
-    /// Uses the provided `key` argument for encryption. Any key previously set on the
-    /// builder via `with_encryption_key()` or JSON-LD config is ignored.
+    /// Equivalent to `with_encryption_key(key).build()`: the `key` argument
+    /// replaces any key previously set on the builder via
+    /// `with_encryption_key()` or JSON-LD config.
     ///
     /// To use a key configured on the builder, use [`build_encrypted_from_config()`] instead.
     ///
@@ -2479,8 +2873,7 @@ impl FlureeBuilder {
     /// callers should zeroize their own key copies if needed.
     #[cfg(feature = "native")]
     pub fn build_encrypted(self, key: [u8; 32]) -> Result<Fluree> {
-        // Always use the explicitly provided key
-        self.build_encrypted_internal(key)
+        self.with_encryption_key(key).build()
     }
 
     /// Build a file-backed Fluree instance with encryption using the configured key.
@@ -2497,75 +2890,45 @@ impl FlureeBuilder {
     /// ```ignore
     /// // From JSON-LD config with environment variable
     /// let config = json!({
-    ///     "@context": {"@vocab": "https://ns.flur.ee/system#"},
-    ///     "@graph": [{
-    ///         "@type": "Connection",
-    ///         "indexStorage": {
+    ///     "@context": {
+    ///         "@base": "https://ns.flur.ee/config/connection/",
+    ///         "@vocab": "https://ns.flur.ee/system#"
+    ///     },
+    ///     "@graph": [
+    ///         {
+    ///             "@id": "storage",
     ///             "@type": "Storage",
     ///             "filePath": "/data/fluree",
     ///             "AES256Key": {"envVar": "FLUREE_ENCRYPTION_KEY"}
-    ///         }
-    ///     }]
+    ///         },
+    ///         {"@id": "connection", "@type": "Connection", "indexStorage": {"@id": "storage"}}
+    ///     ]
     /// });
     /// let fluree = FlureeBuilder::from_json_ld(&config)?
     ///     .build_encrypted_from_config()?;
     /// ```
     #[cfg(feature = "native")]
     pub fn build_encrypted_from_config(self) -> Result<Fluree> {
-        let key = self.encryption_key.ok_or_else(|| {
-            ApiError::config("No encryption key configured. Set via with_encryption_key(), with_encryption_key_base64(), or AES256Key in JSON-LD config")
-        })?;
-        self.build_encrypted_internal(key)
-    }
-
-    /// Internal helper to build encrypted storage
-    #[cfg(feature = "native")]
-    fn build_encrypted_internal(mut self, key: [u8; 32]) -> Result<Fluree> {
-        let path = self
-            .storage_path
-            .take()
-            .ok_or_else(|| ApiError::config("File storage requires a path"))?;
-
-        let file_storage = self.file_storage(&path);
-        // Startup sweep, before the encryption wrapper hides the concrete
-        // storage. Staging debris is on-disk state, not content, so the
-        // sweep is the same for an encrypted tree.
-        file_storage.sweep_orphaned_staging();
-        file_storage.recover_wal()?;
-        let nameservice = FileNameService::with_storage(file_storage.clone());
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        let storage = EncryptedStorage::new(file_storage, key_provider);
-        let event_bus = self.resolve_event_bus();
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-        let attachment_provider_cell = Self::new_attachment_provider_cell();
-        let indexing_mode =
-            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Ok(Self::finalize_with_backend(
-            self.ledger_cache_config,
-            self.config,
-            RuntimeParts {
-                backend,
-                nameservice: ns_mode,
-                event_bus,
-                indexing_mode,
-                index_config,
-                attachment_provider_cell,
-            },
-            self.remote_connections,
-            self.remote_mounts,
-            #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        ))
+        if !self.has_encryption_key() {
+            return Err(ApiError::config("No encryption key configured. Set via with_encryption_key(), with_encryption_key_base64(), or AES256Key in JSON-LD config"));
+        }
+        self.build()
     }
 
     /// Check if this builder has an encryption key configured.
     pub fn has_encryption_key(&self) -> bool {
         self.encryption_key.is_some()
+    }
+
+    /// Wrap `storage` in [`EncryptedStorage`] when this builder carries a
+    /// key. Every terminal build path routes its base storage through here,
+    /// so a key set by `with_encryption_key*()` or parsed from JSON-LD is
+    /// honoured on every backend rather than dropped by one backend's path.
+    fn encrypt_if_configured(&self, storage: Arc<dyn Storage>) -> Arc<dyn Storage> {
+        match &self.encryption_key {
+            Some(key) => key.wrap(storage),
+            None => storage,
+        }
     }
 
     /// Build a memory-backed Fluree instance
@@ -2576,9 +2939,11 @@ impl FlureeBuilder {
     /// outlive the `Fluree` handle. Use `set_indexing_mode` after building
     /// if you need it, or switch to a persistent builder (`file`, `s3`,
     /// `ipfs`), which enable indexing by default.
+    ///
+    /// A key set on the builder encrypts the storage, as on every build path.
     pub fn build_memory(self) -> Fluree {
         self.warn_if_discarding_indexer_config("build_memory");
-        let storage = MemoryStorage::new();
+        let storage = self.encrypt_if_configured(Arc::new(MemoryStorage::new()));
         let nameservice = MemoryNameService::new();
         let event_bus = self.resolve_event_bus();
         let notifying =
@@ -2589,7 +2954,7 @@ impl FlureeBuilder {
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
-                backend: StorageBackend::Managed(Arc::new(storage)),
+                backend: StorageBackend::Managed(storage),
                 nameservice: ns_mode,
                 event_bus,
                 indexing_mode: tx::IndexingMode::Disabled,
@@ -2599,44 +2964,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        )
-    }
-
-    /// Build a memory-backed Fluree instance with AES-256-GCM encryption
-    ///
-    /// Useful for testing encryption without touching the filesystem.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - 32-byte AES-256 encryption key
-    pub fn build_memory_encrypted(self, key: [u8; 32]) -> Fluree {
-        self.warn_if_discarding_indexer_config("build_memory_encrypted");
-        let mem_storage = MemoryStorage::new();
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        let storage = EncryptedStorage::new(mem_storage, key_provider);
-        let nameservice = MemoryNameService::new();
-        let event_bus = self.resolve_event_bus();
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying));
-        let index_config = self.derive_indexing();
-        Self::finalize_with_backend(
-            self.ledger_cache_config,
-            self.config,
-            RuntimeParts {
-                backend: StorageBackend::Managed(Arc::new(storage)),
-                nameservice: ns_mode,
-                event_bus,
-                indexing_mode: tx::IndexingMode::Disabled,
-                index_config,
-                attachment_provider_cell: Self::new_attachment_provider_cell(),
-            },
-            self.remote_connections,
-            self.remote_mounts,
-            #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         )
     }
 
@@ -2644,9 +2972,10 @@ impl FlureeBuilder {
     ///
     /// Stores content-addressed data (commits, indexes) in IPFS via the Kubo
     /// HTTP RPC API. The nameservice is in-memory only — ledger heads and
-    /// branch metadata do not persist across restarts. For persistent
-    /// nameservice, compose your own with [`build_with`] using
-    /// [`fluree_db_storage_ipfs::IpfsStorage`].
+    /// branch metadata do not persist across restarts. There is no builder yet
+    /// that pairs IPFS storage with a persistent nameservice: [`build_with`]
+    /// takes an address-based `Storage`, which
+    /// [`fluree_db_storage_ipfs::IpfsStorage`] does not implement.
     ///
     /// # Arguments
     ///
@@ -2659,11 +2988,22 @@ impl FlureeBuilder {
     ///   garbage collector can reclaim them.
     /// - Admin operations that require prefix listing (e.g., fast-path ledger
     ///   drop) fall back to CID-walking, which is slower but correct.
+    /// - Encryption at rest is not supported: a builder carrying an
+    ///   encryption key is rejected rather than publishing plaintext to IPFS.
     ///
     /// [`build_with`]: FlureeBuilder::build_with
     #[cfg(feature = "ipfs")]
-    pub fn build_ipfs(self, api_url: impl Into<String>) -> Fluree {
+    pub fn build_ipfs(self, api_url: impl Into<String>) -> Result<Fluree> {
         use fluree_db_storage_ipfs::{IpfsConfig, IpfsStorage};
+        // `IpfsStorage` is a `ContentStore`, not a `Storage`, so
+        // `encrypt_if_configured` cannot wrap it.
+        if self.has_encryption_key() {
+            return Err(ApiError::config(
+                "build_ipfs cannot honour a configured encryption key: IPFS storage \
+                 does not support encryption at rest. Remove the key or choose \
+                 another storage backend.",
+            ));
+        }
         let ipfs_store = IpfsStorage::new(IpfsConfig {
             api_url: api_url.into(),
             pin_on_put: true,
@@ -2678,7 +3018,7 @@ impl FlureeBuilder {
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Self::finalize_with_backend(
+        Ok(Self::finalize_with_backend(
             self.ledger_cache_config,
             self.config,
             RuntimeParts {
@@ -2692,8 +3032,8 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        )
+            self.identity,
+        ))
     }
 
     /// Build an S3-backed Fluree instance (storage-backed nameservice).
@@ -2704,11 +3044,13 @@ impl FlureeBuilder {
     /// - Requires the `aws` feature.
     /// - Uses the AWS default credential/region chain.
     /// - Ledger caching is enabled when `ledger_cache_config` is set on the builder.
+    /// - A key set on the builder encrypts the storage, as on every build path;
+    ///   the storage-backed nameservice stays plaintext.
     #[cfg(feature = "aws")]
     pub async fn build_s3(self) -> Result<Fluree> {
         use fluree_db_connection::aws;
         use fluree_db_connection::config::S3StorageConfig;
-        use fluree_db_storage_aws::{S3Config, S3Storage};
+        use fluree_db_storage_aws::S3Storage;
 
         let s3_cfg: &S3StorageConfig = match &self.config.index_storage.storage_type {
             StorageType::S3(s3) => s3,
@@ -2719,34 +3061,10 @@ impl FlureeBuilder {
             }
         };
 
-        let timeout_ms = s3_cfg
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_cfg.write_timeout_ms)
-            .chain(s3_cfg.list_timeout_ms)
-            .max();
-
         let sdk_config = aws::get_or_init_sdk_config().await?;
-
-        let storage = S3Storage::new(
-            sdk_config,
-            S3Config {
-                bucket: s3_cfg.bucket.to_string(),
-                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
-                endpoint: s3_cfg
-                    .endpoint
-                    .as_ref()
-                    .map(std::string::ToString::to_string),
-                force_path_style: s3_cfg.force_path_style,
-                timeout_ms,
-                max_retries: s3_cfg.max_retries.map(|n| n as u32),
-                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
-                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
-                max_concurrent_requests: s3_cfg.max_concurrent_requests,
-            },
-        )
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
+        let storage = S3Storage::new(sdk_config, aws::s3_config_from(s3_cfg))
+            .await
+            .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
         // Empty prefix: S3Storage already applies its own key prefix.
         let nameservice = StorageNameService::new(storage.clone(), "");
@@ -2755,7 +3073,7 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
+        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
@@ -2773,7 +3091,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -2798,7 +3116,7 @@ impl FlureeBuilder {
     ) -> Result<Fluree> {
         use fluree_db_connection::aws;
         use fluree_db_connection::config::S3StorageConfig;
-        use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Config, S3Storage};
+        use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Storage};
 
         let s3_cfg: &S3StorageConfig =
             match &self.config.index_storage.storage_type {
@@ -2808,36 +3126,13 @@ impl FlureeBuilder {
                 )),
             };
 
-        let timeout_ms = s3_cfg
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_cfg.write_timeout_ms)
-            .chain(s3_cfg.list_timeout_ms)
-            .max();
-
         let sdk_config = aws::get_or_init_sdk_config().await?;
-
-        let storage = S3Storage::new(
-            sdk_config,
-            S3Config {
-                bucket: s3_cfg.bucket.to_string(),
-                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
-                // Treat an empty endpoint as unset (use the AWS default endpoint).
-                endpoint: s3_cfg
-                    .endpoint
-                    .as_ref()
-                    .map(std::string::ToString::to_string)
-                    .filter(|e| !e.is_empty()),
-                force_path_style: s3_cfg.force_path_style,
-                timeout_ms,
-                max_retries: s3_cfg.max_retries.map(|n| n as u32),
-                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
-                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
-                max_concurrent_requests: s3_cfg.max_concurrent_requests,
-            },
-        )
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
+        let s3_config = aws::s3_config_from(s3_cfg);
+        // The DynamoDB client shares the consolidated S3 operation timeout.
+        let timeout_ms = s3_config.timeout_ms;
+        let storage = S3Storage::new(sdk_config, s3_config)
+            .await
+            .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
 
         let dynamo_ns = DynamoDbNameService::new(
             sdk_config,
@@ -2860,7 +3155,7 @@ impl FlureeBuilder {
             fluree_db_nameservice::NotifyingNameService::new(dynamo_ns, event_bus.clone());
         let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
         let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
+        let backend = StorageBackend::Managed(self.encrypt_if_configured(Arc::new(storage)));
         let attachment_provider_cell = Self::new_attachment_provider_cell();
         let indexing_mode =
             self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
@@ -2878,14 +3173,16 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
     /// Build an S3-backed Fluree instance with AES-256-GCM encryption.
     ///
-    /// All data written to S3 is transparently encrypted before upload,
-    /// and decrypted on read.
+    /// Equivalent to `with_encryption_key(key).build_s3()`: all data written
+    /// to S3 is transparently encrypted before upload and decrypted on read,
+    /// while the storage-backed nameservice stays plaintext, as on every
+    /// other build path.
     ///
     /// Notes:
     /// - Requires the `aws` feature.
@@ -2897,78 +3194,19 @@ impl FlureeBuilder {
     /// * `key` - 32-byte AES-256 encryption key
     #[cfg(feature = "aws")]
     pub async fn build_s3_encrypted(self, key: [u8; 32]) -> Result<Fluree> {
-        use fluree_db_connection::aws;
-        use fluree_db_connection::config::S3StorageConfig;
-        use fluree_db_storage_aws::{S3Config, S3Storage};
+        self.with_encryption_key(key).build_s3().await
+    }
 
-        let s3_cfg: &S3StorageConfig = match &self.config.index_storage.storage_type {
-            StorageType::S3(s3) => s3,
-            _ => return Err(ApiError::config(
-                "build_s3_encrypted requires FlureeBuilder::s3(...) or an S3 indexStorage config",
-            )),
-        };
-
-        let timeout_ms = s3_cfg
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_cfg.write_timeout_ms)
-            .chain(s3_cfg.list_timeout_ms)
-            .max();
-
-        let sdk_config = aws::get_or_init_sdk_config().await?;
-
-        let s3_storage = S3Storage::new(
-            sdk_config,
-            S3Config {
-                bucket: s3_cfg.bucket.to_string(),
-                prefix: s3_cfg.prefix.as_ref().map(std::string::ToString::to_string),
-                endpoint: s3_cfg
-                    .endpoint
-                    .as_ref()
-                    .map(std::string::ToString::to_string),
-                force_path_style: s3_cfg.force_path_style,
-                timeout_ms,
-                max_retries: s3_cfg.max_retries.map(|n| n as u32),
-                retry_base_delay_ms: s3_cfg.retry_base_delay_ms,
-                retry_max_delay_ms: s3_cfg.retry_max_delay_ms,
-                max_concurrent_requests: s3_cfg.max_concurrent_requests,
-            },
-        )
-        .await
-        .map_err(|e| ApiError::config(format!("Failed to create S3 storage: {e}")))?;
-
-        // Wrap with encryption
-        let encryption_key = EncryptionKey::new(key, 0);
-        let key_provider = StaticKeyProvider::new(encryption_key);
-        let storage = EncryptedStorage::new(s3_storage, key_provider);
-
-        // Empty prefix: S3Storage already applies its own key prefix.
-        let nameservice = StorageNameService::new(storage.clone(), "");
-        let event_bus = self.resolve_event_bus();
-        let notifying =
-            fluree_db_nameservice::NotifyingNameService::new(nameservice, event_bus.clone());
-        let ns_mode = NameServiceMode::ReadWrite(Arc::new(notifying.clone()));
-        let index_config = self.derive_indexing();
-        let backend = StorageBackend::Managed(Arc::new(storage));
-        let attachment_provider_cell = Self::new_attachment_provider_cell();
-        let indexing_mode =
-            self.start_background_indexing(&backend, &notifying, &attachment_provider_cell);
-        Ok(Self::finalize_with_backend(
-            self.ledger_cache_config,
-            self.config,
-            RuntimeParts {
-                backend,
-                nameservice: ns_mode,
-                event_bus,
-                indexing_mode,
-                index_config,
-                attachment_provider_cell,
-            },
-            self.remote_connections,
-            self.remote_mounts,
-            #[cfg(feature = "iceberg")]
-            self.secret_resolver,
-        ))
+    /// Build a memory-backed Fluree instance with AES-256-GCM encryption.
+    ///
+    /// Equivalent to `with_encryption_key(key).build_memory()`. Useful for
+    /// testing encryption without touching the filesystem.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - 32-byte AES-256 encryption key
+    pub fn build_memory_encrypted(self, key: [u8; 32]) -> Fluree {
+        self.with_encryption_key(key).build_memory()
     }
 
     // ========================================================================
@@ -3118,12 +3356,11 @@ impl FlureeBuilder {
         parts: RuntimeParts,
         remote_connections: remote_service::RemoteConnectionRegistry,
         remote_mounts: Vec<RemoteMountSpec>,
-        // The single assembly point forwards the builder's secret resolver so
-        // every `build*` path carries it uniformly. Gated: the trait lives in the
+        // The single assembly point forwards the builder's identity context
+        // (secret resolver, host-identity policy, AWS subject) so every
+        // `build*` path carries it uniformly. Gated: the types live in the
         // optional `fluree-db-iceberg` dep.
-        #[cfg(feature = "iceberg")] secret_resolver: Option<
-            Arc<dyn fluree_db_iceberg::SecretResolver>,
-        >,
+        #[cfg(feature = "iceberg")] identity: fluree_db_iceberg::IdentityContext,
     ) -> Fluree {
         let RuntimeParts {
             backend,
@@ -3178,7 +3415,10 @@ impl FlureeBuilder {
             ledger_manager,
             remote_service: build_remote_service(remote_connections),
             #[cfg(feature = "iceberg")]
-            secret_resolver,
+            identity,
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(feature = "native")]
+            root: RootHold::default(),
         }
     }
 
@@ -3234,8 +3474,8 @@ impl FlureeBuilder {
 
         // --- Local (memory/filesystem) ---
         match &self.config.index_storage.storage_type {
-            StorageType::Memory => self.build_client_memory(nameservice),
-            StorageType::File => self.build_client_file(nameservice),
+            StorageType::Memory => self.build_client_memory(nameservice).await,
+            StorageType::File => self.build_client_file(nameservice).await,
             StorageType::S3(_) => Err(ApiError::config(
                 "S3 storage requires the 'aws' feature on fluree-db-api",
             )),
@@ -3249,11 +3489,16 @@ impl FlureeBuilder {
     /// is `Some`, it replaces the default `MemoryNameService` (and
     /// the notifying wrapper + background indexer that ride along
     /// with it).
-    fn build_client_memory(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
-        let base_storage: Arc<dyn Storage> = Arc::new(MemoryStorage::new());
+    async fn build_client_memory(
+        self,
+        nameservice: Option<NameServiceMode>,
+    ) -> Result<FlureeClient> {
+        let base_storage = self.encrypt_if_configured(Arc::new(MemoryStorage::new()));
 
         // Wrap with address identifier routing if configured
-        let storage = self.wrap_address_identifiers(base_storage)?;
+        let storage = self
+            .wrap_address_identifiers(base_storage, &self.config)
+            .await?;
         let backend = StorageBackend::Managed(storage);
         let event_bus = self.resolve_event_bus();
         let index_config = self.derive_indexing();
@@ -3287,7 +3532,7 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
@@ -3295,7 +3540,7 @@ impl FlureeBuilder {
     /// is `Some`, it replaces the default `FileNameService` (and
     /// the notifying wrapper + background indexer that ride along
     /// with it).
-    fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
+    async fn build_client_file(self, nameservice: Option<NameServiceMode>) -> Result<FlureeClient> {
         #[cfg(not(feature = "native"))]
         {
             let _ = nameservice;
@@ -3313,6 +3558,7 @@ impl FlureeBuilder {
                 .ok_or_else(|| ApiError::config("File storage requires filePath"))?
                 .clone();
 
+            let root_lock = self.lock_storage_root(path.as_ref())?;
             let mut file_storage = self.file_storage(path.as_ref());
             // A query peer must recover the preceding writer's tail without
             // retaining its WAL lock. Any incidental storage writes remain
@@ -3325,18 +3571,14 @@ impl FlureeBuilder {
             // Client build is startup: take the explicit sweep of
             // crash-orphaned staging files here, where startup is known.
             file_storage.sweep_orphaned_staging();
-            file_storage.recover_wal()?;
+            let root_lock = Self::recover_holding(&file_storage, root_lock).await?;
             let ns_storage = file_storage.clone();
-            let base_storage: Arc<dyn Storage> = if let Some(key) = self.encryption_key {
-                let encryption_key = EncryptionKey::new(key, 0);
-                let key_provider = StaticKeyProvider::new(encryption_key);
-                Arc::new(EncryptedStorage::new(file_storage, key_provider))
-            } else {
-                Arc::new(file_storage)
-            };
+            let base_storage = self.encrypt_if_configured(Arc::new(file_storage));
 
             // Wrap with address identifier routing if configured
-            let storage = self.wrap_address_identifiers(base_storage)?;
+            let storage = self
+                .wrap_address_identifiers(base_storage, &self.config)
+                .await?;
             let backend = StorageBackend::Managed(storage);
             let event_bus = self.resolve_event_bus();
             let index_config = self.derive_indexing();
@@ -3373,8 +3615,9 @@ impl FlureeBuilder {
                 self.remote_connections,
                 self.remote_mounts,
                 #[cfg(feature = "iceberg")]
-                self.secret_resolver,
-            ))
+                self.identity,
+            )
+            .holding(root_lock))
         }
     }
 
@@ -3401,10 +3644,14 @@ impl FlureeBuilder {
             } else {
                 Arc::new(index)
             };
+        // Encrypt below the address-identifier router so both tiers and every
+        // routed write share the key; the AWS nameservice stays plaintext,
+        // as the file nameservice does.
+        let base_storage = self.encrypt_if_configured(base_storage);
 
         // Wrap with address identifier routing if configured
         let storage = self
-            .wrap_address_identifiers_aws(base_storage, aws_handle.config())
+            .wrap_address_identifiers(base_storage, aws_handle.config())
             .await?;
         let backend = StorageBackend::Managed(storage);
         let event_bus = self.resolve_event_bus();
@@ -3436,30 +3683,15 @@ impl FlureeBuilder {
             self.remote_connections,
             self.remote_mounts,
             #[cfg(feature = "iceberg")]
-            self.secret_resolver,
+            self.identity,
         ))
     }
 
-    /// Wrap base storage with address identifier routing for local backends.
-    fn wrap_address_identifiers(&self, base_storage: Arc<dyn Storage>) -> Result<Arc<dyn Storage>> {
-        if let Some(addr_ids) = &self.config.address_identifiers {
-            let mut identifier_map = std::collections::HashMap::new();
-            for (identifier, storage_config) in addr_ids {
-                let id_storage = build_local_storage_from_config(storage_config)?;
-                identifier_map.insert(identifier.to_string(), id_storage);
-            }
-            Ok(Arc::new(AddressIdentifierResolverStorage::new(
-                base_storage,
-                identifier_map,
-            )))
-        } else {
-            Ok(base_storage)
-        }
-    }
-
-    /// Wrap base storage with address identifier routing for AWS backends.
-    #[cfg(feature = "aws")]
-    async fn wrap_address_identifiers_aws(
+    /// Wrap base storage with routing for `config`'s address identifiers, if it has any.
+    ///
+    /// An S3 identifier needs the `aws` feature.
+    /// Without it, the identifier is rejected with a configuration error.
+    async fn wrap_address_identifiers(
         &self,
         base_storage: Arc<dyn Storage>,
         config: &ConnectionConfig,
@@ -3468,8 +3700,9 @@ impl FlureeBuilder {
             let mut identifier_map = std::collections::HashMap::new();
             for (identifier, storage_config) in addr_ids {
                 let id_storage: Arc<dyn Storage> = match &storage_config.storage_type {
+                    #[cfg(feature = "aws")]
                     StorageType::S3(_) => build_s3_storage_from_config(storage_config).await?,
-                    _ => build_local_storage_from_config(storage_config)?,
+                    _ => build_local_storage_from_config(storage_config).await?,
                 };
                 identifier_map.insert(identifier.to_string(), id_storage);
             }
@@ -3504,10 +3737,10 @@ pub struct Fluree {
     leaflet_cache: std::sync::Arc<fluree_db_binary_index::LeafletCache>,
     /// Per-instance cache for resolved cross-ledger governance
     /// artifacts (`f:policySource` from a model ledger, etc.). Keyed
-    /// on `(ArtifactKind, model_ledger_id, graph_iri, resolved_t)`
+    /// on `(ArtifactKind, model_ledger_id, graph_iri, model head)`
     /// so a single entry is reusable across every data ledger on
     /// this instance that references the same model graph at the
-    /// same model `t`.
+    /// same model head commit.
     governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,
@@ -3531,13 +3764,31 @@ pub struct Fluree {
     /// the executor is passed to `ContextConfig` and made available to
     /// `ServiceOperator` during query execution.
     remote_service: Option<Arc<dyn fluree_db_query::remote_service::RemoteServiceExecutor>>,
-    /// Injected resolver for `ConfigValue::SecretRef` secret references in
-    /// Iceberg graph-source auth. `None` in OSS/CLI (secret references then fail
-    /// closed); a host (e.g. solo) injects a tenant-scoped resolver via
-    /// [`Fluree::with_secret_resolver`]. db never sees tenant identity — the
-    /// resolver authorizes itself.
+    /// What graph-source auth providers are built with: the injected resolver
+    /// for `ConfigValue::SecretRef` references (`None` in OSS/CLI, where they
+    /// fail closed; a multi-tenant host injects a tenant-scoped one via
+    /// [`Fluree::with_secret_resolver`] — db never sees tenant identity, the
+    /// resolver authorizes itself), the host-identity policy, and the AWS
+    /// subject that signs Workload Identity Federation exchanges.
     #[cfg(feature = "iceberg")]
-    secret_resolver: Option<Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    identity: fluree_db_iceberg::IdentityContext,
+    /// The key-rotation sweep running in this process, if any.
+    key_rotation: Arc<key_rotation::KeyRotationSlot>,
+    /// What this instance holds of its file storage root.
+    #[cfg(feature = "native")]
+    root: RootHold,
+}
+
+/// What an instance holds of its file storage root.
+#[cfg(feature = "native")]
+#[derive(Clone, Default)]
+struct RootHold {
+    /// The root's lock, when the builder took one. Every clone shares it,
+    /// so it is released only when the last clone is dropped.
+    lock: Option<Arc<fluree_db_core::RootLock>>,
+    /// Set for an instance [`SharedFluree`] handles own. Its lifecycle is
+    /// theirs, so [`Fluree::disconnect`] leaves it alone.
+    owned_by_shared_handles: bool,
 }
 
 impl Fluree {
@@ -3576,7 +3827,10 @@ impl Fluree {
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(feature = "native")]
+            root: RootHold::default(),
         }
     }
 
@@ -3601,8 +3855,23 @@ impl Fluree {
             ledger_manager: None,
             remote_service: None,
             #[cfg(feature = "iceberg")]
-            secret_resolver: None,
+            identity: default_identity_context(),
+            key_rotation: Arc::new(key_rotation::KeyRotationSlot::default()),
+            #[cfg(feature = "native")]
+            root: RootHold::default(),
         }
+    }
+
+    #[cfg(feature = "native")]
+    fn holding(mut self, root_lock: Option<Arc<fluree_db_core::RootLock>>) -> Self {
+        self.root.lock = root_lock;
+        self
+    }
+
+    #[cfg(feature = "native")]
+    pub(crate) fn owned_by_shared_handles(mut self) -> Self {
+        self.root.owned_by_shared_handles = true;
+        self
     }
 
     /// Set the indexing mode
@@ -3638,7 +3907,37 @@ impl Fluree {
         resolver: Arc<dyn fluree_db_iceberg::SecretResolver>,
     ) -> Fluree {
         let mut cloned = self.clone();
-        cloned.secret_resolver = Some(resolver);
+        cloned.identity.secret_resolver = Some(resolver);
+        cloned
+    }
+
+    /// Return a clone of this `Fluree` whose graph sources may use only the
+    /// host-derived identities `policy` allows (see
+    /// [`HostIdentityPolicy`](fluree_db_iceberg::HostIdentityPolicy)). Cheap,
+    /// and leaves the original untouched, like [`Fluree::with_secret_resolver`].
+    #[cfg(feature = "iceberg")]
+    pub fn with_host_identity_policy(
+        &self,
+        policy: fluree_db_iceberg::HostIdentityPolicy,
+    ) -> Fluree {
+        let mut cloned = self.clone();
+        cloned.identity.policy = policy;
+        cloned
+    }
+
+    /// Return a clone of this `Fluree` whose Google Workload Identity
+    /// Federation exchanges are signed with `subject` instead of the host's
+    /// own AWS credential chain — e.g. an AssumeRole session per tenant, so a
+    /// customer's WIF provider can condition on the tenant. An embedder's
+    /// subject is not a host identity, so the host-identity policy does not
+    /// gate it. Cheap, and leaves the original untouched.
+    #[cfg(feature = "iceberg")]
+    pub fn with_aws_subject_credentials(
+        &self,
+        subject: Arc<dyn fluree_db_iceberg::AwsSubjectCredentials>,
+    ) -> Fluree {
+        let mut cloned = self.clone();
+        cloned.identity.aws_subject = Some(subject);
         cloned
     }
 
@@ -3646,7 +3945,20 @@ impl Fluree {
     /// path; `None` means `ConfigValue::SecretRef` references fail closed.
     #[cfg(feature = "iceberg")]
     pub(crate) fn secret_resolver(&self) -> Option<&Arc<dyn fluree_db_iceberg::SecretResolver>> {
-        self.secret_resolver.as_ref()
+        self.identity.secret_resolver.as_ref()
+    }
+
+    /// Whether this instance can resolve a graph source's `secret_ref` values
+    /// (see [`Fluree::with_secret_resolver`]); a surface refuses them otherwise.
+    #[cfg(feature = "iceberg")]
+    pub fn has_secret_resolver(&self) -> bool {
+        self.identity.secret_resolver.is_some()
+    }
+
+    /// Everything a graph-source auth provider is built with on this instance.
+    #[cfg(feature = "iceberg")]
+    pub(crate) fn identity_context(&self) -> &fluree_db_iceberg::IdentityContext {
+        &self.identity
     }
 
     /// Get the remote SERVICE executor, if configured.
@@ -3959,6 +4271,30 @@ impl Fluree {
         import::CreateBuilder::new(self, ledger_id.to_string())
     }
 
+    /// Bulk-import into a new named graph of an existing ledger.
+    ///
+    /// The same pipeline as [`Fluree::create`]`(..).import(..)`, continuing
+    /// the ledger's commits and extending its index rather than building
+    /// one: see [`import::GraphImportTarget`] for what it requires and how it
+    /// holds the ledger.
+    ///
+    /// ```ignore
+    /// let result = fluree
+    ///     .import_into_graph("mydb", "http://example.org/graph/products")
+    ///     .import("/data/products/")
+    ///     .threads(8)
+    ///     .execute()
+    ///     .await?;
+    /// ```
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn import_into_graph(
+        &self,
+        ledger_id: &str,
+        graph_iri: &str,
+    ) -> import::GraphImportTarget<'_> {
+        import::GraphImportTarget::new(self, ledger_id.to_string(), graph_iri.to_string())
+    }
+
     /// Create a lazy graph handle for a ledger at the latest head.
     ///
     /// No I/O occurs until a terminal method is called (`.load()`,
@@ -4180,6 +4516,7 @@ impl Fluree {
                         None,
                         None,
                         None,
+                        None,
                     )
                     .await?;
                 return self.commit_sequential_outcome(outcome, &index_config).await;
@@ -4331,9 +4668,14 @@ impl Fluree {
         // all. Explicit here rather than implicit in the view's origin,
         // because config-graph defaults are completed at query preparation
         // (`complete_config_defaults`) for every view that reaches it.
+        //
+        // For the same reason the probe reads the default graph alone, as
+        // every read of a write statement does: the write stages against it,
+        // whatever the ledger's union default graph.
         let probe_view = probe_view
             .with_default_context(default_context)
-            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none());
+            .with_reasoning(fluree_db_query::ir::reasoning::ReasoningModes::none())
+            .with_union_default_graph(false);
 
         match cw {
             ConditionalCypherWrite::MergeSet { merge, trailing } => {
@@ -4449,52 +4791,11 @@ impl Fluree {
                 ))
             }
             ConditionalCypherWrite::DeleteRel(update) => {
-                let delete = crate::cypher_write::delete_clause(update).ok_or_else(|| {
-                    ApiError::cypher("DELETE plan has no DELETE clause".to_string(), Vec::new())
-                })?;
                 // `DELETE r` retracts the relationship's base `(a)-[:T]->(b)`
-                // triple, whose `f:reifies*` cascade removes the bundle. If the
-                // base edge backs a parallel sibling, that retraction would
-                // disturb the sibling — reject. The endpoints must be named so
-                // the probe can group by them.
-                for target in &delete.targets {
-                    let (a, b) = crate::cypher_write::rel_endpoint_vars(update, &target.name)
-                        .ok_or_else(|| {
-                            ApiError::cypher(
-                                format!(
-                                    "DELETE of relationship `{}` requires both endpoint \
-                                     nodes to be named (e.g. `(a)-[{}]->(b)`)",
-                                    target.name, target.name
-                                ),
-                                Vec::new(),
-                            )
-                        })?;
-                    let probe_ast = crate::cypher_write::build_parallel_probe_ast(
-                        &update.read_clauses,
-                        &a,
-                        &b,
-                        &target.name,
-                    );
-                    if self
-                        .query_cypher_ast(&probe_view, &probe_ast)
-                        .await?
-                        .row_count()
-                        > 0
-                    {
-                        return Err(ApiError::cypher(
-                            format!(
-                                "DELETE of relationship `{}` failed: parallel relationships \
-                                 share its underlying edge, so deleting one would affect the \
-                                 others. Per-occurrence DELETE of a parallel relationship is \
-                                 not yet supported.",
-                                target.name
-                            ),
-                            Vec::new(),
-                        ));
-                    }
-                }
-                // No parallel siblings → retracting each base edge removes only
-                // its own reifier bundle. Lower the original DELETE directly.
+                // triple, whose `f:reifies*` cascade removes the bundle; staging
+                // refuses an edge that backs a parallel sibling too (see
+                // `TxnOpts::relationship_deletes`). Lower the original DELETE
+                // directly.
                 let ast = fluree_db_cypher::CypherAst {
                     statement: fluree_db_cypher::ast::Statement::Update(update.clone()),
                     span: update.span,
@@ -4751,26 +5052,43 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
+        // Not a call to `ledger_handle`: awaiting it would nest one more future
+        // in every caller's, and some test futures sit at the type-layout
+        // depth limit.
+        let ledger_id = LedgerId::parse(ledger_id)?;
+        match &self.ledger_manager {
+            Some(mgr) => mgr.get_or_load(&ledger_id).await,
+            None => Ok(Self::ephemeral_handle(
+                &ledger_id,
+                self.ledger(&ledger_id).await?,
+            )),
+        }
+    }
+
+    /// [`ledger_cached`](Self::ledger_cached) for an id the caller has
+    /// already parsed (a route's path ledger): the handle is found by the id
+    /// as it stands, with no second parse.
+    pub async fn ledger_handle(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(ledger_id).await,
-            None => {
-                // Caching disabled: load fresh, wrap in ephemeral handle.
-                // Note: This handle is NOT cached; each call loads fresh.
-                // Extract the concrete BinaryIndexStore from the state's TypeErasedStore
-                // so the handle's binary_store stays coherent with db.range_provider.
-                let state = self.ledger(ledger_id).await?;
-                let binary_store = state.binary_store.as_ref().and_then(|te| {
-                    te.0.clone()
-                        .downcast::<fluree_db_binary_index::BinaryIndexStore>()
-                        .ok()
-                });
-                Ok(LedgerHandle::new(
-                    ledger_id.to_string(),
-                    state,
-                    binary_store,
-                ))
-            }
+            None => Ok(Self::ephemeral_handle(
+                ledger_id,
+                self.ledger(ledger_id).await?,
+            )),
         }
+    }
+
+    /// Caching disabled: a fresh load wrapped in an ephemeral handle, which is
+    /// NOT cached (each call loads fresh). The concrete `BinaryIndexStore` is
+    /// taken from the state's type-erased store, so the handle's binary store
+    /// stays coherent with the snapshot's range provider.
+    fn ephemeral_handle(ledger_id: &LedgerId, state: LedgerState) -> LedgerHandle {
+        let binary_store = state.binary_store.as_ref().and_then(|te| {
+            te.0.clone()
+                .downcast::<fluree_db_binary_index::BinaryIndexStore>()
+                .ok()
+        });
+        LedgerHandle::new(ledger_id.clone(), state, binary_store)
     }
 
     /// Disconnect a ledger from the connection cache
@@ -4801,8 +5119,9 @@ impl Fluree {
     /// let handle = fluree.ledger_cached("my/ledger").await?;
     /// ```
     pub async fn disconnect_ledger(&self, ledger_id: &str) {
-        if let Some(mgr) = &self.ledger_manager {
-            mgr.disconnect(ledger_id).await;
+        // An id that does not parse cannot have been cached.
+        if let (Some(mgr), Ok(ledger_id)) = (&self.ledger_manager, LedgerId::parse(ledger_id)) {
+            mgr.disconnect(&ledger_id).await;
         }
         // If caching is disabled, this is a no-op
     }
@@ -4819,11 +5138,30 @@ impl Fluree {
     /// 2. Evicts all cached ledgers from the ledger manager (with a shutdown flag
     ///    that prevents in-flight loaders from re-inserting)
     /// 3. Clears the R2RML mapping cache
+    /// 4. Retires a file storage root's WAL
+    ///
+    /// It does not release a lock `FlureeBuilder::with_storage_lock` took:
+    /// that lasts until the instance's last clone is dropped. An instance
+    /// that `SharedFluree` handles own is theirs to shut down, so this
+    /// does nothing to it; close the handles instead.
     ///
     /// For full termination, the caller should also:
     /// - Abort the maintenance task JoinHandle (if spawned via `spawn_maintenance`)
     /// - Drop the Fluree instance (stops the indexer worker)
     pub async fn disconnect(&self) {
+        #[cfg(feature = "native")]
+        if self.root.owned_by_shared_handles {
+            tracing::warn!(
+                "disconnect() on an instance that SharedFluree handles own does nothing; \
+                 close the handles instead"
+            );
+            return;
+        }
+        self.shut_down().await;
+    }
+
+    /// [`Self::disconnect`]'s work, for the owner of the instance's lifecycle.
+    pub(crate) async fn shut_down(&self) {
         // 1. Cancel background indexing and wait for idle
         if let tx::IndexingMode::Background(handle) = &self.indexing_mode {
             handle.cancel_all().await;
@@ -4935,9 +5273,11 @@ impl Fluree {
             }
         };
 
+        let ledger_id = LedgerId::parse(ledger_id)?;
+
         // Fast path: if min_t is set, check current cached t before hitting NS
         if let Some(min_t) = opts.min_t {
-            if let Some(current_t) = mgr.current_t(ledger_id).await {
+            if let Some(current_t) = mgr.current_t(&ledger_id).await {
                 if current_t >= min_t {
                     return Ok(Some(RefreshResult {
                         t: current_t,
@@ -4948,14 +5288,11 @@ impl Fluree {
         }
 
         // Step B: Lookup nameservice record
-        // The nameservice handles address resolution (mydb -> mydb:main, etc.)
-        let ns_record = match self.nameservice().lookup(ledger_id).await? {
+        let ns_record = match self.nameservice().lookup(&ledger_id).await? {
             Some(record) => record,
             None => return Ok(None), // Ledger doesn't exist in nameservice
         };
         // Step C: Use NsRecord.ledger_id as the cache key
-        // The ledger_id field contains the canonical form (e.g., "testdb:main")
-        // Note: NsRecord.name field only contains the name without branch, despite docs
         let canonical_alias = ns_record.ledger_id.clone();
 
         // Step D: Delegate to notify with the fresh record
@@ -5332,7 +5669,7 @@ impl Fluree {
                 ConfigCasResult::Updated => {
                     tracing::info!(
                         cid = %new_cid,
-                        ledger = canonical_id,
+                        ledger = %canonical_id,
                         "default context updated"
                     );
 
@@ -5358,7 +5695,7 @@ impl Fluree {
                 ConfigCasResult::Conflict { .. } => {
                     tracing::debug!(
                         attempt,
-                        ledger = canonical_id,
+                        ledger = %canonical_id,
                         "CAS conflict updating default context, retrying"
                     );
                     continue;
@@ -5555,9 +5892,10 @@ mod tests {
             defaults.gc_min_time_mins
         );
         assert_eq!(
-            cfg3.indexer_config.gc_hard_max_old_indexes, None,
-            "the ceiling is opt-in"
+            cfg3.indexer_config.gc_hard_max_old_indexes,
+            defaults.gc_hard_max_old_indexes
         );
+        assert_eq!(defaults.gc_hard_max_old_indexes, Some(10));
         assert!(!b3.indexer_config_user_set);
     }
 
@@ -5600,7 +5938,7 @@ mod tests {
             .with_writer(buf.clone())
             .with_max_level(tracing::Level::WARN)
             .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
+        let guard = fluree_test_support::scoped_default(subscriber);
         (buf, guard)
     }
 
@@ -5678,6 +6016,7 @@ mod tests {
                     indexing_enabled: None,
                     track_class_stats: None,
                     gc_min_time_mins: None,
+                    gc_hard_max_old_indexes: None,
                 }),
             }),
             ..Default::default()
@@ -5686,6 +6025,45 @@ mod tests {
         let idx = derive_index_config(&config);
         assert_eq!(idx.reindex_min_bytes, 250_000);
         assert_eq!(idx.reindex_max_bytes, 2_500_000);
+    }
+
+    /// The three retention settings reach the indexer from a JSON-LD
+    /// connection config, and an absent ceiling keeps the indexer's default.
+    #[cfg(feature = "native")]
+    #[test]
+    fn connection_config_gc_retention_reaches_the_indexer() {
+        use serde_json::{json, Value as JsonValue};
+
+        let parse = |indexing: JsonValue| {
+            ConnectionConfig::from_json_ld(&json!({
+                "@context": {
+                    "@base": "https://ns.flur.ee/config/connection/",
+                    "@vocab": "https://ns.flur.ee/system#"
+                },
+                "@graph": [
+                    {"@id": "memory", "@type": "Storage"},
+                    {
+                        "@id": "connection",
+                        "@type": "Connection",
+                        "indexStorage": {"@id": "memory"},
+                        "defaults": {"indexing": indexing}
+                    }
+                ]
+            }))
+            .expect("parse")
+        };
+
+        let set = build_indexer_config(&parse(json!({
+            "maxOldIndexes": 3,
+            "gcMinTimeMins": 60,
+            "gcHardMaxOldIndexes": 40
+        })));
+        assert_eq!(set.gc_max_old_indexes, 3);
+        assert_eq!(set.gc_min_time_mins, 60);
+        assert_eq!(set.gc_hard_max_old_indexes, Some(40));
+
+        let unset = build_indexer_config(&parse(json!({"gcMinTimeMins": 60})));
+        assert_eq!(unset.gc_hard_max_old_indexes, Some(10));
     }
 
     #[test]
@@ -6067,7 +6445,9 @@ mod tests {
     #[cfg(feature = "ipfs")]
     async fn test_build_ipfs_constructs_fluree() {
         // No real Kubo node needed — this only verifies the type plumbing.
-        let fluree = FlureeBuilder::memory().build_ipfs("http://127.0.0.1:5001");
+        let fluree = FlureeBuilder::memory()
+            .build_ipfs("http://127.0.0.1:5001")
+            .expect("build_ipfs");
         // Backend should be Permanent (IPFS), not Managed.
         assert!(matches!(
             fluree.backend(),
@@ -6076,7 +6456,59 @@ mod tests {
         // Admin storage should be None for IPFS (no raw Storage interface).
         assert!(fluree.admin_storage().is_none());
     }
+
+    #[tokio::test]
+    #[cfg(feature = "ipfs")]
+    async fn build_ipfs_rejects_an_encryption_key() {
+        let err = FlureeBuilder::memory()
+            .with_encryption_key([7u8; 32])
+            .build_ipfs("http://127.0.0.1:5001")
+            .err()
+            .expect("a configured key must not be dropped silently");
+        assert!(err.to_string().contains("encryption key"), "{err}");
+    }
 }
 
 #[cfg(all(test, feature = "shacl"))]
 mod shacl_tests;
+
+#[cfg(all(test, feature = "native"))]
+mod storage_lock_tests {
+    use super::*;
+
+    /// One blocking thread, held busy, queues the build's WAL replay behind
+    /// it; the build is then dropped mid-replay.
+    #[test]
+    fn a_cancelled_build_keeps_the_root_locked_until_its_replay_ends() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel::<()>();
+            let busy = tokio::task::spawn_blocking(move || {
+                let _ = wait.recv();
+            });
+            let build = FlureeBuilder::file(dir.path().to_str().unwrap())
+                .without_indexing()
+                .with_storage_lock()
+                .build_async();
+
+            let cancelled = tokio::time::timeout(std::time::Duration::ZERO, build).await;
+
+            assert!(cancelled.is_err(), "the replay was meant to be queued");
+            assert!(
+                matches!(
+                    fluree_db_core::RootLock::acquire(dir.path()),
+                    Err(fluree_db_core::RootLockError::Held { .. })
+                ),
+                "the root was released while its replay was still queued"
+            );
+            release.send(()).unwrap();
+            busy.await.unwrap();
+        });
+    }
+}

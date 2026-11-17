@@ -116,9 +116,36 @@ pub fn document_iri(prefix: &str, relative_path: &str) -> String {
 }
 
 pub fn prepare(path: &Path, relative_path: &str, opts: &IngestOptions) -> Result<PreparedDocument> {
-    let kind = SourceKind::from_path(path)
-        .ok_or_else(|| DocError::Unsupported(path.display().to_string()))?;
+    let doc_iri = document_iri(&opts.iri_prefix, relative_path);
+    let (meta, parsed) = parse_file(
+        path,
+        relative_path,
+        &doc_iri,
+        opts.cache.as_ref(),
+        opts.vlm.as_ref(),
+    )?;
+    let chunks = chunk_doco(&parsed.doco, &opts.chunk)?;
+    Ok(PreparedDocument {
+        meta,
+        doc_iri,
+        parsed,
+        chunks,
+    })
+}
+
+/// One file parsed as the document `doc_iri`, through the parse cache: what
+/// [`prepare`] does short of chunking, and what `fluree doc parse` prints.
+/// The document's nodes are minted under its IRI.
+pub fn parse_file(
+    path: &Path,
+    relative_path: &str,
+    doc_iri: &str,
+    cache: Option<&DocCache>,
+    vlm: Option<&Arc<VlmReader>>,
+) -> Result<(SourceMeta, ParsedDocument)> {
     let data = std::fs::read(path).map_err(|e| DocError::Io(format!("{}: {e}", path.display())))?;
+    let kind = SourceKind::detect(path, &data)
+        .ok_or_else(|| DocError::Unsupported(path.display().to_string()))?;
     let meta = SourceMeta {
         path: path.to_path_buf(),
         relative_path: relative_path.to_string(),
@@ -130,39 +157,29 @@ pub fn prepare(path: &Path, relative_path: &str, opts: &IngestOptions) -> Result
         kind,
         byte_size: data.len() as u64,
     };
-    let doc_iri = document_iri(&opts.iri_prefix, relative_path);
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "document".into());
 
     let parse_opts = ParseOptions {
-        base_iri: doc_iri.clone(),
-        doc_iri: doc_iri.clone(),
-        vlm: opts.vlm.clone(),
+        base_iri: doc_iri.to_string(),
+        doc_iri: doc_iri.to_string(),
+        source_name: Some(meta.file_name.clone()),
+        vlm: vlm.cloned(),
     };
     let fingerprint = parse_opts.fingerprint();
-    let parsed = match opts
-        .cache
-        .as_ref()
-        .and_then(|c| c.load_parse(&meta.sha256, &fingerprint))
-    {
+    let parsed = match cache.and_then(|c| c.load_parse(&meta.sha256, &fingerprint)) {
         Some(hit) => hit,
         None => {
             let parsed = parse_bytes(data, kind, &stem, &parse_opts)?;
-            if let Some(cache) = &opts.cache {
+            if let Some(cache) = cache {
                 cache.store_parse(&meta.sha256, &fingerprint, &parsed)?;
             }
             parsed
         }
     };
-    let chunks = chunk_doco(&parsed.doco, &opts.chunk)?;
-    Ok(PreparedDocument {
-        meta,
-        doc_iri,
-        parsed,
-        chunks,
-    })
+    Ok((meta, parsed))
 }
 
 #[cfg(test)]

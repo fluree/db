@@ -2,10 +2,10 @@ use super::*;
 use crate::ast::pattern::ServiceEndpoint;
 use crate::ast::update::UpdateOperation;
 use crate::ast::{
-    BlankNodeValue, DescribeTarget, GroupCondition, IriValue, LiteralValue, OrderDirection,
-    OrderExpr, PredicateTerm, SelectModifier, SelectVariable, SelectVariables, SubjectTerm, Term,
-    VarOrIri,
+    DescribeTarget, GroupCondition, IriValue, LiteralValue, OrderDirection, OrderExpr,
+    PredicateTerm, SelectModifier, SelectVariable, SelectVariables, SubjectTerm, Term, VarOrIri,
 };
+use crate::diag::Diagnostic;
 
 fn parse(input: &str) -> ParseOutput<SparqlAst> {
     parse_sparql(input)
@@ -664,6 +664,37 @@ fn test_limit_offset() {
     }
 }
 
+/// `LIMIT` and `OFFSET` take values up to `i64::MAX`; a larger one is
+/// reported as too large, not as a missing integer.
+#[test]
+fn test_limit_offset_beyond_the_largest_value() {
+    let max =
+        assert_parses("SELECT * WHERE { } LIMIT 9223372036854775807 OFFSET 9223372036854775807");
+    if let QueryBody::Select(q) = &max.body {
+        assert_eq!(
+            q.modifiers.limit.as_ref().map(|l| l.value),
+            Some(i64::MAX as u64)
+        );
+        assert_eq!(
+            q.modifiers.offset.as_ref().map(|o| o.value),
+            Some(i64::MAX as u64)
+        );
+    }
+    for clause in ["LIMIT", "OFFSET"] {
+        let result = assert_parse_error(
+            &format!("SELECT * WHERE {{ }} {clause} 9223372036854775808"),
+            &format!("{clause} is too large: the largest supported value is 9223372036854775807"),
+        );
+        assert!(
+            result
+                .diagnostics
+                .iter()
+                .all(|d| !d.message.contains("expected integer")),
+            "{clause}"
+        );
+    }
+}
+
 #[test]
 fn test_order_by() {
     let ast = assert_parses("SELECT * WHERE { } ORDER BY ?name");
@@ -929,13 +960,45 @@ fn test_literal_lang_tag_complex() {
 }
 
 #[test]
+fn test_anon_blank_node_is_one_node_across_lists() {
+    // A `;` or `,` list copies its `[]` subject into each triple; every copy
+    // must carry one label. Separate `[]`s get separate labels.
+    let ast = assert_parses(
+        "SELECT * WHERE { [] <http://ex/p> ?o ; <http://ex/q> ?z . \
+         [] <http://ex/r> <http://ex/x> , <http://ex/y> . [] <http://ex/s> [] }",
+    );
+    let QueryBody::Select(q) = &ast.body else {
+        panic!("a SELECT");
+    };
+    let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern else {
+        panic!("a BGP: {:?}", q.where_clause.pattern);
+    };
+    let label = |t: &SubjectTerm| match t {
+        SubjectTerm::BlankNode(b) => b.label.clone(),
+        other => panic!("a blank node: {other:?}"),
+    };
+    let subjects: Vec<_> = patterns.iter().map(|tp| label(&tp.subject)).collect();
+    assert_eq!(subjects.len(), 5);
+    assert_eq!(subjects[0], subjects[1], "`;` keeps one node");
+    assert_eq!(subjects[2], subjects[3], "`,` keeps one node");
+    let Term::BlankNode(last_object) = &patterns[4].object else {
+        panic!("a blank-node object");
+    };
+    let distinct: std::collections::HashSet<_> =
+        [&subjects[0], &subjects[2], &subjects[4], &last_object.label]
+            .into_iter()
+            .collect();
+    assert_eq!(distinct.len(), 4, "each `[]` is its own node: {subjects:?}");
+}
+
+#[test]
 fn test_blank_node_labeled() {
     let ast = assert_parses("SELECT * WHERE { _:b1 ?p ?o }");
     if let QueryBody::Select(q) = &ast.body {
         if let GraphPattern::Bgp { patterns, .. } = &q.where_clause.pattern {
             assert!(matches!(
                 &patterns[0].subject,
-                SubjectTerm::BlankNode(b) if matches!(&b.value, BlankNodeValue::Labeled(l) if l.as_ref() == "b1")
+                SubjectTerm::BlankNode(b) if b.label.as_ref() == "b1"
             ));
         }
     }
@@ -1555,14 +1618,48 @@ fn test_construct_template_blank_node_property_list() {
 
 #[test]
 fn test_blank_node_property_list_label_no_user_collision() {
-    // A user blank node literally named `_:#bnpl0` is impossible (the lexer
-    // rejects `#`), so the synthetic property-list node cannot be addressed or
-    // accidentally joined. A user label like `_b` near a `[ … ]` stays distinct:
-    // `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3 triples, and the
-    // synthetic node is its own variable.
+    // A user blank node literally named `_:-bnpl0` is impossible (a label
+    // can't start with `-`), so the synthetic property-list node cannot be
+    // addressed or accidentally joined. A user label like `_b` near a `[ … ]`
+    // stays distinct: `?s :p _:b . ?s :q [ :r ?o ]` → 2 + the user triple = 3
+    // triples, and the synthetic node is its own variable.
     let ast = assert_parses("SELECT ?o WHERE { ?s :p _:b . ?s :q [ :r ?o ] }");
     if let QueryBody::Select(q) = &ast.body {
         assert_eq!(bgp_triple_count(&q.where_clause.pattern), 3);
+    }
+    for synthetic in ["-anon0", "-bnpl0", "-coll0", "-reif0"] {
+        let query = format!("SELECT ?o WHERE {{ _:{synthetic} :p ?o }}");
+        assert!(parse(&query).has_errors(), "{query} must not parse");
+    }
+}
+
+#[test]
+fn test_minted_blank_node_labels_start_with_a_dash() {
+    // The other half of the test above: every label the parser mints for a
+    // `[]`, a `[ … ]`, a `( … )` or a standalone `<< … >>` with no reifier
+    // starts with `-`.
+    let ast = assert_parses(
+        "PREFIX ex: <http://example.org/> \
+         INSERT { _:b ex:p [ ex:q ?o ] ; ex:list ( ?o ?o ) ; ex:r [] } \
+         WHERE { ?s ex:p ?o . ?s ex:r [ ex:q ?x ] ; ex:list ( ?x ) . << ?s ex:p ?o >> . }",
+    );
+    let debug = format!("{ast:?}");
+    let labels: Vec<&str> = debug
+        .split("BlankNode { label: \"")
+        .skip(1)
+        .filter_map(|rest| rest.split('"').next())
+        .collect();
+    for kind in ["anon", "bnpl", "coll", "reif"] {
+        assert!(
+            labels.iter().any(|label| label.contains(kind)),
+            "no {kind} label minted: {labels:?}"
+        );
+    }
+    for label in labels {
+        assert!(
+            label == "b" || label.starts_with('-'),
+            "minted label {label} can lex as a user's label"
+        );
     }
 }
 
@@ -2431,7 +2528,7 @@ fn annotation_block_with_named_blank_reifier() {
     let ann = bgp[0].annotation.as_ref().expect("annotation tail");
     match unit(ann).reifier.as_ref().expect("reifier id") {
         crate::ast::ReifierId::BlankNode(b) => {
-            assert!(matches!(b.value, BlankNodeValue::Labeled(ref l) if l.as_ref() == "ann"));
+            assert_eq!(b.label.as_ref(), "ann");
         }
         other => panic!("expected blank-node reifier, got {other:?}"),
     }
@@ -2856,10 +2953,282 @@ fn test_ordinary_comments_are_not_pragmas() {
     assert_eq!(ast.pragmas.reasoning, None);
 }
 
+/// The pragma diagnostics of a request that must fail to parse.
+fn pragma_errors(input: &str) -> Vec<Diagnostic> {
+    let output = parse(input);
+    assert!(output.ast.is_none(), "expected a rejected parse: {input}");
+    output
+        .diagnostics
+        .into_iter()
+        .filter(|d| d.code == DiagCode::InvalidPragma)
+        .collect()
+}
+
+/// A misspelled or unsupported pragma fails the parse instead of running the
+/// request without the option it asked for.
 #[test]
-fn test_unknown_pragma_ignored() {
-    let ast = assert_parses("# PRAGMA timeout: 30\nSELECT * WHERE { }");
-    assert_eq!(ast.pragmas.reasoning, None);
+fn test_unknown_pragma_rejected() {
+    let input = "# PRAGMA timeout: 30\nSELECT * WHERE { }";
+    let errors = pragma_errors(input);
+    assert_eq!(errors.len(), 1, "{errors:?}");
+    assert!(
+        errors[0].message.contains("unknown pragma `timeout`"),
+        "{}",
+        errors[0].message
+    );
+    assert_eq!(errors[0].span.slice(input), "# PRAGMA timeout: 30");
+
+    let errors = pragma_errors("# PRAGMA max-feul: 10\nSELECT * WHERE { }");
+    assert!(
+        errors[0].message.contains("max-fuel"),
+        "{}",
+        errors[0].message
+    );
+}
+
+#[test]
+fn test_pragma_without_name_rejected() {
+    for input in [
+        "# PRAGMA\nSELECT * WHERE { }",
+        "# PRAGMA: 1\nSELECT * WHERE { }",
+    ] {
+        let errors = pragma_errors(input);
+        assert!(
+            errors[0].message.contains("expected a pragma name"),
+            "{input}"
+        );
+    }
+}
+
+#[test]
+fn test_request_option_pragmas() {
+    let ast = assert_parses(
+        "# PRAGMA meta: fuel, time\n\
+         # PRAGMA max-fuel: 2500.5\n\
+         # PRAGMA min-t: 42\n\
+         # PRAGMA identity: <did:key:z6Mkalice>\n\
+         # PRAGMA policy-class: http://ex.org/Manager, <http://ex.org/Auditor>\n\
+         # PRAGMA policy-values: {\"?dept\": \"sales\"}\n\
+         # PRAGMA default-allow: FALSE\n\
+         # PRAGMA include-system-facts: true\n\
+         # PRAGMA union-default-graph: false\n\
+         SELECT * WHERE { }",
+    );
+    let p = &ast.pragmas;
+    assert_eq!(
+        p.meta,
+        Some(crate::ast::MetaPragma {
+            time: true,
+            fuel: true,
+            policy: false
+        })
+    );
+    assert_eq!(p.max_fuel, Some(2500.5));
+    assert_eq!(p.min_t, Some(42));
+    assert_eq!(p.identity.as_deref(), Some("did:key:z6Mkalice"));
+    assert_eq!(
+        p.policy_class,
+        Some(vec![
+            "http://ex.org/Manager".to_string(),
+            "http://ex.org/Auditor".to_string()
+        ])
+    );
+    assert_eq!(
+        p.policy_values.as_ref().and_then(|v| v.get("?dept")),
+        Some(&serde_json::json!("sales"))
+    );
+    assert_eq!(p.default_allow, Some(false));
+    assert_eq!(p.include_system_facts, Some(true));
+    assert_eq!(p.union_default_graph, Some(false));
+    assert!(p.has_policy_selection());
+
+    let all = assert_parses("# PRAGMA meta: true\nSELECT * WHERE { }");
+    assert_eq!(
+        all.pragmas.meta,
+        Some(crate::ast::MetaPragma {
+            time: true,
+            fuel: true,
+            policy: true
+        })
+    );
+    let none = assert_parses("SELECT * WHERE { }");
+    assert!(!none.pragmas.has_policy_selection());
+    assert_eq!(none.pragmas.max_fuel, None);
+}
+
+#[test]
+fn test_malformed_pragma_values_rejected() {
+    for (pragma, expected) in [
+        ("max-fuel: -1", "non-negative number"),
+        ("max-fuel: lots", "non-negative number"),
+        ("min-t: -3", "non-negative integer"),
+        ("min-t: 1.5", "non-negative integer"),
+        ("meta: memory", "does not know `memory`"),
+        ("meta:", "expects true, false"),
+        ("default-allow: yes", "true or false"),
+        ("include-system-facts:", "true or false"),
+        ("union-default-graph: yes", "true or false"),
+        ("identity: did:a did:b", "one IRI"),
+        ("identity:", "one IRI"),
+        ("policy-class:", "at least one IRI"),
+        ("policy-values: [1]", "JSON object"),
+        ("policy-values: {\"?a\":", "JSON object"),
+    ] {
+        let errors = pragma_errors(&format!("# PRAGMA {pragma}\nSELECT * WHERE {{ }}"));
+        assert!(
+            errors.iter().any(|d| d.message.contains(expected)),
+            "{pragma}: {errors:?}"
+        );
+    }
+}
+
+#[test]
+fn test_update_pragmas() {
+    let ast = assert_parses(
+        "PREFIX ex: <http://ex.org/>\n\
+         # PRAGMA event-time: 2024-01-02T03:04:05Z\n\
+         # PRAGMA validation-mode: Warn\n\
+         # PRAGMA unique-properties: ex:email, <http://ex.org/ssn>\n\
+         INSERT DATA { ex:a ex:email \"a@ex.org\" }",
+    );
+    let p = &ast.pragmas;
+    assert_eq!(p.event_time.as_deref(), Some("2024-01-02T03:04:05Z"));
+    assert_eq!(p.validation_mode.as_deref(), Some("warn"));
+    assert_eq!(
+        p.unique_properties,
+        Some(vec![
+            "http://ex.org/email".to_string(),
+            "http://ex.org/ssn".to_string()
+        ])
+    );
+
+    for (pragma, expected) in [
+        ("validation-mode: soft", "warn or reject"),
+        ("event-time:", "RFC 3339"),
+        ("unique-properties:", "at least one IRI"),
+    ] {
+        let errors = pragma_errors(&format!(
+            "# PRAGMA {pragma}\nINSERT DATA {{ <urn:s> <urn:p> 1 }}"
+        ));
+        assert!(errors[0].message.contains(expected), "{pragma}: {errors:?}");
+    }
+}
+
+/// IRI-valued pragmas expand a prefix the request declares, including one a
+/// later update operation declares; undeclared prefixes (a DID's `did:`) and
+/// `<…>` IRIs are kept as written.
+#[test]
+fn test_pragma_iris_expand_declared_prefixes() {
+    let ast = assert_parses(
+        "PREFIX ex: <http://ex.org/>\n\
+         # PRAGMA identity: did:key:z6Mk\n\
+         # PRAGMA policy-class: ex:Manager, <ex:Literal>, urn:x:y\n\
+         SELECT * WHERE { }",
+    );
+    assert_eq!(ast.pragmas.identity.as_deref(), Some("did:key:z6Mk"));
+    assert_eq!(
+        ast.pragmas.policy_class,
+        Some(vec![
+            "http://ex.org/Manager".to_string(),
+            "ex:Literal".to_string(),
+            "urn:x:y".to_string()
+        ])
+    );
+
+    let ast = assert_parses(
+        "INSERT DATA { <urn:a> <urn:p> 1 } ;\n\
+         PREFIX ex: <http://ex.org/>\n\
+         # PRAGMA identity: ex:alice\n\
+         INSERT DATA { <urn:b> <urn:p> 2 }",
+    );
+    assert_eq!(ast.pragmas.identity.as_deref(), Some("http://ex.org/alice"));
+}
+
+#[test]
+fn test_request_pragmas_helper() {
+    use crate::parse::request_pragmas;
+
+    // No mention of a pragma: defaults, without a parse.
+    assert_eq!(
+        request_pragmas("SELECT * WHERE { }"),
+        Ok(Default::default())
+    );
+    let pragmas = request_pragmas("# PRAGMA max-fuel: 7\nSELECT * WHERE { }").unwrap();
+    assert_eq!(pragmas.max_fuel, Some(7.0));
+    // A pragma error is reported; any other parse failure is left to the
+    // parse that would run the request.
+    let err = request_pragmas("# PRAGMA max-feul: 7\nSELECT * WHERE { }").unwrap_err();
+    assert!(err.contains("unknown pragma `max-feul`"), "{err}");
+    assert_eq!(
+        request_pragmas("# PRAGMA max-fuel: 7\nSELEKT nonsense"),
+        Ok(Default::default())
+    );
+}
+
+/// `request_pragmas` skips the parse unless a comment could be a directive. Each
+/// spelling the parser reads as a pragma must get past that check, and the word
+/// alone, outside a comment, must not.
+#[test]
+fn test_request_pragmas_skips_only_text_without_a_directive() {
+    use crate::parse::request_pragmas;
+
+    for comment in [
+        "# PRAGMA max-fuel: 7",
+        "#PRAGMA max-fuel: 7",
+        "## PRAGMA max-fuel: 7",
+        "#\tpragma max-fuel 7",
+        "#\u{3000}Pragma max-fuel: 7",
+    ] {
+        let sparql = format!("SELECT * WHERE {{ }}\n{comment}");
+        assert!(super::may_carry_pragma(&sparql), "{comment:?}");
+        assert_eq!(
+            request_pragmas(&sparql).map(|p| p.max_fuel),
+            Ok(Some(7.0)),
+            "{comment:?}"
+        );
+    }
+    for text in [
+        "SELECT * WHERE { ?s <urn:p> \"pragma\" }",
+        "PREFIX x: <http://ex.org/pragma#>\nSELECT * WHERE { ?s x:p ?o }",
+        "# a comment about the pragma\nSELECT * WHERE { }",
+    ] {
+        assert!(!super::may_carry_pragma(text), "{text:?}");
+    }
+}
+
+/// Query options are refused on an UPDATE; the shared request options apply
+/// to both forms.
+#[test]
+fn test_pragma_form_applicability() {
+    for pragma in [
+        "min-t: 1",
+        "reasoning: rdfs",
+        "include-system-facts: true",
+        "union-default-graph: true",
+    ] {
+        let errors = pragma_errors(&format!(
+            "# PRAGMA {pragma}\nINSERT DATA {{ <urn:s> <urn:p> 1 }}"
+        ));
+        assert!(
+            errors[0]
+                .message
+                .contains("applies to queries, not updates"),
+            "{pragma}: {errors:?}"
+        );
+    }
+    let ast = assert_parses(
+        "# PRAGMA max-fuel: 10\n# PRAGMA identity: did:key:x\nINSERT DATA { <urn:s> <urn:p> 1 }",
+    );
+    assert_eq!(ast.pragmas.max_fuel, Some(10.0));
+    assert_eq!(ast.pragmas.identity.as_deref(), Some("did:key:x"));
+
+    let errors = pragma_errors("# PRAGMA event-time: 2024-01-01T00:00:00Z\nSELECT * WHERE { }");
+    assert!(
+        errors[0]
+            .message
+            .contains("applies to updates, not queries"),
+        "{errors:?}"
+    );
 }
 
 #[test]

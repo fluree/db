@@ -17,6 +17,9 @@ regex = "1"
 parking_lot = "0.12"
 
 [dev-dependencies]
+# Builds an `R2rmlError` for the classifier's table test; already in the graph
+# through fluree-db-query.
+fluree-db-r2rml = { path = "../fluree-db-r2rml" }
 tokio = { workspace = true }
 
 [lints]
