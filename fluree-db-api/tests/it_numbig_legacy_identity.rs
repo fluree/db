@@ -75,11 +75,16 @@ fn numbig_arena_files(dir: &Path) -> Vec<std::path::PathBuf> {
 /// A file-backed directory holding the fixture's ledger, bulk-imported, so
 /// every fact is in the index.
 async fn imported_ledger(ledger_id: &str) -> (TempDir, TempDir) {
+    imported_ledger_of(ledger_id, FIXTURE).await
+}
+
+/// [`imported_ledger`] over `fixture`.
+async fn imported_ledger_of(ledger_id: &str, fixture: &str) -> (TempDir, TempDir) {
     let db_dir = TempDir::new().expect("db tmpdir");
     let data_dir = TempDir::new().expect("data tmpdir");
     std::fs::File::create(data_dir.path().join("00-data.ttl"))
         .expect("create ttl")
-        .write_all(FIXTURE.as_bytes())
+        .write_all(fixture.as_bytes())
         .expect("write ttl");
     let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
         .without_indexing()
@@ -306,4 +311,71 @@ impl Drop for FastPathsGuard {
     fn drop(&mut self) {
         set_fast_paths_disabled(false);
     }
+}
+
+/// [`FIXTURE`]'s decimals with every subject linked to the others, for a
+/// cyclic join over one predicate's decimals.
+const CYCLIC_FIXTURE: &str = r"@prefix ex: <http://example.org/> .
+ex:a ex:d 1.5 ; ex:link ex:b , ex:c .
+ex:b ex:d 2.25 ; ex:link ex:a , ex:c .
+ex:c ex:d 19.99 ; ex:link ex:a , ex:b .
+";
+
+/// The cyclic join keys a decimal by its handle only within one predicate of
+/// an arena that holds each value once. On a legacy arena, where `1.5` and
+/// `1.50` are two handles, it declines (`arena-literal-object`) and the
+/// general plan pairs the two subjects that hold `1.5`, both ways. On the
+/// arena as a current build writes it the lane keeps the same query.
+#[tokio::test(flavor = "current_thread")]
+async fn the_cyclic_join_declines_a_legacy_decimal_arena() {
+    const QUERY: &str = "SELECT ?a ?b WHERE { ?a ex:d ?v . ?b ex:d ?v . ?a ex:link ?b }";
+    let mut failures = Vec::new();
+    for legacy in [true, false] {
+        let ledger_id = if legacy {
+            "numbig-legacy/cyclic:main"
+        } else {
+            "numbig-legacy/cyclic-canary:main"
+        };
+        let (db_dir, _data_dir) = imported_ledger_of(ledger_id, CYCLIC_FIXTURE).await;
+        if legacy {
+            install_legacy_arena(db_dir.path());
+        }
+        let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("reopen");
+        let db = fluree.graph(ledger_id).load().await.expect("load");
+        let _switch = FAST_PATH_SWITCH.read().await;
+        let (store, _guard) = init_test_tracing();
+        let before = store.find_events("fast-path outcome").len();
+        let bails_before = store.find_events("cyclic bgp fast path bail").len();
+        let results = sparql(&db, QUERY).await;
+        let rows = results["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .len();
+        let want_rows = if legacy { 2 } else { 0 };
+        if rows != want_rows {
+            failures.push(format!(
+                "legacy {legacy}: {rows} rows, want {want_rows}: {results}"
+            ));
+        }
+        let declined = stamped(&store, before, "fallback")
+            .iter()
+            .any(|s| s == "cyclic_bgp");
+        let served = stamped(&store, before, "proceed")
+            .iter()
+            .any(|s| s == "cyclic_bgp");
+        let bailed = store.find_events("cyclic bgp fast path bail")[bails_before..]
+            .iter()
+            .any(|e| e.fields.get("reason").map(String::as_str) == Some("arena-literal-object"));
+        if (declined, served, bailed) != (legacy, !legacy, legacy) {
+            failures.push(format!(
+                "legacy {legacy}: cyclic declined {declined}, served {served}, bailed on the arena \
+                 literal {bailed}; stamps {:?}",
+                stamped(&store, before, "")
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
