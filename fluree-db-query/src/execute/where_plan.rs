@@ -2233,7 +2233,8 @@ fn collect_block(patterns: &[Pattern], start: usize, seeding: Option<bool>) -> I
                     if triples.is_empty()
                         && binds.iter().all(|b| b.expr.is_constant_iri())
                         && bind_seeds_block(*var, expr, &patterns[i + 1..])
-                        && !seed_defers_to_property_join(patterns, start, *var, has_upstream_seed)
+                        && (has_upstream_seed
+                            || !seed_defers_to_property_join(patterns, start, *var))
                     {
                         break;
                     }
@@ -2310,15 +2311,11 @@ fn bind_seeds_block(var: VarId, expr: &Expression, rest: &[Pattern]) -> bool {
 /// bound object. Seeded, the chain starts at the triple reading `?var`, which
 /// `count / ndv` prices as rare whatever the constant: `BIND(ex:Common AS ?c)
 /// ?s ex:lang "fr" ; … ex:about ?c`, with `ex:Common` on half the subjects, then
-/// probes `ex:lang` once per subject naming it. Outside a property join a seed only
-/// narrows the scan the held-back plan reads first, so it stays; so does one into
-/// the star's subject, which it pins to a single subject.
-fn seed_defers_to_property_join(
-    patterns: &[Pattern],
-    start: usize,
-    var: VarId,
-    has_upstream_seed: bool,
-) -> bool {
+/// probes `ex:lang` once per subject naming it. A seed into the star's subject
+/// stays, since it pins the star to a single subject. A block with an upstream
+/// operator has no property join to keep, so the caller skips this; an OPTIONAL
+/// body is planned once per outer row.
+fn seed_defers_to_property_join(patterns: &[Pattern], start: usize, var: VarId) -> bool {
     let held = collect_block(patterns, start, None);
     if !held.list_views.is_empty() || held.triples.iter().any(|tp| tp.s.as_var() == Some(var)) {
         return false;
@@ -2330,7 +2327,7 @@ fn seed_defers_to_property_join(
         held.end_index,
         &held.triples,
         &object_bounds,
-        has_upstream_seed,
+        false,
     )
     .0
     .can_property_join
