@@ -20,7 +20,8 @@ A binary index build produces:
 - **Shared dictionary artifacts**:
   - small dictionaries (predicates, graphs, datatypes, languages) embedded in the **index root** (CAS) and/or persisted as flat files in local builds
   - large dictionaries (subjects, strings): reverse as **CoW single-level B-tree-like trees**
-    (a branch manifest `DTB1` + `DLR1` leaf blobs), forward as ID-range-routed **`FPK1` packs**
+    (a branch manifest `DTB1` + `DLR1` leaf blobs, front-coded `DLR2` for subjects), forward as
+    ID-range-routed **`FPK1` packs**
 - **Manifests / roots** that describe how to load the above either from a local directory layout
   or from the content store via `IndexRoot` (FIR6 binary format, CID-based).
 
@@ -51,7 +52,7 @@ Fact indexes exist in up to four sort orders (see `RunSortOrder`):
 - **Branch manifest**: maps key ranges to leaf files; used for routing.
 - **Column block**: a separately compressed single-column section inside a leaflet.
 - **History sidecar**: a separate CAS object holding a leaf's time-travel transition log.
-- **Dictionary tree**: a `DTB1` branch + `DLR1` leaves, holding the reverse (value → ID) direction for large keyspaces (subjects/strings).
+- **Dictionary tree**: a `DTB1` branch + `DLR1` leaves, holding the reverse (value → ID) direction for large keyspaces (subjects/strings). Subject leaves are written front-coded (`DLR2`): each key stores only what it does not share with the one before, restarting every 16 entries, and ids are varints of the local id. Readers take either layout, so a tree may mix them.
 - **Forward pack**: an `FPK1` blob holding a contiguous ID range of a forward (ID → value) dictionary, routed from the index root.
 - **ContentId**: a CIDv1 value that uniquely identifies a content-addressed artifact by its hash and type. See [ContentId and ContentStore](content-id-and-contentstore.md).
 
@@ -142,7 +143,7 @@ At a high level the root contains:
     14-bit payload, so `dt_id` is at most 16,383. Writes that would need a larger one are refused.
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
-  - tree blobs: subject/string reverse (`DTB1` branch + `DLR1` leaves)
+  - tree blobs: subject/string reverse (`DTB1` branch + `DLR2` subject / `DLR1` string leaves)
   - forward packs: subject (per namespace) & string (`FPK1`), routed by ID range
   - optional per-predicate numbig arenas
   - optional per-predicate vector arenas (manifest + shards)

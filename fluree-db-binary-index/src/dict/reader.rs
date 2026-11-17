@@ -1647,6 +1647,36 @@ mod tests {
             assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 1, "read whole");
         }
 
+        /// A front-coded leaf under a fencing reader is read whole, once,
+        /// and answers lookups and range scans as the plain tree does.
+        #[test]
+        fn a_front_coded_leaf_is_read_whole() {
+            let entries: Vec<ReverseEntry> = entries().into_iter().take(500).collect();
+            let format = crate::dict::reverse_leaf::LeafFormat::FrontCoded {
+                ns_relative_ids: false,
+            };
+            let built =
+                builder::build_reverse_tree_as(entries.clone(), usize::MAX, format).unwrap();
+            assert_eq!(built.branch.leaves.len(), 1);
+            let address = built.branch.leaves[0].address.clone();
+            let blob = built.leaves[0].bytes.clone();
+            assert!(ReverseLeaf::from_bytes(&blob).unwrap().is_front_coded());
+            let cs = SegmentedContentStore::new(true);
+            let reader = fenced_reader(&cs, vec![(address, blob)], built.branch);
+            for key in probes(&entries) {
+                let want = entries.iter().find(|e| e.key == key).map(|e| e.id);
+                assert_eq!(reader.reverse_lookup(&key).unwrap(), want);
+            }
+            let (lo, hi) = (&entries[40].key, &entries[260].key);
+            let scanned = reader.reverse_range_scan(lo, hi).unwrap();
+            let want: Vec<(Vec<u8>, u64)> = entries[40..260]
+                .iter()
+                .map(|e| (e.key.clone(), e.id))
+                .collect();
+            assert_eq!(scanned, want);
+            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 1, "read whole");
+        }
+
         /// An entry whose length runs past its stretch, or past the leaf, is
         /// an error, never a read past the bytes.
         #[test]
