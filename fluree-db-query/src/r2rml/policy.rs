@@ -273,7 +273,7 @@ pub fn class_overlap_warnings(mapping: &CompiledR2rmlMapping) -> Vec<String> {
     warnings
 }
 
-/// The prefixes a class `tm` derives from its row starts with (see/// The prefixes a class `tm` derives from its row starts with (see
+/// The prefixes a class `tm` derives from its row starts with (see
 /// [`ClassScope::derives`]); `None` (outer) when it derives none.
 fn derived_class_prefixes(
     mapping: &CompiledR2rmlMapping,
@@ -288,14 +288,15 @@ fn derived_class_prefixes(
         }
         match &pom.object_map {
             ObjectMap::Constant { .. } => continue,
+            // Only an IRI is a class: a template or column minting a literal
+            // gives the subject none.
             ObjectMap::Template {
                 template,
                 term_type,
                 ..
             } => {
-                derives = true;
-                // Only an IRI is a class.
                 if *term_type == TermType::Iri {
+                    derives = true;
                     prefixes.push(super::rewrite::constant_prefix(template).to_string());
                 }
             }
@@ -314,7 +315,6 @@ fn derived_class_prefixes(
                 }
             }
             ObjectMap::Column { term_type, .. } => {
-                derives = true;
                 if *term_type == TermType::Iri {
                     return Some(None);
                 }
@@ -570,10 +570,6 @@ impl R2rmlPolicyGate {
         }))
     }
 
-    /// Whether this map's rows carry classes the mapping cannot know
-    /// statically (a column/template/ref `rdf:type` object map) that a class
-    /// policy would need — the scan must then project those columns and
-    /// materialize each row's classes.
     /// Every `(triples map, predicate)` verdict the mapping can need, decided
     /// up front for a lane that plans the whole block before reading a row.
     /// A class policy over a map with one column-derived `rdf:type` is
@@ -671,6 +667,10 @@ impl R2rmlPolicyGate {
         Ok(Some(out))
     }
 
+    /// Whether this map's rows carry classes the mapping cannot know
+    /// statically (a column/template/ref `rdf:type` object map) that a class
+    /// policy would need — the scan must then project those columns and
+    /// materialize each row's classes.
     pub(crate) fn needs_row_classes(&self, tm: &TriplesMap) -> bool {
         self.has_class_policies && !derived_type_columns(tm).is_empty()
     }
@@ -1692,19 +1692,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn subsets_are_every_combination() {
-        let items: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
-        let mut all: Vec<Vec<&str>> = subsets(&items)
-            .map(|s| s.into_iter().map(String::as_str).collect())
-            .collect();
-        all.sort();
-        assert_eq!(all.len(), 8);
-        assert_eq!(all[0], Vec::<&str>::new());
-        assert!(all.contains(&vec!["a", "b", "c"]));
-        assert_eq!(subsets(&[]).count(), 1);
-    }
-
     /// An `f:required` restriction on another property does not change how a
     /// decision on this one is made: the two-point check settles it, so nine
     /// extra classes (past the enumeration cap) hide the row instead of
@@ -1779,6 +1766,50 @@ mod tests {
             true,
         );
         assert!(decide_result(&mut gate, &hist, "http://ex/name").is_err());
+    }
+
+    /// A map typing its subjects with a literal mints no class, so it neither
+    /// derives classes for a decision nor draws an overlap warning.
+    #[test]
+    fn a_literal_type_derives_no_class() {
+        use fluree_db_r2rml::mapping::TermType;
+        let literal = ObjectMap::Template {
+            template: "kind-{kind}".to_string(),
+            columns: vec!["kind".to_string()],
+            term_type: TermType::Literal,
+            datatype: None,
+            language: None,
+        };
+        let a = templated("http://ex/a", "http://ex/c/{id}", &["http://ex/C"], vec![]);
+        let b = templated(
+            "http://ex/b",
+            "http://ex/c/{id}",
+            &["http://ex/C"],
+            vec![
+                pom(rdf::TYPE, literal),
+                pom(rdf::TYPE, ObjectMap::column("label")),
+            ],
+        );
+        let mapping = CompiledR2rmlMapping::new(vec![a, b.clone()]);
+        assert!(derived_class_prefixes(&mapping, &b).is_none());
+        assert!(
+            class_overlap_warnings(&mapping).is_empty(),
+            "{:?}",
+            class_overlap_warnings(&mapping)
+        );
+    }
+
+    #[test]
+    fn subsets_are_every_combination() {
+        let items: Vec<String> = ["a", "b", "c"].iter().map(ToString::to_string).collect();
+        let mut all: Vec<Vec<&str>> = subsets(&items)
+            .map(|s| s.into_iter().map(String::as_str).collect())
+            .collect();
+        all.sort();
+        assert_eq!(all.len(), 8);
+        assert_eq!(all[0], Vec::<&str>::new());
+        assert!(all.contains(&vec!["a", "b", "c"]));
+        assert_eq!(subsets(&[]).count(), 1);
     }
 
     #[test]
