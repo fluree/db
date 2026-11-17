@@ -19,6 +19,7 @@ use std::sync::Arc;
 use thiserror::Error;
 
 use super::helpers::WELL_KNOWN_DATATYPES;
+use crate::parse::encode::IriEncoder;
 use crate::parse::UnresolvedDatatypeConstraint;
 
 /// Errors that can occur during arithmetic operations
@@ -613,39 +614,26 @@ impl ComparableValue {
             ComparableValue::String(s) => Some(s.as_ref()),
             ComparableValue::Iri(s) => Some(s.as_ref()),
             ComparableValue::TypedLiteral {
-                val: FlakeValue::String(s),
+                val: FlakeValue::String(s) | FlakeValue::Json(s),
                 ..
             } => Some(s.as_str()),
             _ => None,
         }
     }
 
-    /// String content of a value usable as a SPARQL string-builtin argument: a
-    /// plain / `xsd:string` literal, or a language-tagged literal (§17.4.3
-    /// admits a simple literal, `xsd:string`, and a plain literal with a
-    /// language tag). Unlike [`as_str`](Self::as_str), this rejects an IRI and a
-    /// foreign-datatype `TypedLiteral`, so a builtin that requires a string
-    /// argument (CONTAINS/STRSTARTS/…) keeps raising a type error on those while
-    /// staying transparent to a language tag. Same accept-set as `CONCAT`.
+    /// String content of a value usable as a SPARQL string-builtin argument:
+    /// a literal whose datatype [`reads_as_text`]. Unlike
+    /// [`as_str`](Self::as_str), this rejects an IRI and a literal of any
+    /// other datatype, so a builtin that requires a string argument
+    /// (CONTAINS/STRSTARTS/CONCAT/…) keeps raising a type error on those while
+    /// staying transparent to a language tag.
     pub fn string_arg(&self) -> Option<&str> {
         match self {
             ComparableValue::String(s) => Some(s.as_ref()),
             ComparableValue::TypedLiteral {
-                val: FlakeValue::String(s),
+                val: FlakeValue::String(s) | FlakeValue::Json(s),
                 dtc,
-            } => match dtc {
-                None | Some(UnresolvedDatatypeConstraint::LangTag(_)) => Some(s.as_str()),
-                // An explicit xsd:string IS a string — `STRDT(?x, xsd:string)`
-                // behaves like a simple literal, matching `str_arg_and_lang`'s
-                // accept-set (the two choke-points previously disagreed:
-                // STRBEFORE accepted it while CONTAINS type-errored).
-                Some(UnresolvedDatatypeConstraint::Explicit(iri))
-                    if iri.as_ref() == fluree_vocab::xsd::STRING =>
-                {
-                    Some(s.as_str())
-                }
-                Some(UnresolvedDatatypeConstraint::Explicit(_)) => None,
-            },
+            } if reads_as_text(dtc.as_ref()) => Some(s.as_str()),
             _ => None,
         }
     }
@@ -701,7 +689,9 @@ impl ComparableValue {
             }
             ComparableValue::Vector(_) => None, // Vectors don't have a string representation
             ComparableValue::TypedLiteral { val, .. } => match val {
-                FlakeValue::String(s) => Some(ComparableValue::String(Arc::from(s))),
+                FlakeValue::String(s) | FlakeValue::Json(s) => {
+                    Some(ComparableValue::String(Arc::from(s)))
+                }
                 FlakeValue::Long(n) => Some(ComparableValue::String(Arc::from(n.to_string()))),
                 // Same canonical form as the bare `Double` arm above (#1695).
                 FlakeValue::Double(d) => Some(ComparableValue::String(Arc::from(
@@ -841,12 +831,9 @@ impl ComparableValue {
                                 .to_string(),
                         )
                     })?;
-                    let dt = ctx
-                        .active_snapshot
-                        .encode_iri_strict(&dt_iri)
-                        .ok_or_else(|| {
-                            QueryError::InvalidFilter(format!("Unknown datatype IRI: {dt_iri}"))
-                        })?;
+                    // Any IRI is a datatype (§17.4.2.9), including one in a
+                    // namespace this ledger has never seen.
+                    let dt = ctx.active_snapshot.encode_datatype(&dt_iri);
                     Ok(Binding::lit(val, dt))
                 }
                 // No datatype constraint rides along on the value, so recover it
@@ -955,6 +942,35 @@ fn stamp_minted(
     ))
 }
 
+/// Whether a literal of this datatype reads as text to the string builtins
+/// (§17.4.3 admits a simple literal, `xsd:string` and a language-tagged
+/// string): those, plus Fluree's `@fulltext` and `rdf:JSON`, whose values are
+/// text a query searches and slices. The one accept-set for every string
+/// builtin. Comparison is separate: `=` and `<` stay term-exact, so an
+/// `@fulltext` or JSON value equals and orders only its own kind.
+pub(crate) fn reads_as_text(dtc: Option<&UnresolvedDatatypeConstraint>) -> bool {
+    match dtc {
+        None | Some(UnresolvedDatatypeConstraint::LangTag(_)) => true,
+        Some(UnresolvedDatatypeConstraint::Explicit(iri)) => matches!(
+            iri.as_ref(),
+            fluree_vocab::xsd::STRING | fluree_vocab::fluree::FULL_TEXT | fluree_vocab::rdf::JSON
+        ),
+    }
+}
+
+/// A JSON value as the evaluator sees it: an `rdf:JSON` literal, not a
+/// string, so `=` and `<` against a string are the type error they are for
+/// any other datatype. The string builtins still read it as text
+/// ([`reads_as_text`]).
+fn json_literal(json: FlakeValue) -> ComparableValue {
+    ComparableValue::TypedLiteral {
+        val: json,
+        dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(
+            fluree_vocab::rdf::JSON,
+        ))),
+    }
+}
+
 impl TryFrom<&FlakeValue> for ComparableValue {
     type Error = NullValueError;
 
@@ -963,7 +979,7 @@ impl TryFrom<&FlakeValue> for ComparableValue {
             FlakeValue::Long(n) => Ok(ComparableValue::Long(*n)),
             FlakeValue::Double(d) => Ok(ComparableValue::Double(*d)),
             FlakeValue::String(s) => Ok(ComparableValue::String(Arc::from(s.as_str()))),
-            FlakeValue::Json(s) => Ok(ComparableValue::String(Arc::from(s.as_str()))),
+            FlakeValue::Json(_) => Ok(json_literal(val.clone())),
             FlakeValue::Boolean(b) => Ok(ComparableValue::Bool(*b)),
             FlakeValue::Ref(sid) => Ok(ComparableValue::Sid(sid.clone())),
             FlakeValue::Null => Err(NullValueError),
@@ -997,7 +1013,7 @@ impl TryFrom<FlakeValue> for ComparableValue {
             FlakeValue::Long(n) => Ok(ComparableValue::Long(n)),
             FlakeValue::Double(d) => Ok(ComparableValue::Double(d)),
             FlakeValue::String(s) => Ok(ComparableValue::String(Arc::from(s))),
-            FlakeValue::Json(s) => Ok(ComparableValue::String(Arc::from(s))),
+            json @ FlakeValue::Json(_) => Ok(json_literal(json)),
             FlakeValue::Boolean(b) => Ok(ComparableValue::Bool(b)),
             FlakeValue::Ref(sid) => Ok(ComparableValue::Sid(sid)),
             FlakeValue::Null => Err(NullValueError),

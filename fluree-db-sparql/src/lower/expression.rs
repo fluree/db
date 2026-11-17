@@ -40,6 +40,25 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                     });
                 }
                 let value = self.lower_filter_value(lit)?;
+                // Likewise a typed literal whose datatype has no value kind of
+                // its own (a customer datatype, `xsd:anyURI`, `xsd:token`, a
+                // non-point WKT, …): it lowers to a string, and a bare string
+                // constant is an `xsd:string`, so `FILTER(?o = "a"^^ex:T)`
+                // compared plain strings. `"x"^^<dt>` ≡ `STRDT("x", <dt>)`.
+                if let (LiteralValue::Typed { datatype, .. }, FlakeValue::String(s)) =
+                    (&lit.value, &value)
+                {
+                    let dt_iri = self.expand_iri(datatype)?;
+                    if dt_iri != xsd::STRING {
+                        return Ok(Expression::Call {
+                            func: Function::StrDt,
+                            args: vec![
+                                Expression::Const(FlakeValue::String(s.clone())),
+                                Expression::Const(FlakeValue::String(dt_iri)),
+                            ],
+                        });
+                    }
+                }
                 Ok(Expression::Const(value))
             }
 

@@ -1,7 +1,8 @@
 //! Two known endpoints in a wide edge star: VALUES must constrain the probes.
 //!
 //! Compare two multi-row VALUES with the FILTER IN workaround. Singleton and
-//! broad-set controls protect existing star plans. Tiny=6k, small=24k,
+//! broad-set controls protect existing star plans; the singleton's BIND twin
+//! checks a constant-IRI BIND seeds the star as well. Tiny=6k, small=24k,
 //! medium=129k (the report's scale), large=500k edges; 256-byte snapshots.
 //!
 //! cargo bench -p fluree-db-api --bench query_hot_values_star
@@ -86,6 +87,11 @@ fn bench_query_hot_values_star(c: &mut Criterion) {
         (
             "singleton_anchor",
             "VALUES ?a { ex:A } VALUES ?b { ex:B ex:C }",
+            "",
+        ),
+        (
+            "singleton_anchor_bind",
+            "BIND(ex:A AS ?a) VALUES ?b { ex:B ex:C }",
             "",
         ),
         (

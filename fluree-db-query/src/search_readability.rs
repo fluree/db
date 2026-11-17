@@ -27,7 +27,8 @@ use crate::binary_scan::BinaryScanOperator;
 use crate::context::ExecutionContext;
 use crate::dataset::ActiveGraphs;
 use crate::error::Result;
-use fluree_db_core::{range_with_overlay, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
+use fluree_db_core::range::range_with_overlay_tracked;
+use fluree_db_core::{IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
 
 /// Readability for a hit identified by IRIs. See module docs.
 pub(crate) async fn search_hit_readable(
@@ -120,7 +121,7 @@ async fn any_visible_flake(
         let range_match = RangeMatch::new()
             .with_subject(subject_sid.clone())
             .with_predicate(pred_sid.clone());
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             snapshot,
             ctx.binary_g_id,
             overlay,
@@ -128,6 +129,7 @@ async fn any_visible_flake(
             RangeTest::Eq,
             range_match,
             RangeOptions::new().with_to_t(to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         let visible = BinaryScanOperator::filter_flakes_by_policy(
