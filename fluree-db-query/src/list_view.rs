@@ -221,11 +221,17 @@ impl ListView {
 
     /// The blank node for cell `k` of `owner`'s list.
     pub fn cell(&self, owner: &Owner, k: usize) -> Sid {
+        cell_sid(self.list_number(owner), k)
+    }
+
+    /// The number this request names `owner`'s list by, given now if it has
+    /// none: lists are numbered in the order a cell of theirs is first named.
+    fn list_number(&self, owner: &Owner) -> usize {
         let mut table = self
             .lists
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let n = match table.ids.get(owner) {
+        match table.ids.get(owner) {
             Some(&n) => n,
             None => {
                 let n = table.owners.len();
@@ -233,8 +239,7 @@ impl ListView {
                 table.ids.insert(owner.clone(), n);
                 n
             }
-        };
-        Sid::new(BLANK_NODE, format!("l{n}-{k}"))
+        }
     }
 
     /// The list and position `sid` names, when it is a cell of this request.
@@ -580,6 +585,8 @@ pub struct ListAugmentOperator {
     held: Option<HeldRows>,
     schema: Arc<[VarId]>,
     inputs: std::collections::VecDeque<Batch>,
+    /// The input being joined with its list triples, a batch at a time.
+    pending: Option<PendingRows>,
     joined: bool,
     unit_done: bool,
     state: OperatorState,
@@ -600,6 +607,7 @@ impl ListAugmentOperator {
             held,
             schema,
             inputs: std::collections::VecDeque::new(),
+            pending: None,
             joined: false,
             unit_done: false,
             state: OperatorState::Created,
@@ -612,6 +620,13 @@ impl ListAugmentOperator {
             return Ok(None);
         }
         loop {
+            if let Some(pending) = self.pending.as_mut() {
+                ctx.check_cancelled()?;
+                match pending.next_batch(&self.pattern, &self.schema, ctx.batch_size)? {
+                    Some(batch) => return Ok(Some(batch)),
+                    None => self.pending = None,
+                }
+            }
             if self.inputs.is_empty() {
                 match &self.held {
                     Some(held) => self.inputs.extend(held.take()),
@@ -627,11 +642,8 @@ impl ListAugmentOperator {
                 return Ok(None);
             };
             ctx.check_cancelled()?;
-            if let Some(batch) =
-                list_rows(ctx, &self.view, &self.pattern, &self.schema, &input).await?
-            {
-                return Ok(Some(batch));
-            }
+            self.pending =
+                Some(PendingRows::read(ctx, &self.view, &self.pattern, &self.schema, input).await?);
         }
     }
 }
@@ -651,42 +663,93 @@ fn select_rows(batch: &Batch, rows: &[usize]) -> Result<Batch> {
     Ok(Batch::new(batch.schema_arc(), columns)?)
 }
 
-/// `input` joined with the list triples that match `t`, in `schema`.
-async fn list_rows(
-    ctx: &ExecutionContext<'_>,
-    view: &ListView,
-    t: &TriplePattern,
-    schema: &Arc<[VarId]>,
-    input: &Batch,
-) -> Result<Option<Batch>> {
-    let graphs = ctx.path_graphs()?;
-    // Which triple position each output column takes, when not the input's.
-    let positions: Vec<Option<usize>> = schema
-        .iter()
-        .map(|v| {
-            [t.s.as_var(), t.p.as_var(), t.o.as_var()]
-                .iter()
-                .position(|pv| *pv == Some(*v))
-        })
-        .collect();
-    let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); schema.len()];
-    let mut rows = 0;
-    let mut cache: HashMap<(Want, Want, ObjectWant), Vec<ListTriple>> = HashMap::new();
-    for row in 0..input.len() {
-        let bound = |var: Option<VarId>| var.and_then(|v| input.get(row, v));
-        let s = node_want(ctx, bound(t.s.as_var()), &t.s)?;
-        let p = node_want(ctx, bound(t.p.as_var()), &t.p)?;
-        let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref())?;
-        let key = (s.clone(), p.clone(), o.clone());
-        if !cache.contains_key(&key) {
-            let found = list_triples(ctx, view, &graphs, &s, &p, &o).await?;
-            cache.insert(key.clone(), found);
+/// An input joined with the list triples that match `t` for each of its
+/// rows, made a batch at a time, so a read of many lists never holds all their
+/// triples at once on top of the batches they go into.
+struct PendingRows {
+    input: Batch,
+    /// Which triple position each output column takes, when not the input's.
+    positions: Vec<Option<usize>>,
+    /// The lists each row matches; rows asking for the same ones share them.
+    matched: Vec<Arc<Matched>>,
+    row: usize,
+    triples: Option<ListTriples>,
+}
+
+impl PendingRows {
+    /// Reads, and numbers, every list the rows of `input` match before any
+    /// triple is made, so the cells are labelled as when all of them were made
+    /// at once, whatever reads the first batches before the next is made.
+    async fn read(
+        ctx: &ExecutionContext<'_>,
+        view: &ListView,
+        t: &TriplePattern,
+        schema: &Arc<[VarId]>,
+        input: Batch,
+    ) -> Result<Self> {
+        let graphs = ctx.path_graphs()?;
+        let positions = schema
+            .iter()
+            .map(|v| {
+                [t.s.as_var(), t.p.as_var(), t.o.as_var()]
+                    .iter()
+                    .position(|pv| *pv == Some(*v))
+            })
+            .collect();
+        let mut by_key: HashMap<(Want, Want, ObjectWant), Arc<Matched>> = HashMap::new();
+        let mut matched = Vec::with_capacity(input.len());
+        for row in 0..input.len() {
+            let bound = |var: Option<VarId>| var.and_then(|v| input.get(row, v));
+            let s = node_want(ctx, bound(t.s.as_var()), &t.s)?;
+            let p = node_want(ctx, bound(t.p.as_var()), &t.p)?;
+            let o = object_want(ctx, bound(t.o.as_var()), &t.o, t.dtc.as_ref())?;
+            let key = (s, p, o);
+            let found = match by_key.get(&key) {
+                Some(found) => Arc::clone(found),
+                None => {
+                    let (s, p, o) = &key;
+                    let found = Arc::new(Matched::read(ctx, view, &graphs, s, p, o.clone()).await?);
+                    by_key.insert(key, Arc::clone(&found));
+                    found
+                }
+            };
+            matched.push(found);
         }
-        for triple in cache[&key].iter().filter(|triple| repeats_agree(t, triple)) {
-            for ((var, position), column) in schema.iter().zip(&positions).zip(&mut columns) {
+        Ok(Self {
+            input,
+            positions,
+            matched,
+            row: 0,
+            triples: None,
+        })
+    }
+
+    /// The next rows, at most `limit` of them; `None` once the input is done.
+    fn next_batch(
+        &mut self,
+        t: &TriplePattern,
+        schema: &Arc<[VarId]>,
+        limit: usize,
+    ) -> Result<Option<Batch>> {
+        let mut columns: Vec<Vec<Binding>> = vec![Vec::new(); schema.len()];
+        let mut rows = 0;
+        while self.row < self.input.len() && rows < limit.max(1) {
+            let row = self.row;
+            let triples = self
+                .triples
+                .get_or_insert_with(|| ListTriples::new(Arc::clone(&self.matched[row])));
+            let Some(triple) = triples.next() else {
+                self.triples = None;
+                self.row += 1;
+                continue;
+            };
+            if !repeats_agree(t, &triple) {
+                continue;
+            }
+            for ((var, position), column) in schema.iter().zip(&self.positions).zip(&mut columns) {
                 // The input's value, which the triple was found by; an unbound
                 // one takes the triple's.
-                let value = match (input.get(row, *var), position) {
+                let value = match (self.input.get(row, *var), position) {
                     (Some(b), _) if *b != Binding::Unbound => b.clone(),
                     (_, Some(0)) => Binding::sid(triple.s.clone()),
                     (_, Some(1)) => Binding::sid(triple.p.clone()),
@@ -697,104 +760,242 @@ async fn list_rows(
             }
             rows += 1;
         }
+        if rows == 0 {
+            return Ok(None);
+        }
+        if schema.is_empty() {
+            return Ok(Some(Batch::empty_schema_with_len(rows)));
+        }
+        Ok(Some(Batch::new(Arc::clone(schema), columns)?))
     }
-    if rows == 0 {
-        return Ok(None);
-    }
-    if schema.is_empty() {
-        return Ok(Some(Batch::empty_schema_with_len(rows)));
-    }
-    Ok(Some(Batch::new(Arc::clone(schema), columns)?))
 }
 
-/// The list triples matching `s p o` in `graphs`.
-async fn list_triples(
-    ctx: &ExecutionContext<'_>,
-    view: &ListView,
-    graphs: &[PathGraph<'_>],
-    s: &Want,
-    p: &Want,
-    o: &ObjectWant,
-) -> Result<Vec<ListTriple>> {
-    if matches!(s, Want::Nothing) || matches!(p, Want::Nothing) {
-        return Ok(Vec::new());
+/// The lists one `s p o` matches, read and numbered: per graph, the lists
+/// whose owner edges may match and the lists whose cells may, each with its
+/// list number.
+struct Matched {
+    graphs: Vec<GraphLists>,
+    want_first: bool,
+    want_rest: bool,
+    /// The one position asked for, when the subject is a cell.
+    at: Option<usize>,
+    o: ObjectWant,
+    first: Sid,
+    rest: Sid,
+}
+
+#[derive(Default)]
+struct GraphLists {
+    owners: Option<(Arc<[List]>, Vec<usize>)>,
+    cells: Option<(Arc<[List]>, Vec<usize>)>,
+}
+
+/// The positions of a list of `len` members whose cells are read: all of
+/// them, or the one asked for.
+fn positions(at: Option<usize>, len: usize) -> std::ops::Range<usize> {
+    match at {
+        Some(k) => k..len.min(k + 1),
+        None => 0..len,
     }
-    let (first, rest) = (Sid::new(RDF, RDF_FIRST), Sid::new(RDF, RDF_REST));
-    let cell = match s {
-        Want::Node(sid) => view.decode(sid),
-        _ => None,
-    };
-    let mut out = Vec::new();
-    for graph in graphs {
-        // Owner edges: `s p head`, for a subject that is not a cell.
-        let owner_edges = match p {
-            Want::Any => true,
-            Want::Node(p) => view.may_hold_lists(p),
-            Want::Nothing => false,
+}
+
+impl Matched {
+    /// The lists matching `s p o` in `graphs`, numbered in the order their
+    /// triples are made: per graph, the owner edges' lists, then each list
+    /// with a cell to read.
+    async fn read(
+        ctx: &ExecutionContext<'_>,
+        view: &ListView,
+        graphs: &[PathGraph<'_>],
+        s: &Want,
+        p: &Want,
+        o: ObjectWant,
+    ) -> Result<Self> {
+        let mut out = Matched {
+            graphs: Vec::new(),
+            want_first: false,
+            want_rest: false,
+            at: None,
+            o,
+            first: Sid::new(RDF, RDF_FIRST),
+            rest: Sid::new(RDF, RDF_REST),
         };
-        if owner_edges && cell.is_none() {
-            for (owner, _) in lists_in(ctx, graph, view, s, p).await?.iter() {
-                let head = view.cell(owner, 0);
-                out.push(ListTriple {
-                    s: owner.1.clone(),
-                    p: owner.2.clone(),
-                    o: Binding::sid(head),
-                });
-            }
+        if matches!(s, Want::Nothing) || matches!(p, Want::Nothing) {
+            return Ok(out);
         }
-        // Cells: `cellK rdf:first memberK ; rdf:rest next`.
-        let (want_first, want_rest) = match p {
+        let cell = match s {
+            Want::Node(sid) => view.decode(sid),
+            _ => None,
+        };
+        out.at = cell.as_ref().map(|(_, k)| *k);
+        (out.want_first, out.want_rest) = match p {
             Want::Any => (true, true),
             Want::Node(p) => (is_rdf_first(p), is_rdf_rest(p)),
             Want::Nothing => (false, false),
         };
-        if !(want_first || want_rest) {
-            continue;
+        for graph in graphs {
+            let mut lists = GraphLists::default();
+            // Owner edges: `s p head`, for a subject that is not a cell.
+            let owner_edges = match p {
+                Want::Any => true,
+                Want::Node(p) => view.may_hold_lists(p),
+                Want::Nothing => false,
+            };
+            if owner_edges && cell.is_none() {
+                let found = lists_in(ctx, graph, view, s, p).await?;
+                let numbers = found
+                    .iter()
+                    .map(|(owner, _)| view.list_number(owner))
+                    .collect();
+                lists.owners = Some((found, numbers));
+            }
+            // Cells: `cellK rdf:first memberK ; rdf:rest next`.
+            if out.want_first || out.want_rest {
+                let found = match (s, &cell) {
+                    (_, Some((owner, _))) if owner.0 != graph.g_id => None,
+                    (_, Some((owner, _))) => {
+                        let at = Want::Node(owner.1.clone());
+                        let of = Want::Node(owner.2.clone());
+                        Some(lists_in(ctx, graph, view, &at, &of).await?)
+                    }
+                    (Want::Node(_), None) => None,
+                    _ => Some(lists_in(ctx, graph, view, &Want::Any, &Want::Any).await?),
+                };
+                if let Some(found) = found {
+                    // A list with no cell to read here gets no number from it.
+                    let numbers = found
+                        .iter()
+                        .map(|(owner, members)| {
+                            if positions(out.at, members.len()).is_empty() {
+                                usize::MAX
+                            } else {
+                                view.list_number(owner)
+                            }
+                        })
+                        .collect();
+                    lists.cells = Some((found, numbers));
+                }
+            }
+            out.graphs.push(lists);
         }
-        let lists = match (s, &cell) {
-            (_, Some((owner, _))) => {
-                if owner.0 != graph.g_id {
+        Ok(out)
+    }
+}
+
+/// The triples of a [`Matched`], made one at a time, in the order they are
+/// answered: per graph, the owner edges, then each list's cells, a cell's
+/// `rdf:first` before its `rdf:rest`.
+struct ListTriples {
+    matched: Arc<Matched>,
+    graph: usize,
+    /// Past the owner edges, at the cells.
+    at_cells: bool,
+    list: usize,
+    /// The position in the current list, once it has been entered.
+    k: Option<usize>,
+    /// The current cell, between its `rdf:first` and its `rdf:rest`.
+    here: Option<Sid>,
+}
+
+impl ListTriples {
+    fn new(matched: Arc<Matched>) -> Self {
+        Self {
+            matched,
+            graph: 0,
+            at_cells: false,
+            list: 0,
+            k: None,
+            here: None,
+        }
+    }
+
+    fn next(&mut self) -> Option<ListTriple> {
+        let m = &self.matched;
+        loop {
+            let g = m.graphs.get(self.graph)?;
+            if !self.at_cells {
+                if let Some((owner, _)) = g.owners.as_ref().and_then(|(l, _)| l.get(self.list)) {
+                    let n = g.owners.as_ref().map(|(_, numbers)| numbers[self.list])?;
+                    self.list += 1;
+                    let triple = ListTriple {
+                        s: owner.1.clone(),
+                        p: owner.2.clone(),
+                        o: Binding::sid(cell_sid(n, 0)),
+                    };
+                    if m.o.matches(&triple.o) {
+                        return Some(triple);
+                    }
                     continue;
                 }
-                let at = Want::Node(owner.1.clone());
-                let of = Want::Node(owner.2.clone());
-                lists_in(ctx, graph, view, &at, &of).await?
+                self.at_cells = true;
+                self.list = 0;
+                continue;
             }
-            (Want::Node(_), None) => continue,
-            _ => lists_in(ctx, graph, view, &Want::Any, &Want::Any).await?,
-        };
-        for (owner, members) in lists.iter() {
-            let positions = match &cell {
-                Some((_, k)) => *k..members.len().min(k + 1),
-                None => 0..members.len(),
+            let Some((lists, numbers)) = &g.cells else {
+                self.graph += 1;
+                self.at_cells = false;
+                self.list = 0;
+                self.k = None;
+                self.here = None;
+                continue;
             };
-            for k in positions {
-                let member = &members[k];
-                let here = view.cell(owner, k);
-                if want_first {
-                    out.push(ListTriple {
-                        s: here.clone(),
-                        p: first.clone(),
-                        o: member_binding(member),
-                    });
+            let Some((_, members)) = lists.get(self.list) else {
+                self.graph += 1;
+                self.at_cells = false;
+                self.list = 0;
+                self.k = None;
+                self.here = None;
+                continue;
+            };
+            let range = positions(m.at, members.len());
+            let k = *self.k.get_or_insert(range.start);
+            if k >= range.end {
+                self.list += 1;
+                self.k = None;
+                continue;
+            }
+            let n = numbers[self.list];
+            let triple = match self.here.take() {
+                // The cell's `rdf:first`; its `rdf:rest` comes next.
+                None => {
+                    let here = cell_sid(n, k);
+                    self.here = Some(here.clone());
+                    if !m.want_first {
+                        continue;
+                    }
+                    ListTriple {
+                        s: here,
+                        p: m.first.clone(),
+                        o: member_binding(&members[k]),
+                    }
                 }
-                if want_rest {
+                Some(here) => {
+                    self.k = Some(k + 1);
+                    if !m.want_rest {
+                        continue;
+                    }
                     let next = if k + 1 == members.len() {
                         Sid::new(RDF, RDF_NIL)
                     } else {
-                        view.cell(owner, k + 1)
+                        cell_sid(n, k + 1)
                     };
-                    out.push(ListTriple {
+                    ListTriple {
                         s: here,
-                        p: rest.clone(),
+                        p: m.rest.clone(),
                         o: Binding::sid(next),
-                    });
+                    }
                 }
+            };
+            if m.o.matches(&triple.o) {
+                return Some(triple);
             }
         }
     }
-    out.retain(|t| o.matches(&t.o));
-    Ok(out)
+}
+
+/// The blank node for cell `k` of list `n`.
+fn cell_sid(n: usize, k: usize) -> Sid {
+    Sid::new(BLANK_NODE, format!("l{n}-{k}"))
 }
 
 /// Whether `triple` gives each variable `t` repeats (`?x ?p ?x`) one term.
@@ -1289,6 +1490,7 @@ impl Operator for ListAugmentOperator {
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.join.open(ctx).await?;
         self.inputs.clear();
+        self.pending = None;
         self.joined = false;
         self.unit_done = false;
         self.state = OperatorState::Open;
@@ -1317,6 +1519,7 @@ impl Operator for ListAugmentOperator {
     fn close(&mut self) {
         self.join.close();
         self.inputs.clear();
+        self.pending = None;
         self.state = OperatorState::Closed;
     }
 

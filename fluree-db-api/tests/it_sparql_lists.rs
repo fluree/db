@@ -353,6 +353,53 @@ async fn every_request_names_the_cells_alike() {
     }
 }
 
+/// A list with more triples than a batch holds is answered a batch at a time,
+/// not as one batch of every triple, and still reads back whole: the Turtle
+/// writer folds the cells back into the list only if the chain and its labels
+/// carry across the batches.
+#[tokio::test]
+async fn a_long_list_is_answered_a_batch_at_a_time() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    const N: usize = 2_500;
+    let members: Vec<String> = (0..N).map(|i| i.to_string()).collect();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ttl = format!("ex:s ex:items ({}) .", members.join(" "));
+    let ledger = ledger_with(&fluree, "long", &ttl).await;
+
+    let result = rdf_query(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("select");
+    let sizes: Vec<usize> = result
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .collect();
+    assert_eq!(sizes.iter().sum::<usize>(), 1 + 2 * N, "{sizes:?}");
+    // The default batch size is 1,000 rows; the list alone is 5,001.
+    assert!(sizes.iter().all(|&n| n <= 1_000), "{sizes:?}");
+
+    let construct = rdf_query(
+        &fluree,
+        &ledger,
+        "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+    )
+    .await
+    .expect("construct");
+    let ttl = format_results_string(
+        &construct,
+        &construct.context,
+        &ledger.snapshot,
+        &FormatterConfig::turtle(),
+    )
+    .expect("turtle");
+    assert!(
+        ttl.contains(&format!("( {} )", members.join(" "))),
+        "the list is not written whole:\n{}",
+        &ttl[..ttl.len().min(2_000)]
+    );
+}
+
 /// The fuel of `rdf:rest*/rdf:first` grows with the list, not with its
 /// square or cube: the walk starts at the owner, though statistics count no
 /// `rdf:first` for a compact list, and reads the list once.
