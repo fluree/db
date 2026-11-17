@@ -409,9 +409,13 @@ fn compute_clean(
             if graph_has_scan_hidden_predicates(ctx, store)? {
                 return Ok(None);
             }
-            // Distinct subjects from SPOT leaflet lead groups
-            // (SPOT key layout: s_id(8) + …).
-            count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot, 8)?
+            // Distinct subjects from SPOT leaflet groups.
+            let Some(subjects) =
+                count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot)?
+            else {
+                return Ok(None);
+            };
+            subjects
         }
         Anchor::Class(class_sid) => {
             let Some(class) = class_stats(ctx, class_sid) else {
@@ -609,7 +613,9 @@ fn overlay_all_subjects_count(
         return Ok(None);
     }
     let g_id = ctx.binary_g_id;
-    let base = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot, 8)?;
+    let Some(base) = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot)? else {
+        return Ok(None);
+    };
 
     // Translate every novelty flake (all predicates) to V3 id space.
     let dn = ctx.dict_novelty.clone().unwrap_or_else(|| {

@@ -120,6 +120,11 @@ impl Fluree {
             return Ok(Erased::Nothing);
         }
         let root_bytes = store.get(&root_id).await?;
+        // A v4 index is rewritten whole: rewriting its touched leaves alone
+        // would leave a root mixing v4 and v5 artifacts.
+        if !fluree_db_binary_index::format::index_root::is_current_format(&root_bytes) {
+            return Ok(Erased::NeedsRebuild);
+        }
         let root = IndexRoot::decode(&root_bytes)
             .map_err(|e| ApiError::internal(format!("index root {root_id}: {e}")))?;
         let records = erasure

@@ -934,6 +934,14 @@ name = "it_batched_pair_join"
 path = "tests/it_batched_pair_join.rs"
 required-features = ["native"]
 
+# Standalone: directory-only aggregates over leaflets whose routing keys
+# history widened; toggles the process-global fast-path switch and the
+# parallel-walk threshold, and asserts routing via span capture.
+[[test]]
+name = "it_leaflet_live_edges"
+path = "tests/it_leaflet_live_edges.rs"
+required-features = ["native"]
+
 # Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
 # switch AND asserts membership-join routing via span capture.
 [[test]]

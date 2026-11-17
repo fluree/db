@@ -604,25 +604,47 @@ where
     F: Fn(&[LeafEntry]) -> Result<Option<P>> + Sync + Send,
     C: Fn(P, P) -> P,
 {
+    parallel_leaf_chunk_reduce_at(leaves, parallel, |_, chunk| map(chunk), combine)
+}
+
+/// [`parallel_leaf_chunk_reduce`] whose `map` also takes the index in
+/// `leaves` of its chunk's first leaf, so a partial can name a leaf by index
+/// rather than borrow its chunk.
+pub(crate) fn parallel_leaf_chunk_reduce_at<P, F, C>(
+    leaves: &[LeafEntry],
+    parallel: bool,
+    map: F,
+    combine: C,
+) -> Result<Option<P>>
+where
+    P: Send,
+    F: Fn(usize, &[LeafEntry]) -> Result<Option<P>> + Sync + Send,
+    C: Fn(P, P) -> P,
+{
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
     let k = ncpu.min(PARALLEL_LEAF_SCAN_MAX_CHUNKS).min(leaves.len());
     if !parallel || ncpu < 2 || k < 2 {
         // Not worth parallelizing: run the map serially over the whole slice.
-        return map(leaves);
+        return map(0, leaves);
     }
 
     // Contiguous, near-equal leaf chunks (`chunks()` yields ceil(len/per) slices).
     let per = leaves.len().div_ceil(k);
-    let chunks: Vec<&[LeafEntry]> = leaves.chunks(per).collect();
+    let chunks: Vec<(usize, &[LeafEntry])> = leaves
+        .chunks(per)
+        .enumerate()
+        .map(|(i, chunk)| (i * per, chunk))
+        .collect();
     tracing::debug!(
         chunks = chunks.len(),
         leaves = leaves.len(),
         "fast-path: parallel leaf-chunk reduce"
     );
 
-    let partials: Vec<Result<Option<P>>> = parallel_map_pooled(chunks, map);
+    let partials: Vec<Result<Option<P>>> =
+        parallel_map_pooled(chunks, |(start, chunk)| map(start, chunk));
 
     let mut acc: Option<P> = None;
     for partial in partials {

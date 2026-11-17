@@ -696,12 +696,17 @@ impl RangeSemiJoinOperator {
                         }
                         match key_bounds(envelope, o_type.decode_kind()) {
                             Some((lo, hi)) => {
-                                let first =
-                                    read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_key;
-                                let last =
-                                    read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_key;
-                                if last < lo || first > hi {
-                                    continue;
+                                // The routing keys bound the rows, but history
+                                // can widen them into another o_type, whose
+                                // o_key does not compare with `lo`/`hi`.
+                                let bounds = crate::join::post_o_key_bounds(
+                                    &read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
+                                    &read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
+                                    (p_id, ot),
+                                );
+                                match bounds {
+                                    Some((first, last)) if last >= lo && first <= hi => {}
+                                    _ => continue,
                                 }
                                 Some((ot, lo, hi))
                             }
