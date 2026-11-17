@@ -1,0 +1,158 @@
+name: npm release
+
+# Builds @fluree/db-wasm (the in-browser engine) and @fluree/react, smokes the
+# packed engine in headless Chrome, and publishes both to npm. The same version
+# tags as the CLI release trigger it. Both packages carry the workspace
+# version: `v4.3.0` publishes 4.3.0, and a pre-release tag (`v4.3.0-rc.1`)
+# publishes 4.3.0-rc.1 under the `next` dist-tag. The repo keeps 0.0.0-dev in
+# package.json; the version is stamped at pack time.
+#
+# Publishing uses npm trusted publishing: npm trusts this workflow, run in the
+# `npm` environment, so no token is stored. A package's first publish predates
+# that trust; NPM_TOKEN covers it and is removed afterwards. Only a tag push
+# publishes, and only when the tag names the workspace version. Run it by hand
+# (workflow_dispatch) to build and smoke the packages without publishing.
+on:
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build and smoke
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      # Same restatement as CI's wasm jobs: an env RUSTFLAGS masks
+      # .cargo/config.toml.
+      RUSTFLAGS: --cfg getrandom_backend="wasm_js"
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.97.0
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Install wasm-bindgen CLI (Cargo.lock version) and binaryen
+        # A native build: getrandom hard-errors on the wasm cfg for a
+        # non-wasm target.
+        env:
+          RUSTFLAGS: ""
+        run: |
+          VER=$(grep -A1 '^name = "wasm-bindgen"$' Cargo.lock | tail -1 | cut -d'"' -f2)
+          cargo install wasm-bindgen-cli --version "$VER" --locked
+          sudo apt-get update -qq && sudo apt-get install -y -qq binaryen
+
+      - name: Workspace version
+        id: version
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 --locked \
+            | jq -r '.packages[] | select(.name == "fluree-db-wasm") | .version')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # npm never takes a version twice, so a tag on the wrong commit must not
+      # publish whatever version that commit carries.
+      - name: The tag names the version being built
+        if: github.ref_type == 'tag'
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "${GITHUB_REF_NAME#v}" != "$VERSION" ]; then
+            echo "tag $GITHUB_REF_NAME does not match the workspace version $VERSION"
+            exit 1
+          fi
+
+      - name: Build @fluree/db-wasm (wasm-release profile + wasm-opt + tsc)
+        working-directory: fluree-db-wasm/js
+        run: |
+          npm ci
+          node scripts/build.mjs
+
+      - name: Test and build @fluree/react
+        working-directory: fluree-react
+        run: |
+          npm ci
+          npx vitest run
+          npm run build
+
+      - name: Stamp the version
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          (cd fluree-db-wasm/js && npm pkg set version="$VERSION")
+          (cd fluree-react && npm pkg set version="$VERSION")
+
+      # --packed smokes what an install receives, so a `files` regression
+      # (the .wasm dropped from the tarball, say) fails here, not for users.
+      - name: Smoke the packed engine (headless Chrome)
+        working-directory: fluree-db-wasm/js
+        run: node scripts/smoke-browser.mjs --packed
+
+      # npm ships a LICENSE at the package root whatever `files` says; the
+      # BUSL terms travel with the code.
+      - name: Pack
+        run: |
+          mkdir -p "$RUNNER_TEMP/npm"
+          for dir in fluree-db-wasm/js fluree-react; do
+            cp LICENSE "$dir/LICENSE"
+            (cd "$dir" && npm pack --pack-destination "$RUNNER_TEMP/npm")
+          done
+          for tgz in "$RUNNER_TEMP"/npm/*.tgz; do
+            tar -tzf "$tgz" | grep -qx 'package/LICENSE' || { echo "$tgz carries no LICENSE"; exit 1; }
+          done
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: npm-packages
+          path: ${{ runner.temp }}/npm/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: publish to npm
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    environment:
+      name: npm
+      url: https://www.npmjs.com/package/@fluree/react
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      # Trusted publishing needs npm 11.5.1 or later; node 22 ships npm 10.
+      - run: npm install -g npm@11.6.2
+      - uses: actions/download-artifact@v7
+        with:
+          name: npm-packages
+          path: npm
+      - name: Publish
+        env:
+          VERSION: ${{ needs.build.outputs.version }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          tag=latest
+          case "$VERSION" in *-*) tag=next ;; esac
+          # The engine first: an app peering with @fluree/react installs both.
+          # A version already published is skipped, so a re-run after a
+          # partial publish finishes the job.
+          for spec in "db-wasm" "react"; do
+            name="@fluree/$spec"
+            if npm view "$name@$VERSION" version >/dev/null 2>&1; then
+              echo "$name@$VERSION is already published"
+              continue
+            fi
+            npm publish "npm/fluree-$spec-$VERSION.tgz" --access public --provenance --tag "$tag"
+          done
