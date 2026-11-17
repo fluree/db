@@ -124,8 +124,8 @@ async fn subject_and_object_probes_take_the_row_store_id() {
     );
     assert_eq!(lookups, 1, "object probes looked their ids up again");
 
-    // DESCRIBE expands each target through the same per-row probe. Its
-    // output DISTINCT makes lookups of its own, so count the probes instead.
+    // On next the fused chain answers this DESCRIBE, so no per-row probe
+    // runs: none is stamped, and the answer must still be right.
     let (spans, _guard) = support::span_capture::init_test_tracing();
     let q = format!("{PREFIXES}DESCRIBE ?x WHERE {{ ex:a ex:knows ?x }}");
     let described = support::query_sparql(&fluree, &ledger, &q)
@@ -139,8 +139,20 @@ async fn subject_and_object_probes_take_the_row_store_id() {
             stamps(&spans, "proceed"),
             stamps(&spans, "fallback:gate_declined")
         ),
-        (2, 0),
-        "each target's probe takes its id"
+        (0, 0),
+        "the fused chain answers DESCRIBE"
+    );
+    assert_eq!(
+        spans
+            .find_events("fast-path outcome")
+            .iter()
+            .filter(
+                |e| e.fields.get("site").map(String::as_str) == Some("fused_chain")
+                    && e.fields.get("outcome").map(String::as_str) == Some("proceed")
+            )
+            .count(),
+        1,
+        "DESCRIBE took the fused chain"
     );
     assert!(
         described.contains("sb") && described.contains("\"c\"") && !described.contains("likes"),
