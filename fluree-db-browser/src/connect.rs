@@ -126,11 +126,12 @@ impl BrowserPeer {
             events_url(&self.api_base, ledgers),
             Some(self.token.clone()),
         );
+        let sleeper = Arc::new(DriverSleeper::new(self.io.clone()));
         let sink = PeerHeadSink {
             fluree: self.fluree.clone(),
             registry: Arc::clone(&self.heads),
+            sleeper: sleeper.clone(),
         };
-        let sleeper = DriverSleeper::new(self.io.clone());
         let stream_config = HeadStreamConfig {
             reconnect_initial: self.config.reconnect_initial,
             reconnect_max: self.config.reconnect_max,
@@ -138,7 +139,7 @@ impl BrowserPeer {
         };
         let (stop_tx, stop_rx) = watch::channel(false);
         let future = Box::pin(async move {
-            run_head_stream(&source, &sink, &sleeper, stream_config, stop_rx).await;
+            run_head_stream(&source, &sink, &*sleeper, stream_config, stop_rx).await;
         });
         (HeadTracker::new(stop_tx), future)
     }
