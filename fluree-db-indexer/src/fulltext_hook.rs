@@ -218,6 +218,11 @@ impl FulltextHook {
         &self.entries
     }
 
+    /// Keep only the collected entries `keep` accepts.
+    pub fn retain(&mut self, keep: impl FnMut(&FulltextEntry) -> bool) {
+        self.entries.retain(keep);
+    }
+
     pub fn entries_mut(&mut self) -> &mut [FulltextEntry] {
         &mut self.entries
     }

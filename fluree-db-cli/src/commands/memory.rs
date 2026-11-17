@@ -75,13 +75,13 @@ pub async fn run(action: MemoryAction, dirs: &FlureeDir) -> CliResult<()> {
     }
 }
 
-fn build_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
+async fn build_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
     // Short-lived CLI commands keep a persistent (file-backed) ledger so that
     // `import` and the `init` legacy-ledger migration work and repeated
     // invocations don't rebuild from scratch. The long-lived `mcp serve` path
     // uses an ephemeral in-memory ledger instead (see `mcp_serve`), which is
     // what makes many concurrent MCP processes safe.
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     // Determine memory_dir: use .fluree-memory/ at the project root.
     // In unified (local) mode, data_dir is .fluree/ so its parent is the project root.
@@ -100,7 +100,7 @@ fn build_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
 /// any `.ttl` files on disk. Use from every memory subcommand except
 /// `init`, which intentionally constructs an empty store before sync.
 async fn build_synced_store(dirs: &FlureeDir) -> CliResult<MemoryStore> {
-    let store = build_store(dirs)?;
+    let store = build_store(dirs).await?;
     store.ensure_synced().await.map_err(memory_err)?;
     Ok(store)
 }

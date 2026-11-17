@@ -13,3 +13,15 @@
 fn every_test_file_is_reachable() {
     fluree_test_support::assert_every_test_file_is_reachable(env!("CARGO_MANIFEST_DIR"));
 }
+
+/// No test in the workspace installs a thread-local tracing subscriber except
+/// through `fluree_test_support::scoped_default` or `with_scoped_default`,
+/// without which the capture can intermittently miss events. Checked here for
+/// every workspace member at once.
+#[test]
+fn scoped_subscribers_use_the_floor() {
+    fluree_test_support::assert_scoped_subscribers_use_the_floor(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/.."
+    ));
+}

@@ -14,7 +14,7 @@
 //! | `r2rml.read_metadata` | `fluree-db-api/src/graph_source/r2rml.rs` (PR-8 cold: metadata-JSON S3 GET + parse, keyed by content-addressed `metadata_location`) | — |
 //! | `r2rml.count_manifest_read` | `fluree-db-api/src/graph_source/r2rml.rs` (PR-8 cold: the COUNT(*) path's manifest-list + manifest read, nested in `r2rml.count_manifest`) | — |
 //! | `r2rml.prefetch` | `fluree-db-api/src/graph_source/r2rml.rs` (PR-8 slice-1: concurrent catalog-resolution warm; `requested`/`warmed` prove engagement + fan-out width) | — |
-//! | `iceberg.scan_plan`  | `fluree-db-iceberg/src/scan/send_planner.rs` (manifest read + file pruning) | `files_selected`, `files_pruned`, `estimated_row_count` |
+//! | `iceberg.scan_plan`  | `fluree-db-iceberg/src/scan/send_planner.rs` (file selection on every Iceberg scan, plus the manifest read on a scan-files cache miss); also `fluree-db-api/src/graph_source/r2rml.rs` (the top-k read stage) | `files_selected`, `files_pruned`, `estimated_row_count` |
 //! | `iceberg.parquet_read` | `fluree-db-api/src/graph_source/r2rml.rs` (per-file decode, in spawned tasks) | `file_size` |
 //! | `iceberg.oauth_token`  | `fluree-db-iceberg/src/auth/oauth2.rs` (OAuth token mint) | — |
 //! | `iceberg.read_footer` / `iceberg.plan_columns` / `iceberg.fetch_bytes` / `iceberg.decode` | `fluree-db-iceberg/src/io/send_parquet.rs` (per-file cost decomposition inside `iceberg.parquet_read`) | — |
@@ -72,11 +72,13 @@ pub const SPAN_ALLOWLIST: &[&str] = &[
 /// R2RML engine ran.
 ///
 /// Deliberately excludes the data-/cache-/plan-dependent spans:
-/// - `iceberg.scan_plan` — fires only when the planner takes the
-///   pruning/pushdown branch (2 of 16 smoke queries; finding F7 in
-///   `04-findings-register`), so treating it as must-fire false-flagged most
-///   virtual queries. Re-add if the engine ever emits it unconditionally
-///   (with `files_pruned=0`), per the ROADMAP harness follow-up.
+/// - `iceberg.scan_plan` — fires on every Iceberg table scan, a scan-files
+///   cache hit included (it used to fire only on a pushdown filter or a cache
+///   miss; finding F7 in `04-findings-register`). It still cannot be
+///   must-fire: a `COUNT(*)` answered from the manifests, a table with no
+///   snapshot, and SQL or Delta sources never plan an Iceberg scan. A top-k
+///   scan records it twice (the plan, then the files the top-k stage read),
+///   so `files_selected` sums the two.
 /// - `iceberg.parquet_read` — a metadata-only COUNT can answer from row-count
 ///   stats without reading any Parquet.
 /// - `r2rml.load_table` / `iceberg.oauth_token` — fire only on a cold catalog /

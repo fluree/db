@@ -18,13 +18,13 @@
 //!   rejected — only `Abort`, `TakeSource`, and `TakeBranch` make sense for
 //!   revert.
 
-use crate::commit_data::{collect_from_commits, CollectedCommitData, Fold};
+use crate::commit_data::{collect_from_commits, CollectedCommitData, ConfigGraphs, Fold};
 use crate::error::{ApiError, Result};
 use crate::ledger_manager::GuardedStagedCommit;
 use crate::ledger_view::{CommitRef, LedgerView};
 use crate::rebase::ConflictStrategy;
 use fluree_db_core::commit::{TxnMetaEntry, TxnMetaValue};
-use fluree_db_core::ledger_id::format_ledger_id;
+use fluree_db_core::LedgerId;
 use fluree_db_core::{
     collect_dag_cids, collect_first_parent_cids, load_commit_by_id, load_commit_envelope_by_id,
     trace_first_parent_commits_by_id, BranchedContentStore, CommitId, ConflictKey, ContentStore,
@@ -342,12 +342,12 @@ impl crate::Fluree {
         branch: &str,
         selection: RevertSelection,
     ) -> Result<RevertContext> {
-        let branch_id = format_ledger_id(ledger_name, branch);
+        let branch_id = LedgerId::from_parts(ledger_name, branch)?;
         let branch_record = self
             .nameservice()
             .lookup(&branch_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(branch_id.clone().to_string()))?;
         let branch_head_id = branch_record.commit_head_id.clone().ok_or_else(|| {
             ApiError::InvalidBranch(format!("Branch {branch_id} has no commits to revert"))
         })?;
@@ -387,11 +387,28 @@ impl crate::Fluree {
         };
 
         let plan = resolve_revert_plan(&branch_store, &branch_head_id, &resolved).await?;
+        // A drop at or after the oldest reverted commit is the only way one
+        // can be involved; the commits are read only then.
+        if branch_state
+            .snapshot
+            .graph_registry
+            .graph_drops()
+            .any(|(_, drop)| drop.floor >= plan.oldest_t)
+        {
+            let mut reverted = Vec::with_capacity(plan.ordered_commits.len());
+            for commit_id in plan.ordered_commits.iter() {
+                let commit = load_commit_by_id(&branch_store, commit_id).await?;
+                reverted.push(RevertedWrites::of(&commit));
+            }
+            refuse_reverting_drops(&reverted, &branch_state)?;
+        }
+        let mut config = ConfigGraphs::for_target(&branch_state);
         let conflict_keys = compute_conflict_keys(
             &branch_store,
             &branch_head_id,
             &plan.reverted_set,
             plan.oldest_t,
+            &mut config,
         )
         .await?;
 
@@ -401,6 +418,7 @@ impl crate::Fluree {
             branch_store,
             plan,
             conflict_keys,
+            config,
         })
     }
 
@@ -429,23 +447,26 @@ impl crate::Fluree {
             branch_store,
             plan,
             conflict_keys,
+            mut config,
         } = ctx;
         let reverted_commits = plan.ordered_commits.clone().into_vec();
         let conflict_count = conflict_keys.len();
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         // Load reverted commits oldest-first then fold via the shared
         // accumulator: invert each flake's `op` (assertion ⇄ retraction),
-        // net per fact, and accumulate `namespace_delta`/`graph_delta` with
-        // earlier-wins semantics, matching the merge path's
-        // `collect_commit_data`.
+        // net per fact, and accumulate `namespace_delta` (earlier wins) and
+        // named graphs, matching the merge path's `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
-            commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+            let mut commit = load_commit_by_id(&branch_store, commit_id).await?;
+            config.flakes(&mut commit.flakes);
+            commits.push(commit);
         }
+        let reverted: Vec<RevertedWrites> = commits.iter().map(RevertedWrites::of).collect();
         let CollectedCommitData {
-            flakes: inverted,
+            net: undo,
             namespace_delta,
-            graph_delta,
+            graph_iris,
         } = collect_from_commits(commits, Fold::Undo);
 
         // Acquire state under the ledger write lock when a manager is
@@ -455,6 +476,9 @@ impl crate::Fluree {
         let (write_guard, target_state) = self
             .lock_or_load(&branch_id, branch_store.clone(), branch_record)
             .await?;
+
+        // Again under the lock: a drop may have landed since the context.
+        refuse_reverting_drops(&reverted, &target_state)?;
 
         let current_head_t = target_state.t();
         let current_head_id = target_state
@@ -470,15 +494,16 @@ impl crate::Fluree {
         let staged_view = self
             .stage_revert(
                 target_state,
-                inverted,
+                undo,
                 &conflict_keys,
                 &strategy,
                 &namespace_delta,
+                &graph_iris,
             )
             .await?;
         let Some((view, outcome)) = staged_view else {
             return Ok(StagedRevert {
-                branch_id: branch_id.to_string(),
+                branch_id: branch_id.clone(),
                 branch: branch.to_string(),
                 reverted_commits,
                 conflict_count,
@@ -508,8 +533,8 @@ impl crate::Fluree {
         if !namespace_delta.is_empty() {
             commit_opts = commit_opts.with_namespace_delta(namespace_delta);
         }
-        if !graph_delta.is_empty() {
-            commit_opts = commit_opts.with_graph_delta(graph_delta);
+        if !graph_iris.is_empty() {
+            commit_opts = commit_opts.with_graph_iris(graph_iris);
         }
 
         // With the lock held the staged base is authoritative — derive
@@ -534,7 +559,7 @@ impl crate::Fluree {
         .await?;
 
         Ok(StagedRevert {
-            branch_id: branch_id.to_string(),
+            branch_id: branch_id.clone(),
             branch: branch.to_string(),
             reverted_commits,
             conflict_count,
@@ -583,11 +608,14 @@ impl RevertSelection {
 /// Everything [`Fluree::revert_selection`] needs after resolution and validation
 /// but before mutating state. Shared with the preview path.
 pub(crate) struct RevertContext {
-    pub(crate) branch_id: String,
+    pub(crate) branch_id: LedgerId,
     pub(crate) branch_record: fluree_db_nameservice::NsRecord,
     pub(crate) branch_store: BranchedContentStore,
     pub(crate) plan: RevertPlan,
     pub(crate) conflict_keys: Vec<ConflictKey>,
+    /// How the branch names its config graph, which the conflict keys and
+    /// the folded flakes take.
+    pub(crate) config: ConfigGraphs,
 }
 
 /// Source after [`CommitRef`] resolution, ready for plan computation.
@@ -605,6 +633,58 @@ pub(crate) struct RevertPlan {
     /// `t` of the oldest reverted commit. Used as the lower bound when
     /// scanning intervening commits for conflicts.
     pub(crate) oldest_t: i64,
+}
+
+/// What a reverted commit did that a revert may be unable to undo: the
+/// graphs it dropped, and those it wrote.
+struct RevertedWrites {
+    t: i64,
+    drops: bool,
+    graphs: FxHashSet<Option<fluree_db_core::Sid>>,
+}
+
+impl RevertedWrites {
+    fn of(commit: &fluree_db_core::Commit) -> Self {
+        Self {
+            t: commit.t,
+            drops: !commit.graph_drops.is_empty(),
+            graphs: commit.flakes.iter().map(|f| f.g.clone()).collect(),
+        }
+    }
+}
+
+/// Refuse a revert of `reverted` on `state`: a drop has no inverse to write,
+/// and undoing a write to a graph a later commit dropped would bring back
+/// part of what the drop took. The revert and its preview both ask.
+fn refuse_reverting_drops(reverted: &[RevertedWrites], state: &LedgerState) -> Result<()> {
+    if let Some(commit) = reverted.iter().find(|c| c.drops) {
+        return Err(ApiError::BranchConflict(format!(
+            "cannot revert the commit at t={}: it drops graphs, which a revert cannot undo",
+            commit.t
+        )));
+    }
+    let registry = &state.snapshot.graph_registry;
+    if !registry.has_drops() {
+        return Ok(());
+    }
+    let reverse_graph = state.snapshot.build_reverse_graph()?;
+    for commit in reverted {
+        for g in &commit.graphs {
+            let g_id = match g {
+                None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
+                Some(sid) => reverse_graph.get(sid).copied(),
+            };
+            let Some(floor) = g_id.and_then(|g_id| registry.drop_after(g_id, commit.t)) else {
+                continue;
+            };
+            return Err(ApiError::BranchConflict(format!(
+                "cannot revert the commit at t={}: it wrote a graph dropped at t={floor}, \
+                 and undoing the write would bring back part of what the drop took",
+                commit.t
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Output of [`Fluree::prepare_revert`] / [`Fluree::build_revert_commit`].
@@ -626,7 +706,7 @@ pub(crate) struct RevertPlan {
 pub struct StagedRevert {
     /// Fully-qualified branch id (`"<ledger>:<branch>"`) used by the
     /// apply path for content-store + publisher addressing.
-    pub branch_id: String,
+    pub branch_id: LedgerId,
     /// Branch name (without ledger prefix) — echoed onto the
     /// resulting receipt.
     pub branch: String,
@@ -795,6 +875,7 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
     head_id: &CommitId,
     reverted_set: &FxHashSet<CommitId>,
     oldest_t: i64,
+    config: &mut ConfigGraphs,
 ) -> Result<Vec<ConflictKey>> {
     // stop_at_t = oldest_t - 1 → include every commit with t >= oldest_t.
     let stop = oldest_t.saturating_sub(1);
@@ -816,6 +897,8 @@ async fn compute_conflict_keys<C: ContentStore + Clone + 'static>(
         }
     }
 
+    let (reverted_keys, intervening_keys) =
+        (config.keys(reverted_keys), config.keys(intervening_keys));
     let mut conflicts: Vec<ConflictKey> = reverted_keys
         .intersection(&intervening_keys)
         .cloned()

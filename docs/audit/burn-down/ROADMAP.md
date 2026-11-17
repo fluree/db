@@ -392,6 +392,10 @@ pr-1; BASE↔G1 joint entries resolve at whichever lands second.
   (When this was written ingest also dropped `()` objects entirely; the issue
   #1694 fix now stores them as the `rdf:nil` triple they denote, which greened
   `list-1` — its pattern needs no spine — and took it off this register.)
+  **D-13 resolved: translate at query time.** Storage keeps `list_index`
+  items; a SPARQL request reads each list as the RDF graph it denotes (owner
+  edge to a head cell, `rdf:first`/`rdf:rest` cells), and graph output writes
+  the cells back as `( … )` / `@list`. `list-2..4` came off the register.
 - **`subquery12` is resolved by PR-1** (bare-`{SELECT}` misparse executing
   through error recovery) — remove it from PR-X2's scope; its probe item is
   closed, and it further evidences the diagnostic-swallowing hole PR-3 must

@@ -496,6 +496,23 @@ fn create_new_in_place(path: &Path, bytes: &[u8], policy: &WritePolicy) -> std::
     Ok(true)
 }
 
+/// Runs `f` on the blocking pool and returns its result.
+///
+/// A panic in `f` resumes on the caller.
+/// The only error is the task's cancellation, as during runtime shutdown.
+async fn run_blocking<T, F>(f: F) -> std::result::Result<T, tokio::task::JoinError>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+        .await
+        .or_else(|e| match e.try_into_panic() {
+            Ok(payload) => std::panic::resume_unwind(payload),
+            Err(e) => Err(e),
+        })
+}
+
 /// File-based storage backed by `tokio::fs`.
 #[derive(Debug, Clone)]
 pub struct FileStorage {
@@ -548,8 +565,8 @@ impl std::fmt::Debug for AfterCheckpoint {
     }
 }
 
-/// A logged operation's exclusive hold on its key.
-type KeyHold = tokio::sync::OwnedMutexGuard<()>;
+/// A guard on one WAL key stripe (see `Wal::key_stripe`).
+type KeyStripeGuard = tokio::sync::OwnedMutexGuard<()>;
 
 /// The next operation may retry contention, but never unsupported storage or
 /// a poisoned attached log. The root operation gate serializes transitions.
@@ -566,14 +583,34 @@ enum WalAttach {
 
 const WAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Pins one mode through read/closure/write (including a CAS's async hop).
-/// Drop the key guard before releasing the root gate.
+/// The guards and WAL mode for one file operation.
+///
+/// `durability` and `log` stay fixed while it is held. Fields drop in
+/// declaration order, so the key stripe is released before the root gate.
+///
+/// It is `!Send`, so a `Send` future cannot hold it across an `.await`.
+/// A `spawn_blocking` task cannot return one either.
+/// The type does not stop a `!Send` future, such as a `LocalSet` task, from
+/// holding it across an `.await`. Holders must take and release it on a
+/// blocking thread.
 struct OperationHold {
-    _key: Option<KeyHold>,
+    _key_stripe: Option<KeyStripeGuard>,
     log: Option<Arc<Wal>>,
     durability: Durability,
-    _root: tokio::sync::OwnedRwLockReadGuard<()>,
+    _root_gate: tokio::sync::OwnedRwLockReadGuard<()>,
+    _not_send: std::marker::PhantomData<*const ()>,
 }
+
+// Stops compiling if `OperationHold` becomes `Send`.
+// Both impls would then apply, so the `some_item` path below is ambiguous.
+const _: fn() = || {
+    trait AmbiguousIfSend<A> {
+        fn some_item() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSend<()> for T {}
+    impl<T: ?Sized + Send> AmbiguousIfSend<u8> for T {}
+    let _ = <OperationHold as AmbiguousIfSend<_>>::some_item;
+};
 
 impl FileStorage {
     /// Create a new file storage with the given base path
@@ -630,6 +667,22 @@ impl FileStorage {
     fn forget_dir(&self, path: &Path) {
         if let Some(parent) = path.parent() {
             self.known_dirs.lock().remove(parent);
+        }
+    }
+
+    /// Takes the key lock for `path`, creating its parent directory if needed.
+    ///
+    /// A cached parent that was since removed surfaces as `NotFound`.
+    /// The cache entry is then forgotten and the directory created once more.
+    fn key_lock(&self, path: &Path) -> std::io::Result<std::fs::File> {
+        self.ensure_parent_dir(path)?;
+        match wal::open_key_lock(path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.forget_dir(path);
+                self.ensure_parent_dir(path)?;
+                wal::open_key_lock(path)
+            }
+            other => other,
         }
     }
 
@@ -828,25 +881,55 @@ impl FileStorage {
         }
     }
 
-    /// Replay the WAL an earlier run left under this root, if any, so
-    /// state acknowledged before a crash is on disk before the first read.
+    /// Replays the WAL an earlier run left under this root, if any.
     ///
-    /// A startup action like [`Self::sweep_orphaned_staging`]: the connection
-    /// and builder paths call it, constructing a handle never does. Blocking.
-    /// Replays under any durability setting, so an operator who switched back
+    /// State acknowledged before a crash is then on disk before the first read.
+    /// The connection and builder paths call it at startup, like
+    /// [`Self::sweep_orphaned_staging`]. Constructing a handle does not call it.
+    ///
+    /// Blocking. It takes the root gate exclusively, so the calling thread
+    /// waits until every in-flight file operation on this root has finished.
+    /// The replay itself is synchronous file I/O on the calling thread.
+    ///
+    /// It replays under any durability setting. An operator who switched back
     /// to per-write flushing after a crash still sees the acknowledged tail.
-    /// Leaves no trace on a root that never journaled.
+    /// A root that never journaled is left untouched.
     pub fn recover_wal(&self) -> Result<()> {
-        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        let root_gate = futures::executor::block_on(self.root_gate()?.write_owned());
+        self.recover_wal_locked(&root_gate)
+    }
+
+    /// Replays the WAL an earlier run left under this root, if any, without blocking the caller.
+    ///
+    /// It replays what [`Self::recover_wal`] replays.
+    /// It waits for the root gate asynchronously.
+    /// The replay then runs on the blocking pool, which holds the root gate until it finishes.
+    /// Dropping this future before it takes the root gate replays nothing.
+    /// Dropping it afterward leaves the replay to finish on the blocking pool.
+    pub async fn recover_wal_async(&self) -> Result<()> {
+        let root_gate = self.root_gate()?.write_owned().await;
+        let storage = self.clone();
+        run_blocking(move || storage.recover_wal_locked(&root_gate))
+            .await
+            .map_err(|e| crate::error::Error::io(format!("WAL recovery join: {e}")))?
+    }
+
+    /// Replays the WAL under this root while `_root_gate` holds its root gate exclusively.
+    ///
+    /// Blocking: the replay is synchronous file I/O.
+    fn recover_wal_locked(
+        &self,
+        _root_gate: &tokio::sync::OwnedRwLockWriteGuard<()>,
+    ) -> Result<()> {
         if self.durability == Durability::Wal {
             self.attach_wal_locked(false)?;
         } else {
-            // Replay and let go: this handle is not going to journal.
+            // This handle does not journal, so the log is replayed and then released.
             Wal::acquire(&self.base_path, self.wal_owner.as_deref(), false)
                 .map(drop)
                 .map_err(|e| Self::recovery_error(&self.base_path, e))?;
         }
-        // A root several processes journal: apply what a stopped one left.
+        // Several processes can journal one root. Apply what stopped owners left.
         wal::replay_unowned(&self.base_path)
             .map(drop)
             .map_err(|e| Self::recovery_error(&self.base_path, e))
@@ -981,12 +1064,13 @@ impl FileStorage {
         } else {
             None
         };
-        let key_hold = log.as_ref().map(|log| log.key_stripe(key));
+        let key_stripe = log.as_ref().map(|log| log.key_stripe(key));
         Ok(OperationHold {
-            _key: key_hold,
+            _key_stripe: key_stripe,
             log,
             durability,
-            _root: root,
+            _root_gate: root,
+            _not_send: std::marker::PhantomData,
         })
     }
 
@@ -1056,11 +1140,48 @@ impl FileStorage {
         Ok(())
     }
 
+    /// Leave `root` with a write its WAL logged but a crash kept off disk.
+    ///
+    /// The write puts `bytes` at `address`. Returns the path of the file the crash lost.
+    #[doc(hidden)]
+    pub async fn crash_with_a_logged_write_for_test(
+        root: impl AsRef<Path>,
+        address: &str,
+        bytes: &[u8],
+    ) -> Result<PathBuf> {
+        let storage = Self::new(root.as_ref()).with_durability(Durability::Wal);
+        storage.hold_wal_segments_for_test()?;
+        storage.write_bytes(address, bytes).await?;
+        storage.sync().await?;
+        storage.simulate_crash_for_test();
+        let path = storage.resolve_path(address)?;
+        std::fs::remove_file(&path)
+            .map_err(|e| crate::error::Error::io(format!("remove {}: {e}", path.display())))?;
+        Ok(path)
+    }
+
     /// Run `f` on the writing thread between an oversized write's checkpoint
     /// and its write. Shared across clones.
     #[cfg(test)]
     pub(crate) fn set_after_checkpoint_hook_for_test(&self, f: impl Fn() + Send + Sync + 'static) {
         *self.after_checkpoint.0.lock().unwrap() = Some(Box::new(f));
+    }
+
+    /// Pause (or resume) the WAL's background thread, which otherwise
+    /// flushes a waiting append, closes a segment a second old and retires
+    /// closed segments on its own schedule. Its flushes count in
+    /// [`Self::fsyncs_issued`], so a test that counts the flushes of its own
+    /// writes pauses it first. Returns once any pass under way has finished.
+    /// Attaches the log. Only with the `test-hooks` feature (or in this
+    /// crate's own tests).
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[doc(hidden)]
+    pub fn pause_wal_background_for_test(&self, paused: bool) -> Result<()> {
+        let _root = futures::executor::block_on(self.root_gate()?.write_owned());
+        if let Some(log) = self.attach_wal_locked(true)? {
+            log.pause_background(paused);
+        }
+        Ok(())
     }
 
     /// Delay every WAL device flush by `delay`, so a test can widen the
@@ -1099,6 +1220,13 @@ impl FileStorage {
     /// Get the base path for this storage
     pub fn base_path(&self) -> &std::path::Path {
         &self.base_path
+    }
+
+    /// The file `address` names under this storage's root, by the rule every
+    /// read and write applies: an address that is absolute, has a `..`
+    /// component, or names the write-ahead log's directory is an error.
+    pub fn path_of(&self, address: &str) -> Result<std::path::PathBuf> {
+        self.resolve_path(address)
     }
 
     /// Extract the path portion from a Fluree address.
@@ -1140,29 +1268,30 @@ impl FileStorage {
     }
 
     fn resolve_relative_path(&self, path: &str) -> Result<std::path::PathBuf> {
-        use std::path::Component;
-        let p = std::path::Path::new(path);
-
-        // Disallow absolute paths, path traversal, and the log's own directory.
-        if p.is_absolute()
-            || p.components().any(|c| {
-                matches!(
-                    c,
-                    Component::ParentDir | Component::RootDir | Component::Prefix(_)
-                ) || c.as_os_str() == WAL_DIR
-            })
-        {
-            return Err(crate::error::Error::storage(format!(
+        wal::key_path(&self.base_path, path).ok_or_else(|| {
+            crate::error::Error::storage(format!(
                 "Invalid storage path '{path}': must be a relative path without '..' or '{WAL_DIR}'"
-            )));
-        }
-
-        Ok(self.base_path.join(p))
+            ))
+        })
     }
 }
 
 #[async_trait]
 impl StorageRead for FileStorage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    /// Reads are local files, which readers map or read in place.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         let path = self.resolve_path(address)?;
         let mut read = tokio::fs::read(&path).await;
@@ -1404,7 +1533,7 @@ impl StorageRead for FileStorage {
         let path_prefix = Self::extract_path_from_address(prefix).unwrap_or(prefix);
 
         // Get the directory to list from and the file prefix to match
-        let full_path = self.base_path.join(path_prefix);
+        let full_path = self.resolve_relative_path(path_prefix)?;
         let (list_dir, file_prefix) = if full_path.is_dir() {
             (full_path, String::new())
         } else {
@@ -1457,14 +1586,18 @@ impl StorageRead for FileStorage {
                         dirs_to_visit.push(path);
                     }
                 } else if file_type.is_file() {
-                    // A staging file left by an interrupted write is not
-                    // content and must not be handed out as an address.
-                    if is_tmp_artifact(&entry.file_name().to_string_lossy()) {
+                    // A staging file left by an interrupted write, and the
+                    // root's lock file, are not content and must not be
+                    // handed out as addresses.
+                    if is_tmp_artifact(&entry.file_name().to_string_lossy())
+                        || entry.file_name() == super::ROOT_LOCK_FILE
+                    {
                         continue;
                     }
-                    // Convert back to relative path from base
+                    // Convert back to relative path from base, as an address
+                    // path: one with `\` would read to a sweep as an orphan.
                     if let Ok(relative) = path.strip_prefix(&self.base_path) {
-                        let relative_str = relative.to_string_lossy().to_string();
+                        let relative_str = super::address_path(relative);
                         // Check if it matches the file prefix (if any)
                         if file_prefix.is_empty() || relative_str.starts_with(path_prefix) {
                             // Return as fluree:file:// address
@@ -1554,42 +1687,83 @@ impl StorageWrite for FileStorage {
     async fn delete(&self, address: &str) -> Result<()> {
         let (key, path) = self.resolve_key(address)?;
         let storage = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let operation = storage.begin_operation(storage.durability, &key)?;
-            let (_, log) = storage.write_plan(&operation, 0)?;
-            let appended = match &log {
-                // Ordered after the writes it undoes, so replay cannot bring
-                // the file back. Covered by the next flush, which is no weaker
-                // than an unlink that was never followed by a directory flush.
-                Some(log) => {
-                    Some(log.append(Op::Delete { key: &key }, false).map_err(|e| {
-                        crate::error::Error::io(format!("WAL append for {key}: {e}"))
-                    })?)
-                }
-                None => None,
-            };
-            match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                // Idempotent: not found is OK
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => {
-                    if let (Some(log), Some(appended)) = (&log, &appended) {
-                        log.cancel(appended.seq, &key).map_err(|cancel| {
-                            crate::error::Error::io(format!(
-                                "delete {}: {e}; WAL cancel also failed: {cancel}",
-                                path.display()
-                            ))
-                        })?;
-                    }
-                    Err(crate::error::Error::io(format!(
-                        "Failed to delete {}: {e}",
-                        path.display()
-                    )))
+        tokio::task::spawn_blocking(move || storage.delete_key_blocking(&key, &path))
+            .await
+            .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+    }
+
+    /// One blocking task for the whole batch rather than one per address:
+    /// the per-key work is an unlink, so a batch of thousands is otherwise
+    /// mostly task hand-offs.
+    async fn delete_many(&self, addresses: &[String]) -> Vec<(String, crate::error::Error)> {
+        let mut failures = Vec::new();
+        let mut resolved = Vec::with_capacity(addresses.len());
+        for address in addresses {
+            match self.resolve_key(address) {
+                Ok((key, path)) => resolved.push((address.clone(), key, path)),
+                Err(e) => failures.push((address.clone(), e)),
+            }
+        }
+        let storage = self.clone();
+        match tokio::task::spawn_blocking(move || {
+            let mut failed = Vec::new();
+            for (address, key, path) in resolved {
+                if let Err(e) = storage.delete_key_blocking(&key, &path) {
+                    failed.push((address, e));
                 }
             }
+            failed
         })
         .await
-        .map_err(|e| crate::error::Error::io(format!("delete join: {e}")))?
+        {
+            Ok(failed) => failures.extend(failed),
+            Err(e) => failures.extend(addresses.iter().map(|address| {
+                (
+                    address.clone(),
+                    crate::error::Error::io(format!("delete join: {e}")),
+                )
+            })),
+        }
+        failures
+    }
+}
+
+impl FileStorage {
+    /// Unlink `path`, recording the delete in the WAL first when one is
+    /// attached. Absence is success. Runs on the caller's thread: it takes
+    /// the root gate and a key stripe, which block.
+    fn delete_key_blocking(&self, key: &str, path: &std::path::Path) -> Result<()> {
+        let operation = self.begin_operation(self.durability, key)?;
+        let (_, log) = self.write_plan(&operation, 0)?;
+        let appended = match &log {
+            // Ordered after the writes it undoes, so replay cannot bring
+            // the file back. Covered by the next flush, which is no weaker
+            // than an unlink that was never followed by a directory flush.
+            Some(log) => Some(
+                log.append(Op::Delete { key }, false)
+                    .map_err(|e| crate::error::Error::io(format!("WAL append for {key}: {e}")))?,
+            ),
+            None => None,
+        };
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            // Idempotent: not found is OK
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => {
+                if let (Some(log), Some(appended)) = (&log, &appended) {
+                    log.cancel(appended.seq, key).map_err(|cancel| {
+                        crate::error::Error::io(format!(
+                            "delete {}: {e}; WAL cancel also failed: {cancel}",
+                            path.display()
+                        ))
+                    })?;
+                }
+                Err(crate::error::Error::io(format!(
+                    "Failed to delete {}: {e}",
+                    path.display()
+                )))
+            }
+        }
     }
 }
 
@@ -1723,14 +1897,12 @@ impl FileStorage {
             let (policy, log) = storage
                 .write_plan(&operation, bytes.len())
                 .map_err(|e| StorageExtError::io(e.to_string()))?;
-            storage
-                .ensure_parent_dir(&path)
-                .map_err(|e| StorageExtError::io(format!("mkdir for {}: {}", path.display(), e)))?;
             // The same sidecar lock a compare-and-swap on this key holds and
             // replay takes: between the link and the record no other writer
             // may advance the file, or the log would carry their transition
             // ahead of the creation it builds on.
-            let _key_lock = wal::key_lock(&path)
+            let _key_lock = storage
+                .key_lock(&path)
                 .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
             let created = create_new_atomic(&path, &bytes, &policy)
                 .map_err(|e| StorageExtError::io(format!("write {}: {}", path.display(), e)))?;
@@ -1758,146 +1930,101 @@ impl FileStorage {
         .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
     }
 
-    /// Atomic locked read inside `spawn_blocking`.
+    /// Takes the key lock for `path` and reads the file's current bytes.
     ///
-    /// Acquires an exclusive flock on a sidecar `.lock` file, reads the data
-    /// file, and returns the current bytes. The lock is held across the
-    /// returned guard so the caller can write back atomically.
-    ///
-    /// Returns `(current_bytes, lock_guard_and_path)` — drop the second
-    /// element to release the lock.
-    async fn blocking_locked_read(
+    /// Blocking: should be called off the async runtime.
+    /// A missing or empty file reads as `None`.
+    /// The returned `LockedFile` holds the key lock until it is dropped.
+    /// Pass it to [`Self::locked_write_blocking`] to write under the same lock.
+    fn locked_read_blocking(
         &self,
         key: String,
         path: PathBuf,
     ) -> StorageExtResult<(Option<Vec<u8>>, LockedFile)> {
-        let storage = self.clone();
-        tokio::task::spawn_blocking(move || {
-            // Attaching replays the leftover log, and replay takes the same
-            // sidecar lock for a record on this key; it has to come first.
-            let operation = storage
-                .begin_operation(storage.durability, &key)
-                .map_err(|e| StorageExtError::io(e.to_string()))?;
-            storage
-                .ensure_parent_dir(&path)
-                .map_err(|e| StorageExtError::io(format!("mkdir for {}: {}", path.display(), e)))?;
+        // `begin_operation` can attach the WAL, and attaching replays the log.
+        // Replay takes the key lock of each key it applies.
+        // Taking the key lock first would make that replay wait on this thread.
+        let operation = self
+            .begin_operation(self.durability, &key)
+            .map_err(|e| StorageExtError::io(e.to_string()))?;
+        let key_lock = self
+            .key_lock(&path)
+            .map_err(|e| StorageExtError::io(format!("lock {}: {}", path.display(), e)))?;
 
-            // Use a separate lock file so that the atomic rename of the data
-            // file doesn't invalidate the lock (rename replaces the directory
-            // entry, creating a new inode on Linux — the lock on the old inode
-            // would no longer protect the new file).
-            let lock_path = path.with_extension("lock");
-            let lock_file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .open(&lock_path)
-                .map_err(|e| {
-                    StorageExtError::io(format!("open lock {}: {}", lock_path.display(), e))
-                })?;
+        let current = wal::read_opt(&path)
+            .map_err(|e| StorageExtError::io(format!("read {}: {}", path.display(), e)))?;
 
-            fs2::FileExt::lock_exclusive(&lock_file)
-                .map_err(|e| StorageExtError::io(format!("lock {}: {}", lock_path.display(), e)))?;
-
-            let current = match std::fs::read(&path) {
-                Ok(buf) if buf.is_empty() => None,
-                Ok(buf) => Some(buf),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
-                Err(e) => {
-                    return Err(StorageExtError::io(format!(
-                        "read {}: {}",
-                        path.display(),
-                        e
-                    )))
-                }
-            };
-
-            Ok((
-                current,
-                LockedFile {
-                    key,
-                    path,
-                    _lock_file: lock_file,
-                    operation,
-                },
-            ))
-        })
-        .await
-        .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
+        Ok((
+            current,
+            LockedFile {
+                key,
+                path,
+                _key_lock: key_lock,
+                operation,
+            },
+        ))
     }
 
-    /// Atomic locked write inside `spawn_blocking`.
+    /// Writes `new_bytes` to the file `locked` holds the key lock for.
     ///
-    /// Writes `new_bytes` to a temp file and renames into place while the
-    /// flock from `blocking_locked_read` is still held. The lock is released
-    /// when the `LockedFile` guard is dropped at the end. `expected` is what
-    /// the read under that lock returned, so the log can replay the transition
-    /// only against the state it was made from.
-    async fn blocking_locked_write(
+    /// Blocking: should be called off the async runtime.
+    /// `expected` must be the bytes [`Self::locked_read_blocking`] returned.
+    /// With a WAL attached, the write is logged as an `Op::Cas` from `expected` to `new_bytes`.
+    /// Replay applies that record only if the file is missing or still holds `expected`.
+    /// The key lock is released when `locked` drops at the end of the call.
+    fn locked_write_blocking(
         &self,
         locked: LockedFile,
         expected: Option<Vec<u8>>,
         new_bytes: Vec<u8>,
     ) -> StorageExtResult<()> {
-        let storage = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let (policy, log) = storage
-                .write_plan(&locked.operation, new_bytes.len())
-                .map_err(|e| StorageExtError::io(e.to_string()))?;
-            // The one flush a commit pays. It lands before the file does, so
-            // a head on disk always has its log record — and every content
-            // append before it — on disk too.
-            let appended = match &log {
-                Some(log) => Some(
-                    log.append(
-                        Op::Cas {
-                            key: &locked.key,
-                            expected: expected.as_deref(),
-                            new: &new_bytes,
-                        },
-                        true,
-                    )
-                    .map_err(|e| {
-                        StorageExtError::io(format!("WAL append for {}: {e}", locked.key))
-                    })?,
-                ),
-                None => None,
-            };
-            if let Err(e) = write_atomic(&locked.path, &new_bytes, &policy) {
-                // Staging or the rename failed, so the file still holds
-                // `expected` while the log says it moved. Cancel the record
-                // before a retry logs its own transition from the same value.
-                if let (Some(log), Some(appended)) = (&log, &appended) {
-                    log.cancel(appended.seq, &locked.key).map_err(|cancel| {
-                        StorageExtError::io(format!(
-                            "write {}: {e}; WAL cancel also failed: {cancel}",
-                            locked.path.display()
-                        ))
-                    })?;
-                }
-                return Err(StorageExtError::io(format!(
-                    "write {}: {e}",
-                    locked.path.display()
-                )));
+        let (policy, log) = self
+            .write_plan(&locked.operation, new_bytes.len())
+            .map_err(|e| StorageExtError::io(e.to_string()))?;
+        // The record is synced before the file is written.
+        // The sync also covers every earlier append.
+        // A file on disk therefore always has its record, and every earlier record, on disk.
+        let appended = match &log {
+            Some(log) => Some(
+                log.append(
+                    Op::Cas {
+                        key: &locked.key,
+                        expected: expected.as_deref(),
+                        new: &new_bytes,
+                    },
+                    true,
+                )
+                .map_err(|e| StorageExtError::io(format!("WAL append for {}: {e}", locked.key)))?,
+            ),
+            None => None,
+        };
+        if let Err(e) = write_atomic(&locked.path, &new_bytes, &policy) {
+            // The file still holds `expected`, but the record says it holds `new_bytes`.
+            // Cancel the record so a retry can log its own write from `expected`.
+            if let (Some(log), Some(appended)) = (&log, &appended) {
+                log.cancel(appended.seq, &locked.key).map_err(|cancel| {
+                    StorageExtError::io(format!(
+                        "write {}: {e}; WAL cancel also failed: {cancel}",
+                        locked.path.display()
+                    ))
+                })?;
             }
-            Ok(())
-            // lock released when `locked._lock_file` is dropped
-        })
-        .await
-        .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
+            return Err(StorageExtError::io(format!(
+                "write {}: {e}",
+                locked.path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
-/// Holds an exclusive flock and the data file path for the duration of a CAS.
+/// The key lock and operation hold for one compare-and-swap.
 ///
-/// The lock is released when this struct is dropped (the `_lock_file` field's
-/// `Drop` impl calls `flock(LOCK_UN)`).
+/// Fields drop in declaration order, so the key lock is released before the operation hold.
 struct LockedFile {
     key: String,
     path: PathBuf,
-    _lock_file: std::fs::File,
-    /// Pins the mode and root/key guards until after the flock is released.
+    _key_lock: std::fs::File,
     operation: OperationHold,
 }
 
@@ -1912,36 +2039,50 @@ impl StorageCas for FileStorage {
 
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send,
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
     {
         let (key, path) = self
             .resolve_key(address)
             .map_err(|e| StorageExtError::io(e.to_string()))?;
 
-        // Phase 1: acquire lock + read (blocking)
-        let phase = std::time::Instant::now();
-        let (current, locked) = self.blocking_locked_read(key, path).await?;
-        let read_us = phase.elapsed().as_micros() as u64;
+        // All three phases run in one blocking task, so no async task holds the root gate.
+        // `recover_wal` can block a runtime thread while it waits for the root gate.
+        // An async task holding the root gate could need that thread to run.
+        // Both would then wait forever.
+        let storage = self.clone();
+        // The blocking task does not inherit the caller's span.
+        // Entering it keeps the closure's events and "cas phases" under the caller's span.
+        let span = tracing::Span::current();
+        run_blocking(move || {
+            let _entered = span.enter();
+            // Phase 1: take the key lock and read.
+            let phase = std::time::Instant::now();
+            let (current, locked) = storage.locked_read_blocking(key, path)?;
+            let read_us = phase.elapsed().as_micros() as u64;
 
-        // Phase 2: call closure on async task
-        match f(current.as_deref())? {
-            CasAction::Write(new_bytes) => {
-                // Phase 3: write under same lock (blocking)
-                let phase = std::time::Instant::now();
-                self.blocking_locked_write(locked, current, new_bytes)
-                    .await?;
-                tracing::debug!(
-                    target: "fluree::write_path",
-                    read_us,
-                    write_us = phase.elapsed().as_micros() as u64,
-                    "cas phases"
-                );
-                Ok(CasOutcome::Written)
+            // Phase 2: run `f` on the current bytes.
+            match f(current.as_deref())? {
+                CasAction::Write(new_bytes) => {
+                    // Phase 3: write under the same key lock.
+                    let phase = std::time::Instant::now();
+                    storage.locked_write_blocking(locked, current, new_bytes)?;
+                    tracing::debug!(
+                        target: "fluree::write_path",
+                        read_us,
+                        write_us = phase.elapsed().as_micros() as u64,
+                        "cas phases"
+                    );
+                    Ok(CasOutcome::Written)
+                }
+                CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
             }
-            CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
-        }
-        // Lock released when `locked` is dropped (on Abort path, dropped here)
+        })
+        .await
+        .map_err(|e| StorageExtError::io(format!("spawn_blocking join: {e}")))?
     }
 }
 
@@ -2084,6 +2225,22 @@ mod tests {
         );
     }
 
+    /// The batch path unlinks every address in one blocking task and treats
+    /// an absent one as already gone, as `delete` does.
+    #[tokio::test]
+    async fn delete_many_unlinks_every_address_and_ignores_absent_ones() {
+        let (_dir, storage) = storage();
+        storage.write_bytes("a.json", b"a").await.unwrap();
+        storage.write_bytes("b.json", b"b").await.unwrap();
+
+        let failures = storage
+            .delete_many(&["a.json".into(), "b.json".into(), "absent.json".into()])
+            .await;
+        assert!(failures.is_empty(), "nothing should fail: {failures:?}");
+        assert!(!storage.exists("a.json").await.unwrap());
+        assert!(!storage.exists("b.json").await.unwrap());
+    }
+
     /// The CAS write-back goes through the same staging path, so a reader
     /// racing a nameservice head update never sees a half-written ref.
     #[cfg(unix)]
@@ -2106,6 +2263,58 @@ mod tests {
             std::fs::metadata(&path).unwrap().ino(),
             "CAS wrote in place, not staged and renamed"
         );
+    }
+
+    /// A panic in the closure reaches the caller as a panic, not as a storage error.
+    /// The key lock is released, so the next compare-and-swap on the key writes.
+    #[tokio::test]
+    async fn compare_and_swap_resumes_a_panic_in_the_closure_on_the_caller() {
+        let (_dir, storage) = storage();
+        let panicked = tokio::spawn({
+            let storage = storage.clone();
+            async move {
+                storage
+                    .compare_and_swap("h.json", |_| -> StorageExtResult<CasAction<()>> {
+                        panic!("closure panicked")
+                    })
+                    .await
+            }
+        })
+        .await
+        .expect_err("the closure's panic came back as a value");
+        assert_eq!(
+            crate::task::panic_message(panicked.into_panic()),
+            "closure panicked"
+        );
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            storage.compare_and_swap("h.json", |_| Ok(CasAction::<()>::Write(b"v1".to_vec()))),
+        )
+        .await
+        .expect("the panicked compare-and-swap kept the key lock")
+        .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+    }
+
+    /// A dropped ledger removes a directory this storage has cached.
+    /// Inserting and swapping under it again must recreate the directory.
+    #[tokio::test]
+    async fn key_lock_recreates_a_removed_parent_directory() {
+        let (dir, storage) = storage();
+        assert!(storage.insert("ledger/h.json", b"v0").await.unwrap());
+        std::fs::remove_dir_all(dir.path().join("ledger")).unwrap();
+        assert!(storage.insert("ledger/h.json", b"v1").await.unwrap());
+
+        std::fs::remove_dir_all(dir.path().join("ledger")).unwrap();
+        let outcome = storage
+            .compare_and_swap("ledger/h.json", |_| {
+                Ok(CasAction::<()>::Write(b"v2".to_vec()))
+            })
+            .await
+            .unwrap();
+        assert!(matches!(outcome, CasOutcome::Written));
+        assert_eq!(storage.read_bytes("ledger/h.json").await.unwrap(), b"v2");
     }
 
     /// A flush leaves no trace in the bytes on disk, so the count is the only
@@ -2329,6 +2538,37 @@ mod tests {
         assert!(leftovers.is_empty(), "staging files left: {leftovers:?}");
     }
 
+    /// An address names a file under the root or none: `path_of` and
+    /// `list_prefix` refuse an absolute address or one with a `..` component.
+    #[tokio::test]
+    async fn addresses_name_files_under_the_root_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("beside")).unwrap();
+        let storage = FileStorage::new(&root);
+
+        assert_eq!(
+            storage.path_of("fluree:file://a/b.json").unwrap(),
+            root.join("a/b.json")
+        );
+        for address in [
+            "fluree:file://../beside/x.json",
+            "fluree:file:///beside/x.json",
+        ] {
+            assert!(storage.path_of(address).is_err(), "{address}");
+        }
+        assert!(storage
+            .list_prefix("fluree:file://../beside/")
+            .await
+            .is_err());
+        assert!(storage.list_prefix("../beside/").await.is_err());
+        assert_eq!(
+            storage.list_prefix("a/").await.unwrap(),
+            Vec::<String>::new()
+        );
+    }
+
     /// A staging file left by an interrupted write is not content; handing it
     /// out as an address would let callers read a partial object.
     #[tokio::test]
@@ -2342,6 +2582,23 @@ mod tests {
 
         let listed = storage.list_prefix("d").await.unwrap();
         assert_eq!(listed, vec!["fluree:file://d/real.json".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_prefix_addresses_separate_with_slashes() {
+        let (_dir, storage) = storage();
+        storage
+            .write_bytes("fluree:file://d/e/real.json", b"v")
+            .await
+            .unwrap();
+        assert_eq!(
+            storage.list_prefix("d").await.unwrap(),
+            vec!["fluree:file://d/e/real.json".to_string()]
+        );
+        assert_eq!(
+            storage.list_prefix("d/e/re").await.unwrap(),
+            vec!["fluree:file://d/e/real.json".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -3006,7 +3263,7 @@ mod wal_tests {
     async fn publish(storage: &FileStorage, head: &[u8]) {
         let head = head.to_vec();
         let outcome = storage
-            .compare_and_swap(HEAD, |_| Ok(CasAction::Write::<()>(head.clone())))
+            .compare_and_swap(HEAD, move |_| Ok(CasAction::Write::<()>(head.clone())))
             .await
             .unwrap();
         assert!(matches!(outcome, CasOutcome::Written));
@@ -3036,6 +3293,8 @@ mod wal_tests {
         let storage = with_wal(dir.path());
         // The first write also creates the segment, which is its own cost.
         commit(&storage, 1).await;
+        // Count this commit's flushes, not the background thread's.
+        storage.pause_wal_background_for_test(true).unwrap();
         let before = storage.fsyncs_issued();
         commit(&storage, 2).await;
         assert_eq!(storage.fsyncs_issued() - before, 1);
@@ -3067,6 +3326,31 @@ mod wal_tests {
         assert_eq!(storage.read_bytes(TXN).await.unwrap(), b"r\x02");
         assert_eq!(storage.read_bytes(COMMIT).await.unwrap(), b"c\x02");
         assert_eq!(storage.read_bytes(HEAD).await.unwrap(), b"h\x02");
+        assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
+    }
+
+    /// The async path replays the same records and retires the log.
+    /// It reads the files from disk, since `read_bytes` replays on a miss by itself.
+    #[tokio::test]
+    async fn recover_wal_async_restores_acknowledged_writes_after_a_crash() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = with_wal(dir.path());
+        storage.hold_wal_segments_for_test().unwrap();
+        commit(&storage, 1).await;
+        commit(&storage, 2).await;
+        storage.simulate_crash_for_test();
+        drop(storage);
+        let resolver = FileStorage::new(dir.path());
+        for address in [TXN, COMMIT, HEAD] {
+            std::fs::remove_file(resolver.resolve_path(address).unwrap()).unwrap();
+        }
+
+        let storage = FileStorage::new(dir.path()).with_durability(Durability::Wal);
+        storage.recover_wal_async().await.unwrap();
+        let on_disk = |address| std::fs::read(resolver.resolve_path(address).unwrap()).unwrap();
+        assert_eq!(on_disk(TXN), b"r\x02");
+        assert_eq!(on_disk(COMMIT), b"c\x02");
+        assert_eq!(on_disk(HEAD), b"h\x02");
         assert_eq!(wal_entries(dir.path()), ["LOCK"], "replay retires the log");
     }
 
@@ -3191,6 +3475,7 @@ mod wal_tests {
         let a = owned(dir.path(), "node-1");
         let b = owned(dir.path(), "node-2");
         a.write_bytes(TXN, b"from a").await.unwrap();
+        a.pause_wal_background_for_test(true).unwrap();
         let before = a.fsyncs_issued();
         a.write_bytes(COMMIT, b"from a").await.unwrap();
         assert_eq!(a.fsyncs_issued() - before, 1, "one flush, for the log");
@@ -3503,6 +3788,22 @@ mod wal_tests {
             .is_err());
     }
 
+    #[tokio::test]
+    async fn listing_keeps_out_the_root_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let _lock = crate::storage::RootLock::acquire(dir.path()).unwrap();
+        let storage = with_wal(dir.path());
+        commit(&storage, 1).await;
+        let listed = storage.list_prefix("").await.unwrap();
+        assert!(!listed.is_empty());
+        assert!(
+            listed
+                .iter()
+                .all(|a| !a.contains(crate::storage::ROOT_LOCK_FILE)),
+            "{listed:?}"
+        );
+    }
+
     fn contested_root(dir: &Path) -> (FileStorage, std::fs::File) {
         std::fs::create_dir(dir.join(WAL_DIR)).unwrap();
         let held = std::fs::File::create(dir.join(WAL_DIR).join("LOCK")).unwrap();
@@ -3549,10 +3850,11 @@ mod wal_tests {
         let (storage, held) = contested_root(dir.path());
         let held = std::sync::Mutex::new(Some(held));
         let before = storage.fsyncs_issued();
+        let retrier = storage.clone();
         storage
-            .compare_and_swap(HEAD, |_| {
+            .compare_and_swap(HEAD, move |_| {
                 drop(held.lock().unwrap().take());
-                retry_due(&storage);
+                retry_due(&retrier);
                 Ok(CasAction::<()>::Write(b"sync head".to_vec()))
             })
             .await
@@ -3574,7 +3876,7 @@ mod wal_tests {
         let (storage, held) = contested_root(dir.path());
         let plain = FileStorage::new(dir.path()).with_durability(Durability::Sync);
         let (key, path) = plain.resolve_key(HEAD).unwrap();
-        let (current, locked) = plain.blocking_locked_read(key, path).await.unwrap();
+        let (current, locked) = plain.locked_read_blocking(key, path).unwrap();
         drop(held);
         retry_due(&storage);
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -3584,17 +3886,112 @@ mod wal_tests {
             done_tx.send(op.log.is_some()).unwrap();
         });
         let premature = done_rx.recv_timeout(Duration::from_millis(200));
-        // Always release the holder before asserting, so a failed test cannot
-        // leave the contending thread parked forever.
+        // Write and drop `locked` before asserting.
+        // A failed assertion would otherwise leave `thread` waiting on the root gate forever.
         plain
-            .blocking_locked_write(locked, current, b"finished".to_vec())
-            .await
+            .locked_write_blocking(locked, current, b"finished".to_vec())
             .unwrap();
         thread.join().unwrap();
         assert!(premature.is_err(), "takeover overlapped a local CAS");
         assert!(done_rx.recv_timeout(Duration::from_secs(5)).unwrap());
         assert_eq!(plain.read_bytes(HEAD).await.unwrap(), b"finished");
         assert_eq!(storage.effective_durability(), Durability::Wal);
+    }
+
+    /// A compare-and-swap in flight must not deadlock `recover_wal` on a current-thread runtime.
+    ///
+    /// `FlureeBuilder::file(..).build()` calls `recover_wal` from a runtime thread.
+    /// `recover_wal` blocks that thread until it can take the root gate.
+    /// The compare-and-swap holds the root gate from its read to its write.
+    /// It must be able to release the root gate without the blocked runtime thread.
+    ///
+    /// The runtime thread blocks until the closure runs, so the root gate is held when
+    /// `recover_wal` starts waiting. A closure that needs the runtime thread never runs.
+    #[test]
+    fn recover_wal_on_a_runtime_thread_does_not_deadlock_an_in_flight_cas() {
+        use std::time::Duration;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // A separate thread lets a deadlock fail the test instead of hanging it.
+        std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let storage = FileStorage::new(dir.path());
+                let (in_f_tx, in_f_rx) = std::sync::mpsc::channel();
+                let cas = tokio::spawn(async move {
+                    storage
+                        .compare_and_swap(HEAD, move |_| {
+                            // The root gate is held here.
+                            let _ = in_f_tx.send(());
+                            // Stay in flight while `recover_wal` starts waiting.
+                            std::thread::sleep(Duration::from_millis(100));
+                            Ok(CasAction::<()>::Write(b"x".to_vec()))
+                        })
+                        .await
+                });
+                // Yield so the compare-and-swap task starts its blocking task.
+                tokio::task::yield_now().await;
+                in_f_rx
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("the compare-and-swap closure needed the blocked runtime thread");
+                FileStorage::new(dir.path()).recover_wal().unwrap();
+                cas.await.unwrap().unwrap();
+            });
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("recover_wal deadlocked against an in-flight CAS");
+    }
+
+    /// `recover_wal_async` waits for the root gate without blocking its runtime thread.
+    ///
+    /// Another thread holds an operation on the root, so recovery has to wait.
+    /// A timer on the same current-thread runtime must still fire during that wait.
+    /// The test releases the operation only after the timer fires.
+    #[test]
+    fn recover_wal_async_waits_for_the_root_gate_without_blocking_the_runtime() {
+        use std::time::Duration;
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        // A separate thread lets a blocked runtime fail the test instead of hanging it.
+        std::thread::spawn(move || {
+            let dir = tempfile::tempdir().unwrap();
+            let storage = FileStorage::new(dir.path());
+            let (held_tx, held_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+            let holder = {
+                let storage = storage.clone();
+                std::thread::spawn(move || {
+                    let _operation = storage.begin_operation(storage.durability, "k").unwrap();
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                })
+            };
+            held_rx.recv().unwrap();
+
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async {
+                let recovery = tokio::spawn(async move { storage.recover_wal_async().await });
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                assert!(
+                    !recovery.is_finished(),
+                    "recovery ran without the root gate"
+                );
+                release_tx.send(()).unwrap();
+                recovery.await.unwrap().unwrap();
+            });
+            holder.join().unwrap();
+            done_tx.send(()).unwrap();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("waiting for the root gate blocked the runtime thread");
     }
 
     #[tokio::test]

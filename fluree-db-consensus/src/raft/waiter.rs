@@ -61,7 +61,7 @@ use tokio::sync::oneshot;
 /// head advance (poison + admin preemption).
 #[derive(Debug)]
 pub enum WaiterOutcome {
-    Applied(AppliedReceipt),
+    Applied(Box<AppliedReceipt>),
     Aborted(AbortReason),
 }
 
@@ -266,7 +266,7 @@ impl WaiterMap {
     /// Dropped when no local waiter is bound — on a follower that is
     /// every terminal apply.
     pub fn resolve_applied(&self, queue_id: u64, receipt: AppliedReceipt) {
-        self.resolve_with(queue_id, WaiterOutcome::Applied(receipt));
+        self.resolve_with(queue_id, WaiterOutcome::Applied(Box::new(receipt)));
     }
 
     /// Resolve `queue_id` with an abort outcome. Same "no waiter, no

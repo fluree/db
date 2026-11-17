@@ -1,5 +1,5 @@
 use crate::detect::QueryFormat;
-use crate::error::CliResult;
+use crate::error::{CliError, CliResult};
 use comfy_table::{ContentArrangement, Table};
 use fluree_db_api::format::IriCompactor;
 use fluree_db_api::QueryResult;
@@ -44,28 +44,21 @@ pub struct FormatOutput {
     pub total_rows: usize,
 }
 
-/// Fast-path SPARQL table formatting directly from `QueryResult` (no intermediate JSON).
-///
-/// Returns:
-/// - `Ok(Some(output))` when formatting succeeded
-/// - `Ok(None)` when the result contains grouped bindings that require SPARQL disaggregation;
-///   callers should fall back to the JSON-based formatter for correctness.
+/// SPARQL table formatting directly from `QueryResult` (no intermediate JSON).
 pub fn format_sparql_table_from_result(
     result: &QueryResult,
     snapshot: &LedgerSnapshot,
     limit: Option<usize>,
-) -> CliResult<Option<FormatOutput>> {
+) -> CliResult<FormatOutput> {
     // ASK queries: display boolean result directly instead of an empty table.
     if result.output.is_ask() {
         let has_solution = result.batches.iter().any(|b| !b.is_empty());
-        return Ok(Some(FormatOutput {
+        return Ok(FormatOutput {
             text: has_solution.to_string(),
             total_rows: 1,
-        }));
+        });
     }
 
-    // Grouped bindings require cartesian disaggregation (SPARQL formatter logic).
-    // Rather than re-implement that here, fall back to the existing SPARQL JSON formatter.
     let compactor = IriCompactor::new(snapshot.shared_namespaces(), &result.context);
     let gv = result.binary_graph.as_ref();
 
@@ -103,10 +96,10 @@ pub fn format_sparql_table_from_result(
 
     let headers: Vec<String> = head_pairs.iter().map(|(name, _)| name.clone()).collect();
     if headers.is_empty() {
-        return Ok(Some(FormatOutput {
+        return Ok(FormatOutput {
             text: "(empty result set)".to_string(),
             total_rows: 0,
-        }));
+        });
     }
 
     let mut table = Table::new();
@@ -124,10 +117,7 @@ pub fn format_sparql_table_from_result(
             let mut cells: Vec<String> = Vec::with_capacity(head_pairs.len());
             for (_, var_id) in &head_pairs {
                 let b = batch.get(row, *var_id).unwrap_or(&Binding::Unbound);
-                match sparql_table_cell(b, &compactor, gv) {
-                    Ok(cell) => cells.push(cell),
-                    Err(SparqlTableFastPath::NeedsDisaggregation) => return Ok(None),
-                }
+                cells.push(sparql_table_cell(b, &compactor, gv));
             }
             table.add_row(cells);
             printed += 1;
@@ -147,15 +137,10 @@ pub fn format_sparql_table_from_result(
         result.row_count()
     };
 
-    Ok(Some(FormatOutput {
+    Ok(FormatOutput {
         text: table.to_string(),
         total_rows,
-    }))
-}
-
-#[derive(Debug)]
-enum SparqlTableFastPath {
-    NeedsDisaggregation,
+    })
 }
 
 /// Prefix of the placeholder rendered when an encoded binding cannot be
@@ -202,8 +187,8 @@ fn sparql_table_cell(
     b: &Binding,
     compactor: &IriCompactor,
     gv: Option<&BinaryGraphView>,
-) -> Result<String, SparqlTableFastPath> {
-    let s = match b {
+) -> String {
+    match b {
         Binding::Unbound | Binding::Poisoned => String::new(),
 
         // Use display compaction (includes auto-derived fallback prefixes)
@@ -219,7 +204,7 @@ fn sparql_table_cell(
 
         Binding::EncodedSid { s_id, .. } => {
             let Some(gv) = gv else {
-                return Ok(unresolved_cell(NO_GRAPH_VIEW, &format!("s_id={s_id}")));
+                return unresolved_cell(NO_GRAPH_VIEW, &format!("s_id={s_id}"));
             };
             // Novelty-aware resolve (parity with the API formatters'
             // materialization): subjects first seen after the index snapshot
@@ -251,7 +236,7 @@ fn sparql_table_cell(
         // `fluree-db-api/src/lib.rs:4580`, `fluree-db-query/src/sort.rs:93`.
         Binding::EncodedPid { p_id } => {
             let Some(gv) = gv else {
-                return Ok(unresolved_cell(NO_GRAPH_VIEW, &format!("p_id={p_id}")));
+                return unresolved_cell(NO_GRAPH_VIEW, &format!("p_id={p_id}"));
             };
             match gv.store().resolve_predicate_iri(*p_id) {
                 Some(iri) => compact_bnode_strip(compactor.compact_iri_for_display(iri).ok()),
@@ -267,10 +252,10 @@ fn sparql_table_cell(
             ..
         } => {
             let Some(gv) = gv else {
-                return Ok(unresolved_cell(
+                return unresolved_cell(
                     NO_GRAPH_VIEW,
                     &format!("o_kind={o_kind} o_key={o_key} p_id={p_id}"),
-                ));
+                );
             };
             match gv.decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id) {
                 Ok(v) => flake_value_to_table_cell(&v, compactor),
@@ -281,9 +266,6 @@ fn sparql_table_cell(
             }
         }
 
-        // Grouped values must be disaggregated into multiple rows for SPARQL semantics.
-        Binding::Grouped(_) => return Err(SparqlTableFastPath::NeedsDisaggregation),
-
         // A path renders as arrow-joined node IRIs (Cypher-only; never reached
         // via the SPARQL surface).
         Binding::Path { nodes, .. } => nodes
@@ -292,21 +274,20 @@ fn sparql_table_cell(
             .collect::<Vec<_>>()
             .join("->"),
 
-        // A list (Cypher collect/list value) — semicolon-joined cells; never
-        // reached via the SPARQL surface.
-        Binding::List(values) => {
-            let mut parts = Vec::with_capacity(values.len());
-            for v in values {
-                parts.push(sparql_table_cell(v, compactor, gv)?);
-            }
-            parts.join(";")
-        }
+        // A list — semicolon-joined cells, like the CSV/TSV writers. A Cypher
+        // collect/list value, or a JSON-LD per-group list; a SPARQL query never
+        // produces either.
+        Binding::List(values) | Binding::Grouped(values) => values
+            .iter()
+            .map(|v| sparql_table_cell(v, compactor, gv))
+            .collect::<Vec<_>>()
+            .join(";"),
 
         // A map (Cypher map value) — `key=value` pairs; never reached via SPARQL.
         Binding::Map(entries) => {
             let mut parts = Vec::with_capacity(entries.len());
             for (k, v) in entries {
-                parts.push(format!("{k}={}", sparql_table_cell(v, compactor, gv)?));
+                parts.push(format!("{k}={}", sparql_table_cell(v, compactor, gv)));
             }
             parts.join(";")
         }
@@ -318,8 +299,7 @@ fn sparql_table_cell(
             compact_bnode_strip(compactor.compact_sid_for_display(&rel.predicate).ok()),
             compact_bnode_strip(compactor.compact_sid_for_display(&rel.end).ok()),
         ),
-    };
-    Ok(s)
+    }
 }
 
 fn compact_bnode_strip(compacted: Option<String>) -> String {
@@ -529,14 +509,39 @@ fn format_jsonld_table(json: &serde_json::Value, limit: Option<usize>) -> CliRes
 
     // Collect all keys from all objects for column headers
     let mut columns: Vec<String> = Vec::new();
+    let mut saw_object = false;
     for obj in arr {
         if let Some(map) = obj.as_object() {
+            saw_object = true;
             for key in map.keys() {
                 if !columns.contains(key) {
                     columns.push(key.clone());
                 }
             }
         }
+    }
+
+    // Column discovery only understands JSON objects. Without this guard a
+    // non-object array — notably the array-of-arrays a JSON-LD SELECT returns —
+    // produced an empty header and empty cells: a `++`/`||` table under a
+    // footer truthfully reporting N rows (#1805). Callers reach this renderer
+    // only by passing `OutputFormatKind::Table` for a JSON-LD result, which
+    // `commands::query::json_path_display_format` exists to prevent; say so
+    // rather than rendering a table that silently drops every value.
+    if !saw_object {
+        return Err(CliError::Input(format!(
+            "cannot render this JSON-LD result as a table: expected an array of \
+             objects, found {total_rows} row(s) of {}. SELECT results are \
+             positional arrays and have no column names — use --format json. \
+             (A caller that reached this with a SELECT result skipped \
+             `json_path_display_format`.)",
+            match arr.first() {
+                Some(serde_json::Value::Array(_)) => "arrays",
+                Some(serde_json::Value::String(_)) => "strings",
+                Some(serde_json::Value::Null) => "nulls",
+                _ => "scalars",
+            }
+        )));
     }
 
     let mut table = Table::new();
@@ -584,6 +589,62 @@ mod tests {
     use serde_json::json;
 
     const LEDGER: &str = "cli/table-novelty:main";
+
+    // ---- #1805 secondary: the JSON-LD table renderer's input contract ------
+
+    /// A JSON-LD SELECT result is an array of positional *arrays*, not of
+    /// objects. `format_jsonld_table` discovers columns by `as_object()`, so
+    /// such a result yielded no columns, no header and no cells — a `++`/`||`
+    /// table under a footer that truthfully said "(2 rows)". Callers are meant
+    /// to coerce JSON-LD to `--format json` via
+    /// `commands::query::json_path_display_format`; one remote call site did
+    /// not. Renderer-side this must be a diagnostic, not an empty table.
+    #[test]
+    fn jsonld_table_rejects_select_rows_instead_of_rendering_them_empty() {
+        let select_rows = json!([["ex:e1", "v1"], ["ex:e2", "v2"]]);
+        let err = match format_jsonld_table(&select_rows, None) {
+            Err(e) => e.to_string(),
+            Ok(out) => panic!(
+                "array-of-arrays must not render as a table; got:\n{}",
+                out.text
+            ),
+        };
+        assert!(err.contains("array of"), "got: {err}");
+        assert!(err.contains("--format json"), "must suggest the fix: {err}");
+        assert!(
+            err.contains("json_path_display_format"),
+            "must name the guard the caller skipped: {err}"
+        );
+    }
+
+    /// Non-object scalars are equally unrenderable and must be reported, not
+    /// silently blanked.
+    #[test]
+    fn jsonld_table_rejects_scalar_rows() {
+        assert!(format_jsonld_table(&json!([1, 2, 3]), None).is_err());
+        assert!(format_jsonld_table(&json!(["a", "b"]), None).is_err());
+    }
+
+    /// The guard must not fire on what the renderer is actually for. An empty
+    /// array and a non-array both have their own early returns above it, and an
+    /// object array renders as before even when some rows lack some keys.
+    #[test]
+    fn jsonld_table_still_renders_node_objects() {
+        let out = format_jsonld_table(
+            &json!([{"@id": "ex:e1", "ex:v": "v1"}, {"@id": "ex:e2"}]),
+            None,
+        )
+        .expect("object rows must still render");
+        assert_eq!(out.total_rows, 2);
+        assert!(out.text.contains("ex:e1"), "got: {}", out.text);
+        assert!(out.text.contains("v1"), "got: {}", out.text);
+
+        assert_eq!(
+            format_jsonld_table(&json!([]), None).unwrap().text,
+            "(empty result set)"
+        );
+        assert!(format_jsonld_table(&json!({"a": 1}), None).is_ok());
+    }
 
     /// Base data (indexed) plus a subject that lands only in novelty.
     ///
@@ -693,8 +754,7 @@ mod tests {
              already resolves s_id={s_id}"
         );
 
-        let cell = sparql_table_cell(&Binding::encoded_sid(s_id), &compactor, Some(&gv))
-            .expect("cell renders");
+        let cell = sparql_table_cell(&Binding::encoded_sid(s_id), &compactor, Some(&gv));
 
         assert!(
             cell.ends_with("m9"),
@@ -761,9 +821,8 @@ mod tests {
              wrong) is not being exercised"
         );
 
-        let output = format_sparql_table_from_result(&result, &db.snapshot, None)
-            .expect("table renders")
-            .expect("no grouped bindings, so the fast path applies");
+        let output =
+            format_sparql_table_from_result(&result, &db.snapshot, None).expect("table renders");
 
         assert!(
             output.text.contains("m9"),
@@ -815,7 +874,7 @@ mod tests {
 
         for (b, id_text) in &cases {
             for gv in [Some(&gv), None] {
-                let cell = sparql_table_cell(b, &compactor, gv).expect("cell renders");
+                let cell = sparql_table_cell(b, &compactor, gv);
 
                 assert!(
                     cell.starts_with(UNRESOLVED_CELL_PREFIX) && cell.ends_with(')'),
@@ -856,8 +915,7 @@ mod tests {
             &Binding::List(vec![Binding::encoded_sid(u64::MAX - 1)]),
             &compactor,
             Some(&gv),
-        )
-        .expect("cell renders");
+        );
 
         assert!(cell.starts_with(UNRESOLVED_CELL_PREFIX), "{cell:?}");
         assert!(

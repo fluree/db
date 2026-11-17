@@ -29,10 +29,10 @@ docker run -p 8090:8090 fluree/server:latest
 **Homebrew, shell installer, or Windows PowerShell** — installs the `fluree` binary that bundles both the CLI and the embedded server (`fluree server run`).
 
 ```bash
-# Homebrew (macOS / Linux)
+# Homebrew (macOS 14 or later / Linux)
 brew install fluree/tap/fluree
 
-# Shell installer (macOS / Linux)
+# Shell installer (macOS 14 or later / Linux)
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.sh | sh
 ```
 
@@ -41,7 +41,7 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/late
 irm https://github.com/fluree/db/releases/latest/download/fluree-db-cli-installer.ps1 | iex
 ```
 
-Pre-built binaries and the changelog for every release are on the [GitHub Releases page](https://github.com/fluree/db/releases).
+Pre-built binaries and the changelog for every release are on the [GitHub Releases page](https://github.com/fluree/db/releases). Pre-releases install from Homebrew as `fluree/tap/fluree-beta`, beside the stable `fluree` ([details](docs/getting-started/quickstart-server.md#option-2-homebrew-macos--linux)).
 
 ## Zero to graph in 60 seconds
 
@@ -291,7 +291,7 @@ fluree mcp serve            # stdio transport for Claude Desktop, Cursor, etc.
 
 | | |
 |---|---|
-| **Performance** | [Columnar integer-ID engine, cost-based planner, 16 fast-path operators](docs/design/performance.md) — [benchmarks](https://github.com/fluree/benchmark-db) |
+| **Performance** | [Columnar integer-ID engine, cost-based planner, fused fast-path operators](docs/design/performance.md) — [benchmarks](https://github.com/fluree/benchmark-db) |
 | **Query languages** | [SPARQL 1.1](docs/query/sparql.md), [JSON-LD Query](docs/query/jsonld-query.md), [openCypher](docs/query/cypher.md), [GraphQL](docs/query/graphql.md) (schema derived from your data) |
 | **Data formats** | JSON-LD, [Turtle, TriG](docs/transactions/turtle.md), N-Triples, N-Quads |
 | **Edge annotations** | [Property-graph edges & statement-level metadata (RDF 1.2 / SPARQL 1.2)](docs/concepts/edge-annotations.md) |
@@ -340,3 +340,9 @@ The published docs are available as LLM-readable text following the [`llms.txt`]
 
 Licensed under the [Business Source License 1.1](LICENSE), with a Change Date
 to Apache License 2.0 as specified in that file.
+
+In short: you may use Fluree in production for anything except offering
+Fluree itself to others as a hosted or managed database. Building your own
+applications and data products on Fluree is permitted, including publishing a
+dataset you curate with a public, read-only query endpoint. See the
+[License FAQ](docs/reference/license-faq.md) for details.

@@ -43,6 +43,23 @@ pattern of triple patterns only**. `FILTER`, `GRAPH`, `OPTIONAL`, `BIND`,
 the explicit-template form (`CONSTRUCT { ... } WHERE { ... }`) when you need
 them.
 
+### JSON-LD Query
+
+A JSON-LD query builds a graph with a `construct` template in place of `select`: node maps
+shaped like the `where` clause, whose variables are filled from each solution.
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": [{"@id": "?person", "ex:name": "?name"}],
+  "construct": [{"@id": "?person", "ex:displayName": "?name"}]
+}
+```
+
+`"construct": true` uses the `where` clause's triples as the template, like SPARQL's
+`CONSTRUCT WHERE`. A `where` node's own `@graph` is kept, so its triples come out in that
+graph (SPARQL's shorthand has no `GRAPH` form).
+
 ### Multiple Triples
 
 Construct multiple triples per solution:
@@ -115,6 +132,98 @@ WHERE {
 }
 ```
 
+## Named Graphs in the Template
+
+A `GRAPH` block in the template writes its triples into a named graph, so the result is a
+dataset rather than a single graph. The graph can be a constant or a variable bound by the
+`WHERE` clause. This is an extension to SPARQL 1.1 (Apache Jena ARQ supports the same form).
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+# Copy every named graph, keeping each triple in its graph
+CONSTRUCT { GRAPH ?g { ?s ?p ?o } }
+WHERE { GRAPH ?g { ?s ?p ?o } }
+```
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+# Mix the default graph and a named graph
+CONSTRUCT {
+  ?person a ex:Named .
+  GRAPH ex:names { ?person ex:name ?name }
+}
+WHERE { ?person ex:name ?name }
+```
+
+In a JSON-LD query, the block has the `where` clause's graph form, `["graph", <graph IRI or
+?var>, node-map, ...]`:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": [{"@id": "?person", "ex:name": "?name"}],
+  "construct": [
+    {"@id": "?person", "@type": "ex:Named"},
+    ["graph", "ex:names", {"@id": "?person", "ex:name": "?name"}]
+  ]
+}
+```
+
+A template node's own `@graph` names the graph too, as it does in a `where` clause:
+`{"@id": "?person", "@graph": "ex:names", "ex:name": "?name"}` is the same block.
+
+Only formats that can express named graphs carry a dataset: TriG, N-Quads and JSON-LD (see
+[Output Formats](#output-formats)). A row that leaves the graph variable unbound writes nothing.
+
+## Edge Annotations in the Template
+
+A template triple can carry an RDF 1.2 annotation, so the result links a reifier to the edge
+(see [Edge annotations](../concepts/edge-annotations.md)). Write it as an annotation tail,
+`~ reifier` and an optional `{| ... |}` body, or as `?r rdf:reifies <<( s p o )>>`:
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+
+# Carry each edge's stored reifiers into the result
+CONSTRUCT { ?s ex:worksFor ?o ~ ?r }
+WHERE {
+  ?s ex:worksFor ?o
+  OPTIONAL { ?r rdf:reifies <<( ?s ex:worksFor ?o )>> }
+}
+```
+
+```sparql
+PREFIX ex: <http://example.org/ns/>
+
+# Describe each edge with a new, per-row reifier
+CONSTRUCT { ?s ex:worksFor ?o {| ex:source ex:hrExport |} }
+WHERE { ?s ex:worksFor ?o }
+```
+
+A reifier variable that a row leaves unbound attaches nothing; the triple is still written.
+A `{| ... |}` block without a reifier, or a blank-node reifier (`~ _:r`), mints a fresh blank
+node for each solution, like `[ ]`. The block's properties become ordinary triples about the
+reifier.
+
+In a JSON-LD query, put `@annotation` on the object, as when writing an annotation. An
+`@annotation` without an `@id` mints a fresh reifier per solution:
+
+```json
+{
+  "@context": {"ex": "http://example.org/ns/"},
+  "where": [{"@id": "?s", "ex:worksFor": {"@id": "?o", "@annotation": {"@id": "?r"}}}],
+  "construct": [{"@id": "?s", "ex:worksFor": {"@id": "?o", "@annotation": {"@id": "?r"}}}]
+}
+```
+
+Every output format carries the annotations: `o ~ r` in Turtle and TriG,
+`r rdf:reifies <<( s p o )>>` lines in N-Triples and N-Quads, `@annotation` in JSON-LD, and
+the RDF 1.2 `rdf:annotation` / `rdf:annotationNodeID` attributes in RDF/XML
+([RDF 1.2 XML Syntax §2.20](https://www.w3.org/TR/rdf12-xml/)).
+
 ## Use Cases
 
 ### Extract Subgraph
@@ -174,7 +283,7 @@ A CONSTRUCT template is instantiated once per **solution**, and a WHERE clause
 is a bag — a subject with three `ex:tag` values contributes three solutions,
 not one (SPARQL 1.1 §16.2). Because the result is an RDF graph, identical
 triples built from different solutions collapse into one, so this is usually
-invisible. It becomes visible in exactly two places:
+invisible. It becomes visible in three places:
 
 **Blank nodes in the template mint one blank node per solution.** A template
 blank node (`[ ... ]` or `_:b`) is fresh for every solution, so each solution
@@ -192,6 +301,12 @@ distinct `ex:note` blank nodes — one per solution, not one per gadget. If you
 want one node per subject, make the WHERE clause produce one solution per
 subject (for example, drop the `?s ex:tag ?o` pattern, or move it into a
 subquery with `SELECT DISTINCT ?s`).
+
+**List entries keep their repeats.** A template triple that repeats a WHERE
+pattern reading a list writes the entries it reads as the list, in order, so a
+member the list holds twice is written twice, and a `LIMIT` that keeps one
+solution for a repeated member still writes every entry holding it. This holds
+for the JSON-LD `construct` form too. See [Lists](sparql.md#lists).
 
 **`LIMIT` counts solutions, not output triples.** The slice is applied to the
 solution sequence *before* the template is instantiated, and duplicate triples
@@ -212,6 +327,38 @@ WHERE {
 }
 ```
 
+## Output Formats
+
+A CONSTRUCT result is returned as JSON-LD unless you ask for another graph
+format. Over HTTP, send `Accept: text/turtle`, `application/n-triples`,
+`application/rdf+xml`, `application/trig` or `application/n-quads` to
+`POST /v1/fluree/query/{ledger}`; in Rust, pass `FormatterConfig::turtle()`, `ntriples()`,
+`rdf_xml()`, `trig()` or `nquads()` and call `execute_formatted_string()`. Turtle and TriG
+output use the query's `PREFIX`es:
+
+```bash
+curl -X POST http://localhost:8090/v1/fluree/query/mydb:main \
+  -H "Content-Type: application/sparql-query" \
+  -H "Accept: text/turtle" \
+  --data 'PREFIX ex: <http://example.org/ns/>
+CONSTRUCT { ?person ex:displayName ?name } WHERE { ?person ex:name ?name }'
+```
+
+```turtle
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:displayName "Alice" .
+```
+
+A template with `GRAPH` blocks produces a dataset, which Turtle, N-Triples and RDF/XML cannot
+express: over HTTP such a query negotiates only among TriG, N-Quads and JSON-LD, and an `Accept`
+that admits none of them is a `406`. Without `GRAPH` blocks, TriG and N-Quads output are plain
+Turtle and N-Triples.
+
+DESCRIBE results take the same formats. See
+[Graph Formats](output-formats.md#graph-formats-construct--describe) for the
+details of each.
+
 ## Best Practices
 
 1. **Specific Patterns**: Construct specific patterns rather than wildcards
@@ -221,10 +368,17 @@ WHERE {
 
 ## Current Limitations
 
-- **RDF collection syntax** (`( ?a ?b )`) is not yet supported in CONSTRUCT
-  templates — list the `rdf:first`/`rdf:rest`/`rdf:nil` triples explicitly.
-- **No annotations in CONSTRUCT templates** (the template output form is
-  deferred); a `CONSTRUCT` whose `WHERE` uses annotations to filter still works.
+- `GRAPH` blocks cannot nest, and the `CONSTRUCT WHERE` shorthand has no `GRAPH` form (its
+  template is a basic graph pattern, per SPARQL 1.1).
+- A triple term in a template is accepted only as the object of `rdf:reifies`; nested triple
+  terms and property paths inside a template annotation block are rejected.
+- `?r rdf:reifies <<( s p o )>>` in a template also writes `s p o`, the same as the annotation
+  tail `s p o ~ ?r`. Fluree reifies asserted edges only, as every write form does (see
+  [Edge annotations](../concepts/edge-annotations.md)), so a result never carries a reifier
+  without its triple.
+- A SPARQL datalog rule whose head (the template) annotates an edge is rejected: rules infer
+  plain triples only. A `GRAPH <iri> { … }` block in the head derives into that named graph
+  (see [Named graphs](datalog-rules.md#named-graphs)).
 
 ## Related Documentation
 

@@ -36,8 +36,8 @@ pub async fn run(
             Err(CliError::NotFound(_)) => {
                 // Ledger not found — try graph source lookup
                 let alias = context::resolve_ledger(ledger, dirs)?;
-                let fluree = context::build_fluree(dirs)?;
-                let gs_id = context::to_ledger_id(&alias);
+                let fluree = context::build_fluree(dirs).await?;
+                let gs_id = context::to_ledger_id(&alias)?;
                 if let Some(gs) = fluree.nameservice().lookup_graph_source(&gs_id).await? {
                     if graph.is_some() {
                         return Err(CliError::Usage(
@@ -99,6 +99,7 @@ pub async fn run(
                 {
                     println!("Index ID:       {index}");
                 }
+                print_config_diagnostics(&info);
 
                 // Print full JSON if there are stats
                 if info.get("stats").is_some() {
@@ -111,7 +112,7 @@ pub async fn run(
             }
         }
         LedgerMode::Local { fluree, alias } => {
-            let ledger_id = context::to_ledger_id(&alias);
+            let ledger_id = context::to_ledger_id(&alias)?;
 
             // Try ledger first, then graph source
             if let Some(record) = fluree.nameservice().lookup(&ledger_id).await? {
@@ -141,6 +142,24 @@ pub async fn run(
                     Some(id) => println!("Index ID:       {id}"),
                     None => println!("Index ID:       (none)"),
                 }
+                // Only the config diagnostics, not the full ledger-info stats:
+                // the ledger is loaded, and its config graph read.
+                let diagnostics = match fluree.ledger(&ledger_id).await {
+                    Ok(ledger) => fluree_db_api::config_resolver::diagnose(
+                        &ledger.snapshot,
+                        ledger.novelty.as_ref(),
+                        ledger.t(),
+                    )
+                    .await
+                    .map_err(|e| e.to_string()),
+                    Err(e) => Err(e.to_string()),
+                };
+                match diagnostics {
+                    Ok(diagnostics) => print_config_diagnostics(
+                        &serde_json::json!({ "configDiagnostics": diagnostics }),
+                    ),
+                    Err(e) => eprintln!("warning: config diagnostics unavailable: {e}"),
+                }
             } else if let Some(gs) = fluree.nameservice().lookup_graph_source(&ledger_id).await? {
                 if graph.is_some() {
                     return Err(CliError::Usage(
@@ -157,4 +176,28 @@ pub async fn run(
     }
 
     Ok(())
+}
+
+/// Degenerate config-graph state (ledger info's `configDiagnostics`),
+/// printed only when there is some: for a local ledger, and for a tracked
+/// one from the server's ledger info.
+fn print_config_diagnostics(info: &serde_json::Value) {
+    let Some(diagnostics) = info
+        .get("configDiagnostics")
+        .and_then(serde_json::Value::as_array)
+        .filter(|d| !d.is_empty())
+    else {
+        return;
+    };
+    println!();
+    println!("Config diagnostics:");
+    for diagnostic in diagnostics {
+        println!(
+            "  - {}",
+            diagnostic
+                .get("message")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+        );
+    }
 }

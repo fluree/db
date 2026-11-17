@@ -74,10 +74,9 @@ pub(crate) fn convert_string_literal(
         | xsd::POSITIVE_INTEGER
         | xsd::NON_POSITIVE_INTEGER
         | xsd::NEGATIVE_INTEGER => parse_integer(value),
-        xsd::DOUBLE | xsd::FLOAT => value
-            .parse::<f64>()
+        xsd::DOUBLE | xsd::FLOAT => fluree_graph_ir::parse_xsd_double(value)
             .map(FlakeValue::Double)
-            .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
+            .unwrap_or_else(|| FlakeValue::String(value.to_string())),
         xsd::DECIMAL => value
             .parse::<bigdecimal::BigDecimal>()
             .map(|d| FlakeValue::Decimal(Box::new(d)))
@@ -120,7 +119,12 @@ pub(crate) fn convert_string_literal(
         xsd::YEAR_MONTH_DURATION => YearMonthDuration::parse(value)
             .map(|v| FlakeValue::YearMonthDuration(Box::new(v)))
             .unwrap_or_else(|_| FlakeValue::String(value.to_string())),
-        rdf::JSON => FlakeValue::Json(value.to_string()),
+        // Canonicalizing gives one term per value (#1781). This converter is
+        // the lenient one, so a lexical that is not valid JSON is kept as
+        // written rather than failing the write.
+        rdf::JSON => FlakeValue::Json(
+            fluree_graph_ir::canonicalize_json(value).unwrap_or_else(|_| value.to_string()),
+        ),
         fluree::EMBEDDING_VECTOR => {
             // Delegate to core's shared lexical parser so JSON-LD bulk import,
             // Turtle, and SPARQL `"[..]"^^f:embeddingVector` all share f32
@@ -205,10 +209,9 @@ pub fn parse_xsd_lexical(value: &str, dt_iri: &str) -> Result<Option<FlakeValue>
             }
             other => other,
         },
-        xsd::DOUBLE | xsd::FLOAT => value
-            .parse::<f64>()
+        xsd::DOUBLE | xsd::FLOAT => fluree_graph_ir::parse_xsd_double(value)
             .map(FlakeValue::Double)
-            .map_err(|e| format!("invalid {dt_iri} lexical `{value}`: {e}"))?,
+            .ok_or_else(|| format!("invalid {dt_iri} lexical `{value}`"))?,
         xsd::DECIMAL => value
             .parse::<bigdecimal::BigDecimal>()
             .map(|d| FlakeValue::Decimal(Box::new(d)))
@@ -251,7 +254,12 @@ pub fn parse_xsd_lexical(value: &str, dt_iri: &str) -> Result<Option<FlakeValue>
         xsd::YEAR_MONTH_DURATION => YearMonthDuration::parse(value)
             .map(|v| FlakeValue::YearMonthDuration(Box::new(v)))
             .map_err(|e| format!("invalid xsd:yearMonthDuration lexical `{value}`: {e}"))?,
-        rdf::JSON => FlakeValue::Json(value.to_string()),
+        // Canonicalizing gives one term per value (#1781). A lexical that is
+        // not valid JSON has no canonical form, and the ingest paths that
+        // accept one keep it as written, so this parser does too.
+        rdf::JSON => FlakeValue::Json(
+            fluree_graph_ir::canonicalize_json(value).unwrap_or_else(|_| value.to_string()),
+        ),
         // Non-XSD / non-Fluree-recognized datatype. Caller treats
         // the value as a plain string under the (already-registered)
         // application datatype Sid.
@@ -277,6 +285,8 @@ pub(crate) fn convert_native_literal(value: &LiteralValue) -> FlakeValue {
         LiteralValue::Double(d) => FlakeValue::Double(*d),
         LiteralValue::Boolean(b) => FlakeValue::Boolean(*b),
         LiteralValue::String(s) => FlakeValue::String(s.to_string()),
-        LiteralValue::Json(s) => FlakeValue::Json(s.to_string()),
+        LiteralValue::Json(s) => FlakeValue::Json(
+            fluree_graph_ir::canonicalize_json(s).unwrap_or_else(|_| s.to_string()),
+        ),
     }
 }

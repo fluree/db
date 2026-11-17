@@ -58,6 +58,13 @@ Embed Fluree directly in your Rust applications. Learn how to:
 - Handle errors and configuration
 - Write tests with Fluree
 
+### [Using Fluree from Python](python.md)
+
+Run Fluree inside your Python process with `pip install fluree`. Learn how to:
+- Install the package and open a ledger
+- Read this book's queries and transactions from Python
+- Use transactions, time travel, policy and asyncio from Python
+
 ## What is Fluree?
 
 Fluree is a temporal graph database that stores data as RDF triples with built-in support for:
@@ -92,6 +99,13 @@ Fluree is a temporal graph database that stores data as RDF triples with built-i
 4. **Advanced Queries**: [Query](../query/README.md) for complex query patterns
 5. **Transactions**: [Transactions](../transactions/README.md) for data modification patterns
 6. **Production Ready**: [Operations](../operations/README.md) and [Dev Setup](../contributing/dev-setup.md)
+
+**For Python developers (embedded package):**
+
+1. **Python Guide**: [Using Fluree from Python](python.md) to install the package and map this book to its API
+2. **Core Concepts**: [Concepts](../concepts/) to understand how Fluree works
+3. **Practical Guides**: [Cookbooks](../guides/); their queries run unchanged through `ledger.query()`
+4. **Queries and writes**: [Query](../query/) and [Transactions](../transactions/)
 
 ## Prerequisites
 

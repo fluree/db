@@ -17,8 +17,7 @@ use serde::{Deserialize, Serialize};
 /// Registers in the profiling default: precision 12, ~1.6% error.
 pub const DEFAULT_REGISTERS: usize = 4096;
 
-/// The indexer's sketch: 256 registers, precision 8, ~6.5% error, and a
-/// persisted form of exactly 256 bytes.
+/// The indexer's sketch: 256 registers, precision 8, ~6.5% error.
 pub type Hll256 = Hll<256>;
 /// The profiling sketch.
 pub type Hll4096 = Hll<DEFAULT_REGISTERS>;
@@ -85,7 +84,7 @@ impl<const M: usize> Hll<M> {
         &self.registers
     }
 
-    /// The raw registers by value: the persisted form, no header.
+    /// The raw registers by value.
     pub const fn to_bytes(&self) -> [u8; M] {
         self.registers
     }

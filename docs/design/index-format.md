@@ -120,12 +120,23 @@ Key properties:
     per-retraction list-meta hydration when novelty agrees. `Some(true)` is sticky. A zero byte decodes
     to `None` (untracked — legacy roots, bulk import) and consumers must assume lists may exist; a full
     rebuild, or any incremental pass that sees a list row, moves the root out of that state.
+  - bit 3 `GRAPH_DROPS` — a `graph_drops` section follows the last optional section: per dropped graph,
+    `g_id`, the `t` of its latest drop (its *floor*) and, when written again since, the `t` of that
+    write. A dropped graph keeps its `graph_iris` entry; the index holds none of its facts from before
+    the floor, and readers refuse a query naming it as of a `t` before the floor. The section comes
+    last, so a reader predating it refuses the root on its trailing-bytes check rather than reading the
+    graph as merely emptied. A drop the root does not cover yet (floor above `index_t`) is known from
+    the commits after it; until a build covers it, readers serve the graph from novelty alone
+    (`BinaryIndexStore::without_graphs`). The commit side is the envelope's `graph_drops` field, by IRI
+    (see `Commit::graph_drops`).
 
 At a high level the root contains:
 
 - **Inline small dictionaries** (embedded in the binary root):
   - `graph_iris[]` (dict_index → graph IRI; `g_id = dict_index + 1`)
-  - `datatype_iris[]` (dt_id → datatype IRI)
+  - `datatype_iris[]` (dt_id → datatype IRI). Positions 0–14 hold the reserved datatypes
+    (`DatatypeDictId::RESERVED_IRIS`). A custom datatype's `o_type` carries its `dt_id` as a
+    14-bit payload, so `dt_id` is at most 16,383. Writes that would need a larger one are refused.
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
   - tree blobs: subject/string reverse (`DTB1` branch + `DLR1` leaves)

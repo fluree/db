@@ -93,6 +93,19 @@ impl DistinctOperator {
 
 #[async_trait]
 impl Operator for DistinctOperator {
+    // The trait object has no Default; replace it with a closed wrapper's stub.
+    #[allow(clippy::box_default)]
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        if self.state != OperatorState::Created {
+            return None;
+        }
+        self.state = OperatorState::Closed;
+        Some(std::mem::replace(
+            &mut self.child,
+            Box::new(crate::seed::EmptyOperator::new()),
+        ))
+    }
+
     /// Item 11 (F-AUD-7): DECLINE forwarding — DISTINCT may collapse arbitrarily
     /// many input rows into one, so producing `k` distinct rows can require
     /// unboundedly many input rows. Explicit (was a silent trait-default no-op) so
@@ -184,15 +197,15 @@ impl Operator for DistinctOperator {
             // allocation; only rows that survive are copied into an owned key.
             let mut scratch: Vec<Cow<'_, Binding>> = Vec::with_capacity(num_cols);
 
+            let (dicts, gv) = EqualityNorm::parts(&self.norm);
             for row_idx in 0..batch.len() {
                 if self.norm.is_some() {
-                    let (store, gv) = EqualityNorm::parts(&self.norm);
                     // Normalize decoded bindings to encoded form so mixed
                     // representations of the same value dedup (encoded
                     // bindings pass through untouched, borrowed).
                     scratch.clear();
                     scratch.extend((0..num_cols).map(|col| {
-                        normalize_for_key_cow(batch.get_by_col(row_idx, col), store, gv)
+                        normalize_for_key_cow(batch.get_by_col(row_idx, col), dicts, gv)
                     }));
                     // `Cow` hashes as the binding it wraps, so this equals the
                     // stored `Vec<Binding>` hash the map recomputes on rehash.
@@ -356,7 +369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_unique() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -391,7 +404,7 @@ mod tests {
     /// returned an empty graph instead of its one triple.
     #[tokio::test]
     async fn test_distinct_zero_column_batches_yield_exactly_one_row() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -422,7 +435,7 @@ mod tests {
     /// the fix must not manufacture a row out of an empty solution sequence.
     #[tokio::test]
     async fn test_distinct_zero_column_empty_child_stays_empty() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -435,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_all_duplicates() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -454,7 +467,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_mixed() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -491,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_across_batches() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -524,7 +537,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_batch_all_dupes_skipped() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -552,7 +565,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_multi_column() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -572,7 +585,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_unbound() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -597,7 +610,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_with_poisoned() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -622,7 +635,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_preserves_schema() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
@@ -653,7 +666,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_distinct_state_transitions() {
-        let snapshot = LedgerSnapshot::genesis("test/main");
+        let snapshot = LedgerSnapshot::genesis("test:main");
         let vars = VarRegistry::new();
         let ctx = ExecutionContext::new(&snapshot, &vars);
 

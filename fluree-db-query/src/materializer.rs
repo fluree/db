@@ -80,7 +80,11 @@ impl Hash for FlakeValueKey {
         match &self.0 {
             FlakeValue::String(s) => s.hash(state),
             FlakeValue::Long(n) => n.hash(state),
-            FlakeValue::Double(d) => d.to_bits().hash(state),
+            // The bits `FlakeValue`'s equality compares: every NaN equal,
+            // -0.0 equal to 0.0.
+            FlakeValue::Double(d) => {
+                fluree_db_core::value_id::canonical_f64_bits(*d).hash(state);
+            }
             FlakeValue::Boolean(b) => b.hash(state),
             FlakeValue::Ref(sid) => {
                 sid.namespace_code.hash(state);
@@ -522,23 +526,15 @@ impl Materializer {
             } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)? {
                 FlakeValue::Ref(sid) => Binding::sid(sid),
                 val => {
-                    // NUM_BIG arena values share one EncodedLit whose dt_id is
-                    // hardcoded to decimal — recover xsd:integer vs xsd:decimal
-                    // from the decoded value, not dt_id (issue #1329).
-                    let dt_sid = match val.overflow_numeric_datatype_sid() {
-                        Some(sid) => sid,
-                        None => self
-                            .graph_view
-                            .store()
-                            .dt_sids()
-                            .get(*dt_id as usize)
-                            .cloned()
-                            .ok_or_else(|| {
-                                QueryError::dictionary_lookup(format!(
-                                    "materialize literal: unknown dt_id {dt_id}"
-                                ))
-                            })?,
-                    };
+                    let dt_sid = self
+                        .graph_view
+                        .store()
+                        .resolve_dt_id_sid_for_value(*dt_id, &val)
+                        .ok_or_else(|| {
+                            QueryError::dictionary_lookup(format!(
+                                "materialize literal: unknown dt_id {dt_id}"
+                            ))
+                        })?;
                     let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -720,5 +716,65 @@ mod tests {
         let double_val = ComparableValue::Double(3.5);
         assert_eq!(double_val.as_f64(), Some(3.5));
         assert_eq!(double_val.as_i64(), None); // Has fractional part
+    }
+
+    /// Double bit patterns whose identity differs from their bits: NaNs with
+    /// every sign and a spread of payloads (quiet and signalling), both zeros,
+    /// both infinities, and a few ordinary values to compare them against.
+    fn special_double_bits() -> Vec<u64> {
+        let mut bits = vec![
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            0x7FF0_0000_0000_0001,
+            0xFFF0_0000_0000_0001,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            1.5f64.to_bits(),
+            (-1.5f64).to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+        ];
+        for shift in 0..51 {
+            bits.push(0x7FF0_0000_0000_0000 | (1u64 << shift));
+            bits.push(0xFFF0_0000_0000_0000 | (1u64 << shift));
+        }
+        bits
+    }
+
+    /// A hash join keys rows by `FlakeValueKey`, whose equality is
+    /// `FlakeValue`'s: every NaN equals every NaN, and -0.0 equals 0.0. Equal
+    /// keys must hash equally, or a join drops rows that match.
+    #[test]
+    fn equal_double_keys_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        let hash = |k: &FlakeValueKey| {
+            let mut h = DefaultHasher::new();
+            k.hash(&mut h);
+            h.finish()
+        };
+        let keys: Vec<FlakeValueKey> = special_double_bits()
+            .into_iter()
+            .map(|b| FlakeValueKey(FlakeValue::Double(f64::from_bits(b))))
+            .collect();
+        let mut equal_pairs = 0;
+        for a in &keys {
+            for b in &keys {
+                if a == b {
+                    equal_pairs += 1;
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+        // Every NaN with every NaN, each zero with both zeros, the rest only
+        // with themselves.
+        let nans = keys
+            .iter()
+            .filter(|k| matches!(k.0, FlakeValue::Double(d) if d.is_nan()))
+            .count();
+        assert_eq!(equal_pairs, nans * nans + 4 + (keys.len() - nans - 2));
     }
 }

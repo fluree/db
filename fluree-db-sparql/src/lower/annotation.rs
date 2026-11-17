@@ -20,7 +20,7 @@
 //! for the rationale.
 
 use crate::ast::annotation::{Annotation, AnnotationBlock, AnnotationVerb, ReifierId, TripleTerm};
-use crate::ast::term::{BlankNodeValue, QuotedTriple, SubjectTerm, Term as SparqlTerm};
+use crate::ast::term::{QuotedTriple, SubjectTerm, Term as SparqlTerm};
 use crate::span::SourceSpan;
 
 use fluree_db_core::DatatypeConstraint;
@@ -155,16 +155,10 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     pub(super) fn lower_reifier_id(&mut self, reifier: Option<&ReifierId>) -> Result<Ref> {
         match reifier {
             Some(ReifierId::Iri(iri)) => self.lower_iri_ref(iri),
-            Some(ReifierId::BlankNode(b)) => match &b.value {
-                BlankNodeValue::Labeled(label) => {
-                    let var_id = self.vars.get_or_insert(&format!("_:{label}"));
-                    Ok(Ref::Var(var_id))
-                }
-                BlankNodeValue::Anon => {
-                    let var_id = self.vars.get_or_insert(&format!("_:[]{}", self.vars.len()));
-                    Ok(Ref::Var(var_id))
-                }
-            },
+            Some(ReifierId::BlankNode(b)) => {
+                let var_id = self.vars.get_or_insert(&format!("_:{}", b.label));
+                Ok(Ref::Var(var_id))
+            }
             Some(ReifierId::Var(v)) => Ok(self.lower_var_ref(v)),
             None => {
                 // Anonymous block / bare `~` mints a fresh non-distinguished
@@ -245,7 +239,7 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
     /// Carries the same constraint-preserving object lowering as the
     /// annotation-block body so reified base-edge object positions
     /// match precisely.
-    fn lower_triple_term(
+    pub(super) fn lower_triple_term(
         &mut self,
         term: &TripleTerm,
         out: &mut Vec<Pattern>,

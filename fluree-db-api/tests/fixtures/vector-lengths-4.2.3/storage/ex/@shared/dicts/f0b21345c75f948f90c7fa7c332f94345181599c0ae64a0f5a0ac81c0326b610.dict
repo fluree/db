@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "dims": 3,
+  "dtype": "f32",
+  "normalized": false,
+  "shard_capacity": 3072,
+  "total_count": 1,
+  "shards": [
+    {
+      "cas": "bagdibqabciqhwgrtuluhaxk6iii4dr5kwi4lxgpfiy2trxnyazc32bpkzz534ky",
+      "count": 1
+    }
+  ]
+}

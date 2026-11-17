@@ -26,7 +26,7 @@
 //! subject and key columns decoded, no bindings for rows outside the
 //! envelope). Whenever the walk cannot answer a batch — leaflets are not
 //! authoritative on their own (novelty overlay, time-travel, a dataset scope,
-//! a restricting policy), a bound is not numeric (the walk keys inline
+//! a policy that can touch the predicate), a bound is not numeric (the walk keys inline
 //! numerics only), or the envelope would cover too many rows for the driving
 //! stream — the batch is answered by the same batched subject probes the
 //! nested loop would have used. If that lane declines too, one seeded
@@ -56,15 +56,15 @@ use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::execute::build_where_operators_seeded;
 use crate::fast_path_common::{
-    leaf_entries_for_predicate, root_or_no_policy, subject_probe_lane_plan, try_normalize_pred_sid,
-    ProbeLanePlan, ProbeOps,
+    classify_predicates_under_policy, leaf_entries_for_predicate, policy_lane_for_predicate,
+    subject_probe_lane_plan, try_normalize_pred_sid, LaneOutput, PredicateFastPath, ProbeLanePlan,
+    ProbeOps, POLICY_PREDICATE_SCAN_SITE,
 };
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{Expression, Pattern};
 use crate::join::{
-    batched_subject_probe_binary, make_dict_overlay, prepare_leaf_for_scan, LeafScan,
-    SubjectProbeParams,
+    batched_subject_probe_binary, make_dict_overlay, prepare_leaf_for_scan, SubjectProbeParams,
 };
 use crate::object_binding::{equality_norm, materialized_object_binding, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -74,9 +74,6 @@ use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-use fluree_db_binary_index::read::column_loader::{
-    load_leaflet_columns, load_leaflet_columns_cached, LeafletDecodeSpec,
-};
 use fluree_db_binary_index::read::column_types::{ColumnData, ColumnProjection, ColumnSet};
 use fluree_db_binary_index::{BinaryIndexStore, ColumnBatch, RunSortOrder};
 use fluree_db_core::o_type::{DecodeKind, OType};
@@ -287,8 +284,9 @@ enum WalkOutcome {
     Built(RangeIndex),
     /// The envelope covers more rows than the driving stream justifies.
     Capped,
-    /// Leaflets are not authoritative here (overlay, time-travel, dataset,
-    /// policy) or the predicate cannot be resolved.
+    /// Leaflets are not authoritative here (overlay, time-travel, dataset, a
+    /// policy that can touch the predicate) or the predicate cannot be
+    /// resolved.
     Declined,
 }
 
@@ -370,13 +368,15 @@ fn key_bounds(envelope: &Envelope, kind: DecodeKind) -> Option<(u64, u64)> {
             Some((lo, hi))
         }
         DecodeKind::F64 => {
+            // A comparison never selects NaN (XPath F&O 3.1 §4.3.2), whose key
+            // is the only one above `+INF`'s: an open upper side stops there.
             let lo = match &envelope.lower {
                 None => u64::MIN,
-                Some(v) => ObjKey::encode_f64(f(v)?.next_down()).map_or(u64::MIN, ObjKey::as_u64),
+                Some(v) => ObjKey::encode_f64(f(v)?.next_down()).as_u64(),
             };
             let hi = match &envelope.upper {
-                None => u64::MAX,
-                Some(v) => ObjKey::encode_f64(f(v)?.next_up()).map_or(u64::MAX, ObjKey::as_u64),
+                None => ObjKey::F64_COMPARABLE_MAX.as_u64(),
+                Some(v) => ObjKey::encode_f64(f(v)?.next_up()).as_u64(),
             };
             Some((lo, hi))
         }
@@ -463,6 +463,32 @@ impl RangeSemiJoinOperator {
             fallback_rows: 0,
             probe_batches: 0,
         }
+    }
+
+    /// Whether the view policy will make the walk and probe lanes decline for
+    /// some condition, so `open` should dedup the driving side up front as the
+    /// generic plan would. A plan-shaping check only: it must not stamp, or a
+    /// routing test would see a decline the lanes never took.
+    fn policy_blocks_lanes(&self, ctx: &ExecutionContext<'_>) -> bool {
+        if ctx.allow_unfiltered() {
+            return false;
+        }
+        let Some(store) = ctx.binary_store.as_ref() else {
+            return true;
+        };
+        let pred_sids: Option<Vec<fluree_db_core::Sid>> = self
+            .conditions
+            .iter()
+            .map(|cond| try_normalize_pred_sid(store, &cond.predicate))
+            .collect();
+        let Some(pred_sids) = pred_sids else {
+            return true;
+        };
+        let refs: Vec<&fluree_db_core::Sid> = pred_sids.iter().collect();
+        !matches!(
+            classify_predicates_under_policy(ctx, &refs),
+            PredicateFastPath::Allow
+        )
     }
 
     fn input(&self) -> &dyn Operator {
@@ -606,10 +632,9 @@ impl RangeSemiJoinOperator {
             return Ok(WalkOutcome::Declined);
         };
         if ctx.is_multi_ledger()
-            || ctx.from_t.is_some()
+            || ctx.is_history_range()
             || !ctx.overlay_free_single_graph()
             || ctx.to_t < store.max_t()
-            || !root_or_no_policy(ctx)
         {
             return Ok(WalkOutcome::Declined);
         }
@@ -617,20 +642,30 @@ impl RangeSemiJoinOperator {
         let Some(pred_sid) = try_normalize_pred_sid(store, &cond.predicate) else {
             return Ok(WalkOutcome::Declined);
         };
-        let g_id = ctx.binary_g_id;
-        // Overlay-free and the predicate is not in the index: nothing can match.
-        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
-            return Ok(WalkOutcome::Built(RangeIndex {
+        let empty = || {
+            Ok(WalkOutcome::Built(RangeIndex {
                 envelope: envelope.clone(),
                 values: ValueIndex::with_capacity(0),
                 rows: 0,
-            }));
+            }))
+        };
+        // The walk reads leaflets raw, like the scan's cursor lane, so it runs
+        // only where the view policy provably cannot touch this predicate.
+        match policy_lane_for_predicate(ctx, &pred_sid, POLICY_PREDICATE_SCAN_SITE) {
+            PredicateFastPath::Allow => {}
+            // Every value of this predicate is hidden: no subject can pass.
+            PredicateFastPath::Empty => return empty(),
+            PredicateFastPath::Decline => return Ok(WalkOutcome::Declined),
+        }
+        let g_id = ctx.binary_g_id;
+        // Overlay-free and the predicate is not in the index: nothing can match.
+        let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
+            return empty();
         };
         let bounds = ObjectBounds {
             lower: envelope.lower.clone().map(|v| (v, true)),
             upper: envelope.upper.clone().map(|v| (v, true)),
         };
-        let cache = store.leaflet_cache();
         let narrow = ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OKey));
         let mixed = narrow
             .union(ColumnSet::single(ColumnId::OType))
@@ -640,16 +675,10 @@ impl RangeSemiJoinOperator {
         // Pass 1: locate the in-range rows per leaflet and count them.
         let mut leaflets: Vec<WalkedLeaflet> = Vec::new();
         let mut total = 0usize;
-        for leaf in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
+        for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
             ctx.check_cancelled()?;
-            let LeafScan {
-                leaf_bytes,
-                header,
-                dir,
-                leaf_id,
-                ..
-            } = prepare_leaf_for_scan(store, leaf, false)?;
-            for (leaflet_idx, entry) in dir.entries.iter().enumerate() {
+            let leaf = prepare_leaf_for_scan(store, leaf_entry, false)?;
+            for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
                 if entry.row_count == 0 || entry.p_const.is_some_and(|p| p != p_id) {
                     continue;
                 }
@@ -677,34 +706,11 @@ impl RangeSemiJoinOperator {
                     }
                     _ => None,
                 };
-                let decode_set = if key_range.is_some() { narrow } else { mixed };
-                let leaflet_idx_u32 = u32::try_from(leaflet_idx)
-                    .map_err(|_| QueryError::Internal("leaflet idx exceeds u32".to_string()))?;
-                let batch = match &cache {
-                    Some(cache) => load_leaflet_columns_cached(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        cache,
-                        LeafletDecodeSpec {
-                            leaf_id,
-                            leaflet_idx: leaflet_idx_u32,
-                            order: header.order,
-                            decode_set,
-                        },
-                    ),
-                    None => load_leaflet_columns(
-                        &leaf_bytes,
-                        entry,
-                        dir.payload_base,
-                        &ColumnProjection {
-                            output: decode_set,
-                            internal: ColumnSet::EMPTY,
-                        },
-                        header.order,
-                    ),
-                }
-                .map_err(|e| QueryError::Internal(format!("load columns (range walk): {e}")))?;
+                let proj = ColumnProjection {
+                    output: if key_range.is_some() { narrow } else { mixed },
+                    internal: ColumnSet::EMPTY,
+                };
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
 
                 let keyed = match key_range {
                     Some((ot, lo, hi)) => {
@@ -836,7 +842,7 @@ impl RangeSemiJoinOperator {
             .and_then(|s| try_normalize_pred_sid(s, &self.conditions[c].predicate));
         let lane = match (&store, &pred_sid) {
             (Some(store), Some(pred_sid)) if !ctx.is_multi_ledger() => {
-                subject_probe_lane_plan(ctx, store, pred_sid)?
+                subject_probe_lane_plan(ctx, store, pred_sid, LaneOutput::Encoded)?
             }
             _ => ProbeLanePlan::Decline,
         };
@@ -1093,7 +1099,7 @@ impl Operator for RangeSemiJoinOperator {
         }
         self.restore_child();
         if ctx.binary_store.is_none()
-            || !root_or_no_policy(ctx)
+            || self.policy_blocks_lanes(ctx)
             || ctx.is_multi_ledger()
             || ctx.eager_materialization
         {
@@ -1232,7 +1238,7 @@ impl Operator for RangeSemiJoinOperator {
                     crate::fast_path_outcome::FastPathOutcome::Proceed,
                 );
 
-                let (store, gv) = EqualityNorm::parts(&self.norm);
+                let (dicts, gv) = EqualityNorm::parts(&self.norm);
                 let mut fallback_rows: Vec<usize> = Vec::new();
                 for (row, keep_row) in keep.iter_mut().enumerate() {
                     if !*keep_row {
@@ -1249,7 +1255,7 @@ impl Operator for RangeSemiJoinOperator {
                         }
                         Some(Binding::Poisoned) => false,
                         Some(subject) => {
-                            let key = binding_to_group_key_normalized(subject, store, gv);
+                            let key = binding_to_group_key_normalized(subject, dicts, gv);
                             let mut any = false;
                             for value in index.values.values_of(&key) {
                                 if self.value_passes(c, interval, &batch, row, value, ctx)? {
@@ -1344,5 +1350,33 @@ mod tests {
                 "rounded walk bounds must include {inside}"
             );
         }
+    }
+
+    #[test]
+    fn double_walk_bounds_cover_the_infinities_and_never_nan() {
+        let key = |d: f64| ObjKey::encode_f64(d).as_u64();
+        let walk = |lower: Option<f64>, upper: Option<f64>| {
+            key_bounds(
+                &Envelope {
+                    lower: lower.map(FlakeValue::Double),
+                    upper: upper.map(FlakeValue::Double),
+                },
+                DecodeKind::F64,
+            )
+        };
+        // An open upper side stops at +INF, below NaN's key: no comparison
+        // selects NaN (F&O 3.1 §4.3.2).
+        let (lo, hi) = walk(Some(0.0), None).unwrap();
+        assert!(lo <= key(1.0) && key(f64::INFINITY) <= hi);
+        assert!(key(f64::NAN) > hi);
+        let (lo, hi) = walk(None, Some(0.0)).unwrap();
+        assert!(lo <= key(f64::NEG_INFINITY) && key(-1.0) <= hi);
+        // Infinite bounds keep the infinities inside the walk.
+        let (lo, hi) = walk(Some(f64::NEG_INFINITY), Some(f64::INFINITY)).unwrap();
+        assert!(lo <= key(f64::NEG_INFINITY) && key(f64::INFINITY) <= hi);
+        assert!(key(f64::NAN) > hi);
+        // A NaN bound has no walk; the row-level check selects nothing.
+        assert!(walk(Some(f64::NAN), None).is_none());
+        assert!(walk(None, Some(f64::NAN)).is_none());
     }
 }

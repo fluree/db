@@ -6,6 +6,8 @@ mod construct;
 mod describe;
 mod modifier;
 mod pattern;
+mod pragma;
+pub use pragma::pragma_names;
 mod select;
 mod term;
 mod update;
@@ -67,7 +69,8 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
 
     match parser.parse_query() {
         Some(mut ast) => {
-            ast.pragmas = extract_pragmas(&comments);
+            let (pragmas, pragma_diagnostics) = pragma::extract_pragmas(&comments, &ast);
+            ast.pragmas = pragmas;
 
             // Trailing-token / EOF assertion: after a complete Query or
             // Update request parses, every remaining non-EOF token is an
@@ -85,7 +88,8 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
                 stream.error_at_current("unexpected trailing tokens after the end of the query");
             }
 
-            let diagnostics = stream.take_diagnostics();
+            let mut diagnostics = stream.take_diagnostics();
+            diagnostics.extend(pragma_diagnostics);
             // Parse-time *semantic* rejections (currently the V5 BIND-scope
             // check) and unconsumed trailing input must prevent AST
             // production: unlike recovered syntax errors — where returning a
@@ -99,9 +103,15 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
             // it; for a multi-operation UPDATE that re-opens exactly the
             // #1438 silent-data-loss window the guard above closes (roadmap
             // D-4: hard errors, no diagnostic-swallowing).
-            let semantic_reject = diagnostics
-                .iter()
-                .any(|d| d.code == DiagCode::BindTargetAlreadyInScope && d.is_error());
+            // A pragma that cannot be applied is rejected the same way: running
+            // the request without the option it asked for (a fuel cap, a
+            // policy) would silently weaken it.
+            let semantic_reject = diagnostics.iter().any(|d| {
+                matches!(
+                    d.code,
+                    DiagCode::BindTargetAlreadyInScope | DiagCode::InvalidPragma
+                ) && d.is_error()
+            });
             if semantic_reject || unconsumed_input {
                 ParseOutput::with_diagnostics(None, diagnostics)
             } else {
@@ -112,78 +122,46 @@ pub fn parse_sparql(input: &str) -> ParseOutput<SparqlAst> {
     }
 }
 
-/// Extract Fluree `# PRAGMA ...` directives from the query's comments.
+/// The `# PRAGMA` options of a SPARQL request, for a host that needs them
+/// before it parses the request to run it — a fuel cap, a policy selection, a
+/// `min-t` wait.
 ///
-/// Comments are sourced from the lexer (`tokenize_with_comments`), so `#`
-/// characters inside string literals or IRIs can never be misread as
-/// directives, and the query stays valid SPARQL for standard tooling.
-/// Comparison is case-insensitive on the `PRAGMA` keyword and pragma name;
-/// the value is split on commas and whitespace. Unrecognized pragma names
-/// are ignored (they are ordinary comments).
-///
-/// Supported:
-/// - `# PRAGMA reasoning: owl2rl` (also `rdfs`, `owl2ql`, `datalog`,
-///   `owl-datalog`, `none`, or a comma-separated combination)
-/// - `# PRAGMA reasoning-max-facts: 20000000` — OWL2-RL materialization budget
-/// - `# PRAGMA reasoning-max-seconds: 300` — OWL2-RL materialization budget
-fn extract_pragmas(comments: &[String]) -> Pragmas {
-    let mut pragmas = Pragmas::default();
-
-    for comment in comments {
-        let Some(rest) = strip_keyword_ci(comment, "PRAGMA") else {
-            continue;
-        };
-
-        // `strip_keyword_ci` requires a word boundary, so plain `reasoning`
-        // never matches the `reasoning-max-*` directives.
-        if let Some(value) = strip_keyword_ci(rest, "reasoning-max-facts") {
-            // Last pragma wins; the raw value is preserved (even if empty) so
-            // lowering can reject an invalid number with a proper error.
-            pragmas.reasoning_max_facts = Some(pragma_scalar_value(value));
-        } else if let Some(value) = strip_keyword_ci(rest, "reasoning-max-seconds") {
-            pragmas.reasoning_max_seconds = Some(pragma_scalar_value(value));
-        } else if let Some(value) = strip_keyword_ci(rest, "reasoning-max-memory-mb") {
-            pragmas.reasoning_max_memory_mb = Some(pragma_scalar_value(value));
-        } else if let Some(value) = strip_keyword_ci(rest, "reasoning") {
-            let value = value.trim_start().strip_prefix(':').unwrap_or(value);
-            let modes: Vec<String> = value
-                .split([',', ' ', '\t'])
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect();
-            // Last pragma wins if repeated; an empty mode list is preserved so
-            // lowering can reject `# PRAGMA reasoning:` with no value.
-            pragmas.reasoning = Some(modes);
-        }
+/// Text with no comment that could be a `# PRAGMA` returns the defaults
+/// without parsing. A request that fails to parse for any other reason also
+/// returns the defaults: it will not run, and the parse that would run it
+/// reports the error.
+pub fn request_pragmas(input: &str) -> Result<Pragmas, String> {
+    if !may_carry_pragma(input) {
+        return Ok(Pragmas::default());
     }
-
-    pragmas
+    let output = parse_sparql(input);
+    if let Some(ast) = output.ast {
+        return Ok(ast.pragmas);
+    }
+    let errors: Vec<&str> = output
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == DiagCode::InvalidPragma)
+        .map(|d| d.message.as_str())
+        .collect();
+    if errors.is_empty() {
+        Ok(Pragmas::default())
+    } else {
+        Err(errors.join("; "))
+    }
 }
 
-/// Extract a single trimmed scalar value after an optional `:`.
-fn pragma_scalar_value(value: &str) -> String {
-    let value = value.trim_start();
-    let value = value.strip_prefix(':').unwrap_or(value);
-    value.trim().to_string()
-}
-
-/// Strip a case-insensitive keyword prefix followed by a word boundary
-/// (whitespace, `:`, or end of input). Returns the remainder.
-fn strip_keyword_ci<'a>(input: &'a str, keyword: &str) -> Option<&'a str> {
-    let trimmed = input.trim_start();
-    if trimmed.len() < keyword.len() || !trimmed.is_char_boundary(keyword.len()) {
-        return None;
-    }
-    let (head, rest) = trimmed.split_at(keyword.len());
-    if !head.eq_ignore_ascii_case(keyword) {
-        return None;
-    }
-    match rest.chars().next() {
-        None => Some(rest),
-        Some(c) if c.is_whitespace() || c == ':' => Some(rest),
-        Some(_) => None,
-    }
+/// Whether some `#` in `input` is followed, past further `#`s and same-line
+/// whitespace, by `pragma` in any case. That covers every comment the parser
+/// reads as a directive, without lexing; a `#` inside a string or IRI can only
+/// cost a parse, never hide a pragma.
+fn may_carry_pragma(input: &str) -> bool {
+    input.match_indices('#').any(|(at, _)| {
+        input[at..]
+            .trim_start_matches(|c: char| c == '#' || (c.is_whitespace() && c != '\n' && c != '\r'))
+            .get(..6)
+            .is_some_and(|head| head.eq_ignore_ascii_case("pragma"))
+    })
 }
 
 /// Parse a group graph pattern from a token stream.

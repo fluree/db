@@ -70,7 +70,12 @@ async fn a_transaction_costs_one_flush() {
     let handle = fluree.ledger_cached(LEDGER).await.expect("cache");
     insert(&fluree, &handle, 0).await;
 
+    // The log's background thread flushes on its own schedule: it flushes an
+    // append left waiting, and closes a segment a second old and retires it,
+    // flushing every file it covered. None of that is this transaction's, but
+    // the counter sees it all, so on a loaded machine this counted 15.
     let probe = probe(dir.path());
+    probe.pause_wal_background_for_test(true).expect("pause");
     let before = probe.fsyncs_issued();
     insert(&fluree, &handle, 1).await;
     assert_eq!(
@@ -175,6 +180,8 @@ async fn concurrent_ledgers_share_a_flush() {
     probe.hold_wal_segments_for_test().expect("hold");
     let delay = std::time::Duration::from_millis(60);
     probe.slow_wal_sync_for_test(delay).expect("slow");
+    // Count the commits' flushes, not the background thread's.
+    probe.pause_wal_background_for_test(true).expect("pause");
     let before = probe.fsyncs_issued();
     let tasks: Vec<_> = handles
         .into_iter()

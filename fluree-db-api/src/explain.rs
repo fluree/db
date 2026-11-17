@@ -221,6 +221,13 @@ fn logical_node(
                 triple_pattern_to_user_object(tp, vars, compactor),
             );
         }
+        Pattern::ListView(lv) => {
+            node.insert("kind".into(), json!("list-view"));
+            node.insert(
+                "pattern".into(),
+                triple_pattern_to_user_object(&lv.triple, vars, compactor),
+            );
+        }
         Pattern::Optional(inner) => {
             node.insert("kind".into(), json!("optional"));
             node.insert("patterns".into(), children(inner));
@@ -603,7 +610,7 @@ fn explain_from_parsed(
         let stats_arc = stats_view.clone().map(std::sync::Arc::new);
         match fluree_db_query::build_operator_tree(parsed, stats_arc, &planning) {
             Ok(op) => serde_json::to_value(op.describe()).unwrap_or(JsonValue::Null),
-            Err(e) => json!({ "error": e.to_string() }),
+            Err(e) => json!({ "error": e.name_variables(vars).to_string() }),
         }
     };
 
@@ -719,7 +726,7 @@ pub async fn explain_sparql(
     snapshot: &fluree_db_core::LedgerSnapshot,
     sparql: &str,
 ) -> Result<JsonValue> {
-    explain_sparql_for_view(snapshot, sparql, None, false)
+    explain_sparql_for_view(snapshot, sparql, None, None, false)
 }
 
 /// Explain an openCypher query against a LedgerSnapshot.
@@ -772,16 +779,17 @@ pub async fn explain_sparql_with_default_context(
     sparql: &str,
     default_context: Option<&JsonValue>,
 ) -> Result<JsonValue> {
-    explain_sparql_for_view(snapshot, sparql, default_context, false)
+    explain_sparql_for_view(snapshot, sparql, default_context, None, false)
 }
 
 pub(crate) fn explain_sparql_for_view(
     snapshot: &fluree_db_core::LedgerSnapshot,
     sparql: &str,
     default_context: Option<&JsonValue>,
+    params: Option<&fluree_db_sparql::ParamMap>,
     allow_semantic_elision: bool,
 ) -> Result<JsonValue> {
-    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context)?;
+    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params, false)?;
 
     explain_from_parsed(
         snapshot,

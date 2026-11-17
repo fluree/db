@@ -18,6 +18,25 @@
 //! - `people_window` — the same five appends with every snapshot RETAINED: a
 //!   healthy source that got ahead of its job, so the window resolves and is
 //!   read incrementally, and is too large to commit in one pass.
+//! - `people_paged` — the same five appends again, read only by the paging
+//!   test: five data files whose sizes are not in commit order.
+//! - `amounts` — decimal columns for FILTER pushdown: `ratio` is `decimal(38,9)`
+//!   (BigQuery's `NUMERIC`) with values one grid step either side of 0.05 and
+//!   1.05; `price` is `decimal(5,2)`, too narrow to hold a literal like 1000.
+//! - `literals` — string columns a mapping reads as `xsd:integer` (`ntext`:
+//!   "999", "1000", …) and `xsd:boolean` (`btext`: "1", "true", …), and a
+//!   double column holding -0.0 and 0.0.
+//!
+//! Under `tests/fixtures/iceberg/sets/`, in their own namespace, tables whose
+//! rows mint the same triple more than once (R2RML set semantics; see the
+//! `sets.*` block of the script below):
+//!
+//! - `customers_history` — several versions per customer, no key covering
+//!   `customer_id` alone, in two files.
+//! - `customers_current` — one row per customer; `customer_id` is an Iceberg
+//!   identifier field.
+//! - `orders` — references `customers_history`; one exact duplicate row, one
+//!   copy in each file.
 //!
 //! The fixtures' metadata carries the ABSOLUTE paths they were written under
 //! (`file:///tmp/...`), so reading them from a checkout also proves the
@@ -31,7 +50,28 @@
 //! cp -r /tmp/fluree-local-iceberg/silver/people fluree-db-api/tests/fixtures/iceberg/silver/people
 //! cp -r /tmp/fluree-local-iceberg/silver/people_backlog fluree-db-api/tests/fixtures/iceberg/silver/people_backlog
 //! cp -r /tmp/fluree-local-iceberg/silver/people_window fluree-db-api/tests/fixtures/iceberg/silver/people_window
+//! cp -r /tmp/fluree-local-iceberg/silver/people_paged fluree-db-api/tests/fixtures/iceberg/silver/people_paged
+//! cp -r /tmp/fluree-local-iceberg/silver/amounts fluree-db-api/tests/fixtures/iceberg/silver/amounts
+//! cp -r /tmp/fluree-local-iceberg/silver/literals fluree-db-api/tests/fixtures/iceberg/silver/literals
+//! cp -r /tmp/fluree-local-iceberg/silver/versions fluree-db-api/tests/fixtures/iceberg/silver/versions
+//! cp -r /tmp/fluree-local-iceberg/silver/tombstones fluree-db-api/tests/fixtures/iceberg/silver/tombstones
 //! ```
+//!
+//! The `sets` tables were written under `/tmp/fluree-local-iceberg-sets`, the
+//! path their metadata records. The script deletes and rewrites its whole
+//! warehouse argument, and every run mints new file names and snapshot ids,
+//! so give it its own directory and copy only the tables you mean to replace:
+//!
+//! ```bash
+//! python3 scripts/local/write_local_iceberg_table.py /tmp/fluree-local-iceberg-sets
+//! rm -rf fluree-db-api/tests/fixtures/iceberg/sets/{customers_history,customers_current,orders}
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/customers_history fluree-db-api/tests/fixtures/iceberg/sets/customers_history
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/customers_current fluree-db-api/tests/fixtures/iceberg/sets/customers_current
+//! cp -r /tmp/fluree-local-iceberg-sets/sets/orders fluree-db-api/tests/fixtures/iceberg/sets/orders
+//! ```
+//!
+//! The `sql-sqlite` extra is what brings `sqlalchemy`, which the script's SQL
+//! catalog needs; install it in a virtualenv if the system Python lacks it.
 //!
 //! `FLUREE_LOCAL_ICEBERG_TABLE=file:///path/to/table` overrides the `people`
 //! fixture to run those tests against any table with the same shape.
@@ -46,6 +86,12 @@
 
 use fluree_db_api::{ApiError, FlureeBuilder, FlureeR2rmlProvider, R2rmlCreateConfig};
 use futures::TryStreamExt;
+
+#[path = "support/span_capture.rs"]
+mod span_capture;
+
+// Top-k cases over `silver.versions`, in a module of their own.
+mod iceberg_local_fs_top_k;
 
 const PEOPLE_R2RML: &str = r#"
     @prefix rr: <http://www.w3.org/ns/r2rml#> .
@@ -280,6 +326,546 @@ async fn local_table_end_to_end() {
     eprintln!("local iceberg end-to-end: all assertions passed");
 }
 
+/// Time-pinned reads of a graph source. The fixture has two snapshots (3 rows,
+/// then +2), so a pin that were silently dropped would still return all five.
+/// Both public routes are covered — the `from`-driven dataset builder and the
+/// lazy `graph_at()` handle, whose graph-source fallback used to drop the pin —
+/// and a COUNT is checked against its scan so the manifest shortcut cannot
+/// answer from a different snapshot than the rows.
+/// A SPARQL connection query carrying governance options — what every server
+/// SPARQL request is, even with no policy headers — reads a graph source named
+/// in `FROM`. That branch once ran without the graph-source providers and
+/// answered with no rows and no error.
+#[tokio::test]
+async fn a_sparql_connection_query_with_governance_options_reads_a_graph_source() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("governed-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create local-file graph source");
+
+    let sparql = "SELECT ?name FROM <governed-people:main> \
+                  WHERE { ?s <http://example.org/name> ?name }";
+    let ask = || {
+        fluree
+            .query_from()
+            .sparql(sparql)
+            .connection_opts(fluree_db_api::GovernanceOptions::default())
+    };
+
+    let result = ask().execute().await.expect("execute");
+    assert_eq!(result.row_count(), 5, "execute");
+
+    let formatted = ask().execute_formatted().await.expect("execute_formatted");
+    assert_eq!(
+        formatted["results"]["bindings"].as_array().map(Vec::len),
+        Some(5),
+        "execute_formatted: {formatted}"
+    );
+
+    let text = ask()
+        .execute_formatted_string()
+        .await
+        .expect("execute_formatted_string");
+    assert_eq!(text.matches("\"name\"").count(), 1 + 5, "{text}");
+
+    let tracked = ask()
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("execute_tracked: {}", e.error));
+    assert_eq!(
+        tracked.result["results"]["bindings"]
+            .as_array()
+            .map(Vec::len),
+        Some(5),
+        "execute_tracked: {}",
+        tracked.result
+    );
+}
+
+#[tokio::test]
+async fn pinned_query_on_a_graph_source_reads_that_snapshot() {
+    use fluree_db_api::TimeSpec;
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("local-people-pinned", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create local-file graph source");
+    let alias = "local-people-pinned:main";
+
+    // The two snapshots' ids and commit times, straight from the table metadata.
+    let (first, first_ms, current_ms) = {
+        use fluree_db_iceberg::catalog::{SendCatalogClient, TableIdentifier};
+        use fluree_db_iceberg::io::FileIcebergStorage;
+        use fluree_db_iceberg::metadata::TableMetadata;
+        use fluree_db_iceberg::{SendDirectCatalogClient, SendIcebergStorage};
+
+        let storage = std::sync::Arc::new(FileIcebergStorage::new());
+        let client =
+            SendDirectCatalogClient::new(location.clone(), std::sync::Arc::clone(&storage));
+        let resp = client
+            .load_table(&TableIdentifier::new("silver", "people"), false)
+            .await
+            .expect("direct load_table");
+        let bytes = SendIcebergStorage::read(storage.as_ref(), &resp.metadata_location)
+            .await
+            .expect("read metadata json");
+        let meta = TableMetadata::from_json_str(std::str::from_utf8(&bytes).expect("utf8"))
+            .expect("parse metadata");
+        let current = meta.current_snapshot().expect("current snapshot");
+        let first = meta
+            .snapshot(
+                current
+                    .parent_snapshot_id
+                    .expect("two snapshots in fixture"),
+            )
+            .expect("first snapshot");
+        (first.snapshot_id, first.timestamp_ms, current.timestamp_ms)
+    };
+    assert!(
+        first_ms < current_ms,
+        "fixture snapshots are distinct in time"
+    );
+    let iso = |ms: i64| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms)
+            .expect("valid ms")
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
+    };
+    // An instant strictly between the two commits selects the first snapshot;
+    // the instant of the first commit itself does too (at-or-before).
+    let between = iso(i64::midpoint(first_ms, current_ms));
+    let at_first = iso(first_ms);
+    let before_first = iso(first_ms - 1);
+
+    let names = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let count = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["(count ?s)"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let rows_of = |v: &serde_json::Value| v.as_array().map(Vec::len);
+    let count_of = |v: &serde_json::Value| v[0][0].as_u64().or_else(|| v[0].as_u64());
+    // SPARQL twins (CLAUDE.md: the two surfaces share an IR but not an entry
+    // point — `FROM <alias@…>` lexes the pin out of an IRI).
+    let sparql_names = |from: &str| {
+        format!("SELECT ?name FROM <{from}> WHERE {{ ?s <http://example.org/name> ?name }}")
+    };
+    let sparql_count = |from: &str| {
+        format!(
+            "SELECT (COUNT(?s) AS ?n) FROM <{from}> WHERE {{ ?s <http://example.org/name> ?name }}"
+        )
+    };
+    let bindings_of = |v: &serde_json::Value| v["results"]["bindings"].as_array().map(Vec::len);
+    let binding_count_of = |v: &serde_json::Value| {
+        v["results"]["bindings"][0]["n"]["value"]
+            .as_str()
+            .map(str::to_string)
+    };
+
+    // Unpinned control: both routes see the current snapshot's five rows.
+    let latest = fluree
+        .graph(alias)
+        .query()
+        .jsonld(&names)
+        .execute_formatted()
+        .await
+        .expect("latest query");
+    assert_eq!(rows_of(&latest), Some(5), "got: {latest}");
+    // ...and advertise no `t`: the genesis view's 0 is not a state a client
+    // could pin the next page to.
+    let raw = fluree
+        .graph(alias)
+        .query()
+        .jsonld(&names)
+        .execute()
+        .await
+        .expect("latest raw query");
+    assert_eq!(raw.t, None, "a virtual source has no t to pin on");
+
+    // --- Honored pins: the first snapshot's three rows, on both routes, with
+    //     the COUNT agreeing with the scan.
+    let honored: Vec<(String, TimeSpec)> = vec![
+        (format!("snapshot:{first}"), TimeSpec::AtSnapshot(first)),
+        (format!("time:{between}"), TimeSpec::AtTime(between.clone())),
+        (format!("iso:{between}"), TimeSpec::AtTime(between.clone())),
+        (
+            format!("time:{at_first}"),
+            TimeSpec::AtTime(at_first.clone()),
+        ),
+        (
+            format!("recorded:{between}"),
+            TimeSpec::AtRecorded(between.clone()),
+        ),
+    ];
+    for (suffix, spec) in &honored {
+        let mut from_names = names.clone();
+        from_names["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let rows = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("from @{suffix}: {e}"));
+        assert_eq!(rows_of(&rows), Some(3), "from @{suffix}: {rows}");
+
+        let mut from_count = count.clone();
+        from_count["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let n = fluree
+            .query_from()
+            .jsonld(&from_count)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("count from @{suffix}: {e}"));
+        assert_eq!(count_of(&n), Some(3), "count from @{suffix}: {n}");
+
+        let rows = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("graph_at({spec:?}): {e}"));
+        assert_eq!(rows_of(&rows), Some(3), "graph_at({spec:?}): {rows}");
+
+        // The tracked cores push the pin separately from the plain ones; a
+        // request with tracking headers runs through them.
+        let tracked = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked from @{suffix}: {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked from @{suffix}: {tracked:?}"
+        );
+        let tracked = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked graph_at({spec:?}): {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked graph_at({spec:?}): {tracked:?}"
+        );
+        // A second (named) view makes it a dataset, which has its own core.
+        let mut dataset_names = from_names.clone();
+        dataset_names["fromNamed"] = serde_json::json!([format!("{alias}@{suffix}")]);
+        let tracked = fluree
+            .query_from()
+            .jsonld(&dataset_names)
+            .track_all()
+            .execute_tracked()
+            .await
+            .unwrap_or_else(|e| panic!("tracked dataset @{suffix}: {e:?}"));
+        assert_eq!(
+            rows_of(&tracked.result),
+            Some(3),
+            "tracked dataset @{suffix}: {tracked:?}"
+        );
+
+        let from = format!("{alias}@{suffix}");
+        let rows = fluree
+            .query_from()
+            .sparql(&sparql_names(&from))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL FROM <{from}>: {e}"));
+        assert_eq!(bindings_of(&rows), Some(3), "SPARQL FROM <{from}>: {rows}");
+        let n = fluree
+            .query_from()
+            .sparql(&sparql_count(&from))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL count FROM <{from}>: {e}"));
+        assert_eq!(
+            binding_count_of(&n).as_deref(),
+            Some("3"),
+            "SPARQL count FROM <{from}>: {n}"
+        );
+    }
+
+    // The pin applies when the query addresses the source itself in an
+    // explicit GRAPH block (which skips the auto-wrapping the bare form gets).
+    let mut got = Vec::new();
+    for from in [alias.to_string(), format!("{alias}@snapshot:{first}")] {
+        let rows = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?name FROM <{from}> WHERE {{ GRAPH <{alias}> {{ ?s <http://example.org/name> ?name }} }}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("GRAPH <{alias}> FROM <{from}>: {e}"));
+        got.push(bindings_of(&rows));
+    }
+    assert_eq!(
+        got,
+        [Some(5), Some(3)],
+        "explicit GRAPH block: latest, pinned"
+    );
+
+    // --- Refused pins. Each must be an error on both routes — never the
+    //     current snapshot, never the oldest one — and a 400: the caller asked
+    //     for something the source cannot answer.
+    let expect_refused =
+        |result: Result<serde_json::Value, ApiError>, route: &str, needle: &str| {
+            let err = match result {
+                Ok(rows) => panic!("{route}: pinned query returned {rows} instead of an error"),
+                Err(err) => err,
+            };
+            assert!(
+                err.to_string().contains(needle),
+                "{route}: unexpected error: {err}"
+            );
+            assert_eq!(err.status_code(), 400, "{route}: {err}");
+        };
+    let refused: Vec<(String, TimeSpec, &str)> = vec![
+        // Before the oldest retained snapshot: typed, names the oldest.
+        (
+            format!("iso:{before_first}"),
+            TimeSpec::AtTime(before_first.clone()),
+            "no snapshot of table 'silver.people' at or before",
+        ),
+        // An id no snapshot has.
+        (
+            "snapshot:999".to_string(),
+            TimeSpec::AtSnapshot(999),
+            "snapshot 999 not found",
+        ),
+        // Ledger-only selectors have no meaning against a table.
+        (
+            "t:1".to_string(),
+            TimeSpec::AtT(1),
+            "Graph sources have no transaction numbers or commit hashes",
+        ),
+        (
+            "commit:abcdef".to_string(),
+            TimeSpec::AtCommit("abcdef".to_string()),
+            "Graph sources have no transaction numbers or commit hashes",
+        ),
+    ];
+    for (suffix, spec, needle) in &refused {
+        let mut from_names = names.clone();
+        from_names["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("from @{suffix}"), needle);
+
+        let mut from_count = count.clone();
+        from_count["from"] = serde_json::Value::String(format!("{alias}@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&from_count)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("count from @{suffix}"), needle);
+
+        let result = fluree
+            .graph_at(alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("graph_at({spec:?})"), needle);
+
+        let from = format!("{alias}@{suffix}");
+        let result = fluree
+            .query_from()
+            .sparql(&sparql_names(&from))
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("SPARQL FROM <{from}>"), needle);
+    }
+
+    // One source pinned to two states in one query is a conflict, not a race.
+    let two_states = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": format!("{alias}@snapshot:{first}"),
+        "fromNamed": [format!("{alias}@iso:{}", iso(current_ms))],
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&two_states)
+        .execute_formatted()
+        .await;
+    expect_refused(result, "two pins", "two different states");
+
+    // ...and so is one reference pinned and another unpinned: the pin is per
+    // source for the whole query, so the unpinned view must not silently follow it.
+    let pinned_and_latest = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": [format!("{alias}@snapshot:{first}"), alias],
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&pinned_and_latest)
+        .execute_formatted()
+        .await;
+    expect_refused(result, "pinned + latest", "two different states");
+
+    // A BM25 index is not a graph: named as the dataset, pinned or not, it is
+    // refused as one (a pin on a SQL source, which is one, is refused in
+    // it_sql_graph_source).
+    let ledger = fluree.create_ledger("bm25-src").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [{"@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "Hello world"}]
+            }),
+        )
+        .await
+        .expect("seed bm25 ledger");
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "bm25-pinned",
+            "bm25-src:main",
+            serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:title": "?title"}],
+                "select": {"?x": ["@id", "ex:title"]}
+            }),
+        ))
+        .await
+        .expect("create bm25 index");
+    for suffix in [format!("time:{between}"), "snapshot:1".to_string()] {
+        let mut on_bm25 = names.clone();
+        on_bm25["from"] = serde_json::Value::String(format!("bm25-pinned:main@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&on_bm25)
+            .execute_formatted()
+            .await;
+        expect_refused(
+            result,
+            &format!("bm25 @{suffix}"),
+            "is a BM25 index, not a graph",
+        );
+    }
+
+    // A table with NO snapshots yet (staged as the fixture's pre-first-commit
+    // metadata alone): unpinned reads are empty, and every pin is an error that
+    // says so — there is no oldest snapshot to name, and nothing to fall back to.
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let empty_dir = staging.path().join("people_empty");
+    let empty_meta = empty_dir.join("metadata");
+    std::fs::create_dir_all(&empty_meta).expect("empty table metadata dir");
+    let first_meta = std::fs::read_dir(fixtures_dir().join("silver/people/metadata"))
+        .expect("people metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .min()
+        .expect("a 00000 metadata file");
+    std::fs::copy(
+        &first_meta,
+        empty_meta.join(first_meta.file_name().expect("name")),
+    )
+    .expect("stage the empty-table metadata");
+    let empty_alias = "local-people-empty:main";
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct(
+                "local-people-empty",
+                format!("file://{}", empty_dir.display()),
+                PEOPLE_R2RML,
+            )
+            .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create empty-table graph source");
+    let rows = fluree
+        .graph(empty_alias)
+        .query()
+        .jsonld(&names)
+        .execute_formatted()
+        .await
+        .expect("unpinned read of an empty table");
+    assert_eq!(rows_of(&rows), Some(0), "got: {rows}");
+    for (suffix, spec, needle) in [
+        (
+            format!("iso:{between}"),
+            TimeSpec::AtTime(between.clone()),
+            "the table has no snapshots",
+        ),
+        (
+            format!("snapshot:{first}"),
+            TimeSpec::AtSnapshot(first),
+            "not found for table",
+        ),
+    ] {
+        let mut from_names = names.clone();
+        from_names["from"] = serde_json::Value::String(format!("{empty_alias}@{suffix}"));
+        let result = fluree
+            .query_from()
+            .jsonld(&from_names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("empty table, from @{suffix}"), needle);
+        let result = fluree
+            .graph_at(empty_alias, spec.clone())
+            .query()
+            .jsonld(&names)
+            .execute_formatted()
+            .await;
+        expect_refused(result, &format!("empty table, graph_at({spec:?})"), needle);
+    }
+
+    // `@snapshot:` on a native ledger is refused; it is not a ledger selector.
+    fluree.create_ledger("plain-ledger").await.expect("ledger");
+    let mut on_ledger = names.clone();
+    on_ledger["from"] = serde_json::Value::String("plain-ledger:main@snapshot:1".to_string());
+    let result = fluree
+        .query_from()
+        .jsonld(&on_ledger)
+        .execute_formatted()
+        .await;
+    expect_refused(
+        result,
+        "ledger @snapshot",
+        "selects a graph source's table snapshot",
+    );
+    on_ledger["from"] = serde_json::Value::String("plain-ledger:main@iso:not-a-time".to_string());
+    let result = fluree
+        .query_from()
+        .jsonld(&on_ledger)
+        .execute_formatted()
+        .await;
+    expect_refused(
+        result,
+        "ledger @iso malformed",
+        "Invalid ISO-8601 timestamp for time travel",
+    );
+}
+
 /// The lake face of the stats kernel: the same table, profiled through the
 /// scan the virtual graph reads, pinned to its current snapshot.
 #[tokio::test]
@@ -449,7 +1035,9 @@ async fn an_expired_history_table_drains_in_bounded_passes() {
                 Ok(r) => break r,
                 Err(ApiError::MaterializePartial { detail, .. }) if attempts < 50 => {
                     eprintln!("pass {}: deferred ({detail}); draining novelty", pass + 1);
-                    indexer.wait_for_idle(target).await;
+                    indexer
+                        .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+                        .await;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 Err(e) => panic!("pass {} failed: {e}", pass + 1),
@@ -492,7 +1080,9 @@ async fn an_expired_history_table_drains_in_bounded_passes() {
         );
         // Let the indexer drain the target before the next pass so the next commit
         // has headroom; the retry loop above covers the case where it has not.
-        indexer.wait_for_idle(target).await;
+        indexer
+            .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+            .await;
     }
 
     // Steady state: the watermark resolves, the window is empty, nothing commits.
@@ -668,7 +1258,9 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
                     Ok(r) => break r,
                     Err(ApiError::MaterializePartial { detail, .. }) if attempts < 50 => {
                         eprintln!("pass {pass}: deferred ({detail}); draining novelty");
-                        indexer.wait_for_idle(target).await;
+                        indexer
+                            .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+                            .await;
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
                     Err(e) => panic!("pass {pass} failed: {e}"),
@@ -689,7 +1281,9 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
     assert!(!first.incremental, "a first run is a full read");
     assert_eq!(first.rows_read, 600);
     assert_eq!(watermark().await, Some(chain[0]));
-    indexer.wait_for_idle(target).await;
+    indexer
+        .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+        .await;
 
     // The source commits four more times while the job is away.
     for (from, to) in &held {
@@ -735,7 +1329,9 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
             None,
             "cursor after pass {pass}"
         );
-        indexer.wait_for_idle(target).await;
+        indexer
+            .wait_for_idle(&fluree_db_api::LedgerId::parse(target).unwrap())
+            .await;
     }
 
     // Steady state: the watermark is at the head, the window is empty, nothing
@@ -782,5 +1378,4690 @@ async fn an_incremental_backlog_drains_in_bounded_passes() {
     for i in 1..=3000 {
         let name = format!("person-{i:04}");
         assert!(distinct.contains(name.as_str()), "{name} missing");
+    }
+}
+
+/// A full read pinned to a snapshot returns that snapshot whole, whatever the
+/// per-pass budget. The budget paces the tracking worker's unpinned passes; a
+/// consumer that pins a snapshot and gets a prefix back has silently lost rows.
+///
+/// Both routes a cut can take are crossed. On `people_window` every snapshot is
+/// retained, so a cut checkpoints at an earlier snapshot and reports it as the
+/// read's `to` with no sequence — nothing a caller can tell from a whole read.
+/// On `people_backlog` nothing near the start is retained, so a cut records a
+/// sequence cursor instead. A pin resuming from a cursor reads everything above
+/// it, which crosses the cursor path's own cut.
+///
+/// Assumes `FLUREE_MATERIALIZE_MAX_ROWS_PER_PASS` and
+/// `FLUREE_MATERIALIZE_FLAKE_BYTES_PER_ROW` are unset, as they are in CI.
+#[tokio::test]
+async fn a_pinned_full_read_is_never_cut_by_the_row_budget() {
+    allow_fixture_roots();
+    // The ceiling the drain tests use, so the budget cuts inside the second
+    // 600-row commit of a 3,000-row table.
+    let fluree = FlureeBuilder::memory()
+        .with_indexing_thresholds(64 * 1024, 500 * 1024)
+        .build_memory();
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let budget = provider.pass_row_budget();
+    assert!(
+        (601..=1200).contains(&budget),
+        "an unpinned read of these tables must be cut for this test to mean \
+         anything: budget={budget}"
+    );
+
+    async fn read_all(stream: fluree_db_query::r2rml::ColumnBatchStream) -> usize {
+        let batches: Vec<_> = stream.try_collect().await.expect("stream batches");
+        batches.iter().map(|b| b.num_rows).sum()
+    }
+
+    for fixture in ["people_window", "people_backlog"] {
+        let location = format!(
+            "file://{}/tests/fixtures/iceberg/silver/{fixture}",
+            env!("CARGO_MANIFEST_DIR")
+        );
+        let table = format!("silver.{fixture}");
+        let mapping = PEOPLE_R2RML.replace("silver.people", &table);
+        let config = R2rmlCreateConfig::new_direct(fixture, &location, &mapping)
+            .with_mapping_media_type("text/turtle");
+        fluree
+            .create_r2rml_graph_source(config)
+            .await
+            .expect("create graph source");
+        let gs = format!("{fixture}:main");
+        let head = provider
+            .current_snapshot_id(&gs, &table)
+            .await
+            .expect("current snapshot")
+            .expect("fixture has snapshots");
+
+        let scan = provider
+            .scan_for_materialize_stream(&gs, &table, &[], None, Some(head), None)
+            .await
+            .expect("pinned full read");
+        assert!(!scan.incremental, "{fixture}: no window, so a full read");
+        assert_eq!(
+            scan.to_snapshot_id,
+            Some(head),
+            "{fixture}: reports its pin"
+        );
+        assert_eq!(scan.to_sequence, None, "{fixture}: not a prefix");
+        assert_eq!(
+            read_all(scan.stream).await,
+            3000,
+            "{fixture}: every row of the pin"
+        );
+    }
+
+    // Commits 3..=5 lie above a cursor at 2, and all of them are read.
+    let scan = provider
+        .scan_for_materialize_stream(
+            "people_backlog:main",
+            "silver.people_backlog",
+            &[],
+            None,
+            Some(
+                provider
+                    .current_snapshot_id("people_backlog:main", "silver.people_backlog")
+                    .await
+                    .expect("current snapshot")
+                    .expect("fixture has snapshots"),
+            ),
+            Some(2),
+        )
+        .await
+        .expect("pinned read resumed from a cursor");
+    assert_eq!(scan.to_sequence, None, "not a prefix");
+    assert_eq!(
+        read_all(scan.stream).await,
+        1800,
+        "every commit above the cursor"
+    );
+}
+
+/// A graph source sharing the default graph with a ledger is refused, in
+/// SPARQL and JSON-LD alike — the default graph would not union it in, and a
+/// query that silently read only some of its sources would be wrong. Named
+/// and addressed with GRAPH, the same join works.
+#[tokio::test]
+async fn a_graph_source_joins_a_ledger_as_a_named_graph_not_in_the_default_graph() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("joined-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "http://example.org/person/1", "ex:tier": "gold"
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let mixed = "PREFIX ex: <http://example.org/> SELECT ?name ?tier \
+                 FROM <crm:main> FROM <joined-people:main> \
+                 WHERE { ?p ex:name ?name ; ex:tier ?tier }";
+    let err = fluree
+        .query_from()
+        .sparql(mixed)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FROM NAMED"), "{err}");
+    let mixed_jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": ["joined-people:main", "crm:main"],
+        "select": ["?name", "?tier"],
+        "where": {"@id": "?p", "ex:name": "?name", "ex:tier": "?tier"}
+    });
+    let err = fluree
+        .query_from()
+        .jsonld(&mixed_jsonld)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.to_string().contains("FROM NAMED"), "{err}");
+
+    let named = "PREFIX ex: <http://example.org/> SELECT ?name ?tier \
+                 FROM <crm:main> FROM NAMED <joined-people:main> \
+                 WHERE { ?p ex:tier ?tier GRAPH <joined-people:main> { ?p ex:name ?name } }";
+    let rows = fluree
+        .query_from()
+        .sparql(named)
+        .execute_formatted()
+        .await
+        .expect("named join");
+    assert_eq!(
+        rows["results"]["bindings"].as_array().map(Vec::len),
+        Some(1),
+        "{rows}"
+    );
+}
+
+/// A dropped graph source is gone: its record stays as a tombstone, which
+/// must not still resolve for queries in the same process.
+#[tokio::test]
+async fn a_dropped_graph_source_no_longer_answers() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("dropped-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+    let sparql =
+        "SELECT ?name FROM <dropped-people:main> WHERE { ?s <http://example.org/name> ?name }";
+    fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .expect("query before drop");
+
+    fluree
+        .drop_graph_source("dropped-people", None, fluree_db_api::DropMode::Hard)
+        .await
+        .expect("drop");
+
+    let err = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.is_not_found(), "connection query after drop: {err}");
+    let graph = fluree.graph("dropped-people:main");
+    let err = graph
+        .query()
+        .with_r2rml()
+        .sparql("SELECT ?name WHERE { ?s <http://example.org/name> ?name }")
+        .execute()
+        .await
+        .unwrap_err();
+    assert!(err.is_not_found(), "graph query after drop: {err}");
+}
+
+/// `ORDER BY ... LIMIT k` hands `k = LIMIT + OFFSET` to the scan-side top-k,
+/// whose heap starts at a capped capacity: a `LIMIT` far beyond the table's
+/// rows answers from the rows there are, on SPARQL and JSON-LD.
+#[tokio::test]
+async fn order_by_with_a_limit_beyond_the_table_answers_its_rows() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = keyed_by_id(PEOPLE_R2RML, "silver.people");
+    let config = R2rmlCreateConfig::new_direct("topk-people", &location, &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    const LIMIT: u64 = 9_223_372_036_854_775_807;
+    // erin, person/5, holds the top score; an IRI may come back compacted.
+    let is_top = |v: &serde_json::Value| v.as_str().is_some_and(|s| s.ends_with("person/5"));
+    for (offset, rows) in [(0u64, 5usize), (1, 4)] {
+        let sparql = format!(
+            "SELECT ?s ?score FROM <topk-people:main> \
+             WHERE {{ ?s <http://example.org/score> ?score }} \
+             ORDER BY DESC(?score) LIMIT {LIMIT} OFFSET {offset}"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL OFFSET {offset}: {e}"));
+        let bindings = result["results"]["bindings"]
+            .as_array()
+            .expect("bindings array");
+        assert_eq!(bindings.len(), rows, "SPARQL OFFSET {offset}: {result}");
+        assert_eq!(
+            is_top(&bindings[0]["s"]["value"]),
+            offset == 0,
+            "SPARQL OFFSET {offset}: {result}"
+        );
+
+        let jsonld = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "topk-people:main",
+            "select": ["?s", "?score"],
+            "where": {"@id": "?s", "ex:score": "?score"},
+            "orderBy": "(desc ?score)",
+            "limit": LIMIT,
+            "offset": offset,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD OFFSET {offset}: {e}"));
+        let rows_out = result.as_array().expect("array result");
+        assert_eq!(rows_out.len(), rows, "JSON-LD OFFSET {offset}: {result}");
+        assert_eq!(
+            is_top(&rows_out[0][0]),
+            offset == 0,
+            "JSON-LD OFFSET {offset}: {result}"
+        );
+    }
+}
+
+/// Store an Iceberg graph-source record with no R2RML mapping, as registration
+/// once allowed: no surface can register one now, but records stored then
+/// remain. Its location is a real table, so only the missing mapping can be
+/// why a query of it fails.
+async fn publish_unmapped_source(fluree: &fluree_db_api::Fluree, name: &str) -> String {
+    let config = fluree_db_api::IcebergCreateConfig::new_direct(name, table_location())
+        .to_iceberg_gs_config()
+        .to_json()
+        .expect("serialize config");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            name,
+            "main",
+            fluree_db_nameservice::GraphSourceType::Iceberg,
+            &config,
+            &[],
+        )
+        .await
+        .expect("publish unmapped record");
+    format!("{name}:main")
+}
+
+/// The refusal every route gives a query that names a graph source with no
+/// mapping: the typed code and status, naming the source and the cause.
+fn assert_unmapped<T: std::fmt::Debug>(result: Result<T, ApiError>, gs: &str, route: &str) {
+    let err = match result {
+        Ok(answer) => panic!("{route}: answered instead of refusing: {answer:?}"),
+        Err(err) => err,
+    };
+    assert_eq!(
+        err.error_type(),
+        "err:db/GraphSourceUnmapped",
+        "{route}: {err}"
+    );
+    assert_eq!(err.status_code(), 409, "{route}: {err}");
+    let message = err.to_string();
+    assert!(
+        message.contains(&format!("graph source '{gs}' has no R2RML mapping")),
+        "{route}: {message}"
+    );
+    assert!(!message.contains("not found"), "{route}: {message}");
+}
+
+const NAME_SPARQL: &str = "SELECT ?name WHERE { ?s <http://example.org/name> ?name }";
+
+fn name_jsonld() -> serde_json::Value {
+    serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": {"@id": "?s", "ex:name": "?name"},
+    })
+}
+
+/// A graph source with no mapping queried as the target itself refuses with
+/// its cause. Read as "not a mapped source", the target fell through to the
+/// ledger lookup and answered "Ledger not found".
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_query_that_targets_it() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-target").await;
+
+    let graph = fluree.graph(&gs);
+    assert_unmapped(
+        graph.query().sparql(NAME_SPARQL).execute_formatted().await,
+        &gs,
+        "SPARQL target",
+    );
+    let jsonld = name_jsonld();
+    assert_unmapped(
+        graph.query().jsonld(&jsonld).execute_formatted().await,
+        &gs,
+        "JSON-LD target",
+    );
+
+    // Materializing it reads the same mapping, and refuses the same way.
+    assert_unmapped(
+        fluree
+            .materialize_r2rml_graph_source(&gs, "unmapped-target-copy:main", false)
+            .await
+            .map(|_| ()),
+        &gs,
+        "materialize",
+    );
+
+    // The remedy the refusal names: registering it again under the same name,
+    // with a mapping, replaces the record, and the source answers.
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("unmapped-target", table_location(), PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register again with a mapping");
+    let rows = fluree
+        .graph(&gs)
+        .query()
+        .sparql(NAME_SPARQL)
+        .execute()
+        .await
+        .expect("query the remapped source");
+    assert_eq!(rows.row_count(), 5, "the remapped source answers");
+}
+
+/// A graph source with no mapping named in a dataset (`FROM`, `FROM NAMED`)
+/// refuses with its cause. It used to resolve to an empty genesis graph and
+/// answer no rows without an error.
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_query_that_names_it_in_its_dataset() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-dataset").await;
+    fluree.create_ledger("crm:main").await.expect("ledger");
+
+    let from = format!("SELECT ?name FROM <{gs}> WHERE {{ ?s <http://example.org/name> ?name }}");
+    assert_unmapped(
+        fluree.query_from().sparql(&from).execute_formatted().await,
+        &gs,
+        "SPARQL FROM",
+    );
+    let mut from_jsonld = name_jsonld();
+    from_jsonld["from"] = gs.clone().into();
+    assert_unmapped(
+        fluree
+            .query_from()
+            .jsonld(&from_jsonld)
+            .execute_formatted()
+            .await,
+        &gs,
+        "JSON-LD from",
+    );
+
+    // Every server SPARQL request carries governance options; that branch once
+    // ran without the graph-source providers, so the refusal must not depend
+    // on them.
+    assert_unmapped(
+        fluree
+            .query_from()
+            .sparql(&from)
+            .connection_opts(fluree_db_api::GovernanceOptions::default())
+            .execute_formatted()
+            .await,
+        &gs,
+        "SPARQL FROM with governance options",
+    );
+    // `query_dataset` runs a dataset built up front without the graph-source
+    // providers, so their probe never sees the source: resolving it into the
+    // dataset is what has to refuse.
+    let spec = fluree_db_api::DatasetSpec::new()
+        .with_default(fluree_db_api::GraphSource::parse(&gs).expect("parse source"));
+    assert_unmapped(
+        fluree.build_dataset_view(&spec).await.map(|_| ()),
+        &gs,
+        "build_dataset_view",
+    );
+
+    // A tracked query reports only a status and a message.
+    match fluree.query_from().sparql(&from).execute_tracked().await {
+        Ok(answer) => panic!("tracked SPARQL FROM: answered {}", answer.result),
+        Err(err) => {
+            assert_eq!(err.status, 409, "tracked SPARQL FROM: {}", err.error);
+            assert!(
+                err.error.contains("has no R2RML mapping"),
+                "tracked SPARQL FROM: {}",
+                err.error
+            );
+        }
+    }
+
+    let named = format!(
+        "SELECT ?name FROM <crm:main> FROM NAMED <{gs}> \
+         WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}"
+    );
+    assert_unmapped(
+        fluree.query_from().sparql(&named).execute_formatted().await,
+        &gs,
+        "SPARQL FROM NAMED + GRAPH",
+    );
+    let named_jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "crm:main",
+        "fromNamed": [gs],
+        "select": ["?name"],
+        "where": [["graph", gs, {"@id": "?s", "ex:name": "?name"}]],
+    });
+    assert_unmapped(
+        fluree
+            .query_from()
+            .jsonld(&named_jsonld)
+            .execute_formatted()
+            .await,
+        &gs,
+        "JSON-LD fromNamed + graph",
+    );
+}
+
+/// `GRAPH <source>` inside a query of a ledger, with no dataset naming the
+/// source, asks the R2RML probe directly rather than resolving a dataset. A
+/// source with no mapping refuses there too, instead of matching nothing.
+#[tokio::test]
+async fn an_unmapped_graph_source_refuses_a_graph_pattern_in_a_ledger_query() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_unmapped_source(&fluree, "unmapped-graph").await;
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@id": "http://example.org/person/1", "ex:tier": "gold"
+            }),
+        )
+        .await
+        .expect("insert");
+
+    let graph = fluree.graph("crm:main");
+    let sparql =
+        format!("SELECT ?name WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}");
+    assert_unmapped(
+        graph.query().sparql(&sparql).execute_formatted().await,
+        &gs,
+        "SPARQL GRAPH in a ledger query",
+    );
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?name"],
+        "where": [["graph", gs, {"@id": "?s", "ex:name": "?name"}]],
+    });
+    assert_unmapped(
+        graph.query().jsonld(&jsonld).execute_formatted().await,
+        &gs,
+        "JSON-LD graph in a ledger query",
+    );
+}
+
+/// Registering a Direct source reaches its tables the way its queries do (a
+/// warehouse root's per-table directory included) and reports the outcome as
+/// `connection_tested`, as registering a REST source does. A table that cannot
+/// be read still registers, and then fails when queried.
+#[tokio::test]
+async fn a_direct_registration_reports_whether_its_tables_resolve() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let register = |name: &'static str, location: String| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .create_r2rml_graph_source(
+                    R2rmlCreateConfig::new_direct(name, &location, PEOPLE_R2RML)
+                        .with_mapping_media_type("text/turtle"),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("register {name}: {e}"))
+        }
+    };
+
+    let table = register("probe-table", table_location()).await;
+    assert!(table.connection_tested, "a readable table is verified");
+
+    // The mapping's `silver.people` resolves to its own directory beneath the
+    // root, as it does when the source is queried.
+    let root = format!("file://{}/silver", fixtures_dir().display());
+    let rooted = register("probe-root", root).await;
+    assert!(
+        rooted.connection_tested,
+        "a warehouse root resolves the mapping's table"
+    );
+    let rows = fluree
+        .query_from()
+        .sparql(
+            "SELECT ?name FROM <probe-root:main> \
+             WHERE { ?s <http://example.org/name> ?name }",
+        )
+        .execute()
+        .await
+        .expect("query the warehouse-root source");
+    assert_eq!(rows.row_count(), 5, "the probe and the query agree");
+
+    let missing = format!("file://{}/silver/no_such_table", fixtures_dir().display());
+    let unread = register("probe-missing", missing).await;
+    assert!(
+        !unread.connection_tested,
+        "a table that cannot be read is not verified"
+    );
+    assert!(
+        matches!(
+            &unread.connection_check,
+            fluree_db_api::ConnectionCheck::TableFailed { table, .. } if table == "silver.people"
+        ),
+        "the outcome names the table: {:?}",
+        unread.connection_check
+    );
+    assert_eq!(
+        table.connection_check,
+        fluree_db_api::ConnectionCheck::Verified
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup_graph_source("probe-missing:main")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "and is still registered"
+    );
+    let err = fluree
+        .query_from()
+        .sparql(
+            "SELECT ?name FROM <probe-missing:main> \
+             WHERE { ?s <http://example.org/name> ?name }",
+        )
+        .execute()
+        .await
+        .expect_err("a source whose table cannot be read fails when queried");
+    assert!(
+        err.to_string().contains("no_such_table"),
+        "the failure names the location: {err}"
+    );
+}
+
+/// A REST catalog that serves the committed `people` fixture's current
+/// metadata inline at `silver.people` and refuses `silver.refused` (403).
+/// The `metadata-location` a mock REST catalog answers with for the fixture
+/// metadata file `current`. A catalog may not place a table on this host's
+/// disk (only a Direct source reads the local filesystem), so the mock names
+/// an object-store location and serves the metadata inline, which is all
+/// registration's table check reads.
+fn catalog_metadata_location(current: &std::path::Path) -> String {
+    format!(
+        "s3://fixture-bucket/silver/people/metadata/{}",
+        current.file_name().unwrap().to_string_lossy()
+    )
+}
+
+async fn people_catalog() -> wiremock::MockServer {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let metadata_dir = fixtures_dir().join("silver/people/metadata");
+    let current = std::fs::read_dir(&metadata_dir)
+        .expect("people metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let metadata: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&current).expect("read metadata"))
+            .expect("parse metadata");
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/config"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/people"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "metadata-location": catalog_metadata_location(&current),
+            "metadata": metadata,
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/refused"))
+        .respond_with(ResponseTemplate::new(403).set_body_string("not yours"))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/namespaces/silver/tables/broken"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("catalog fault"))
+        .mount(&server)
+        .await;
+    server
+}
+
+/// Registering a REST source loads each table its mapping names through the
+/// catalog, as its queries will, and reports it as `connection_tested`. A
+/// source whose tables come from its mapping has no table of its own; the
+/// check once loaded the placeholder standing in for one, so it reported
+/// `false` for every such source. A table the catalog refuses still
+/// registers, reported as not verified.
+#[tokio::test]
+async fn a_rest_registration_loads_each_mapped_table_through_the_catalog() {
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let register = |name: &'static str, mapping: String| {
+        let fluree = &fluree;
+        let config = R2rmlCreateConfig::new(
+            name,
+            catalog.uri(),
+            fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            mapping,
+        )
+        .with_mapping_media_type("text/turtle")
+        .with_vended_credentials(false)
+        .with_s3_region("us-east-1");
+        async move {
+            fluree
+                .create_r2rml_graph_source(config)
+                .await
+                .unwrap_or_else(|e| panic!("register {name}: {e}"))
+        }
+    };
+
+    let mapped = register("rest-people", PEOPLE_R2RML.to_string()).await;
+    assert!(
+        mapped.connection_tested,
+        "a table the catalog serves is verified"
+    );
+    let asked: Vec<String> = catalog
+        .received_requests()
+        .await
+        .expect("request recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        asked
+            .iter()
+            .any(|p| p == "/v1/namespaces/silver/tables/people"),
+        "the mapped table was loaded: {asked:?}"
+    );
+    assert!(
+        !asked.iter().any(|p| p.contains("default")),
+        "the placeholder is never loaded: {asked:?}"
+    );
+
+    let refused = register(
+        "rest-refused",
+        PEOPLE_R2RML.replace("silver.people", "silver.refused"),
+    )
+    .await;
+    assert!(
+        !refused.connection_tested,
+        "a table the catalog refuses is not verified"
+    );
+    match &refused.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.refused");
+            assert!(error.contains("not yours"), "the catalog's reason: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    assert_eq!(
+        mapped.connection_check,
+        fluree_db_api::ConnectionCheck::Verified
+    );
+
+    // A table the catalog answers it does not have, or answers for with an
+    // error status, did not load; a catalog that does not answer at all is
+    // unreachable.
+    let missing = register(
+        "rest-missing",
+        PEOPLE_R2RML.replace("silver.people", "silver.nope"),
+    )
+    .await;
+    match &missing.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.nope");
+            assert!(error.contains("not found"), "the catalog's answer: {error}");
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    let broken = register(
+        "rest-broken",
+        PEOPLE_R2RML.replace("silver.people", "silver.broken"),
+    )
+    .await;
+    match &broken.connection_check {
+        fluree_db_api::ConnectionCheck::TableFailed { table, error } => {
+            assert_eq!(table, "silver.broken");
+            assert!(
+                error.contains("catalog fault"),
+                "the catalog's answer: {error}"
+            );
+        }
+        other => panic!("expected TableFailed, got {other:?}"),
+    }
+    let unreachable = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "rest-unreachable",
+                "http://127.0.0.1:9/catalog",
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                PEOPLE_R2RML.to_string(),
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1"),
+        )
+        .await
+        .expect("an unreachable catalog still registers");
+    match &unreachable.connection_check {
+        fluree_db_api::ConnectionCheck::CatalogUnreachable { table, error } => {
+            assert_eq!(table, "silver.people");
+            assert!(!error.contains("not found"), "no catalog answered: {error}");
+        }
+        other => panic!("expected CatalogUnreachable, got {other:?}"),
+    }
+
+    // A catalog client that cannot be built loads no table, and is not
+    // reported as a table: its catalog credential names a secret that no
+    // resolver holds.
+    let unbuilt = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "rest-unbuilt",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                PEOPLE_R2RML.to_string(),
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .with_auth_bearer_token_ref("catalog/no-such-token"),
+        )
+        .await
+        .expect("a source whose client cannot be built still registers");
+    assert!(!unbuilt.connection_tested);
+    assert!(
+        matches!(
+            unbuilt.connection_check,
+            fluree_db_api::ConnectionCheck::ClientFailed { .. }
+        ),
+        "{:?}",
+        unbuilt.connection_check
+    );
+    assert!(
+        fluree
+            .nameservice()
+            .lookup_graph_source("rest-refused:main")
+            .await
+            .expect("lookup")
+            .is_some(),
+        "and is still registered"
+    );
+
+    // Verified means every mapped table: one refused among served ones is not.
+    let both = format!(
+        "{PEOPLE_R2RML}\n{}",
+        PEOPLE_R2RML
+            .replace("silver.people", "silver.refused")
+            .replace("mapping#PeopleMapping", "mapping#RefusedMapping")
+    );
+    let partial = register("rest-partial", both).await;
+    assert_eq!(partial.table_count, 2, "{:?}", partial.table_names);
+    assert!(
+        !partial.connection_tested,
+        "one refused table leaves the source unverified"
+    );
+}
+
+/// Mappings that parse but define no `rr:TriplesMap`: the `rr:` prefix without
+/// its trailing `#` turns every `rr:` term into another IRI, and a misspelled
+/// class types no map. Every query of a source with one would answer no rows.
+fn mappings_that_define_nothing() -> [(&'static str, String); 2] {
+    [
+        ("no-hash", PEOPLE_R2RML.replace("r2rml#>", "r2rml>")),
+        (
+            "misspelled",
+            PEOPLE_R2RML.replace("a rr:TriplesMap", "a rr:TripleMap"),
+        ),
+    ]
+}
+
+#[tokio::test]
+async fn a_mapping_that_defines_no_triples_map_is_refused_at_registration() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (name, mapping) in mappings_that_define_nothing() {
+        let err = fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, table_location(), mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect_err(name);
+        assert_eq!(err.status_code(), 400, "{name}: {err}");
+        assert!(
+            err.to_string().contains(
+                "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
+                 http://www.w3.org/ns/r2rml#"
+            ),
+            "{name}: {err}"
+        );
+        assert!(
+            fluree
+                .nameservice()
+                .lookup_graph_source(&format!("{name}:main"))
+                .await
+                .expect("lookup")
+                .is_none(),
+            "{name}: a refused registration stores no record"
+        );
+    }
+}
+
+/// Store a source whose mapping defines no `rr:TriplesMap`, as registration
+/// once allowed: the mapping is in the content store, as a registration would
+/// have put it, and the record points at it.
+async fn publish_empty_mapping_source(fluree: &fluree_db_api::Fluree, name: &str) -> String {
+    use fluree_db_core::ContentStore;
+    let (_, empty) = mappings_that_define_nothing().into_iter().next().unwrap();
+    let gs = format!("{name}:main");
+    let cid = fluree
+        .content_store(&gs)
+        .put(
+            fluree_db_core::ContentKind::GraphSourceMapping,
+            empty.as_bytes(),
+        )
+        .await
+        .expect("store the mapping");
+    let config = R2rmlCreateConfig::new_direct(name, table_location(), empty)
+        .with_mapping_media_type("text/turtle")
+        .to_iceberg_gs_config(&cid.to_string())
+        .to_json()
+        .expect("serialize config");
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            name,
+            "main",
+            fluree_db_nameservice::GraphSourceType::Iceberg,
+            &config,
+            &[],
+        )
+        .await
+        .expect("publish");
+    gs
+}
+
+/// A source stored with a mapping that defines nothing (registered before
+/// registration refused one) refuses every query with the cause, rather than
+/// answering no rows.
+#[tokio::test]
+async fn a_stored_mapping_that_defines_no_triples_map_refuses_every_query() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let gs = publish_empty_mapping_source(&fluree, "empty-mapping").await;
+    let gs = gs.as_str();
+    fluree.create_ledger("crm:main").await.expect("ledger");
+
+    let refused = |result: Result<serde_json::Value, ApiError>, route: &str| {
+        let err = match result {
+            Ok(answer) => panic!("{route}: answered instead of refusing: {answer}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.error_type(),
+            "err:db/GraphSourceUnmapped",
+            "{route}: {err}"
+        );
+        assert_eq!(err.status_code(), 409, "{route}: {err}");
+        assert!(
+            err.to_string().contains(&format!(
+                "graph source '{gs}' has an R2RML mapping that defines no rr:TriplesMap"
+            )),
+            "{route}: {err}"
+        );
+    };
+    let from = format!("SELECT ?name FROM <{gs}> WHERE {{ ?s <http://example.org/name> ?name }}");
+    refused(
+        fluree.query_from().sparql(&from).execute_formatted().await,
+        "SPARQL FROM",
+    );
+    let mut from_jsonld = name_jsonld();
+    from_jsonld["from"] = gs.into();
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&from_jsonld)
+            .execute_formatted()
+            .await,
+        "JSON-LD from",
+    );
+    let target = fluree.graph(gs);
+    refused(
+        target.query().sparql(NAME_SPARQL).execute_formatted().await,
+        "SPARQL target",
+    );
+    let jsonld = name_jsonld();
+    refused(
+        target.query().jsonld(&jsonld).execute_formatted().await,
+        "JSON-LD target",
+    );
+    let in_ledger =
+        format!("SELECT ?name WHERE {{ GRAPH <{gs}> {{ ?s <http://example.org/name> ?name }} }}");
+    refused(
+        fluree
+            .graph("crm:main")
+            .query()
+            .sparql(&in_ledger)
+            .execute_formatted()
+            .await,
+        "SPARQL GRAPH in a ledger query",
+    );
+}
+
+/// A mapping that cannot be read names no table, and the catalog source's own
+/// `table` is a placeholder: registration loads nothing, so the source is not
+/// verified, and the placeholder never reaches the catalog.
+#[tokio::test]
+async fn a_registration_whose_mapping_cannot_be_read_loads_no_table() {
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    let created = fluree
+        .create_r2rml_graph_source(R2rmlCreateConfig {
+            iceberg: fluree_db_api::IcebergCreateConfig::new(
+                "unread-mapping",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+            )
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1"),
+            mapping: fluree_db_api::R2rmlMappingInput::Address("no/such/mapping.ttl".into()),
+            mapping_media_type: Some("text/turtle".into()),
+        })
+        .await
+        .expect("an unreadable mapping address registers unvalidated");
+    assert!(!created.mapping_validated);
+    assert!(!created.connection_tested, "nothing was loaded");
+    assert_eq!(
+        created.connection_check,
+        fluree_db_api::ConnectionCheck::NoTables
+    );
+    let asked: Vec<String> = catalog
+        .received_requests()
+        .await
+        .expect("request recording")
+        .iter()
+        .map(|r| r.url.path().to_string())
+        .collect();
+    assert!(
+        !asked.iter().any(|p| p.contains("/tables/")),
+        "no table, placeholder or otherwise, was loaded: {asked:?}"
+    );
+}
+
+/// Registration loads a mapping's tables together, through one catalog client
+/// built before the loads: the client cache does not coalesce concurrent
+/// misses, so loads that each found it cold would each build one, resolving
+/// the catalog's token reference once per table.
+#[tokio::test]
+async fn a_registration_builds_one_catalog_client_for_all_its_tables() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct CountingResolver(AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl fluree_db_iceberg::SecretResolver for CountingResolver {
+        async fn resolve_secret(
+            &self,
+            _secret_ref: &str,
+        ) -> Result<String, fluree_db_iceberg::SecretResolveError> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            // Hold the build open, as a real resolver's round trip does, so
+            // loads issued together would overlap it.
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            Ok("catalog-token".to_string())
+        }
+    }
+
+    allow_fixture_roots();
+    let catalog = people_catalog().await;
+    {
+        use wiremock::matchers::{method, path_regex};
+        use wiremock::{Mock, ResponseTemplate};
+        let metadata_dir = fixtures_dir().join("silver/people/metadata");
+        let current = std::fs::read_dir(&metadata_dir)
+            .expect("people metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .max()
+            .expect("a metadata file");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        Mock::given(method("GET"))
+            .and(path_regex(r"^/v1/namespaces/silver/tables/people_[0-9]+$"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "metadata-location": catalog_metadata_location(&current),
+                "metadata": metadata,
+            })))
+            .mount(&catalog)
+            .await;
+    }
+    let resolver = std::sync::Arc::new(CountingResolver::default());
+    let fluree = FlureeBuilder::memory()
+        .with_secret_resolver(resolver.clone())
+        .build_memory();
+    let mapping = (1..=4)
+        .map(|i| {
+            PEOPLE_R2RML
+                .replace("silver.people", &format!("silver.people_{i}"))
+                .replace("mapping#PeopleMapping", &format!("mapping#People{i}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    let created = fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new(
+                "wide",
+                catalog.uri(),
+                fluree_db_iceberg::config::MAPPING_DEFINED_TABLE,
+                mapping,
+            )
+            .with_mapping_media_type("text/turtle")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .with_auth_bearer_token_ref("catalog/token"),
+        )
+        .await
+        .expect("register");
+    assert_eq!(created.table_count, 4, "{:?}", created.table_names);
+    assert!(created.connection_tested, "every table loaded");
+    assert_eq!(
+        resolver.0.load(Ordering::SeqCst),
+        1,
+        "one client, so the token reference was resolved once"
+    );
+}
+
+/// `GRAPH ?g` with `?g` bound from data before the block runs. A binding that
+/// names a source no query reads as a graph (no mapping, an empty mapping, a
+/// BM25 index) is a graph outside the dataset: it yields no rows, SPARQL's
+/// answer, and the query goes on, answering for the other bindings. A
+/// constant `GRAPH <source>` naming the same source is refused.
+#[tokio::test]
+async fn a_graph_variable_bound_from_data_to_an_unreadable_source_yields_no_rows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let unmapped = publish_unmapped_source(&fluree, "bound-unmapped").await;
+    let empty = publish_empty_mapping_source(&fluree, "bound-empty").await;
+    fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .graph("crm:main")
+        .transact()
+        .sparql_update(&format!(
+            "PREFIX ex: <http://example.org/> \
+             INSERT DATA {{ \
+               <urn:a> ex:in <{unmapped}> . <urn:b> ex:in <{empty}> . \
+               <urn:c> ex:in <bound-search:main> . <urn:d> ex:in <urn:g1> . \
+               <urn:doc> a ex:Doc ; ex:title \"hello\" . \
+               GRAPH <urn:g1> {{ <urn:x> ex:p \"in g1\" }} }}"
+        ))
+        .commit()
+        .await
+        .expect("seed");
+    fluree
+        .create_full_text_index(fluree_db_api::Bm25CreateConfig::new(
+            "bound-search",
+            "crm:main",
+            serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "where": [{"@id": "?x", "@type": "ex:Doc", "ex:title": "?t"}],
+                "select": {"?x": ["@id", "ex:title"]}
+            }),
+        ))
+        .await
+        .expect("index");
+
+    // `?g` is bound before the GRAPH block runs only where the block is
+    // correlated with the rows binding it: after a subquery, or inside
+    // OPTIONAL. (A plain join evaluates `GRAPH ?g` over the ledger's own named
+    // graphs and never probes a source.)
+    let ledger = fluree.graph("crm:main");
+    let one_row = |rows: &serde_json::Value, route: &str| {
+        let bindings = rows["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{route}: {rows}"));
+        assert_eq!(
+            bindings.len(),
+            1,
+            "{route}: only urn:g1 is a graph here: {rows}"
+        );
+        assert_eq!(bindings[0]["g"]["value"], "urn:g1", "{route}: {rows}");
+        assert_eq!(bindings[0]["o"]["value"], "in g1", "{route}: {rows}");
+    };
+    let subquery = "PREFIX ex: <http://example.org/> SELECT ?g ?o WHERE { \
+                    { SELECT ?g WHERE { ?s ex:in ?g } } GRAPH ?g { ?x ex:p ?o } }";
+    let rows = ledger
+        .query()
+        .sparql(subquery)
+        .execute_formatted()
+        .await
+        .expect("SPARQL subquery: a data-bound GRAPH variable does not fail the query");
+    one_row(&rows, "SPARQL subquery");
+    let optional = "PREFIX ex: <http://example.org/> SELECT ?g ?o WHERE { \
+                    ?s ex:in ?g OPTIONAL { GRAPH ?g { ?x ex:p ?o } } }";
+    let rows = ledger
+        .query()
+        .sparql(optional)
+        .execute_formatted()
+        .await
+        .expect("SPARQL OPTIONAL: a data-bound GRAPH variable does not fail the query");
+    let bindings = rows["results"]["bindings"].as_array().expect("bindings");
+    assert_eq!(bindings.len(), 4, "every ?g row is kept: {rows}");
+    let matched: Vec<_> = bindings.iter().filter(|b| b.get("o").is_some()).collect();
+    assert_eq!(matched.len(), 1, "only urn:g1 matches inside GRAPH: {rows}");
+    assert_eq!(matched[0]["g"]["value"], "urn:g1", "{rows}");
+
+    let jsonld_subquery = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?o"],
+        "where": [
+            ["query", {"select": ["?g"], "where": {"@id": "?s", "http://example.org/in": "?g"}}],
+            ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]
+        ]
+    });
+    let rows = ledger
+        .query()
+        .jsonld(&jsonld_subquery)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD subquery: a data-bound graph variable does not fail the query");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 1, "only urn:g1 is a graph here: {rows:?}");
+    assert!(rows[0].to_string().contains("in g1"), "{rows:?}");
+    let jsonld_optional = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?g", "?o"],
+        "where": [
+            {"@id": "?s", "ex:in": "?g"},
+            ["optional", ["graph", "?g", {"@id": "?x", "ex:p": "?o"}]]
+        ]
+    });
+    let rows = ledger
+        .query()
+        .jsonld(&jsonld_optional)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD optional: a data-bound graph variable does not fail the query");
+    let rows = rows.as_array().expect("rows");
+    assert_eq!(rows.len(), 4, "every ?g row is kept: {rows:?}");
+    assert_eq!(
+        rows.iter()
+            .filter(|r| r.to_string().contains("in g1"))
+            .count(),
+        1,
+        "only urn:g1 matches inside graph: {rows:?}"
+    );
+
+    // The same sources named as constants are refused.
+    for gs in [unmapped.as_str(), empty.as_str(), "bound-search:main"] {
+        let constant = format!(
+            "PREFIX ex: <http://example.org/> SELECT ?o WHERE {{ GRAPH <{gs}> {{ ?x ex:p ?o }} }}"
+        );
+        let err = ledger
+            .query()
+            .sparql(&constant)
+            .execute_formatted()
+            .await
+            .expect_err(gs);
+        assert!(
+            matches!(
+                err.error_type(),
+                "err:db/GraphSourceUnmapped" | "err:db/GraphSourceNotAGraph"
+            ),
+            "{gs}: {err}"
+        );
+    }
+}
+
+const AMOUNTS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#AmountsMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.amounts" ] ;
+        rr:subjectMap [ rr:template "http://example.org/amount/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:ratio ;
+            rr:objectMap [ rr:column "ratio" ; rr:datatype xsd:decimal ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:price ;
+            rr:objectMap [ rr:column "price" ; rr:datatype xsd:decimal ]
+        ] .
+"#;
+
+/// The ids (sorted) a SPARQL `FILTER(?v <filter>)` over `ex:<column>` returns.
+async fn sparql_amount_ids(fluree: &fluree_db_api::Fluree, column: &str, filter: &str) -> Vec<i64> {
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?id FROM <amounts:main> \
+         WHERE {{ ?s ex:id ?id ; ex:{column} ?v FILTER(?v {filter}) }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// A decimal FILTER over a `decimal(38,9)` / `decimal(5,2)` column answers
+/// exactly what the in-engine FILTER would. The pushdown evaluates the
+/// literal against each decoded batch before the engine sees it, so a literal
+/// the column cannot hold exactly must widen that filter to every row, never
+/// narrow it: a row it drops is lost. Each case below failed on main: the
+/// first two panicked the reader ("scale 2 is greater than precision 1"), the
+/// next two lost a row to Arrow's rounding cast, and the last lost every row
+/// to a cast that overflowed to NULL.
+#[tokio::test]
+async fn decimal_filters_answer_exactly() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/amounts",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("amounts", &location, AMOUNTS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create decimal graph source");
+
+    // ratio: 1=0.049999999 2=0.050000000 3=0.050000001 4=1.050000000 5=-0.05
+    // price: 1=999.99 2=1.00 3=12.34 4=0.05 5=-999.99
+    let cases: [(&str, &str, &[i64]); 6] = [
+        ("ratio", ">= 0.05", &[2, 3, 4]),
+        ("price", ">= 0.05", &[1, 2, 3, 4]),
+        ("ratio", "< 1.0500000001", &[1, 2, 3, 4, 5]),
+        ("ratio", "> 1.0499999999", &[4]),
+        ("price", "< 1000", &[1, 2, 3, 4, 5]),
+        ("ratio", "= 0.05", &[2]),
+    ];
+    for (column, filter, want) in cases {
+        assert_eq!(
+            sparql_amount_ids(&fluree, column, filter).await,
+            want,
+            "FILTER(?{column} {filter})"
+        );
+    }
+
+    // JSON-LD has no decimal FILTER literal (a fractional number is a double,
+    // which is not pushed against a decimal column), so its route into the
+    // same row filter is an integer literal against a decimal column: the
+    // overflow case above.
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "amounts:main",
+        "select": ["?id"],
+        "where": [
+            {"@id": "?s", "ex:id": "?id", "ex:price": "?p"},
+            ["filter", "(< ?p 1000)"]
+        ],
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .expect("JSON-LD decimal filter");
+    let mut ids: Vec<i64> = rows
+        .as_array()
+        .unwrap_or_else(|| panic!("array result: {rows}"))
+        .iter()
+        .map(|row| row[0].as_i64().unwrap_or_else(|| panic!("id in {rows}")))
+        .collect();
+    ids.sort_unstable();
+    assert_eq!(ids, [1, 2, 3, 4, 5], "JSON-LD (< ?p 1000): {rows}");
+}
+
+const LITERALS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#LiteralsMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.literals" ] ;
+        rr:subjectMap [ rr:template "http://example.org/literal/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:n ;
+            rr:objectMap [ rr:column "ntext" ; rr:datatype xsd:integer ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:b ;
+            rr:objectMap [ rr:column "btext" ; rr:datatype xsd:boolean ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:d ;
+            rr:objectMap [ rr:column "f64" ; rr:datatype xsd:double ]
+        ] .
+"#;
+
+/// The ids (sorted) that `FILTER(?v <op> <lit>)` over `ex:<pred>` returns, on
+/// SPARQL (`sparql_lit`) and on its JSON-LD twin (`jsonld_lit`).
+async fn literal_ids(
+    fluree: &fluree_db_api::Fluree,
+    pred: &str,
+    op: &str,
+    sparql_lit: &str,
+    jsonld_lit: &str,
+) -> (Vec<i64>, Vec<i64>) {
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> \
+         SELECT ?id FROM <literals:main> \
+         WHERE {{ ?s ex:id ?id ; ex:{pred} ?v FILTER(?v {op} {sparql_lit}) }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "literals:main",
+        "select": ["?id"],
+        "where": [
+            {"@id": "?s", "ex:id": "?id", format!("ex:{pred}"): "?v"},
+            ["filter", format!("({op} ?v {jsonld_lit})")]
+        ],
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{jsonld}: {e}"));
+    let mut jsonld_ids: Vec<i64> = rows
+        .as_array()
+        .unwrap_or_else(|| panic!("array result: {rows}"))
+        .iter()
+        .map(|row| {
+            row.as_i64()
+                .or_else(|| row[0].as_i64())
+                .unwrap_or_else(|| panic!("id in {rows}"))
+        })
+        .collect();
+    jsonld_ids.sort_unstable();
+    (ids, jsonld_ids)
+}
+
+/// A pushed comparison must not compare in an order the engine does not. An
+/// `xsd:integer` or `xsd:boolean` map over a string column orders by value in
+/// the engine, where the column's own comparison is by text ("999" < "1000"
+/// is false; "1" is not "true"). And the engine treats -0.0 as equal to 0,
+/// where the Arrow kernels order -0.0 below 0.0. Each case below lost a true
+/// match to the row filter before it was fixed.
+#[tokio::test]
+async fn literal_filters_compare_as_the_engine_does() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/literals",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("literals", &location, LITERALS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create literals graph source");
+
+    // ntext: 1="999" 2="1000" 3="50" 4="-5" 5="7"
+    // btext: 1="1" 2="true" 3="0" 4="false" 5=null
+    // f64:   1=-0.0 2=0.0 3=1.5 4=-1.5 5=null
+    let cases: [(&str, &str, &str, &str, &[i64]); 13] = [
+        ("n", "<", "1000", "1000", &[1, 3, 4, 5]),
+        ("n", ">=", "50", "50", &[1, 2, 3]),
+        ("n", "=", "1000", "1000", &[2]),
+        ("b", "=", "true", "true", &[1, 2]),
+        ("b", "=", "false", "false", &[3, 4]),
+        ("d", ">=", "0", "0", &[1, 2, 3]),
+        ("d", "<=", "0", "0", &[1, 2, 4]),
+        ("d", ">", "0", "0", &[3]),
+        ("d", "<", "0", "0", &[4]),
+        ("d", "=", "0", "0", &[1, 2]),
+        ("d", ">=", "0.0e0", "0.0", &[1, 2, 3]),
+        ("d", "<=", "-0.0e0", "-0.0", &[1, 2, 4]),
+        ("d", ">", "-1.5e0", "-1.5", &[1, 2, 3]),
+    ];
+    let mut failures = Vec::new();
+    for (pred, op, sparql_lit, jsonld_lit, want) in cases {
+        let (sparql, jsonld) = literal_ids(&fluree, pred, op, sparql_lit, jsonld_lit).await;
+        if sparql != want {
+            failures.push(format!(
+                "SPARQL FILTER(?{pred} {op} {sparql_lit}): {sparql:?} != {want:?}"
+            ));
+        }
+        if jsonld != want {
+            failures.push(format!(
+                "JSON-LD ({op} ?{pred} {jsonld_lit}): {jsonld:?} != {want:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// BigQuery writes a snapshot summary of only `{"operation": "overwrite"}`, so
+/// the summary has no delete counters for the zero-I/O guard to read. A
+/// merge-on-read delete manifest in such a snapshot's manifest list must still
+/// refuse every read that would return rows (the scan, a `COUNT(*)`, a
+/// materialize read) with the merge-on-read refusal, never return the rows the
+/// delete files remove.
+///
+/// The staged table is the `people` fixture with its current snapshot's summary
+/// replaced by BigQuery's and its manifest list replaced by the same list plus
+/// one delete manifest (`content = 1`), which does not exist: refusing must not
+/// need to read it. The control is the same summary over the original list.
+#[tokio::test]
+async fn a_delete_manifest_a_bigquery_summary_does_not_report_refuses_every_read() {
+    use apache_avro::types::Value as AvroValue;
+
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let stage = |name: &str, with_delete_manifest: bool| -> String {
+        let table_dir = staging.path().join(name);
+        copy_dir_all(&fixtures_dir().join("silver/people"), &table_dir);
+        let metadata_dir = table_dir.join("metadata");
+        let mut metadata_files: Vec<std::path::PathBuf> = std::fs::read_dir(&metadata_dir)
+            .expect("metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .collect();
+        metadata_files.sort();
+        let newest = metadata_files.last().expect("a metadata file").clone();
+        let mut meta: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&newest).expect("read metadata"))
+                .expect("parse metadata");
+        let current = meta["current-snapshot-id"].clone();
+        let snapshot = meta["snapshots"]
+            .as_array_mut()
+            .expect("snapshots")
+            .iter_mut()
+            .find(|s| s["snapshot-id"] == current)
+            .expect("current snapshot");
+        snapshot["summary"] = serde_json::json!({"operation": "overwrite"});
+        if with_delete_manifest {
+            // The list, as written: the fixture's `file:///tmp/...` path, which
+            // the provider remaps onto the staged location.
+            let list_ref = snapshot["manifest-list"]
+                .as_str()
+                .expect("list")
+                .to_string();
+            let list_name = list_ref.rsplit('/').next().expect("list file name");
+            let original = std::fs::read(metadata_dir.join(list_name)).expect("read list");
+            let reader = apache_avro::Reader::new(&original[..]).expect("avro list");
+            let schema = reader.writer_schema().clone();
+            let records: Vec<AvroValue> = reader.map(|r| r.expect("record")).collect();
+            let AvroValue::Record(data) = records[0].clone() else {
+                panic!("a manifest_file record");
+            };
+            let delete: Vec<(String, AvroValue)> = data
+                .into_iter()
+                .map(|(k, v)| match k.as_str() {
+                    "manifest_path" => {
+                        let AvroValue::String(p) = v else {
+                            panic!("manifest_path")
+                        };
+                        (k, AvroValue::String(p.replace(".avro", "-deletes.avro")))
+                    }
+                    "content" => (k, AvroValue::Int(1)),
+                    _ => (k, v),
+                })
+                .collect();
+            let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+            for record in records {
+                writer.append(record).expect("copy a record");
+            }
+            writer
+                .append(AvroValue::Record(delete))
+                .expect("add the delete manifest");
+            let with_deletes = "snap-with-delete-manifest.avro";
+            std::fs::write(
+                metadata_dir.join(with_deletes),
+                writer.into_inner().expect("avro bytes"),
+            )
+            .expect("write list");
+            snapshot["manifest-list"] =
+                serde_json::json!(list_ref.replace(list_name, with_deletes));
+        }
+        std::fs::write(&newest, serde_json::to_vec(&meta).expect("metadata json"))
+            .expect("write metadata");
+        format!("file://{}", table_dir.display())
+    };
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let query = |gs: &str| {
+        serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": gs,
+            "select": ["?name"],
+            "where": {"@id": "?s", "ex:name": "?name"},
+        })
+    };
+    let count = |gs: &str| {
+        serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": gs,
+            "select": ["(count ?s)"],
+            "where": {"@id": "?s", "@type": "ex:Person"},
+        })
+    };
+    let refused = |result: Result<serde_json::Value, ApiError>, what: &str| {
+        let err = result.expect_err(what);
+        assert!(
+            err.to_string()
+                .contains("Merge-on-read deletes not applied"),
+            "{what}: {err}"
+        );
+    };
+
+    // Control: BigQuery's summary over a list with no delete manifest reads.
+    let clean = stage("clean", false);
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("bq-clean", &clean, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register the clean table");
+    let rows = fluree
+        .query_from()
+        .jsonld(&query("bq-clean:main"))
+        .execute_formatted()
+        .await
+        .expect("the clean table reads");
+    assert_eq!(rows.as_array().expect("rows").len(), 5);
+
+    // The delete manifest refuses each read, though the summary says nothing.
+    let mor = stage("mor", true);
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("bq-mor", &mor, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("register the table (registration reads no data)");
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&query("bq-mor:main"))
+            .execute_formatted()
+            .await,
+        "the scan",
+    );
+    refused(
+        fluree
+            .query_from()
+            .jsonld(&count("bq-mor:main"))
+            .execute_formatted()
+            .await,
+        "COUNT(*)",
+    );
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    match provider
+        .scan_for_materialize_stream("bq-mor:main", "silver.people", &[], None, None, None)
+        .await
+    {
+        Ok(_) => panic!("a materialize read must be refused"),
+        Err(err) => assert!(
+            err.to_string()
+                .contains("Merge-on-read deletes not applied"),
+            "materialize: {err}"
+        ),
+    }
+}
+
+/// A subgraph crawl over a graph source answers the subjects its ORDER BY puts
+/// on the page, in that order, as the same crawl over a native ledger does. The
+/// crawl runs as one flat scan regrouped by subject, and that scan used to drop
+/// the ORDER BY: the page came back in scan order and, under an OFFSET, held the
+/// wrong subjects. The native twin carries the fixture's IRIs and scores, so it
+/// is the oracle; every projection shape the expansion handles is covered,
+/// because each one builds its own flat query.
+#[tokio::test]
+async fn a_graph_source_crawl_answers_in_order_by_order() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("ordered-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let twin = fluree
+        .create_ledger("ordered-twin:main")
+        .await
+        .expect("twin ledger");
+    let people = [
+        (1, "alice", 91.5),
+        (2, "bob", 82.0),
+        (3, "carol", 77.25),
+        (4, "dave", 64.0),
+        (5, "erin", 99.9),
+    ];
+    let graph: Vec<Value> = people
+        .iter()
+        .map(|(id, name, score)| {
+            json!({
+                "@id": format!("http://example.org/person/{id}"),
+                "@type": "http://example.org/Person",
+                "http://example.org/name": name,
+                "http://example.org/score": score,
+            })
+        })
+        .collect();
+    fluree
+        .insert(twin, &json!({ "@graph": graph }))
+        .await
+        .expect("seed native twin");
+
+    let optional_sort = json!([
+        {"@id": "?s", "@type": "ex:Person"},
+        ["optional", {"@id": "?s", "ex:score": "?sort"}]
+    ]);
+    let one_map = json!({"@id": "?s", "@type": "ex:Person", "ex:score": "?sort"});
+    // Scores: 1 → 91.5, 2 → 82, 3 → 77.25, 4 → 64, 5 → 99.9.
+    let cases = [
+        // The live R2-3 shape: the sort key comes from an OPTIONAL.
+        (
+            "[*] desc",
+            json!(["*"]),
+            optional_sort.clone(),
+            json!([["desc", "?sort"]]),
+            5,
+            0,
+            vec![5, 1, 2, 3, 4],
+        ),
+        // OFFSET and LIMIT cut the ordered subjects, not the scan's.
+        (
+            "[*] asc page",
+            json!(["*"]),
+            one_map.clone(),
+            json!("?sort"),
+            3,
+            1,
+            vec![3, 2, 1],
+        ),
+        (
+            "[@id] desc page",
+            json!(["@id"]),
+            one_map.clone(),
+            json!("(desc ?sort)"),
+            2,
+            1,
+            vec![1, 2],
+        ),
+        (
+            "predicates desc",
+            json!(["@id", "ex:name"]),
+            optional_sort,
+            json!([["desc", "?sort"]]),
+            4,
+            0,
+            vec![5, 1, 2, 3],
+        ),
+    ];
+    for (label, projection, where_clause, order_by, limit, offset, expected) in cases {
+        let expected: Vec<String> = expected.iter().map(|n| format!("ex:person/{n}")).collect();
+        for from in ["ordered-people:main", "ordered-twin:main"] {
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": from,
+                "select": {"?s": projection},
+                "where": where_clause,
+                "orderBy": order_by,
+                "limit": limit,
+                "offset": offset,
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} on {from}: {e}"));
+            let ids: Vec<&str> = result
+                .as_array()
+                .expect("a crawl answers an array")
+                .iter()
+                .map(|doc| doc["@id"].as_str().expect("each document has an @id"))
+                .collect();
+            assert_eq!(ids, expected, "{label} on {from}: {result}");
+        }
+    }
+}
+
+/// The crawl's flat scan carries no GROUP BY / HAVING, so a crawl that asks for
+/// them is refused, as a top-level `values` is, rather than answered without
+/// them.
+#[tokio::test]
+async fn a_graph_source_crawl_refuses_group_by_and_having() {
+    use serde_json::json;
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("grouped-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    for (key, value) in [
+        ("groupBy", json!(["?s"])),
+        ("having", json!("(> (count ?n) 1)")),
+    ] {
+        let mut query = json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "grouped-people:main",
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "ex:name": "?n"},
+        });
+        query[key] = value;
+        let err = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .expect_err("a crawl cannot honor {key}");
+        assert!(
+            matches!(
+                err,
+                ApiError::Query(fluree_db_query::QueryError::R2rmlUnsupportedPattern { .. })
+            ),
+            "{key}: {err}"
+        );
+    }
+}
+
+/// A subgraph crawl over a graph source keeps the request's options: its
+/// fuel limit, from the body's `opts` or a tracked request's override, on the
+/// connection and the graph terminals alike, and its reasoning keys. The crawl runs
+/// a rewritten flat query, which used to carry only the context, `select`,
+/// `where`, `orderBy` and `limit`, so a crawl ran without its fuel limit and
+/// without reasoning. SPARQL has no subgraph crawl, so there is no twin.
+#[tokio::test]
+async fn crawl_over_a_graph_source_keeps_its_query_options() {
+    use fluree_db_api::{TrackedQueryResponse, TrackingOptions};
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("optioned-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+
+    let crawl = |extra: Value| {
+        let mut q = json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": {"?s": ["*"]},
+            "where": {"@id": "?s", "@type": "ex:Person"},
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            q[k] = v.clone();
+        }
+        q
+    };
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+    let fuel_exceeded = |err: &ApiError| {
+        matches!(
+            err,
+            ApiError::Query(fluree_db_query::QueryError::FuelLimitExceeded(_))
+        )
+    };
+    let tracked_fuel_exceeded =
+        |status: u16, error: &str| status == 400 && error.to_lowercase().contains("fuel");
+    // Five people with a name and a score cost more than 1.001 fuel: the
+    // 1.000 floor and one thousandth per row.
+    let tight = json!({"opts": {"max-fuel": 1.001}});
+    let generous = json!({"opts": {"max-fuel": 1_000_000}});
+    let with_from = |mut q: Value| {
+        q["from"] = json!("optioned-people:main");
+        q
+    };
+
+    // Connection terminal, body limit.
+    let ok = fluree
+        .query_from()
+        .jsonld(&with_from(crawl(generous.clone())))
+        .execute_formatted()
+        .await
+        .expect("a crawl under its limit succeeds");
+    assert_eq!(rows(&ok), 5, "{ok}");
+    let err = fluree
+        .query_from()
+        .jsonld(&with_from(crawl(tight.clone())))
+        .execute_formatted()
+        .await
+        .expect_err("a crawl past its body fuel limit fails");
+    assert!(fuel_exceeded(&err), "connection, body limit: {err:?}");
+
+    // Graph terminal, body limit.
+    let graph = fluree.graph("optioned-people:main");
+    let err = graph
+        .query()
+        .with_r2rml()
+        .jsonld(&crawl(tight.clone()))
+        .execute_formatted()
+        .await
+        .expect_err("a crawl past its body fuel limit fails");
+    assert!(fuel_exceeded(&err), "graph, body limit: {err:?}");
+
+    // Tracked terminals: the override's limit holds, and replaces the body's.
+    let override_limit = TrackingOptions {
+        track_fuel: true,
+        max_fuel: Some(1_001),
+        ..TrackingOptions::default()
+    };
+    let check_tracked = |label: &str,
+                         limited: Result<TrackedQueryResponse, _>,
+                         lifted: Result<TrackedQueryResponse, _>| {
+        let limited: fluree_db_api::TrackedErrorResponse =
+            limited.expect_err(&format!("{label}: the override's limit holds"));
+        assert!(
+            tracked_fuel_exceeded(limited.status, &limited.error),
+            "{label}: {} {}",
+            limited.status,
+            limited.error
+        );
+        let lifted = lifted.unwrap_or_else(|e| {
+            panic!("{label}: an override with no limit lifts the body's: {e:?}")
+        });
+        assert_eq!(rows(&lifted.result), 5, "{label}: {:?}", lifted.result);
+        // The crawl reports what it cost, as a tracked flat query does.
+        assert!(
+            lifted.fuel.is_some_and(|fuel| fuel > 1.0),
+            "{label}: fuel {:?}",
+            lifted.fuel
+        );
+        assert!(lifted.time.is_some(), "{label}: no time reported");
+        assert!(
+            limited.fuel.is_some(),
+            "{label}: a crawl past its limit reports the fuel it spent"
+        );
+    };
+    check_tracked(
+        "connection",
+        fluree
+            .query_from()
+            .jsonld(&with_from(crawl(json!({}))))
+            .tracking(override_limit.clone())
+            .execute_tracked()
+            .await,
+        fluree
+            .query_from()
+            .jsonld(&with_from(crawl(tight.clone())))
+            .track_all()
+            .execute_tracked()
+            .await,
+    );
+    check_tracked(
+        "graph",
+        graph
+            .query()
+            .with_r2rml()
+            .jsonld(&crawl(json!({})))
+            .tracking(override_limit.clone())
+            .execute_tracked()
+            .await,
+        graph
+            .query()
+            .with_r2rml()
+            .jsonld(&crawl(tight.clone()))
+            .track_all()
+            .execute_tracked()
+            .await,
+    );
+
+    // Reasoning reaches the flat query's parser: an unknown mode is refused,
+    // as on a flat query, where the crawl used to answer as if none were named.
+    // (`crawl::e2e::crawl_carries_reasoning` shows an RDFS crawl answering the
+    // subclass's instances.)
+    for (label, query) in [
+        (
+            "crawl",
+            with_from(crawl(json!({"reasoning": "no-such-mode"}))),
+        ),
+        (
+            "flat",
+            with_from(json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": ["?s"],
+                "where": {"@id": "?s", "@type": "ex:Person"},
+                "reasoning": "no-such-mode",
+            })),
+        ),
+    ] {
+        let err = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .expect_err("an unknown reasoning mode is refused");
+        assert!(err.to_string().contains("reasoning"), "{label}: {err}");
+    }
+}
+
+/// SPARQL twin of the crawl ordering. SPARQL has no subgraph crawl: the
+/// shape that picks a page of subjects by ORDER BY and returns their triples is
+/// a CONSTRUCT, which runs on the ordinary R2RML path and keeps only the
+/// ordered page's triples. DESCRIBE lowers to a subquery, which a graph source
+/// refuses rather than answering from its empty native index.
+#[tokio::test]
+async fn sparql_construct_over_a_graph_source_keeps_the_ordered_page() {
+    fn strings<'v>(v: &'v serde_json::Value, out: &mut Vec<&'v str>) {
+        match v {
+            serde_json::Value::String(s) => out.push(s),
+            serde_json::Value::Array(a) => a.iter().for_each(|v| strings(v, out)),
+            serde_json::Value::Object(o) => o.values().for_each(|v| strings(v, out)),
+            _ => {}
+        }
+    }
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("constructed-people", &location, PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let construct = "PREFIX ex: <http://example.org/> \
+        CONSTRUCT { ?s ex:name ?name } FROM <constructed-people:main> \
+        WHERE { ?s a ex:Person ; ex:name ?name OPTIONAL { ?s ex:score ?sort } } \
+        ORDER BY DESC(?sort) LIMIT 2 OFFSET 1";
+    let result = fluree
+        .query_from()
+        .sparql(construct)
+        .execute_formatted()
+        .await
+        .expect("CONSTRUCT");
+    let mut found = Vec::new();
+    strings(&result, &mut found);
+    let mut names: Vec<&str> = found
+        .into_iter()
+        .filter(|s| ["alice", "bob", "carol", "dave", "erin"].contains(s))
+        .collect();
+    names.sort_unstable();
+    // DESC(score): erin, alice, bob, carol, dave; OFFSET 1 LIMIT 2 → alice, bob.
+    assert_eq!(names, ["alice", "bob"], "CONSTRUCT: {result}");
+
+    let describe = "PREFIX ex: <http://example.org/> \
+        DESCRIBE ?s FROM <constructed-people:main> \
+        WHERE { ?s a ex:Person } ORDER BY ?s LIMIT 2";
+    let err = fluree
+        .query_from()
+        .sparql(describe)
+        .execute_formatted()
+        .await
+        .expect_err("DESCRIBE over a graph source is refused");
+    // DESCRIBE's expansion follows `rdf:rest*`, a path no graph source evaluates.
+    let err = err.to_string();
+    assert!(
+        err.contains("cannot be evaluated over a virtual dataset"),
+        "DESCRIBE: {err}"
+    );
+}
+
+/// The people table mapped twice over disjoint subject templates: persons
+/// carry a name, agents a score. So a person never has a score, and a class
+/// or constraint on persons fuses into the scan beside it (the templates prove
+/// the fusion drops nothing).
+const SPLIT_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ; rr:class ex:Person ] ;
+        rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+    <http://example.org/mapping#Agent> a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people" ] ;
+        rr:subjectMap [ rr:template "http://example.org/agent/{id}" ; rr:class ex:Agent ] ;
+        rr:predicateObjectMap [ rr:predicate ex:score ; rr:objectMap [ rr:column "score" ] ] .
+"#;
+
+/// A pattern written above an OPTIONAL is part of its left side. The rewrite
+/// fuses a class (or a constant-object constraint) into the scan written below
+/// the OPTIONAL; that fused scan must stay above it. Below, the OPTIONAL runs
+/// over an empty seed, binds `?s` to the agents it matches, and every person,
+/// none of whom has a score, is lost. On a lake the trigger is a null column
+/// under an OPTIONAL.
+#[tokio::test]
+async fn an_optional_keeps_the_class_written_above_it() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("split-people", &location, SPLIT_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let jsonld = |query: Value| {
+        let fluree = &fluree;
+        async move {
+            let mut query = query;
+            query["@context"] = json!({"ex": "http://example.org/"});
+            query["from"] = json!("split-people:main");
+            fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"))
+        }
+    };
+    let rows = |v: &Value| v.as_array().map_or(0, Vec::len);
+    let no_score = json!(["optional", {"@id": "?s", "ex:score": "?x"}]);
+
+    // The browse crawl: the class fuses into the injected wildcard.
+    let crawl = jsonld(json!({
+        "select": {"?s": ["*"]},
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score],
+    }))
+    .await;
+    assert_eq!(rows(&crawl), 5, "crawl: {crawl}");
+    assert!(
+        crawl
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|d| d["ex:name"].is_string()),
+        "each person keeps its name: {crawl}"
+    );
+
+    // A constant-object constraint folded onto the crawl wildcard (W4-1b).
+    let alice = jsonld(json!({
+        "select": {"?s": ["*"]},
+        "where": [{"@id": "?s", "ex:name": "alice"}, no_score],
+    }))
+    .await;
+    assert_eq!(rows(&alice), 1, "constraint crawl: {alice}");
+
+    // The class fused into a star written below the OPTIONAL.
+    let star = jsonld(json!({
+        "select": ["?s", "?n", "?x"],
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score, {"@id": "?s", "ex:name": "?n"}],
+    }))
+    .await;
+    assert_eq!(rows(&star), 5, "class into star: {star}");
+
+    // A flat wildcard, and its SPARQL twin: a type and a name per person.
+    let flat = jsonld(json!({
+        "select": ["?s", "?p", "?o"],
+        "where": [{"@id": "?s", "@type": "ex:Person"}, no_score, {"@id": "?s", "?p": "?o"}],
+    }))
+    .await;
+    assert_eq!(rows(&flat), 10, "flat wildcard: {flat}");
+    let sparql = fluree
+        .query_from()
+        .sparql(
+            "PREFIX ex: <http://example.org/> SELECT ?s ?p ?o FROM <split-people:main> \
+             WHERE { ?s a ex:Person OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+        )
+        .execute_formatted()
+        .await
+        .expect("SPARQL");
+    assert_eq!(
+        rows(&sparql["results"]["bindings"]),
+        10,
+        "SPARQL wildcard: {sparql}"
+    );
+}
+
+/// A MINUS is positional like an OPTIONAL: what is written before it is its
+/// left side, so a scan the rewrite fuses or groups must not cross it. Every
+/// shape runs over `SPLIT_R2RML` and over a native twin holding the same
+/// triples, on SPARQL and JSON-LD, and must give the count Jena ARQ and
+/// Oxigraph both give. The fused shapes lifted the wildcard or the star above a
+/// MINUS that reads its variables; the scopes without an OPTIONAL were never
+/// restored to written order, so the grouped scans ran below the MINUS.
+#[tokio::test]
+async fn a_minus_keeps_the_scans_written_above_it() {
+    use serde_json::{json, Value};
+
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("minus-people", &location, SPLIT_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let twin = fluree
+        .create_ledger("minus-twin:main")
+        .await
+        .expect("twin ledger");
+    let people = [
+        (1, "alice", "91.5"),
+        (2, "bob", "82.0"),
+        (3, "carol", "77.25"),
+        (4, "dave", "64.0"),
+        (5, "erin", "99.9"),
+    ];
+    let mut graph: Vec<Value> = Vec::new();
+    for (id, name, score) in people {
+        graph.push(json!({
+            "@id": format!("http://example.org/person/{id}"),
+            "@type": "http://example.org/Person",
+            "http://example.org/name": name,
+        }));
+        graph.push(json!({
+            "@id": format!("http://example.org/agent/{id}"),
+            "@type": "http://example.org/Agent",
+            "http://example.org/score": score,
+        }));
+    }
+    fluree
+        .insert(twin, &json!({ "@graph": graph }))
+        .await
+        .expect("seed native twin");
+
+    let score = json!(["optional", {"@id": "?s", "ex:score": "?x"}]);
+    let person = json!({"@id": "?s", "@type": "ex:Person"});
+    let alice = json!({"@id": "?s", "ex:name": "alice"});
+    let wildcard = json!({"@id": "?s", "?p": "?o"});
+    // (label, SPARQL query, JSON-LD select, JSON-LD where, rows per ARQ and Oxigraph)
+    let cases = [
+        (
+            "class into wildcard, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s ex:name ?o } OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([person, ["minus", {"@id": "?s", "ex:name": "?o"}], score, wildcard]),
+            0,
+        ),
+        (
+            "class into star, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s a ?n } OPTIONAL { ?s ex:score ?x } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["minus", {"@id": "?s", "@type": "?n"}], score, {"@id": "?s", "ex:name": "?n"}]),
+            0,
+        ),
+        (
+            "constraint into wildcard, MINUS then OPTIONAL",
+            "SELECT * WHERE { ?s ex:name \"alice\" . MINUS { ?s a ?o } OPTIONAL { ?s ex:score ?x } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([alice, ["minus", {"@id": "?s", "@type": "?o"}], score, wildcard]),
+            0,
+        ),
+        (
+            "class into wildcard, MINUS only",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s ex:name ?o } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([person, ["minus", {"@id": "?s", "ex:name": "?o"}], wildcard]),
+            0,
+        ),
+        (
+            "class into star, MINUS only",
+            "SELECT * WHERE { ?s a ex:Person . MINUS { ?s a ?n } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["minus", {"@id": "?s", "@type": "?n"}], {"@id": "?s", "ex:name": "?n"}]),
+            0,
+        ),
+        (
+            "constraint into wildcard, MINUS only",
+            "SELECT * WHERE { ?s ex:name \"alice\" . MINUS { ?s a ?o } ?s ?p ?o }",
+            json!(["?s", "?p", "?o"]),
+            json!([alice, ["minus", {"@id": "?s", "@type": "?o"}], wildcard]),
+            0,
+        ),
+        // The review's P3 and P3b, verbatim. The class triple is written
+        // first, so `?s` is bound when the MINUS runs (Join(Minus(Extend(
+        // BGP(?s a Person), ?k), BGP(?s name "alice")), BGP(?s name ?n)),
+        // §18.2.2) and alice is removed: 4. With no OPTIONAL the scope was
+        // never restored to written order, so the graph source ran the class
+        // below the MINUS, which then removed nothing: 5.
+        (
+            "P3: class, BIND, then MINUS",
+            "SELECT ?s ?n WHERE { ?s a ex:Person . BIND(\"k\" AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n }",
+            json!(["?s", "?n"]),
+            json!([person, ["bind", "?k", ["expr", ["str", "k"]]], ["minus", alice], {"@id": "?s", "ex:name": "?n"}]),
+            4,
+        ),
+        (
+            "P3b: class, BIND, MINUS, then OPTIONAL",
+            "SELECT ?s ?n WHERE { ?s a ex:Person . BIND(\"k\" AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n OPTIONAL { ?s ex:score ?x } }",
+            json!(["?s", "?n"]),
+            json!([person, ["bind", "?k", ["expr", ["str", "k"]]], ["minus", alice], {"@id": "?s", "ex:name": "?n"}, score]),
+            4,
+        ),
+        // With the BIND written first, the MINUS's left side is the BIND alone,
+        // whose domain shares nothing with the MINUS, so it removes nothing and
+        // the triple written after it joins every person: 5.
+        (
+            "BIND first, then MINUS",
+            "SELECT * WHERE { BIND(1 AS ?k) MINUS { ?s ex:name \"alice\" } ?s ex:name ?n }",
+            json!(["?s", "?n", "?k"]),
+            json!([["bind", "?k", "(+ 0 1)"], ["minus", alice], {"@id": "?s", "ex:name": "?n"}]),
+            5,
+        ),
+    ];
+    let count = |v: &Value| {
+        v["results"]["bindings"]
+            .as_array()
+            .or_else(|| v.as_array())
+            .map_or(usize::MAX, Vec::len)
+    };
+    let mut wrong = Vec::new();
+    for (label, query, select, where_clause, expected) in &cases {
+        for from in ["minus-people:main", "minus-twin:main"] {
+            let sparql = format!(
+                "PREFIX ex: <http://example.org/> {}",
+                query.replacen(" WHERE", &format!(" FROM <{from}> WHERE"), 1)
+            );
+            let result = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} SPARQL on {from}: {e}"));
+            if count(&result) != *expected {
+                wrong.push(format!("{label} SPARQL on {from}: {} rows", count(&result)));
+            }
+            let jsonld = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": from,
+                "select": select,
+                "where": where_clause,
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&jsonld)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{label} JSON-LD on {from}: {e}"));
+            if count(&result) != *expected {
+                wrong.push(format!(
+                    "{label} JSON-LD on {from}: {} rows",
+                    count(&result)
+                ));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "rows differ from ARQ/Oxigraph:\n{}",
+        wrong.join("\n")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Scan planning from the snapshot's kept file list. `people_window` is five
+// appends of 600 rows with disjoint ids (1..=600, 601..=1200, ...), one data
+// file each, so an id range selects whole files.
+// ---------------------------------------------------------------------------
+
+const WINDOW_IDS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#WindowIds>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] .
+"#;
+
+/// A private copy of `people_window` (so deleting its manifests touches no
+/// other test, and its cache keys are its own) behind a graph source `alias`.
+async fn staged_window(alias: &str) -> (fluree_db_api::Fluree, tempfile::TempDir) {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_window");
+    copy_dir_all(&fixtures_dir().join("silver/people_window"), &table_dir);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        alias,
+        format!("file://{}", table_dir.display()),
+        WINDOW_IDS_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create window graph source");
+    (fluree, staging)
+}
+
+/// Delete the staged table's data manifests (the manifest lists stay), so any
+/// later scan that reads a manifest fails.
+fn delete_data_manifests(staging: &tempfile::TempDir) -> usize {
+    let metadata = staging.path().join("people_window/metadata");
+    let mut deleted = 0;
+    for entry in std::fs::read_dir(&metadata).expect("metadata dir") {
+        let path = entry.expect("entry").path();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        if name.ends_with(".avro") && !name.starts_with("snap-") {
+            std::fs::remove_file(&path).expect("delete a data manifest");
+            deleted += 1;
+        }
+    }
+    deleted
+}
+
+/// The ids (sorted) a SPARQL query over `from` returns, with `filter` as the
+/// body of a `FILTER(...)` over `?id` (none when empty).
+async fn sparql_window_ids(fluree: &fluree_db_api::Fluree, from: &str, filter: &str) -> Vec<i64> {
+    let filter = if filter.is_empty() {
+        String::new()
+    } else {
+        format!("FILTER({filter})")
+    };
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?id FROM <{from}> WHERE {{ ?s ex:id ?id {filter} }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut ids: Vec<i64> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| b["id"]["value"].as_str().unwrap().parse().unwrap())
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+/// The JSON-LD twin of [`sparql_window_ids`]; `filter` is a JSON-LD filter
+/// expression over `?id`.
+async fn jsonld_window_ids(fluree: &fluree_db_api::Fluree, from: &str, filter: &str) -> Vec<i64> {
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?id"],
+        "where": [{"@id": "?s", "ex:id": "?id"}, ["filter", filter]],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut ids: Vec<i64> = result
+        .as_array()
+        .unwrap_or_else(|| panic!("rows for {query}: {result}"))
+        .iter()
+        .map(|row| {
+            let v = if row.is_array() { &row[0] } else { row };
+            v.as_i64().unwrap_or_else(|| panic!("an id in {result}"))
+        })
+        .collect();
+    ids.sort_unstable();
+    ids
+}
+
+fn id_range(lo: i64, hi: i64) -> Vec<i64> {
+    (lo..=hi).collect()
+}
+
+/// Once a snapshot's file list is kept, a filtered scan plans from it and
+/// reads no manifest: the data manifests are deleted after the first
+/// (unfiltered) scan, and filtered scans on both surfaces still answer
+/// exactly. Before, a filtered scan re-read every manifest on every query.
+#[tokio::test]
+async fn a_filtered_scan_reads_no_manifest_once_the_file_list_is_kept() {
+    let (fluree, staging) = staged_window("kept-list").await;
+    let from = "kept-list:main";
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+    assert_eq!(
+        delete_data_manifests(&staging),
+        5,
+        "one manifest per append"
+    );
+
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id >= 700 && ?id < 1300").await,
+        id_range(700, 1299)
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id IN (5, 2500, 9999)").await,
+        vec![5, 2500]
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id > 2995").await,
+        id_range(2996, 3000)
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(and (>= ?id 700) (< ?id 1300))").await,
+        id_range(700, 1299)
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(= ?id 2500)").await,
+        vec![2500]
+    );
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+}
+
+/// A filtered first scan keeps the WHOLE file list, not its filtered
+/// selection: after it, with the manifests gone, a different filter and an
+/// unfiltered scan both answer from the kept list.
+#[tokio::test]
+async fn a_filtered_first_scan_keeps_the_whole_file_list() {
+    let (fluree, staging) = staged_window("first-filtered").await;
+    let from = "first-filtered:main";
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id >= 2950").await,
+        id_range(2950, 3000)
+    );
+    assert_eq!(delete_data_manifests(&staging), 5);
+
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "?id < 3").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        jsonld_window_ids(&fluree, from, "(< ?id 3)").await,
+        vec![1, 2]
+    );
+    assert_eq!(
+        sparql_window_ids(&fluree, from, "").await,
+        id_range(1, 3000)
+    );
+}
+
+const TOMBSTONES_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Tombstones>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.tombstones" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
+"#;
+
+/// With a delete convention and no ordering column, a materialize pass keeps
+/// the last row it reads for each subject, so it must read the source's files
+/// in commit order. `silver.tombstones` commits 200,000 live revisions of
+/// subjects 1..=10 in one large file, then subject 7's tombstone in a one-row
+/// file. Read in commit order the tombstone is applied last and subject 7 is
+/// retracted; read as the reads finish (the materialize read before this
+/// branch), the small file tends to be read first, and the large file's later
+/// live rows resurrect the subject. Five fresh materializations must all
+/// retract it and keep the other nine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tombstone_committed_after_a_large_file_retracts_its_subject() {
+    allow_fixture_roots();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/tombstones",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("tomb", &location, TOMBSTONES_R2RML)
+                .with_mapping_media_type("text/turtle")
+                .with_delete_convention(fluree_db_api::DeleteConvention {
+                    column: "op".to_string(),
+                    deleted_values: vec![Some("d".to_string())],
+                }),
+        )
+        .await
+        .expect("create the tombstones graph source");
+
+    let mut runs = Vec::new();
+    for run in 0..5 {
+        let target = format!("tomb_native_{run}:main");
+        fluree.create_ledger(&target).await.expect("target ledger");
+        fluree
+            .materialize_r2rml_graph_source("tomb:main", &target, true)
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let result = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s FROM <{target}> WHERE {{ ?s <http://example.org/name> ?n }}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("run {run}: {e}"));
+        let mut people: Vec<i64> = result["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings: {result}"))
+            .iter()
+            .map(|b| person_number(b["s"]["value"].as_str().expect("an IRI")))
+            .collect();
+        people.sort_unstable();
+        people.dedup();
+        runs.push(people);
+    }
+    let want: Vec<i64> = (1..=10).filter(|&id| id != 7).collect();
+    for (run, people) in runs.iter().enumerate() {
+        assert_eq!(people, &want, "run {run}: subject 7 is retracted");
+    }
+}
+
+/// Every scan records its file selection on `iceberg.scan_plan`, a scan
+/// planned from the kept list included: a warm unfiltered scan reports all
+/// five files (it used to record nothing), and a warm filtered one the files
+/// its filter kept and pruned.
+#[tokio::test(flavor = "current_thread")]
+async fn a_scan_from_the_kept_list_records_its_file_counts() {
+    let (fluree, _staging) = staged_window("kept-counts").await;
+    let from = "kept-counts:main";
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let counts = |seen: usize| {
+        store.find_spans("iceberg.scan_plan")[seen..]
+            .iter()
+            .map(|s| {
+                (
+                    s.fields.get("files_selected").cloned().unwrap_or_default(),
+                    s.fields.get("files_pruned").cloned().unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let pair = |selected: &str, pruned: &str| vec![(selected.to_string(), pruned.to_string())];
+
+    // The first scan reads the manifests and keeps the list.
+    assert_eq!(sparql_window_ids(&fluree, from, "").await.len(), 3000);
+    assert_eq!(counts(0), pair("5", "0"));
+
+    for (filter, want, (selected, pruned)) in [
+        ("", 3000, ("5", "0")),
+        ("?id >= 700 && ?id < 1300", 600, ("2", "3")),
+        ("?id IN (5, 2500)", 2, ("2", "3")),
+        ("?id > 99999", 0, ("0", "5")),
+    ] {
+        let seen = store.find_spans("iceberg.scan_plan").len();
+        assert_eq!(
+            sparql_window_ids(&fluree, from, filter).await.len(),
+            want,
+            "{filter}"
+        );
+        assert_eq!(counts(seen), pair(selected, pruned), "{filter:?}");
+    }
+}
+
+/// A pinned scan keeps and plans from its own snapshot's list, apart from the
+/// current snapshot's, filtered or not, in either order.
+#[tokio::test]
+async fn a_pinned_filtered_scan_plans_from_its_own_snapshots_list() {
+    let (fluree, staging) = staged_window("pinned-kept").await;
+    // The second commit (ids 1..=1200), read from the final metadata.
+    let latest = std::fs::read_dir(staging.path().join("people_window/metadata"))
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(latest).expect("read metadata")).unwrap();
+    let second = meta["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sequence-number"] == 2)
+        .expect("a second commit")["snapshot-id"]
+        .as_i64()
+        .unwrap();
+    let current = "pinned-kept:main";
+    let pinned = format!("pinned-kept:main@snapshot:{second}");
+    let window = "?id >= 1100 && ?id < 1300";
+
+    for _ in 0..2 {
+        assert_eq!(
+            sparql_window_ids(&fluree, current, window).await,
+            id_range(1100, 1299)
+        );
+        assert_eq!(
+            sparql_window_ids(&fluree, &pinned, window).await,
+            id_range(1100, 1200)
+        );
+        assert_eq!(
+            jsonld_window_ids(&fluree, &pinned, "(>= ?id 1100)").await,
+            id_range(1100, 1200)
+        );
+        assert_eq!(sparql_window_ids(&fluree, &pinned, "").await.len(), 1200);
+        assert_eq!(sparql_window_ids(&fluree, current, "").await.len(), 3000);
+    }
+}
+
+const RENAMED_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#Renamed>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.renamed" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:long ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "full_name" ]
+        ] .
+"#;
+
+/// A private copy of `silver.renamed` behind graph source `alias`, and the id
+/// of its first snapshot (written before the rename).
+async fn staged_renamed(alias: &str) -> (fluree_db_api::Fluree, tempfile::TempDir, i64) {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("renamed");
+    copy_dir_all(&fixtures_dir().join("silver/renamed"), &table_dir);
+    let latest = std::fs::read_dir(table_dir.join("metadata"))
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .max()
+        .expect("a metadata file");
+    let meta: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(latest).expect("read metadata")).unwrap();
+    let first = meta["snapshots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["sequence-number"] == 1)
+        .expect("a first commit")["snapshot-id"]
+        .as_i64()
+        .unwrap();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        alias,
+        format!("file://{}", table_dir.display()),
+        RENAMED_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create renamed graph source");
+    (fluree, staging, first)
+}
+
+/// `(id, name)` pairs (sorted) a SPARQL query over `from` returns.
+async fn sparql_names(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    filter: &str,
+) -> Vec<(i64, String)> {
+    let filter = if filter.is_empty() {
+        String::new()
+    } else {
+        format!("FILTER({filter})")
+    };
+    let sparql = format!(
+        "PREFIX ex: <http://example.org/> SELECT ?id ?name FROM <{from}> \
+         WHERE {{ ?s ex:id ?id ; ex:name ?name {filter} }}"
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    let mut rows: Vec<(i64, String)> = result["results"]["bindings"]
+        .as_array()
+        .unwrap_or_else(|| panic!("bindings for {sparql}: {result}"))
+        .iter()
+        .map(|b| {
+            (
+                b["id"]["value"].as_str().unwrap().parse().unwrap(),
+                b["name"]["value"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// The JSON-LD twin of [`sparql_names`] (a filter is required).
+async fn jsonld_names(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    filter: &str,
+) -> Vec<(i64, String)> {
+    let query = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": from,
+        "select": ["?id", "?name"],
+        "where": [{"@id": "?s", "ex:id": "?id", "ex:name": "?name"}, ["filter", filter]],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let mut rows: Vec<(i64, String)> = result
+        .as_array()
+        .unwrap_or_else(|| panic!("rows for {query}: {result}"))
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_i64().unwrap(),
+                row[1].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+fn people(rows: &[(i64, &str)]) -> Vec<(i64, String)> {
+    rows.iter().map(|(id, n)| (*id, n.to_string())).collect()
+}
+
+/// A read pinned to a snapshot older than a column rename finds the column
+/// under its current name, whichever way the scan is planned: from the
+/// manifests (the first scan, filtered or not) or from the kept file list
+/// (later scans, filtered or not). Each plan's tasks name their columns by
+/// the schema they carry, and the mapping names columns as they are now.
+#[tokio::test]
+async fn a_pinned_read_finds_a_renamed_column_under_its_current_name() {
+    let early = people(&[(1, "alice"), (2, "bob"), (3, "carol")]);
+    let all = people(&[
+        (1, "alice"),
+        (2, "bob"),
+        (3, "carol"),
+        (4, "dave"),
+        (5, "erin"),
+    ]);
+
+    // Unfiltered first: planned from the manifests, then from the kept list.
+    let (fluree, _staging, first) = staged_renamed("renamed-a").await;
+    let pinned = format!("renamed-a:main@snapshot:{first}");
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "").await,
+        early,
+        "pinned, cold"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "").await,
+        early,
+        "pinned, warm"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "?id >= 2").await,
+        early[1..],
+        "pinned, filtered, warm"
+    );
+    assert_eq!(
+        jsonld_names(&fluree, &pinned, "(>= ?id 2)").await,
+        early[1..],
+        "pinned, filtered, warm (JSON-LD)"
+    );
+    assert_eq!(sparql_names(&fluree, "renamed-a:main", "").await, all);
+
+    // Filtered first: the filtered plan is the one read from the manifests.
+    let (fluree, _staging, first) = staged_renamed("renamed-b").await;
+    let pinned = format!("renamed-b:main@snapshot:{first}");
+    assert_eq!(
+        jsonld_names(&fluree, &pinned, "(<= ?id 2)").await,
+        early[..2],
+        "pinned, filtered, cold (JSON-LD)"
+    );
+    assert_eq!(
+        sparql_names(&fluree, &pinned, "?id <= 2").await,
+        early[..2],
+        "pinned, filtered, warm"
+    );
+    assert_eq!(
+        sparql_names(&fluree, "renamed-b:main", "?id > 3").await,
+        all[3..],
+        "current, filtered"
+    );
+}
+
+/// A materialize read whose window ends at a snapshot older than a column
+/// rename keeps the column: the projection is resolved, and the batches are
+/// named, under current names, so a twin built from it carries every row's
+/// value. Covers the incremental read and the streaming read pinned to that
+/// snapshot.
+#[tokio::test]
+async fn a_materialize_read_before_a_rename_keeps_the_renamed_column() {
+    let (fluree, _staging, first) = staged_renamed("renamed-m").await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let projection = vec!["id".to_string(), "full_name".to_string()];
+    let names_of = |batches: &[fluree_db_iceberg::ColumnBatch]| {
+        let mut rows: Vec<(i64, String)> = batches
+            .iter()
+            .flat_map(|b| {
+                let ids = b.column_by_name("id").expect("an id column");
+                let names = b
+                    .column_by_name("full_name")
+                    .unwrap_or_else(|| panic!("a full_name column in {:?}", b.schema));
+                (0..b.num_rows)
+                    .map(|i| {
+                        (
+                            ids.get_i64(i).expect("an id"),
+                            names.get_string(i).expect("a name").to_string(),
+                        )
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        rows.sort();
+        rows
+    };
+    let early = people(&[(1, "alice"), (2, "bob"), (3, "carol")]);
+
+    let batches = provider
+        .scan_table_incremental("renamed-m:main", "silver.renamed", &projection, None, first)
+        .await
+        .expect("incremental read to the first snapshot");
+    assert_eq!(names_of(&batches), early, "incremental");
+
+    let scan = provider
+        .scan_for_materialize_stream(
+            "renamed-m:main",
+            "silver.renamed",
+            &projection,
+            None,
+            Some(first),
+            None,
+        )
+        .await
+        .expect("pinned materialize read");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
+    assert_eq!(names_of(&batches), early, "pinned stream");
+}
+
+/// `people_window` read as five files with disjoint `id` ranges (1..=600,
+/// 601..=1200, …), so a scan-side top-k by `id` can prune files.
+const WINDOW_PEOPLE_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#WindowMapping>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:name ;
+            rr:objectMap [ rr:column "name" ]
+        ] .
+"#;
+
+/// `mapping` with `id` declared the key of `table`'s logical table. A
+/// scan-side top-k counts rows, so it runs only over a map whose rows cannot
+/// repeat a triple; the top-k tests below declare the key their fixtures hold
+/// so the decline they pin is theirs, not the missing key's.
+fn keyed_by_id(mapping: &str, table: &str) -> String {
+    let keyed = mapping.replace(
+        &format!(r#"rr:tableName "{table}" ]"#),
+        &format!(r#"rr:tableName "{table}" ; <https://ns.flur.ee/db#key> ( "id" ) ]"#),
+    );
+    assert_ne!(keyed, mapping, "the key was spliced in");
+    keyed
+}
+
+/// The ids (in answer order) of the first column named `id` in a SPARQL or
+/// JSON-LD result.
+fn answer_ids(result: &serde_json::Value) -> Vec<i64> {
+    let parse = |v: &serde_json::Value| -> i64 {
+        match v {
+            serde_json::Value::Number(n) => n.as_i64().unwrap(),
+            serde_json::Value::String(s) => s.parse().unwrap(),
+            serde_json::Value::Object(o) => match &o["value"] {
+                serde_json::Value::String(s) => s.parse().unwrap(),
+                other => other.as_i64().unwrap(),
+            },
+            other => panic!("not an id: {other}"),
+        }
+    };
+    if let Some(bindings) = result["results"]["bindings"].as_array() {
+        return bindings.iter().map(|b| parse(&b["id"])).collect();
+    }
+    result
+        .as_array()
+        .unwrap_or_else(|| panic!("not a result: {result}"))
+        .iter()
+        .map(|row| parse(&row[0]))
+        .collect()
+}
+
+/// `people_window.id` references `cells.i32`; persons 9 and 10 reference
+/// cells 2 and 5 (each key sits on two cells, and the smaller wins), and most
+/// persons' references dangle.
+const PERSON_CELL_TOPK_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+    @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:id ;
+            rr:objectMap [ rr:column "id" ; rr:datatype xsd:integer ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:cell ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Cell> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "i32" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/cell/{id}" ] .
+"#;
+
+/// A `VALUES` binding the object of a reference: `ORDER BY DESC(?id) LIMIT 3`
+/// answers the persons that reference those cells (ids 10 and 9), not the
+/// table's top three ids, which the join with the `VALUES` then drops.
+#[tokio::test]
+async fn order_by_limit_over_a_scan_its_input_binds_answers_the_bound_rows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mapping = keyed_by_id(PERSON_CELL_TOPK_R2RML, "silver.people_window");
+    let config = R2rmlCreateConfig::new_direct("topk-cell", &root, &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cells = [
+        "http://example.org/cell/2".to_string(),
+        "http://example.org/cell/5".to_string(),
+    ];
+    let mut wrong = Vec::new();
+    let sparql = format!(
+        "SELECT ?id FROM <topk-cell:main> WHERE {{ VALUES ?c {{ {} }} \
+         ?p <http://example.org/cell> ?c ; <http://example.org/id> ?id }} \
+         ORDER BY DESC(?id) LIMIT 3",
+        cells
+            .iter()
+            .map(|c| format!("<{c}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    if answer_ids(&result) != [10, 9] {
+        wrong.push(format!("SPARQL: {result}"));
+    }
+    let ids: Vec<serde_json::Value> = cells
+        .iter()
+        .map(|c| serde_json::json!({"@id": c}))
+        .collect();
+    let jsonld = serde_json::json!({
+        "from": "topk-cell:main",
+        "select": ["?id"],
+        "where": [
+            ["values", ["?c", ids]],
+            {"@id": "?p", "http://example.org/cell": "?c", "http://example.org/id": "?id"}
+        ],
+        "orderBy": "(desc ?id)",
+        "limit": 3,
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("JSON-LD: {e}"));
+    if answer_ids(&result) != [10, 9] {
+        wrong.push(format!("JSON-LD: {result}"));
+    }
+    assert!(
+        wrong.is_empty(),
+        "expected ids [10, 9]:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// A scan-side top-k counts the rows it reads, so it runs only over a map
+/// whose rows cannot repeat a triple. `people_window` declares no key: the
+/// top-k is declined and every file is read, to the same answer the keyed
+/// map gives after reading only the file holding the top ids.
+#[tokio::test]
+async fn a_top_k_over_a_keyless_map_reads_every_file() {
+    allow_fixture_roots();
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let keyed = keyed_by_id(WINDOW_PEOPLE_R2RML, "silver.people_window");
+    for (name, mapping) in [
+        ("topk-keyless", WINDOW_PEOPLE_R2RML),
+        ("topk-keyed", keyed.as_str()),
+    ] {
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct(name, &location, mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+    }
+    for (name, prunes) in [("topk-keyless", false), ("topk-keyed", true)] {
+        let before = store.find_events("scan-side top-k prune").len();
+        let sparql = format!(
+            "SELECT ?id FROM <{name}:main> WHERE {{ ?s <http://example.org/id> ?id }} \
+             ORDER BY DESC(?id) LIMIT 2"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+        assert_eq!(answer_ids(&result), [3000, 2999], "{name}: {result}");
+        let jsonld = serde_json::json!({
+            "from": format!("{name}:main"),
+            "select": ["?id"],
+            "where": {"@id": "?s", "http://example.org/id": "?id"},
+            "orderBy": "(desc ?id)",
+            "limit": 2,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {name}: {e}"));
+        assert_eq!(
+            answer_ids(&result),
+            [3000, 2999],
+            "JSON-LD {name}: {result}"
+        );
+        let pruned = store.find_events("scan-side top-k prune")[before..]
+            .iter()
+            .any(|e| e.fields.get("files_pruned").is_some_and(|n| n != "0"));
+        assert_eq!(pruned, prunes, "{name}: whether the top-k pruned files");
+    }
+}
+
+/// `ORDER BY … LIMIT k` over a scan whose rows are joined to its input (a
+/// `VALUES` block, here) answers the top k of the JOINED rows. The scan-side
+/// top-k keeps the k best rows the reader returns and skips every file that
+/// cannot beat them, which is sound only when the reader returns no row the
+/// operator later drops. The join with the `VALUES` drops rows, and a pushed
+/// `IN` may be applied only partly by the reader: fed those rows, the heap
+/// fills with ids 2401..=3000 from the last file, stops before the first, and
+/// loses id 5.
+#[tokio::test]
+async fn order_by_limit_over_a_joined_scan_answers_the_joined_top_k() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let mapping = keyed_by_id(WINDOW_PEOPLE_R2RML, "silver.people_window");
+    let config = R2rmlCreateConfig::new_direct("topk-window", &location, &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cases = [
+        // A single-var VALUES also pushes an `IN` on the id column.
+        (
+            "VALUES ?id { 5 2500 }",
+            serde_json::json!(["values", ["?id", [5, 2500]]]),
+        ),
+        // A two-var VALUES pushes nothing; the join alone drops rows.
+        (
+            "VALUES (?s ?id) { (<http://example.org/person/5> 5) (<http://example.org/person/2500> 2500) }",
+            serde_json::json!(["values", [["?s", "?id"], [
+                [{"@id": "http://example.org/person/5"}, 5],
+                [{"@id": "http://example.org/person/2500"}, 2500]
+            ]]]),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (values, jsonld_values) in cases {
+        let sparql = format!(
+            "SELECT ?id FROM <topk-window:main> \
+             WHERE {{ {values} ?s <http://example.org/id> ?id }} \
+             ORDER BY DESC(?id) LIMIT 2"
+        );
+        let result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+        if answer_ids(&result) != [2500, 5] {
+            wrong.push(format!("SPARQL {values}: {result}"));
+        }
+
+        let jsonld = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "topk-window:main",
+            "select": ["?id"],
+            "where": [jsonld_values, {"@id": "?s", "ex:id": "?id"}],
+            "orderBy": "(desc ?id)",
+            "limit": 2,
+        });
+        let result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {values}: {e}"));
+        if answer_ids(&result) != [2500, 5] {
+            wrong.push(format!("JSON-LD {values}: {result}"));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "expected ids [2500, 5]:\n{}",
+        wrong.join("\n")
+    );
+}
+
+/// The rows of a SPARQL (bindings) or JSON-LD (array of rows) result, each as
+/// the text of its `vars` (an IRI, or a literal's lexical form), sorted.
+fn answer_rows(result: &serde_json::Value, vars: &[&str]) -> Vec<Vec<String>> {
+    let text = |v: &serde_json::Value| -> String {
+        match v {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Object(o) => o
+                .get("value")
+                .or_else(|| o.get("@id"))
+                .or_else(|| o.get("@value"))
+                .map(|v| v.as_str().map_or_else(|| v.to_string(), str::to_string))
+                .unwrap_or_else(|| panic!("not a term: {v}")),
+            other => panic!("not a term: {other}"),
+        }
+    };
+    let mut rows: Vec<Vec<String>> =
+        if let Some(bindings) = result["results"]["bindings"].as_array() {
+            bindings
+                .iter()
+                .map(|b| vars.iter().map(|v| text(&b[*v])).collect())
+                .collect()
+        } else {
+            result
+                .as_array()
+                .unwrap_or_else(|| panic!("not a result: {result}"))
+                .iter()
+                .map(|row| match row {
+                    serde_json::Value::Array(cells) => cells.iter().map(text).collect(),
+                    cell => vec![text(cell)],
+                })
+                .collect()
+        };
+    rows.sort();
+    rows
+}
+
+fn person(id: u32) -> String {
+    format!("http://example.org/person/{id}")
+}
+
+/// A `VALUES` block of subjects narrows the scan to their template keys (on
+/// five files with disjoint `id` ranges, the two subjects' files). Subjects the
+/// template cannot produce, or that no row holds, contribute nothing.
+#[tokio::test]
+async fn a_values_subject_set_answers_its_subjects() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("keys-window", &location, WINDOW_PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let subjects = [
+        person(5),
+        person(2500),
+        person(99_999),
+        "http://other.example/person/7".to_string(),
+    ];
+    let expected = vec![
+        vec![person(2500), "person-2500".to_string()],
+        vec![person(5), "person-0005".to_string()],
+    ];
+    let sparql = format!(
+        "SELECT ?s ?n FROM <keys-window:main> WHERE {{ VALUES ?s {{ {} }} \
+         ?s <http://example.org/name> ?n }}",
+        subjects
+            .iter()
+            .map(|s| format!("<{s}>"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    let result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+    assert_eq!(
+        answer_rows(&result, &["s", "n"]),
+        expected,
+        "SPARQL: {result}"
+    );
+
+    let ids: Vec<serde_json::Value> = subjects
+        .iter()
+        .map(|s| serde_json::json!({"@id": s}))
+        .collect();
+    let jsonld = serde_json::json!({
+        "from": "keys-window:main",
+        "select": ["?s", "?n"],
+        "where": [
+            ["values", ["?s", ids]],
+            {"@id": "?s", "http://example.org/name": "?n"}
+        ],
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("JSON-LD: {e}"));
+    assert_eq!(
+        answer_rows(&result, &["s", "n"]),
+        expected,
+        "JSON-LD: {result}"
+    );
+}
+
+/// `people_window.id` references `cells.i32`, whose values 9 and 10 each sit
+/// on two rows (cells 2 and 4, cells 5 and 7) and whose 2 and 100 sit on one;
+/// every other person's reference dangles. The join reaches both cells of a
+/// duplicated key and drops a dangling reference, whether the parent is read
+/// whole (no LIMIT: the first window holds 3,000 keys) or by the keys of a
+/// `LIMIT`'s first rows or a `VALUES` block's subjects.
+const PERSON_CELL_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:cell ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Cell> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "i32" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/cell/{id}" ] .
+"#;
+
+#[tokio::test]
+async fn a_referencing_map_keeps_its_answers_when_the_parent_is_read_by_key() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("person-cell", &root, PERSON_CELL_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cell = |id: u32| format!("http://example.org/cell/{id}");
+    let all = vec![
+        vec![person(10), cell(5)],
+        vec![person(10), cell(7)],
+        vec![person(100), cell(6)],
+        vec![person(2), cell(1)],
+        vec![person(9), cell(2)],
+        vec![person(9), cell(4)],
+    ];
+    let values = [person(9), person(10), person(11)];
+    let values_answer = vec![
+        vec![person(10), cell(5)],
+        vec![person(10), cell(7)],
+        vec![person(9), cell(2)],
+        vec![person(9), cell(4)],
+    ];
+
+    let mut wrong = Vec::new();
+    for (label, sparql_where, jsonld_values, limit) in [
+        ("all", String::new(), None, None),
+        ("LIMIT 2", String::new(), None, Some(2)),
+        (
+            "VALUES",
+            format!(
+                "VALUES ?p {{ {} }}",
+                values
+                    .iter()
+                    .map(|s| format!("<{s}>"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            ),
+            Some(
+                values
+                    .iter()
+                    .map(|s| serde_json::json!({"@id": s}))
+                    .collect::<Vec<_>>(),
+            ),
+            None,
+        ),
+    ] {
+        let sparql = format!(
+            "SELECT ?p ?c FROM <person-cell:main> WHERE {{ {sparql_where} \
+             ?p <http://example.org/cell> ?c }}{}",
+            limit.map_or(String::new(), |k| format!(" LIMIT {k}"))
+        );
+        let sparql_result = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+
+        let mut where_clause = Vec::new();
+        if let Some(ids) = jsonld_values {
+            where_clause.push(serde_json::json!(["values", ["?p", ids]]));
+        }
+        where_clause.push(serde_json::json!({"@id": "?p", "http://example.org/cell": "?c"}));
+        let mut jsonld = serde_json::json!({
+            "from": "person-cell:main",
+            "select": ["?p", "?c"],
+            "where": where_clause,
+        });
+        if let Some(k) = limit {
+            jsonld["limit"] = serde_json::json!(k);
+        }
+        let jsonld_result = fluree
+            .query_from()
+            .jsonld(&jsonld)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD {label}: {e}"));
+
+        for (surface, result) in [("SPARQL", &sparql_result), ("JSON-LD", &jsonld_result)] {
+            let rows = answer_rows(result, &["p", "c"]);
+            let ok = match label {
+                "all" => rows == all,
+                "LIMIT 2" => rows.len() == 2 && rows.iter().all(|r| all.contains(r)),
+                _ => rows == values_answer,
+            };
+            if !ok {
+                wrong.push(format!("{surface} {label}: {rows:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}
+
+/// Each `people_window` row references its own twin through a referencing
+/// object map over the same table.
+const WINDOW_TWIN_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:twin ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Twin> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Twin>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/twin/{id}" ] .
+"#;
+
+/// A parent read by key decides whether to probe from the keyed read's file
+/// counts, planned from the snapshot's kept file list like any scan: once the
+/// list is kept, the data manifests can go and a `LIMIT` (probing its first
+/// rows' keys) and a `VALUES` (pushing its subjects, then probing) still answer.
+/// A file-count plan that re-read the manifests would fail here.
+#[tokio::test]
+async fn a_parent_probe_plans_its_file_counts_from_the_kept_list() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_window");
+    copy_dir_all(&fixtures_dir().join("silver/people_window"), &table_dir);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct(
+        "window-twin",
+        format!("file://{}", table_dir.display()),
+        WINDOW_TWIN_R2RML,
+    )
+    .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create window graph source");
+
+    let twin = |id: u32| format!("http://example.org/twin/{id}");
+    let values = format!("VALUES ?p {{ <{}> <{}> }}", person(5), person(2500));
+    let ask = |body: String, limit: &'static str| {
+        let fluree = &fluree;
+        async move {
+            let sparql = format!(
+                "SELECT ?p ?q FROM <window-twin:main> WHERE {{ {body} \
+                 ?p <http://example.org/twin> ?q }}{limit}"
+            );
+            let result = fluree
+                .query_from()
+                .sparql(&sparql)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+            answer_rows(&result, &["p", "q"])
+        }
+    };
+    let ask_jsonld = || {
+        let fluree = &fluree;
+        async move {
+            let jsonld = serde_json::json!({
+                "from": "window-twin:main",
+                "select": ["?p", "?q"],
+                "where": [
+                    ["values", ["?p", [{"@id": person(5)}, {"@id": person(2500)}]]],
+                    {"@id": "?p", "http://example.org/twin": "?q"}
+                ],
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&jsonld)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("JSON-LD: {e}"));
+            answer_rows(&result, &["p", "q"])
+        }
+    };
+    let bound = vec![vec![person(2500), twin(2500)], vec![person(5), twin(5)]];
+    let twins = |rows: &[Vec<String>]| {
+        rows.len() == 2
+            && rows
+                .iter()
+                .all(|r| r[1] == r[0].replace("/person/", "/twin/"))
+    };
+
+    // The first queries read the manifests and keep the file list.
+    assert_eq!(ask(values.clone(), "").await, bound);
+    assert!(twins(&ask(String::new(), " LIMIT 2").await));
+    assert_eq!(
+        delete_data_manifests(&staging),
+        5,
+        "one manifest per append"
+    );
+
+    // Every plan now comes from the kept list, the probes' file counts too.
+    assert_eq!(ask(values, "").await, bound, "SPARQL VALUES");
+    assert_eq!(ask_jsonld().await, bound, "JSON-LD VALUES");
+    let limited = ask(String::new(), " LIMIT 2").await;
+    assert!(twins(&limited), "SPARQL LIMIT 2: {limited:?}");
+}
+
+// ---------------------------------------------------------------------------
+// Table keys over the `sets` fixtures: what an Iceberg source reports, and a
+// declared `f:key` checked against the pinned snapshot's schema.
+// ---------------------------------------------------------------------------
+
+/// `sets.customers_current` (customer_id an Iceberg identifier field) and
+/// `sets.customers_history` (no identifier field) minting the same subjects;
+/// `history_table_extra` follows the history table's name on its logical
+/// table (an `f:key`, or nothing).
+fn sets_customers_r2rml(history_table_extra: &str) -> String {
+    format!(
+        r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix ex: <http://example.org/> .
+
+        <http://example.org/mapping#Current>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_current" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/customer/{{customer_id}}" ;
+                rr:class ex:Customer
+            ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+
+        <http://example.org/mapping#History>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sets.customers_history" {history_table_extra} ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/customer/{{customer_id}}" ;
+                rr:class ex:Customer
+            ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+    "#
+    )
+}
+
+/// A graph source `alias` over the committed `sets` tables (a warehouse root:
+/// each table name resolves to its directory), mapped by `mapping`.
+async fn sets_source(alias: &str, mapping: &str) -> fluree_db_api::Fluree {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/sets",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config =
+        R2rmlCreateConfig::new_direct(alias, &root, mapping).with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create sets graph source");
+    fluree
+}
+
+#[tokio::test]
+async fn an_iceberg_identifier_field_is_a_table_key() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider, R2rmlTableProvider};
+    let fluree = sets_source("sets-keys", &sets_customers_r2rml("")).await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let gs = "sets-keys:main";
+
+    assert_eq!(
+        provider
+            .table_keys(gs, "sets.customers_current", None)
+            .await
+            .expect("keys of customers_current"),
+        Some(vec![vec!["customer_id".to_string()]])
+    );
+    assert_eq!(
+        provider
+            .table_keys(gs, "sets.customers_history", None)
+            .await
+            .expect("keys of customers_history"),
+        None
+    );
+
+    // Through the one way a lane obtains keys: the current table's subjects
+    // are unique, the history table's are not.
+    let mapping = provider.compiled_mapping(gs, None).await.expect("mapping");
+    for (table, unique) in [
+        ("sets.customers_current", true),
+        ("sets.customers_history", false),
+    ] {
+        let keys = effective_table_keys(&provider, &mapping, gs, table, None)
+            .await
+            .expect("effective keys");
+        let tm = mapping.find_maps_for_table(table)[0];
+        assert_eq!(tm.subject_unique_under(&keys), unique, "{table}: {keys:?}");
+    }
+}
+
+#[tokio::test]
+async fn a_declared_key_unites_with_what_the_table_reports() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider};
+    // The history table's natural key carries the version column, so it does
+    // not make the per-customer subject unique.
+    let fluree = sets_source(
+        "sets-declared",
+        &sets_customers_r2rml(r#"; f:key ( "customer_id" "valid_from" )"#),
+    )
+    .await;
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let gs = "sets-declared:main";
+    let mapping = provider.compiled_mapping(gs, None).await.expect("mapping");
+    let keys = effective_table_keys(&provider, &mapping, gs, "sets.customers_history", None)
+        .await
+        .expect("a usable declared key");
+    assert_eq!(
+        keys,
+        fluree_db_r2rml::TableKeys::new([["customer_id", "valid_from"]])
+    );
+    let history = mapping.find_maps_for_table("sets.customers_history")[0];
+    assert!(!history.subject_unique_under(&keys));
+}
+
+#[tokio::test]
+async fn a_declared_key_the_table_cannot_hold_is_refused() {
+    use fluree_db_query::r2rml::{effective_table_keys, R2rmlProvider, R2rmlTableProvider};
+    // A column the snapshot lacks (a misspelling, or other casing).
+    for (key, says) in [
+        (
+            r#"( "customer_idx" )"#,
+            r#"column "customer_idx", which the table does not have"#,
+        ),
+        (
+            r#"( "Customer_ID" )"#,
+            r#"column "Customer_ID", which the table does not have"#,
+        ),
+    ] {
+        let alias = format!("sets-bad-{}", key.len());
+        let fluree = sets_source(&alias, &sets_customers_r2rml(&format!("; f:key {key}"))).await;
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        let gs = format!("{alias}:main");
+        let err = provider
+            .table_keys(&gs, "sets.customers_history", None)
+            .await
+            .expect_err("a key the table cannot hold refuses");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(says) && msg.contains("sets.customers_history"),
+            "{key}: {msg}"
+        );
+        // The choke point every lane goes through refuses too, rather than
+        // falling back to the declaration.
+        let mapping = provider.compiled_mapping(&gs, None).await.expect("mapping");
+        assert!(
+            effective_table_keys(&provider, &mapping, &gs, "sets.customers_history", None)
+                .await
+                .is_err()
+        );
+        // A table that declares nothing is unaffected.
+        assert!(provider
+            .table_keys(&gs, "sets.customers_current", None)
+            .await
+            .is_ok());
+    }
+
+    // A floating-point column, on silver.people's `score`.
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = PEOPLE_R2RML.replace(
+        r#"rr:logicalTable [ rr:tableName "silver.people" ]"#,
+        r#"rr:logicalTable [ rr:tableName "silver.people" ; <https://ns.flur.ee/db#key> ( "score" ) ]"#,
+    );
+    assert_ne!(mapping, PEOPLE_R2RML, "the key was spliced in");
+    let config = R2rmlCreateConfig::new_direct("people-float-key", table_location(), &mapping)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("registration compiles the mapping; the schema is checked at query time");
+    let provider = FlureeR2rmlProvider::new(&fluree);
+    let msg = provider
+        .table_keys("people-float-key:main", "silver.people", None)
+        .await
+        .expect_err("a floating-point key refuses")
+        .to_string();
+    assert!(
+        msg.contains(r#"column "score" of type Float64"#) && msg.contains("floating-point"),
+        "{msg}"
+    );
+}
+
+/// A graph source's answer streams out of the GRAPH scope that reads it, one
+/// batch at a time, rather than being held whole and handed on as one batch:
+/// the 3,000 rows of `people_window` arrive in batches no larger than the
+/// batch size, through a FROM, on SPARQL and JSON-LD.
+#[tokio::test]
+async fn a_graph_sources_answer_streams_in_batches() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let location = format!(
+        "file://{}/tests/fixtures/iceberg/silver/people_window",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("streamed-people", &location, WINDOW_PEOPLE_R2RML)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let sizes = |result: &fluree_db_api::QueryResult| -> Vec<usize> {
+        result
+            .batches
+            .iter()
+            .map(fluree_db_api::Batch::len)
+            .collect()
+    };
+    let check = |label: &str, sizes: Vec<usize>| {
+        assert_eq!(sizes.iter().sum::<usize>(), 3000, "{label}: {sizes:?}");
+        assert!(
+            sizes.len() > 1 && sizes.iter().all(|&n| n <= 1000),
+            "{label}: the answer came in batches of {sizes:?}"
+        );
+    };
+
+    let sparql = "PREFIX ex: <http://example.org/> SELECT ?s ?n \
+                  FROM <streamed-people:main> WHERE { ?s ex:name ?n }";
+    let result = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute()
+        .await
+        .expect("FROM");
+    check("SPARQL FROM", sizes(&result));
+    let jsonld = serde_json::json!({
+        "from": "streamed-people:main",
+        "select": ["?s", "?n"],
+        "where": {"@id": "?s", "http://example.org/name": "?n"},
+    });
+    let result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute()
+        .await
+        .expect("JSON-LD FROM");
+    check("JSON-LD FROM", sizes(&result));
+}
+
+/// `silver.cells` references `silver.people_window` by its `id` twice, through
+/// two columns of its own: `ex:self` by `id` (cell k is person k) and
+/// `ex:near` by `i32` (cells 1 to 7 hold 2, 9, -3, 9, 10, 100, 10; no person
+/// is -3, and cell 8's is null).
+const CELL_TWO_REFS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/cell/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:self ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:near ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "i32" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] .
+"#;
+
+/// Insert `triples` (subject, predicate, object IRIs) into a new memory
+/// ledger `alias`: the native answer a graph source's query is checked against.
+async fn native_oracle(fluree: &fluree_db_api::Fluree, alias: &str, triples: &[[String; 3]]) {
+    let ledger = fluree.create_ledger(alias).await.expect("oracle ledger");
+    let graph: Vec<serde_json::Value> = triples
+        .iter()
+        .map(|[s, p, o]| serde_json::json!({"@id": s, p.as_str(): {"@id": o}}))
+        .collect();
+    fluree
+        .insert(ledger, &serde_json::json!({"@graph": graph}))
+        .await
+        .expect("oracle insert");
+}
+
+/// `pattern`'s answers over `from` on both surfaces: `vars` (in order) of the
+/// SPARQL `SELECT … WHERE { values triples } LIMIT`, and of its JSON-LD twin.
+/// `values` binds `?{var}` to IRIs; `triples` share the subject `?{subject}`.
+#[allow(clippy::too_many_arguments)]
+async fn sparql_and_jsonld_rows(
+    fluree: &fluree_db_api::Fluree,
+    from: &str,
+    values: Option<(&str, &[String])>,
+    subject: &str,
+    triples: &[(&str, &str)],
+    limit: Option<usize>,
+    vars: &[&str],
+) -> [Vec<Vec<String>>; 2] {
+    let select: Vec<String> = vars.iter().map(|v| format!("?{v}")).collect();
+    let values_clause = values.map_or(String::new(), |(var, iris)| {
+        let iris: Vec<String> = iris.iter().map(|iri| format!("<{iri}>")).collect();
+        format!("VALUES ?{var} {{ {} }} ", iris.join(" "))
+    });
+    let pattern: Vec<String> = triples.iter().map(|(p, o)| format!("<{p}> ?{o}")).collect();
+    let sparql = format!(
+        "SELECT {} FROM <{from}> WHERE {{ {values_clause}?{subject} {} }}{}",
+        select.join(" "),
+        pattern.join(" ; "),
+        limit.map_or(String::new(), |k| format!(" LIMIT {k}"))
+    );
+    let sparql_result = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("SPARQL over {from}: {e}"));
+
+    let mut where_clause = Vec::new();
+    if let Some((var, iris)) = values {
+        let ids: Vec<serde_json::Value> = iris
+            .iter()
+            .map(|iri| serde_json::json!({"@id": iri}))
+            .collect();
+        where_clause.push(serde_json::json!(["values", [format!("?{var}"), ids]]));
+    }
+    let mut node = serde_json::Map::new();
+    node.insert("@id".into(), serde_json::json!(format!("?{subject}")));
+    for (p, o) in triples {
+        node.insert((*p).to_string(), serde_json::json!(format!("?{o}")));
+    }
+    where_clause.push(serde_json::Value::Object(node));
+    let mut jsonld = serde_json::json!({
+        "from": from,
+        "select": select,
+        "where": where_clause,
+    });
+    if let Some(k) = limit {
+        jsonld["limit"] = serde_json::json!(k);
+    }
+    let jsonld_result = fluree
+        .query_from()
+        .jsonld(&jsonld)
+        .execute_formatted()
+        .await
+        .unwrap_or_else(|e| panic!("JSON-LD over {from}: {e}"));
+    [
+        answer_rows(&sparql_result, vars),
+        answer_rows(&jsonld_result, vars),
+    ]
+}
+
+/// Two referencing object maps of one map read one parent by the same parent
+/// column through different columns of their own. A parent read by key serves
+/// both: a star holding both answers every cell whose two references resolve,
+/// on both surfaces, as the same triples in a ledger do.
+#[tokio::test]
+async fn two_references_to_one_parent_by_different_columns_both_resolve() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("cell-refs", &root, CELL_TWO_REFS_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let cell = |id: u32| format!("http://example.org/cell/{id}");
+    let (self_p, near_p) = ("http://example.org/self", "http://example.org/near");
+    // cell id -> `i32`, for the cells whose `ex:near` resolves.
+    let near = [(1, 2), (2, 9), (4, 9), (5, 10), (6, 100), (7, 10)];
+    let mut triples: Vec<[String; 3]> = (1..=8)
+        .map(|id| [cell(id), self_p.to_string(), person(id)])
+        .collect();
+    triples.extend(
+        near.iter()
+            .map(|&(id, to)| [cell(id), near_p.to_string(), person(to)]),
+    );
+    native_oracle(&fluree, "cell-refs-oracle:main", &triples).await;
+    let mut star: Vec<Vec<String>> = near
+        .iter()
+        .map(|&(id, to)| vec![cell(id), person(id), person(to)])
+        .collect();
+    star.sort();
+
+    let star_pattern = [(self_p, "s"), (near_p, "n")];
+    let mut wrong = Vec::new();
+    for from in ["cell-refs:main", "cell-refs-oracle:main"] {
+        for limit in [None, Some(3)] {
+            let answers = sparql_and_jsonld_rows(
+                &fluree,
+                from,
+                None,
+                "c",
+                &star_pattern,
+                limit,
+                &["c", "s", "n"],
+            )
+            .await;
+            for (surface, rows) in ["SPARQL", "JSON-LD"].iter().zip(answers) {
+                let ok = match limit {
+                    None => rows == star,
+                    Some(k) => rows.len() == k && rows.iter().all(|r| star.contains(r)),
+                };
+                if !ok {
+                    wrong.push(format!("{from} {surface} LIMIT {limit:?}: {rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}
+
+/// `silver.cells` (by `i32`) and `silver.literals` (by `id`) both reference
+/// `silver.people_window` by its `id` through `ex:ref`, with one subject
+/// template, so a row id names a subject of both maps.
+const TWO_MAPS_ONE_PARENT_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Cell>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.cells" ] ;
+        rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:ref ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "i32" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Literal>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.literals" ] ;
+        rr:subjectMap [ rr:template "http://example.org/row/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:ref ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Person> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] .
+"#;
+
+/// Two maps reference one parent by the same parent column, each through a
+/// column of its own table, and the scan's input arrives in more than one
+/// window: under a `LIMIT` the input is pulled 1024 rows at a time, and here
+/// the first 1024 `VALUES` subjects name no row. The parent's keys resolved in
+/// one window are kept for the next, for both maps, so the second window
+/// answers every row of both tables, on both surfaces, as a ledger does.
+#[tokio::test]
+async fn two_maps_to_one_parent_resolve_their_own_keys_across_input_windows() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let root = format!(
+        "file://{}/tests/fixtures/iceberg/silver",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let config = R2rmlCreateConfig::new_direct("two-maps", &root, TWO_MAPS_ONE_PARENT_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+
+    let row = |id: u32| format!("http://example.org/row/{id}");
+    let ref_p = "http://example.org/ref";
+    // `cells`: row id -> `i32`, where it resolves; `literals`: row k -> person k.
+    let cells = [(1, 2), (2, 9), (4, 9), (5, 10), (6, 100), (7, 10)];
+    let literals = (1..=5).map(|id| (id, id));
+    let pairs: Vec<(u32, u32)> = cells.into_iter().chain(literals).collect();
+    let triples: Vec<[String; 3]> = pairs
+        .iter()
+        .map(|&(id, to)| [row(id), ref_p.to_string(), person(to)])
+        .collect();
+    native_oracle(&fluree, "two-maps-oracle:main", &triples).await;
+    let mut want: Vec<Vec<String>> = pairs
+        .iter()
+        .map(|&(id, to)| vec![row(id), person(to)])
+        .collect();
+    want.sort();
+
+    // 1024 subjects no table holds, then rows 1 to 8.
+    let subjects: Vec<String> = (100_001..=101_024).chain(1..=8).map(row).collect();
+    let mut wrong = Vec::new();
+    for from in ["two-maps:main", "two-maps-oracle:main"] {
+        for limit in [Some(100), None] {
+            let answers = sparql_and_jsonld_rows(
+                &fluree,
+                from,
+                Some(("r", &subjects)),
+                "r",
+                &[(ref_p, "p")],
+                limit,
+                &["r", "p"],
+            )
+            .await;
+            for (surface, rows) in ["SPARQL", "JSON-LD"].iter().zip(answers) {
+                if rows != want {
+                    wrong.push(format!("{from} {surface} LIMIT {limit:?}: {rows:?}"));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong answers:\n{}", wrong.join("\n"));
+}
+
+/// An unsliced answer holds every person exactly once. Its order is open (the
+/// scan streams files as their reads finish), so nothing is asserted about it;
+/// that the unsliced lane streams in completion order is pinned by the routing
+/// test in `it_graph_source_r2rml` and the reader's unit tests.
+fn assert_every_person_once(rows: &[i64], surface: &str) {
+    let mut sorted = rows.to_vec();
+    sorted.sort_unstable();
+    assert_eq!(
+        sorted,
+        (1..=3000).collect::<Vec<i64>>(),
+        "{surface}: unsliced, every person once"
+    );
+}
+
+/// The person number at the end of a subject IRI, compacted or not
+/// (`…/person/17` and `ex:person/17` both give 17).
+fn person_number(iri: &str) -> i64 {
+    iri.rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("not a person IRI: {iri}"))
+}
+
+/// The persons of `people_paged` (or a table written the same way: five
+/// 600-row commits, one data file each, ids ascending in commit order) in the
+/// order a sliced scan emits them: the commits taken by data-file size, ties
+/// in commit order, each commit's persons in order. Read from the table's own
+/// files, and checked to differ from commit order.
+fn paged_scan_order(table_dir: &std::path::Path) -> Vec<i64> {
+    // Each commit's data file, in commit order: the snapshot with sequence
+    // number n names its manifest list `snap-<id>-<n>-<uuid>.avro`, and
+    // pyiceberg names that commit's data file `<…>-<uuid>.parquet`.
+    let metadata_dir = table_dir.join("metadata");
+    let mut metadata_files: Vec<std::path::PathBuf> = std::fs::read_dir(&metadata_dir)
+        .expect("metadata dir")
+        .map(|e| e.expect("entry").path())
+        .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+        .collect();
+    metadata_files.sort();
+    let final_meta: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(metadata_files.last().expect("metadata files")).expect("read metadata"),
+    )
+    .expect("parse metadata");
+    let mut snapshots: Vec<&serde_json::Value> = final_meta["snapshots"]
+        .as_array()
+        .expect("snapshots")
+        .iter()
+        .collect();
+    snapshots.sort_by_key(|s| s["sequence-number"].as_i64().expect("sequence"));
+    let data_files: Vec<std::path::PathBuf> = std::fs::read_dir(table_dir.join("data"))
+        .expect("data dir")
+        .map(|e| e.expect("entry").path())
+        .collect();
+    let commit_files: Vec<(String, u64)> = snapshots
+        .iter()
+        .map(|snapshot| {
+            let manifest_list = snapshot["manifest-list"].as_str().expect("manifest list");
+            let uuid = manifest_list
+                .trim_end_matches(".avro")
+                .rsplit('-')
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("-");
+            let file = data_files
+                .iter()
+                .find(|p| p.to_string_lossy().ends_with(&format!("{uuid}.parquet")))
+                .unwrap_or_else(|| panic!("no data file for {uuid}"));
+            let name = file
+                .file_name()
+                .expect("a name")
+                .to_string_lossy()
+                .to_string();
+            (name, std::fs::metadata(file).expect("file size").len())
+        })
+        .collect();
+    assert_eq!(commit_files.len(), 5, "five commits: {commit_files:?}");
+    // The query's emit order: commits by data-file size, ties in commit order
+    // (a stable sort over commit order).
+    let mut by_size: Vec<usize> = (0..commit_files.len()).collect();
+    by_size.sort_by_key(|&c| commit_files[c].1);
+    assert_ne!(
+        by_size,
+        (0..commit_files.len()).collect::<Vec<_>>(),
+        "the fixture's sizes must not already be in commit order, or size order and commit \
+         order are indistinguishable: {commit_files:?}"
+    );
+    by_size
+        .iter()
+        .flat_map(|&c| {
+            let lo = i64::try_from(c).expect("commit") * 600 + 1;
+            lo..lo + 600
+        })
+        .collect()
+}
+
+/// A client paging an unordered graph-source query with LIMIT/OFFSET (no ORDER
+/// BY) sees the pages partition the answer: one execution after another, a
+/// sliced query emits the table's files smallest first (ties in commit order),
+/// whatever order the file reads finish in.
+///
+/// `people_paged` is five 600-row commits, one data file each, ids ascending
+/// in commit order, so the deterministic order is each commit's persons in
+/// order, the commits taken by data-file size (read here from the table's own
+/// files, and checked to differ from commit order).
+///
+/// A query with no slice cannot observe its order, so it may stream files as
+/// their reads finish: it is checked for its rows only. A crawl pages subjects
+/// itself (an OFFSET with no LIMIT reaches its flat query as no slice), so it
+/// asks for the deterministic order explicitly. So do the two other prefixes
+/// of an answer: a JSON-LD `selectOne` (the first row, taken when the result
+/// is formatted) and a byte-budgeted AgentJson response (a page its client
+/// continues with OFFSET). The materialize read keeps commit order, persons
+/// 1..=3000.
+#[tokio::test]
+async fn unordered_pages_partition_a_multi_file_answer() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+
+    let everyone = paged_scan_order(&table_dir);
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
+    let location = format!("file://{}", table_dir.display());
+    fluree
+        .create_r2rml_graph_source(
+            R2rmlCreateConfig::new_direct("paged", &location, &mapping)
+                .with_mapping_media_type("text/turtle"),
+        )
+        .await
+        .expect("create graph source");
+    let fluree = &fluree;
+    const PAGE: usize = 500;
+
+    // SPARQL.
+    let sparql = |page: Option<usize>| async move {
+        let paging = page.map_or(String::new(), |k| {
+            format!(" LIMIT {PAGE} OFFSET {}", k * PAGE)
+        });
+        let rows = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?s FROM <paged:main> WHERE {{ ?s <http://example.org/name> ?n }}{paging}"
+            ))
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("SPARQL page {page:?}: {e}"));
+        rows["results"]["bindings"]
+            .as_array()
+            .unwrap_or_else(|| panic!("bindings: {rows}"))
+            .iter()
+            .map(|b| person_number(b["s"]["value"].as_str().expect("an IRI")))
+            .collect::<Vec<i64>>()
+    };
+    let pages = || async {
+        let mut paged = Vec::new();
+        for k in 0..everyone.len().div_ceil(PAGE) {
+            paged.extend(sparql(Some(k)).await);
+        }
+        paged
+    };
+    assert_eq!(
+        pages().await,
+        everyone,
+        "SPARQL: the pages partition the answer"
+    );
+    assert_eq!(pages().await, everyone, "SPARQL: a second run agrees");
+    assert_every_person_once(&sparql(None).await, "SPARQL");
+
+    // JSON-LD.
+    let jsonld = |page: Option<usize>| async move {
+        let mut query = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "paged:main",
+            "select": ["?s"],
+            "where": {"@id": "?s", "ex:name": "?n"},
+        });
+        if let Some(k) = page {
+            query["limit"] = serde_json::json!(PAGE);
+            query["offset"] = serde_json::json!(k * PAGE);
+        }
+        let rows = fluree
+            .query_from()
+            .jsonld(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("JSON-LD page {page:?}: {e}"));
+        rows.as_array()
+            .unwrap_or_else(|| panic!("rows: {rows}"))
+            .iter()
+            .map(|row| {
+                let s = row.as_array().map_or(row, |r| &r[0]);
+                person_number(s.as_str().expect("an IRI"))
+            })
+            .collect::<Vec<i64>>()
+    };
+    let mut paged = Vec::new();
+    for k in 0..everyone.len().div_ceil(PAGE) {
+        paged.extend(jsonld(Some(k)).await);
+    }
+    assert_eq!(paged, everyone, "JSON-LD: the pages partition the answer");
+    assert_every_person_once(&jsonld(None).await, "JSON-LD");
+
+    // A crawl with an OFFSET and no LIMIT: the subjects after the first 2,900
+    // in the deterministic order.
+    let crawl = fluree
+        .query_from()
+        .jsonld(&serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "from": "paged:main",
+            "select": {"?s": ["@id"]},
+            "where": {"@id": "?s", "ex:name": "?n"},
+            "offset": 2900,
+        }))
+        .execute_formatted()
+        .await
+        .expect("crawl");
+    let crawled: Vec<i64> = crawl
+        .as_array()
+        .unwrap_or_else(|| panic!("a crawl answers an array: {crawl}"))
+        .iter()
+        .map(|doc| person_number(doc["@id"].as_str().expect("an @id")))
+        .collect();
+    assert_eq!(
+        crawled,
+        everyone[2900..],
+        "crawl: OFFSET in the fixed order"
+    );
+
+    // A `selectOne` keeps the first row of the answer when it is formatted:
+    // the first person in the fixed order, every time.
+    for run in 0..2 {
+        let one = fluree
+            .query_from()
+            .jsonld(&serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": "paged:main",
+                "selectOne": ["?s"],
+                "where": {"@id": "?s", "ex:name": "?n"},
+            }))
+            .execute_formatted()
+            .await
+            .expect("selectOne");
+        let s = one.as_array().map_or(&one, |row| &row[0]);
+        assert_eq!(
+            person_number(s.as_str().unwrap_or_else(|| panic!("an IRI: {one}"))),
+            everyone[0],
+            "selectOne (run {run}): the first row in the fixed order"
+        );
+    }
+
+    // A byte-budgeted AgentJson response is a page its client continues with
+    // OFFSET (`hasMore`, `resume`): its rows are a prefix of the fixed order,
+    // though the query itself has no slice.
+    let agent_page = fluree
+        .query_from()
+        .sparql("SELECT ?s FROM <paged:main> WHERE { ?s <http://example.org/name> ?n }")
+        .format(fluree_db_api::FormatterConfig::agent_json().with_max_bytes(4_000))
+        .execute_formatted()
+        .await
+        .expect("AgentJson page");
+    assert_eq!(
+        agent_page["hasMore"], true,
+        "a truncated page: {agent_page}"
+    );
+    let page_rows: Vec<i64> = agent_page["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("rows: {agent_page}"))
+        .iter()
+        .map(|row| person_number(row["?s"].as_str().expect("an IRI")))
+        .collect();
+    assert!(!page_rows.is_empty(), "{agent_page}");
+    assert_eq!(
+        page_rows,
+        everyone[..page_rows.len()],
+        "AgentJson: the page is a prefix of the fixed order"
+    );
+
+    // The materialize read streams the same files the same way.
+    let scan = FlureeR2rmlProvider::new(fluree)
+        .scan_for_materialize_stream("paged:main", "silver.people_paged", &[], None, None, None)
+        .await
+        .expect("materialize read");
+    let batches: Vec<_> = scan.stream.try_collect().await.expect("stream batches");
+    let ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|b| {
+            let ids = b.column_by_name("id").expect("an id column");
+            (0..b.num_rows)
+                .map(|i| ids.get_i64(i).expect("an id"))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(
+        ids,
+        (1..=3000).collect::<Vec<i64>>(),
+        "materialize read: commit order"
+    );
+}
+
+/// A GROUP BY with no ORDER BY, paged with LIMIT/OFFSET, returns the same
+/// groups on the same pages in every execution, on SPARQL and JSON-LD: the
+/// sliced scan reads the files in a fixed order and the groups come out of the
+/// fold in a fixed order. `score` takes 100 values over `people_paged`'s 3,000
+/// rows; ten pages of ten partition one 1,000-row page, and two fresh
+/// instances agree page for page.
+#[tokio::test]
+async fn unordered_grouped_pages_are_the_same_on_every_execution() {
+    allow_fixture_roots();
+    let staging =
+        tempfile::TempDir::new_in(fixtures_dir()).expect("staging dir under the fixtures root");
+    let table_dir = staging.path().join("people_paged");
+    copy_dir_all(&fixtures_dir().join("silver/people_paged"), &table_dir);
+    let mapping = PEOPLE_R2RML.replace("silver.people", "silver.people_paged");
+    let location = format!("file://{}", table_dir.display());
+
+    let mut runs: Vec<(Vec<String>, Vec<String>)> = Vec::new();
+    for _ in 0..2 {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct("grouped", &location, &mapping)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+        let fluree = &fluree;
+        let sparql = |limit: usize, offset: usize| async move {
+            let rows = fluree
+                .query_from()
+                .sparql(&format!(
+                    "SELECT ?sc (COUNT(?s) AS ?n) FROM <grouped:main> \
+                     WHERE {{ ?s <http://example.org/score> ?sc }} \
+                     GROUP BY ?sc LIMIT {limit} OFFSET {offset}"
+                ))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("SPARQL page {offset}: {e}"));
+            rows["results"]["bindings"]
+                .as_array()
+                .unwrap_or_else(|| panic!("bindings: {rows}"))
+                .iter()
+                .map(|b| format!("{}={}", b["sc"]["value"], b["n"]["value"]))
+                .collect::<Vec<String>>()
+        };
+        let jsonld = |limit: usize, offset: usize| async move {
+            let rows = fluree
+                .query_from()
+                .jsonld(&serde_json::json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "from": "grouped:main",
+                    "select": ["?sc", "(count ?s)"],
+                    "where": {"@id": "?s", "ex:score": "?sc"},
+                    "groupBy": ["?sc"],
+                    "limit": limit,
+                    "offset": offset,
+                }))
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("JSON-LD page {offset}: {e}"));
+            rows.as_array()
+                .unwrap_or_else(|| panic!("rows: {rows}"))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<String>>()
+        };
+        let whole = sparql(1000, 0).await;
+        assert_eq!(whole.len(), 100, "SPARQL: one row per score: {whole:?}");
+        let mut paged = Vec::new();
+        for k in 0..10 {
+            paged.extend(sparql(10, k * 10).await);
+        }
+        assert_eq!(paged, whole, "SPARQL: the pages partition the groups");
+        let whole_jsonld = jsonld(1000, 0).await;
+        assert_eq!(whole_jsonld.len(), 100, "JSON-LD: one row per score");
+        let mut paged = Vec::new();
+        for k in 0..10 {
+            paged.extend(jsonld(10, k * 10).await);
+        }
+        assert_eq!(
+            paged, whole_jsonld,
+            "JSON-LD: the pages partition the groups"
+        );
+        runs.push((whole, whole_jsonld));
+    }
+    assert_eq!(
+        runs[0], runs[1],
+        "two fresh instances page the groups alike"
+    );
+}
+
+/// `people_paged` references `people_window` twice. `ex:peer` joins by
+/// `score` (`id % 100`), so each key sits on 30 parent rows spread over all
+/// five files, and a person joins each of their 30 `peer` subjects. `ex:twin`
+/// joins by `id`: one parent row per key, in files of disjoint `id` ranges.
+const PAGED_REFERENCES_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Person>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_paged" ] ;
+        rr:subjectMap [ rr:template "http://example.org/person/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:peer ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Peer> ;
+                rr:joinCondition [ rr:child "score" ; rr:parent "score" ]
+            ]
+        ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:twin ;
+            rr:objectMap [
+                rr:parentTriplesMap <http://example.org/mapping#Twin> ;
+                rr:joinCondition [ rr:child "id" ; rr:parent "id" ]
+            ]
+        ] .
+
+    <http://example.org/mapping#Peer>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/peer/{id}" ] .
+
+    <http://example.org/mapping#Twin>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "silver.people_window" ] ;
+        rr:subjectMap [ rr:template "http://example.org/twin/{id}" ] .
+"#;
+
+/// A paged unordered query over a referencing map returns the same pages on
+/// every execution, on SPARQL and JSON-LD. The parent's reads ask for no order
+/// (they fold into a lookup whose contents do not depend on it), so the rows
+/// come in the child's sliced scan order, each row followed by every parent
+/// subject its key matches in subject order, and the pages partition exactly
+/// that answer in two fresh instances. `ex:peer` reads the parent whole (every
+/// file holds every key); `ex:twin` reads it by the keys of each page's rows.
+#[tokio::test]
+async fn unordered_pages_over_a_referencing_map_are_the_same_on_every_execution() {
+    allow_fixture_roots();
+    let silver = fixtures_dir().join("silver");
+    let order = paged_scan_order(&silver.join("people_paged"));
+    let root = format!("file://{}", silver.display());
+    let parent = |kind: &str, id: i64| format!("http://example.org/{kind}/{id}");
+    // Each score's peers, in the order a key's parent subjects are joined.
+    let mut peers: std::collections::HashMap<i64, Vec<String>> = std::collections::HashMap::new();
+    for id in 1..=3000 {
+        peers.entry(id % 100).or_default().push(parent("peer", id));
+    }
+    for subjects in peers.values_mut() {
+        subjects.sort();
+    }
+    let expected = |predicate: &str| -> Vec<(String, String)> {
+        order
+            .iter()
+            .flat_map(|&id| {
+                let subject = person(u32::try_from(id).expect("an id"));
+                let objects = if predicate == "peer" {
+                    peers[&(id % 100)].clone()
+                } else {
+                    vec![parent("twin", id)]
+                };
+                objects.into_iter().map(move |o| (subject.clone(), o))
+            })
+            .collect()
+    };
+
+    for run in 0..2 {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree
+            .create_r2rml_graph_source(
+                R2rmlCreateConfig::new_direct("paged-refs", &root, PAGED_REFERENCES_R2RML)
+                    .with_mapping_media_type("text/turtle"),
+            )
+            .await
+            .expect("create graph source");
+        for predicate in ["peer", "twin"] {
+            let iri = format!("http://example.org/{predicate}");
+            let want = expected(predicate);
+            // 30 `peer` rows per person: pages of 4,500 keep it to 20 queries.
+            let page = if predicate == "peer" { 4_500 } else { 500 };
+            let mut sparql_pages = Vec::new();
+            let mut jsonld_pages = Vec::new();
+            for k in 0..want.len().div_ceil(page) {
+                let sparql = format!(
+                    "SELECT ?s ?o FROM <paged-refs:main> WHERE {{ ?s <{iri}> ?o }} \
+                     LIMIT {page} OFFSET {}",
+                    k * page
+                );
+                let rows = fluree
+                    .query_from()
+                    .sparql(&sparql)
+                    .execute_formatted()
+                    .await
+                    .unwrap_or_else(|e| panic!("{sparql}: {e}"));
+                sparql_pages.extend(
+                    rows["results"]["bindings"]
+                        .as_array()
+                        .unwrap_or_else(|| panic!("bindings: {rows}"))
+                        .iter()
+                        .map(|b| {
+                            let term =
+                                |v: &str| b[v]["value"].as_str().expect("an IRI").to_string();
+                            (term("s"), term("o"))
+                        }),
+                );
+                let jsonld = serde_json::json!({
+                    "from": "paged-refs:main",
+                    "select": ["?s", "?o"],
+                    "where": {"@id": "?s", iri.as_str(): "?o"},
+                    "limit": page,
+                    "offset": k * page,
+                });
+                let rows = fluree
+                    .query_from()
+                    .jsonld(&jsonld)
+                    .execute_formatted()
+                    .await
+                    .unwrap_or_else(|e| panic!("JSON-LD {predicate} page {k}: {e}"));
+                jsonld_pages.extend(
+                    rows.as_array()
+                        .unwrap_or_else(|| panic!("rows: {rows}"))
+                        .iter()
+                        .map(|row| {
+                            let term = |i: usize| row[i].as_str().expect("an IRI").to_string();
+                            (term(0), term(1))
+                        }),
+                );
+            }
+            assert!(
+                sparql_pages == want,
+                "SPARQL ex:{predicate}, run {run}: the pages are the child's scan order with \
+                 each row's parent subjects in order; {} rows of {}, first difference at {:?}",
+                sparql_pages.len(),
+                want.len(),
+                sparql_pages.iter().zip(&want).position(|(a, b)| a != b)
+            );
+            assert!(
+                jsonld_pages == want,
+                "JSON-LD ex:{predicate}, run {run}: first difference at {:?}",
+                jsonld_pages.iter().zip(&want).position(|(a, b)| a != b)
+            );
+        }
     }
 }

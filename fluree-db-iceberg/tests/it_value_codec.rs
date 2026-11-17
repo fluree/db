@@ -186,11 +186,7 @@ fn test_decimal_encoding() {
     ];
 
     for (unscaled, precision, scale) in decimals {
-        let original = TypedValue::Decimal {
-            unscaled,
-            precision,
-            scale,
-        };
+        let original = TypedValue::Decimal { unscaled, scale };
         let encoded = encode_value(&original);
 
         // Decode with matching precision/scale

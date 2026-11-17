@@ -274,3 +274,71 @@ async fn multi_query_with_token_outside_scope_sparql_returns_404() {
     let (status, _body) = post_envelope(&app, &envelope, Some(&read_c_only)).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
+
+// =============================================================================
+// The ledgers a SPARQL sub-query reads
+// =============================================================================
+
+/// A prefixed name in `FROM` is read-checked like a bracketed IRI naming the
+/// same ledger.
+#[tokio::test]
+async fn multi_query_sparql_sibling_scope_matches_resolved_dataset() {
+    let (_tmp, state) = data_auth_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mqa:e").await;
+    create_ledger(&app, "mqa:f").await;
+    let (_, write_e) = write_scoped_token(&["mqa:e"], 31);
+    insert_one(&app, "mqa:e", "ex:p", "P", &write_e).await;
+    let (_, write_f) = write_scoped_token(&["mqa:f"], 32);
+    insert_one(&app, "mqa:f", "ex:q", "Q", &write_f).await;
+    let (_, read_e_only) = read_scoped_token(&["mqa:e"], 33);
+    let (_, read_both) = read_scoped_token(&["mqa:e", "mqa:f"], 34);
+
+    let envelope = json!({
+        "queries": {
+            "both": {
+                "language": "sparql",
+                "query": "PREFIX ex: <http://example.org/> \
+                          SELECT ?name FROM <mqa:e> FROM mqa:f WHERE { ?s ex:name ?name }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope, Some(&read_e_only)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got body: {body}");
+
+    // A token that may read both ledgers gets both ledgers' rows.
+    let (status, body) = post_envelope(&app, &envelope, Some(&read_both)).await;
+    assert_eq!(status, StatusCode::OK, "got body: {body}");
+    let text = body.to_string();
+    assert!(
+        text.contains("\"P\"") && text.contains("\"Q\""),
+        "both ledgers' rows expected, got: {body}"
+    );
+}
+
+/// `urn:fluree:` is another spelling of a ledger address; the read check
+/// applies to the ledger it names.
+#[tokio::test]
+async fn multi_query_sparql_sibling_urn_spelling_is_read_checked() {
+    let (_tmp, state) = data_auth_state().await;
+    let app = build_router(state);
+    create_ledger(&app, "mqa:g").await;
+    create_ledger(&app, "mqa:h").await;
+    let (_, write_g) = write_scoped_token(&["mqa:g"], 35);
+    insert_one(&app, "mqa:g", "ex:p", "P", &write_g).await;
+    let (_, write_h) = write_scoped_token(&["mqa:h"], 36);
+    insert_one(&app, "mqa:h", "ex:q", "Q", &write_h).await;
+    let (_, read_g_only) = read_scoped_token(&["mqa:g"], 37);
+
+    let envelope = json!({
+        "queries": {
+            "h": {
+                "language": "sparql",
+                "query": "PREFIX ex: <http://example.org/> \
+                          SELECT ?name FROM <urn:fluree:mqa:h> WHERE { ?s ex:name ?name }"
+            }
+        }
+    });
+    let (status, body) = post_envelope(&app, &envelope, Some(&read_g_only)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "got body: {body}");
+}

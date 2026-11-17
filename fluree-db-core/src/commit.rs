@@ -219,6 +219,20 @@ pub struct Commit {
     /// - `2+`: user-defined named graphs
     pub graph_delta: HashMap<u16, String>,
 
+    /// Graphs this commit drops, by IRI, ascending; the default graph is
+    /// [`crate::DEFAULT_GRAPH_IRI`], which no named graph may take.
+    ///
+    /// A dropped graph's facts before this commit's `t` are no longer
+    /// queryable, at the head or as of any earlier `t`; the commits that wrote
+    /// them keep them. The drops apply before the commit's `graph_delta` and
+    /// flakes, so a commit can drop a graph and write it afresh: writing into a
+    /// dropped graph registers it again, under the same g_id. The default
+    /// graph can be dropped this way and stays the default graph.
+    ///
+    /// By IRI, as replay reads `graph_delta`: a reader numbers graphs its own
+    /// way (a rebuilt index assigns them in the order it meets them).
+    pub graph_drops: Vec<String>,
+
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<crate::ns_encoding::NsSplitMode>,
@@ -239,6 +253,7 @@ impl Commit {
             commit_signatures: Vec::new(),
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
+            graph_drops: Vec::new(),
             ns_split_mode: None,
         }
     }
@@ -361,6 +376,9 @@ pub struct CommitEnvelope {
     /// Used by `ApiFulltextConfigProvider` to short-circuit when the config
     /// graph was never registered anywhere in the chain.
     pub graph_delta: HashMap<u16, String>,
+
+    /// Graphs this commit drops. Same shape as [`Commit::graph_drops`].
+    pub graph_drops: Vec<String>,
 
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
@@ -503,16 +521,17 @@ pub enum GraphRegistrationProbe {
 }
 
 /// Probe the commit DAG envelope-only to discover whether a named graph
-/// IRI was ever registered, and at what `t` it first appeared.
+/// IRI `names_graph` accepts was ever registered, and at what `t` it first
+/// appeared.
 ///
 /// Walks the chain via byte-range envelope reads (~128 KiB per envelope on
 /// range-capable backends), inspects each envelope's `graph_delta` for
-/// `graph_iri`, and returns:
+/// such an IRI, and returns:
 ///
 /// - [`Found(t)`](GraphRegistrationProbe::Found) — the smallest `t`
-///   where the IRI appears in any commit's `graph_delta`.
+///   where one appears in any commit's `graph_delta`.
 /// - [`NotFound`](GraphRegistrationProbe::NotFound) — every commit was a
-///   v4 envelope and none registered the IRI.
+///   v4 envelope and none registered one.
 /// - [`Inconclusive`](GraphRegistrationProbe::Inconclusive) — at least one
 ///   envelope was v3 (or an unknown future version) and could not be
 ///   inspected for `graph_delta`. Walk short-circuits and returns
@@ -539,7 +558,7 @@ pub enum GraphRegistrationProbe {
 pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
-    graph_iri: &str,
+    names_graph: impl Fn(&str) -> bool,
 ) -> Result<GraphRegistrationProbe> {
     let mut earliest: Option<i64> = None;
     let mut frontier = vec![head_id.clone()];
@@ -561,7 +580,7 @@ pub async fn first_t_where_graph_registered<C: ContentStore + ?Sized>(
         if version != codec::VERSION {
             return Ok(GraphRegistrationProbe::Inconclusive);
         }
-        if envelope.graph_delta.values().any(|iri| iri == graph_iri) {
+        if envelope.graph_delta.values().any(|iri| names_graph(iri)) {
             earliest = Some(match earliest {
                 Some(e) => e.min(envelope.t),
                 None => envelope.t,
@@ -623,9 +642,14 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+) -> Result<(
+    Vec<(i64, ContentId)>,
+    crate::ns_encoding::NsSplitMode,
+    Vec<CommitGraphLifecycle>,
+)> {
     let mut result = Vec::new();
     let mut split_mode = crate::ns_encoding::NsSplitMode::default();
+    let mut lifecycles = Vec::new();
     let mut next = Some(head_id.clone());
 
     while let Some(cid) = next {
@@ -648,6 +672,13 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         if let Some(mode) = envelope.ns_split_mode {
             split_mode = mode;
         }
+        if !envelope.graph_drops.is_empty() || !envelope.graph_delta.is_empty() {
+            lifecycles.push(CommitGraphLifecycle {
+                t: envelope.t,
+                drops: envelope.graph_drops.clone(),
+                written: envelope.graph_delta.values().cloned().collect(),
+            });
+        }
         // Given that invariant the parent's `t` is at most this one's minus
         // one, so once that is at or below the stop point the parent is out
         // of range and is never fetched.
@@ -659,7 +690,20 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         result.push((envelope.t, cid));
     }
 
-    Ok((result, split_mode))
+    Ok((result, split_mode, lifecycles))
+}
+
+/// One commit's graph lifecycle, as the first-parent walk reads it from the
+/// envelope: the graphs it drops (`Commit::graph_drops`) and the graphs its
+/// `graph_delta` writes.
+#[derive(Debug, Clone)]
+pub struct CommitGraphLifecycle {
+    /// The commit's `t`.
+    pub t: i64,
+    /// The graphs it drops, by IRI.
+    pub drops: Vec<String>,
+    /// The graphs its `graph_delta` writes, by IRI.
+    pub written: Vec<String>,
 }
 
 /// Walk a branch's first-parent lineage from a head CID, collecting
@@ -682,17 +726,23 @@ pub async fn collect_first_parent_cids<C: ContentStore + ?Sized>(
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<Vec<(i64, ContentId)>> {
-    let (cids, _split_mode) = walk_first_parent(store, head_id, stop_at_t).await?;
+    let (cids, _split_mode, _lifecycles) = walk_first_parent(store, head_id, stop_at_t).await?;
     Ok(cids)
 }
 
 /// Like [`collect_first_parent_cids`], and also return the authoritative
-/// `NsSplitMode` for the lineage.
+/// `NsSplitMode` for the lineage and, newest first, the graph lifecycle of
+/// every commit that drops or registers a graph — what a rebuild needs to
+/// leave out what the drops took.
 pub async fn collect_first_parent_cids_with_split_mode<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-) -> Result<(Vec<(i64, ContentId)>, crate::ns_encoding::NsSplitMode)> {
+) -> Result<(
+    Vec<(i64, ContentId)>,
+    crate::ns_encoding::NsSplitMode,
+    Vec<CommitGraphLifecycle>,
+)> {
     walk_first_parent(store, head_id, stop_at_t).await
 }
 
@@ -967,6 +1017,555 @@ async fn advance_frontier<C: ContentStore>(
 }
 
 // =============================================================================
+// Branch comparison
+// =============================================================================
+
+/// One branch's side of a divergence. Built by [`diff_branches`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct BranchSide {
+    /// Every commit on the branch's line above the point where the other
+    /// side's history takes over, oldest first. Folding these gives the
+    /// branch's state, so this is what a merge applies and what a rebase
+    /// replays.
+    pub commits: Vec<ContentId>,
+    /// The commits among them that carry the branch's own changes. A merge
+    /// whose merged-in history the other side already holds is left out,
+    /// because its changes came from that side. This is what conflict
+    /// detection compares.
+    ///
+    /// Such a merge stays in `commits`, because part of what it carries is
+    /// its own: its flakes on keys the branch changed earlier are how it
+    /// resolved that overlap, and dropping them would undo the resolution.
+    /// Its remaining flakes copy the other side's changes, so a caller that
+    /// folds or replays `commits` must leave those out.
+    pub own: Vec<ContentId>,
+    /// Whether one of `commits` drops a graph (`Commit::graph_drops`). A drop
+    /// is no set of flakes to fold or replay onto other history, so an
+    /// operation that would do either refuses.
+    pub drops_graphs: bool,
+}
+
+/// What two branches changed since they last shared a commit. Built by
+/// [`diff_branches`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchDiff {
+    /// The most recent commit both branches hold. It is taken from the
+    /// source's line when that line has one above the fork, and from the
+    /// target's line otherwise. When each branch has merged the other,
+    /// their two cut points differ and this reports the source's.
+    pub base: ContentId,
+    /// The source's side of the divergence.
+    pub source: BranchSide,
+    /// The target's side of the divergence.
+    pub target: BranchSide,
+    /// Every commit reachable from the source's head that the target does
+    /// not hold, parents before children. These are the commits the target
+    /// needs copied into its own storage.
+    pub source_only: Vec<ContentId>,
+    /// Whether the target's head is on the source's first-parent line. Only
+    /// then can the target adopt the source's head and keep its own `t`
+    /// rising.
+    pub fast_forward: bool,
+}
+
+/// Compare two branches by commit identity.
+///
+/// Each branch numbers its commits from its own fork point, so a `t` from one
+/// branch means nothing on the other. This walk never compares them. It
+/// follows first-parent lines, and it follows merge parents into the branches
+/// they brought in.
+///
+/// Returns an error when the two branches share no commit.
+pub async fn diff_branches<C: ContentStore + ?Sized>(
+    store: &C,
+    source_head: &ContentId,
+    target_head: &ContentId,
+) -> Result<BranchDiff> {
+    // Walk the source's line until it meets the target's line. That meeting
+    // point is the fork, and it bounds every other walk here.
+    let mut target_line = FirstParentLine::new(target_head.clone());
+    let mut source_line = Vec::new();
+    let mut next = Some(source_head.clone());
+    let mut child_t = None;
+    let mut fork = None;
+    while let Some(cid) = next.take() {
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if let Some(child_t) = child_t {
+            if envelope.t >= child_t {
+                return Err(Error::invalid_commit(format!(
+                    "first-parent chain is not t-decreasing: commit {cid} has t={} \
+                     under a child with t={child_t}",
+                    envelope.t
+                )));
+            }
+        }
+        child_t = Some(envelope.t);
+        if target_line.contains(store, &cid, envelope.t).await? {
+            fork = Some(cid.clone());
+            source_line.push((cid, envelope));
+            break;
+        }
+        next = envelope.parents.first().cloned();
+        source_line.push((cid, envelope));
+    }
+    let Some(fork) = fork else {
+        return Err(Error::invalid_commit(format!(
+            "commits {source_head} and {target_head} share no history"
+        )));
+    };
+
+    // The target's line down to the same fork.
+    let mut target_line_commits = Vec::new();
+    let mut next = Some(target_head.clone());
+    let mut child_t = None;
+    while let Some(cid) = next.take() {
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if let Some(child_t) = child_t {
+            if envelope.t >= child_t {
+                return Err(Error::invalid_commit(format!(
+                    "first-parent chain is not t-decreasing: commit {cid} has t={} \
+                     under a child with t={child_t}",
+                    envelope.t
+                )));
+            }
+        }
+        child_t = Some(envelope.t);
+        if cid == fork {
+            target_line_commits.push((cid, envelope));
+            break;
+        }
+        next = envelope.parents.first().cloned();
+        target_line_commits.push((cid, envelope));
+    }
+
+    // Each side's history above the fork. A merge parent leads into the
+    // branch it brought in, which is walked until it rejoins shared history.
+    let shared = FirstParentLine::new(fork.clone());
+    let mut source_ancestry = Ancestry::above(shared.clone(), &source_line);
+    let mut target_ancestry = Ancestry::above(shared, &target_line_commits);
+    source_ancestry.expand(store).await?;
+    target_ancestry.expand(store).await?;
+
+    let source = line_above(&source_line, &target_ancestry);
+    let target = line_above(&target_line_commits, &source_ancestry);
+    // The most recent commit both sides hold. It sits on one branch's line
+    // and arrived on the other through a merge. Without such a merge it is
+    // the fork.
+    let base = most_recent_shared(&source_line, &target_ancestry)
+        .or_else(|| most_recent_shared(&target_line_commits, &source_ancestry))
+        .unwrap_or(fork.clone());
+
+    let source_only = missing_from(store, source_head, &mut target_ancestry).await?;
+
+    Ok(BranchDiff {
+        base,
+        source,
+        target,
+        source_only,
+        fast_forward: fork == *target_head,
+    })
+}
+
+/// The commits reachable from `head` that `other` does not hold, parents
+/// before children.
+async fn missing_from<C: ContentStore + ?Sized>(
+    store: &C,
+    head: &ContentId,
+    other: &mut Ancestry,
+) -> Result<Vec<ContentId>> {
+    let mut missing = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // Each commit is emitted after the parents pushed above it. The history
+    // is acyclic. A parent already seen has already been emitted.
+    let mut stack = vec![(head.clone(), false)];
+    while let Some((cid, expanded)) = stack.pop() {
+        if expanded {
+            missing.push(cid);
+            continue;
+        }
+        if !seen.insert(cid.clone()) {
+            continue;
+        }
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if other.holds(store, &cid, envelope.t).await? {
+            continue;
+        }
+        stack.push((cid, true));
+        stack.extend(envelope.parents.into_iter().map(|parent| (parent, false)));
+    }
+    Ok(missing)
+}
+
+/// The line's most recent commit that the other side's history holds, if it
+/// is above the fork. The fork itself is the last commit on the line.
+fn most_recent_shared(line: &[(ContentId, CommitEnvelope)], other: &Ancestry) -> Option<ContentId> {
+    line.iter()
+        .take(line.len().saturating_sub(1))
+        .map(|(cid, _)| cid)
+        .find(|cid| other.contains(cid))
+        .cloned()
+}
+
+/// The line's commits above the first one the other side's history holds,
+/// oldest first, and which of them carry the branch's own changes.
+fn line_above(line: &[(ContentId, CommitEnvelope)], other: &Ancestry) -> BranchSide {
+    let above = line.iter().take_while(|(cid, _)| !other.contains(cid));
+    let mut commits = Vec::new();
+    let mut own = Vec::new();
+    let mut drops_graphs = false;
+    for (cid, envelope) in above {
+        let merged_in = &envelope.parents[1.min(envelope.parents.len())..];
+        if merged_in.is_empty() || !merged_in.iter().all(|p| other.contains(p)) {
+            own.push(cid.clone());
+        }
+        drops_graphs |= !envelope.graph_drops.is_empty();
+        commits.push(cid.clone());
+    }
+    commits.reverse();
+    own.reverse();
+    BranchSide {
+        commits,
+        own,
+        drops_graphs,
+    }
+}
+
+// =============================================================================
+// Transfer planning
+// =============================================================================
+
+/// The commits a receiver needs to advance a branch. Built by
+/// [`plan_commit_transfer`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitTransferPlan {
+    /// The first-parent line above the base. The receiver replays these
+    /// commits. The last one becomes its head.
+    pub lineage: Vec<ContentId>,
+    /// The commits that merges on the line brought in. The receiver stores
+    /// these commits without replaying them. Each merge commit already
+    /// carries their combined changes.
+    pub merged: Vec<ContentId>,
+}
+
+/// One page of a transfer plan. Built by [`plan_commit_transfer_page`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CommitTransferPage {
+    /// This page's share of the plan.
+    pub plan: CommitTransferPlan,
+    /// The commit the next page starts from. It is `None` on the last page.
+    pub next: Option<ContentId>,
+}
+
+/// Plan the transfer of a branch from `base` to `head`.
+///
+/// `base` is the receiver's head. It is `None` when the receiver has no
+/// commits.
+///
+/// `lineage` comes back oldest first. `merged` comes back parents before
+/// children.
+///
+/// Returns `None` when `base` is not on the first-parent line of `head`. The
+/// receiver cannot fast-forward to `head` in that case.
+///
+/// `merged` holds only commits the receiver lacks. The walk stops at every
+/// commit reachable from the base, so a branch merged twice sends only what
+/// it gained between the two merges.
+pub async fn plan_commit_transfer<C: ContentStore + ?Sized>(
+    store: &C,
+    head: &ContentId,
+    base: Option<&ContentId>,
+) -> Result<Option<CommitTransferPlan>> {
+    Ok(plan_commit_transfer_page(store, head, base, usize::MAX)
+        .await?
+        .map(|page| page.plan))
+}
+
+/// Plan one page of the transfer of a branch from `base` to `from`.
+///
+/// The page holds at most `limit` commits, counting its line and the
+/// commits its merges brought in, walking down from `from`. A page always
+/// holds at least one line commit, so paging always advances, and one merge
+/// can therefore carry the page past `limit`. The next page starts at
+/// `next` with the same `base`.
+///
+/// Returns `None` under the same condition as [`plan_commit_transfer`]. A
+/// page that ends above the base cannot detect it. The page that reaches the
+/// base does.
+///
+/// A commit that merges on two pages both brought in appears on both pages.
+pub async fn plan_commit_transfer_page<C: ContentStore + ?Sized>(
+    store: &C,
+    from: &ContentId,
+    base: Option<&ContentId>,
+    limit: usize,
+) -> Result<Option<CommitTransferPage>> {
+    let base = match base {
+        Some(base) if base == from => return Ok(Some(CommitTransferPage::default())),
+        Some(base) if !store.has(base).await? => return Ok(None),
+        Some(base) => Some((base, load_commit_envelope_by_id(store, base).await?.t)),
+        None => None,
+    };
+
+    // Walk the line down to the base, or until the page is full, taking
+    // what each merge brought in as it goes.
+    let mut lineage = Vec::new();
+    let mut merged = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    // The line as walked so far, and where it continues. The merged-in walk
+    // stops at it. A commit above `from` cannot be an ancestor of a merge at
+    // or below it.
+    let mut line = FirstParentLine::new(from.clone());
+    // What the receiver already holds. The merged-in walk stops at it, so a
+    // branch merged twice sends only the commits it gained since.
+    let mut held = Ancestry::reaching(base.map(|(base_id, _)| base_id.clone()));
+    let mut next = Some(from.clone());
+    let mut child_t = None;
+    // The line commit under this page, and whether the page filled first.
+    let mut below = None;
+    let mut full = false;
+    while let Some(cid) = next.take() {
+        // Both lists count toward the page. One merge can bring in a whole
+        // branch, so counting the line alone would not bound the page. A
+        // page always takes one line commit, so paging always advances.
+        if !lineage.is_empty() && lineage.len() + merged.len() >= limit {
+            below = Some(cid);
+            full = true;
+            break;
+        }
+        let envelope = load_commit_envelope_by_id(store, &cid).await?;
+        if let Some((base_id, base_t)) = base {
+            if envelope.t <= base_t {
+                if cid == *base_id {
+                    below = Some(cid);
+                    break;
+                }
+                return Ok(None);
+            }
+        }
+        if let Some(child_t) = child_t {
+            if envelope.t >= child_t {
+                return Err(Error::invalid_commit(format!(
+                    "first-parent chain is not t-decreasing: commit {cid} has t={} \
+                     under a child with t={child_t}",
+                    envelope.t
+                )));
+            }
+        }
+        child_t = Some(envelope.t);
+        let mut parents = envelope.parents.into_iter();
+        let first_parent = parents.next();
+        line.walked(cid.clone(), envelope.t, &first_parent);
+        lineage.push(cid);
+
+        // What this commit's merges brought in. Each commit is emitted after
+        // the parents pushed above it. The history is acyclic, so a parent
+        // already seen has already been emitted, on this page or an earlier
+        // one in this walk.
+        let mut stack: Vec<(ContentId, bool)> =
+            parents.rev().map(|parent| (parent, false)).collect();
+        while let Some((cid, expanded)) = stack.pop() {
+            if expanded {
+                merged.push(cid);
+                continue;
+            }
+            if !seen.insert(cid.clone()) {
+                continue;
+            }
+            // The receiver has it, or this transfer's line carries it. The
+            // receiver is asked first, since that walk never loads the line
+            // of a commit whose `t` comes from another branch.
+            if held.reaches(store, &cid).await? {
+                continue;
+            }
+            let envelope = load_commit_envelope_by_id(store, &cid).await?;
+            if line.contains(store, &cid, envelope.t).await? {
+                continue;
+            }
+            stack.push((cid, true));
+            stack.extend(envelope.parents.into_iter().map(|parent| (parent, false)));
+        }
+
+        next = first_parent;
+        if next.is_none() && base.is_some() {
+            // The line reached genesis without meeting the base.
+            return Ok(None);
+        }
+    }
+    lineage.reverse();
+    let next_page = below.filter(|cid| full && base.is_none_or(|(base_id, _)| cid != base_id));
+
+    Ok(Some(CommitTransferPage {
+        plan: CommitTransferPlan { lineage, merged },
+        next: next_page,
+    }))
+}
+
+/// A set of commits closed under parents: every commit a walk from its roots
+/// reaches, through every parent.
+///
+/// The walk runs on demand. [`Ancestry::expand`] runs it to the end, and
+/// [`Ancestry::reaches`] runs it only as far as one answer needs. A commit
+/// the roots reach is usually found early, because a merge's commits sit
+/// near the branch's head. A commit they do not reach exhausts the walk,
+/// which then answers from memory.
+struct Ancestry {
+    members: std::collections::HashSet<ContentId>,
+    /// Parents still to walk.
+    frontier: Vec<ContentId>,
+    /// A line the walk stops at, and whose commits the ancestry holds. A
+    /// commit on it carries everything behind it. It is empty when nothing
+    /// bounds the walk.
+    stop: FirstParentLine,
+}
+
+impl Ancestry {
+    /// What a branch's line adds above `stop`: the line itself, plus every
+    /// commit its merges brought in.
+    fn above(stop: FirstParentLine, line: &[(ContentId, CommitEnvelope)]) -> Self {
+        Self {
+            members: line.iter().map(|(cid, _)| cid.clone()).collect(),
+            frontier: line
+                .iter()
+                .flat_map(|(_, envelope)| envelope.parents.iter().skip(1))
+                .cloned()
+                .collect(),
+            stop,
+        }
+    }
+
+    /// Every commit `roots` reach. Nothing bounds this walk but genesis.
+    fn reaching(roots: impl IntoIterator<Item = ContentId>) -> Self {
+        Self {
+            members: std::collections::HashSet::new(),
+            frontier: roots.into_iter().collect(),
+            stop: FirstParentLine::empty(),
+        }
+    }
+
+    /// Run the walk to the end.
+    async fn expand<C: ContentStore + ?Sized>(&mut self, store: &C) -> Result<()> {
+        while self.step(store).await?.is_some() {}
+        Ok(())
+    }
+
+    /// Whether the walk reaches `cid`, running it only that far.
+    async fn reaches<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+        cid: &ContentId,
+    ) -> Result<bool> {
+        if self.members.contains(cid) {
+            return Ok(true);
+        }
+        while let Some(reached) = self.step(store).await? {
+            if reached == *cid {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Self::reaches`], answered from the walk already run.
+    fn contains(&self, cid: &ContentId) -> bool {
+        self.members.contains(cid) || self.stop.members.contains(cid)
+    }
+
+    /// Whether the ancestry holds `cid`: the walk reaches it, or it is on
+    /// the line the walk stops at. `t` is `cid`'s own `t`.
+    async fn holds<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+        cid: &ContentId,
+        t: i64,
+    ) -> Result<bool> {
+        Ok(self.reaches(store, cid).await? || self.stop.contains(store, cid, t).await?)
+    }
+
+    /// Walk one commit of the frontier. Returns the commit it reached, or
+    /// `None` once the frontier is spent.
+    async fn step<C: ContentStore + ?Sized>(&mut self, store: &C) -> Result<Option<ContentId>> {
+        while let Some(cid) = self.frontier.pop() {
+            if self.members.contains(&cid) {
+                continue;
+            }
+            let envelope = load_commit_envelope_by_id(store, &cid).await?;
+            if self.stop.contains(store, &cid, envelope.t).await? {
+                continue;
+            }
+            self.frontier.extend(envelope.parents);
+            self.members.insert(cid.clone());
+            return Ok(Some(cid));
+        }
+        Ok(None)
+    }
+}
+
+/// A first-parent line. Its members are loaded only as deep as a query needs.
+#[derive(Clone)]
+struct FirstParentLine {
+    members: std::collections::HashSet<ContentId>,
+    next: Option<ContentId>,
+    lowest_t: i64,
+}
+
+impl FirstParentLine {
+    fn new(head: ContentId) -> Self {
+        Self {
+            members: std::collections::HashSet::new(),
+            next: Some(head),
+            lowest_t: i64::MAX,
+        }
+    }
+
+    /// A line with no commits. It holds nothing and loads nothing.
+    fn empty() -> Self {
+        Self {
+            members: std::collections::HashSet::new(),
+            next: None,
+            lowest_t: i64::MAX,
+        }
+    }
+
+    /// Record a commit the caller walked, and where the line continues
+    /// below it. The lazy cursor only moves down, because a query may have
+    /// loaded deeper already.
+    fn walked(&mut self, cid: ContentId, t: i64, next: &Option<ContentId>) {
+        if t < self.lowest_t {
+            self.lowest_t = t;
+            self.next.clone_from(next);
+        }
+        self.members.insert(cid);
+    }
+
+    /// Whether commit `cid` is on the line. `t` is that commit's `t`.
+    async fn contains<C: ContentStore + ?Sized>(
+        &mut self,
+        store: &C,
+        cid: &ContentId,
+        t: i64,
+    ) -> Result<bool> {
+        if self.members.contains(cid) {
+            return Ok(true);
+        }
+        // The line's `t` decreases toward genesis. Loading can therefore stop
+        // at `t`. A commit from another branch carries another clock, so `t`
+        // can send this walk to genesis.
+        while self.lowest_t > t {
+            let Some(next) = self.next.take() else {
+                break;
+            };
+            let envelope = load_commit_envelope_by_id(store, &next).await?;
+            // A line's `t` decreases toward genesis. Taking the minimum
+            // keeps the loop finite on a chain that does not.
+            self.lowest_t = self.lowest_t.min(envelope.t);
+            self.next = envelope.parents.into_iter().next();
+            self.members.insert(next);
+        }
+        Ok(self.members.contains(cid))
+    }
+}
+
+// =============================================================================
 // CommitSummary - lightweight per-commit info for diff/log views
 // =============================================================================
 
@@ -1118,6 +1717,7 @@ mod tests {
             namespace_delta: HashMap::from([(100, "ex:".to_string())]),
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
+            graph_drops: Vec::new(),
             ns_split_mode: None,
         };
 
@@ -1466,6 +2066,373 @@ mod tests {
 
         assert_eq!(ancestor.commit_id, chain[0]);
         assert_eq!(ancestor.t, 1);
+    }
+
+    // =========================================================================
+    // diff_branches tests
+    // =========================================================================
+
+    /// main: m1 <- m2 <- m3
+    /// dev:   \- d2 <- d3 <- d4
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_separates_both_sides() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 3, None, 1).await;
+        let dev = store_chain(&store, 2, 3, Some(main[0].clone()), 2).await;
+
+        let diff = diff_branches(&store, dev.last().unwrap(), main.last().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(diff.base, main[0]);
+        assert_eq!(diff.source.commits, dev);
+        assert_eq!(diff.target.commits, main[1..]);
+        assert!(!diff.fast_forward);
+    }
+
+    /// The target's head is on the source's line, so the target can adopt it.
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_reports_a_fast_forward() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 2, None, 1).await;
+        let dev = store_chain(&store, 3, 2, Some(main[1].clone()), 2).await;
+
+        let diff = diff_branches(&store, dev.last().unwrap(), main.last().unwrap())
+            .await
+            .unwrap();
+        assert!(diff.fast_forward);
+        assert_eq!(diff.base, main[1]);
+        assert_eq!(diff.source.commits, dev);
+        assert!(diff.target.commits.is_empty());
+    }
+
+    /// The commits the target must copy: the source's own, plus what its
+    /// merges brought in, and nothing the target already holds.
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_lists_the_commits_the_target_lacks() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 2, None, 1).await;
+        let dev = store_chain(&store, 2, 1, Some(main[0].clone()), 2).await;
+        let x = store_chain(&store, 2, 2, Some(main[0].clone()), 3).await;
+        let merge = store_merge(&store, 3, vec![dev[0].clone(), x[1].clone()], 2).await;
+
+        let diff = diff_branches(&store, &merge, main.last().unwrap())
+            .await
+            .unwrap();
+        let missing: std::collections::HashSet<&ContentId> = diff.source_only.iter().collect();
+        assert_eq!(
+            missing,
+            [&dev[0], &x[0], &x[1], &merge].into_iter().collect(),
+            "dev's commit, x's commits, and the merge"
+        );
+        let position = |cid: &ContentId| diff.source_only.iter().position(|c| c == cid).unwrap();
+        assert!(position(&x[0]) < position(&x[1]));
+        assert!(position(&x[1]) < position(&merge));
+        assert!(position(&dev[0]) < position(&merge));
+    }
+
+    /// x is merged into dev, then both branches commit again. The base is the
+    /// x commit that was merged, and dev's own commits are its side of the
+    /// diff. x's `t` values run above dev's, which is what the old `t` cutoff
+    /// got wrong.
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_after_an_earlier_merge() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 1, None, 1).await;
+        let x = store_chain(&store, 2, 5, Some(main[0].clone()), 2).await;
+        let dev = store_chain(&store, 2, 1, Some(main[0].clone()), 3).await;
+        let merge = store_merge(&store, 3, vec![dev[0].clone(), x[4].clone()], 3).await;
+        let dev_after = store_chain(&store, 4, 1, Some(merge.clone()), 3).await[0].clone();
+        let x_after = store_chain(&store, 7, 1, Some(x[4].clone()), 2).await[0].clone();
+
+        let diff = diff_branches(&store, &x_after, &dev_after).await.unwrap();
+        assert_eq!(diff.base, x[4], "the x commit dev already merged");
+        assert_eq!(diff.source.commits, [x_after]);
+        assert_eq!(
+            diff.target.commits,
+            [dev[0].clone(), merge.clone(), dev_after.clone()],
+            "dev's line, the merge of x included"
+        );
+        assert_eq!(
+            diff.target.own,
+            [dev[0].clone(), dev_after],
+            "dev's own changes, without the merge of x"
+        );
+        assert!(!diff.fast_forward);
+    }
+
+    /// The round trip: dev merges main in, commits, and is merged back. The
+    /// merge of main is left out of dev's side, and main's head is not on
+    /// dev's line, so this is not a fast-forward.
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_after_a_sync_from_the_target() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 5, None, 1).await;
+        let dev = store_chain(&store, 2, 1, Some(main[0].clone()), 2).await;
+        let sync = store_merge(&store, 3, vec![dev[0].clone(), main[4].clone()], 2).await;
+        let dev_after = store_chain(&store, 4, 1, Some(sync.clone()), 2).await[0].clone();
+
+        let diff = diff_branches(&store, &dev_after, main.last().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(diff.base, main[4], "main's head, which dev merged");
+        assert_eq!(
+            diff.source.commits,
+            [dev[0].clone(), sync.clone(), dev_after.clone()],
+            "dev's line, the sync merge included: it carries the resolution"
+        );
+        assert_eq!(
+            diff.source.own,
+            [dev[0].clone(), dev_after],
+            "dev's own changes, without the sync of main"
+        );
+        assert!(diff.target.commits.is_empty());
+        assert!(!diff.fast_forward, "main's head is behind a merge edge");
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn diff_branches_rejects_unrelated_histories() {
+        let store = MemoryContentStore::new();
+        let a = store_chain(&store, 1, 2, None, 100).await;
+        let b = store_chain(&store, 1, 2, None, 200).await;
+
+        let error = diff_branches(&store, a.last().unwrap(), b.last().unwrap())
+            .await
+            .expect_err("no shared commit");
+        assert!(error.to_string().contains("share no history"), "{error}");
+    }
+
+    // =========================================================================
+    // plan_commit_transfer tests
+    // =========================================================================
+
+    /// Helper: store a merge commit at `t`. The first of `parents` is the
+    /// first parent.
+    #[cfg(feature = "credential")]
+    async fn store_merge(
+        store: &MemoryContentStore,
+        t: i64,
+        parents: Vec<ContentId>,
+        branch_tag: i64,
+    ) -> ContentId {
+        let commit =
+            Commit::new(t, vec![make_test_flake(branch_tag, 1, t, t)]).with_merge_parents(parents);
+        store_commit(store, &commit).await
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_linear() {
+        let store = MemoryContentStore::new();
+        let c = store_chain(&store, 1, 4, None, 1).await;
+
+        let plan = plan_commit_transfer(&store, &c[3], Some(&c[1]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![c[2].clone(), c[3].clone()]);
+        assert!(plan.merged.is_empty());
+
+        let plan = plan_commit_transfer(&store, &c[3], None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, c);
+
+        let plan = plan_commit_transfer(&store, &c[3], Some(&c[3]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan, CommitTransferPlan::default());
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_splits_a_merge() {
+        // main:    m1 <- m2 <- m3 <- m4
+        // feature:  \- f2 <- f3 ----/
+        // The receiver has m2. The feature commits reuse main's `t` values.
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 3, None, 1).await;
+        let feature = store_chain(&store, 2, 2, Some(main[0].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![main[2].clone(), feature[1].clone()], 1).await;
+
+        let plan = plan_commit_transfer(&store, &m4, Some(&main[1]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![main[2].clone(), m4]);
+        assert_eq!(plan.merged, feature);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_orders_nested_merges_parents_first() {
+        // main:  m1 <- m2 <------------ m3
+        // f:      \- f2 <- f3 ---------/
+        // g:      \- g2 --/
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 2, None, 1).await;
+        let f2 = store_chain(&store, 2, 1, Some(main[0].clone()), 2).await[0].clone();
+        let g2 = store_chain(&store, 2, 1, Some(main[0].clone()), 3).await[0].clone();
+        let f3 = store_merge(&store, 3, vec![f2.clone(), g2.clone()], 2).await;
+        let m3 = store_merge(&store, 3, vec![main[1].clone(), f3.clone()], 1).await;
+
+        let plan = plan_commit_transfer(&store, &m3, Some(&main[1]))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![m3]);
+        assert_eq!(plan.merged.len(), 3);
+        let position = |cid: &ContentId| plan.merged.iter().position(|c| c == cid).unwrap();
+        assert!(position(&f2) < position(&f3));
+        assert!(position(&g2) < position(&f3));
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_pages_cover_the_whole_plan() {
+        // main:    m1 <- m2 <- m3 <- m4 <- m5
+        // feature:  \- f2 <- f3 ----/
+        // The receiver has m2. Pages hold one line commit each.
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 3, None, 1).await;
+        let feature = store_chain(&store, 2, 2, Some(main[0].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![main[2].clone(), feature[1].clone()], 1).await;
+        let m5 = store_chain(&store, 5, 1, Some(m4.clone()), 1).await[0].clone();
+
+        let mut pages = Vec::new();
+        let mut from = Some(m5.clone());
+        while let Some(cid) = from {
+            let page = plan_commit_transfer_page(&store, &cid, Some(&main[1]), 1)
+                .await
+                .unwrap()
+                .unwrap();
+            from = page.next.clone();
+            pages.push(page.plan);
+        }
+
+        let lineage: Vec<ContentId> = pages.iter().rev().flat_map(|p| p.lineage.clone()).collect();
+        assert_eq!(lineage, vec![main[2].clone(), m4, m5.clone()]);
+        // Only the merge's page carries the feature commits.
+        let merged: Vec<&Vec<ContentId>> = pages.iter().map(|p| &p.merged).collect();
+        assert_eq!(merged, [&Vec::new(), &feature, &Vec::new()]);
+
+        // A base off the line is reported by the page that reaches it.
+        let page = plan_commit_transfer_page(&store, &m5, Some(&feature[0]), 1)
+            .await
+            .unwrap()
+            .expect("the first page ends above the base's t");
+        assert!(page.next.is_some());
+        let mut from = page.next;
+        let mut outcome = Some(page.plan);
+        while let (Some(cid), Some(_)) = (from.clone(), outcome.as_ref()) {
+            let page = plan_commit_transfer_page(&store, &cid, Some(&feature[0]), 1)
+                .await
+                .unwrap();
+            from = page.as_ref().and_then(|p| p.next.clone());
+            outcome = page.map(|p| p.plan);
+        }
+        assert_eq!(outcome, None);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_page_counts_merged_commits() {
+        // main:    m1 <- m2 <- m3 <- m4 <- m5
+        // feature:  \- f2 <- f3 <- f4 <- f5 <- f6 -/
+        // The receiver has m2. The merge brings in five commits.
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 3, None, 1).await;
+        let feature = store_chain(&store, 2, 5, Some(main[0].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![main[2].clone(), feature[4].clone()], 1).await;
+        let m5 = store_chain(&store, 5, 1, Some(m4.clone()), 1).await[0].clone();
+
+        // The page stops at the merge, which alone is over the limit.
+        let page = plan_commit_transfer_page(&store, &m5, Some(&main[1]), 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plan.lineage, vec![m4.clone(), m5.clone()]);
+        assert_eq!(page.plan.merged, feature);
+        assert_eq!(page.next, Some(main[2].clone()));
+
+        // Paging advances from there.
+        let page = plan_commit_transfer_page(&store, &main[2], Some(&main[1]), 3)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plan.lineage, vec![main[2].clone()]);
+        assert!(page.plan.merged.is_empty());
+        assert_eq!(page.next, None);
+
+        // A page holds its line commit whatever the merge brings in.
+        let page = plan_commit_transfer_page(&store, &m4, Some(&main[2]), 1)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.plan.lineage, vec![m4]);
+        assert_eq!(page.plan.merged, feature);
+        assert_eq!(page.next, None);
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_skips_what_an_earlier_merge_sent() {
+        // main: m1 <- m2 <- m3 <- m4
+        // x:     \- x2 <- x3 -/     \- x4 <- x5 -/
+        // m2 merges x at x3, m4 merges it again at x5.
+        let store = MemoryContentStore::new();
+        let m1 = store_chain(&store, 1, 1, None, 1).await[0].clone();
+        let x = store_chain(&store, 2, 2, Some(m1.clone()), 2).await;
+        let m2 = store_merge(&store, 2, vec![m1, x[1].clone()], 1).await;
+        let m3 = store_chain(&store, 3, 1, Some(m2.clone()), 1).await[0].clone();
+        let x_later = store_chain(&store, 4, 2, Some(x[1].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![m3.clone(), x_later[1].clone()], 1).await;
+
+        // The receiver has the first merge, so it has x up to x3.
+        let plan = plan_commit_transfer(&store, &m4, Some(&m2))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![m3.clone(), m4.clone()]);
+        assert_eq!(plan.merged, x_later);
+
+        // Same from a base above the first merge.
+        let plan = plan_commit_transfer(&store, &m4, Some(&m3))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.lineage, vec![m4.clone()]);
+        assert_eq!(plan.merged, x_later);
+
+        // A receiver with nothing gets both merges' commits.
+        let plan = plan_commit_transfer(&store, &m4, None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(plan.merged, [x, x_later].concat());
+    }
+
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn plan_commit_transfer_rejects_a_base_off_the_line() {
+        let store = MemoryContentStore::new();
+        let main = store_chain(&store, 1, 3, None, 1).await;
+        let feature = store_chain(&store, 2, 2, Some(main[0].clone()), 2).await;
+        let m4 = store_merge(&store, 4, vec![main[2].clone(), feature[1].clone()], 1).await;
+        let absent = make_test_content_id(ContentKind::Commit, "absent");
+
+        // A merge parent, a commit below it, and a commit the store lacks.
+        for base in [&feature[1], &feature[0], &absent] {
+            let plan = plan_commit_transfer(&store, &m4, Some(base)).await.unwrap();
+            assert_eq!(plan, None);
+        }
     }
 
     // =========================================================================

@@ -38,6 +38,31 @@ use xxhash_rust::xxh64::Xxh64;
 
 /// Directory under the storage root holding the lock and segments.
 pub(super) const WAL_DIR: &str = ".fluree-wal";
+
+/// The file a root-relative storage key names under `base`, or `None` for a
+/// key that is absolute, has a `..` component, or names [`WAL_DIR`].
+pub(super) fn key_path(base: &Path, key: &str) -> Option<PathBuf> {
+    use std::path::Component;
+    let relative = Path::new(key);
+    let refused = relative.is_absolute()
+        || relative.components().any(|c| {
+            matches!(
+                c,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            ) || c.as_os_str() == WAL_DIR
+        });
+    (!refused).then(|| base.join(relative))
+}
+
+/// [`key_path`], as the error a log names a key outside its root with.
+fn record_path(base: &Path, key: &str) -> io::Result<PathBuf> {
+    key_path(base, key).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("log record key '{key}' is not a path under the storage root"),
+        )
+    })
+}
 /// Under `WAL_DIR`, one log directory per owner when several processes
 /// share a root (a Raft cluster's payload store).
 const OWNERS_DIR: &str = "owners";
@@ -469,6 +494,14 @@ pub(super) struct Wal {
     /// Test hook: keep every segment until close, so a test can crash the
     /// log with records still in it however slowly it runs.
     hold_segments: AtomicBool,
+    /// Test hook: the background thread does nothing while set, so a test
+    /// counting the flushes of its own writes counts only those.
+    #[cfg(any(test, feature = "test-hooks"))]
+    background_paused: AtomicBool,
+    /// Held for each pass of the background thread, so pausing it can wait
+    /// out a pass already under way.
+    #[cfg(any(test, feature = "test-hooks"))]
+    background_pass: Mutex<()>,
     /// Owned logs flush every append: on a shared root nothing later flushes
     /// on a payload's behalf, because the head lives in Raft, not in a file.
     flush_every_append: bool,
@@ -756,6 +789,17 @@ fn writeback(file: &File, fsyncs: &AtomicU64) -> io::Result<()> {
     Ok(())
 }
 
+/// Open a written file to hand it to the drive. Windows flushes a file only
+/// through a handle with write access (`FlushFileBuffers`); a Unix
+/// descriptor flushes either way.
+fn open_to_flush(path: &Path) -> io::Result<File> {
+    if cfg!(windows) {
+        std::fs::OpenOptions::new().write(true).open(path)
+    } else {
+        File::open(path)
+    }
+}
+
 /// The Linux batch commit: flush the filesystem holding `base` and wait.
 #[cfg(target_os = "linux")]
 fn syncfs(base: &Path, fsyncs: &AtomicU64) -> io::Result<()> {
@@ -786,8 +830,8 @@ pub(super) fn flush_keys(base: &Path, keys: &[String], fsyncs: &AtomicU64) -> io
     let mut barrier: Option<File> = None;
     let mut any_file = false;
     for key in unique {
-        let path = base.join(key);
-        match File::open(&path) {
+        let path = record_path(base, key)?;
+        match open_to_flush(&path) {
             Ok(file) => {
                 writeback(&file, fsyncs)?;
                 barrier = Some(file);
@@ -850,7 +894,8 @@ fn write_page_cache(path: &Path, bytes: &[u8]) -> io::Result<()> {
     result
 }
 
-fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
+/// Reads `path`. A missing or empty file reads as `None`.
+pub(super) fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.is_empty() => Ok(None),
         Ok(bytes) => Ok(Some(bytes)),
@@ -863,10 +908,18 @@ fn read_opt(path: &Path) -> io::Result<Option<Vec<u8>>> {
 /// write. Replay takes it too: a writer in per-write mode on the same root
 /// may be publishing the same head, and a replayed transition must not land
 /// on top of a newer one.
+///
+/// The lock is a separate `.lock` file because writes replace the data file by rename.
+/// A rename gives the data file a new inode, and a lock on the old inode would not cover it.
 pub(super) fn key_lock(path: &Path) -> io::Result<File> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    open_key_lock(path)
+}
+
+/// Takes the [`key_lock`] for `path` without creating its parent directory.
+pub(super) fn open_key_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .read(true)
         .write(true)
@@ -882,14 +935,14 @@ pub(super) fn key_lock(path: &Path) -> io::Result<File> {
 fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()> {
     match op {
         OwnedOp::Write { key, bytes } => {
-            let path = base.join(key);
+            let path = record_path(base, key)?;
             if read_opt(&path)?.as_deref() != Some(bytes.as_slice()) {
                 write_page_cache(&path, bytes)?;
             }
             touched.push(key.clone());
         }
         OwnedOp::Insert { key, bytes } => {
-            let path = base.join(key);
+            let path = record_path(base, key)?;
             let _lock = key_lock(&path)?;
             if read_opt(&path)?.is_none() {
                 write_page_cache(&path, bytes)?;
@@ -897,7 +950,7 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
             touched.push(key.clone());
         }
         OwnedOp::Cas { key, expected, new } => {
-            let path = base.join(key);
+            let path = record_path(base, key)?;
             let _lock = key_lock(&path)?;
             let current = read_opt(&path)?;
             if current.as_deref() == Some(new.as_slice()) {
@@ -919,7 +972,7 @@ fn apply(base: &Path, op: &OwnedOp, touched: &mut Vec<String>) -> io::Result<()>
             touched.push(key.clone());
         }
         OwnedOp::Delete { key } => {
-            match std::fs::remove_file(base.join(key)) {
+            match std::fs::remove_file(record_path(base, key)?) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
                 Err(e) => return Err(e),
@@ -1196,6 +1249,10 @@ impl Wal {
             lock: Mutex::new(Some(lock)),
             crashed: AtomicBool::new(false),
             hold_segments: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            background_paused: AtomicBool::new(false),
+            #[cfg(any(test, feature = "test-hooks"))]
+            background_pass: Mutex::new(()),
             poisoned: AtomicBool::new(false),
             retiring: Mutex::new(()),
             key_stripes: (0..KEY_STRIPES)
@@ -1581,6 +1638,15 @@ impl Wal {
     }
 
     fn tick(&self) -> io::Result<()> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        let _pass = self
+            .background_pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        #[cfg(any(test, feature = "test-hooks"))]
+        if self.background_paused.load(Ordering::Acquire) {
+            return Ok(());
+        }
         if self.crashed.load(Ordering::Acquire) || self.poisoned.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -1620,6 +1686,19 @@ impl Wal {
     #[doc(hidden)]
     pub fn hold_segments(&self) {
         self.hold_segments.store(true, Ordering::Release);
+    }
+
+    /// Pause or resume the background thread: while paused it flushes,
+    /// rotates and retires nothing. Pausing returns once any pass already
+    /// under way has finished, so no flush of the thread's lands after it.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn pause_background(&self, paused: bool) {
+        self.background_paused.store(paused, Ordering::Release);
+        drop(
+            self.background_pass
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
     }
 
     /// Flush the files each closed segment covered, then remove the segment,
@@ -2321,8 +2400,9 @@ mod tests {
         }
         let before = log.fsyncs_issued();
         let oversized = vec![b'x'; MAX_RECORD_BYTES + 1];
+        let published = oversized.clone();
         storage
-            .compare_and_swap(head, |_| Ok(CasAction::Write::<()>(oversized.clone())))
+            .compare_and_swap(head, move |_| Ok(CasAction::Write::<()>(published.clone())))
             .await
             .unwrap();
         assert!(
@@ -2853,6 +2933,48 @@ mod tests {
             follower.join().unwrap().is_err(),
             "the follower was acknowledged by a flush that could not have covered it"
         );
+    }
+
+    /// A record's key names a file under the root or the record is refused:
+    /// neither replay nor retirement touches a path outside the root.
+    #[test]
+    fn a_record_key_names_a_file_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        assert_eq!(key_path(&root, "a/b"), Some(root.join("a/b")));
+        for key in ["/beside", "../beside", "a/../../beside", WAL_DIR] {
+            assert_eq!(key_path(&root, key), None, "{key}");
+        }
+
+        let mut touched = Vec::new();
+        for op in [
+            OwnedOp::Write {
+                key: "../beside".into(),
+                bytes: b"x".to_vec(),
+            },
+            OwnedOp::Insert {
+                key: "../beside".into(),
+                bytes: b"x".to_vec(),
+            },
+            OwnedOp::Cas {
+                key: "../beside".into(),
+                expected: None,
+                new: b"x".to_vec(),
+            },
+            OwnedOp::Delete {
+                key: "../beside".into(),
+            },
+        ] {
+            let error = apply(&root, &op, &mut touched).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
+        assert!(touched.is_empty());
+        assert!(!dir.path().join("beside").exists());
+
+        let fsyncs = AtomicU64::new(0);
+        let error = flush_keys(&root, &["../beside".to_string()], &fsyncs).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
     }
 
     /// Retiring a segment flushes each file it touched once, however many

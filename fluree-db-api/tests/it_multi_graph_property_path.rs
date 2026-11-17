@@ -130,9 +130,11 @@ WHERE { subj:jazz subj:broader* ?anc }";
         .await;
 }
 
-/// Q2 (characterization) — property path over MULTI-graph `FROM` is guarded.
-/// This is failure 1 in #1405, intentionally left in place (cross-snapshot BFS
-/// is a follow-up); the test asserts the guard still fires.
+/// Q2 (characterization) — property path over a `FROM` spanning ledgers is
+/// guarded. This is failure 1 in #1405, intentionally left in place
+/// (cross-snapshot BFS is a follow-up); the test asserts the guard still
+/// fires. A `FROM` of several graphs of ONE ledger traverses them
+/// (`it_union_default_graph.rs`).
 #[tokio::test]
 async fn q2_multi_graph_property_path_is_guarded() {
     let (fluree, local, handle) = fluree_with_indexer();
@@ -149,8 +151,9 @@ WHERE { ?book lib:subject ?c . ?c subj:broader* subj:arts }";
                 .await
                 .expect_err("multi-graph property path should be rejected");
             assert!(
-                err.to_string()
-                    .contains("Property paths over multi-graph datasets are not supported"),
+                err.to_string().contains(
+                    "Property paths over a default graph spanning ledgers are not supported"
+                ),
                 "unexpected error: {err}"
             );
         })

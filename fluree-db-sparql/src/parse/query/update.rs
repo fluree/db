@@ -1,6 +1,5 @@
 //! SPARQL Update parsing: INSERT, DELETE, and related operations.
 
-use crate::ast::pattern::GraphName;
 use crate::ast::update::{
     Create, DeleteData, DeleteWhere, GraphMgmtRef, GraphOrDefault, GraphRefAll, GraphTransfer,
     InsertData, Load, Modify, QuadData, QuadPattern, QuadPatternElement, UpdateOperation,
@@ -35,9 +34,10 @@ enum TransferKind {
 /// operations and MUST succeed. Collecting from those forms would wrongly
 /// reject them, so they are excluded here.
 ///
-/// Parser-synthesized labels (`#bnpl<N>` from blank-node property lists) are
-/// minted from a counter that is monotonic across the whole request, so they
-/// can never collide across operations; they flow through here harmlessly.
+/// Parser-synthesized labels (`-anon<N>` for `[]`, `-bnpl<N>` for blank-node
+/// property lists) are minted from a counter that is monotonic across the
+/// whole request, so they can never collide across operations; they flow
+/// through here harmlessly.
 pub(super) fn collect_template_bnode_labels(
     op: &UpdateOperation,
     out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
@@ -46,21 +46,17 @@ pub(super) fn collect_template_bnode_labels(
         tp: &crate::ast::TriplePattern,
         out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>,
     ) {
-        use crate::ast::{BlankNodeValue, SubjectTerm, Term};
+        use crate::ast::{SubjectTerm, Term};
 
         fn from_subject(s: &SubjectTerm, out: &mut Vec<(std::sync::Arc<str>, SourceSpan)>) {
             match s {
                 SubjectTerm::BlankNode(bn) => {
-                    if let BlankNodeValue::Labeled(label) = &bn.value {
-                        out.push((label.clone(), bn.span));
-                    }
+                    out.push((bn.label.clone(), bn.span));
                 }
                 SubjectTerm::QuotedTriple(qt) => {
                     from_subject(&qt.subject, out);
                     if let Term::BlankNode(bn) = qt.object.as_ref() {
-                        if let BlankNodeValue::Labeled(label) = &bn.value {
-                            out.push((label.clone(), bn.span));
-                        }
+                        out.push((bn.label.clone(), bn.span));
                     }
                 }
                 // A triple-term value subject (deferred, D-1) — mirror the
@@ -69,9 +65,7 @@ pub(super) fn collect_template_bnode_labels(
                 SubjectTerm::TripleTerm(tt) => {
                     from_subject(&tt.subject, out);
                     if let Term::BlankNode(bn) = &tt.object {
-                        if let BlankNodeValue::Labeled(label) = &bn.value {
-                            out.push((label.clone(), bn.span));
-                        }
+                        out.push((bn.label.clone(), bn.span));
                     }
                 }
                 SubjectTerm::Var(_) | SubjectTerm::Iri(_) => {}
@@ -80,23 +74,17 @@ pub(super) fn collect_template_bnode_labels(
 
         from_subject(&tp.subject, out);
         if let Term::BlankNode(bn) = &tp.object {
-            if let BlankNodeValue::Labeled(label) = &bn.value {
-                out.push((label.clone(), bn.span));
-            }
+            out.push((bn.label.clone(), bn.span));
         }
         if let Some(annotation) = &tp.annotation {
             for unit in &annotation.units {
                 if let Some(crate::ast::annotation::ReifierId::BlankNode(bn)) = &unit.reifier {
-                    if let BlankNodeValue::Labeled(label) = &bn.value {
-                        out.push((label.clone(), bn.span));
-                    }
+                    out.push((bn.label.clone(), bn.span));
                 }
                 if let Some(block) = &unit.block {
                     for entry in &block.entries {
                         if let Term::BlankNode(bn) = &entry.object {
-                            if let BlankNodeValue::Labeled(label) = &bn.value {
-                                out.push((label.clone(), bn.span));
-                            }
+                            out.push((bn.label.clone(), bn.span));
                         }
                     }
                 }
@@ -424,6 +412,7 @@ impl super::Parser<'_> {
         let using = self.parse_using_clause();
 
         // Parse WHERE clause
+        let where_keyword = self.stream.current_span();
         let where_pattern = self.parse_update_where_clause()?;
 
         let span = start.union(self.stream.previous_span());
@@ -434,6 +423,7 @@ impl super::Parser<'_> {
         if let Some(u) = using {
             modify = modify.with_using(u);
         }
+        modify = modify.with_where_keyword(where_keyword);
 
         Some(UpdateOperation::Modify(Box::new(modify)))
     }
@@ -459,6 +449,7 @@ impl super::Parser<'_> {
         let using = self.parse_using_clause();
 
         // Parse WHERE clause
+        let where_keyword = self.stream.current_span();
         let where_pattern = self.parse_update_where_clause()?;
 
         let span = start.union(self.stream.previous_span());
@@ -469,6 +460,7 @@ impl super::Parser<'_> {
         if let Some(u) = using {
             modify = modify.with_using(u);
         }
+        modify = modify.with_where_keyword(where_keyword);
 
         Some(UpdateOperation::Modify(Box::new(modify)))
     }
@@ -599,22 +591,7 @@ impl super::Parser<'_> {
         let start = self.stream.current_span();
         self.stream.advance(); // consume GRAPH
 
-        // Parse graph name (IRI or variable) using the same rules as query GRAPH patterns.
-        let name = if let Some((var_name, var_span)) = self.stream.consume_var() {
-            GraphName::Var(crate::ast::Var::new(var_name.as_ref(), var_span))
-        } else if let Some(iri) = self.parse_iri_term() {
-            GraphName::Iri(iri)
-        } else {
-            self.stream
-                .error_at_current("expected IRI or variable after GRAPH");
-            return None;
-        };
-
-        if !self.stream.match_token(&TokenKind::LBrace) {
-            self.stream
-                .error_at_current("expected '{' after GRAPH name");
-            return None;
-        }
+        let name = self.parse_graph_block_start()?;
 
         // Parse the inner triples (same construct-template grammar as other UPDATE templates).
         let mut triples: Vec<crate::ast::TriplePattern> = Vec::new();

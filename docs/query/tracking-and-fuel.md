@@ -85,6 +85,7 @@ Cost ladder (per event):
 | Row returned by a batched subject probe / SPOT star walk (charged in the primitive, so property-join and nested-loop-join callers pay alike) | 0.001 |
 | Row matched by a nested-loop join's own leaflet scan (subject-driven and object-driven lanes) | 0.001 |
 | Overlay/novelty row materialized | 0.001 |
+| Edge a property path reads while traversing, and row a property path emits | 0.001 each |
 | History row scanned (base + in-range sidecar rows) | 0.001 |
 | R2RML row emitted (Iceberg/Parquet) | 0.001 |
 | Transaction commit baseline (once per commit, including each bulk-import chunk) | 10.000 |
@@ -97,6 +98,7 @@ Cost ladder (per event):
 | `geof:distance` | 0.001 |
 | Vector similarity (`DotProduct`, `CosineSimilarity`, `EuclideanDistance`) | 0.002 |
 | `Fulltext` (per-row BM25 scoring) | 0.005 |
+| Fact processed by an OWL 2 RL round, when the query materializes (a query served from the reasoning cache does not pay it) | 0.001 |
 
 Cheap operations (comparisons, arithmetic, type checks, simple string ops, datetime extraction, etc.) cost zero — instrumentation overhead would dwarf the actual cost.
 
@@ -150,7 +152,7 @@ Set fuel limits via `opts.max-fuel` (decimal allowed). Setting a fuel limit impl
 }
 ```
 
-You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header.
+You can also use `"maxFuel"` or `"max_fuel"` as alternative key names. The HTTP equivalent is the `fluree-max-fuel` header. A SPARQL request names both in its text as `# PRAGMA max-fuel: 1000` and `# PRAGMA meta: true` (or `meta: fuel, time`); see [Request options](sparql.md#request-options--pragma). A pragma's `max-fuel` can lower the header's limit but never raise it, and its `meta` adds to the tracking the `fluree-track-*` headers request but cannot switch it off.
 
 Because the `1.000` query floor is charged before execution and counts toward the limit, `max-fuel` must leave room for it:
 
@@ -218,7 +220,7 @@ The same JSON rides the `x-fdb-reasoning` response header. See
 [Reasoning — materialization budget](reasoning.md#materialization-budget)
 for budget configuration.
 
-Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG and SPARQL UPDATE when tracking headers are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
+Tracked transaction responses (`/insert`, `/upsert`, `/update`, including Turtle/TriG, and SPARQL UPDATE when tracking headers or pragmas are used) expose the same top-level `time`, `fuel`, and `policy` fields when present, alongside the transaction receipt fields.
 
 ## Best Practices
 

@@ -239,3 +239,58 @@ async fn sparql_rule_literal_bound_predicate_variable_does_not_abort_other_rules
          predicate variable, got {rows:?}"
     );
 }
+
+/// A CONSTRUCT template that annotates an edge is rejected by name, not run
+/// with the annotation dropped. One that writes into a named graph runs, and
+/// a graph the ledger does not have is an error naming it rather than a
+/// silent write into the default graph.
+#[tokio::test]
+async fn sparql_rule_head_with_annotation_or_missing_graph_rejected() {
+    for (name, template, expected) in [
+        (
+            "annotatedHead",
+            "?x ex:derived ?y ~ ?r",
+            "annotates an edge",
+        ),
+        (
+            "graphHead",
+            "GRAPH ex:inferred { ?x ex:derived ?y }",
+            "<http://example.org/inferred>, which this ledger does not have",
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger0 = genesis_ledger(&fluree, &format!("datalog/sparql-head-{name}"));
+        let rule_data = json!({
+            "@context": { "f": "https://ns.flur.ee/db#" },
+            "@id": format!("http://example.org/{name}"),
+            "f:rule": {
+                "@type": "https://ns.flur.ee/db#sparql",
+                "@value": format!(
+                    "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT {{ {template} }} WHERE {{ ?x ex:a ?y }}"
+                )
+            }
+        });
+        let ledger = fluree.insert(ledger0, &rule_data).await.unwrap().ledger;
+        let data = json!({
+            "@context": { "ex": "http://example.org/" },
+            "@graph": [ {"@id": "ex:thing", "ex:a": 1} ]
+        });
+        let ledger = fluree.insert(ledger, &data).await.unwrap().ledger;
+
+        let q = json!({
+            "@context": { "ex": "http://example.org/" },
+            "select": "?x",
+            "where": {"@id": "?x", "ex:derived": "?y"},
+            "reasoning": "datalog"
+        });
+        let err = support::query_jsonld(&fluree, &ledger, &q)
+            .await
+            .expect_err("the rule must be rejected, not run without its annotation or graph");
+        let message = err.to_string();
+        assert!(
+            message.contains(name) && message.contains(expected),
+            "{name}: {message}"
+        );
+    }
+}

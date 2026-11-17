@@ -5,6 +5,7 @@
 //! namespace codes, while WASM/offline implementations can use stubs or
 //! context-only encoders.
 
+use crate::ir::triple::{Ref, Term};
 use fluree_db_core::{canonical_split, LedgerSnapshot, NsSplitMode, Sid};
 use fluree_vocab::{rdf, xsd};
 
@@ -23,6 +24,29 @@ pub trait IriEncoder {
     /// Unlike `encode_iri`, this does not fall back to a full-IRI SID.
     fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
         self.encode_iri(iri)
+    }
+
+    /// Lower a constant IRI in subject or predicate position: a SID when the
+    /// prefix is registered, else the IRI for the scan to encode per graph.
+    ///
+    /// The one lowering rule every query surface shares. Operators that need
+    /// a statically known predicate — the nested-loop join's batched probe
+    /// lanes, the planner's stats lookups — test for the SID form and
+    /// silently degrade to per-row paths on `Ref::Iri`, so a surface that
+    /// lowers differently loses those lanes without any test noticing.
+    fn encode_ref(&self, iri: &str) -> Ref {
+        match self.encode_iri_strict(iri) {
+            Some(sid) => Ref::Sid(sid),
+            None => Ref::Iri(iri.into()),
+        }
+    }
+
+    /// Object-position counterpart of [`encode_ref`](Self::encode_ref).
+    fn encode_term(&self, iri: &str) -> Term {
+        match self.encode_iri_strict(iri) {
+            Some(sid) => Term::Sid(sid),
+            None => Term::Iri(iri.into()),
+        }
     }
 }
 

@@ -55,7 +55,8 @@ impl DerivedSet {
             }
             FlakeValue::Double(v) => {
                 2u8.hash(&mut hasher);
-                v.to_bits().hash(&mut hasher);
+                // One key per stored value: every NaN, and -0.0 with 0.0.
+                fluree_db_core::value_id::canonical_f64_bits(*v).hash(&mut hasher);
             }
             FlakeValue::Boolean(v) => {
                 3u8.hash(&mut hasher);
@@ -279,5 +280,30 @@ impl DerivedSet {
             .zip(is_base)
             .filter_map(|(flake, base)| (!base).then_some(flake))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A derived fact and a stored one are the same fact when their objects
+    /// are the same value: every NaN is one value, and -0.0 is 0.0.
+    #[test]
+    fn object_hash_identifies_doubles_by_value() {
+        let hash = |bits: u64| DerivedSet::object_hash(&FlakeValue::Double(f64::from_bits(bits)));
+        let nan = hash(f64::NAN.to_bits());
+        for bits in [
+            0xFFF8_0000_0000_0000u64,
+            0x7FF0_0000_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ] {
+            assert_eq!(hash(bits), nan, "{bits:#x}");
+        }
+        assert_eq!(hash((-0.0f64).to_bits()), hash(0.0f64.to_bits()));
+        assert_ne!(
+            hash(f64::INFINITY.to_bits()),
+            hash(f64::NEG_INFINITY.to_bits())
+        );
     }
 }

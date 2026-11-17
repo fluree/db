@@ -53,10 +53,10 @@ Fluree supports time pinning in graph references.
 
 **Current syntax (implemented today):**
 - `<ledger>:<branch>@t:<t>` — pin to transaction time
-- `<ledger>:<branch>@iso:<rfc3339>` — pin to ISO datetime
+- `<ledger>:<branch>@time:<rfc3339>` — pin to ISO datetime
 - `<ledger>:<branch>@commit:<commit-content-id>` — pin to commit ContentId (prefix allowed)
 
-Note: you may see an `=` form in older design notes (`@t=100`, etc.). That form is **not** the supported user-facing syntax today; use the `@t:` / `@iso:` / `@commit:` forms in docs and examples.
+Note: you may see an `=` form in older design notes (`@t=100`, etc.). That form is **not** the supported user-facing syntax today; use the `@t:` / `@time:` / `@commit:` forms in docs and examples.
 
 From a user perspective:
 - The `@…` portion selects **which snapshot value** you mean for that ledger graph.
@@ -103,21 +103,11 @@ Using `#<named-graph-alias>` is idiomatic RDF identity, but **HTTP clients do no
 That’s fine for graph identity and query semantics, but if you want a dereferenceable HTTP endpoint for a named graph,
 plan to expose a server-visible selector (e.g., `?graph=txn-meta`) in addition to the canonical identity.
 
-### Full IRIs are always allowed
-Semantic web users may prefer full IRIs:
-- `https://data.flur.ee/acme/people:main@t:1000#txn-meta`
+### Full IRIs for ledgers (not implemented)
+A future design would let a full IRI such as `https://data.flur.ee/acme/people:main@t:1000#txn-meta` name a ledger graph. It is not implemented. Today an IRI with a scheme and `//` is always a **graph IRI**, never a ledger address: in `FROM`, `FROM NAMED` or a JSON-LD `from` it names a graph the target ledger has registered under exactly that IRI, and nothing else.
 
-These should be used as-is (no resolution needed).
-
-### Base resolution (“make aliases globally identifiable”)
-Many users prefer short names like `people:main` or `acme/people:main`. To make them globally identifiable:
-- Allow a configured base (SPARQL `BASE <…>` or a connection/query base configuration).
-- Treat alias-style graph references as **relative IRI references** resolved against that base.
-
-Example:
-- Base: `https://data.flur.ee/`
-- Ref: `<acme/people:main@t:1000#txn-meta>`
-- Graph IRI: `https://data.flur.ee/acme/people:main@t:1000#txn-meta`
+### Base resolution (not implemented for ledger references)
+SPARQL `BASE <…>` expands relative dataset IRIs as SPARQL requires, but there is no base that turns an alias into a ledger address. Under `BASE <https://data.flur.ee/>`, `<acme/people:main@t:1000>` expands to the graph IRI `https://data.flur.ee/acme/people:main@t:1000`, which names no ledger. To name a ledger in a query that declares a `BASE`, use its `urn:fluree:` form (`<urn:fluree:acme/people:main@t:1000>`), which `BASE` leaves alone, or, for a ledger name without `/`, its `name:branch` address, which is already an absolute IRI.
 
 ### Character and encoding rules (user-facing)
 To avoid ambiguity and URL pitfalls:
@@ -125,7 +115,8 @@ To avoid ambiguity and URL pitfalls:
   - `@` separates the time specifier
   - `#` separates a named-graph alias (fragment)
   - `:` is used inside the ledger ID as `ledger:branch`
-- **Do not use raw `@` or `#` inside ledger names, branch names, or named-graph aliases**.
+- **Ledger and branch names cannot contain `@`, `#` or `:`** (beyond the one `:` before the branch); see [naming rules](../concepts/ledgers-and-nameservice.md#naming-rules).
+- **Do not use raw `@` or `#` inside named-graph aliases**.
   - If needed, percent-encode them.
 - RFC3339 / ISO timestamps must be URL-safe:
   - Prefer UTC with `Z` (e.g., `2026-02-03T17:02:11Z`).
@@ -151,10 +142,8 @@ Graph sources differ in capabilities:
 
 ## Conventions and examples
 
-### SPARQL: base + pinned graphs
+### SPARQL: pinned graphs
 ```sparql
-BASE <https://data.flur.ee/>
-
 SELECT ?s ?p ?o
 FROM <acme/people:main@t:1000>
 WHERE {
@@ -164,8 +153,6 @@ WHERE {
 
 ### SPARQL: txn metadata named graph
 ```sparql
-BASE <https://data.flur.ee/>
-
 SELECT ?commit ?t
 FROM NAMED <acme/people:main@t:1000#txn-meta>
 WHERE {

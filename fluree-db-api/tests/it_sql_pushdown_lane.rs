@@ -414,10 +414,11 @@ async fn setup() -> (MockServer, Fluree) {
     (server, fluree)
 }
 
-/// Cases the per-scan lane cannot run (a graph source has no native index
-/// for the engine's subquery operator), checked against the native twin
-/// of the shop fixture instead.
-const LANE_ONLY_CASES: &[&str] = &[
+/// Sub-select cases, checked against the native twin of the shop fixture as
+/// well as against the per-scan lane: both lanes evaluate a sub-select by
+/// lowering its body through the R2RML rewrite, so a defect in that shared
+/// plan would be invisible to the lane comparison alone.
+const SUB_SELECT_CASES: &[&str] = &[
     "a sub-select projects an OPTIONAL variable as nullable",
     "a grouped sub-select joins its counts to the outer rows",
     "a grouped sub-select sums in the database and finalizes in the engine",
@@ -427,7 +428,7 @@ const LANE_ONLY_CASES: &[&str] = &[
 ];
 
 /// The shop fixture as a native ledger (`shop-native:main`): the oracle for
-/// shapes the per-scan lane cannot answer.
+/// the sub-select shapes, whose plan the two graph-source lanes share.
 async fn seed_native_twin(fluree: &Fluree) {
     let ledger = fluree
         .create_ledger("shop-native:main")
@@ -1033,14 +1034,18 @@ fn cases() -> Vec<Case> {
         },
         // An entity several resolutions provide (a predicate two maps
         // mint, on the same subject or on different ones) is one derived
-        // table: the resolutions `UNION ALL`ed, each row tagged with its
-        // branch so its terms decode through that branch's maps. Two maps
-        // minting a triple alike (CustomerCountry's copy of Customer's
-        // label) count as one provider: the graph holds the triple once.
+        // table: the resolutions `UNION ALL`ed, each row tagged with how its
+        // terms decode. Two maps minting a triple alike (CustomerCountry's
+        // copy of Customer's label) count as one provider: the graph holds
+        // the triple once. Resolutions over `customers` and `profiles` both
+        // mint `customer/{id}`, so a name equal to an email would give one
+        // solution twice: they decode alike, share a tag, and the statement
+        // is a `SELECT DISTINCT`; `people` mints subjects apart and keeps a
+        // tag of its own.
         Case {
             name: "a predicate two maps provide unions the resolutions at the node",
             sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
-            sql: &[r#"SELECT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t2"."email" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL) AS "u0""#],
+            sql: &[r#"SELECT DISTINCT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t2"."email" AS "c2", 0 AS "c3" FROM "shop"."profiles" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL) AS "u0""#],
             rows: &[
                 "e=ada@example.org l=Ada",
                 "e=ada@example.org l=ada@example.org",
@@ -1053,7 +1058,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "maps with different subjects providing a predicate union their accesses",
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l }",
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 0 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 1 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
             // The subject has no key over the union (two templates), so it
             // decodes per branch; the object is one string column.
             rows: &[
@@ -1073,7 +1078,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a filter on a union variable pushes on the union's column",
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l FILTER(?l = \"Ada\") }",
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 0 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 1 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
             rows: &[
                 "l=Ada s=http://example.org/customer/1",
                 "l=Ada s=http://example.org/person/1",
@@ -1086,7 +1091,7 @@ fn cases() -> Vec<Case> {
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l } ORDER BY DESC(?l) LIMIT 1",
             // Every branch requires the column, so the union's is required
             // and orders exactly.
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 0 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 1 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
             rows: &["l=cy@example.org s=http://example.org/customer/3"],
             routing: Routing::MustFire,
             declined: None,
@@ -1100,7 +1105,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a foreign key into a union entity joins the parent's columns",
             sparql: "SELECT ?o ?l FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c3" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."id" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."id" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c2" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            sql: &[r#"SELECT DISTINCT "t0"."id" AS "c0", "u0"."c3" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."id" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."id" AS "c2", 0 AS "c3" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c2" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
             rows: &[
                 "l=Ada o=http://example.org/order/10",
                 "l=Ada o=http://example.org/order/11",
@@ -1114,7 +1119,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a foreign key into a partitioned union entity keeps its other parts",
             sparql: "SELECT ?o ?l ?k FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l ; ex:country ?k }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c4" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4", "u0"."c3" AS "c5" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."country" AS "c2", "t1"."id" AS "c3", 0 AS "c4" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."country" AS "c2", "t3"."id" AS "c3", 1 AS "c4" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."country" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c3" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            sql: &[r#"SELECT DISTINCT "t0"."id" AS "c0", "u0"."c4" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4", "u0"."c3" AS "c5" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."country" AS "c2", "t1"."id" AS "c3", 0 AS "c4" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."country" AS "c2", "t3"."id" AS "c3", 0 AS "c4" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."country" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c3" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
             rows: &[
                 "k=UK l=Ada o=http://example.org/order/10",
                 "k=UK l=Ada o=http://example.org/order/11",
@@ -1308,12 +1313,33 @@ fn cases() -> Vec<Case> {
             declined: Some("ref object map into a union entity over templates the lane cannot relate"),
         },
         Case {
+            // Cy has no orders, so ?o stays unbound and the second OPTIONAL
+            // joins every order's total, including the customerless one.
             name: "an optional hanging off an optional entity declines",
             sparql: "SELECT ?n ?t FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?o ex:customer ?c } OPTIONAL { ?o ex:total ?t } }",
             sql: &[],
-            rows: &["n=Ada t=5.00", "n=Ada t=99.50", "n=Bo t=42.00", "n=Cy t="],
+            rows: &[
+                "n=Ada t=5.00",
+                "n=Ada t=99.50",
+                "n=Bo t=42.00",
+                "n=Cy t=42.00",
+                "n=Cy t=5.00",
+                "n=Cy t=7.00",
+                "n=Cy t=99.50",
+            ],
             routing: Routing::MustNotFire,
             declined: Some("optional chained on an optional entity"),
+        },
+        Case {
+            // The second `?c ex:name` shares ?k with the OPTIONAL, so it must not
+            // join the star opened above it: Ada and Cy bind ?k to a country no
+            // name equals, and only Bo, with no country, survives.
+            name: "a triple after an optional that reuses its variable declines",
+            sparql: "SELECT ?n ?k FROM <shop-sql:main> WHERE { ?c ex:name ?n OPTIONAL { ?c ex:country ?k } ?c ex:name ?k }",
+            sql: &[],
+            rows: &["k=Bo n=Bo"],
+            routing: Routing::MustNotFire,
+            declined: Some("optional variable already bound"),
         },
         Case {
             name: "an inexact filter inside OPTIONAL declines",
@@ -1656,7 +1682,7 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
 
     for (i, c) in cases.iter().enumerate() {
         let sparql = format!("{PREFIX}{}", c.sparql);
-        if LANE_ONLY_CASES.contains(&c.name) {
+        if SUB_SELECT_CASES.contains(&c.name) {
             let native = native_rows(&fluree, &sparql).await;
             if native != by_value(&lane_rows[i]) {
                 failures.push(format!(
@@ -1664,7 +1690,6 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
                     c.name, lane_rows[i]
                 ));
             }
-            continue;
         }
         set_fast_paths_disabled(true);
         let rows = rows_of(&query(&fluree, &sparql).await);
@@ -2161,14 +2186,28 @@ async fn class_policy_on_a_derived_type_pushes_a_predicate() {
     assert!(!sent[0].contains("kind"), "{}", sent[0]);
 }
 
-/// A sub-select the lane cannot take has no other lane: a graph source has
-/// no native index for the engine's subquery operator, so the query refuses
-/// as it did before the lane took any sub-select at all. Never a silent
-/// empty answer.
+/// A sub-select the lane cannot take falls back to the per-scan lane, which
+/// evaluates it by lowering its body through the R2RML rewrite. Its rows
+/// match the native twin; never a refusal, never a silent empty answer from
+/// the source's (empty) native index. Each shape is stamped `MustNotFire`, so
+/// a change that moves one into the lane shows here, paired with a canary the
+/// lane takes so the absence is not a capture that saw nothing.
 #[tokio::test]
-async fn sub_selects_the_lane_cannot_take_still_refuse() {
+async fn sub_selects_the_lane_cannot_take_are_answered_by_the_scan_lane() {
     let _lock = KILL_SWITCH.lock().await;
     let (_server, fluree) = setup().await;
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+
+    let canary = format!(
+        "{PREFIX}SELECT ?n ?k FROM <shop-sql:main> WHERE {{ ?c ex:name ?n {{ SELECT ?c (COUNT(?o) AS ?k) WHERE {{ ?o ex:customer ?c }} GROUP BY ?c }} }}"
+    );
+    let before = store.find_events("fast-path outcome").len();
+    query(&fluree, &canary).await;
+    assert!(
+        proceeded_sites(&store, before).iter().any(|s| s == SITE),
+        "canary: the lane takes a grouped sub-select, so the capture sees `{SITE}`"
+    );
     let shapes = [
         (
             "a HAVING over an AVG",
@@ -2192,18 +2231,21 @@ async fn sub_selects_the_lane_cannot_take_still_refuse() {
         ),
     ];
     for (what, sparql) in shapes {
-        let err = fluree
+        let sparql = format!("{PREFIX}{sparql}");
+        let before = store.find_events("fast-path outcome").len();
+        let result = fluree
             .query_from()
-            .sparql(&format!("{PREFIX}{sparql}"))
+            .sparql(&sparql)
             .execute_tracked()
             .await
-            .err()
-            .map(|e| e.error.to_string())
-            .unwrap_or_else(|| panic!("{what}: expected a refusal"));
+            .unwrap_or_else(|e| panic!("{what}: {}", e.error));
         assert!(
-            err.contains("cannot be evaluated over a virtual dataset") && err.contains("subquery"),
-            "{what}: {err}"
+            !proceeded_sites(&store, before).iter().any(|s| s == SITE),
+            "{what}: `{SITE}` proceeded on a shape the lane does not take"
         );
+        let rows = by_value(&rows_of(&result.result));
+        assert!(!rows.is_empty(), "{what}: no rows");
+        assert_eq!(rows, native_rows(&fluree, &sparql).await, "{what}");
     }
 }
 
@@ -2368,6 +2410,32 @@ fn aggregate_cases() -> Vec<Case> {
                 "c=http://example.org/customer/2 n=1 s=42.00",
             ],
             routing: Routing::MustFire,
+            declined: None,
+        },
+        // A canary pair: the key-only grouping is one grouped statement, and the
+        // same grouping with a SELECT expression stays in the engine, which
+        // evaluates the expression once per group (#1978); the lane pushes no
+        // per-group BIND.
+        Case {
+            name: "GROUP BY a foreign-key object with COUNT",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c",
+            sql: &[r#"SELECT "t1"."id" AS "c0", COUNT("t0"."id") AS "c1" FROM "shop"."orders" AS "t0" JOIN "shop"."customers" AS "t1" ON "t0"."customer_id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL AND "t1"."id" IS NOT NULL GROUP BY "t1"."id""#],
+            rows: &[
+                "c=http://example.org/customer/1 n=2",
+                "c=http://example.org/customer/2 n=1",
+            ],
+            routing: Routing::MustFire,
+            declined: None,
+        },
+        Case {
+            name: "a grouped SELECT expression stays in the engine",
+            sparql: "SELECT ?c (COUNT(?o) AS ?n) (?n * 10 AS ?m) FROM <shop-sql:main> WHERE { ?o ex:customer ?c } GROUP BY ?c",
+            sql: &[],
+            rows: &[
+                "c=http://example.org/customer/1 m=20 n=2",
+                "c=http://example.org/customer/2 m=10 n=1",
+            ],
+            routing: Routing::MustNotFire,
             declined: None,
         },
         Case {
@@ -2934,14 +3002,35 @@ const MYSQL: LiveBackend = LiveBackend {
         "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
         "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
-    declines: &[],
+    // A union entity's statement needs a `SELECT DISTINCT` over string
+    // columns to answer with set semantics (its maps can mint one subject).
+    // MySQL's default collations fold case and accents, so that DISTINCT
+    // could merge two distinct values ('Ada' and 'ada'): the lane declines to
+    // the per-scan lane ("repeated solutions the statement cannot remove
+    // exactly"), whose rows these cases still check. The same rule as the
+    // live case "DISTINCT over strings runs in the engine where the database
+    // folds case".
+    declines: &[
+        "a predicate two maps provide unions the resolutions at the node",
+        "maps with different subjects providing a predicate union their accesses",
+        "a filter on a union variable pushes on the union's column",
+        "a top-k on a union variable pushes its LIMIT",
+        "a foreign key into a union entity joins the parent's columns",
+        "a foreign key into a partitioned union entity keeps its other parts",
+    ],
 };
 
 /// Maps over the dialect tables, appended to the shop mapping for live runs.
+///
+/// `tags` references `words` on `word`, which is not the word's subject
+/// column, so the registration probe checks `(id, word)` together and proves
+/// `id` alone unique for no map; the declared key does.
 const LIVE_R2RML: &str = r#"
+    @prefix f: <https://ns.flur.ee/db#> .
+
     <http://example.org/mapping#Word>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "words" ] ;
+        rr:logicalTable [ rr:tableName "words" ; f:key ( "id" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/word/{id}" ; rr:class ex:Word ] ;
         rr:predicateObjectMap [ rr:predicate ex:word ; rr:objectMap [ rr:column "word" ] ] ;
         rr:predicateObjectMap [ rr:predicate ex:len ; rr:objectMap [ rr:column "len" ] ] .
@@ -3414,7 +3503,10 @@ async fn live_differential(backend: &LiveBackend) {
     let mut cfg = fluree_db_sql::SqlGsConfig::new(url.clone());
     cfg.dialect = backend.dialect;
     let cfg = cfg.hydrate(None).await.expect("hydrate");
-    let auth = cfg.auth.create_provider_arc().expect("auth");
+    let auth = cfg
+        .auth
+        .create_provider_arc(&fluree_db_iceberg::IdentityContext::default())
+        .expect("auth");
     let client = fluree_db_sql::TrinoClient::new(&cfg, auth).expect("client");
     for stmt in backend.seed {
         client
@@ -3461,12 +3553,10 @@ async fn live_differential(backend: &LiveBackend) {
             .replace("shop-vp:main", "shop-vp-live:main")
             .replace("shop-typed:main", "shop-typed-live:main")
             .replace("shop-memo:main", "shop-memo-live:main");
+        // A sub-select a dialect declines falls back to the per-scan lane,
+        // which lowers its body like any other shape, so its rows are checked
+        // like the rest.
         let declines = backend.declines.contains(&c.name);
-        // A sub-select the lane declines has no other lane here: the query
-        // refuses (pinned in `sub_selects_the_lane_cannot_take_still_refuse`).
-        if declines && LANE_ONLY_CASES.contains(&c.name) {
-            continue;
-        }
         let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         match (&c.routing, c.sql.is_empty()) {
             (Routing::MustFire, false) if declines && !sent.is_empty() => {
@@ -3497,7 +3587,7 @@ async fn live_differential(backend: &LiveBackend) {
                 c.name, c.rows
             ));
         }
-        if LANE_ONLY_CASES.contains(&c.name) {
+        if SUB_SELECT_CASES.contains(&c.name) {
             let native = native_rows(&fluree, &sparql).await;
             if native != by_value(&lane_rows) {
                 failures.push(format!(
@@ -3505,7 +3595,6 @@ async fn live_differential(backend: &LiveBackend) {
                     c.name
                 ));
             }
-            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {
@@ -3944,4 +4033,490 @@ async fn jsonld_blocks_route_like_their_sparql_twins() {
     set_fast_paths_disabled(false);
 
     assert!(failures.is_empty(), "\n{}", failures.join("\n\n"));
+}
+
+// ---------------------------------------------------------------------------
+// The capability probe and IRIs that name no source
+// ---------------------------------------------------------------------------
+
+/// `docs:main`: one default-graph triple, one in `<urn:ex:doc:1>`, one commit.
+async fn docs_ledger(fluree: &Fluree) {
+    let ledger = fluree
+        .create_ledger("docs:main")
+        .await
+        .expect("docs ledger");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            r#"@prefix ex: <http://example.org/> .
+               ex:d ex:title "default graph title" .
+               GRAPH <urn:ex:doc:1> { ex:ep1 ex:title "episode one" . }"#,
+        )
+        .execute()
+        .await
+        .expect("seed docs:main");
+}
+
+/// The outcomes `SITE` stamped since event `from`.
+fn lane_outcomes(store: &span_capture::SpanStore, from: usize) -> Vec<String> {
+    store.find_events("fast-path outcome")[from..]
+        .iter()
+        .filter(|e| e.fields.get("site").map(String::as_str) == Some(SITE))
+        .filter_map(|e| e.fields.get("outcome").cloned())
+        .collect()
+}
+
+/// A GRAPH IRI that addresses a ledger's own graph is not a graph-source id,
+/// and the lane's capability probe must decline it rather than fail the query.
+///
+/// The probe sees every constant `GRAPH <iri>` that names a dataset member,
+/// and `ledger#graph` members (any spelling, `#txn-meta` included) do not
+/// parse as source ids. v4.2.2 turned that parse failure into a 400 ("Invalid
+/// ID format ... branch cannot contain '#'"), which broke the form
+/// `docs/query/datasets.md` documents. Each case also checks that the block
+/// reached the lane's gate, so it keeps exercising the probe.
+#[tokio::test]
+async fn a_ledgers_own_graphs_are_not_sources_to_the_lane() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "unset FLUREE_DISABLE_QUERY_FAST_PATHS: the lane would never probe"
+    );
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let fluree = FlureeBuilder::memory().build_memory();
+    docs_ledger(&fluree).await;
+
+    let ep1 = "e=http://example.org/ep1 t=episode one";
+    let cases: &[(&str, &str, &[&str])] = &[
+        (
+            "a named graph as ledger#graph",
+            "SELECT ?e ?t FROM NAMED <docs:main#urn:ex:doc:1> \
+             WHERE { GRAPH <docs:main#urn:ex:doc:1> { ?e ex:title ?t } }",
+            &[ep1],
+        ),
+        (
+            "a named graph as urn:fluree:ledger#graph",
+            "SELECT ?e ?t FROM NAMED <urn:fluree:docs:main#urn:ex:doc:1> \
+             WHERE { GRAPH <urn:fluree:docs:main#urn:ex:doc:1> { ?e ex:title ?t } }",
+            &[ep1],
+        ),
+        (
+            "txn-meta beside the default graph (datasets.md, Mixed Patterns)",
+            "SELECT ?title ?t FROM <docs:main> FROM NAMED <docs:main#txn-meta> \
+             WHERE { ?d ex:title ?title . \
+                     GRAPH <docs:main#txn-meta> { ?c <https://ns.flur.ee/db#t> ?t } }",
+            &["t=1 title=default graph title"],
+        ),
+        (
+            "the ledger itself, loaded as a member, is declined without a lookup",
+            "SELECT ?d ?t FROM NAMED <docs:main> \
+             WHERE { GRAPH <docs:main> { ?d ex:title ?t } }",
+            &["d=http://example.org/d t=default graph title"],
+        ),
+    ];
+
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    let mut failures: Vec<String> = Vec::new();
+    for (name, body, expected) in cases {
+        let before = store.find_events("fast-path outcome").len();
+        match fluree
+            .query_from()
+            .sparql(&format!("{PREFIX}{body}"))
+            .execute_formatted()
+            .await
+        {
+            Ok(v) if rows_of(&v) == *expected => {}
+            Ok(v) => failures.push(format!("{name}: rows {:?}", rows_of(&v))),
+            Err(e) => failures.push(format!("{name}: query failed: {e}")),
+        }
+        let outcomes = lane_outcomes(&store, before);
+        if outcomes.is_empty() || outcomes.iter().any(|o| o == "proceed") {
+            failures.push(format!(
+                "{name}: expected `{SITE}` declined, got {outcomes:?}"
+            ));
+        }
+    }
+
+    // The JSON-LD twin of the first case reaches the same probe.
+    let before = store.find_events("fast-path outcome").len();
+    let q = json!({
+        "fromNamed": ["docs:main#urn:ex:doc:1"],
+        "select": ["?e", "?t"],
+        "where": [[
+            "graph",
+            "docs:main#urn:ex:doc:1",
+            {"@id": "?e", "http://example.org/title": "?t"}
+        ]],
+    });
+    match fluree.query_from().jsonld(&q).execute_formatted().await {
+        Ok(v) if jsonld_rows_of(&v, &["?e", "?t"]) == [ep1] => {}
+        Ok(v) => failures.push(format!("json-ld fromNamed: rows {v}")),
+        Err(e) => failures.push(format!("json-ld fromNamed: query failed: {e}")),
+    }
+    if lane_outcomes(&store, before).is_empty() {
+        failures.push("json-ld fromNamed: the block never reached the lane".to_string());
+    }
+
+    // No dataset: a GRAPH IRI the ledger does not hold is probed too, and
+    // matches nothing.
+    let before = store.find_events("fast-path outcome").len();
+    match fluree
+        .graph("docs:main")
+        .query()
+        .with_r2rml()
+        .sparql(&format!(
+            "{PREFIX}SELECT ?e ?t WHERE {{ GRAPH <urn:ex:doc:404> {{ ?e ex:title ?t }} }}"
+        ))
+        .execute_formatted()
+        .await
+    {
+        Ok(v) if rows_of(&v).is_empty() => {}
+        Ok(v) => failures.push(format!("graph(): rows {:?}", rows_of(&v))),
+        Err(e) => failures.push(format!("graph(): query failed: {e}")),
+    }
+    if lane_outcomes(&store, before).is_empty() {
+        failures.push("graph(): the block never reached the lane".to_string());
+    }
+    drop(tracing_guard);
+
+    // An id that names nothing still fails at dataset resolution, as before.
+    let err = fluree
+        .query_from()
+        .sparql("SELECT ?s FROM NAMED <nosuch:main> WHERE { GRAPH <nosuch:main> { ?s ?p ?o } }")
+        .execute_formatted()
+        .await
+        .expect_err("an unknown source must not resolve");
+    if !err.is_not_found() {
+        failures.push(format!("unknown source: expected not-found, got {err}"));
+    }
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A nameservice whose graph-source lookups fail, as an unreachable backend's
+/// would. Every other read goes to the real nameservice.
+#[derive(Debug)]
+struct SourceLookupsFail(std::sync::Arc<dyn fluree_db_nameservice::NameServicePublisher>);
+
+const INJECTED: &str = "injected graph-source lookup failure";
+
+mod source_lookups_fail {
+    use super::SourceLookupsFail;
+    use async_trait::async_trait;
+    use fluree_db_nameservice::{
+        ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, LedgerHeads,
+        NameServiceError, NameServiceLookup, NsLookupResult, NsRecord, RefKind, RefLookup,
+        RefValue, Result, StatusLookup, StatusValue,
+    };
+
+    #[async_trait]
+    impl GraphSourceLookup for SourceLookupsFail {
+        async fn lookup_graph_source(&self, _: &str) -> Result<Option<GraphSourceRecord>> {
+            Err(NameServiceError::storage(super::INJECTED))
+        }
+        async fn lookup_any(&self, id: &str) -> Result<NsLookupResult> {
+            self.0.lookup_any(id).await
+        }
+        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+            self.0.all_graph_source_records().await
+        }
+    }
+
+    #[async_trait]
+    impl RefLookup for SourceLookupsFail {
+        async fn get_ref(&self, id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+            self.0.get_ref(id, kind).await
+        }
+    }
+
+    #[async_trait]
+    impl StatusLookup for SourceLookupsFail {
+        async fn get_status(&self, id: &str) -> Result<Option<StatusValue>> {
+            self.0.get_status(id).await
+        }
+    }
+
+    #[async_trait]
+    impl ConfigLookup for SourceLookupsFail {
+        async fn get_config(&self, id: &str) -> Result<Option<ConfigValue>> {
+            self.0.get_config(id).await
+        }
+    }
+
+    #[async_trait]
+    impl NameServiceLookup for SourceLookupsFail {
+        async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
+            self.0.lookup(id).await
+        }
+        async fn all_records(&self) -> Result<Vec<NsRecord>> {
+            self.0.all_records().await
+        }
+        async fn branch_records(&self, name: &str) -> Result<Vec<NsRecord>> {
+            self.0.branch_records(name).await
+        }
+        async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
+            self.0.heads(id).await
+        }
+    }
+}
+
+/// `fluree`'s storage and nameservice, with every graph-source lookup failing.
+fn with_source_lookups_failing(fluree: &Fluree) -> Fluree {
+    let real = fluree
+        .nameservice_mode()
+        .publisher_arc()
+        .expect("read-write nameservice");
+    Fluree::from_backend(
+        fluree.config().clone(),
+        fluree.backend().clone(),
+        fluree_db_api::NameServiceMode::ReadOnly(std::sync::Arc::new(SourceLookupsFail(real))),
+    )
+}
+
+/// A query on the native twin's own view.
+async fn on_twin(fluree: &Fluree, sparql: &str) -> fluree_db_api::Result<Value> {
+    fluree
+        .graph("shop-native:main")
+        .query()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+}
+
+/// A GRAPH IRI that is not a member of the query's dataset is asked about at
+/// run time. When the nameservice cannot say whether it names a mapped source,
+/// the query fails rather than reading the source as an empty graph, off the
+/// lane (the executor's probe) and on it (the lane's capability lookup). A
+/// graph loaded as a ledger graph is never asked about, so queries over
+/// ledgers answer as they do with a healthy nameservice; and an IRI that is no
+/// graph-source id needs no lookup.
+#[tokio::test]
+async fn graph_source_probes_fail_closed_and_skip_ledger_graphs() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let (_server, fluree) = setup().await;
+    let down = with_source_lookups_failing(&fluree);
+
+    let into_source = format!(
+        "{PREFIX}SELECT ?o ?t WHERE {{ GRAPH <shop-sql:main> {{ ?o ex:total ?t FILTER(?t > 40) }} }}"
+    );
+    let into_source_jsonld = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?o", "?t"],
+        "where": [["graph", "shop-sql:main", {"@id": "?o", "ex:total": "?t"}]]
+    });
+    let native = format!("{PREFIX}SELECT ?o ?t WHERE {{ ?o ex:total ?t FILTER(?t > 40) }}");
+    let native_member = format!(
+        "{PREFIX}SELECT ?o ?t FROM NAMED <shop-native:main> \
+         WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t FILTER(?t > 40) }} }}"
+    );
+    let native_default = format!(
+        "{PREFIX}SELECT ?o ?t FROM <shop-native:main> WHERE {{ ?o ex:total ?t FILTER(?t > 40) }}"
+    );
+    let no_source_id =
+        format!("{PREFIX}SELECT ?s WHERE {{ GRAPH <http://example.org/nowhere> {{ ?s ?p ?o }} }}");
+    // A single GRAPH block feeding a COUNT: on the lane this plans the fused
+    // source aggregate, which decides at open whether the graph is a source.
+    let member_count = format!(
+        "{PREFIX}SELECT (COUNT(?o) AS ?n) FROM NAMED <shop-native:main> \
+         WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t }} }}"
+    );
+    let own_id_count = format!(
+        "{PREFIX}SELECT (COUNT(?o) AS ?n) WHERE {{ GRAPH <shop-native:main> {{ ?o ex:total ?t }} }}"
+    );
+
+    let native_rows = rows_of(&on_twin(&fluree, &native).await.expect("native"));
+    assert_eq!(native_rows.len(), 2, "{native_rows:?}");
+    let count_rows = rows_of(&query(&fluree, &member_count).await);
+    assert_eq!(count_rows, ["n=4"]);
+    assert_eq!(
+        rows_of(&on_twin(&fluree, &own_id_count).await.expect("own id")),
+        count_rows
+    );
+
+    let mut failures = Vec::new();
+    for lane_off in [false, true] {
+        set_fast_paths_disabled(lane_off);
+        let lane = if lane_off { "lane off" } else { "lane on" };
+
+        // The backend's fault, so a 500 the client may retry, not a 400.
+        match on_twin(&down, &into_source).await {
+            Err(e) if e.to_string().contains(INJECTED) && e.status_code() == 500 => {}
+            other => failures.push(format!("{lane}: GRAPH <source> gave {other:?}")),
+        }
+        let jsonld = down
+            .graph("shop-native:main")
+            .query()
+            .jsonld(&into_source_jsonld)
+            .execute_formatted()
+            .await;
+        match jsonld {
+            Err(e) if e.to_string().contains(INJECTED) && e.status_code() == 500 => {}
+            other => failures.push(format!("{lane}: JSON-LD graph <source> gave {other:?}")),
+        }
+
+        match on_twin(&down, &native).await {
+            Ok(v) if rows_of(&v) == native_rows => {}
+            other => failures.push(format!("{lane}: the twin's own view gave {other:?}")),
+        }
+        for (name, sparql) in [
+            ("FROM NAMED <ledger> + GRAPH", &native_member),
+            ("FROM <ledger>", &native_default),
+        ] {
+            match down.query_from().sparql(sparql).execute_formatted().await {
+                Ok(v) if rows_of(&v) == native_rows => {}
+                other => failures.push(format!("{lane}: {name} gave {other:?}")),
+            }
+        }
+        match down
+            .query_from()
+            .sparql(&member_count)
+            .execute_formatted()
+            .await
+        {
+            Ok(v) if rows_of(&v) == count_rows => {}
+            other => failures.push(format!(
+                "{lane}: COUNT over the ledger member gave {other:?}"
+            )),
+        }
+        match on_twin(&down, &own_id_count).await {
+            Ok(v) if rows_of(&v) == count_rows => {}
+            other => failures.push(format!("{lane}: COUNT over the own id gave {other:?}")),
+        }
+        match on_twin(&down, &no_source_id).await {
+            Ok(v) if rows_of(&v).is_empty() => {}
+            other => failures.push(format!("{lane}: a non-id GRAPH IRI gave {other:?}")),
+        }
+    }
+    set_fast_paths_disabled(false);
+
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// A union default graph reads the ledger's own graphs, loaded as ledger
+/// graphs, so it answers while every graph-source lookup fails: none of its
+/// members is asked about as a source, including under the names a `GRAPH`
+/// pattern reaches the default graph by (the ledger's address,
+/// `urn:default`), which no registry entry vouches for.
+#[tokio::test]
+async fn a_union_default_graph_never_probes_its_members() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("union-native:main")
+        .await
+        .expect("create");
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:v \"default\" .\n\
+             GRAPH <http://example.org/g> { ex:b ex:v \"named\" . }\n",
+        )
+        .execute()
+        .await
+        .expect("seed");
+    let down = with_source_lookups_failing(&fluree);
+    let mut failures = Vec::new();
+    for (pattern, expected) in [
+        ("?s ex:v ?v", &["v=default", "v=named"][..]),
+        (
+            "GRAPH <union-native:main> { ?s ex:v ?v }",
+            &["v=default"][..],
+        ),
+        ("GRAPH <urn:default> { ?s ex:v ?v }", &["v=default"][..]),
+        (
+            "GRAPH <http://example.org/g> { ?s ex:v ?v }",
+            &["v=named"][..],
+        ),
+    ] {
+        let sparql = format!(
+            "# PRAGMA union-default-graph: true\n\
+             PREFIX ex: <http://example.org/>\n\
+             SELECT ?v WHERE {{ {pattern} }}"
+        );
+        match down
+            .graph("union-native:main")
+            .query()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+        {
+            Ok(v) if rows_of(&v) == expected => {}
+            other => failures.push(format!("{pattern}: {other:?}")),
+        }
+    }
+    assert!(failures.is_empty(), "\n{}", failures.join("\n"));
+}
+
+/// Declining an IRI that names no source is not swallowing a failure: when
+/// the nameservice cannot answer for a well-formed id, the probe fails the
+/// query rather than quietly plan a possible SQL source as a native graph.
+/// The id here, `maybe-source:main`, is a `GRAPH` IRI that a query on the
+/// ledger's view (no dataset) names and the ledger has no graph by, which is
+/// what is still asked about at run time: on the lane (its capability lookup)
+/// and off it (the executor's probe). A dataset member's `GRAPH` never is: a
+/// graph the query loaded as a ledger graph is never asked about, so the
+/// ledger's own graph and the ledger itself, named as dataset members, answer
+/// with the same nameservice down.
+#[tokio::test]
+async fn a_failed_source_lookup_still_fails_the_query() {
+    let _lock = KILL_SWITCH.lock().await;
+    set_fast_paths_disabled(false);
+    let fluree = FlureeBuilder::memory().build_memory();
+    docs_ledger(&fluree).await;
+    let down = with_source_lookups_failing(&fluree);
+
+    let well_formed =
+        format!("{PREFIX}SELECT ?d ?t WHERE {{ GRAPH <maybe-source:main> {{ ?d ex:title ?t }} }}");
+    let lane_on = down
+        .graph("docs:main")
+        .query()
+        .sparql(&well_formed)
+        .execute_formatted()
+        .await;
+    let own_graph = format!(
+        "{PREFIX}SELECT ?e ?t FROM NAMED <docs:main#urn:ex:doc:1> \
+         WHERE {{ GRAPH <docs:main#urn:ex:doc:1> {{ ?e ex:title ?t }} }}"
+    );
+    let own_graph = down
+        .query_from()
+        .sparql(&own_graph)
+        .execute_formatted()
+        .await;
+    let own_ledger = format!(
+        "{PREFIX}SELECT ?d ?t FROM NAMED <docs:main> \
+         WHERE {{ GRAPH <docs:main> {{ ?d ex:title ?t }} }}"
+    );
+    let own_ledger = down
+        .query_from()
+        .sparql(&own_ledger)
+        .execute_formatted()
+        .await;
+    set_fast_paths_disabled(true);
+    let lane_off = down
+        .graph("docs:main")
+        .query()
+        .sparql(&well_formed)
+        .execute_formatted()
+        .await;
+    set_fast_paths_disabled(false);
+
+    for (lane, result) in [("lane on", lane_on), ("lane off", lane_off)] {
+        let err = result.expect_err(&format!("{lane}: a failed lookup must fail the query"));
+        assert!(
+            err.to_string().contains(INJECTED),
+            "{lane}: unexpected error: {err}"
+        );
+        assert_eq!(err.status_code(), 500, "{lane}: {err}");
+    }
+    assert_eq!(
+        rows_of(&own_graph.expect("a ledger's own graph needs no lookup")),
+        ["e=http://example.org/ep1 t=episode one"]
+    );
+    assert_eq!(
+        rows_of(&own_ledger.expect("a ledger loaded as a member needs no lookup")),
+        ["d=http://example.org/d t=default graph title"]
+    );
 }

@@ -8,16 +8,18 @@
 //! easy to get subtly wrong (see [`spawn_leader_watcher`]).
 
 use crate::admin::{self, RaftAdmin};
+use crate::compaction::CompactionStorage;
 use crate::config::FlureeRaftConfig;
 use crate::group::GroupId;
 use crate::log_adapter::LogAdapter;
 use crate::network::{self, HttpClientConfig, RaftHttpClient, RaftTransportConfig};
-use crate::node::NodeId;
+use crate::node::{ClusterNode, NodeId};
 use crate::state_machine::{
     AppStateMachine, ReadOnlyState, StateMachineAdapter, StateMachineObserver,
 };
 use crate::storage::RaftStorage;
-use openraft::{Config as RaftConfig, Raft};
+use openraft::metrics::WaitError;
+use openraft::{Config as RaftConfig, Raft, RaftMetrics};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -231,6 +233,7 @@ pub struct RaftGroup<A: AppStateMachine> {
     /// no-redirects guarantee the SSRF guard depends on.
     pub client: RaftHttpClient,
     transport: RaftTransportConfig,
+    pub(crate) storage: Arc<dyn CompactionStorage>,
 }
 
 impl<A: AppStateMachine> RaftGroup<A> {
@@ -287,6 +290,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
         let raft_config = Arc::new(raft);
         check_election_timeout(&raft_config, &config.transport);
 
+        let compaction_storage: Arc<dyn CompactionStorage> = storage.clone();
         let log = LogAdapter::new(Arc::clone(&storage));
         // `open` restores from the current snapshot if there is one.
         // Required on restart: without it the adapter boots at
@@ -320,6 +324,7 @@ impl<A: AppStateMachine> RaftGroup<A> {
             state,
             client,
             transport: config.transport,
+            storage: compaction_storage,
         })
     }
 
@@ -350,6 +355,22 @@ impl<A: AppStateMachine> RaftGroup<A> {
     pub fn is_leader(&self) -> bool {
         self.raft.metrics().borrow().current_leader == Some(self.node_id)
     }
+
+    /// Wait until this node has applied the entry at `index`, so a read
+    /// of [`Self::state`] here sees that write. `index` comes from
+    /// [`Proposed::log_id`](crate::forward::Proposed::log_id), on any
+    /// node.
+    pub async fn wait_applied(&self, index: u64, timeout: Duration) -> Result<(), WaitError> {
+        self.raft
+            .wait(Some(timeout))
+            .metrics(applied(index), "the entry to apply")
+            .await
+            .map(|_| ())
+    }
+}
+
+pub(crate) fn applied(index: u64) -> impl Fn(&RaftMetrics<NodeId, ClusterNode>) -> bool + Send {
+    move |m| m.last_applied.as_ref().is_some_and(|id| id.index >= index)
 }
 
 // ============================================================================

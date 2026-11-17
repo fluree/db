@@ -140,9 +140,37 @@ pub(crate) struct IcebergCatalogSession {
     /// just to learn the source family.
     #[cfg(feature = "sql")]
     sql_dispatch: Mutex<HashMap<String, Option<Arc<super::sql::SqlSource>>>>,
+    /// The same memo for Delta sources. The memoized source also holds the
+    /// table versions this query reads.
+    #[cfg(feature = "delta")]
+    delta_dispatch: Mutex<HashMap<String, Option<Arc<super::delta::DeltaSource>>>>,
+    /// Per-query memo of each source's compiled mapping. Every caller needing
+    /// it (each schema probe, each table's key lookup, the scans) would
+    /// otherwise repeat the nameservice lookup behind it, two object reads on
+    /// a storage-backed nameservice; the mapping is fixed for the query as the
+    /// source's family already is.
+    mappings: Mutex<HashMap<String, Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>>>,
 }
 
 impl IcebergCatalogSession {
+    pub(crate) fn mapping(
+        &self,
+        graph_source_id: &str,
+    ) -> Option<Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>> {
+        self.mappings.lock().unwrap().get(graph_source_id).cloned()
+    }
+
+    pub(crate) fn memo_mapping(
+        &self,
+        graph_source_id: &str,
+        mapping: Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>,
+    ) {
+        self.mappings
+            .lock()
+            .unwrap()
+            .insert(graph_source_id.to_string(), mapping);
+    }
+
     #[cfg(feature = "sql")]
     pub(crate) fn mark_sql_source(&self, graph_source_id: &str) {
         self.sql_sources
@@ -174,6 +202,30 @@ impl IcebergCatalogSession {
         decision: Option<Arc<super::sql::SqlSource>>,
     ) {
         self.sql_dispatch
+            .lock()
+            .unwrap()
+            .insert(graph_source_id.to_string(), decision);
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn delta_dispatch(
+        &self,
+        graph_source_id: &str,
+    ) -> Option<Option<Arc<super::delta::DeltaSource>>> {
+        self.delta_dispatch
+            .lock()
+            .unwrap()
+            .get(graph_source_id)
+            .cloned()
+    }
+
+    #[cfg(feature = "delta")]
+    pub(crate) fn memo_delta_dispatch(
+        &self,
+        graph_source_id: &str,
+        decision: Option<Arc<super::delta::DeltaSource>>,
+    ) {
+        self.delta_dispatch
             .lock()
             .unwrap()
             .insert(graph_source_id.to_string(), decision);
@@ -407,7 +459,7 @@ mod tests {
     use fluree_db_iceberg::io::S3IcebergStorage;
 
     fn creds(expires_in_secs: Option<i64>) -> VendedCredentials {
-        VendedCredentials {
+        VendedCredentials::S3(fluree_db_iceberg::credential::S3Credentials {
             access_key_id: "AKIA".to_string(),
             secret_access_key: "secret".to_string(),
             session_token: Some("token".to_string()),
@@ -415,7 +467,7 @@ mod tests {
             endpoint: None,
             region: Some("us-east-2".to_string()),
             path_style: false,
-        }
+        })
     }
 
     fn resp(loc: &str, creds: Option<VendedCredentials>) -> LoadTableResponse {
@@ -599,6 +651,7 @@ mod tests {
             key.clone(),
             &resp("s3://snap-A.json", Some(creds(Some(3600)))),
         );
+        #[allow(deprecated)]
         let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await
@@ -631,6 +684,7 @@ mod tests {
         // on; the r2rml helper test drives the same contract end-to-end.
         let s = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        #[allow(deprecated)]
         let storage = Arc::new(IcebergStorageBackend::S3(
             S3IcebergStorage::from_default_chain(Some("us-east-2"), None, false)
                 .await

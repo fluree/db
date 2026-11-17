@@ -52,11 +52,17 @@ The CLI fetches this endpoint when a remote is added (`fluree remote add`) to au
     "scopes": ["openid", "profile"],
     "redirect_port": 8400
   },
-  "serving": { "query": true, "blocks": true }
+  "serving": { "query": true, "blocks": true },
+  "push": { "merged_commits": true },
+  "import": { "modes": ["direct"], "direct_max_bytes": 6291456 }
 }
 ```
 
 The optional `serving` object advertises the server-wide serving capabilities: `query` (the server executes queries) and `blocks` (the storage proxy serves raw replication content, enabling peer/local-compute mode). Per-ledger posture may further restrict either tier — the authoritative per-ledger view is the `serving` array on `GET /v1/fluree/storage/ns/{ledger-id}` responses (see [Query peers](../operations/query-peers.md)).
+
+The optional `push` object advertises push capabilities. `merged_commits: true` means the server implements [`POST /push-merges/*ledger`](../api/endpoints.md#post-push-mergesledger). The CLI pushes a history containing a merge only to a server that advertises it. A server that omits the object, or whose discovery cannot be read, is treated as not supporting it.
+
+The optional `import` object advertises `.flpack` import capabilities. See [Negotiated upload import](../api/endpoints.md#negotiated-upload-import-import-upload) for its fields. A server that omits it is treated as supporting direct import only.
 
 ### `api_base_url`
 
@@ -103,6 +109,51 @@ It is specifically intended to support implementations that:
 
 - Discovery endpoint absent (404 or connection error) → CLI assumes `token` type, prompts user to provide a token manually
 - `version` > 1 → CLI warns but attempts to parse known fields
+
+## Account services
+
+Some servers are not Fluree data APIs but **account services**: the place a person signs in to once per machine (for
+example fluree.ai), whose hosted services, usage and billing belong to the account. The CLI signs in to one with
+[`fluree login`](../cli/login.md) and stores the result in the machine's `account.toml` (global config directory), never in
+a project's remote config. `fluree remote add` refuses such a URL.
+
+An account service's discovery document carries an `account` object and **no top-level `api_base_url`** (that field always
+means a Fluree data API):
+
+```json
+{
+  "version": 1,
+  "service": "fluree.ai",
+  "account": {
+    "api_base_url": "https://fluree.ai/v1",
+    "dashboard_url": "https://fluree.ai",
+    "status_url": "https://fluree.ai/v1/fuel/status"
+  },
+  "auth": {
+    "type": "oidc_device",
+    "issuer": "https://fluree.ai/v1/oauth",
+    "client_id": "fluree-cli",
+    "exchange_url": "https://fluree.ai/v1/oauth/exchange",
+    "scopes": ["openid"]
+  }
+}
+```
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `service` | No | Display name for the service |
+| `account.api_base_url` | Yes | Base of the account's own API (absolute URL, or absolute path resolved against the discovery origin) |
+| `account.dashboard_url` | No | Where a person manages the account (and disconnects machines) |
+| `account.status_url` | No | An endpoint describing the account for a Bearer token |
+
+The flow is the one above with two requirements: the issuer's `openid-configuration` must offer a
+`device_authorization_endpoint` (there is no PKCE fallback for accounts), and the exchange must return a `refresh_token`,
+which the CLI uses with `grant_type=refresh_token` whenever the access token is about to expire. The device request may
+carry a non-standard `device_name` form field (the machine's host name) for the approval page to show. Sign-out is
+`POST {account.api_base_url}/auth/disconnect` with the access token as Bearer; the server should revoke the machine's refresh
+credential. A service that invalidates tokens when the account's configuration changes should answer such a token `401` with the
+code `config_stale` (top-level `error`, or `error.error`): the CLI then refreshes and sends the call once more, and
+`fluree auth token --account --refresh` forces the same renewal for scripts.
 
 ## Token exchange
 
@@ -371,7 +422,7 @@ Common `401` error messages and their causes:
 | `Bearer token required` | No `Authorization: Bearer ...` header | `fluree auth login --remote <name>` |
 | `Invalid token` | Malformed JWT/JWS, bad signature | Re-issue token; check signing key |
 | `Token expired` | `exp` claim is in the past | Refresh or re-login |
-| `Untrusted issuer` | `iss` / signing key not in trusted list | Check `--trusted-issuer` / `--jwks-issuer` config |
+| `Untrusted issuer` | `iss` / signing key not in trusted list | Check `--data-auth-trusted-issuer` (or the events/admin equivalent) / `--jwks-issuer` config |
 | `OIDC issuer not configured` | Token has `kid` header but no JWKS configured | Add `--jwks-issuer` to server config |
 | `Token lacks storage proxy permissions` | Valid token but missing `fluree.storage.*` | Use operator token or `fluree track` instead |
 

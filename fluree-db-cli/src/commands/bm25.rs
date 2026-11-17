@@ -182,7 +182,7 @@ async fn run_list(
 }
 
 async fn local_index_rows(dirs: &FlureeDir) -> CliResult<Vec<IndexRow>> {
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
     let ledgers = fluree.nameservice().all_records().await?;
     let sources = fluree.nameservice().all_graph_source_records().await?;
 
@@ -393,7 +393,7 @@ async fn run_create(
         config = config.with_b(b);
     }
 
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
     let result = fluree
         .create_full_text_index(config)
         .await
@@ -502,7 +502,7 @@ async fn run_sync(
         return Ok(());
     }
 
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
     let result = match target_t {
         Some(t) => fluree.sync_bm25_index_to(index, t, None).await,
         None => fluree.sync_bm25_index(index).await,
@@ -568,7 +568,7 @@ async fn run_drop(
         return report_remote_drop(index, &response);
     }
 
-    let fluree = build_fluree(dirs)?;
+    let fluree = build_fluree(dirs).await?;
     let result = fluree
         .drop_full_text_index(index)
         .await

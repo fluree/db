@@ -13,6 +13,9 @@
 // plain `allow` is the only annotation correct across every binary.
 #![allow(dead_code)]
 
+pub mod hooked_storage;
+pub mod reasoning_lanes;
+pub mod recording_ns;
 pub mod span_capture;
 
 use fluree_db_api::{LedgerState, Novelty};
@@ -263,6 +266,50 @@ pub fn genesis_ledger_for_fluree(_fluree: &fluree_db_api::Fluree, ledger_id: &st
     LedgerState::new(db, Novelty::new(0))
 }
 
+/// Two instances over one storage and one nameservice, each with its own
+/// ledger cache: the shape of several servers sharing S3 and DynamoDB. A
+/// change one makes reaches the other only through storage.
+pub fn instances_sharing_storage() -> (MemoryFluree, MemoryFluree) {
+    let storage = fluree_db_core::MemoryStorage::new();
+    let nameservice = Arc::new(fluree_db_nameservice::memory::MemoryNameService::new());
+    let instance = || {
+        fluree_db_api::FlureeBuilder::memory().build_with(
+            storage.clone(),
+            fluree_db_api::NameServiceMode::ReadWrite(nameservice.clone()),
+        )
+    };
+    (instance(), instance())
+}
+
+// =============================================================================
+// SHACL helpers
+// =============================================================================
+
+/// A ledger config node that enables SHACL, to write with a test's shapes (in
+/// a JSON-LD `@graph`, or on its own). Shapes are enforced only where the
+/// ledger config sets `f:shaclEnabled true`. Full IRIs, so it needs no
+/// `@context`.
+pub fn shacl_enabled_config_node() -> JsonValue {
+    json!({
+        "@id": "urn:config:main",
+        "@type": "https://ns.flur.ee/db#LedgerConfig",
+        "@graph": "config",
+        "https://ns.flur.ee/db#shaclDefaults": {
+            "@id": "urn:config:shacl",
+            "https://ns.flur.ee/db#shaclEnabled": true
+        }
+    })
+}
+
+/// Commit [`shacl_enabled_config_node`] to `ledger`.
+pub async fn enable_shacl(fluree: &MemoryFluree, ledger: MemoryLedger) -> MemoryLedger {
+    fluree
+        .insert(ledger, &shacl_enabled_config_node())
+        .await
+        .expect("enable SHACL in the ledger config")
+        .ledger
+}
+
 // =============================================================================
 // Common seeding helpers
 // =============================================================================
@@ -299,7 +346,11 @@ pub async fn seed_user_with_ssn(
 /// Rebuild and publish a binary index for the ledger's current commit head.
 ///
 /// Use this in regression tests that need to exercise the FIR6/binary-only
-/// reload path rather than the purely in-memory novelty path.
+/// reload path rather than the purely in-memory novelty path. The rebuild
+/// replaces an index already published at the same `t`, so a test that asks
+/// for a full rebuild reads one ([`publish_built_index`]). A branch's
+/// pre-fork commits live in its source's namespace, so the rebuild reads
+/// through the branch-aware store.
 pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: &str) {
     let record = fluree
         .nameservice()
@@ -308,19 +359,14 @@ pub async fn rebuild_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::rebuild_index_from_commits(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         ledger_id,
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
     .await
     .expect("index rebuild should succeed");
-    fluree
-        .publisher()
-        .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
-        .await
-        .expect("publish index");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
 }
 
 /// Like `rebuild_and_publish_index`, but uses `build_index_for_record` which
@@ -335,18 +381,80 @@ pub async fn build_and_publish_index(fluree: &fluree_db_api::Fluree, ledger_id: 
         .expect("nameservice lookup")
         .expect("ledger record should exist");
     let result = fluree_db_indexer::build_index_for_record(
-        fluree.content_store(ledger_id),
+        fluree.branched_content_store(ledger_id).await.unwrap(),
         &record,
         fluree_db_indexer::IndexerConfig::default(),
     )
     .await
     .expect("index build should succeed");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
+}
+
+/// Build the index incrementally over the published one and publish it, with
+/// no fallback to a full rebuild: the build fails if the incremental path
+/// does. For tests whose incremental lane must not quietly become a rebuild.
+#[cfg(feature = "native")]
+pub async fn build_incrementally_and_publish_index(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+) {
+    let record = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    assert!(
+        record.index_head_id.is_some(),
+        "an incremental build needs a published index"
+    );
+    let result = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.branched_content_store(ledger_id).await.unwrap(),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .expect("incremental index build should succeed");
+    publish_built_index(fluree, ledger_id, result.index_t, &result.root_id).await;
+}
+
+/// Publish the index a test built, and fail closed if it didn't take.
+///
+/// `publish_index` declines, silently, an index whose `t` is not newer than
+/// the one already published. So a second build at one `t` (a full rebuild
+/// after an incremental build, a repeat rebuild, or a build that a background
+/// indexer beat to that `t`) left the test reading the index it meant to
+/// replace. This publishes the way `Fluree::reindex` does, replacing an index
+/// of the same `t`, so the test reads the build it asked for. A newer
+/// published index can't be replaced, and that panics: the test's reads would
+/// not see its build. Build the `Fluree` with `without_indexing()` so no
+/// background indexer publishes ahead of the test.
+pub async fn publish_built_index(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    index_t: i64,
+    root_id: &fluree_db_core::ContentId,
+) {
     fluree
         .publisher()
         .expect("read-write nameservice")
-        .publish_index(ledger_id, result.index_t, &result.root_id)
+        .publish_index_allow_equal(ledger_id, index_t, root_id)
         .await
         .expect("publish index");
+    let published = fluree
+        .nameservice()
+        .lookup(ledger_id)
+        .await
+        .expect("nameservice lookup")
+        .expect("ledger record should exist");
+    assert_eq!(
+        published.index_head_id.as_ref(),
+        Some(root_id),
+        "{ledger_id}: the index built at t={index_t} was not published; the \
+         nameservice holds one at t={}. The test would read that index instead. \
+         Is a background indexer running? Build the Fluree `without_indexing()`.",
+        published.index_t
+    );
 }
 
 // =============================================================================
@@ -370,7 +478,9 @@ pub async fn trigger_index_and_wait_outcome(
     ledger_id: &str,
     t: i64,
 ) -> fluree_db_api::IndexOutcome {
-    let completion = handle.trigger(ledger_id, t).await;
+    let completion = handle
+        .trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), t)
+        .await;
     match completion.wait().await {
         ok @ fluree_db_api::IndexOutcome::Completed { .. } => ok,
         fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -431,7 +541,10 @@ pub fn start_background_indexer_with_attachments(
 
     #[async_trait]
     impl AttachmentEventsProvider for TestProvider {
-        async fn attachment_events(&self, ledger_id: &str) -> Option<AttachmentEventCoverage> {
+        async fn attachment_events(
+            &self,
+            ledger_id: &fluree_db_api::LedgerId,
+        ) -> Option<AttachmentEventCoverage> {
             use fluree_db_api::ledger_manager::RunningCoverage;
             let result = self
                 .manager
@@ -503,8 +616,10 @@ pub async fn wait_for_index_application(
         .await
         .expect("notify after reindex");
 
-    // Poll the cached handle's snapshot.t (the *indexed* t).
-    let deadline = Instant::now() + Duration::from_secs(2);
+    // Poll the cached handle's snapshot.t (the *indexed* t). The deadline
+    // bounds a broken path, not a loaded runner — nextest hard-kills a true
+    // hang at 360s, so a short budget here only buys flakes.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let handle = fluree
             .ledger_cached(&canonical)
@@ -793,4 +908,246 @@ pub async fn load_people(fluree: &MemoryFluree) -> Result<String, Box<dyn std::e
 
     fluree.insert(ledger, &insert_txn).await?;
     Ok(ledger_id.to_string())
+}
+
+// =============================================================================
+// Collector end-to-end scenario (shared by the file and the S3 + DynamoDB suites)
+// =============================================================================
+
+/// Indexer settings under which every publish past the second collects:
+/// one old version kept, no age guard.
+#[cfg(feature = "native")]
+pub fn collecting_indexer_config() -> fluree_db_indexer::IndexerConfig {
+    fluree_db_indexer::IndexerConfig {
+        gc_max_old_indexes: 1,
+        gc_min_time_mins: 0,
+        ..fluree_db_indexer::IndexerConfig::small()
+    }
+}
+
+/// Drive a ledger and a fork of it through builds the running worker
+/// collects behind, then drop the fork, and check after each stage that
+/// every dictionary blob a surviving chain references is still in storage.
+///
+/// Subject ids are sequential on purpose: that is the key pattern under
+/// which a reverse-dictionary leaf split recreates a blob an earlier
+/// manifest named as garbage.
+///
+/// `fluree` must be in background indexing mode on `handle`, whose worker
+/// is running with [`collecting_indexer_config`].
+#[cfg(feature = "native")]
+pub async fn run_collector_and_fork_drop_scenario(
+    fluree: &fluree_db_api::Fluree,
+    handle: &fluree_db_indexer::IndexerHandle,
+    ledger_name: &str,
+) {
+    use fluree_db_core::ContentStore;
+    use fluree_db_indexer::{shared_refs_of_branches, BranchIndexHead};
+    use std::time::Duration;
+
+    let main_id = format!("{ledger_name}:main");
+    let dev_id = format!("{ledger_name}:dev");
+    let index_cfg = fluree_db_api::IndexConfig {
+        reindex_min_bytes: 0,
+        reindex_max_bytes: 1_000_000_000,
+    };
+
+    // One transaction of sequential subjects, then a build through the worker.
+    let round = |ledger_id: String, round: usize| {
+        let index_cfg = index_cfg.clone();
+        async move {
+            let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+            let subjects: Vec<_> = (0..40)
+                .map(|i| json!({"@id": format!("ex:item-{:06}", round * 1000 + i), "ex:val": i}))
+                .collect();
+            let tx = json!({
+                "@context": {"ex": "http://example.org/ns/"},
+                "@graph": subjects
+            });
+            let result = fluree
+                .insert_with_opts(
+                    ledger,
+                    &tx,
+                    fluree_db_transact::TxnOpts::default(),
+                    fluree_db_transact::CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("insert");
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
+                    result.receipt.t,
+                )
+                .await;
+            match tokio::time::timeout(Duration::from_secs(120), completion.wait())
+                .await
+                .expect("build timed out: a release window must not wedge the worker")
+            {
+                fluree_db_api::IndexOutcome::Completed { .. } => {}
+                other => panic!("build on {ledger_id} did not complete: {other:?}"),
+            }
+        }
+    };
+
+    // Every dictionary blob `ledger_id`'s whole chain references is present.
+    let assert_dicts_present = |ledger_id: String, stage: &'static str| async move {
+        // Let a pass the last publish spawned finish before looking.
+        drop(
+            handle
+                .hold_gc(&fluree_db_api::LedgerName::parse(ledger_name).unwrap())
+                .await,
+        );
+        let head = fluree
+            .nameservice()
+            .lookup(&ledger_id)
+            .await
+            .expect("lookup")
+            .expect("record")
+            .index_head_id;
+        let refs = shared_refs_of_branches(
+            fluree.backend(),
+            &[BranchIndexHead {
+                ledger_id: fluree_db_api::LedgerId::parse(&ledger_id).unwrap(),
+                index_head_id: head,
+            }],
+            None,
+        )
+        .await
+        .expect("walk chain");
+        assert!(
+            !refs.is_empty(),
+            "{stage}: {ledger_id} references no dictionaries"
+        );
+        let store = fluree.content_store(&ledger_id);
+        for cid in &refs {
+            assert!(
+                store.has(cid).await.expect("has"),
+                "{stage}: {ledger_id} still references dictionary blob {cid}, which is gone"
+            );
+        }
+    };
+
+    fluree.create_ledger(ledger_name).await.expect("create");
+    let first_root = {
+        round(main_id.clone(), 0).await;
+        fluree
+            .nameservice()
+            .lookup(&main_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .index_head_id
+            .expect("first build published")
+    };
+    for r in 1..4 {
+        round(main_id.clone(), r).await;
+    }
+    assert_dicts_present(main_id.clone(), "main alone").await;
+
+    // The collector really ran: the first version is past retention.
+    let store = fluree.content_store(&main_id);
+    let mut collected = false;
+    for _ in 0..100 {
+        if !store.has(&first_root).await.expect("has") {
+            collected = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        collected,
+        "the collector never released the first index version"
+    );
+
+    // Fork, build on the fork, then keep building on main: main's passes now
+    // name blobs the fork's copied root still reads.
+    fluree
+        .create_branch(ledger_name, "dev", None, None)
+        .await
+        .expect("create branch");
+    for r in 10..12 {
+        round(dev_id.clone(), r).await;
+    }
+    for r in 4..7 {
+        round(main_id.clone(), r).await;
+    }
+    assert_dicts_present(main_id.clone(), "after fork").await;
+    assert_dicts_present(dev_id.clone(), "after fork").await;
+
+    let report = tokio::time::timeout(
+        Duration::from_secs(120),
+        fluree.drop_branch(ledger_name, "dev"),
+    )
+    .await
+    .expect("branch drop timed out")
+    .expect("branch drop");
+    assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+    assert_dicts_present(main_id.clone(), "after fork drop").await;
+
+    // And the worker still builds once the drop's window has closed.
+    round(main_id.clone(), 7).await;
+    assert_dicts_present(main_id.clone(), "after a build following the drop").await;
+}
+
+/// The RDF lists `subject predicate` holds in `ledger`'s default graph, each
+/// as its members' integer values, sorted. Read through the shared list
+/// reader, so a list reads the same whether it is stored as positioned
+/// members or as an explicit `rdf:first`/`rdf:rest` chain.
+#[allow(dead_code)]
+pub async fn stored_int_lists(
+    ledger: &LedgerState,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    stored_int_lists_in(ledger, 0, subject, predicate).await
+}
+
+/// [`stored_int_lists`] in graph `g_id`.
+#[allow(dead_code)]
+pub async fn stored_int_lists_in(
+    ledger: &LedgerState,
+    g_id: fluree_db_core::GraphId,
+    subject: &str,
+    predicate: &str,
+) -> Vec<Vec<i64>> {
+    use fluree_db_core::comparator::IndexType;
+    use fluree_db_core::range::{RangeMatch, RangeTest};
+    use fluree_db_core::FlakeValue;
+    let snapshot = &ledger.snapshot;
+    let (Some(s), Some(p)) = (snapshot.encode_iri(subject), snapshot.encode_iri(predicate)) else {
+        return Vec::new();
+    };
+    let db = ledger.as_graph_db_ref(g_id);
+    let values = db
+        .range(
+            IndexType::Spot,
+            RangeTest::Eq,
+            RangeMatch {
+                s: Some(s),
+                p: Some(p),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("range");
+    let read = fluree_db_core::rdf_list::read_lists(db, &values)
+        .await
+        .expect("read lists");
+    assert!(read.malformed == 0 && read.values.is_empty(), "{read:?}");
+    let mut lists: Vec<Vec<i64>> = read
+        .lists
+        .into_iter()
+        .map(|members| {
+            members
+                .into_iter()
+                .map(|m| match m {
+                    FlakeValue::Long(n) => n,
+                    other => panic!("integer member expected, got {other:?}"),
+                })
+                .collect()
+        })
+        .collect();
+    lists.sort();
+    lists
 }

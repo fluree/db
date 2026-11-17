@@ -99,7 +99,9 @@ async fn index_and_load(
     alias: &str,
     t: i64,
 ) -> LedgerState {
-    let completion = handle.trigger(alias, t).await;
+    let completion = handle
+        .trigger(&fluree_db_api::LedgerId::parse(alias).unwrap(), t)
+        .await;
     match completion.wait().await {
         fluree_db_api::IndexOutcome::Completed { .. } => {}
         fluree_db_api::IndexOutcome::Failed(e) => panic!("indexing failed: {e}"),
@@ -712,6 +714,18 @@ async fn fulltext_configured_property_indexed_after_reindex() {
     assert!(
         results.iter().all(|(_, score)| *score > 0.0),
         "all configured-property hits should have positive scores: {results:?}"
+    );
+
+    let sparql = query_fulltext_sparql(
+        &fluree,
+        &loaded,
+        "SELECT ?id ?score WHERE { ?id ex:title ?title \
+         BIND(fulltext(?title, \"Rust\") AS ?score) FILTER(?score > 0) } ORDER BY DESC(?score)",
+    )
+    .await;
+    assert_eq!(
+        sparql, results,
+        "SPARQL fulltext() must score as JSON-LD does"
     );
 }
 
@@ -1971,4 +1985,453 @@ async fn fulltext_perf_50k_labels() {
             hits.len()
         );
     }
+}
+
+// =============================================================================
+// SPARQL `fulltext()` — twins of the JSON-LD queries above
+// =============================================================================
+
+/// Run a SPARQL query projecting `(label, score)` and return the pairs in
+/// result order.
+async fn query_fulltext_sparql(
+    fluree: &support::MemoryFluree,
+    ledger: &support::MemoryLedger,
+    select: &str,
+) -> Vec<(String, f64)> {
+    let sparql =
+        format!("PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#> {select}");
+    let result = support::query_sparql(fluree, ledger, &sparql)
+        .await
+        .unwrap_or_else(|e| panic!("SPARQL fulltext query failed: {e}"));
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            let row = row.as_array().expect("row");
+            (
+                row[0].as_str().expect("label").to_string(),
+                row[1].as_f64().expect("score"),
+            )
+        })
+        .collect()
+}
+
+fn sparql_content_query(call: &str) -> String {
+    format!(
+        "SELECT ?title ?score WHERE {{ ?doc ex:content ?content ; ex:title ?title \
+         BIND({call} AS ?score) FILTER(?score > 0) }} ORDER BY DESC(?score)"
+    )
+}
+
+/// The same scores and order from SPARQL as from JSON-LD, over indexed
+/// documents and over documents committed after the index was built.
+#[tokio::test]
+async fn fulltext_sparql_scores_as_jsonld_does() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let alias = "it/fulltext-sparql:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let db0 = LedgerSnapshot::genesis(alias);
+            let mut ledger = LedgerState::new(db0, Novelty::new(0));
+            for (id, title, content) in [
+                (
+                    "ex:doc1",
+                    "Rust Guide",
+                    "Rust is a systems programming language",
+                ),
+                ("ex:doc2", "Pasta", "Cooking pasta with tomatoes and basil"),
+                (
+                    "ex:doc3",
+                    "Rust Macros",
+                    "Rust macros generate Rust code at compile time",
+                ),
+            ] {
+                ledger = insert_doc(&fluree, ledger, id, title, content).await;
+            }
+            let indexed = index_and_load(&fluree, &handle, alias, ledger.snapshot.t).await;
+
+            let sparql = sparql_content_query("fulltext(?content, \"Rust programming\")");
+            let jsonld = query_fulltext(&fluree, &indexed, "Rust programming").await;
+            assert_eq!(jsonld.len(), 2, "{jsonld:?}");
+            assert_eq!(
+                query_fulltext_sparql(&fluree, &indexed, &sparql).await,
+                jsonld
+            );
+
+            let with_novelty = insert_doc(
+                &fluree,
+                indexed,
+                "ex:doc4",
+                "Rust Book",
+                "Programming in Rust, the book",
+            )
+            .await;
+            let jsonld = query_fulltext(&fluree, &with_novelty, "Rust programming").await;
+            assert_eq!(jsonld.len(), 3, "{jsonld:?}");
+            assert_eq!(
+                query_fulltext_sparql(&fluree, &with_novelty, &sparql).await,
+                jsonld
+            );
+        })
+        .await;
+}
+
+/// `fulltext`, its case and underscore variants, and the namespaced
+/// `f:fulltext` all name the same function.
+#[tokio::test]
+async fn fulltext_sparql_spellings_agree() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut ledger = support::genesis_ledger_for_fluree(&fluree, "it/fulltext-sparql-names:main");
+    for (id, title, content) in [
+        (
+            "ex:doc1",
+            "Rust Guide",
+            "Rust is a systems programming language",
+        ),
+        ("ex:doc2", "Pasta", "Cooking pasta with tomatoes and basil"),
+    ] {
+        ledger = insert_doc(&fluree, ledger, id, title, content).await;
+    }
+
+    let expected = query_fulltext(&fluree, &ledger, "Rust").await;
+    assert_eq!(expected.len(), 1, "{expected:?}");
+    for call in [
+        "fulltext(?content, \"Rust\")",
+        "FULLTEXT(?content, \"Rust\")",
+        "full_text(?content, \"Rust\")",
+        "f:fulltext(?content, \"Rust\")",
+        "<https://ns.flur.ee/db#fulltext>(?content, \"Rust\")",
+    ] {
+        let rows = query_fulltext_sparql(&fluree, &ledger, &sparql_content_query(call)).await;
+        assert_eq!(rows, expected, "{call}");
+    }
+}
+
+/// The JSON-LD form of `f:fullTextDefaults` from the docs: the config node
+/// names the config graph with a per-node `@graph`, and its nested
+/// `f:FullTextDefaults` and `f:FullTextProperty` nodes must land there too.
+#[tokio::test]
+async fn fulltext_configured_through_jsonld_node_graph() {
+    use fluree_db_api::ReindexOptions;
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/fulltext-config-jsonld:main";
+    let ledger = support::genesis_ledger_for_fluree(&fluree, ledger_id);
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [{
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "@type": "f:LedgerConfig",
+                    "@graph": format!("urn:fluree:{ledger_id}#config"),
+                    "f:fullTextDefaults": {
+                        "@type": "f:FullTextDefaults",
+                        "f:defaultLanguage": "en",
+                        "f:property": [
+                            { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } }
+                        ]
+                    }
+                }]
+            }),
+        )
+        .await
+        .expect("write config")
+        .ledger;
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [
+                    { "@id": "ex:doc1", "ex:title": "Rust programming language guide" },
+                    { "@id": "ex:doc2", "ex:title": "Cooking recipes for pasta" }
+                ]
+            }),
+        )
+        .await
+        .expect("insert docs");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+    let hits = query_fulltext_plain(&fluree, &loaded, "Rust").await;
+    let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["ex:doc1"], "{hits:?}");
+}
+
+// =============================================================================
+// `fulltext()` under a policy
+// =============================================================================
+
+/// An indexed ledger with `ex:title` declared in `f:fullTextDefaults`,
+/// `ex:content` typed `@fulltext`, and a reader whose policy class holds
+/// `view_policy`.
+async fn policed_fulltext_ledger(
+    fluree: &support::MemoryFluree,
+    ledger_id: &str,
+    view_policy: JsonValue,
+) -> support::MemoryLedger {
+    use fluree_db_api::ReindexOptions;
+
+    let ledger = support::genesis_ledger_for_fluree(fluree, ledger_id);
+    let ledger = fluree
+        .upsert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [{
+                    "@id": format!("urn:fluree:{ledger_id}:config:ledger"),
+                    "@type": "f:LedgerConfig",
+                    "@graph": format!("urn:fluree:{ledger_id}#config"),
+                    "f:fullTextDefaults": {
+                        "@type": "f:FullTextDefaults",
+                        "f:defaultLanguage": "en",
+                        "f:property": [
+                            { "@type": "f:FullTextProperty", "f:target": { "@id": "ex:title" } }
+                        ]
+                    }
+                }]
+            }),
+        )
+        .await
+        .expect("write config")
+        .ledger;
+    let fulltext = |text: &str| json!({ "@value": text, "@type": "@fulltext" });
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@graph": [
+                    { "@id": "ex:doc1", "@type": "ex:Doc", "ex:title": "graph databases make relationship queries fast",
+                      "ex:content": fulltext("graph databases make relationship queries fast") },
+                    { "@id": "ex:doc2", "@type": "ex:Doc", "ex:title": "time series databases store ordered data",
+                      "ex:content": fulltext("time series databases store ordered data") },
+                    { "@id": "ex:doc3", "@type": "ex:Doc", "ex:title": "a graph of graph algorithms",
+                      "ex:content": fulltext("a graph of graph algorithms") },
+                    { "@id": "ex:reader", "f:policyClass": [{ "@id": "ex:ReaderPolicy" }] },
+                    view_policy
+                ]
+            }),
+        )
+        .await
+        .expect("insert docs");
+    fluree
+        .reindex(ledger_id, ReindexOptions::default())
+        .await
+        .expect("reindex");
+    let loaded = fluree.ledger(ledger_id).await.expect("load");
+    assert!(loaded.index_t() > 0, "the documents must be indexed");
+    loaded
+}
+
+fn allow_every_read() -> JsonValue {
+    json!({
+        "@id": "ex:allow-all",
+        "@type": ["f:AccessPolicy", "ex:ReaderPolicy"],
+        "f:action": [{ "@id": "f:view" }],
+        "f:allow": true
+    })
+}
+
+fn hide_doc3() -> JsonValue {
+    json!({
+        "@id": "ex:all-but-doc3",
+        "@type": ["f:AccessPolicy", "ex:ReaderPolicy"],
+        "f:action": [{ "@id": "f:view" }],
+        "f:query": {
+            "@value": "{\"where\": [[\"filter\", \"(!= ?$this <http://example.org/doc3>)\"]]}",
+            "@type": "http://www.w3.org/2001/XMLSchema#string"
+        }
+    })
+}
+
+enum Surface {
+    JsonLd,
+    Sparql,
+}
+
+/// `(id, score)` of every document `fulltext()` scores above zero for
+/// "graph" on `property`, best first, read as `ex:reader` when `as_reader`.
+/// `joined` adds a class pattern, so the scored value is reached by a join.
+async fn graph_hits(
+    fluree: &support::MemoryFluree,
+    ledger: &support::MemoryLedger,
+    property: &str,
+    surface: Surface,
+    joined: bool,
+    as_reader: bool,
+) -> Vec<(String, f64)> {
+    let mut db = support::graphdb_from_ledger(ledger);
+    if as_reader {
+        let opts = fluree_db_api::GovernanceOptions {
+            identity: Some("http://example.org/reader".to_string()),
+            default_allow: Some(false),
+            ..Default::default()
+        };
+        db = fluree.wrap_policy(db, &opts).await.expect("wrap policy");
+    }
+    let result = match surface {
+        Surface::JsonLd => {
+            let mut pattern = json!({ "@id": "?id", property: "?text" });
+            if joined {
+                pattern["@type"] = json!("ex:Doc");
+            }
+            let query = json!({
+                "@context": fulltext_context(),
+                "select": ["?id", "?score"],
+                "where": [
+                    pattern,
+                    ["bind", "?score", "(fulltext ?text \"graph\")"],
+                    ["filter", "(> ?score 0)"]
+                ],
+                "orderBy": [["desc", "?score"]]
+            });
+            fluree.query(&db, &query).await
+        }
+        Surface::Sparql => {
+            let class = if joined { "a ex:Doc ;" } else { "" };
+            let query = format!(
+                "PREFIX ex: <http://example.org/> PREFIX f: <https://ns.flur.ee/db#> \
+                 SELECT ?id ?score WHERE {{ ?id {class} {property} ?text \
+                 BIND(f:fulltext(?text, \"graph\") AS ?score) FILTER(?score > 0) }} \
+                 ORDER BY DESC(?score)"
+            );
+            fluree.query(&db, query.as_str()).await
+        }
+    }
+    .expect("fulltext query");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("jsonld");
+    rows.as_array()
+        .expect("rows")
+        .iter()
+        .map(|row| {
+            (
+                row[0].as_str().expect("id").to_string(),
+                row[1].as_f64().expect("score"),
+            )
+        })
+        .collect()
+}
+
+async fn assert_reader_scores_match_unrestricted(surface: fn() -> Surface, ledger_id: &str) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = policed_fulltext_ledger(&fluree, ledger_id, allow_every_read()).await;
+    let ledger = assert_reader_matches(&fluree, ledger, &surface, &["ex:doc3", "ex:doc1"]).await;
+
+    let with_novelty = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": fulltext_context(),
+                "@id": "ex:doc4",
+                "@type": "ex:Doc",
+                "ex:title": "graph graph graph",
+                "ex:content": { "@value": "graph graph graph", "@type": "@fulltext" }
+            }),
+        )
+        .await
+        .expect("insert unindexed doc")
+        .ledger;
+    assert_reader_matches(
+        &fluree,
+        with_novelty,
+        &surface,
+        &["ex:doc4", "ex:doc3", "ex:doc1"],
+    )
+    .await;
+}
+
+async fn assert_reader_matches(
+    fluree: &support::MemoryFluree,
+    ledger: support::MemoryLedger,
+    surface: &fn() -> Surface,
+    expected_ids: &[&str],
+) -> support::MemoryLedger {
+    for property in ["ex:title", "ex:content"] {
+        for joined in [false, true] {
+            let unrestricted =
+                graph_hits(fluree, &ledger, property, surface(), joined, false).await;
+            let ids: Vec<&str> = unrestricted.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(
+                ids, expected_ids,
+                "{property} joined={joined}: {unrestricted:?}"
+            );
+            let as_reader = graph_hits(fluree, &ledger, property, surface(), joined, true).await;
+            assert_eq!(as_reader, unrestricted, "{property} joined={joined}");
+        }
+    }
+    ledger
+}
+
+/// A reader who may read everything gets the scores an unrestricted request
+/// gets, on a configured property and on a `@fulltext` value.
+#[tokio::test]
+async fn fulltext_scores_under_an_allow_all_policy() {
+    assert_reader_scores_match_unrestricted(|| Surface::JsonLd, "it/fulltext-policy-jsonld:main")
+        .await;
+}
+
+#[tokio::test]
+async fn fulltext_sparql_scores_under_an_allow_all_policy() {
+    assert_reader_scores_match_unrestricted(|| Surface::Sparql, "it/fulltext-policy-sparql:main")
+        .await;
+}
+
+async fn assert_hidden_document_is_not_a_hit(surface: fn() -> Surface, ledger_id: &str) {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = policed_fulltext_ledger(&fluree, ledger_id, hide_doc3()).await;
+    for property in ["ex:title", "ex:content"] {
+        for joined in [false, true] {
+            let hits = graph_hits(&fluree, &ledger, property, surface(), joined, true).await;
+            let ids: Vec<&str> = hits.iter().map(|(id, _)| id.as_str()).collect();
+            assert_eq!(ids, ["ex:doc1"], "{property} joined={joined}: {hits:?}");
+            // Scores come from statistics over every document of the
+            // property, the hidden one included, so the reader's score is the
+            // unrestricted one. Scoping them to what a policy shows would be
+            // a deliberate change to this assertion.
+            let unrestricted =
+                graph_hits(&fluree, &ledger, property, surface(), joined, false).await;
+            let doc1 = unrestricted
+                .iter()
+                .find(|(id, _)| id == "ex:doc1")
+                .unwrap_or_else(|| panic!("{property}: ex:doc1 unrestricted: {unrestricted:?}"));
+            assert!(
+                unrestricted.iter().any(|(id, _)| id == "ex:doc3"),
+                "{property}: the hidden document matches the term: {unrestricted:?}"
+            );
+            assert_eq!(
+                hits[0].1, doc1.1,
+                "{property} joined={joined}: ex:doc1's score"
+            );
+        }
+    }
+}
+
+/// A document the policy hides is not a hit; the ones it shows still score.
+#[tokio::test]
+async fn fulltext_under_a_policy_omits_a_hidden_document() {
+    assert_hidden_document_is_not_a_hit(|| Surface::JsonLd, "it/fulltext-policy-hide-jsonld:main")
+        .await;
+}
+
+#[tokio::test]
+async fn fulltext_sparql_under_a_policy_omits_a_hidden_document() {
+    assert_hidden_document_is_not_a_hit(|| Surface::Sparql, "it/fulltext-policy-hide-sparql:main")
+        .await;
 }

@@ -182,3 +182,80 @@ async fn a_denied_class_cannot_be_queried() {
         "querying a denied class must not succeed: {response}"
     );
 }
+
+// =========================================================================
+// Execution-level filtering, where the schema cannot help
+// =========================================================================
+
+/// A per-subject rule keeps its property in the SDL, because some subjects do
+/// allow it. Introspection therefore cannot hide the property and the filtering
+/// has to happen while the result is formatted.
+///
+/// Every GraphQL root field lowers to a subgraph projection, so the whole surface
+/// is hydration. Formatting through `to_jsonld_async` passed no policy, and the
+/// hydrated nodes carried other identities' values even though the rows were
+/// filtered correctly.
+#[tokio::test]
+async fn a_per_subject_policy_filters_the_returned_data() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = genesis_ledger(&fluree, "gql-policy-per-subject:main");
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": context(),
+                "@graph": [
+                    { "@id": "ex:alice", "@type": "ex:Person",
+                      "ex:name": "Alice", "ex:ssn": "111-11-1111" },
+                    { "@id": "ex:bob", "@type": "ex:Person",
+                      "ex:name": "Bob", "ex:ssn": "222-22-2222" },
+                    { "@id": "ex:aliceId", "ex:owns": { "@id": "ex:alice" } }
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+
+    // Reveals `ex:ssn` only on the record the caller's identity owns.
+    let own_ssn_only = json!([{
+        "@id": "ex:ownSsn",
+        "@type": "f:AccessPolicy",
+        "f:required": true,
+        "f:action": { "@id": "f:view" },
+        "f:onProperty": [{ "@id": "http://example.org/ssn" }],
+        "f:query": serde_json::to_string(&json!({
+            "where": { "@id": "?$identity", "http://example.org/owns": { "@id": "?$this" } }
+        }))
+        .expect("policy query")
+    }]);
+    let view = restricted_view(&fluree, &ledger, &format!("{EX}aliceId"), own_ssn_only).await;
+
+    // The property survives introspection, so the query below is valid GraphQL
+    // and the only defence left is execution.
+    let sdl = schema_sdl(&view).await.expect("sdl");
+    assert!(
+        sdl.contains("ssn"),
+        "a per-subject rule must leave ssn in the schema, or this test is not \
+         exercising execution-level filtering:\n{sdl}"
+    );
+
+    let response = fluree
+        .graphql(&view, &GraphQlRequest::new("{ persons { id name ssn } }"))
+        .await
+        .expect("graphql request");
+    let body = response.to_string();
+
+    assert!(
+        body.contains("111-11-1111"),
+        "alice owns her own record, so her SSN must still be returned: {response}"
+    );
+    assert!(
+        !body.contains("222-22-2222"),
+        "bob's SSN is denied to this identity and must not be returned: {response}"
+    );
+    assert!(
+        body.contains("Alice") && body.contains("Bob"),
+        "both people stay visible; only the SSN is restricted: {response}"
+    );
+}

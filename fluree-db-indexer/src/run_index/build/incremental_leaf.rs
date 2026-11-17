@@ -72,6 +72,31 @@ pub struct LeafUpdateInput<'a> {
 #[derive(Debug)]
 pub struct NewLeafBlob {
     pub info: LeafInfo,
+    /// Where each of this leaf's leaflets came from in the leaf it replaced,
+    /// in leaflet order. Empty for a leaf with no predecessor.
+    pub leaflet_origins: Vec<LeafletOrigin>,
+    /// The leaf this one replaced; set by the branch update.
+    pub replaced_leaf_cid: Option<fluree_db_core::ContentId>,
+}
+
+impl NewLeafBlob {
+    pub fn fresh(info: LeafInfo) -> Self {
+        Self {
+            info,
+            leaflet_origins: Vec::new(),
+            replaced_leaf_cid: None,
+        }
+    }
+}
+
+/// The leaflet of the replaced leaf a new leaflet was derived from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LeafletOrigin {
+    /// Index of the source leaflet in the replaced leaf.
+    pub leaflet_idx: u32,
+    /// The new leaflet is a byte copy of the source, so it decodes to the
+    /// same columns.
+    pub copied: bool,
 }
 
 /// Output of a leaf update: one or more new leaf blobs.
@@ -114,6 +139,8 @@ pub struct StreamSlices<'a> {
 struct ProcessedLeafletV3 {
     /// Encoded leaflet (column blocks + metadata).
     encoded: EncodedLeafletInfo,
+    /// Index of the source leaflet in the leaf being updated.
+    source_idx: u32,
     /// History entries for this leaflet (merged: new + existing).
     history: Vec<HistEntryV2>,
 }
@@ -171,6 +198,7 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
             processed.push(passthrough_leaflet(
                 input.leaf_bytes,
                 entry,
+                i as u32,
                 dir.payload_base,
                 input.sidecar_bytes,
             )?);
@@ -179,6 +207,7 @@ pub fn update_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdateOutput> 
             let mut merged = merge_and_encode_leaflet(
                 input,
                 entry,
+                i as u32,
                 dir.payload_base,
                 (slices.novelty, slices.novelty_ops),
                 (slices.superseded, slices.superseded_ops),
@@ -320,6 +349,13 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
                 last_key,
                 re_encoded_leaflet_count: 0,
             },
+            leaflet_origins: (0..header.leaflet_count)
+                .map(|leaflet_idx| LeafletOrigin {
+                    leaflet_idx,
+                    copied: true,
+                })
+                .collect(),
+            replaced_leaf_cid: None,
         }],
         matched: Vec::new(),
     })
@@ -329,6 +365,7 @@ fn passthrough_entire_leaf(input: &LeafUpdateInput<'_>) -> io::Result<LeafUpdate
 fn passthrough_leaflet(
     leaf_bytes: &[u8],
     entry: &LeafletDirEntryV3,
+    source_idx: u32,
     payload_base: usize,
     sidecar_bytes: Option<&[u8]>,
 ) -> io::Result<ProcessedLeafletV3> {
@@ -345,6 +382,7 @@ fn passthrough_leaflet(
             dir_entry: clone_dir_entry(entry),
             payload,
         },
+        source_idx,
         history,
     })
 }
@@ -360,6 +398,7 @@ fn passthrough_leaflet(
 fn merge_and_encode_leaflet(
     input: &LeafUpdateInput<'_>,
     entry: &LeafletDirEntryV3,
+    source_idx: u32,
     payload_base: usize,
     (novelty, novelty_ops): (&[RunRecordV2], &[u8]),
     (superseded, superseded_ops): (&[RunRecordV2], &[u8]),
@@ -412,6 +451,7 @@ fn merge_and_encode_leaflet(
     if merged.is_empty() {
         return Ok(vec![ProcessedLeafletV3 {
             encoded: EncodedLeafletInfo::Encoded(empty_encoded_leaflet_with_keys(entry)),
+            source_idx,
             history,
         }]);
     }
@@ -426,6 +466,7 @@ fn merge_and_encode_leaflet(
         widen_leaflet_keys_over_history(&mut encoded, &history, order);
         result.push(ProcessedLeafletV3 {
             encoded: EncodedLeafletInfo::Encoded(encoded),
+            source_idx,
             history,
         });
     } else {
@@ -436,6 +477,7 @@ fn merge_and_encode_leaflet(
             widen_leaflet_keys_over_history(&mut encoded, &chunk_history, order);
             result.push(ProcessedLeafletV3 {
                 encoded: EncodedLeafletInfo::Encoded(encoded),
+                source_idx,
                 history: chunk_history,
             });
         }
@@ -614,6 +656,7 @@ fn assemble_output_leaves(
     // into LeafInfo and drives the per-leaflet portion of CAS-write fuel.
     let mut leaflet_data: Vec<(EncodedLeaflet, Vec<HistEntryV2>, bool)> =
         Vec::with_capacity(processed.len());
+    let mut origins: Vec<LeafletOrigin> = Vec::with_capacity(processed.len());
 
     for p in processed {
         let (encoded, was_re_encoded) = match p.encoded {
@@ -622,6 +665,10 @@ fn assemble_output_leaves(
             }
             EncodedLeafletInfo::Encoded(e) => (e, true),
         };
+        origins.push(LeafletOrigin {
+            leaflet_idx: p.source_idx,
+            copied: !was_re_encoded,
+        });
         leaflet_data.push((encoded, p.history, was_re_encoded));
     }
 
@@ -646,9 +693,15 @@ fn assemble_output_leaves(
 
     // Build each leaf blob.
     let mut output = Vec::with_capacity(leaves.len());
+    let mut origins = origins.into_iter();
     for group in leaves {
+        let leaflet_origins = origins.by_ref().take(group.len()).collect();
         let leaf_info = build_leaf_from_group(group, input.order)?;
-        output.push(NewLeafBlob { info: leaf_info });
+        output.push(NewLeafBlob {
+            info: leaf_info,
+            leaflet_origins,
+            replaced_leaf_cid: None,
+        });
     }
 
     Ok(LeafUpdateOutput {
@@ -1019,6 +1072,45 @@ mod tests {
                 .s_id
                 .as_u64(),
             400
+        );
+    }
+
+    /// Each new leaflet records the leaflet it came from: untouched ones as
+    /// copies at their old index, the touched one (split by the insert) as
+    /// re-encoded from its own.
+    #[test]
+    fn update_records_each_leaflets_origin() {
+        let records: Vec<RunRecordV2> = (1..=300).map(|i| rec2(i * 2, 1, 0, 1)).collect();
+        let (leaf_bytes, sidecar) = build_test_leaf(&records, RunSortOrder::Spot);
+        let novelty = vec![rec2(301, 1, 0, 5)];
+        let ops = vec![1u8];
+        let input = LeafUpdateInput {
+            leaf_bytes: &leaf_bytes,
+            novelty: &novelty,
+            novelty_ops: &ops,
+            superseded: &[],
+            superseded_ops: &[],
+            order: RunSortOrder::Spot,
+            g_id: 0,
+            zstd_level: 1,
+            leaflet_target_rows: 100,
+            leaf_target_rows: 10000,
+            sidecar_bytes: sidecar.as_deref(),
+        };
+        let output = update_leaf(&input).unwrap();
+        let origin = |leaflet_idx, copied| LeafletOrigin {
+            leaflet_idx,
+            copied,
+        };
+        assert_eq!(output.leaves.len(), 1);
+        assert_eq!(
+            output.leaves[0].leaflet_origins,
+            vec![
+                origin(0, true),
+                origin(1, false),
+                origin(1, false),
+                origin(2, true)
+            ]
         );
     }
 

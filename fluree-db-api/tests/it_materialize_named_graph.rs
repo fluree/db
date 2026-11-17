@@ -126,18 +126,91 @@ async fn same_iri_in_two_graphs_stays_isolated_and_unions_types() {
 }
 
 #[tokio::test]
-async fn envelope_form_is_rejected_by_insert() {
-    // Control: the OLD emission form — a named-graph ENVELOPE `{"@id": g,
-    // "@graph": [nodes]}` — is not understood by `parse_insert`. Its `@graph`
-    // ARRAY is skipped, the wrapper collapses to `@id`-only, and the insert is
-    // empty. This is exactly the failure every data-bearing table hit before the
-    // fix, and the reason `nodes_by_graph_to_doc` uses the per-node `@graph` string.
+async fn named_graph_object_form_lands_in_the_named_graph() {
+    // The OLD emission form, a JSON-LD 1.1 named graph `{"@id": g, "@graph":
+    // [nodes]}`, used to be dropped by the insert parser (the content was
+    // skipped and the insert came out empty), which is why
+    // `nodes_by_graph_to_doc` emits the per-node `@graph` string. The parser
+    // now reads named-graph objects: the content lands in `g`.
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = support::genesis_ledger(&fluree, "mat/named-graph-envelope:main");
     let envelope = json!([{ "@id": G1, "@graph": [{ "@id": S, "@type": [ARTICLE] }] }]);
-    let res = fluree.insert(ledger, &envelope).await;
+    let ledger = fluree
+        .insert(ledger, &envelope)
+        .await
+        .expect("a named-graph object inserts its content")
+        .ledger;
+    let g1 = support::query_sparql_formatted(
+        &fluree,
+        &ledger,
+        &format!("SELECT ?t WHERE {{ GRAPH <{G1}> {{ <{S}> a ?t }} }}"),
+    )
+    .await
+    .unwrap()
+    .to_string();
+    assert!(g1.contains("Article"), "the content is in G1: {g1}");
+}
+
+/// A node object nested in a node with a per-node `@graph` belongs to that
+/// graph too, as an embedded node does in JSON-LD — through insert, upsert,
+/// and an update's insert template, for nested nodes with and without `@id`.
+#[tokio::test]
+async fn nested_nodes_land_in_the_enclosing_nodes_graph() {
+    const AUTHOR: &str = "https://www.w3.org/ns/activitystreams#attributedTo";
+    const TAG: &str = "https://www.w3.org/ns/activitystreams#tag";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = support::genesis_ledger(&fluree, "mat/named-graph-nested:main");
+
+    let doc = |s: &str, author: &str| {
+        json!([{
+            "@id": s, "@graph": G1, NAME: "Article",
+            AUTHOR: {"@id": author, NAME: "Bob"},
+            TAG: {NAME: "unnamed tag"}
+        }])
+    };
+    let ledger = fluree
+        .insert(ledger, &doc("urn:a:1", "urn:person:1"))
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .upsert(ledger, &doc("urn:a:2", "urn:person:2"))
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .update(ledger, &json!({"insert": doc("urn:a:3", "urn:person:3")}))
+        .await
+        .unwrap()
+        .ledger;
+
+    let names_in = |graph: Option<&str>| {
+        let query = match graph {
+            Some(g) => format!("SELECT ?n WHERE {{ GRAPH <{g}> {{ ?s <{NAME}> ?n }} }}"),
+            None => format!("SELECT ?n WHERE {{ ?s <{NAME}> ?n }}"),
+        };
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            support::query_sparql_formatted(fluree, ledger, &query)
+                .await
+                .unwrap()
+                .to_string()
+        }
+    };
+    let g1 = names_in(Some(G1)).await;
+    assert_eq!(
+        g1.matches("Bob").count(),
+        3,
+        "nested @id nodes belong in G1: {g1}"
+    );
+    assert_eq!(
+        g1.matches("unnamed tag").count(),
+        3,
+        "nested blank nodes belong in G1: {g1}"
+    );
+    let default = names_in(None).await;
     assert!(
-        res.is_err(),
-        "envelope form must be rejected (documents why the materializer uses per-node @graph); got Ok"
+        !default.contains("Bob") && !default.contains("unnamed tag"),
+        "nothing nested may leak into the default graph: {default}"
     );
 }

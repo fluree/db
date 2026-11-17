@@ -1,0 +1,248 @@
+{
+  "@context": {
+    "id": "@id",
+    "type": "@type",
+    "c": "urn:example:check:org/",
+    "nif": "http://persistence.uni-leipzig.org/nlp2rdf/ontologies/nif-core#",
+    "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+    "rdfs": "http://www.w3.org/2000/01/rdf-schema#",
+    "t": "urn:example:check:",
+    "xsd": "http://www.w3.org/2001/XMLSchema#",
+    "xt": "https://ns.flur.ee/extract#",
+    "prov": "http://www.w3.org/ns/prov#",
+    "run": {
+      "@id": "urn:fluree:run:01M72WJ0KYFWR6FJA8G14VBS1Y-",
+      "@prefix": true
+    },
+    "label": "rdfs:label",
+    "anchorOf": "nif:anchorOf",
+    "beginIndex": "nif:beginIndex",
+    "endIndex": "nif:endIndex",
+    "occurrenceClass": {
+      "@id": "xt:occurrenceClass",
+      "@type": "@id"
+    },
+    "assertionStatus": {
+      "@id": "xt:assertionStatus",
+      "@type": "@id"
+    },
+    "accepted": "xt:accepted",
+    "entity": {
+      "@id": "xt:entity",
+      "@type": "@id"
+    },
+    "localEntity": {
+      "@id": "xt:localEntity",
+      "@type": "@id"
+    },
+    "value": "rdf:value",
+    "unit": {
+      "@id": "xt:unit",
+      "@type": "@id"
+    },
+    "linkConfidence": {
+      "@id": "xt:linkConfidence",
+      "@type": "xsd:double"
+    },
+    "score": {
+      "@id": "xt:score",
+      "@type": "xsd:double"
+    },
+    "subjectOccurrence": {
+      "@id": "xt:subjectOccurrence",
+      "@type": "@id"
+    },
+    "objectOccurrence": {
+      "@id": "xt:objectOccurrence",
+      "@type": "@id"
+    },
+    "referenceContext": {
+      "@id": "nif:referenceContext",
+      "@type": "@id"
+    },
+    "responseLayout": {
+      "@id": "xt:responseLayout",
+      "@type": "@id"
+    },
+    "textSha256": "xt:textSha256",
+    "used": {
+      "@id": "prov:used",
+      "@type": "@id"
+    },
+    "wasAssociatedWith": {
+      "@id": "prov:wasAssociatedWith",
+      "@type": "@id"
+    },
+    "manifestSha256": "xt:manifestSha256",
+    "wasGeneratedBy": {
+      "@id": "prov:wasGeneratedBy",
+      "@type": "@id"
+    },
+    "Claim": "xt:Claim",
+    "LocalEntity": "xt:LocalEntity",
+    "Occurrence": "xt:Occurrence"
+  },
+  "txn-meta": {
+    "used": {
+      "@id": "urn:example:api:invoice"
+    },
+    "wasAssociatedWith": {
+      "@id": "https://ns.flur.ee/model/example-reader-1.0"
+    },
+    "manifestSha256": "d14dd92e5dc5fc31fe5755e5b7dac8fde584fc0b67bc3eedc74cf66531ec2826",
+    "responseLayout": {
+      "@id": "https://ns.flur.ee/extract/response/2"
+    },
+    "xt:run": {
+      "@id": "urn:fluree:run:01M72WJ0KYFWR6FJA8G14VBS1Y"
+    },
+    "textSha256": "c78136a12d75baa62cf24742a8084ef10a063e395ea77658bf890334c557208e"
+  },
+  "@graph": [
+    {
+      "id": "xt:mentions",
+      "@graph": [
+        {
+          "id": "run:o22-35",
+          "type": [
+            "Occurrence",
+            "nif:RFC5147String"
+          ],
+          "anchorOf": "DX-2026-07731",
+          "beginIndex": 22,
+          "endIndex": 35,
+          "occurrenceClass": "t:Invoice",
+          "localEntity": "urn:fluree:entity:d64n9b-kstx8ha68g50ryhb",
+          "score": 1.0,
+          "referenceContext": "urn:example:api:invoice",
+          "xt:qualifier": "abstained"
+        },
+        {
+          "id": "run:o46-79",
+          "type": [
+            "Occurrence",
+            "nif:RFC5147String"
+          ],
+          "anchorOf": "Daxin Scientific Supply Co., Ltd.",
+          "beginIndex": 46,
+          "endIndex": 79,
+          "occurrenceClass": "t:Organization",
+          "entity": "c:daxin",
+          "linkConfidence": 0.9924227595329285,
+          "referenceContext": "urn:example:api:invoice"
+        },
+        {
+          "id": "run:o86-96",
+          "type": [
+            "Occurrence",
+            "nif:RFC5147String"
+          ],
+          "anchorOf": "2026/08/06",
+          "beginIndex": 86,
+          "endIndex": 96,
+          "occurrenceClass": "xsd:date",
+          "value": {
+            "@value": "2026-08-06",
+            "type": "xsd:date"
+          },
+          "score": 1.0,
+          "referenceContext": "urn:example:api:invoice",
+          "xt:qualifier": "abstained"
+        },
+        {
+          "id": "run:o163-165",
+          "type": [
+            "Occurrence",
+            "nif:RFC5147String"
+          ],
+          "anchorOf": "10",
+          "beginIndex": 163,
+          "endIndex": 165,
+          "occurrenceClass": "xsd:integer",
+          "value": 10,
+          "score": 1.0,
+          "referenceContext": "urn:example:api:invoice",
+          "xt:qualifier": "abstained"
+        },
+        {
+          "id": "run:o166-175",
+          "type": [
+            "Occurrence",
+            "nif:RFC5147String"
+          ],
+          "anchorOf": "NT$517.00",
+          "beginIndex": 166,
+          "endIndex": 175,
+          "occurrenceClass": "xt:MonetaryAmount",
+          "value": {
+            "@value": "517",
+            "type": "xsd:decimal"
+          },
+          "unit": {
+            "@value": "TWD"
+          },
+          "score": 0.9999971389770508,
+          "referenceContext": "urn:example:api:invoice",
+          "xt:qualifier": "abstained"
+        },
+        {
+          "id": "run:o184-195",
+          "type": [
+            "Occurrence",
+            "nif:RFC5147String"
+          ],
+          "anchorOf": "NT$5,170.00",
+          "beginIndex": 184,
+          "endIndex": 195,
+          "occurrenceClass": "xt:MonetaryAmount",
+          "value": {
+            "@value": "5170",
+            "type": "xsd:decimal"
+          },
+          "unit": {
+            "@value": "TWD"
+          },
+          "score": 0.9999998807907104,
+          "referenceContext": "urn:example:api:invoice",
+          "xt:qualifier": "abstained"
+        },
+        {
+          "id": "urn:fluree:entity:d64n9b-kstx8ha68g50ryhb",
+          "type": "LocalEntity"
+        }
+      ]
+    },
+    {
+      "id": "urn:fluree:entity:d64n9b-kstx8ha68g50ryhb",
+      "type": "t:Invoice",
+      "label": "DX-2026-07731",
+      "t:supplier": {
+        "@id": "c:daxin",
+        "@annotation": {
+          "@id": "run:r-0",
+          "type": "Claim",
+          "assertionStatus": "xt:affirmed",
+          "accepted": true,
+          "score": 1.0,
+          "subjectOccurrence": "run:o22-35",
+          "objectOccurrence": "run:o46-79",
+          "wasGeneratedBy": "urn:fluree:run:01M72WJ0KYFWR6FJA8G14VBS1Y"
+        }
+      },
+      "t:total": {
+        "@value": "5170",
+        "@type": "xsd:decimal",
+        "@annotation": {
+          "@id": "run:r-1",
+          "type": "Claim",
+          "assertionStatus": "xt:affirmed",
+          "accepted": true,
+          "score": 0.9999978542327881,
+          "subjectOccurrence": "run:o22-35",
+          "objectOccurrence": "run:o184-195",
+          "wasGeneratedBy": "urn:fluree:run:01M72WJ0KYFWR6FJA8G14VBS1Y"
+        }
+      }
+    }
+  ]
+}

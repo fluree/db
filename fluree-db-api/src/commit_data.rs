@@ -1,5 +1,5 @@
-//! Fold a sequence of commits into the flakes and `namespace_delta` /
-//! `graph_delta` of ONE new commit.
+//! Fold a sequence of commits into the flakes, `namespace_delta` and named
+//! graphs of ONE new commit.
 //!
 //! Used by the merge and revert paths to bundle multiple source commits into
 //! a single commit. Because that commit lands at a single `t`, and novelty
@@ -9,19 +9,90 @@
 //! then restored folds to nothing. The netting contract is
 //! [`NetChangeAccumulator`]'s.
 
-use fluree_db_core::{Commit, Flake};
+use fluree_db_core::graph_registry::CONFIG_GRAPH_ID;
+use fluree_db_core::{Commit, ConflictKey, ContentId, Flake, Sid};
 use fluree_db_novelty::NetChangeAccumulator;
-use std::collections::HashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+/// Which flakes on one side of a branch comparison are that side's own
+/// changes, tracked as its commits are walked oldest-first.
+///
+/// A merge whose merged-in history the other side already holds is not one
+/// of the side's own commits. Its flakes on keys this side never changed are
+/// copies of the other side's changes. Applying them again brings back
+/// values the other side has since replaced, and comparing them reports
+/// conflicts on keys this side never touched. Its flakes on keys this side
+/// did change are how that merge resolved the overlap, and dropping those
+/// would undo the resolution.
+pub(crate) struct OwnChanges<'a> {
+    own: HashSet<&'a ContentId>,
+    keys: FxHashSet<ConflictKey>,
+}
+
+impl<'a> OwnChanges<'a> {
+    /// `own` is the side's own commits, as `BranchSide::own` reports them.
+    pub(crate) fn new(own: &'a [ContentId]) -> Self {
+        Self {
+            own: own.iter().collect(),
+            keys: FxHashSet::default(),
+        }
+    }
+
+    /// Whether the side made commit `cid` itself.
+    pub(crate) fn is_own(&self, cid: &ContentId) -> bool {
+        self.own.contains(cid)
+    }
+
+    /// Record `cid`'s changes, dropping the flakes that copy the other
+    /// side's. Commits must arrive oldest-first, because a merge's
+    /// resolution covers only keys the side changed before it.
+    pub(crate) fn retain_changes(&mut self, cid: &ContentId, flakes: &mut Vec<Flake>) {
+        if self.is_own(cid) {
+            self.keys.extend(flakes.iter().map(key_of));
+        } else {
+            flakes.retain(|flake| self.keys.contains(&key_of(flake)));
+        }
+    }
+
+    /// Every key the side has changed so far.
+    pub(crate) fn into_keys(self) -> FxHashSet<ConflictKey> {
+        self.keys
+    }
+}
+
+/// The (subject, predicate, graph) key `flake` changes.
+pub(crate) fn key_of(flake: &Flake) -> ConflictKey {
+    ConflictKey::new(flake.s.clone(), flake.p.clone(), flake.g.clone())
+}
+
+/// A range's net change: one flake per surviving fact, and for an undo the
+/// facts among them whose deciding commit held a same-`t` pair. The
+/// positions index `flakes`, so the two only travel together.
+#[derive(Default)]
+pub(crate) struct NetChange {
+    /// One flake per surviving fact. Unordered.
+    pub(crate) flakes: Vec<Flake>,
+    /// For an undo, the positions in `flakes` of facts whose deciding commit
+    /// held a same-`t` retraction and assertion of them: what undoing that
+    /// commit leaves depends on the fact's presence before it
+    /// (`branch_validation::undo_same_t_pairs`). Empty for a replay, whose
+    /// pairs resolve to the assertion, the state at the range head.
+    pub(crate) same_t_pairs: Vec<usize>,
+}
 
 /// Flakes and metadata accumulated from a sequence of commits.
 #[derive(Default)]
 pub(crate) struct CollectedCommitData {
-    /// The range's net change, one flake per surviving fact. Unordered.
-    pub(crate) flakes: Vec<Flake>,
+    /// The range's net change.
+    pub(crate) net: NetChange,
     /// Union of namespace deltas; earlier commits win on key collisions.
     pub(crate) namespace_delta: HashMap<u16, String>,
-    /// Union of graph deltas; earlier commits win on key collisions.
-    pub(crate) graph_delta: HashMap<u16, String>,
+    /// Named graphs the range's commits list, by IRI. Unioned by IRI: each
+    /// commit keys its graphs by its own branch's ids (older commits by
+    /// transaction-local numbers), so keys from different commits can
+    /// collide while naming different graphs.
+    pub(crate) graph_iris: BTreeSet<String>,
 }
 
 /// Which direction the new commit applies the range in.
@@ -38,8 +109,8 @@ pub(crate) enum Fold {
 /// Fold `commits` into a [`CollectedCommitData`].
 ///
 /// Commits must be supplied in **oldest-first** order so that earlier
-/// commits take precedence on namespace and graph delta keys (matches the
-/// historical `or_insert` semantics in `merge.rs::collect_commit_data`).
+/// commits take precedence on namespace delta keys (matches the historical
+/// `or_insert` semantics in `merge.rs::collect_commit_data`).
 ///
 /// Flake `t` is not a concern here: `StagedLedger::new` restamps every
 /// staged flake.
@@ -54,15 +125,16 @@ where
         for (code, prefix) in commit.namespace_delta {
             data.namespace_delta.entry(code).or_insert(prefix);
         }
-        for (g_id, iri) in commit.graph_delta {
-            data.graph_delta.entry(g_id).or_insert(iri);
-        }
+        data.graph_iris.extend(commit.graph_delta.into_values());
     }
 
     // The accumulator wants the range newest-change-first. For a replay
-    // that is the newest commit, last flake first. For an undo the inverse
-    // of the oldest commit is applied last, so the oldest commit's inverse
-    // comes first and each commit's own flakes keep their order.
+    // that is the newest commit first. For an undo the inverse of the
+    // oldest commit is applied last, so the oldest commit's inverse comes
+    // first. Within one commit order does not matter: the accumulator
+    // resolves a same-`t` retraction and assertion of one fact to the
+    // assertion and, for an undo, reports the pair, which the caller
+    // resolves by the fact's presence before that commit.
     let mut acc = NetChangeAccumulator::default();
     match fold {
         Fold::Replay => {
@@ -73,13 +145,190 @@ where
             }
         }
         Fold::Undo => {
+            let mut skipped = 0usize;
             for flakes in &ordered {
                 for flake in flakes {
+                    if is_malformed_retraction(flake) {
+                        skipped += 1;
+                        continue;
+                    }
                     acc.push_newest_first(&flake.invert());
                 }
             }
+            if skipped > 0 {
+                tracing::warn!(
+                    skipped,
+                    "revert skipped retractions no stored fact could match (an \
+                     rdf:langString without a language tag, or a tag on another \
+                     datatype); undoing one would assert an invalid literal"
+                );
+            }
         }
     }
-    data.flakes = acc.finish();
+    data.net = match fold {
+        Fold::Replay => NetChange {
+            flakes: acc.finish(),
+            same_t_pairs: Vec::new(),
+        },
+        Fold::Undo => {
+            let (flakes, same_t_pairs) = acc.finish_with_pairs();
+            NetChange {
+                flakes,
+                same_t_pairs,
+            }
+        }
+    };
     data
+}
+
+/// One graph Sid for the config graph in the flakes and keys a branch
+/// operation folds and compares.
+///
+/// Any ledger's config graph IRI names the config graph, so a history can
+/// hold its config under several (its own, its source branch's, a renamed
+/// ledger's), each a different Sid. Folded or compared by graph, one fact
+/// under two would count as two: a same-`t` retraction under one would win
+/// over the assertion under the other, and a conflict between them would go
+/// unseen. Each takes the Sid the target names its config graph by, which
+/// its state resolves.
+pub(crate) struct ConfigGraphs {
+    ns: fluree_db_transact::NamespaceRegistry,
+    registry: fluree_db_core::GraphRegistry,
+    canonical: Option<Sid>,
+    known: FxHashMap<Sid, bool>,
+}
+
+impl ConfigGraphs {
+    /// For a change staged on `target`.
+    pub(crate) fn for_target(target: &fluree_db_ledger::LedgerState) -> Self {
+        Self::for_snapshot(&target.snapshot)
+    }
+
+    /// For a change staged on a target whose head is `snapshot`.
+    pub(crate) fn for_snapshot(snapshot: &fluree_db_core::LedgerSnapshot) -> Self {
+        let ns = fluree_db_transact::NamespaceRegistry::from_db(snapshot);
+        let registry = &snapshot.graph_registry;
+        let canonical = registry
+            .iri_for_graph_id(CONFIG_GRAPH_ID)
+            .into_iter()
+            .chain(registry.iter_aliases().map(|(_, iri)| iri))
+            .find_map(|iri| ns.lookup_sid_for_iri(iri));
+        Self {
+            ns,
+            registry: registry.clone(),
+            canonical,
+            known: FxHashMap::default(),
+        }
+    }
+
+    /// Learn the namespace codes a commit brings in, which its flakes may
+    /// use. One that conflicts with the target's is the operation's to
+    /// refuse; it decodes no graph here.
+    pub(crate) fn adopt(&mut self, namespace_delta: &HashMap<u16, String>) {
+        let _ = self.ns.adopt_delta_for_persistence(namespace_delta);
+    }
+
+    /// Rename the config graph in `flakes`.
+    pub(crate) fn flakes(&mut self, flakes: &mut [Flake]) {
+        for flake in flakes {
+            if let Some(g) = self.renamed(flake.g.as_ref()) {
+                flake.g = Some(g);
+            }
+        }
+    }
+
+    /// Rename the config graph in `keys`.
+    pub(crate) fn keys(&mut self, keys: FxHashSet<ConflictKey>) -> FxHashSet<ConflictKey> {
+        keys.into_iter()
+            .map(|key| match self.renamed(key.g.as_ref()) {
+                Some(g) => ConflictKey { g: Some(g), ..key },
+                None => key,
+            })
+            .collect()
+    }
+
+    /// The config graph's Sid when `g` names it.
+    fn renamed(&mut self, g: Option<&Sid>) -> Option<Sid> {
+        let g = g?;
+        let config = match self.known.get(g) {
+            Some(config) => *config,
+            None => {
+                // As the target's registry reads it: an index built before
+                // config graphs were read across ledgers holds one as an
+                // ordinary graph.
+                let config = self.ns.get_prefix(g.namespace_code).is_some_and(|prefix| {
+                    self.registry
+                        .assigned_graph_id(&format!("{prefix}{}", g.name.as_ref()))
+                        == Some(CONFIG_GRAPH_ID)
+                });
+                self.known.insert(g.clone(), config);
+                config
+            }
+        };
+        config.then(|| self.canonical.get_or_insert_with(|| g.clone()).clone())
+    }
+}
+
+/// A retraction whose shape no stored fact has: an `rdf:langString`
+/// without a language tag, or a tag on any other datatype.
+///
+/// Upserts written before the retraction resolver rebuilt each retraction
+/// from a query binding and dropped the tag, so `"a"@en` was retracted as a
+/// tagless `"a"^^rdf:langString`. Such a retraction matched nothing and is
+/// inert for reads and indexing, but a revert inverts every flake of the
+/// reverted commits, and inverting it asserts a literal that cannot exist.
+/// Legacy retractions of list entries without their position are
+/// well-formed plain literals, so no shape check can tell them apart.
+fn is_malformed_retraction(flake: &Flake) -> bool {
+    if flake.op {
+        return false;
+    }
+    let lang_string = flake.dt.namespace_code == fluree_vocab::namespaces::RDF
+        && flake.dt.name.as_ref() == "langString";
+    let tagged = flake.m.as_ref().is_some_and(|m| m.lang.is_some());
+    lang_string != tagged
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_core::{FlakeMeta, FlakeValue, Sid};
+
+    fn label(v: &str, dt: &str, lang: Option<&str>, t: i64, op: bool) -> Flake {
+        Flake::new(
+            Sid::new(100, "s"),
+            Sid::new(100, "label"),
+            FlakeValue::String(v.to_string()),
+            Sid::new(fluree_vocab::namespaces::RDF, dt),
+            t,
+            op,
+            lang.map(FlakeMeta::with_lang),
+        )
+    }
+
+    /// Reverting an upsert written before the retraction resolver: its
+    /// retraction of `"a"@en` lost the tag. Inverting that retraction would
+    /// assert `"a"^^rdf:langString` with no tag, so the undo skips it; the
+    /// well-formed flakes of the same commit still invert.
+    #[test]
+    fn undo_skips_retractions_no_stored_fact_could_match() {
+        let legacy_upsert = Commit::new(
+            2,
+            vec![
+                // The phantom: tagless langString.
+                label("a", "langString", None, 2, false),
+                // Well-formed: the upsert's assertion.
+                label("b", "langString", Some("en"), 2, true),
+                // A tag on a non-langString datatype is the other malformed
+                // shape.
+                label("c", "HTML", Some("en"), 2, false),
+            ],
+        );
+        let undone = collect_from_commits([legacy_upsert], Fold::Undo).net.flakes;
+        assert_eq!(undone.len(), 1, "{undone:?}");
+        let f = &undone[0];
+        assert!(!f.op, "the assertion of \"b\"@en inverts to its retraction");
+        assert_eq!(f.o, FlakeValue::String("b".to_string()));
+        assert_eq!(f.m.as_ref().and_then(|m| m.lang.as_deref()), Some("en"));
+    }
 }

@@ -220,12 +220,14 @@ future micro-bench wants to exercise `fluree-db-indexer`,
 | `import` | bulk Turtle / N-Quads / JSON-LD ingest | `fluree-db-api/benches/import_bulk.rs` |
 | `transact` | stage + commit | `fluree-db-api/benches/transact_commit.rs` |
 | `reindex` | full reindex; incremental | `fluree-db-api/benches/reindex_full.rs`, `fluree-db-api/benches/reindex_incremental.rs` |
-| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_property_path.rs` (property-path traversal), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline), `fluree-db-api/benches/query_hot_fanout_star.rs` (same-subject star with an unprojected fan-out object — the property-join semijoin demotion) |
+| `query_hot` | warm-cache query latency | `fluree-db-api/benches/query_hot_bsbm.rs` (BSBM Explore Q3/Q5/Q9), `fluree-db-api/benches/query_hot_bsbm_bi.rs` (BI-F2 bowtie / seed tie-break), `fluree-db-api/benches/query_hot_property_path.rs` (property-path traversal), `fluree-db-api/benches/query_hot_whole_graph_agg.rs` (Cypher metadata-lane aggregate folds vs. pipeline baseline), `fluree-db-api/benches/query_hot_list_view.rs` (what one unrelated list costs SPARQL queries, CONSTRUCTs and a JSON-LD crawl that do not read it, on ledgers with and without the list), `fluree-db-api/benches/query_hot_fanout_star.rs` (same-subject star with an unprojected fan-out object — the property-join semijoin demotion), `fluree-db-api/benches/query_hot_construct_formats.rs` (CONSTRUCT serialized as JSON-LD, RDF/XML, Turtle and N-Triples, with allocation peak and churn; plus the Graph Store `GET` queries, plain and with the annotation `UNION`, over the default and a named graph, before and after the ledger holds an annotation), `fluree-db-api/benches/query_hot_negation_count.rs` (MINUS and NOT EXISTS lanes, join COUNT(*) folds), `fluree-db-api/benches/query_hot_limit_startup.rs` (LIMIT startup goals and star probe windows), `fluree-db-api/benches/query_hot_grouped_projection.rs` (grouped queries projecting a SELECT expression, executed and rendered as SPARQL JSON, with allocation peak and churn) |
 | `query_cold` | reload + first-query latency | `fluree-db-api/benches/query_cold_reload.rs` |
+| `datalog` | rule materialization after a commit (derived-facts cache missed) | `fluree-db-api/benches/datalog_fixpoint.rs` |
 | `novelty` | replay, catch-up, bulk-apply | `fluree-db-api/benches/novelty_replay.rs` |
 | `vector_math` | SIMD vs scalar math micro-benches | `fluree-db-query/benches/vector_math.rs` |
 | `spatial` | S2 covering / build / query | `fluree-db-spatial/benches/spatial_bench.rs` |
 | `insert_formats` | JSON-LD vs Turtle insert format comparison | `fluree-db-api/benches/insert_formats.rs` |
+| `jsonld_parse` | JSON-LD transaction parsing alone (expansion, annotation lowering, templates; no staging) | `fluree-db-api/benches/jsonld_parse.rs` |
 | `vector_query` | end-to-end vector similarity through the query engine | `fluree-db-api/benches/vector_query.rs` |
 | `fulltext_query` | full-text scoring through novelty + index | `fluree-db-api/benches/fulltext_query.rs` |
 | `graphql_schema` | GraphQL schema derivation + registration, and the GraphQL request path against the JSON-LD query it lowers to | `fluree-db-api/benches/graphql_schema.rs` |
@@ -362,12 +364,13 @@ The fix is to wrap setup work that touches the runtime in `rt.block_on`:
 let rt = bench_runtime();
 
 b.iter_batched(
-    // setup — wrap in block_on so the reactor is alive while
-    // FlureeBuilder::file(...).build() runs.
+    // Setup runs in block_on, so the reactor is alive while
+    // FlureeBuilder::file(...).build_async() runs.
     || rt.block_on(async {
         let dir = tempfile::tempdir().unwrap();
         let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
-            .build()
+            .build_async()
+            .await
             .unwrap();
         (dir, fluree)
     }),

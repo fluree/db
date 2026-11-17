@@ -206,7 +206,7 @@ impl ObjectBounds {
         // temporal type. This handles values stored as LEX_ID (string
         // dict) with a temporal datatype annotation (e.g. gYear values
         // in bulk-imported data).
-        if let Some(ordering) = Self::try_coerce_temporal_string_cmp(a, b) {
+        if let Some(ordering) = temporal::cmp_with_lexical(a, b) {
             return Some(ordering);
         }
 
@@ -217,65 +217,6 @@ impl ObjectBounds {
 
         // Incompatible types
         None
-    }
-
-    /// Try to compare a temporal FlakeValue against a String by parsing the
-    /// string as the matching temporal type.
-    fn try_coerce_temporal_string_cmp(
-        a: &FlakeValue,
-        b: &FlakeValue,
-    ) -> Option<std::cmp::Ordering> {
-        match (a, b) {
-            (FlakeValue::String(s), FlakeValue::GYear(g)) => {
-                temporal::GYear::parse(s).ok().map(|p| p.cmp(g.as_ref()))
-            }
-            (FlakeValue::GYear(g), FlakeValue::String(s)) => {
-                temporal::GYear::parse(s).ok().map(|p| g.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::GYearMonth(g)) => temporal::GYearMonth::parse(s)
-                .ok()
-                .map(|p| p.cmp(g.as_ref())),
-            (FlakeValue::GYearMonth(g), FlakeValue::String(s)) => temporal::GYearMonth::parse(s)
-                .ok()
-                .map(|p| g.as_ref().cmp(&p)),
-            (FlakeValue::String(s), FlakeValue::GMonth(g)) => {
-                temporal::GMonth::parse(s).ok().map(|p| p.cmp(g.as_ref()))
-            }
-            (FlakeValue::GMonth(g), FlakeValue::String(s)) => {
-                temporal::GMonth::parse(s).ok().map(|p| g.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::GDay(g)) => {
-                temporal::GDay::parse(s).ok().map(|p| p.cmp(g.as_ref()))
-            }
-            (FlakeValue::GDay(g), FlakeValue::String(s)) => {
-                temporal::GDay::parse(s).ok().map(|p| g.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::GMonthDay(g)) => temporal::GMonthDay::parse(s)
-                .ok()
-                .map(|p| p.cmp(g.as_ref())),
-            (FlakeValue::GMonthDay(g), FlakeValue::String(s)) => temporal::GMonthDay::parse(s)
-                .ok()
-                .map(|p| g.as_ref().cmp(&p)),
-            (FlakeValue::String(s), FlakeValue::DateTime(d)) => {
-                temporal::DateTime::parse(s).ok().map(|p| p.cmp(d.as_ref()))
-            }
-            (FlakeValue::DateTime(d), FlakeValue::String(s)) => temporal::DateTime::parse(s)
-                .ok()
-                .map(|p| d.as_ref().cmp(&p)),
-            (FlakeValue::String(s), FlakeValue::Date(d)) => {
-                temporal::Date::parse(s).ok().map(|p| p.cmp(d.as_ref()))
-            }
-            (FlakeValue::Date(d), FlakeValue::String(s)) => {
-                temporal::Date::parse(s).ok().map(|p| d.as_ref().cmp(&p))
-            }
-            (FlakeValue::String(s), FlakeValue::Time(t)) => {
-                temporal::Time::parse(s).ok().map(|p| p.cmp(t.as_ref()))
-            }
-            (FlakeValue::Time(t), FlakeValue::String(s)) => {
-                temporal::Time::parse(s).ok().map(|p| t.as_ref().cmp(&p))
-            }
-            _ => None,
-        }
     }
 
     /// Returns true if no bounds are set

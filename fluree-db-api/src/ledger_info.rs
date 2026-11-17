@@ -29,7 +29,7 @@ use fluree_db_core::value_id::ValueTypeTag;
 use fluree_db_core::{
     ClassStatEntry, GraphPropertyStatEntry, GraphStatsEntry, IndexSchema, IndexStats,
     LedgerSnapshot, OverlayProvider, RuntimePredicateId, RuntimeSmallDicts, SchemaPredicateInfo,
-    Sid, Storage,
+    Sid, Storage, DEFAULT_GRAPH_IRI,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::{GraphSourceRecord, GraphSourceType, NsRecord};
@@ -116,6 +116,15 @@ pub struct LedgerInfo {
     /// Virtual-only source metadata (identifying only — NEVER credentials).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<Source>,
+
+    /// Native-only: degenerate state in the ledger's config graph (see
+    /// [`crate::config_resolver::diagnose`]). Omitted when there is none.
+    #[serde(
+        rename = "configDiagnostics",
+        default,
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub config_diagnostics: Vec<crate::config_resolver::ConfigDiagnostic>,
 }
 
 impl LedgerInfo {
@@ -196,6 +205,16 @@ pub struct PropertyStat {
     /// Flake/row count. `null` when unknown (virtual dataset, no scan).
     #[serde(default)]
     pub count: Option<i64>,
+    /// An upper bound on the true count, given when `count` is `null` because
+    /// it cannot be known from metadata but a bound can (a virtual source's
+    /// triples map that keeps only some of its table's rows contributes its
+    /// table's row count). The true count is at most this. Omitted otherwise.
+    #[serde(
+        rename = "count-upper-bound",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub count_upper_bound: Option<i64>,
     /// Native-only: most recent modifying `t`. Omitted for virtual datasets.
     #[serde(
         rename = "last-modified-t",
@@ -250,6 +269,16 @@ pub struct ClassInfo {
     /// Instance/row count. `null` when unknown (virtual dataset, no scan).
     #[serde(default)]
     pub count: Option<i64>,
+    /// An upper bound on the true count, given when `count` is `null` because
+    /// it cannot be known from metadata but a bound can; see
+    /// [`PropertyStat::count_upper_bound`]. The true count is at most this.
+    /// Omitted otherwise.
+    #[serde(
+        rename = "count-upper-bound",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub count_upper_bound: Option<i64>,
     /// Native-only schema hierarchy parents. Omitted when empty.
     #[serde(rename = "subclass-of", default, skip_serializing_if = "Vec::is_empty")]
     pub subclass_of: Vec<String>,
@@ -278,9 +307,20 @@ pub struct PropertyInfo {
     /// Per-language-tag counts (empty for virtual R2RML datasets).
     #[serde(default)]
     pub langs: BTreeMap<String, i64>,
-    /// Per-target-class reference counts (empty until FK detection lands).
+    /// Per-target-class reference counts. `null` when the count cannot be
+    /// known exactly (a virtual dataset's reference, whose child keys may
+    /// match no parent row); see [`Self::ref_classes_upper_bound`].
     #[serde(rename = "ref-classes", default)]
-    pub ref_classes: BTreeMap<String, i64>,
+    pub ref_classes: BTreeMap<String, Option<i64>>,
+    /// An upper bound on each `null` entry of [`Self::ref_classes`] that has
+    /// one (a virtual reference whose parent key matches at most one parent
+    /// subject is bounded by the child's rows). Omitted when empty.
+    #[serde(
+        rename = "ref-classes-upper-bound",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub ref_classes_upper_bound: BTreeMap<String, i64>,
 }
 
 /// Native-only index pointer block (`index`).
@@ -312,7 +352,10 @@ pub struct Source {
     /// Catalog descriptor (REST or Direct-mode). Omitted when neither is known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub catalog: Option<Catalog>,
-    /// Per-table row counts (Iceberg snapshot-summary `total-records`). Authoritative
+    /// Per-table row counts: the Iceberg snapshot summary's `total-records`, or,
+    /// when the summary has none (BigQuery writes only `operation`), the sum of
+    /// the snapshot manifest list's `added_rows_count + existing_rows_count` over
+    /// its data manifests. A table whose count is unknown is absent. Authoritative
     /// for append-only / copy-on-write tables; for any table listed in
     /// [`Self::mor_approximate_tables`] the count is an **upper bound** (it sums live
     /// data-file records without subtracting merge-on-read position/equality deletes,
@@ -321,7 +364,8 @@ pub struct Source {
     pub table_row_counts: BTreeMap<String, i64>,
     /// Tables whose [`Self::table_row_counts`] entry is an **approximate upper bound**
     /// because the current Iceberg snapshot carries merge-on-read delete files
-    /// (`total-delete-files`/`-position-deletes`/`-equality-deletes` > 0). Empty (and
+    /// (`total-delete-files`/`-position-deletes`/`-equality-deletes` > 0, or, for a
+    /// count read from the manifest list, a delete manifest in it). Empty (and
     /// omitted) for the common append-only case. Consumers that ignore unknown keys
     /// (the `/data-model` + MCP readers, all null-safe) are unaffected.
     #[serde(
@@ -664,6 +708,22 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         }
     });
 
+    // 7. Config diagnostics: degenerate config-graph state, omitted when clean.
+    // Informational: a failure to compute them is logged, not surfaced.
+    let config_diagnostics = match crate::config_resolver::diagnose(
+        &ledger.snapshot,
+        ledger.novelty.as_ref(),
+        ledger.t(),
+    )
+    .await
+    {
+        Ok(diagnostics) => diagnostics,
+        Err(e) => {
+            tracing::warn!(error = %e, "ledger config diagnostics unavailable");
+            Vec::new()
+        }
+    };
+
     Ok(LedgerInfo {
         ledger_id: None,
         t: None,
@@ -676,6 +736,7 @@ pub async fn build_ledger_info_with_options<S: Storage + Clone>(
         nameservice,
         index,
         source: None,
+        config_diagnostics,
     }
     .into_json())
 }
@@ -704,15 +765,16 @@ pub(crate) fn resolve_graph_selector(
     match selector {
         GraphSelector::Default => Ok(0),
         GraphSelector::ById(g_id) => Ok(*g_id),
-        GraphSelector::ByName(name) => match name.as_str() {
-            "default" | "urn:default" => Ok(0),
-            "txn-meta" => Ok(1),
-            "config" => Ok(2),
-            other => {
+        GraphSelector::ByName(name) => match fluree_db_core::GraphSel::keyword(name)
+            .and_then(|keyword| keyword.reserved_g_id())
+        {
+            Some(g_id) => Ok(g_id),
+            None => {
+                let other = name.as_str();
                 // Try as IRI
                 if let Some(store) = store {
                     store
-                        .graph_id_for_iri(other)
+                        .assigned_graph_id(other)
                         .ok_or_else(|| LedgerInfoError::UnknownGraph(other.to_string()))
                 } else {
                     Err(LedgerInfoError::UnknownGraph(format!(
@@ -722,7 +784,7 @@ pub(crate) fn resolve_graph_selector(
             }
         },
         GraphSelector::ByIri(iri) => {
-            if iri == "urn:default" {
+            if iri == DEFAULT_GRAPH_IRI {
                 return Ok(0);
             }
             // Recognize this ledger's reserved system graph IRIs so resolution
@@ -737,7 +799,7 @@ pub(crate) fn resolve_graph_selector(
             }
             if let Some(store) = store {
                 store
-                    .graph_id_for_iri(iri)
+                    .assigned_graph_id(iri)
                     .ok_or_else(|| LedgerInfoError::UnknownGraph(iri.clone()))
             } else {
                 Err(LedgerInfoError::UnknownGraph(format!(
@@ -751,7 +813,7 @@ pub(crate) fn resolve_graph_selector(
 /// Determine the display name for a graph ID.
 fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String {
     if g_id == 0 {
-        return "urn:default".to_string();
+        return DEFAULT_GRAPH_IRI.to_string();
     }
     if let Some(store) = store {
         if let Some(iri) = store.graph_iri_for_id(g_id) {
@@ -767,18 +829,6 @@ fn graph_display_name(g_id: GraphId, store: Option<&BinaryIndexStore>) -> String
 
 /// Build the `ledger` block with ledger-wide metadata.
 fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
-    let index_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.index_t)
-        .unwrap_or(ledger.snapshot.t);
-
-    let commit_t = ledger
-        .ns_record
-        .as_ref()
-        .map(|r| r.commit_t)
-        .unwrap_or(ledger.t());
-
     let graph_sizes = stats.graphs.as_deref().unwrap_or_default();
     let graph_totals = |g_id: GraphId| -> (u64, u64) {
         graph_sizes
@@ -802,15 +852,19 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     // store an IRI for it, so we synthesize `urn:default` here.
     let (default_flakes, default_size) = graph_totals(0);
     named_graphs.push(NamedGraph {
-        iri: "urn:default".to_string(),
+        iri: DEFAULT_GRAPH_IRI.to_string(),
         g_id: 0,
         flakes: Some(default_flakes as i64),
         size: default_size,
     });
     // Then every registered graph (txn-meta at g_id=1, config at g_id=2,
-    // user-defined at g_id>=3). `iter_entries` is dense and ordered by
-    // g_id, so the response is deterministic.
-    for (g_id, iri) in ledger.snapshot.graph_registry.iter_entries() {
+    // user-defined at g_id>=3) but a dropped one, which does not exist until
+    // written again. Ordered by g_id, so the response is deterministic.
+    for (g_id, iri) in ledger
+        .snapshot
+        .graph_registry
+        .iter_visible_entries(ledger.t())
+    {
         let (flakes, size) = graph_totals(g_id);
         named_graphs.push(NamedGraph {
             iri: iri.to_string(),
@@ -821,10 +875,12 @@ fn build_ledger_block(ledger: &LedgerState, stats: &IndexStats) -> Ledger {
     }
 
     Ledger {
-        alias: ledger.snapshot.ledger_id.clone(),
+        alias: ledger.snapshot.ledger_id.clone().to_string(),
         t: Some(ledger.t()),
-        commit_t: Some(commit_t),
-        index_t: Some(index_t),
+        // The record saved at load time can lag cached commits or index installs.
+        // Describe the state serving this request, not that saved record.
+        commit_t: Some(ledger.t()),
+        index_t: Some(ledger.index_t()),
         flakes: Some(stats.flakes as i64),
         size: stats.size,
         named_graphs,
@@ -1006,7 +1062,7 @@ pub fn gs_record_to_jsonld(record: &GraphSourceRecord) -> JsonValue {
     // token (an env-var reference is safe, but a literal secret must never reach
     // a client). `redact_graph_source_config` returns the string unchanged when
     // it holds no secrets, so non-secret configs stay byte-identical.
-    let redacted_config = redact_graph_source_config(&record.config);
+    let redacted_config = redact_graph_source_record_config(&record.source_type, &record.config);
     let mut obj = json!({
         "@context": { "f": "https://ns.flur.ee/db#" },
         "@id": &canonical_id,
@@ -1061,6 +1117,15 @@ const SECRET_CONFIG_KEYS: &[&str] = &[
     "refresh_token",
 ];
 
+/// A Google service-account credential stores its key file under the generic
+/// name `key` (`{"source": "service_account", "key": …}`, in catalog auth and in
+/// `io.storage_auth`), which no name rule could mark secret without masking every
+/// other `key`. So `key` is secret exactly inside an object that says it is a
+/// service account.
+fn holds_service_account_key(map: &serde_json::Map<String, JsonValue>) -> bool {
+    map.get("source").and_then(JsonValue::as_str) == Some("service_account")
+}
+
 fn is_secret_config_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     SECRET_CONFIG_KEYS.iter().any(|s| *s == lower)
@@ -1111,8 +1176,9 @@ pub fn redact_json_secrets(value: &mut JsonValue) -> bool {
     let mut redacted = false;
     match value {
         JsonValue::Object(map) => {
+            let service_account = holds_service_account_key(map);
             for (k, v) in map.iter_mut() {
-                if is_secret_config_key(k) {
+                if is_secret_config_key(k) || (service_account && k == "key") {
                     if is_secret_ref_object(v) {
                         // A secret *reference* is not a secret (same policy as
                         // env-var names, which the redactor deliberately keeps):
@@ -1181,7 +1247,53 @@ fn redact_secret_subtree(value: &mut JsonValue) -> bool {
     redacted
 }
 
-/// Redact auth/credential leaves from a stored graph-source config JSON string.
+/// Redact a stored graph-source config for a read-out, by its type: every
+/// secret the persisted type classifies (bearer tokens, OAuth2 and Azure client
+/// secrets, service-account keys, in every auth variant) and every key the
+/// type does not know are masked, and then every value under a secret key
+/// name, as [`redact_graph_source_config`] masks it. Returns `config`
+/// unchanged when nothing is, so secret-free configs stay byte-identical.
+///
+/// FAILS CLOSED: a config that is not JSON, or that its source type's config
+/// cannot read, is replaced wholesale, since nothing in it can be classified.
+/// Source types with no auth (BM25, vector, geo) and builds without the
+/// type's feature fall back to [`redact_graph_source_config`].
+pub fn redact_graph_source_record_config(source_type: &GraphSourceType, config: &str) -> String {
+    #[cfg(feature = "iceberg")]
+    {
+        use crate::graph_source::surface::{redact_stored, Redaction};
+        let Ok(mut value) = serde_json::from_str::<JsonValue>(config) else {
+            return "\"[redacted:unparseable]\"".to_string();
+        };
+        // Nothing to classify, and nothing to leak.
+        if value.as_object().is_some_and(serde_json::Map::is_empty) {
+            return config.to_string();
+        }
+        match redact_stored(source_type, &mut value) {
+            Redaction::Masked(typed) => {
+                // The name rule as well: it masks a value the type holds as
+                // plain text under a secret-sounding key (a SQL session
+                // property named `x_token`), and a secret field a config type
+                // gains outside its auth.
+                let named = redact_json_secrets(&mut value);
+                if !typed && !named {
+                    return config.to_string();
+                }
+                return serde_json::to_string(&value)
+                    .unwrap_or_else(|_| "\"[redacted:unserializable]\"".to_string());
+            }
+            Redaction::Unreadable => return "\"[redacted:unreadable]\"".to_string(),
+            Redaction::Untyped => {}
+        }
+    }
+    #[cfg(not(feature = "iceberg"))]
+    let _ = source_type;
+    redact_graph_source_config(config)
+}
+
+/// Redact auth/credential leaves from a stored graph-source config JSON string,
+/// by key name, for a config whose type is unknown. A graph-source record's
+/// read-out uses [`redact_graph_source_record_config`] instead.
 ///
 /// Returns the original string unchanged when it parses as JSON and contains no
 /// secrets, so non-secret configs (e.g. BM25/Vector) stay byte-for-byte
@@ -1217,6 +1329,7 @@ pub fn graph_source_type_label(source_type: &GraphSourceType) -> String {
         GraphSourceType::R2rml => "R2RML".to_string(),
         GraphSourceType::Iceberg => "Iceberg".to_string(),
         GraphSourceType::Sql => "SQL".to_string(),
+        GraphSourceType::Delta => "Delta".to_string(),
         GraphSourceType::Unknown(s) => format!("Unknown({s})"),
     }
 }
@@ -1245,22 +1358,14 @@ pub struct VirtualSourceMeta {
     /// Tables whose snapshot carries merge-on-read delete files, so their row count
     /// is an upper bound (see [`Source::mor_approximate_tables`]).
     pub mor_approximate_tables: Vec<String>,
+    /// What each table's metadata says about its keys and nulls, which decides
+    /// whether a count is exact (see [`build_virtual_ledger_info`]). A table
+    /// without an entry has no known key and may hold nulls anywhere.
+    pub table_columns: HashMap<String, VirtualTableColumns>,
     /// Model ledger governing the source (`--model`), if any.
     pub model: Option<String>,
     /// The source's `default-allow` for governed requests, if set.
     pub default_allow: Option<bool>,
-}
-
-/// Sum two optional row counts, treating `None` as "unknown" rather than zero:
-/// a known count on either side survives, and the result is `None` only when
-/// neither side is known.
-fn add_row_counts(acc: Option<i64>, rows: Option<i64>) -> Option<i64> {
-    match (acc, rows) {
-        (Some(a), Some(r)) => Some(a + r),
-        (Some(a), None) => Some(a),
-        (None, Some(r)) => Some(r),
-        (None, None) => None,
-    }
 }
 
 /// Compact a datatype IRI to a short form where possible (`xsd:*`, `@id`).
@@ -1306,22 +1411,357 @@ fn object_map_datatype(object_map: &ObjectMap) -> String {
 }
 
 #[derive(Default)]
-struct PropertyAgg {
-    count: Option<i64>,
-    datatypes: BTreeMap<String, Option<i64>>,
+struct PropertyAgg<'m> {
+    count: CountAgg<'m>,
+    datatypes: BTreeMap<String, CountAgg<'m>>,
     /// FK relationship targets (`ref-classes`): for a ref (RefObjectMap)
     /// predicate, the parent triples-map's class IRI(s) → accumulated child row
     /// count. Empty for literal-column properties. Only the per-class
     /// aggregation populates this; the flat `stats.properties` view has no
     /// `ref-classes` field and leaves it empty.
-    ref_classes: BTreeMap<String, Option<i64>>,
+    ref_classes: BTreeMap<String, CountAgg<'m>>,
+}
+
+/// What one triples map contributes to a virtual count: exactly its table's
+/// row count (`Exact`), or at most a number of rows (`AtMost`), or nothing
+/// known (`AtMost(None)`: the rows are unknown, or one row can yield more
+/// triples than any metadata bounds).
+#[derive(Clone, Copy, Debug)]
+enum MapRows {
+    Exact(i64),
+    AtMost(Option<i64>),
+}
+
+/// A virtual count summed over the triples maps that contribute to it.
+///
+/// The count is exact only when every contribution is, and the contributing
+/// maps provably mint disjoint subjects
+/// ([`TriplesMap::subjects_provably_disjoint`](fluree_db_r2rml::TriplesMap::subjects_provably_disjoint)),
+/// so no subject, or triple, is counted by two of them. Otherwise it is
+/// `null`, and the sum of every contribution's bound is reported as
+/// `count-upper-bound` when every one of them is known.
+#[derive(Clone, Debug)]
+struct CountAgg<'m> {
+    /// Every contribution so far is exact.
+    exact: bool,
+    /// The sum of the contributions' row counts; `None` once one is unknown.
+    sum: Option<i64>,
+    /// No contribution yet.
+    empty: bool,
+    /// The distinct maps that contributed.
+    maps: Vec<&'m fluree_db_r2rml::TriplesMap>,
+}
+
+impl<'m> CountAgg<'m> {
+    fn new() -> Self {
+        Self {
+            exact: true,
+            sum: Some(0),
+            empty: true,
+            maps: Vec::new(),
+        }
+    }
+
+    fn add(&mut self, tm: &'m fluree_db_r2rml::TriplesMap, rows: MapRows) {
+        let n = match rows {
+            MapRows::Exact(n) => Some(n),
+            MapRows::AtMost(n) => {
+                self.exact = false;
+                n
+            }
+        };
+        self.sum = self.sum.zip(n).map(|(a, b)| a + b);
+        self.empty = false;
+        if !self.maps.iter().any(|m| std::ptr::eq(*m, tm)) {
+            self.maps.push(tm);
+        }
+    }
+
+    /// `(count, count-upper-bound)`.
+    fn finish(&self) -> (Option<i64>, Option<i64>) {
+        if self.empty {
+            return (None, None);
+        }
+        let disjoint = self.maps.iter().enumerate().all(|(i, a)| {
+            self.maps[i + 1..]
+                .iter()
+                .all(|b| a.subjects_provably_disjoint(b))
+        });
+        if self.exact && disjoint {
+            (self.sum, None)
+        } else {
+            (None, self.sum)
+        }
+    }
+
+    /// The count alone, for a map with no bound field (`null` unless exact).
+    fn count(&self) -> Option<i64> {
+        self.finish().0
+    }
+}
+
+impl Default for CountAgg<'_> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// What a virtual table's metadata says about its rows beyond their count,
+/// which decides whether a count derived from that count is exact (see
+/// [`build_virtual_ledger_info`]). An absent entry knows nothing: no key, and
+/// any column may be null.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VirtualTableColumns {
+    /// Columns no row holds a null in.
+    pub non_null: std::collections::BTreeSet<String>,
+    /// Columns whose values can identify a row: flat, and not floating-point
+    /// (see [`fluree_db_r2rml::mapping::usable_in_key`]).
+    pub key_usable: std::collections::BTreeSet<String>,
+    /// Keys the table's metadata reports, each a set of columns no two rows
+    /// agree on (an Iceberg table's identifier fields).
+    pub keys: Vec<Vec<String>>,
+}
+
+/// How a triples map's rows relate to its table, from the mapping alone.
+struct MapSource {
+    /// The table a virtual source reads: the `rr:tableName`, or the `FROM`
+    /// table of an `rr:sqlQuery` in the restricted subset an Iceberg source
+    /// evaluates. `None` for a query outside it (one a SQL engine runs), which
+    /// names no table the counts know.
+    table: Option<String>,
+    /// Whether every row of `table` is a row of the map's logical table: no
+    /// `WHERE`, and a query the source evaluates.
+    whole: bool,
+    /// The query's select list, when it has one: the columns its rows carry.
+    selected: Option<Vec<String>>,
+}
+
+fn map_source(tm: &fluree_db_r2rml::mapping::TriplesMap) -> MapSource {
+    match tm.sql_query() {
+        None => MapSource {
+            table: tm.table_name().map(str::to_string),
+            whole: true,
+            selected: None,
+        },
+        Some(sql) => match fluree_db_r2rml::mapping::RestrictedSelect::parse(sql) {
+            Ok(select) => MapSource {
+                whole: select.conditions.is_empty(),
+                table: Some(select.table),
+                selected: select.columns,
+            },
+            Err(_) => MapSource {
+                table: None,
+                whole: false,
+                selected: None,
+            },
+        },
+    }
+}
+
+/// The distinct tables a mapping's triples maps read, sorted: an `rr:sqlQuery`
+/// map's `FROM` table rather than its query alias.
+#[cfg_attr(not(feature = "iceberg"), allow(dead_code))]
+pub(crate) fn mapping_source_tables(mapping: &CompiledR2rmlMapping) -> Vec<String> {
+    let mut tables: Vec<String> = mapping
+        .triples_maps
+        .values()
+        .filter_map(|tm| map_source(tm).table)
+        .collect();
+    tables.sort();
+    tables.dedup();
+    tables
+}
+
+/// One triples map's facts for the virtual counts.
+struct MapFacts<'a> {
+    /// The map's table's row count, when known.
+    rows: Option<i64>,
+    /// `rows` is exactly the number of rows of the map's logical table: the
+    /// map reads its whole table, and the count is not a merge-on-read bound.
+    rows_exact: bool,
+    /// What the table's metadata says; `None` knows nothing.
+    columns: Option<&'a VirtualTableColumns>,
+    /// The query's select list, when it has one.
+    selected: Option<Vec<String>>,
+    /// The keys of the map's logical table: those declared on it (`f:key`)
+    /// and those its table reports, each kept only when every column is one
+    /// the logical table carries and can identify a row by. A declared key
+    /// the table cannot hold is dropped here (a query over it refuses).
+    keys: fluree_db_r2rml::TableKeys,
+}
+
+impl<'a> MapFacts<'a> {
+    fn new(
+        mapping: &CompiledR2rmlMapping,
+        tm: &fluree_db_r2rml::TriplesMap,
+        meta: &'a VirtualSourceMeta,
+        table_row_counts: &HashMap<String, i64>,
+    ) -> Self {
+        let source = map_source(tm);
+        let rows = source
+            .table
+            .as_ref()
+            .and_then(|t| table_row_counts.get(t).copied());
+        let approximate = source
+            .table
+            .as_ref()
+            .is_some_and(|t| meta.mor_approximate_tables.contains(t));
+        let columns = source
+            .table
+            .as_ref()
+            .and_then(|t| meta.table_columns.get(t));
+        let mut facts = Self {
+            rows,
+            rows_exact: source.whole && !approximate,
+            columns,
+            selected: source.selected,
+            keys: fluree_db_r2rml::TableKeys::none(),
+        };
+        if let Some(columns) = columns {
+            let declared = tm
+                .table_name()
+                .map(|name| mapping.declared_keys(name))
+                .unwrap_or_default();
+            let usable = |key: &[String]| {
+                key.iter()
+                    .all(|c| facts.selects(c) && columns.key_usable.contains(c))
+            };
+            let keys: Vec<Vec<String>> = declared
+                .iter()
+                .chain(columns.keys.iter().map(Vec::as_slice))
+                .filter(|key| usable(key))
+                .map(<[String]>::to_vec)
+                .collect();
+            facts.keys = fluree_db_r2rml::TableKeys::new(keys);
+        }
+        facts
+    }
+
+    fn selects(&self, column: &str) -> bool {
+        self.selected
+            .as_ref()
+            .is_none_or(|selected| selected.iter().any(|c| c == column))
+    }
+
+    /// No row of the logical table holds a null in `column`.
+    fn non_null(&self, column: &str) -> bool {
+        self.selects(column) && self.columns.is_some_and(|c| c.non_null.contains(column))
+    }
+
+    /// Every row mints a subject, and no two rows mint the same one: the
+    /// logical table's row count is the map's subject count.
+    fn one_subject_per_row(&self, tm: &fluree_db_r2rml::TriplesMap) -> bool {
+        let sm = &tm.subject_map;
+        let minted = if sm.constant.is_some() {
+            true
+        } else if let Some(column) = &sm.column {
+            self.non_null(column)
+        } else if let Some(template) = &sm.template {
+            fluree_db_r2rml::mapping::extract_template_columns(template)
+                .iter()
+                .all(|c| self.non_null(c))
+        } else {
+            false
+        };
+        minted && tm.subject_unique_under(&self.keys)
+    }
+
+    /// The map's subjects, counted: exactly the rows when the rows are the
+    /// logical table's and each mints one distinct subject, else at most the
+    /// table's rows (each subject needs a row).
+    fn subjects(&self, tm: &fluree_db_r2rml::TriplesMap) -> MapRows {
+        match self.rows {
+            Some(n) if self.rows_exact && self.one_subject_per_row(tm) => MapRows::Exact(n),
+            rows => MapRows::AtMost(rows),
+        }
+    }
+
+    /// The triples one predicate-object map mints for `predicate`.
+    ///
+    /// Exact when the subjects are, the row never mints one `(predicate,
+    /// object)` twice, and the object is never null. A reference is never
+    /// exact (a child key without a parent row yields nothing): it is at most
+    /// one triple per child row when the parent's join key matches at most one
+    /// parent subject, and unbounded when it may match several (fan-out).
+    fn triples(
+        &self,
+        mapping: &CompiledR2rmlMapping,
+        meta: &VirtualSourceMeta,
+        table_row_counts: &HashMap<String, i64>,
+        tm: &fluree_db_r2rml::TriplesMap,
+        predicate: &str,
+        object_map: &ObjectMap,
+    ) -> MapRows {
+        let object_non_null = match object_map {
+            ObjectMap::Constant { .. } => true,
+            ObjectMap::Column { column, .. } => self.non_null(column),
+            ObjectMap::Template { template, .. } => {
+                fluree_db_r2rml::mapping::extract_template_columns(template)
+                    .iter()
+                    .all(|c| self.non_null(c))
+            }
+            ObjectMap::RefObjectMap(rom) => {
+                let one_parent = mapping.get(&rom.parent_triples_map).is_some_and(|parent| {
+                    MapFacts::new(mapping, parent, meta, table_row_counts)
+                        .join_key_matches_one_subject(parent, &rom.parent_columns())
+                });
+                return MapRows::AtMost(self.rows.filter(|_| one_parent));
+            }
+        };
+        match self.subjects(tm) {
+            MapRows::Exact(n) if object_non_null && tm.emits_distinct_per_row(predicate) => {
+                MapRows::Exact(n)
+            }
+            _ => MapRows::AtMost(self.rows),
+        }
+    }
+
+    /// Whether one value of the parent's join columns matches at most one
+    /// subject of this (parent) map: its subject is a function of those
+    /// columns, or they contain a key of its logical table.
+    fn join_key_matches_one_subject(
+        &self,
+        tm: &fluree_db_r2rml::TriplesMap,
+        join_columns: &[&str],
+    ) -> bool {
+        if join_columns.is_empty() {
+            return tm.subject_map.constant.is_some();
+        }
+        let sm = &tm.subject_map;
+        let subject_of_join = if sm.constant.is_some() {
+            true
+        } else if let Some(column) = &sm.column {
+            join_columns.contains(&column.as_str())
+        } else if let Some(template) = &sm.template {
+            fluree_db_r2rml::mapping::extract_template_columns(template)
+                .iter()
+                .all(|c| join_columns.contains(&c.as_str()))
+        } else {
+            false
+        };
+        subject_of_join || self.keys.has_key_within(join_columns.iter().copied())
+    }
 }
 
 /// Build the native-shaped [`LedgerInfo`] for a virtual (query-in-place)
 /// dataset, derived entirely from metadata: the compiled R2RML mapping supplies
-/// the classes/properties/datatypes, and `table_row_counts` (authoritative
-/// Iceberg manifest row counts — one row = one subject) supplies per-class /
-/// per-property counts. NEVER reads data, NEVER emits auth/credentials.
+/// the classes/properties/datatypes, and `table_row_counts` (Iceberg row counts)
+/// with `meta.table_columns` (what each table's metadata says about keys and
+/// nulls) supply per-class / per-property counts. NEVER reads data, NEVER
+/// emits auth/credentials.
+///
+/// A count is exact or `null`. It is exact when the metadata proves it: every
+/// contributing map reads its whole table under a row count that is not a
+/// merge-on-read bound, mints one distinct subject per row (its subject is
+/// unique under a key of its logical table, and no subject column is ever
+/// null), and, for a property, never mints one `(predicate, object)` twice in
+/// a row and never has a null object; and the contributing maps provably mint
+/// disjoint subjects. Otherwise the count is `null`, with `count-upper-bound`
+/// the sum of the contributing maps' table row counts when every one is known
+/// and bounds its share. A referencing object map is never exact (a child key
+/// without a parent row yields nothing); it is bounded by the child's rows
+/// when the parent's join key matches at most one parent subject, and
+/// unbounded when it can match several.
 ///
 /// This is the pure derivation; the async orchestration that resolves the
 /// mapping + row counts lives in [`build_graph_source_info`].
@@ -1339,30 +1779,29 @@ pub fn build_virtual_ledger_info(
     // the map the instance view and the data-model / LLM reader need to render a
     // class's properties; without it they saw only @id.
     #[derive(Default)]
-    struct ClassAgg {
-        count: Option<i64>,
-        properties: BTreeMap<String, PropertyAgg>,
+    struct ClassAgg<'m> {
+        count: CountAgg<'m>,
+        properties: BTreeMap<String, PropertyAgg<'m>>,
     }
     let mut classes: BTreeMap<String, ClassAgg> = BTreeMap::new();
     let mut properties: BTreeMap<String, PropertyAgg> = BTreeMap::new();
 
     if let Some(mapping) = mapping {
         for tm in mapping.triples_maps.values() {
-            // One row -> one subject: the class/property counts of a triples map
-            // are the row count of its logical table.
-            let rows = tm
-                .table_name()
-                .and_then(|t| table_row_counts.get(t).copied());
+            let facts = MapFacts::new(mapping, tm, meta, table_row_counts);
+            let subjects = facts.subjects(tm);
 
-            // The named predicates this triples map contributes (with datatypes).
-            // Only constant predicates can be named without reading data.
-            let poms: Vec<(String, String)> = tm
+            // The named predicates this triples map contributes (with
+            // datatypes), and what each predicate-object map mints. Only
+            // constant predicates can be named without reading data.
+            let poms: Vec<(String, String, MapRows)> = tm
                 .predicate_object_maps
                 .iter()
                 .filter_map(|pom| {
-                    pom.predicate_map
-                        .as_constant()
-                        .map(|pred| (pred.to_string(), object_map_datatype(&pom.object_map)))
+                    let pred = pom.predicate_map.as_constant()?;
+                    let rows =
+                        facts.triples(mapping, meta, table_row_counts, tm, pred, &pom.object_map);
+                    Some((pred.to_string(), object_map_datatype(&pom.object_map), rows))
                 })
                 .collect();
 
@@ -1376,7 +1815,7 @@ pub fn build_virtual_ledger_info(
             // `classes()` rather than its `table_name()`. The ref predicate's
             // `@id` datatype already flows through `poms` above; this adds the
             // per-target-class counts the native `/info` carries.
-            let ref_targets: Vec<(String, Vec<String>)> = tm
+            let ref_targets: Vec<(String, Vec<String>, MapRows)> = tm
                 .predicate_object_maps
                 .iter()
                 .filter_map(|pom| {
@@ -1385,39 +1824,45 @@ pub fn build_virtual_ledger_info(
                     };
                     let pred = pom.predicate_map.as_constant()?;
                     let parent = mapping.get(&rom.parent_triples_map)?;
-                    Some((pred.to_string(), parent.classes().to_vec()))
+                    let rows =
+                        facts.triples(mapping, meta, table_row_counts, tm, pred, &pom.object_map);
+                    Some((pred.to_string(), parent.classes().to_vec(), rows))
                 })
                 .collect();
 
             for class in tm.classes() {
                 let cls = classes.entry(class.clone()).or_default();
-                cls.count = add_row_counts(cls.count, rows);
+                cls.count.add(tm, subjects);
                 // Per-class property membership (mirrors the native class->property map).
-                for (pred, datatype) in &poms {
+                for (pred, datatype, rows) in &poms {
                     let agg = cls.properties.entry(pred.clone()).or_default();
-                    agg.count = add_row_counts(agg.count, rows);
-                    let dt_entry = agg.datatypes.entry(datatype.clone()).or_insert(None);
-                    *dt_entry = add_row_counts(*dt_entry, rows);
+                    agg.count.add(tm, *rows);
+                    agg.datatypes
+                        .entry(datatype.clone())
+                        .or_default()
+                        .add(tm, *rows);
                 }
-                // Per-class FK relationship targets: accumulate the child row count
-                // onto each ref predicate's target class(es). The predicate entry
-                // already exists from the `poms` loop (its `@id` datatype); this
-                // fills the `ref-classes` map the native path carries.
-                for (pred, targets) in &ref_targets {
+                // Per-class FK relationship targets: accumulate the child's
+                // contribution onto each ref predicate's target class(es). The
+                // predicate entry already exists from the `poms` loop (its `@id`
+                // datatype); this fills the `ref-classes` map the native path
+                // carries.
+                for (pred, targets, rows) in &ref_targets {
                     let agg = cls.properties.entry(pred.clone()).or_default();
                     for target_class in targets {
-                        let rc_entry = agg.ref_classes.entry(target_class.clone()).or_insert(None);
-                        *rc_entry = add_row_counts(*rc_entry, rows);
+                        agg.ref_classes
+                            .entry(target_class.clone())
+                            .or_default()
+                            .add(tm, *rows);
                     }
                 }
             }
 
-            // Flat, dataset-wide property stats (`stats.properties`), unchanged.
-            for (pred, datatype) in poms {
+            // Flat, dataset-wide property stats (`stats.properties`).
+            for (pred, datatype, rows) in poms {
                 let agg = properties.entry(pred).or_default();
-                agg.count = add_row_counts(agg.count, rows);
-                let dt_entry = agg.datatypes.entry(datatype).or_insert(None);
-                *dt_entry = add_row_counts(*dt_entry, rows);
+                agg.count.add(tm, rows);
+                agg.datatypes.entry(datatype).or_default().add(tm, rows);
             }
         }
     }
@@ -1434,28 +1879,42 @@ pub fn build_virtual_ledger_info(
                 .map(|(piri, pagg)| {
                     // `langs` is empty (a Phase-1 R2RML mapping carries no
                     // language tags). `ref-classes` carries the FK relationship
-                    // targets derived from the mapping's RefObjectMaps. The count
-                    // is the child row count; when unknown it degrades to 0 so the
-                    // target class (the structural signal) still renders even when
-                    // the catalog is offline / row counts time out.
+                    // targets derived from the mapping's RefObjectMaps. A
+                    // reference count is never exact (a child key without a
+                    // parent row yields nothing), so each entry is `null`, with
+                    // its bound in `ref-classes-upper-bound` when it has one: the
+                    // target class is the structural signal, and it renders
+                    // even when the catalog is offline / row counts time out.
+                    let ref_classes_upper_bound: BTreeMap<String, i64> = pagg
+                        .ref_classes
+                        .iter()
+                        .filter_map(|(class, count)| Some((class.clone(), count.finish().1?)))
+                        .collect();
                     (
                         piri,
                         PropertyInfo {
-                            types: pagg.datatypes,
+                            types: pagg
+                                .datatypes
+                                .into_iter()
+                                .map(|(dt, count)| (dt, count.count()))
+                                .collect(),
                             langs: BTreeMap::new(),
                             ref_classes: pagg
                                 .ref_classes
                                 .into_iter()
-                                .map(|(target_class, count)| (target_class, count.unwrap_or(0)))
+                                .map(|(target_class, count)| (target_class, count.count()))
                                 .collect(),
+                            ref_classes_upper_bound,
                         },
                     )
                 })
                 .collect();
+            let (count, count_upper_bound) = agg.count.finish();
             (
                 iri,
                 ClassInfo {
-                    count: agg.count,
+                    count,
+                    count_upper_bound,
                     subclass_of: Vec::new(),
                     properties: props,
                     // Native emits an ordered `property-list`; a virtual dataset
@@ -1470,12 +1929,19 @@ pub fn build_virtual_ledger_info(
     let properties: BTreeMap<String, PropertyStat> = properties
         .into_iter()
         .map(|(iri, agg)| {
+            let (count, count_upper_bound) = agg.count.finish();
             (
                 iri,
                 PropertyStat {
-                    count: agg.count,
+                    count,
+                    count_upper_bound,
                     last_modified_t: None,
-                    datatypes: Some(agg.datatypes),
+                    datatypes: Some(
+                        agg.datatypes
+                            .into_iter()
+                            .map(|(dt, count)| (dt, count.count()))
+                            .collect(),
+                    ),
                     ndv_values: None,
                     ndv_subjects: None,
                     selectivity_value: None,
@@ -1526,10 +1992,10 @@ pub fn build_virtual_ledger_info(
         // Top-level parity with the native `/info` response (which the server
         // route stamps `ledger_id`/`t` onto for native ledgers). For a virtual
         // dataset the Iceberg snapshot id serves as the version `t`.
-        ledger_id: Some(record.graph_source_id.clone()),
+        ledger_id: Some(record.graph_source_id.clone().to_string()),
         t: Some(meta.snapshot_id),
         ledger: Ledger {
-            alias: record.graph_source_id.clone(),
+            alias: record.graph_source_id.clone().to_string(),
             t: meta.snapshot_id,
             // A virtual dataset has no commit/index chain.
             commit_t: None,
@@ -1537,13 +2003,13 @@ pub fn build_virtual_ledger_info(
             flakes: total_rows,
             size: 0,
             named_graphs: vec![NamedGraph {
-                iri: "urn:default".to_string(),
+                iri: DEFAULT_GRAPH_IRI.to_string(),
                 g_id: 0,
                 flakes: total_rows,
                 size: 0,
             }],
         },
-        graph: "urn:default".to_string(),
+        graph: DEFAULT_GRAPH_IRI.to_string(),
         stats: Stats {
             flakes: total_rows,
             size: 0,
@@ -1558,6 +2024,8 @@ pub fn build_virtual_ledger_info(
         nameservice: Some(gs_record_to_jsonld(record)),
         index: None,
         source: Some(source),
+        // A graph source has no config graph.
+        config_diagnostics: Vec::new(),
     }
 }
 
@@ -1582,7 +2050,7 @@ pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue 
         obj["dependencies"] = json!(record.dependencies);
     }
     if !record.config.is_empty() {
-        let redacted = redact_graph_source_config(&record.config);
+        let redacted = redact_graph_source_record_config(&record.source_type, &record.config);
         if let Ok(parsed) = serde_json::from_str::<JsonValue>(&redacted) {
             let empty_object = parsed.as_object().is_some_and(serde_json::Map::is_empty);
             if !empty_object {
@@ -1600,8 +2068,9 @@ pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue 
 /// For `Iceberg`/`R2RML` sources this returns the SAME JSON shape a native
 /// ledger's `info` returns — `classes`, `properties`, per-class counts — derived
 /// entirely from the compiled R2RML mapping and Iceberg table **metadata**
-/// (`loadTable` snapshot summary row counts: metadata-only, NEVER a Parquet/data
-/// scan) — and NEVER includes auth/credentials. Other graph-source types get the
+/// (row counts from the `loadTable` snapshot summary, else the snapshot's
+/// manifest list: metadata-only, NEVER a manifest or Parquet/data scan) — and
+/// NEVER includes auth/credentials. Other graph-source types get the
 /// thin (redacted) record view.
 ///
 /// This is the single shared builder behind the db-server `/info` route, the
@@ -1635,9 +2104,10 @@ const INFO_COUNT_FETCH_CONCURRENCY: usize = 8;
 
 /// Default wall-clock budget (ms) for the whole virtual `/info` row-count fetch.
 /// The structure (classes/properties) is derived from the mapping and needs no
-/// counts, so if the catalog is slow the fetch is abandoned and counts degrade to
-/// empty rather than blowing the caller's (lambda / gateway) deadline. Override
-/// with `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` (`0` disables the row-count fetch
+/// counts, so a step still running at the deadline is abandoned and its table's
+/// count is omitted, rather than blowing the caller's (lambda / gateway)
+/// deadline; the tables that finished keep theirs. Override with
+/// `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` (`0` disables the row-count fetch
 /// entirely, returning structure-only).
 #[cfg(feature = "iceberg")]
 const DEFAULT_INFO_COUNT_BUDGET_MS: u64 = 10_000;
@@ -1650,9 +2120,56 @@ fn info_count_budget_ms() -> u64 {
         .unwrap_or(DEFAULT_INFO_COUNT_BUDGET_MS)
 }
 
+/// One table's `loadTable` outcome for the virtual-info fan-out:
+/// `(table name, row count if known, snapshot id, MoR-approximate?, what its
+/// metadata says about keys and nulls)`.
+#[cfg(feature = "iceberg")]
+type VirtualTableCount = (String, Option<i64>, i64, bool, Option<VirtualTableColumns>);
+
+/// What a table's current schema says about its keys and nulls, for the
+/// virtual counts ([`VirtualTableColumns`]).
+///
+/// A column is non-null when the schema requires it and the table's format
+/// version is 2 or older: from version 3 a required column can be added with
+/// an initial default that older data files do not hold, and the reader reads
+/// a column a file lacks as null. Identifier fields are a key through format
+/// version 3 (version 4 replaces them with table constraints, which its
+/// readers must use instead), when every one is a flat column that can
+/// identify a row, as the query path reports them.
+#[cfg(feature = "iceberg")]
+pub(crate) fn virtual_table_columns(
+    metadata: &fluree_db_iceberg::metadata::TableMetadata,
+) -> Option<VirtualTableColumns> {
+    let schema = metadata.current_schema()?;
+    let mut columns = VirtualTableColumns::default();
+    for field in &schema.fields {
+        let flat = crate::graph_source::r2rml::iceberg_flat_type(field);
+        if fluree_db_r2rml::mapping::usable_in_key(flat.as_ref()) {
+            columns.key_usable.insert(field.name.clone());
+        }
+        if field.required && metadata.format_version <= 2 {
+            columns.non_null.insert(field.name.clone());
+        }
+    }
+    if metadata.format_version <= 3 && !schema.identifier_field_ids.is_empty() {
+        let key: Option<Vec<String>> = schema
+            .identifier_field_ids
+            .iter()
+            .map(|id| {
+                schema
+                    .field(*id)
+                    .map(|f| f.name.clone())
+                    .filter(|name| columns.key_usable.contains(name))
+            })
+            .collect();
+        columns.keys.extend(key);
+    }
+    Some(columns)
+}
+
 /// Fetch best-effort per-table row counts (and the first table's snapshot id) for
-/// a virtual Iceberg dataset, sharing ONE REST catalog client across a bounded
-/// concurrent fan-out.
+/// a virtual Iceberg dataset, sharing ONE catalog client (REST, AWS Glue, or AWS S3
+/// Tables) across a bounded concurrent fan-out.
 ///
 /// The prior path built a fresh client AND OAuth provider (empty token cache) per
 /// table inside a SERIAL loop — a redundant token exchange + `loadTable` per
@@ -1662,85 +2179,63 @@ fn info_count_budget_ms() -> u64 {
 /// (keyed by the SAME config fingerprint), and the per-table `loadTable`s run with
 /// bounded concurrency.
 ///
-/// Metadata-only: `loadTable` returns the snapshot-summary row count; no
-/// manifest-list, manifest, or Parquet/data file is read. Every step is
-/// best-effort — a parse / auth / load / metadata failure drops only that table's
-/// count (logged at debug), never the whole response. A Direct-catalog source (no
-/// REST client) returns no counts.
-/// One table's `loadTable` outcome for the virtual-info fan-out:
-/// `(table name, summary row count if present, snapshot id, MoR-approximate?)`.
-#[cfg(feature = "iceberg")]
-type VirtualTableCount = (String, Option<i64>, i64, bool);
-
+/// Time-boxed by `deadline`, applied to each step rather than to the whole
+/// fan-out: building the catalog client, each table's `loadTable` and metadata,
+/// and each table's manifest-list read (inside [`virtual_table_row_count`]). A
+/// step that overruns loses only its own table's count, so a slow manifest-list
+/// read never costs a table whose summary had its total. Every step ends by the
+/// deadline, so the whole fetch does too.
+///
+/// Metadata-only: the table metadata comes inline in a REST `loadTable`, else
+/// from the query path's caches, else from one read of the metadata file (AWS
+/// Glue / S3 Tables return only its location). The count is its snapshot
+/// summary's `total-records`, or, for a writer that leaves that out (BigQuery),
+/// the snapshot's manifest list, read once per snapshot and cached (see
+/// [`virtual_table_row_count`]). No manifest or Parquet/data file is read. Every
+/// step is best-effort: a parse / auth / load / metadata failure drops only that
+/// table's count (logged at debug), never the whole response. A Direct-catalog
+/// source (no catalog) returns no counts.
 #[cfg(feature = "iceberg")]
 async fn fetch_virtual_table_row_counts(
     fluree: &crate::Fluree,
     record: &GraphSourceRecord,
     cfg: &fluree_db_iceberg::IcebergGsConfig,
     tables: &[String],
-) -> (HashMap<String, i64>, Option<i64>, Vec<String>) {
-    use fluree_db_iceberg::catalog::{
-        parse_table_identifier, RestCatalogClient, RestCatalogConfig, SendCatalogClient,
-    };
-    use fluree_db_iceberg::config::CatalogConfig;
+    deadline: tokio::time::Instant,
+) -> VirtualTableCounts {
+    use fluree_db_iceberg::catalog::{parse_table_identifier, SendCatalogClient};
     use futures::StreamExt;
     use std::sync::Arc;
 
-    // Only a REST catalog has a client (and token) worth sharing; a Direct
-    // (table-location) source has no catalog to query for counts.
-    let CatalogConfig::Rest {
-        uri,
-        warehouse,
-        auth,
-        ..
-    } = &cfg.catalog
-    else {
-        return (HashMap::new(), None, Vec::new());
-    };
-
-    // Reuse (or warm) the process-wide REST client under the SAME cache key the
-    // scan path uses, so `/info` and query execution share one OAuth token +
-    // connection pool (see graph_source::r2rml::rest_client_cache_key).
-    let cache = fluree.r2rml_cache();
-    let client_fp =
-        crate::graph_source::rest_client_cache_key(&record.graph_source_id, &record.config);
-    let catalog: Arc<RestCatalogClient> = match cache.rest_client(&client_fp) {
-        Some(c) => c,
-        None => {
-            // Hydrate any SecretRef auth INSIDE the miss arm — after `client_fp`
-            // was computed over the raw config (same ordering discipline as the
-            // scan path). Best-effort: a resolver failure just omits counts, like
-            // every other failure in this display-only path.
-            let hydrated_auth = match auth.hydrate(fluree.secret_resolver()).await {
-                Ok(a) => a,
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: auth secret resolution failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            };
-            let auth_provider = match hydrated_auth.create_provider_arc() {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: auth provider build failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            };
-            let catalog_config = RestCatalogConfig {
-                uri: uri.clone(),
-                warehouse: warehouse.clone(),
-                ..Default::default()
-            };
-            match RestCatalogClient::new(catalog_config, auth_provider) {
-                Ok(client) => {
-                    let client = Arc::new(client);
-                    cache.put_rest_client(client_fp, Arc::clone(&client));
-                    client
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
-                    return (HashMap::new(), None, Vec::new());
-                }
-            }
+    // Every catalog-backed source (REST, AWS Glue, AWS S3 Tables) is counted
+    // through the SAME process-wide client the scan path uses
+    // (graph_source::shared_catalog_client, keyed by catalog_client_cache_key), so
+    // `/info` and query execution share one OAuth token / SDK client + connection
+    // pool, warmed by whichever runs first. A Direct (table-location) source has no
+    // catalog to ask. Best-effort: a client that cannot be built just omits counts,
+    // like every other failure in this display-only path.
+    let catalog = match tokio::time::timeout_at(
+        deadline,
+        crate::graph_source::shared_catalog_client(
+            fluree,
+            &record.graph_source_id,
+            &record.config,
+            cfg,
+        ),
+    )
+    .await
+    {
+        Ok(Ok(Some(catalog))) => catalog,
+        Ok(Ok(None)) => {
+            return fetch_direct_table_row_counts(fluree, record, tables, deadline).await
+        }
+        Ok(Err(e)) => {
+            tracing::debug!(error = %e, "virtual ledger-info: catalog client build failed; counts omitted");
+            return VirtualTableCounts::default();
+        }
+        Err(_) => {
+            tracing::debug!(graph_source = %record.graph_source_id, "virtual ledger-info: catalog client build exceeded the count budget; counts omitted");
+            return VirtualTableCounts::default();
         }
     };
 
@@ -1758,51 +2253,283 @@ async fn fetch_virtual_table_row_counts(
                     let id = parse_table_identifier(&table).ok()?;
                     let api_id = crate::graph_source::TableIdentifier::new(id.namespace, id.table);
                     let catalog_table_id = api_id.to_catalog();
-                    let load = match SendCatalogClient::load_table(
-                        &*catalog,
-                        &catalog_table_id,
-                        vended,
-                    )
-                    .await
-                    {
-                        Ok(l) => l,
-                        Err(e) => {
-                            tracing::debug!(table = %table, error = %e, "virtual ledger-info: loadTable failed; count omitted");
+                    let loaded = tokio::time::timeout_at(deadline, async {
+                        let mut load = match SendCatalogClient::load_table(
+                            &*catalog,
+                            &catalog_table_id,
+                            vended,
+                        )
+                        .await
+                        {
+                            Ok(l) => l,
+                            Err(e) => {
+                                tracing::debug!(table = %table, error = %e, "virtual ledger-info: loadTable failed; count omitted");
+                                return None;
+                            }
+                        };
+                        // Inline (REST), else the caches a query filled, else one read
+                        // of the metadata file (Glue / S3 Tables return a location only).
+                        match crate::graph_source::catalog_table_metadata(fluree, cfg, &mut load)
+                            .await
+                        {
+                            Ok(metadata) => Some((load, metadata)),
+                            Err(e) => {
+                                tracing::debug!(table = %table, error = %e, "virtual ledger-info: table metadata unreadable; count omitted");
+                                None
+                            }
+                        }
+                    })
+                    .await;
+                    let (load, metadata) = match loaded {
+                        Ok(loaded) => loaded?,
+                        Err(_) => {
+                            tracing::debug!(table = %table, "virtual ledger-info: loadTable exceeded the count budget; count omitted");
                             return None;
                         }
                     };
-                    let metadata = load.metadata.as_ref()?;
-                    // MoR rider (F-AUD-1): the snapshot-summary `total-records` this
-                    // count derives from OVER-COUNTS a merge-on-read table (it does not
-                    // subtract position/equality deletes, which Fluree recognizes but
-                    // does not yet apply). Flag such a table so its count is reported
-                    // as an upper bound. Zero-I/O — reads only the in-memory summary.
-                    let has_deletes = metadata_indicates_mor_approximate_count(metadata);
+                    let metadata = metadata.as_ref();
                     let schema =
                         crate::graph_source::table_schema_from_metadata(&api_id, metadata).ok()?;
-                    Some((table, schema.row_count, schema.snapshot.id, has_deletes))
+                    let grant = crate::graph_source::CatalogGrant::from_load(&load, None);
+                    let (row_count, has_deletes) = virtual_table_row_count(
+                        fluree.r2rml_cache(),
+                        &table,
+                        metadata,
+                        schema.row_count,
+                        deadline,
+                        || async {
+                            let plan =
+                                crate::graph_source::catalog_read_plan(fluree, cfg, &load).await?;
+                            let scope = plan.scope().clone();
+                            Ok::<_, fluree_db_query::QueryError>((scope, move || async move {
+                                crate::graph_source::catalog_read_storage(&plan, &grant).await
+                            }))
+                        },
+                    )
+                    .await;
+                    Some((
+                        table,
+                        row_count,
+                        schema.snapshot.id,
+                        has_deletes,
+                        virtual_table_columns(metadata),
+                    ))
                 }
             })
             .buffered(INFO_COUNT_FETCH_CONCURRENCY)
             .collect()
             .await;
 
-    let mut counts = HashMap::new();
-    let mut snapshot_id = None;
-    let mut mor_approximate_tables = Vec::new();
-    for (table, row_count, snap, has_deletes) in per_table.into_iter().flatten() {
-        if has_deletes {
-            mor_approximate_tables.push(table.clone());
+    VirtualTableCounts::collect(per_table)
+}
+
+#[cfg(feature = "iceberg")]
+impl VirtualTableCounts {
+    /// Gather the per-table outcomes, in table order: the first table's
+    /// snapshot is the dataset's.
+    fn collect(per_table: Vec<Option<VirtualTableCount>>) -> Self {
+        let mut counts = HashMap::new();
+        let mut snapshot_id = None;
+        let mut mor_approximate_tables = Vec::new();
+        let mut table_columns = HashMap::new();
+        for (table, row_count, snap, has_deletes, columns) in per_table.into_iter().flatten() {
+            if has_deletes {
+                mor_approximate_tables.push(table.clone());
+            }
+            if let Some(columns) = columns {
+                table_columns.insert(table.clone(), columns);
+            }
+            if let Some(rc) = row_count {
+                counts.insert(table, rc);
+            }
+            if snapshot_id.is_none() {
+                snapshot_id = Some(snap);
+            }
         }
-        if let Some(rc) = row_count {
-            counts.insert(table, rc);
-        }
-        if snapshot_id.is_none() {
-            snapshot_id = Some(snap);
+        mor_approximate_tables.sort();
+        VirtualTableCounts {
+            counts,
+            snapshot_id,
+            mor_approximate_tables,
+            table_columns,
         }
     }
-    mor_approximate_tables.sort();
-    (counts, snapshot_id, mor_approximate_tables)
+}
+
+/// [`fetch_virtual_table_row_counts`] for a Direct (table-location) source,
+/// which has no catalog: each table's metadata file is read as a scan reads it
+/// (its caches included), and the count is its current snapshot summary's
+/// `total-records`, omitted when the writer left it out. No manifest list,
+/// manifest or data file is read. Each table's read is bounded by `deadline`,
+/// and an overrun or failure omits only that table's count.
+#[cfg(feature = "iceberg")]
+async fn fetch_direct_table_row_counts(
+    fluree: &crate::Fluree,
+    record: &GraphSourceRecord,
+    tables: &[String],
+    deadline: tokio::time::Instant,
+) -> VirtualTableCounts {
+    use futures::StreamExt;
+    let provider = crate::graph_source::FlureeR2rmlProvider::new(fluree);
+    let graph_source_id = record.graph_source_id.to_string();
+    let per_table: Vec<Option<VirtualTableCount>> = futures::stream::iter(tables.iter().cloned())
+        .map(|table| {
+            let provider = &provider;
+            let graph_source_id = graph_source_id.as_str();
+            async move {
+                let metadata = match tokio::time::timeout_at(
+                    deadline,
+                    provider.table_metadata(graph_source_id, &table),
+                )
+                .await
+                {
+                    Ok(Ok(metadata)) => metadata,
+                    Ok(Err(e)) => {
+                        tracing::debug!(table = %table, error = %e, "virtual ledger-info: Direct table metadata unreadable; count omitted");
+                        return None;
+                    }
+                    Err(_) => {
+                        tracing::debug!(table = %table, "virtual ledger-info: Direct table metadata exceeded the count budget; count omitted");
+                        return None;
+                    }
+                };
+                let snapshot = metadata.current_snapshot();
+                Some((
+                    table,
+                    snapshot.and_then(fluree_db_iceberg::metadata::Snapshot::total_records),
+                    snapshot.map_or(0, |s| s.snapshot_id),
+                    metadata_indicates_mor_approximate_count(&metadata),
+                    virtual_table_columns(&metadata),
+                ))
+            }
+        })
+        .buffered(INFO_COUNT_FETCH_CONCURRENCY)
+        .collect()
+        .await;
+    VirtualTableCounts::collect(per_table)
+}
+
+/// What the virtual `/info` row-count pass found; see
+/// [`fetch_virtual_table_row_counts`].
+#[cfg(feature = "iceberg")]
+#[derive(Default)]
+struct VirtualTableCounts {
+    counts: HashMap<String, i64>,
+    snapshot_id: Option<i64>,
+    mor_approximate_tables: Vec<String>,
+    table_columns: HashMap<String, VirtualTableColumns>,
+}
+
+/// One virtual table's `/info` row count, and whether it is a merge-on-read
+/// upper bound (the table belongs in [`Source::mor_approximate_tables`]).
+///
+/// The count comes from the first of these that has it:
+/// 1. `summary_rows`, the snapshot summary's `total-records` as
+///    `table_schema_from_metadata` read it. Zero-I/O, and most writers set it.
+/// 2. The manifest-list totals cache, keyed by the snapshot's manifest-list
+///    location under the [`StorageScope`] of the source's storage plan.
+/// 3. One read of that manifest list ([`ManifestListTotals`]), cached for the
+///    next call. `total-records` is optional in the Iceberg spec, and BigQuery
+///    writes a summary of only `operation`.
+///
+/// `plan` decides the source's storage identity (and proves a Google one)
+/// before the cache is consulted, as every location-keyed cache is, so a total
+/// read under one identity is never served to another. It runs only when the
+/// summary has no total. A warm plan makes no remote call: a Google identity's
+/// token is cached process-wide. The store it returns is built only on a cache
+/// miss, so a warm `/info` builds no storage and reads nothing. A failed plan
+/// or read caches nothing and omits the count.
+///
+/// `deadline` bounds the plan and the manifest-list read (building its store
+/// and reading the list), and an overrun omits only this table's count. A
+/// count from the summary never waits on anything, and a warm count is served
+/// even past the deadline: the plan is polled once before the deadline is
+/// consulted, so a plan that is ready at once is used, and the cache is looked
+/// up before the read's timer starts.
+///
+/// [`StorageScope`]: fluree_db_iceberg::StorageScope
+///
+/// MoR rider (F-AUD-1): neither source subtracts position/equality deletes,
+/// which Fluree recognizes but does not yet apply, so both over-count a
+/// merge-on-read table. The table is flagged when the summary's delete
+/// counters say so (fail-closed: see
+/// [`metadata_indicates_mor_approximate_count`]) or, when the manifest list
+/// was the source, when it lists any delete manifest.
+///
+/// [`ManifestListTotals`]: fluree_db_iceberg::ManifestListTotals
+#[cfg(feature = "iceberg")]
+async fn virtual_table_row_count<S, E, P, PFut, O, OFut>(
+    cache: &crate::graph_source::R2rmlCache,
+    table: &str,
+    metadata: &fluree_db_iceberg::metadata::TableMetadata,
+    summary_rows: Option<i64>,
+    deadline: tokio::time::Instant,
+    plan: P,
+) -> (Option<i64>, bool)
+where
+    S: fluree_db_iceberg::SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    P: FnOnce() -> PFut,
+    PFut:
+        std::future::Future<Output = std::result::Result<(fluree_db_iceberg::StorageScope, O), E>>,
+    O: FnOnce() -> OFut,
+    OFut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    let summary_mor = metadata_indicates_mor_approximate_count(metadata);
+    if summary_rows.is_some() {
+        return (summary_rows, summary_mor);
+    }
+    let Some(snapshot) = metadata.current_snapshot() else {
+        return (None, summary_mor);
+    };
+    let mut plan = std::pin::pin!(plan());
+    let planned = match futures::poll!(plan.as_mut()) {
+        std::task::Poll::Ready(planned) => Some(planned),
+        std::task::Poll::Pending => tokio::time::timeout_at(deadline, plan).await.ok(),
+    };
+    let (scope, open_storage) = match planned {
+        Some(Ok(planned)) => planned,
+        Some(Err(e)) => {
+            tracing::debug!(table, error = %e, "virtual ledger-info: no storage plan for the manifest list; count omitted");
+            return (None, summary_mor);
+        }
+        None => {
+            tracing::debug!(
+                table,
+                "virtual ledger-info: storage plan exceeded the count budget; count omitted"
+            );
+            return (None, summary_mor);
+        }
+    };
+    if let Some(totals) =
+        crate::graph_source::cached_manifest_list_totals_hit(Some(cache), &scope, snapshot)
+    {
+        return (
+            totals.row_count,
+            summary_mor || totals.has_delete_manifests(),
+        );
+    }
+    let read = crate::graph_source::read_manifest_list_totals(
+        Some(cache),
+        &scope,
+        table,
+        snapshot,
+        open_storage,
+    );
+    match tokio::time::timeout_at(deadline, read).await {
+        Ok(Some(totals)) => (
+            totals.row_count,
+            summary_mor || totals.has_delete_manifests(),
+        ),
+        Ok(None) => (None, summary_mor),
+        Err(_) => {
+            tracing::debug!(
+                table,
+                "virtual ledger-info: manifest-list read exceeded the count budget; count omitted"
+            );
+            (None, summary_mor)
+        }
+    }
 }
 
 /// Whether a virtual (Iceberg) table's snapshot-summary row count must be treated
@@ -1850,9 +2577,11 @@ async fn build_iceberg_virtual_info(
     };
 
     // Distinct tables: union of the mapping's tables and the config's own table.
+    // An `rr:sqlQuery` map reads its `FROM` table: list (and count) that, never
+    // the query's alias.
     let mut tables: Vec<String> = mapping
         .as_deref()
-        .map(|m| m.table_names().into_iter().map(str::to_string).collect())
+        .map(mapping_source_tables)
         .unwrap_or_default();
     if let Some(cfg) = cfg.as_ref() {
         meta.model = cfg.model.clone();
@@ -1871,9 +2600,22 @@ async fn build_iceberg_virtual_info(
             CatalogConfig::Direct { table_location } => {
                 meta.table_location = Some(table_location.clone());
             }
+            CatalogConfig::Glue { .. } => {
+                meta.catalog_type = Some("glue".to_string());
+                meta.catalog_uri = Some(cfg.catalog.catalog_label().to_string());
+            }
+            CatalogConfig::S3Tables { .. } => {
+                meta.catalog_type = Some("s3tables".to_string());
+                meta.catalog_uri = Some(cfg.catalog.catalog_label().to_string());
+            }
         }
+        // A mapped source's own `table` may be the placeholder a mapping-defined
+        // source records; its tables are the mapping's, so never list (or ask the
+        // catalog about) the placeholder.
         let id = cfg.table.identifier();
-        if !id.is_empty() && !tables.contains(&id) {
+        let placeholder =
+            cfg.mapping.is_some() && id == fluree_db_iceberg::config::MAPPING_DEFINED_TABLE;
+        if !id.is_empty() && !placeholder && !tables.contains(&id) {
             tables.push(id);
         }
     }
@@ -1882,41 +2624,29 @@ async fn build_iceberg_virtual_info(
     meta.tables = tables.clone();
 
     // Best-effort per-table row counts + snapshot id via Iceberg metadata only
-    // (loadTable snapshot summary — reads no manifest/Parquet data). A single
+    // (loadTable snapshot summary, else the cached manifest-list totals — reads
+    // no manifest/Parquet data). A single
     // shared catalog client + bounded concurrency replaces the old serial,
-    // client-per-table loop; the whole fetch is time-boxed so a slow / offline
+    // client-per-table loop; the fetch is time-boxed so a slow / offline
     // catalog degrades counts to empty (and snapshot to `None`) while the schema
-    // (classes/properties, derived from the mapping) still renders on time.
+    // (classes/properties, derived from the mapping) still renders on time. The
+    // box is one deadline applied to each step, not to the whole fetch, so a
+    // step that overruns loses only its own table's count.
     let budget_ms = info_count_budget_ms();
-    let (counts, fetched_snapshot, mor_approximate_tables): (
-        HashMap<String, i64>,
-        Option<i64>,
-        Vec<String>,
-    ) = match cfg.as_ref() {
+    let fetched = match cfg.as_ref() {
         Some(cfg) if budget_ms > 0 => {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(budget_ms),
-                fetch_virtual_table_row_counts(fluree, record, cfg, &tables),
-            )
-            .await
-            {
-                Ok(res) => res,
-                Err(_) => {
-                    tracing::debug!(
-                        graph_source = %record.graph_source_id,
-                        budget_ms,
-                        "virtual ledger-info: row-count fetch exceeded budget; counts omitted"
-                    );
-                    (HashMap::new(), None, Vec::new())
-                }
-            }
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+            fetch_virtual_table_row_counts(fluree, record, cfg, &tables, deadline).await
         }
-        _ => (HashMap::new(), None, Vec::new()),
+        _ => VirtualTableCounts::default(),
     };
+    let counts = fetched.counts;
     if meta.snapshot_id.is_none() {
-        meta.snapshot_id = fetched_snapshot;
+        meta.snapshot_id = fetched.snapshot_id;
     }
-    meta.mor_approximate_tables = mor_approximate_tables;
+    meta.mor_approximate_tables = fetched.mor_approximate_tables;
+    meta.table_columns = fetched.table_columns;
 
     Ok(build_virtual_ledger_info(record, mapping.as_deref(), &meta, &counts).into_json())
 }
@@ -2004,6 +2734,7 @@ fn decode_graph_property_stats(
             compacted,
             PropertyStat {
                 count: Some(entry.count as i64),
+                count_upper_bound: None,
                 last_modified_t: Some(entry.last_modified_t),
                 datatypes,
                 ndv_values,
@@ -2089,7 +2820,7 @@ fn decode_class_stats(
                 .collect();
 
             // ref-classes: per-target-class ref counts
-            let mut ref_classes: BTreeMap<String, i64> = BTreeMap::new();
+            let mut ref_classes: BTreeMap<String, Option<i64>> = BTreeMap::new();
             for rc in &usage.ref_classes {
                 let class_iri = compactor.decode_sid(&rc.class_sid).map_err(|e| match e {
                     crate::format::FormatError::UnknownNamespace(code) => {
@@ -2098,7 +2829,7 @@ fn decode_class_stats(
                     _ => LedgerInfoError::Storage(e.to_string()),
                 })?;
                 let class_compacted = compactor.compact_vocab_iri(&class_iri);
-                ref_classes.insert(class_compacted, rc.count as i64);
+                ref_classes.insert(class_compacted, Some(rc.count as i64));
             }
 
             properties.insert(
@@ -2107,6 +2838,7 @@ fn decode_class_stats(
                     types,
                     langs,
                     ref_classes,
+                    ref_classes_upper_bound: BTreeMap::new(),
                 },
             );
         }
@@ -2115,6 +2847,7 @@ fn decode_class_stats(
             compacted,
             ClassInfo {
                 count: Some(entry.count as i64),
+                count_upper_bound: None,
                 subclass_of,
                 properties,
                 // Native always emits `property-list` (possibly empty).
@@ -2776,6 +3509,10 @@ mod tests {
             json!(["openflights.airlines"]),
             "the MoR table is flagged approximate"
         );
+        // A count over a merge-on-read table's rows is only a bound.
+        let airline = &info["stats"]["classes"]["http://ex.org/Airline"];
+        assert_eq!(airline["count"], JsonValue::Null, "{airline}");
+        assert_eq!(airline["count-upper-bound"], 100, "{airline}");
     }
 
     /// 1528-W1 (/info side): the fail-closed summary classifier must make a table
@@ -2821,6 +3558,428 @@ mod tests {
         assert!(!metadata_indicates_mor_approximate_count(&clean));
     }
 
+    // ------------------------------------------------------------------
+    // virtual_table_row_count: summary first, else the manifest list, cached.
+    // ------------------------------------------------------------------
+
+    /// A BigQuery-written table: its snapshot summary is only
+    /// `{"operation": "overwrite"}`; its manifest list states 2,000,000 rows.
+    #[cfg(feature = "iceberg")]
+    const BQ_METADATA: &[u8] =
+        include_bytes!("../../fluree-db-iceberg/tests/fixtures/bigquery/big.metadata.json");
+    #[cfg(feature = "iceberg")]
+    const BQ_MANIFEST_LIST: &[u8] =
+        include_bytes!("../../fluree-db-iceberg/tests/fixtures/bigquery/big.manifest-list.avro");
+    #[cfg(feature = "iceberg")]
+    const BQ_ROWS: i64 = 2_000_000;
+
+    /// In-memory storage that counts every read.
+    #[cfg(feature = "iceberg")]
+    #[derive(Debug, Default)]
+    struct CountingStorage {
+        files: HashMap<String, bytes::Bytes>,
+        reads: std::sync::atomic::AtomicUsize,
+    }
+
+    #[cfg(feature = "iceberg")]
+    impl CountingStorage {
+        fn with_file(path: &str, data: &'static [u8]) -> Arc<Self> {
+            let mut files = HashMap::new();
+            files.insert(path.to_string(), bytes::Bytes::from_static(data));
+            Arc::new(Self {
+                files,
+                ..Default::default()
+            })
+        }
+        fn reads(&self) -> usize {
+            self.reads.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[async_trait]
+    impl fluree_db_iceberg::SendIcebergStorage for CountingStorage {
+        async fn read(&self, path: &str) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.files
+                .get(path)
+                .cloned()
+                .ok_or_else(|| fluree_db_iceberg::IcebergError::storage(format!("no {path}")))
+        }
+        async fn read_range(
+            &self,
+            path: &str,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_iceberg::Result<bytes::Bytes> {
+            let data = self.read(path).await?;
+            Ok(data.slice(range.start as usize..range.end as usize))
+        }
+        async fn file_size(&self, path: &str) -> fluree_db_iceberg::Result<u64> {
+            Ok(self.read(path).await?.len() as u64)
+        }
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn bq_metadata() -> fluree_db_iceberg::metadata::TableMetadata {
+        fluree_db_iceberg::metadata::TableMetadata::from_json(BQ_METADATA).unwrap()
+    }
+
+    #[cfg(feature = "iceberg")]
+    fn bq_manifest_list_path(metadata: &fluree_db_iceberg::metadata::TableMetadata) -> String {
+        metadata
+            .current_snapshot()
+            .and_then(|s| s.manifest_list_location())
+            .unwrap()
+            .to_string()
+    }
+
+    /// The count `/info` reports for a table, opening `storage` only when the
+    /// resolver asks for it; also returns how many times it asked.
+    #[cfg(feature = "iceberg")]
+    async fn count_with(
+        cache: &crate::graph_source::R2rmlCache,
+        metadata: &fluree_db_iceberg::metadata::TableMetadata,
+        storage: &Arc<CountingStorage>,
+    ) -> ((Option<i64>, bool), usize) {
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let summary_rows = crate::graph_source::table_schema_from_metadata(
+            &TableIdentifier::new("ns", "t"),
+            metadata,
+        )
+        .unwrap()
+        .row_count;
+        let out = count_under(
+            cache,
+            &fluree_db_iceberg::StorageScope::shared(),
+            metadata,
+            summary_rows,
+            storage,
+            &opened,
+        )
+        .await;
+        (out, opened.into_inner())
+    }
+
+    /// [`count_with`], with the storage plan reading under `scope`.
+    #[cfg(feature = "iceberg")]
+    async fn count_under(
+        cache: &crate::graph_source::R2rmlCache,
+        scope: &fluree_db_iceberg::StorageScope,
+        metadata: &fluree_db_iceberg::metadata::TableMetadata,
+        summary_rows: Option<i64>,
+        storage: &Arc<CountingStorage>,
+        opened: &std::sync::atomic::AtomicUsize,
+    ) -> (Option<i64>, bool) {
+        virtual_table_row_count(
+            cache,
+            "ns.t",
+            metadata,
+            summary_rows,
+            far_deadline(),
+            || {
+                std::future::ready(Ok::<_, String>((scope.clone(), || {
+                    opened.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::future::ready(Ok::<_, String>(Arc::clone(storage)))
+                })))
+            },
+        )
+        .await
+    }
+
+    /// A total read under one storage identity is not served to another: the
+    /// cache is keyed by (scope, manifest-list location), as every
+    /// location-keyed cache is.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_cached_under_one_scope_is_not_served_to_another() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let opened = std::sync::atomic::AtomicUsize::new(0);
+        let a = fluree_db_iceberg::StorageScope::of(&[("kind", "google"), ("principal", "a")]);
+        let b = fluree_db_iceberg::StorageScope::of(&[("kind", "google"), ("principal", "b")]);
+
+        let (rows, _) = count_under(&cache, &a, &metadata, None, &storage, &opened).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+        let (rows, _) = count_under(&cache, &a, &metadata, None, &storage, &opened).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+        assert_eq!(
+            storage.reads(),
+            1,
+            "the same scope is served from the cache"
+        );
+
+        let (rows, _) = count_under(&cache, &b, &metadata, None, &storage, &opened).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+        assert_eq!(storage.reads(), 2, "another scope reads the list itself");
+        assert_eq!(
+            opened.into_inner(),
+            2,
+            "each scope built its own store once"
+        );
+    }
+
+    /// A count budget no test reaches.
+    #[cfg(feature = "iceberg")]
+    fn far_deadline() -> tokio::time::Instant {
+        tokio::time::Instant::now() + std::time::Duration::from_secs(3600)
+    }
+
+    /// A storage plan that is ready at once, whose store never comes: its open
+    /// never completes.
+    #[cfg(feature = "iceberg")]
+    #[allow(clippy::type_complexity)]
+    fn never_opens() -> std::future::Ready<
+        std::result::Result<
+            (
+                fluree_db_iceberg::StorageScope,
+                fn() -> std::future::Pending<std::result::Result<Arc<CountingStorage>, String>>,
+            ),
+            String,
+        >,
+    > {
+        std::future::ready(Ok((
+            fluree_db_iceberg::StorageScope::shared(),
+            std::future::pending,
+        )))
+    }
+
+    /// A storage plan that never decides (a Google identity proof that hangs).
+    #[cfg(feature = "iceberg")]
+    #[allow(clippy::type_complexity)]
+    fn never_plans() -> std::future::Pending<
+        std::result::Result<
+            (
+                fluree_db_iceberg::StorageScope,
+                fn() -> std::future::Pending<std::result::Result<Arc<CountingStorage>, String>>,
+            ),
+            String,
+        >,
+    > {
+        std::future::pending()
+    }
+
+    /// The count budget bounds the storage plan too: a plan that never decides
+    /// costs only this table's count, and returns by the deadline.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_budget_bounds_the_storage_plan() {
+        let metadata = bq_metadata();
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let budget = std::time::Duration::from_millis(50);
+
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + budget;
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            virtual_table_row_count(&cache, "ns.t", &metadata, None, deadline, never_plans),
+        )
+        .await
+        .expect("the storage plan is bounded by the deadline");
+        assert_eq!(out, (None, false), "the overrun omits this table's count");
+        let took = started.elapsed();
+        assert!(
+            took >= budget && took < std::time::Duration::from_secs(5),
+            "returned at the deadline, not before it and not long after: {took:?}"
+        );
+    }
+
+    /// The count budget bounds the manifest-list read and nothing else: a read
+    /// that never finishes costs only this table's count, and returns by the
+    /// deadline; a count from the summary is kept with the deadline long past.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_budget_bounds_only_the_manifest_list_read() {
+        let metadata = bq_metadata();
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let budget = std::time::Duration::from_millis(50);
+
+        let started = std::time::Instant::now();
+        let deadline = tokio::time::Instant::now() + budget;
+        // Bounded here too, so an unbounded read fails this test instead of
+        // hanging it.
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            virtual_table_row_count(&cache, "ns.t", &metadata, None, deadline, never_opens),
+        )
+        .await
+        .expect("the manifest-list read is bounded by the deadline");
+        assert_eq!(out, (None, false), "the overrun omits this table's count");
+        let took = started.elapsed();
+        assert!(
+            took >= budget && took < std::time::Duration::from_secs(5),
+            "returned at the deadline, not before it and not long after: {took:?}"
+        );
+
+        let passed = tokio::time::Instant::now();
+        let out =
+            virtual_table_row_count(&cache, "ns.t", &metadata, Some(1234), passed, never_opens)
+                .await;
+        assert_eq!(out, (Some(1234), false), "a summary count never waits");
+    }
+
+    /// A warm `/info` is never cut by the budget: the cache is looked up before
+    /// the deadline is consulted, so a hit is served with the deadline already
+    /// past.
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_cache_hit_is_served_past_the_deadline() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        let _ = count_with(&cache, &metadata, &storage).await;
+        assert_eq!(storage.reads(), 1, "warmed");
+
+        let passed = tokio::time::Instant::now();
+        let out =
+            virtual_table_row_count(&cache, "ns.t", &metadata, None, passed, never_opens).await;
+        assert_eq!(out, (Some(BQ_ROWS), false));
+        assert_eq!(storage.reads(), 1, "no read");
+    }
+
+    #[cfg(feature = "iceberg")]
+    use crate::graph_source::TableIdentifier;
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_falls_back_to_the_manifest_list_when_the_summary_has_no_total() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let ((rows, approximate), opened) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(rows, Some(BQ_ROWS));
+        assert!(
+            !approximate,
+            "no delete manifest, no summary delete counter"
+        );
+        assert_eq!(opened, 1);
+        assert_eq!(storage.reads(), 1, "one read: the manifest list");
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_second_call_is_served_from_the_cache_without_io() {
+        let metadata = bq_metadata();
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let (first, _) = count_with(&cache, &metadata, &storage).await;
+        let (second, opened) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(second, first);
+        assert_eq!(second.0, Some(BQ_ROWS));
+        assert_eq!(opened, 0, "a warm call builds no storage");
+        assert_eq!(
+            storage.reads(),
+            1,
+            "the manifest list was read once, by the first call"
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_prefers_the_summary_and_reads_nothing() {
+        let mut metadata = bq_metadata();
+        let snapshot = metadata.snapshots.last_mut().unwrap();
+        snapshot
+            .summary
+            .insert("total-records".to_string(), "1234".to_string());
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let ((rows, approximate), opened) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(
+            rows,
+            Some(1234),
+            "the summary's count, not the manifest list's"
+        );
+        assert!(!approximate);
+        assert_eq!(opened, 0);
+        assert_eq!(storage.reads(), 0);
+    }
+
+    /// The MoR rule on the manifest-list rung: totals that list a delete
+    /// manifest make the count an upper bound, though the summary has no
+    /// delete counter to say so. (That a `content = 1` entry is counted as a
+    /// delete manifest, and its rows left out, is pinned in fluree-db-iceberg.)
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_from_a_manifest_list_with_delete_manifests_is_approximate() {
+        let metadata = bq_metadata();
+        let list = bq_manifest_list_path(&metadata);
+        let storage = CountingStorage::with_file(&list, BQ_MANIFEST_LIST);
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+        cache.put_manifest_list_totals(
+            &fluree_db_iceberg::StorageScope::shared(),
+            &list,
+            fluree_db_iceberg::ManifestListTotals {
+                row_count: Some(1000),
+                data_file_count: Some(1),
+                delete_manifests: 1,
+            },
+        );
+
+        let ((rows, approximate), _) = count_with(&cache, &metadata, &storage).await;
+
+        assert_eq!(rows, Some(1000));
+        assert!(
+            approximate,
+            "a delete manifest makes the count an upper bound"
+        );
+        assert!(
+            !metadata_indicates_mor_approximate_count(&metadata),
+            "precondition"
+        );
+    }
+
+    #[cfg(feature = "iceberg")]
+    #[tokio::test]
+    async fn virtual_count_failed_read_omits_the_count_and_caches_nothing() {
+        let metadata = bq_metadata();
+        let empty = Arc::new(CountingStorage::default());
+        let cache = crate::graph_source::R2rmlCache::with_defaults();
+
+        let ((rows, _), _) = count_with(&cache, &metadata, &empty).await;
+        assert_eq!(rows, None);
+
+        // The failure was not cached: once the file is readable, it is read.
+        let storage =
+            CountingStorage::with_file(&bq_manifest_list_path(&metadata), BQ_MANIFEST_LIST);
+        let ((rows, _), _) = count_with(&cache, &metadata, &storage).await;
+        assert_eq!(rows, Some(BQ_ROWS));
+    }
+
+    /// A writer that records both (pyiceberg): the manifest list's live totals
+    /// equal the summary's `total-records` / `total-data-files`, so the
+    /// fallback reports what the summary would have.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn manifest_list_totals_agree_with_a_summary_that_has_them() {
+        let metadata = fluree_db_iceberg::metadata::TableMetadata::from_json(include_bytes!(
+            "../tests/fixtures/iceberg/silver/people/metadata/00002-0cd2711a-f4be-4249-b237-67c0d02c3c5a.metadata.json"
+        ))
+        .unwrap();
+        let snapshot = metadata.current_snapshot().unwrap();
+        let totals = fluree_db_iceberg::ManifestListTotals::from_manifest_list(
+            &bytes::Bytes::from_static(include_bytes!(
+                "../tests/fixtures/iceberg/silver/people/metadata/snap-6806124999863420423-0-c2852ed8-7594-407b-9b93-20238dcdfef2.avro"
+            )),
+        )
+        .unwrap();
+        assert_eq!(snapshot.total_records(), Some(5));
+        assert_eq!(totals.row_count, snapshot.total_records());
+        assert_eq!(totals.data_file_count, snapshot.total_data_files());
+        assert_eq!(totals.delete_manifests, 0);
+    }
+
     #[test]
     fn test_compute_selectivity() {
         assert_eq!(compute_selectivity(100, 50), 2);
@@ -2842,12 +4001,27 @@ mod tests {
     }
 
     #[test]
+    fn ledger_block_uses_live_watermarks_instead_of_saved_nameservice_record() {
+        let mut snapshot = fluree_db_core::LedgerSnapshot::genesis("info-watermarks:main");
+        snapshot.t = 1;
+        let mut novelty = fluree_db_novelty::Novelty::new(1);
+        novelty.t = 2;
+        let mut ledger = LedgerState::new(snapshot, novelty);
+        ledger.ns_record = Some(NsRecord::new("info-watermarks:main"));
+
+        let block = build_ledger_block(&ledger, &IndexStats::default());
+        assert_eq!(block.t, Some(2));
+        assert_eq!(block.commit_t, Some(2));
+        assert_eq!(block.index_t, Some(1));
+    }
+
+    #[test]
     fn test_ns_record_to_jsonld() {
         use fluree_db_core::{ContentId, ContentKind};
         let commit_cid = ContentId::new(ContentKind::Commit, b"abc");
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"def");
         let record = NsRecord {
-            ledger_id: "mydb:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("mydb:main").unwrap(),
             name: "mydb:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: Some(commit_cid.clone()),
@@ -2878,7 +4052,7 @@ mod tests {
         use fluree_db_core::{ContentId, ContentKind};
         let commit_cid = ContentId::new(ContentKind::Commit, b"commit-data");
         let record = NsRecord {
-            ledger_id: "mydb:main".to_string(),
+            ledger_id: fluree_db_core::LedgerId::parse("mydb:main").unwrap(),
             name: "mydb:main".to_string(),
             branch: "main".to_string(),
             commit_head_id: Some(commit_cid),
@@ -2901,7 +4075,7 @@ mod tests {
         use fluree_db_core::{ContentId, ContentKind};
         let index_cid = ContentId::new(ContentKind::IndexRoot, b"snapshot-data");
         let record = GraphSourceRecord {
-            graph_source_id: "my-search:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("my-search:main").unwrap(),
             name: "my-search".to_string(),
             branch: "main".to_string(),
             source_type: fluree_db_nameservice::GraphSourceType::Bm25,
@@ -3029,7 +4203,7 @@ mod tests {
 
     fn virtual_record(config: &str) -> GraphSourceRecord {
         GraphSourceRecord {
-            graph_source_id: "sales:main".to_string(),
+            graph_source_id: fluree_db_core::LedgerId::parse("sales:main").unwrap(),
             name: "sales".to_string(),
             branch: "main".to_string(),
             source_type: GraphSourceType::Iceberg,
@@ -3091,8 +4265,36 @@ mod tests {
             ],
             snapshot_id: Some(42),
             mor_approximate_tables: Vec::new(),
+            table_columns: [
+                (
+                    "openflights.airlines",
+                    table_columns(&[&["id"]], &["id", "name", "founded"]),
+                ),
+                (
+                    "openflights.routes",
+                    table_columns(&[&["id"]], &["id", "distance", "airline_id"]),
+                ),
+            ]
+            .into_iter()
+            .map(|(t, c)| (t.to_string(), c))
+            .collect(),
             model: None,
             default_allow: None,
+        }
+    }
+
+    /// A table whose metadata reports `keys` and declares `non_null` columns
+    /// required; every column named is one a key can use.
+    fn table_columns(keys: &[&[&str]], non_null: &[&str]) -> VirtualTableColumns {
+        let names = |cols: &[&str]| cols.iter().map(ToString::to_string).collect::<Vec<_>>();
+        VirtualTableColumns {
+            non_null: non_null.iter().map(ToString::to_string).collect(),
+            key_usable: keys
+                .iter()
+                .flat_map(|k| names(k))
+                .chain(names(non_null))
+                .collect(),
+            keys: keys.iter().map(|k| names(k)).collect(),
         }
     }
 
@@ -3160,16 +4362,34 @@ mod tests {
         // populated `ref-classes` mapping to the parent Airline class, with the
         // child (Route) row count. Derived from the RefObjectMap's
         // `parentTriplesMap` — the relationship the native `/info` exposes.
+        // A reference is never counted exactly (a route whose airline has no
+        // row yields no triple): its ref-classes entry is null, bounded by the
+        // route rows (an airline id names at most one airline).
+        let airline_ref =
+            &info["stats"]["classes"]["http://ex.org/Route"]["properties"]["http://ex.org/airline"];
         assert_eq!(
-            info["stats"]["classes"]["http://ex.org/Route"]["properties"]["http://ex.org/airline"]
-                ["ref-classes"]["http://ex.org/Airline"],
-            50
+            airline_ref["ref-classes"]["http://ex.org/Airline"],
+            JsonValue::Null,
+            "{airline_ref}"
         );
-        // The ref property still carries its `@id` datatype in `types` (the count
-        // and the ref-classes count agree: one airline reference per route row).
+        assert_eq!(
+            airline_ref["ref-classes-upper-bound"]["http://ex.org/Airline"], 50,
+            "{airline_ref}"
+        );
+        // The ref property still carries its `@id` datatype in `types`, its
+        // count unknown; the flat property is bounded by the route rows, since
+        // an airline id names at most one airline.
         assert_eq!(
             info["stats"]["classes"]["http://ex.org/Route"]["properties"]["http://ex.org/airline"]
                 ["types"]["@id"],
+            JsonValue::Null
+        );
+        assert_eq!(
+            info["stats"]["properties"]["http://ex.org/airline"]["count"],
+            JsonValue::Null
+        );
+        assert_eq!(
+            info["stats"]["properties"]["http://ex.org/airline"]["count-upper-bound"],
             50
         );
         // A literal property has NO ref-classes (empty), so the relationship
@@ -3260,7 +4480,10 @@ mod tests {
     }
 
     /// Golden: same mapping with NO row counts — schema still renders, every
-    /// count is an explicit `null`, `table-row-counts` is `{}`.
+    /// count is an explicit `null`, `table-row-counts` is `{}`. This is the
+    /// shape for counts that are genuinely unknown (catalog unreachable, budget
+    /// spent, or neither the summary nor the manifest list states them), not
+    /// for a table whose writer merely omits the summary's `total-records`.
     #[test]
     fn test_virtual_ledger_info_golden_null_counts() {
         let record = virtual_record("{}");
@@ -3277,6 +4500,602 @@ mod tests {
 
         let golden: JsonValue = serde_json::from_str(GOLDEN_VIRTUAL_NULL).unwrap();
         assert_eq!(got, golden, "typed LedgerInfo drifted from golden (null)");
+    }
+
+    /// A filtered map (an `rr:sqlQuery` with a `WHERE`) keeps only some of its
+    /// table's rows, so no metadata knows its count: every count it contributes
+    /// to is `null`, with `count-upper-bound` the sum of the contributing maps'
+    /// table row counts. A reference into a filtered parent is bounded by the
+    /// child's rows when the parent's subject columns are among its join
+    /// columns (one parent subject per child key), and not bounded at all when
+    /// they are not (two kept parent rows can share a child key). Unfiltered
+    /// counts keep their value and carry no bound.
+    #[test]
+    fn test_virtual_ledger_info_filtered_map_counts_are_bounds() {
+        let ttl = r#"
+            @base <http://ex.org/map/> .
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            @prefix ex: <http://ex.org/> .
+            <#Current> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/customer/{customer_id}" ; rr:class ex:Customer ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+            <#Archived> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "crm.customers_archive" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/archived/{customer_id}" ; rr:class ex:Customer ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+            <#Order> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "crm.orders" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/order/{order_id}" ; rr:class ex:Order ] ;
+                rr:predicateObjectMap [ rr:predicate ex:total ; rr:objectMap [ rr:column "total" ] ] ;
+                rr:predicateObjectMap [ rr:predicate ex:customer ; rr:objectMap [
+                    rr:parentTriplesMap <#Current> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] ;
+                rr:predicateObjectMap [ rr:predicate ex:customerVersion ; rr:objectMap [
+                    rr:parentTriplesMap <#CurrentVersion> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ] ] .
+            <#CurrentVersion> a rr:TriplesMap ;
+                rr:logicalTable [ rr:sqlQuery "SELECT * FROM crm.customers_history WHERE is_current = 1" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/version/{customer_id}/{valid_from}" ;
+                                rr:class ex:CustomerVersion ] .
+        "#;
+        let mapping = fluree_db_r2rml::R2rmlLoader::from_turtle(ttl)
+            .unwrap()
+            .compile()
+            .unwrap();
+        assert_eq!(
+            mapping_source_tables(&mapping),
+            [
+                "crm.customers_archive",
+                "crm.customers_history",
+                "crm.orders"
+            ],
+            "a query map lists its FROM table, never its alias"
+        );
+        let counts: HashMap<String, i64> = [
+            ("crm.customers_history", 10),
+            ("crm.customers_archive", 3),
+            ("crm.orders", 7),
+        ]
+        .into_iter()
+        .map(|(t, n)| (t.to_string(), n))
+        .collect();
+        let record = virtual_record("{}");
+        // Keyed tables with no nulls, so the unfiltered maps count exactly.
+        let mut meta = iceberg_meta();
+        meta.table_columns = [
+            (
+                "crm.customers_history",
+                table_columns(&[], &["customer_id", "name"]),
+            ),
+            (
+                "crm.customers_archive",
+                table_columns(&[&["customer_id"]], &["customer_id", "name"]),
+            ),
+            (
+                "crm.orders",
+                table_columns(&[&["order_id"]], &["order_id", "customer_id", "total"]),
+            ),
+        ]
+        .into_iter()
+        .map(|(t, c)| (t.to_string(), c))
+        .collect();
+        let info = serde_json::to_value(build_virtual_ledger_info(
+            &record,
+            Some(&mapping),
+            &meta,
+            &counts,
+        ))
+        .unwrap();
+        let stats = &info["stats"];
+        let customer = &stats["classes"]["http://ex.org/Customer"];
+        assert_eq!(customer["count"], JsonValue::Null, "{customer}");
+        assert_eq!(customer["count-upper-bound"], 13, "{customer}");
+        assert_eq!(
+            customer["properties"]["http://ex.org/name"]["types"]["xsd:string"],
+            JsonValue::Null
+        );
+        let order = &stats["classes"]["http://ex.org/Order"];
+        assert_eq!(
+            order["count"], 7,
+            "an unfiltered child keeps its exact count"
+        );
+        assert!(order.get("count-upper-bound").is_none(), "{order}");
+        let customer_ref = &order["properties"]["http://ex.org/customer"];
+        assert_eq!(
+            customer_ref["types"]["@id"],
+            JsonValue::Null,
+            "{customer_ref}"
+        );
+        assert_eq!(
+            order["properties"]["http://ex.org/total"]["types"]["xsd:string"],
+            7
+        );
+        let props = &stats["properties"];
+        assert_eq!(props["http://ex.org/customer"]["count"], JsonValue::Null);
+        assert_eq!(props["http://ex.org/customer"]["count-upper-bound"], 7);
+        // The version subject is keyed by (customer_id, valid_from) and joined
+        // on customer_id alone: two kept versions of one customer give one
+        // order two references, so the order count bounds nothing.
+        let version = &props["http://ex.org/customerVersion"];
+        assert_eq!(version["count"], JsonValue::Null, "{version}");
+        assert!(version.get("count-upper-bound").is_none(), "{version}");
+        let version_ref = &order["properties"]["http://ex.org/customerVersion"];
+        assert_eq!(
+            version_ref["types"]["@id"],
+            JsonValue::Null,
+            "{version_ref}"
+        );
+        assert_eq!(props["http://ex.org/name"]["count"], JsonValue::Null);
+        assert_eq!(props["http://ex.org/name"]["count-upper-bound"], 13);
+        assert_eq!(props["http://ex.org/total"]["count"], 7);
+        assert!(props["http://ex.org/total"]
+            .get("count-upper-bound")
+            .is_none());
+
+        // A bound needs every contributing table's count.
+        let mut partial = counts.clone();
+        partial.remove("crm.customers_archive");
+        let info = serde_json::to_value(build_virtual_ledger_info(
+            &record,
+            Some(&mapping),
+            &meta,
+            &partial,
+        ))
+        .unwrap();
+        let customer = &info["stats"]["classes"]["http://ex.org/Customer"];
+        assert_eq!(customer["count"], JsonValue::Null, "{customer}");
+        assert!(customer.get("count-upper-bound").is_none(), "{customer}");
+
+        // Merged into a native ledger's `/info`, the graph source's entry
+        // (bound included) replaces the native one.
+        let native: LedgerInfo = serde_json::from_value(serde_json::json!({
+            "ledger": {"alias":"ds","t":7,"commit-t":7,"index-t":7,"flakes":10,"size":0,
+                       "named-graphs":[{"iri":"urn:default","g-id":0,"flakes":10,"size":0}]},
+            "graph": "default",
+            "stats": {"flakes":10,"size":0,
+                      "classes":{"http://ex.org/Customer":{"count":5}},
+                      "properties":{}},
+            "commit": null
+        }))
+        .unwrap();
+        let virt = build_virtual_ledger_info(&record, Some(&mapping), &meta, &counts);
+        let merged = merge_virtual_into_native(native, virt);
+        let merged_customer = &merged.stats.classes["http://ex.org/Customer"];
+        assert_eq!(merged_customer.count, None);
+        assert_eq!(merged_customer.count_upper_bound, Some(13));
+        assert_eq!(
+            merged.stats.properties["http://ex.org/name"].count_upper_bound,
+            Some(13)
+        );
+    }
+
+    /// Build `/info` for a Turtle mapping (`ex:` = `http://ex.org/`) over
+    /// tables with the given row counts and metadata.
+    fn info_for(
+        ttl_maps: &str,
+        tables: &[(&str, i64, Option<VirtualTableColumns>)],
+        mor: &[&str],
+    ) -> JsonValue {
+        let ttl = format!(
+            "@base <http://ex.org/map/> .\n\
+             @prefix rr: <http://www.w3.org/ns/r2rml#> .\n\
+             @prefix ex: <http://ex.org/> .\n\
+             @prefix f: <https://ns.flur.ee/db#> .\n{ttl_maps}"
+        );
+        let mapping = fluree_db_r2rml::R2rmlLoader::from_turtle(&ttl)
+            .unwrap()
+            .compile()
+            .unwrap();
+        let mut meta = iceberg_meta();
+        meta.mor_approximate_tables = mor.iter().map(ToString::to_string).collect();
+        meta.table_columns = tables
+            .iter()
+            .filter_map(|(t, _, c)| c.clone().map(|c| (t.to_string(), c)))
+            .collect();
+        let counts: HashMap<String, i64> =
+            tables.iter().map(|(t, n, _)| (t.to_string(), *n)).collect();
+        serde_json::to_value(build_virtual_ledger_info(
+            &virtual_record("{}"),
+            Some(&mapping),
+            &meta,
+            &counts,
+        ))
+        .unwrap()
+    }
+
+    /// `(count, count-upper-bound)` of a stats entry, `None` for an absent or
+    /// null field.
+    fn count_and_bound(entry: &JsonValue) -> (Option<i64>, Option<i64>) {
+        (
+            entry["count"].as_i64(),
+            entry.get("count-upper-bound").and_then(JsonValue::as_i64),
+        )
+    }
+
+    const CUSTOMER_MAP: &str = r#"
+        <#Customer> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "crm.customers" ] ;
+            rr:subjectMap [ rr:template "http://ex.org/customer/{id}" ; rr:class ex:Customer ] ;
+            rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] ;
+            rr:predicateObjectMap [ rr:predicate ex:email ; rr:objectMap [ rr:column "email" ] ] .
+    "#;
+
+    /// A keyed table whose subject and object columns are never null counts
+    /// exactly; without a key, or with a nullable column, the count is only a
+    /// bound, and a nullable object column leaves the class exact.
+    #[test]
+    fn virtual_counts_are_exact_only_for_keyed_non_null_rows() {
+        let classes = |info: &JsonValue| info["stats"]["classes"]["http://ex.org/Customer"].clone();
+        let prop = |info: &JsonValue, p: &str| info["stats"]["properties"][p].clone();
+
+        // Keyed (an identifier field), nothing nullable: exact everywhere.
+        let keyed = Some(table_columns(&[&["id"]], &["id", "name", "email"]));
+        let info = info_for(CUSTOMER_MAP, &[("crm.customers", 10, keyed)], &[]);
+        assert_eq!(count_and_bound(&classes(&info)), (Some(10), None));
+        assert_eq!(
+            count_and_bound(&prop(&info, "http://ex.org/name")),
+            (Some(10), None)
+        );
+        assert_eq!(
+            classes(&info)["properties"]["http://ex.org/name"]["types"]["xsd:string"],
+            10
+        );
+
+        // No key known: a row may repeat a subject.
+        let keyless = Some(table_columns(&[], &["id", "name", "email"]));
+        let info = info_for(CUSTOMER_MAP, &[("crm.customers", 10, keyless)], &[]);
+        assert_eq!(count_and_bound(&classes(&info)), (None, Some(10)));
+        assert_eq!(
+            count_and_bound(&prop(&info, "http://ex.org/name")),
+            (None, Some(10))
+        );
+        assert_eq!(
+            classes(&info)["properties"]["http://ex.org/name"]["types"]["xsd:string"],
+            JsonValue::Null
+        );
+
+        // No metadata at all: nothing is known but the row count.
+        let info = info_for(CUSTOMER_MAP, &[("crm.customers", 10, None)], &[]);
+        assert_eq!(count_and_bound(&classes(&info)), (None, Some(10)));
+
+        // A nullable object column: that property is a bound, the class and
+        // the other property stay exact.
+        let email_nullable = Some(table_columns(&[&["id"]], &["id", "name"]));
+        let info = info_for(CUSTOMER_MAP, &[("crm.customers", 10, email_nullable)], &[]);
+        assert_eq!(count_and_bound(&classes(&info)), (Some(10), None));
+        assert_eq!(
+            count_and_bound(&prop(&info, "http://ex.org/name")),
+            (Some(10), None)
+        );
+        assert_eq!(
+            count_and_bound(&prop(&info, "http://ex.org/email")),
+            (None, Some(10))
+        );
+
+        // A nullable subject column: a row may mint no subject.
+        let id_nullable = Some(table_columns(&[&["id"]], &["name", "email"]));
+        let info = info_for(CUSTOMER_MAP, &[("crm.customers", 10, id_nullable)], &[]);
+        assert_eq!(count_and_bound(&classes(&info)), (None, Some(10)));
+        assert_eq!(
+            count_and_bound(&prop(&info, "http://ex.org/name")),
+            (None, Some(10))
+        );
+
+        // A merge-on-read table's count is a bound on its live rows.
+        let keyed = Some(table_columns(&[&["id"]], &["id", "name", "email"]));
+        let info = info_for(
+            CUSTOMER_MAP,
+            &[("crm.customers", 10, keyed)],
+            &["crm.customers"],
+        );
+        assert_eq!(count_and_bound(&classes(&info)), (None, Some(10)));
+    }
+
+    /// A key the mapping declares (`f:key`) is a key /info uses, when the
+    /// table can hold it; one over a column that cannot identify a row (a
+    /// float, say) is not.
+    #[test]
+    fn virtual_counts_use_a_declared_key_the_table_can_hold() {
+        let map = |key: &str| {
+            CUSTOMER_MAP.replace(
+                r#"rr:tableName "crm.customers" ]"#,
+                &format!(r#"rr:tableName "crm.customers" ; f:key ( "{key}" ) ]"#),
+            )
+        };
+        let columns = |usable: &[&str]| {
+            let mut c = table_columns(&[], &["id", "name", "email"]);
+            c.key_usable = usable.iter().map(ToString::to_string).collect();
+            Some(c)
+        };
+        let customer =
+            |info: &JsonValue| count_and_bound(&info["stats"]["classes"]["http://ex.org/Customer"]);
+        let info = info_for(&map("id"), &[("crm.customers", 10, columns(&["id"]))], &[]);
+        assert_eq!(customer(&info), (Some(10), None));
+        let info = info_for(&map("id"), &[("crm.customers", 10, columns(&[]))], &[]);
+        assert_eq!(
+            customer(&info),
+            (None, Some(10)),
+            "a key over an unusable column"
+        );
+    }
+
+    /// An `rr:sqlQuery` without a `WHERE` reads its whole table, and the
+    /// table's identifier field is a key of its rows only when the query
+    /// selects that column.
+    #[test]
+    fn virtual_counts_over_a_query_use_the_keys_it_selects() {
+        let map = |select: &str| {
+            format!(
+                r#"
+                <#Customer> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:sqlQuery "SELECT {select} FROM crm.customers" ] ;
+                    rr:subjectMap [ rr:template "http://ex.org/customer/{{id}}" ; rr:class ex:Customer ] .
+                "#
+            )
+        };
+        let tables = || {
+            vec![(
+                "crm.customers",
+                10,
+                Some(table_columns(&[&["id"]], &["id", "name"])),
+            )]
+        };
+        let customer =
+            |info: &JsonValue| count_and_bound(&info["stats"]["classes"]["http://ex.org/Customer"]);
+        assert_eq!(
+            customer(&info_for(&map("*"), &tables(), &[])),
+            (Some(10), None)
+        );
+        assert_eq!(
+            customer(&info_for(&map("id, name"), &tables(), &[])),
+            (Some(10), None)
+        );
+        assert_eq!(
+            customer(&info_for(&map("name"), &tables(), &[])),
+            (None, Some(10)),
+            "the identifier column is not selected"
+        );
+
+        // The same holds for a parent's join key: a key the query does not
+        // select does not bound a reference into it.
+        let refs = |select: &str| {
+            format!(
+                r#"
+                <#Parent> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:sqlQuery "SELECT {select} FROM crm.parents" ] ;
+                    rr:subjectMap [ rr:template "http://ex.org/parent/{{id}}" ] .
+                <#Child> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:tableName "crm.children" ] ;
+                    rr:subjectMap [ rr:template "http://ex.org/child/{{id}}" ] ;
+                    rr:predicateObjectMap [ rr:predicate ex:parent ; rr:objectMap [
+                        rr:parentTriplesMap <#Parent> ;
+                        rr:joinCondition [ rr:child "parent_code" ; rr:parent "code" ] ] ] .
+                "#
+            )
+        };
+        let tables = || {
+            vec![
+                (
+                    "crm.parents",
+                    5,
+                    Some(table_columns(&[&["code"]], &["id", "code"])),
+                ),
+                ("crm.children", 8, Some(table_columns(&[&["id"]], &["id"]))),
+            ]
+        };
+        let parent = |info: &JsonValue| {
+            count_and_bound(&info["stats"]["properties"]["http://ex.org/parent"])
+        };
+        assert_eq!(
+            parent(&info_for(&refs("id, code"), &tables(), &[])),
+            (None, Some(8))
+        );
+        assert_eq!(parent(&info_for(&refs("id"), &tables(), &[])), (None, None));
+    }
+
+    /// Two maps minting one class count exactly only when their subjects are
+    /// provably disjoint; maps that may mint one subject sum to a bound.
+    #[test]
+    fn virtual_counts_across_maps_need_disjoint_subjects() {
+        let two_maps = |second_template: &str| {
+            format!(
+                r#"
+                <#Current> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:tableName "crm.customers" ] ;
+                    rr:subjectMap [ rr:template "http://ex.org/customer/{{id}}" ; rr:class ex:Customer ] .
+                <#Archived> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:tableName "crm.archive" ] ;
+                    rr:subjectMap [ rr:template "{second_template}" ; rr:class ex:Customer ] .
+                "#
+            )
+        };
+        let tables = || {
+            vec![
+                (
+                    "crm.customers",
+                    10,
+                    Some(table_columns(&[&["id"]], &["id"])),
+                ),
+                ("crm.archive", 4, Some(table_columns(&[&["id"]], &["id"]))),
+            ]
+        };
+        let customer =
+            |info: &JsonValue| count_and_bound(&info["stats"]["classes"]["http://ex.org/Customer"]);
+        let info = info_for(&two_maps("http://ex.org/archived/{id}"), &tables(), &[]);
+        assert_eq!(customer(&info), (Some(14), None), "disjoint templates");
+        let info = info_for(&two_maps("http://ex.org/customer/{id}"), &tables(), &[]);
+        assert_eq!(
+            customer(&info),
+            (None, Some(14)),
+            "one template, possibly one subject"
+        );
+        // A count that is unknown for one map leaves the class unknown, with
+        // no bound: a partial sum is neither.
+        let partial = vec![(
+            "crm.customers",
+            10,
+            Some(table_columns(&[&["id"]], &["id"])),
+        )];
+        let info = info_for(&two_maps("http://ex.org/archived/{id}"), &partial, &[]);
+        assert_eq!(customer(&info), (None, None));
+    }
+
+    /// One row can mint a predicate twice: the triples are at most twice the
+    /// rows, never counted exactly.
+    #[test]
+    fn virtual_counts_bound_a_predicate_a_row_mints_twice() {
+        let maps = r#"
+            <#Customer> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "crm.customers" ] ;
+                rr:subjectMap [ rr:template "http://ex.org/customer/{id}" ] ;
+                rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "name" ] ] ;
+                rr:predicateObjectMap [ rr:predicate ex:label ; rr:objectMap [ rr:column "email" ] ] .
+        "#;
+        let columns = Some(table_columns(&[&["id"]], &["id", "name", "email"]));
+        let info = info_for(maps, &[("crm.customers", 10, columns)], &[]);
+        assert_eq!(
+            count_and_bound(&info["stats"]["properties"]["http://ex.org/label"]),
+            (None, Some(20))
+        );
+    }
+
+    /// A reference is never counted exactly. It is bounded by the child's rows
+    /// when the parent's join key matches at most one parent subject (the
+    /// subject is a function of the join columns, or they hold a key of the
+    /// parent's table), and unbounded when it can match several (fan-out).
+    #[test]
+    fn virtual_reference_counts_are_bounded_only_without_fan_out() {
+        let maps = |parent_template: &str, parent_column: &str| {
+            format!(
+                r#"
+                <#Parent> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:tableName "crm.parents" ] ;
+                    rr:subjectMap [ rr:template "{parent_template}" ; rr:class ex:Parent ] .
+                <#Child> a rr:TriplesMap ;
+                    rr:logicalTable [ rr:tableName "crm.children" ] ;
+                    rr:subjectMap [ rr:template "http://ex.org/child/{{id}}" ; rr:class ex:Child ] ;
+                    rr:predicateObjectMap [ rr:predicate ex:parent ; rr:objectMap [
+                        rr:parentTriplesMap <#Parent> ;
+                        rr:joinCondition [ rr:child "parent_code" ; rr:parent "{parent_column}" ] ] ] .
+                "#
+            )
+        };
+        let tables = |parent_keys: &[&[&str]]| {
+            vec![
+                (
+                    "crm.parents",
+                    5,
+                    Some(table_columns(parent_keys, &["id", "code"])),
+                ),
+                (
+                    "crm.children",
+                    8,
+                    Some(table_columns(&[&["id"]], &["id", "parent_code"])),
+                ),
+            ]
+        };
+        let parent_ref = |info: &JsonValue| {
+            let class_scoped = &info["stats"]["classes"]["http://ex.org/Child"]["properties"]
+                ["http://ex.org/parent"];
+            assert_eq!(
+                class_scoped["ref-classes"]["http://ex.org/Parent"],
+                JsonValue::Null,
+                "{class_scoped}"
+            );
+            (
+                count_and_bound(&info["stats"]["properties"]["http://ex.org/parent"]),
+                class_scoped
+                    .get("ref-classes-upper-bound")
+                    .map(|b| b["http://ex.org/Parent"].clone()),
+            )
+        };
+        // The parent's subject is minted from the join column: one subject per
+        // key value, however many parent rows share it (a history table).
+        let info = info_for(
+            &maps("http://ex.org/parent/{code}", "code"),
+            &tables(&[]),
+            &[],
+        );
+        assert_eq!(parent_ref(&info), ((None, Some(8)), Some(json!(8))));
+        // The join column is a key of the parent's table.
+        let info = info_for(
+            &maps("http://ex.org/parent/{id}", "code"),
+            &tables(&[&["code"]]),
+            &[],
+        );
+        assert_eq!(parent_ref(&info), ((None, Some(8)), Some(json!(8))));
+        // Neither: one code can match several parents.
+        let info = info_for(
+            &maps("http://ex.org/parent/{id}", "code"),
+            &tables(&[&["id"]]),
+            &[],
+        );
+        assert_eq!(parent_ref(&info), ((None, None), None));
+        // The child's class is unaffected.
+        assert_eq!(
+            count_and_bound(&info["stats"]["classes"]["http://ex.org/Child"]),
+            (Some(8), None)
+        );
+    }
+
+    /// A key declared on a filtered logical table (an `rr:sqlQuery` with a
+    /// `WHERE`) does not make its count exact: no metadata knows how many rows
+    /// the filter keeps, so the table's row count is the bound.
+    #[test]
+    fn virtual_counts_over_a_keyed_filtered_table_are_bounds() {
+        let maps = r#"
+            <#Current> a rr:TriplesMap ;
+                rr:logicalTable [
+                    rr:sqlQuery "SELECT * FROM crm.history WHERE is_current = 1" ;
+                    f:key ( "id" ) ] ;
+                rr:subjectMap [ rr:template "http://ex.org/customer/{id}" ; rr:class ex:Customer ] ;
+                rr:predicateObjectMap [ rr:predicate ex:name ; rr:objectMap [ rr:column "name" ] ] .
+        "#;
+        let columns = Some(table_columns(&[], &["id", "name", "is_current"]));
+        let info = info_for(maps, &[("crm.history", 30, columns)], &[]);
+        assert_eq!(
+            count_and_bound(&info["stats"]["classes"]["http://ex.org/Customer"]),
+            (None, Some(30))
+        );
+        assert_eq!(
+            count_and_bound(&info["stats"]["properties"]["http://ex.org/name"]),
+            (None, Some(30))
+        );
+    }
+
+    /// The metadata facts: a required column is non-null only through format
+    /// version 2, and identifier fields are a key through version 3.
+    #[cfg(feature = "iceberg")]
+    #[test]
+    fn virtual_table_columns_read_required_and_identifier_fields() {
+        let metadata = |version: i32| {
+            let json = format!(
+                r#"{{"format-version":{version},"table-uuid":"00000000-0000-0000-0000-000000000000",
+                "location":"file:///t","last-sequence-number":0,"last-updated-ms":0,"last-column-id":3,
+                "current-schema-id":0,"schemas":[{{"type":"struct","schema-id":0,"identifier-field-ids":[1],
+                "fields":[{{"id":1,"name":"id","required":true,"type":"long"}},
+                          {{"id":2,"name":"name","required":false,"type":"string"}},
+                          {{"id":3,"name":"score","required":true,"type":"double"}}]}}],
+                "default-spec-id":0,"partition-specs":[{{"spec-id":0,"fields":[]}}],"last-partition-id":999,
+                "default-sort-order-id":0,"sort-orders":[{{"order-id":0,"fields":[]}}],"properties":{{}},
+                "current-snapshot-id":null,"snapshots":[],"snapshot-log":[],"metadata-log":[]}}"#
+            );
+            fluree_db_iceberg::metadata::TableMetadata::from_json(json.as_bytes())
+                .expect("metadata")
+        };
+        let set = |names: &[&str]| -> std::collections::BTreeSet<String> {
+            names.iter().map(ToString::to_string).collect()
+        };
+        let v2 = virtual_table_columns(&metadata(2)).expect("a schema");
+        assert_eq!(v2.non_null, set(&["id", "score"]));
+        assert_eq!(v2.key_usable, set(&["id", "name"]), "a double is no key");
+        assert_eq!(v2.keys, vec![vec!["id".to_string()]]);
+        let v3 = virtual_table_columns(&metadata(3)).expect("a schema");
+        assert!(v3.non_null.is_empty(), "{v3:?}");
+        assert_eq!(v3.keys, vec![vec!["id".to_string()]]);
+        let v4 = virtual_table_columns(&metadata(4)).expect("a schema");
+        assert!(v4.keys.is_empty(), "{v4:?}");
     }
 
     /// The typed `LedgerInfo` round-trips through JSON (so solo / conformance can
@@ -3299,9 +5118,9 @@ mod tests {
         );
     }
 
-    const GOLDEN_VIRTUAL_FULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":150,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":150,"size":0}]},"graph":"urn:default","stats":{"flakes":150,"size":0,"properties":{"http://ex.org/airline":{"count":50,"datatypes":{"@id":50}},"http://ex.org/distance":{"count":50,"datatypes":{"xsd:string":50}},"http://ex.org/founded":{"count":100,"datatypes":{"xsd:integer":100}},"http://ex.org/name":{"count":100,"datatypes":{"xsd:string":100}}},"classes":{"http://ex.org/Airline":{"count":100,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":100},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":100},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":50,"properties":{"http://ex.org/airline":{"types":{"@id":50},"langs":{},"ref-classes":{"http://ex.org/Airline":50}},"http://ex.org/distance":{"types":{"xsd:string":50},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{\"catalog\":{\"type\":\"rest\",\"uri\":\"https://polaris.example.com\",\"auth\":{\"type\":\"oauth2_client_credentials\",\"token_url\":\"https://polaris.example.com/tokens\",\"client_id\":\"svc-client\",\"client_secret\":\"[redacted]\"}},\"table\":\"openflights.airlines\"}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{"openflights.airlines":100,"openflights.routes":50}}}"#;
+    const GOLDEN_VIRTUAL_FULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":150,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":150,"size":0}]},"graph":"urn:default","stats":{"flakes":150,"size":0,"properties":{"http://ex.org/airline":{"count":null,"count-upper-bound":50,"datatypes":{"@id":null}},"http://ex.org/distance":{"count":50,"datatypes":{"xsd:string":50}},"http://ex.org/founded":{"count":100,"datatypes":{"xsd:integer":100}},"http://ex.org/name":{"count":100,"datatypes":{"xsd:string":100}}},"classes":{"http://ex.org/Airline":{"count":100,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":100},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":100},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":50,"properties":{"http://ex.org/airline":{"types":{"@id":null},"langs":{},"ref-classes":{"http://ex.org/Airline":null},"ref-classes-upper-bound":{"http://ex.org/Airline":50}},"http://ex.org/distance":{"types":{"xsd:string":50},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{\"catalog\":{\"type\":\"rest\",\"uri\":\"https://polaris.example.com\",\"auth\":{\"type\":\"oauth2_client_credentials\",\"token_url\":\"https://polaris.example.com/tokens\",\"client_id\":\"svc-client\",\"client_secret\":\"[redacted]\"}},\"table\":\"openflights.airlines\"}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{"openflights.airlines":100,"openflights.routes":50}}}"#;
 
-    const GOLDEN_VIRTUAL_NULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":null,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":null,"size":0}]},"graph":"urn:default","stats":{"flakes":null,"size":0,"properties":{"http://ex.org/airline":{"count":null,"datatypes":{"@id":null}},"http://ex.org/distance":{"count":null,"datatypes":{"xsd:string":null}},"http://ex.org/founded":{"count":null,"datatypes":{"xsd:integer":null}},"http://ex.org/name":{"count":null,"datatypes":{"xsd:string":null}}},"classes":{"http://ex.org/Airline":{"count":null,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":null},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":null,"properties":{"http://ex.org/airline":{"types":{"@id":null},"langs":{},"ref-classes":{"http://ex.org/Airline":0}},"http://ex.org/distance":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{}}}"#;
+    const GOLDEN_VIRTUAL_NULL: &str = r#"{"ledger_id":"sales:main","t":42,"ledger":{"alias":"sales:main","t":42,"commit-t":null,"index-t":null,"flakes":null,"size":0,"named-graphs":[{"iri":"urn:default","g-id":0,"flakes":null,"size":0}]},"graph":"urn:default","stats":{"flakes":null,"size":0,"properties":{"http://ex.org/airline":{"count":null,"datatypes":{"@id":null}},"http://ex.org/distance":{"count":null,"datatypes":{"xsd:string":null}},"http://ex.org/founded":{"count":null,"datatypes":{"xsd:integer":null}},"http://ex.org/name":{"count":null,"datatypes":{"xsd:string":null}}},"classes":{"http://ex.org/Airline":{"count":null,"properties":{"http://ex.org/founded":{"types":{"xsd:integer":null},"langs":{},"ref-classes":{}},"http://ex.org/name":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}},"http://ex.org/Route":{"count":null,"properties":{"http://ex.org/airline":{"types":{"@id":null},"langs":{},"ref-classes":{"http://ex.org/Airline":null}},"http://ex.org/distance":{"types":{"xsd:string":null},"langs":{},"ref-classes":{}}}}}},"commit":null,"nameservice":{"@context":{"f":"https://ns.flur.ee/db#"},"@id":"f:sales:main","@type":["f:MappedSource","f:IcebergMapping"],"f:name":"sales","f:branch":"main","f:status":"ready","f:graphSourceConfig":{"@value":"{}"},"f:graphSourceDependencies":[]},"source":{"virtual":true,"type":"Iceberg","tables":["openflights.airlines","openflights.routes"],"snapshot":42,"catalog":{"type":"rest","uri":"https://polaris.example.com","warehouse":"wh1"},"table-row-counts":{}}}"#;
 
     #[test]
     fn test_redact_graph_source_config_masks_oauth_secret() {
@@ -3466,7 +5285,7 @@ mod tests {
     #[cfg(feature = "iceberg")]
     #[test]
     fn test_every_auth_config_variant_redacts_on_emit() {
-        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::auth::{AuthConfig, ExternalAccountConfig, GoogleCredentials};
         use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
         use fluree_db_iceberg::{ConfigValue, IcebergGsConfig};
 
@@ -3518,6 +5337,46 @@ mod tests {
                 scopes: None,
                 metadata_url: None,
             },
+            // A service-account key file (stored under the generic name `key`),
+            // as a literal and as an env var with an inline default; and as a
+            // secret reference, which stays visible.
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::literal(format!(
+                        r#"{{"type":"service_account","private_key":"{SENTINEL_A}"}}"#
+                    )),
+                },
+                scopes: None,
+                quota_project: Some("lake-project".to_string()),
+            },
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::Dynamic {
+                        env_var: Some("MY_TOKEN".to_string()),
+                        java_property: None,
+                        default_val: Some(SENTINEL_B.to_string()),
+                    },
+                },
+                scopes: None,
+                quota_project: None,
+            },
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ServiceAccount {
+                    key: ConfigValue::SecretRef {
+                        secret_ref: VISIBLE_REF.to_string(),
+                    },
+                },
+                scopes: None,
+                quota_project: None,
+            },
+            // A WIF configuration is not secret; the other sources carry none.
+            AuthConfig::Google {
+                credentials: GoogleCredentials::ExternalAccount {
+                    config: ExternalAccountConfig::Inline(serde_json::Map::new()),
+                },
+                scopes: None,
+                quota_project: None,
+            },
         ];
 
         // Exhaustiveness canary — NO wildcard arm. A new AuthConfig variant
@@ -3528,7 +5387,8 @@ mod tests {
                 AuthConfig::None
                 | AuthConfig::Bearer { .. }
                 | AuthConfig::OAuth2ClientCredentials { .. }
-                | AuthConfig::GoogleMetadata { .. } => {}
+                | AuthConfig::GoogleMetadata { .. }
+                | AuthConfig::Google { .. } => {}
             }
         }
 

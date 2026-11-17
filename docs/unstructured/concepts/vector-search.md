@@ -61,3 +61,9 @@ where a corpus with an index-shaped workload belongs.
 A query vector is only comparable to chunks embedded by the same model. After
 changing `[doc.embedding]`, re-ingest the whole folder rather than part of it,
 or the ranking silently mixes two vector spaces.
+
+The new model must return vectors of the width the ledger already holds: a
+ledger keeps one [vector length](../../indexing-and-search/vector-search.md#length)
+for the chunks' embeddings, even after the old ones are retracted. A model of
+another width is refused with an `Invalid vector` error; ingest into a new
+ledger, or pin `dimensions` to the old width.

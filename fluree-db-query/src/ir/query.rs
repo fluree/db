@@ -18,9 +18,9 @@ use super::grouping::Grouping;
 use super::pattern::Pattern;
 use super::projection::{Column, Projection};
 use super::reasoning::ReasoningConfig;
-use super::triple::TriplePattern;
+use super::triple::{Ref, TriplePattern};
 use crate::sort::SortSpec;
-use crate::var_registry::VarId;
+use crate::var_registry::{VarId, VarRegistry};
 
 /// Resolved CONSTRUCT template patterns
 ///
@@ -28,10 +28,14 @@ use crate::var_registry::VarId;
 /// to produce output triples. Uses the same TriplePattern type as WHERE clause
 /// patterns, but variables are resolved against the query result bindings rather
 /// than matched against the database.
+///
+/// `patterns`, `graphs` and `reifications` index into one another, so they
+/// change only through [`push_pattern`](Self::push_pattern) and
+/// [`push_reification`](Self::push_reification).
 #[derive(Debug, Clone)]
 pub struct ConstructTemplate {
     /// Template patterns (resolved TriplePatterns with Sids and VarIds)
-    pub patterns: Vec<TriplePattern>,
+    patterns: Vec<TriplePattern>,
     /// Variables that originated as template blank nodes (`[ ]`, `_:a`, or the
     /// blank cells of a desugared RDF collection `( ... )`).
     ///
@@ -41,15 +45,46 @@ pub struct ConstructTemplate {
     /// than resolving them against the (absent) bindings. Empty for templates
     /// with no blank nodes, including every JSON-LD/FQL construct and DESCRIBE.
     pub bnode_vars: HashSet<VarId>,
+    /// The named graph each pattern writes into, parallel to `patterns`
+    /// (`None`: the default graph). Empty when no pattern names a graph. A
+    /// template that names one produces a dataset, not a single graph.
+    graphs: Vec<Option<Ref>>,
+    /// RDF 1.2 reifier attachments: `reifier` reifies the triple that
+    /// `patterns[triple]` instantiates to. A row that leaves either unbound
+    /// contributes no attachment.
+    reifications: Vec<TemplateReification>,
+    /// The variables each pattern that restates a triple of the WHERE has
+    /// the list entries of its triple bound to, parallel to `patterns`
+    /// (see [`mark_list_entries`](Self::mark_list_entries)). Empty when no
+    /// pattern restates one.
+    list_entries: Vec<Option<ListEntryVars>>,
+}
+
+/// The variables a CONSTRUCT template triple's list entries are bound to
+/// (`crate::list_entries`): the positions of the entries of the owner's list
+/// that hold the triple's object (an empty list when an earlier solution
+/// named them), and whether the owner also holds the object beside the list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ListEntryVars {
+    pub positions: VarId,
+    pub beside: VarId,
+}
+
+/// A reifier attachment in a CONSTRUCT template (see
+/// [`ConstructTemplate::reifications`]).
+#[derive(Debug, Clone)]
+pub struct TemplateReification {
+    /// Index into [`ConstructTemplate::patterns`] of the reified triple.
+    pub triple: usize,
+    /// The reifier: a variable (a template blank node for `[ ]`-style
+    /// reifiers), or a constant.
+    pub reifier: Ref,
 }
 
 impl ConstructTemplate {
     /// Create a construct template from patterns with no template blank nodes.
     pub fn new(patterns: Vec<TriplePattern>) -> Self {
-        Self {
-            patterns,
-            bnode_vars: HashSet::new(),
-        }
+        Self::with_bnode_vars(patterns, HashSet::new())
     }
 
     /// Create a construct template carrying its template blank-node variables
@@ -58,16 +93,169 @@ impl ConstructTemplate {
         Self {
             patterns,
             bnode_vars,
+            graphs: Vec::new(),
+            reifications: Vec::new(),
+            list_entries: Vec::new(),
         }
     }
 
-    /// Collect all variables referenced in the template patterns.
-    pub fn referenced_vars(&self) -> HashSet<VarId> {
+    /// Append a pattern that writes into `graph` (`None`: the default graph)
+    /// and return its index. `graphs` stays empty until the first named
+    /// graph appears, then is kept aligned with `patterns`.
+    pub fn push_pattern(&mut self, pattern: TriplePattern, graph: Option<Ref>) -> usize {
+        if graph.is_some() || !self.graphs.is_empty() {
+            self.graphs.resize(self.patterns.len(), None);
+            self.graphs.push(graph);
+        }
+        if !self.list_entries.is_empty() {
+            self.list_entries.push(None);
+        }
+        self.patterns.push(pattern);
+        self.patterns.len() - 1
+    }
+
+    /// Attach `reifier` to `patterns[triple]`, an index
+    /// [`push_pattern`](Self::push_pattern) returned.
+    pub fn push_reification(&mut self, triple: usize, reifier: Ref) {
+        assert!(
+            triple < self.patterns.len(),
+            "reification of pattern {triple}, but the template has {}",
+            self.patterns.len()
+        );
+        self.reifications
+            .push(TemplateReification { triple, reifier });
+    }
+
+    /// The template patterns.
+    pub fn patterns(&self) -> &[TriplePattern] {
+        &self.patterns
+    }
+
+    /// The reifier attachments, each naming a pattern that exists.
+    pub fn reifications(&self) -> &[TemplateReification] {
+        &self.reifications
+    }
+
+    /// The graph `patterns[i]` writes into (`None`: the default graph).
+    pub fn graph(&self, i: usize) -> Option<&Ref> {
+        self.graphs.get(i).and_then(Option::as_ref)
+    }
+
+    /// Whether any pattern writes into a named graph, which makes the result
+    /// a dataset.
+    pub fn names_graphs(&self) -> bool {
+        self.graphs.iter().any(Option::is_some)
+    }
+
+    /// Iterate over variables in the patterns, graph names and reifiers.
+    /// Variables mentioned more than once appear more than once.
+    pub fn var_iter(&self) -> impl Iterator<Item = VarId> + '_ {
+        let refs = self
+            .graphs
+            .iter()
+            .flatten()
+            .chain(self.reifications.iter().map(|r| &r.reifier));
         self.patterns
             .iter()
             .flat_map(TriplePattern::referenced_vars)
-            .collect()
+            .chain(refs.filter_map(Ref::as_var))
     }
+
+    /// Collect all variables referenced in the template: its patterns, graph
+    /// names and reifiers.
+    pub fn referenced_vars(&self) -> HashSet<VarId> {
+        self.var_iter().collect()
+    }
+
+    /// Rename `old` to `new` in the patterns, graph names and reifiers.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        let rename = |r: &mut Ref| {
+            if r.as_var() == Some(old) {
+                *r = Ref::Var(new);
+            }
+        };
+        for pattern in &mut self.patterns {
+            pattern.substitute_var(old, new);
+        }
+        for graph in self.graphs.iter_mut().flatten() {
+            rename(graph);
+        }
+        for reification in &mut self.reifications {
+            rename(&mut reification.reifier);
+        }
+        if self.bnode_vars.remove(&old) {
+            self.bnode_vars.insert(new);
+        }
+    }
+
+    /// Under `grouping`, the template is instantiated once per group row, and
+    /// a template variable that row does not bind is unbound (§16.2: the
+    /// triples that read it are skipped). Rename each such variable to one
+    /// nothing binds; template blank nodes are minted per row and stay.
+    pub fn unbind_outside_group_row(&mut self, grouping: &Grouping, vars: &mut VarRegistry) {
+        let unbound: HashSet<VarId> = self
+            .var_iter()
+            .filter(|v| !grouping.group_row_binds(*v) && !self.bnode_vars.contains(v))
+            .collect();
+        for var in unbound {
+            let fresh = vars.fresh("?__construct_unbound_");
+            self.substitute_var(var, fresh);
+        }
+    }
+
+    /// Give each default-graph pattern that restates a triple pattern of
+    /// `where_patterns`, or of an OPTIONAL among them, the variables its list
+    /// entries are bound to. Its triples are those the WHERE read, so where
+    /// they are entries of a list, they are written as that list. Called
+    /// once the query's variables are registered, so the new ones alias
+    /// none.
+    pub fn mark_list_entries(&mut self, where_patterns: &[Pattern], vars: &mut VarRegistry) {
+        let reified: HashSet<usize> = self.reifications.iter().map(|r| r.triple).collect();
+        let marks: Vec<Option<ListEntryVars>> = (0..self.patterns.len())
+            .map(|i| {
+                let t = &self.patterns[i];
+                let minted = [t.s.as_var(), t.p.as_var(), t.o.as_var()]
+                    .into_iter()
+                    .flatten()
+                    .any(|v| self.bnode_vars.contains(&v));
+                let restates = self.graph(i).is_none()
+                    && !reified.contains(&i)
+                    && t.o.is_var()
+                    && !minted
+                    && reads_triple(where_patterns, t);
+                restates.then(|| ListEntryVars {
+                    positions: vars.fresh("?__list_positions_"),
+                    beside: vars.fresh("?__list_beside_"),
+                })
+            })
+            .collect();
+        self.list_entries = if marks.iter().any(Option::is_some) {
+            marks
+        } else {
+            Vec::new()
+        };
+    }
+
+    /// The variables `patterns[i]`'s list entries are bound to, when it
+    /// restates a triple of the WHERE.
+    pub fn list_entries(&self, i: usize) -> Option<ListEntryVars> {
+        self.list_entries.get(i).copied().flatten()
+    }
+
+    /// Whether any pattern restates a triple of the WHERE.
+    pub fn writes_list_entries(&self) -> bool {
+        !self.list_entries.is_empty()
+    }
+}
+
+/// Whether `patterns` read the triple `t`: as one of their triple patterns,
+/// or one of an OPTIONAL's.
+fn reads_triple(patterns: &[Pattern], t: &TriplePattern) -> bool {
+    patterns.iter().any(|pattern| match pattern {
+        Pattern::Triple(w) => w.s == t.s && w.p == t.p && w.o == t.o,
+        Pattern::Optional(inner) => reads_triple(inner, t),
+        _ => false,
+    })
 }
 
 /// A restriction applied to a SELECT query's result stream.
@@ -88,15 +276,33 @@ pub enum Restriction {
     One,
 }
 
+/// What a grouped SELECT may do with a projected variable its grouping neither
+/// keys, aggregates nor binds.
+///
+/// It is a property of the top-level output only. A sub-query's projection is a
+/// bare `Vec<VarId>` ([`super::SubqueryPattern`]), so it cannot carry
+/// [`Self::PerGroupList`]: a per-group list never crosses a sub-query boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum UngroupedProjection {
+    /// A plan error (the SPARQL rule, SPARQL 1.1 §11.4, and Cypher's).
+    #[default]
+    Reject,
+    /// Rendered as a per-group list: the documented JSON-LD query behavior.
+    /// Set only by the JSON-LD user-query entry point.
+    PerGroupList,
+}
+
 /// Describes what the query produces.
 #[derive(Debug, Clone)]
 pub enum QueryOutput {
     /// SELECT — projects rows from the algebra. The `projection` carries
     /// column structure (and per-column hydration); `restriction` carries the
-    /// optional `selectDistinct` / `selectOne` modifier.
+    /// optional `selectDistinct` / `selectOne` modifier; `ungrouped` what a
+    /// grouped query may do with a projected variable it does not group.
     Select {
         projection: Projection,
         restriction: Option<Restriction>,
+        ungrouped: UngroupedProjection,
     },
     /// CONSTRUCT — template patterns instantiated with bindings.
     Construct(ConstructTemplate),
@@ -105,28 +311,27 @@ pub enum QueryOutput {
 }
 
 impl QueryOutput {
-    /// Construct a plain `Select` from a variable list (`select ?x ?y ...`).
-    pub fn select_all(vars: Vec<VarId>) -> Self {
+    fn select_vars(vars: Vec<VarId>, restriction: Option<Restriction>) -> Self {
         Self::Select {
             projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            restriction: None,
+            restriction,
+            ungrouped: UngroupedProjection::Reject,
         }
+    }
+
+    /// Construct a plain `Select` from a variable list (`select ?x ?y ...`).
+    pub fn select_all(vars: Vec<VarId>) -> Self {
+        Self::select_vars(vars, None)
     }
 
     /// Construct a `Select` with `Distinct` restriction (`selectDistinct ?x ...`).
     pub fn select_distinct(vars: Vec<VarId>) -> Self {
-        Self::Select {
-            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            restriction: Some(Restriction::Distinct),
-        }
+        Self::select_vars(vars, Some(Restriction::Distinct))
     }
 
     /// Construct a `Select` with `One` restriction (`selectOne ?x ...`).
     pub fn select_one(vars: Vec<VarId>) -> Self {
-        Self::Select {
-            projection: Projection::Tuple(vars.into_iter().map(Column::Var).collect()),
-            restriction: Some(Restriction::One),
-        }
+        Self::select_vars(vars, Some(Restriction::One))
     }
 
     /// Construct a `Select` with a Wildcard projection (`select *`).
@@ -134,6 +339,7 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Wildcard,
             restriction: None,
+            ungrouped: UngroupedProjection::Reject,
         }
     }
 
@@ -143,6 +349,26 @@ impl QueryOutput {
         Self::Select {
             projection: Projection::Wildcard,
             restriction: Some(Restriction::Distinct),
+            ungrouped: UngroupedProjection::Reject,
+        }
+    }
+
+    /// What a grouped query may do with a projected variable it does not
+    /// group. [`UngroupedProjection::Reject`] for every non-SELECT output.
+    pub fn ungrouped_projection(&self) -> UngroupedProjection {
+        match self {
+            QueryOutput::Select { ungrouped, .. } => *ungrouped,
+            _ => UngroupedProjection::Reject,
+        }
+    }
+
+    /// Set what a grouped SELECT may do with a projected variable it does not
+    /// group. [`UngroupedProjection::PerGroupList`] is the JSON-LD query
+    /// surface's; an output that cannot carry a list (SPARQL-results rows)
+    /// sets [`UngroupedProjection::Reject`]. No effect on other outputs.
+    pub fn set_ungrouped_projection(&mut self, policy: UngroupedProjection) {
+        if let QueryOutput::Select { ungrouped, .. } = self {
+            *ungrouped = policy;
         }
     }
 
@@ -250,6 +476,76 @@ impl QueryOutput {
     }
 }
 
+/// A query's trailing `VALUES` clause (SPARQL's `ValuesClause` after the
+/// solution modifiers) and the binds the query level generated, which read it.
+///
+/// The VALUES joins after the WHERE operator tree and before grouping (a
+/// deliberate deviation from SPARQL 1.1 §18.2.4.3, which joins it after HAVING:
+/// here it restricts the aggregates' input). `then` holds the level's generated
+/// binds (GROUP BY expressions, aggregate inputs, and SELECT expressions placed
+/// before grouping), evaluated in order after the join, so they read its
+/// variables, as a sub-SELECT's binds do (its VALUES is spliced right after its
+/// WHERE). Kept out of `patterns` so the WHERE planner cannot reorder the join
+/// relative to OPTIONAL/UNION.
+#[derive(Debug, Clone)]
+pub struct PostValues {
+    /// The VALUES block's variables, in column order.
+    pub vars: Vec<VarId>,
+    /// Its rows, one binding per variable (`Binding::Unbound` for UNDEF).
+    pub rows: Vec<Vec<crate::binding::Binding>>,
+    /// Binds evaluated in order after the join.
+    pub then: Vec<(VarId, super::Expression)>,
+}
+
+impl PostValues {
+    /// A VALUES block with no binds after it.
+    pub fn new(vars: Vec<VarId>, rows: Vec<Vec<crate::binding::Binding>>) -> Self {
+        Self {
+            vars,
+            rows,
+            then: Vec::new(),
+        }
+    }
+
+    /// The variables bound once the join and its binds have run.
+    pub fn produced_vars(&self) -> Vec<VarId> {
+        self.vars
+            .iter()
+            .copied()
+            .chain(self.then.iter().map(|(var, _)| *var))
+            .collect()
+    }
+
+    /// Rename `old` to `new` in the VALUES columns and the binds.
+    pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        for var in &mut self.vars {
+            if *var == old {
+                *var = new;
+            }
+        }
+        for (var, expr) in &mut self.then {
+            if *var == old {
+                *var = new;
+            }
+            expr.substitute_var(old, new);
+        }
+    }
+
+    /// The clause as WHERE patterns, in evaluation order: the VALUES block,
+    /// then its binds.
+    pub fn to_patterns(&self) -> Vec<Pattern> {
+        std::iter::once(Pattern::Values {
+            vars: self.vars.clone(),
+            rows: self.rows.clone(),
+        })
+        .chain(self.then.iter().map(|(var, expr)| Pattern::Bind {
+            var: *var,
+            expr: expr.clone(),
+        }))
+        .collect()
+    }
+}
+
 /// Resolved query ready for execution.
 ///
 /// This is the canonical query IR — produced by parsing/lowering, consumed
@@ -284,17 +580,14 @@ pub struct Query {
     pub offset: Option<usize>,
     /// Reasoning configuration (RDFS/OWL/datalog modes, schema bundle).
     pub reasoning: ReasoningConfig,
-    /// Post-query VALUES clause (SPARQL `ValuesClause` after `SolutionModifier`).
-    ///
-    /// Stored separately from `patterns` so the WHERE-clause planner does not
-    /// reorder it relative to OPTIONAL/UNION/etc.  Applied as a final inner-join
-    /// constraint after the WHERE operator tree is fully built.
-    pub post_values: Option<Pattern>,
+    /// The trailing VALUES clause and the binds after it ([`PostValues`]),
+    /// applied after the WHERE operator tree is fully built.
+    pub post_values: Option<PostValues>,
     /// When true, scan operators bypass the **variable-predicate**
     /// filter that hides Fluree-system predicates (`f:reifies*` in
     /// every graph; the broader `f:` namespace in the default graph).
     /// Surfaced via `opts.includeSystemFacts: true` on JSON-LD
-    /// queries; SPARQL has no equivalent option today.
+    /// queries and `# PRAGMA include-system-facts: true` on SPARQL.
     ///
     /// Direct user mention of `f:reifies*` IRIs is rejected at parse
     /// time (`fluree-db-query` JSON-LD firewall and `fluree-db-sparql`
@@ -302,12 +595,30 @@ pub struct Query {
     /// rejection is the contract-level boundary; this flag only
     /// relaxes the per-row scan filter for `?p`-shape patterns.
     pub include_system_facts: bool,
+    /// The request's own union default graph switch: `Some(true)` reads the
+    /// default graph as the union of the ledger's default graph and its named
+    /// graphs, `Some(false)` reads the default graph alone, and `None` defers
+    /// to the ledger's `f:unionDefaultGraph` setting. Surfaced via
+    /// `opts.unionDefaultGraph` on JSON-LD queries and
+    /// `# PRAGMA union-default-graph` on SPARQL. It governs only a default
+    /// graph the query does not narrow to named graphs of its own.
+    pub union_default_graph: Option<bool>,
     /// `@vocab` prefix of the ledger context a Cypher query was lowered
     /// against, if any. Read by `labels()`/`type()`/`keys()`/`properties()`
     /// evaluation so IRI compaction matches `db.labels()`: strip the vocab
     /// prefix when it applies, otherwise keep the full IRI (round-trippable).
     /// `None` for JSON-LD/SPARQL queries and vocab-less Cypher.
     pub cypher_vocab: Option<std::sync::Arc<str>>,
+    /// What an unmatched OPTIONAL binds its optional-only variables to: the
+    /// surface language's null semantics. SPARQL / JSON-LD leave the default
+    /// `Unbound`; Cypher lowering sets `Poisoned`.
+    pub unmatched_optional: crate::binding::UnmatchedOptional,
+    /// Answer triple patterns in SPARQL's view of RDF lists, where a list is
+    /// its owner edge and `rdf:first`/`rdf:rest` cells and its members are
+    /// not values of their predicate (see [`crate::list_view`]). Set only for
+    /// the Graph Store `GET`, whose output must round trip; every query
+    /// surface reads a list's members as values.
+    pub rdf_list_view: bool,
 }
 
 impl Query {
@@ -326,7 +637,10 @@ impl Query {
             reasoning: ReasoningConfig::default(),
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: crate::binding::UnmatchedOptional::Unbound,
+            rdf_list_view: false,
         }
     }
 
@@ -348,7 +662,10 @@ impl Query {
             reasoning: self.reasoning.clone(),
             post_values: self.post_values.clone(),
             include_system_facts: self.include_system_facts,
+            union_default_graph: self.union_default_graph,
             cypher_vocab: self.cypher_vocab.clone(),
+            unmatched_optional: self.unmatched_optional,
+            rdf_list_view: self.rdf_list_view,
         }
     }
 }

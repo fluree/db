@@ -84,12 +84,7 @@ fn prefix_match_count(ctx: &ExecutionContext<'_>, pred: &Ref, prefix: &str) -> R
     // `ExecutionContext` usually carries an overlay provider even when there
     // is no novelty (`NoOverlay` has epoch 0), so only fall back when the
     // overlay actually contains delta rows.
-    if ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0
-    {
+    if crate::fast_path_common::overlay_has_novelty(ctx) {
         return Ok(None);
     }
     if !store.lex_sorted_string_ids() {

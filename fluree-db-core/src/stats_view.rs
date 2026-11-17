@@ -138,6 +138,25 @@ pub struct PropertyStatData {
 }
 
 impl StatsView {
+    /// This view with every soundness licence withdrawn, so it serves only as
+    /// an estimate: the ref-only flags and the per-graph observed datatype
+    /// sets read "unknown" (their consumers decline the rewrite), and the
+    /// class counts are not vouched for. For planning a state the view
+    /// doesn't describe exactly, such as the next operation of a sequential
+    /// write planned from the stats of the state the request began on.
+    pub fn estimates_only(mut self) -> Self {
+        self.property_ref_only.clear();
+        self.property_ref_only_by_iri.clear();
+        for graph in self.graph_properties.values_mut() {
+            for property in graph.values_mut() {
+                property.observed_datatypes.clear();
+            }
+        }
+        self.class_coverage_trustworthy = false;
+        self.source = None;
+        self
+    }
+
     /// Approximate byte size for cache weighing.
     pub fn byte_size(&self) -> usize {
         use std::mem::size_of;

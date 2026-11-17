@@ -1,6 +1,10 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_annotation_delete_named_graph.rs"]
+mod it_annotation_delete_named_graph;
+#[path = "it_annotation_filter_pushdown.rs"]
+mod it_annotation_filter_pushdown;
 #[path = "it_compile_breakdown.rs"]
 mod it_compile_breakdown;
 #[path = "it_count_distinct_objects.rs"]
@@ -19,6 +23,8 @@ mod it_edge_annotations_parse;
 mod it_fast_group_count;
 #[path = "it_file_backed.rs"]
 mod it_file_backed;
+#[path = "it_file_startup_recovery.rs"]
+mod it_file_startup_recovery;
 #[path = "it_file_storage_jsonld.rs"]
 mod it_file_storage_jsonld;
 #[path = "it_fuel_floor.rs"]
@@ -33,10 +39,7 @@ mod it_hydration_predicate_gating;
 mod it_join_batched_overlay;
 #[path = "it_turtle_star_write_paths.rs"]
 mod it_turtle_star_write_paths;
-// it_minmax_fast_path_fired is a STANDALONE `[[test]]` bin (see its header):
-// its assertions are about instrumentation, and tracing's process-global
-// callsite-interest cache + thread-local capture make that fragile next to
-// parallel siblings under bare `cargo test`.
+// it_minmax_fast_path_fired is a standalone `[[test]]` bin; see its header.
 // GraphQL is behind a feature flag (async-graphql is a heavy dependency), so
 // this module only compiles when it is on.
 #[cfg(feature = "graphql")]
@@ -70,6 +73,8 @@ mod it_multi_ledger_formatting;
 mod it_multi_query;
 #[path = "it_novelty_dictionary_decode.rs"]
 mod it_novelty_dictionary_decode;
+#[path = "it_novelty_encoded_equality.rs"]
+mod it_novelty_encoded_equality;
 #[path = "it_scaling_bench.rs"]
 mod it_scaling_bench;
 #[path = "it_select_star_novelty.rs"]

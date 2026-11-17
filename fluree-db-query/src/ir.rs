@@ -35,6 +35,7 @@
 
 pub mod adapters;
 pub mod expression;
+pub mod graph_reads;
 pub mod grouping;
 pub mod path;
 pub mod pattern;
@@ -49,16 +50,26 @@ pub use adapters::{
 };
 pub use expression::{ArithmeticOp, CompareOp, Expression, Function};
 pub use fluree_db_core::value::FlakeValue;
-pub use grouping::{AggregateFn, AggregateSpec, Aggregation, Grouping, InputSemantics};
+pub use graph_reads::GraphReads;
+pub use grouping::{
+    having_as_filter, read_as_unbound, sample_ungrouped_reads, AggregateFn, AggregateSpec,
+    Aggregation, Grouping, GroupingError, InputSemantics, ReadStage, SelectExprPlacement,
+    SelectExprPlacer, UngroupedRead,
+};
 pub use path::{
     PathDirection, PathModifier, PathNodeFilter, PathStep, PropertyPathPattern, ShortestPathMode,
     ShortestPathPattern,
 };
-pub use pattern::{GraphName, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern};
+pub use pattern::{
+    GraphName, OrderRole, Pattern, ServiceEndpoint, ServicePattern, SubqueryPattern,
+};
 pub use projection::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec,
     Projection, Root,
 };
-pub use query::{ConstructTemplate, Query, QueryOutput, Restriction};
+pub use query::{
+    ConstructTemplate, ListEntryVars, PostValues, Query, QueryOutput, Restriction,
+    TemplateReification, UngroupedProjection,
+};
 pub use reasoning::{ReasoningConfig, ReasoningModes};
 pub use triple::{Ref, Term, TriplePattern};

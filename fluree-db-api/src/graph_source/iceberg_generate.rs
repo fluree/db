@@ -1,7 +1,7 @@
 //! End-to-end deterministic R2RML generation (PR-1 item (c), the capstone).
 //!
 //! This module glues the two halves already on the branch: track (a)'s
-//! metadata-only [`preview_iceberg_table`] API (the INPUT) and the deterministic
+//! metadata-only [`crate::Fluree::preview_iceberg_table`] API (the INPUT) and the deterministic
 //! [`emit_r2rml`] engine (the ENGINE). For each requested table it fetches the
 //! Tier-A schema + Tier-B stats preview, maps that preview onto the emitter's
 //! self-contained input model ([`EmitTableSchema`] / [`EmitColumn`] /
@@ -32,8 +32,8 @@ use fluree_db_r2rml::emit::{
 
 use crate::graph_source::config::IcebergConnectionConfig;
 use crate::graph_source::iceberg_catalog::{
-    preview_iceberg_table, ColumnInfo, ColumnStats, SnapshotRef, StatsTier, TableIdentifier,
-    TablePreview,
+    preview_iceberg_table_in, ColumnInfo, ColumnStats, SnapshotRef, StatsTier, TableIdentifier,
+    TablePreview, TableSchema,
 };
 use crate::Result;
 
@@ -214,6 +214,7 @@ fn preview_to_emit_schema(table: &TableIdentifier, preview: &TablePreview) -> Em
         name: table.name.clone(),
         columns: preview.schema.columns.iter().map(map_column).collect(),
         identifier_field_ids: preview.schema.identifier_field_ids.clone(),
+        foreign_keys: Vec::new(),
     }
 }
 
@@ -233,14 +234,23 @@ fn build_emit_options(req: &GenerateR2rmlRequest) -> EmitOptions {
             )
         })
         .collect();
+    emit_options(&req.base_namespace, &req.options, per_table_overrides)
+}
 
+/// The emitter's options for a base namespace, the caller's knobs and its
+/// per-table overrides; the remaining IRI bases are [`EmitOptions::new`]'s.
+pub(crate) fn emit_options(
+    base_namespace: &str,
+    options: &GenerateOptions,
+    per_table_overrides: HashMap<TableKey, TableOverride>,
+) -> EmitOptions {
     EmitOptions {
-        xsd_long_as_integer: req.options.xsd_long_as_integer,
-        emit_fk_joins: req.options.emit_fk_joins,
-        keep_fk_keys_as_literals: req.options.keep_fk_keys_as_literals,
-        subject_strategy: req.options.subject_strategy,
+        xsd_long_as_integer: options.xsd_long_as_integer,
+        emit_fk_joins: options.emit_fk_joins,
+        keep_fk_keys_as_literals: options.keep_fk_keys_as_literals,
+        subject_strategy: options.subject_strategy,
         per_table_overrides,
-        ..EmitOptions::new(&req.base_namespace)
+        ..EmitOptions::new(base_namespace)
     }
 }
 
@@ -269,7 +279,7 @@ fn emit_from_previews(
 /// characters. The emitter escapes it into the Turtle `@prefix` header, but a
 /// value carrying a newline / control char is rejected here for a clean `400`
 /// (defense in depth against Turtle header injection).
-fn validate_base_namespace(base: &str) -> Result<()> {
+pub(crate) fn validate_base_namespace(base: &str) -> Result<()> {
     if base.is_empty() {
         return Err(crate::ApiError::config("base_namespace must not be empty"));
     }
@@ -306,11 +316,22 @@ fn assemble_generate_response(
         .ok_or_else(|| crate::ApiError::config("generate_r2rml requires at least one table"))?;
 
     let output = emit_from_previews(previews, req);
+    let schemas: HashMap<String, TableSchema> = previews
+        .iter()
+        .map(|(id, preview)| (id.qualified(), preview.schema.clone()))
+        .collect();
+    let mut diagnostics = output.diagnostics;
+    diagnostics.extend(super::iceberg_validate::keyless_generated_maps(
+        &output.turtle,
+        |compiled| super::iceberg_validate::preview_table_keys(compiled, &schemas),
+        super::iceberg_validate::QueryTables::FromTable,
+        super::iceberg_validate::KeyRemedy::DeclareOrIdentifierFields,
+    ));
 
     Ok(GenerateR2rmlResponse {
         turtle: output.turtle,
         structured: output.structured,
-        diagnostics: output.diagnostics,
+        diagnostics,
         snapshot_id,
     })
 }
@@ -322,7 +343,7 @@ fn assemble_generate_response(
 impl crate::Fluree {
     /// Deterministically generate an R2RML mapping over a set of Iceberg tables.
     ///
-    /// For each requested table it fetches the Tier-A+B [`preview_iceberg_table`]
+    /// For each requested table it fetches the Tier-A+B [`Self::preview_iceberg_table`]
     /// at the table's current snapshot, maps the preview onto the emitter's input
     /// model, runs the deterministic emitter with the request's
     /// `per_table_overrides`, and returns the authoritative
@@ -341,6 +362,10 @@ impl crate::Fluree {
         // the per-table previews below each clone this hydrated, literal-auth
         // connection so no per-table resolver calls happen.
         let connection = self.hydrate_conn(req.connection.clone()).await?;
+        // This instance's host-identity policy and AWS subject: the free
+        // `preview_iceberg_table` would build every preview's auth under the
+        // default, allow-everything context instead.
+        let identity = self.identity_context();
 
         // Fetch each requested table's Tier-A+B preview (metadata-only) with
         // BOUNDED CONCURRENCY. Each preview is an independent chain of network
@@ -364,9 +389,14 @@ impl crate::Fluree {
                 .map(|table| {
                     let connection = connection.clone();
                     async move {
-                        let preview =
-                            preview_iceberg_table(connection, table.clone(), StatsTier::Stats)
-                                .await?;
+                        let preview = preview_iceberg_table_in(
+                            connection,
+                            table.clone(),
+                            StatsTier::Stats,
+                            identity,
+                            None,
+                        )
+                        .await?;
                         Ok::<_, crate::ApiError>((table, preview))
                     }
                 })

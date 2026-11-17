@@ -588,6 +588,15 @@ impl ComparableValue {
                             return cv;
                         }
                     }
+                    // Text an earlier bulk import stored for INF / -INF.
+                    if let Some(d) = legacy_import_infinity(&s) {
+                        if iri.as_ref() == fluree_vocab::xsd::DOUBLE {
+                            return ComparableValue::Double(d);
+                        }
+                        if iri.as_ref() == fluree_vocab::xsd::FLOAT {
+                            return ComparableValue::Float(d as f32);
+                        }
+                    }
                 }
                 ComparableValue::TypedLiteral {
                     val: FlakeValue::String(s),
@@ -1056,6 +1065,17 @@ impl From<&ComparableValue> for FlakeValue {
             ComparableValue::Iri(s) => FlakeValue::String(s.to_string()),
             ComparableValue::TypedLiteral { val, .. } => val.clone(),
         }
+    }
+}
+
+/// `INF` / `-INF` as the text earlier versions' bulk import stored for an
+/// `xsd:double` / `xsd:float` value in the index (`inf`, `-inf`). Read-side
+/// only: the write surfaces keep to the XSD lexical space.
+pub(crate) fn legacy_import_infinity(s: &str) -> Option<f64> {
+    match s {
+        "inf" => Some(f64::INFINITY),
+        "-inf" => Some(f64::NEG_INFINITY),
+        _ => None,
     }
 }
 
@@ -1762,5 +1782,42 @@ mod tests {
         assert_eq!(iri.string_arg(), None);
 
         assert_eq!(ComparableValue::Long(1).string_arg(), None);
+    }
+
+    /// Comparisons and arithmetic read `inf` / `-inf` under `xsd:double` or
+    /// `xsd:float`, the text an earlier bulk import stored for INF / -INF, as
+    /// those numbers. Other non-XSD spellings, and other datatypes, stay
+    /// literals.
+    #[test]
+    fn numeric_operand_reads_inf_text_under_double_and_float() {
+        let typed = |text: &str, dt: &str| ComparableValue::TypedLiteral {
+            val: FlakeValue::String(text.to_string()),
+            dtc: Some(UnresolvedDatatypeConstraint::Explicit(Arc::from(dt))),
+        };
+        assert_eq!(
+            typed("inf", fluree_vocab::xsd::DOUBLE).coerce_numeric_operand(),
+            ComparableValue::Double(f64::INFINITY)
+        );
+        assert_eq!(
+            typed("-inf", fluree_vocab::xsd::DOUBLE).coerce_numeric_operand(),
+            ComparableValue::Double(f64::NEG_INFINITY)
+        );
+        assert_eq!(
+            typed("inf", fluree_vocab::xsd::FLOAT).coerce_numeric_operand(),
+            ComparableValue::Float(f32::INFINITY)
+        );
+        for (text, dt) in [
+            ("Infinity", fluree_vocab::xsd::DOUBLE),
+            ("inf", fluree_vocab::xsd::DECIMAL),
+            ("inf", fluree_vocab::xsd::STRING),
+        ] {
+            assert!(
+                matches!(
+                    typed(text, dt).coerce_numeric_operand(),
+                    ComparableValue::TypedLiteral { .. }
+                ),
+                "{text}^^{dt}"
+            );
+        }
     }
 }

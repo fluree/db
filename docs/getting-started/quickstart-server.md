@@ -4,6 +4,8 @@ This guide will get the Fluree server running on your machine in minutes.
 
 ## Installation
 
+The macOS builds are for Apple silicon and need macOS 14 (Sonoma) or later.
+
 ### Option 1: Shell Installer (macOS / Linux)
 
 ```bash
@@ -15,6 +17,15 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/fluree/db/releases/late
 ```bash
 brew install fluree/tap/fluree
 ```
+
+`fluree` installs stable releases only. To try a pre-release, install `fluree-beta`, which follows the newest release, pre-release or stable. It installs beside `fluree` without replacing the `fluree` on your `PATH`, so you run it by its path:
+
+```bash
+brew install fluree/tap/fluree-beta
+"$(brew --prefix fluree/tap/fluree-beta)/bin/fluree" --version
+```
+
+To make the beta your default `fluree`, put `$(brew --prefix fluree/tap/fluree-beta)/bin` first in your `PATH`; take it out to go back to the stable release. When a stable release supersedes the beta, `brew upgrade` moves `fluree-beta` to it.
 
 ### Option 3: PowerShell (Windows)
 
@@ -35,7 +46,7 @@ Download the latest release for your platform from [GitHub Releases](https://git
 curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-x86_64-unknown-linux-gnu.tar.xz | tar xJ
 chmod +x fluree-db-cli-x86_64-unknown-linux-gnu/fluree
 
-# macOS (Apple Silicon)
+# macOS 14 or later (Apple Silicon)
 curl -L https://github.com/fluree/db/releases/latest/download/fluree-db-cli-aarch64-apple-darwin.tar.xz | tar xJ
 chmod +x fluree-db-cli-aarch64-apple-darwin/fluree
 ```
@@ -69,20 +80,29 @@ For configuration (mounted JSON-LD/TOML config files, env vars, persistent volum
 
 ## Start the Server
 
-### Memory Storage (Development)
+### Default Storage (Development)
 
-Start the server with in-memory storage (data is lost on restart):
+`fluree server run` needs a Fluree project directory; create one with `fluree init` if you
+haven't. By default the server stores data in the project's `.fluree/storage` directory:
 
 ```bash
+fluree init
 fluree server run
 ```
 
 You should see output like:
 
 ```text
-INFO fluree_db_server: Starting Fluree server
-INFO fluree_db_server: Storage mode: memory
-INFO fluree_db_server: Server listening on 0.0.0.0:8090
+INFO fluree_db_cli::commands::server: Starting Fluree server (foreground) version="…" addr=0.0.0.0:8090 storage="file"
+```
+
+### Memory Storage (Throwaway)
+
+To try the server without creating a project, keep the data in memory. Nothing is written to the
+current directory, and the data is gone when the server stops:
+
+```bash
+fluree server run --memory
 ```
 
 ### File Storage (Persistent)
@@ -175,26 +195,28 @@ See the [API Reference](../api/endpoints.md) for complete endpoint documentation
 
 ### Storage Modes
 
-**Memory** (default):
-- Fast, in-process storage
-- Data lost on restart
-- Best for development and testing
-
-**File** (with `--storage-path`):
+**File** (default; `.fluree/storage`, or set with `--storage-path`):
 - Persistent local file storage
 - Data survives restarts
 - Best for single-server deployments
 
+**Memory** (`--memory`; see [Storage Modes](../operations/storage.md#memory-storage)):
+- Fast, in-process storage
+- Data lost on restart
+- Best for development, testing, and CI
+
 ### Configuration
 
-All options can be set via CLI flags or environment variables:
+All options can be set via CLI flags or environment variables. `fluree server run` takes the
+most common server flags directly; pass any other server flag after `--`
+(for example `fluree server run -- --cache-max-mb 4096`):
 
 ```bash
 # CLI flag
 fluree server run --storage-path /data --log-level debug
 
 # Environment variables
-export FLUREE_STORAGE_PATH=/data
+export FLUREE_LISTEN_ADDR=0.0.0.0:9090
 export FLUREE_LOG_LEVEL=debug
 fluree server run
 ```
@@ -214,9 +236,10 @@ fluree server run --log-level debug
 ```bash
 fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --indexing-enabled \
   --events-auth-mode required \
-  --events-auth-trusted-issuers did:key:z6Mk...
+  --events-auth-trusted-issuer did:key:z6Mk...
 ```
 
 ### With Background Indexing
@@ -224,6 +247,7 @@ fluree server run \
 ```bash
 fluree server run \
   --storage-path /var/lib/fluree \
+  -- \
   --indexing-enabled
 ```
 

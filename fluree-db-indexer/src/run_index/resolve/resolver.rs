@@ -24,25 +24,22 @@ use fluree_db_core::temporal::{
 use fluree_db_core::value_id::{ObjKey, ObjKind};
 use fluree_db_core::DatatypeDictId;
 use fluree_db_core::GraphId;
-use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
 use fluree_vocab::{db, fluree};
 
-/// Namespace codes reserved for Fluree system provenance. User-supplied
-/// `TxnMetaEntry`s must never land here — `extract_txn_meta` in
-/// fluree-db-transact rejects them at parse time. This list is duplicated
-/// (not imported) to avoid adding a transact → indexer layering inversion;
-/// the two sites are asserted in sync by the debug_assert in emit paths.
-const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_DB, FLUREE_COMMIT, FLUREE_URN];
-
-/// System-injected txn-meta predicates that legitimately live in a reserved
-/// namespace: `build_commit` strips any user-supplied claim for these and
-/// injects the system-controlled value (`f:identity` for provenance,
-/// `db:receivedAt` for the dual-stamp audit axis). They must flow through
-/// the resolver like ordinary entries so they stay queryable post-index.
-fn is_system_txn_meta_entry(entry: &fluree_db_novelty::TxnMetaEntry) -> bool {
-    entry.predicate_ns == FLUREE_DB
-        && (entry.predicate_name == db::IDENTITY || entry.predicate_name == db::RECEIVED_AT)
+/// Narrow a datatype dictionary ID to the width the index stores.
+///
+/// Returns an error message naming the limit if the ID does not fit.
+fn checked_dt_id(dt_id: u32) -> Result<u16, String> {
+    DatatypeDictId::try_from_dict_id(dt_id)
+        .map(DatatypeDictId::as_u16)
+        .ok_or_else(|| {
+            format!(
+                "datatype dict overflow (dt_id={dt_id} exceeds the maximum of {})",
+                DatatypeDictId::MAX
+            )
+        })
 }
+
 use num_bigint::BigInt;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -489,10 +486,10 @@ impl CommitResolver {
         writer: &mut W,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
-                || is_system_txn_meta_entry(entry),
-            "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
-            entry.predicate_ns
+            fluree_vocab::txn_meta::may_hold(entry.predicate_ns, &entry.predicate_name),
+            "TxnMetaEntry {}:{} in a reserved namespace reached the resolver — a txn-meta reader skipped the user-predicate check?",
+            entry.predicate_ns,
+            entry.predicate_name
         );
 
         // Resolve predicate using ns_code + name
@@ -555,8 +552,7 @@ impl CommitResolver {
                     ));
                 }
                 // Always encode as NUM_F64 to avoid NUM_INT + dt DOUBLE edge cases
-                let key = ObjKey::encode_f64(*n)
-                    .map_err(|e| ResolverError::Resolve(format!("txn_meta double: {e}")))?;
+                let key = ObjKey::encode_f64(*n);
                 Ok((ObjKind::NUM_F64, key, DatatypeDictId::DOUBLE.as_u16(), 0))
             }
             TxnMetaValue::Boolean(b) => Ok((
@@ -617,18 +613,9 @@ impl CommitResolver {
                 let str_id = dicts.strings.get_or_insert(value)?;
                 let dt_prefix = self.lookup_prefix(*dt_ns);
                 let dt_id = dicts.datatypes.get_or_insert_parts(dt_prefix, dt_name);
-                // Match resolve_single_op()'s u8 constraint for format consistency
-                if dt_id > u8::MAX as u32 {
-                    return Err(ResolverError::Resolve(format!(
-                        "txn_meta datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-                    )));
-                }
-                Ok((
-                    ObjKind::LEX_ID,
-                    ObjKey::encode_u32_id(str_id),
-                    dt_id as u16,
-                    0,
-                ))
+                let dt_id = checked_dt_id(dt_id)
+                    .map_err(|e| ResolverError::Resolve(format!("txn_meta {e}")))?;
+                Ok((ObjKind::LEX_ID, ObjKey::encode_u32_id(str_id), dt_id, 0))
             }
         }
     }
@@ -663,14 +650,7 @@ impl CommitResolver {
         // way, `(op.dt_ns_code, op.dt_name)` here is guaranteed canonical.
         let prefix = self.lookup_prefix(op.dt_ns_code);
         let dt_id = dicts.datatypes.get_or_insert_parts(prefix, op.dt_name);
-        // Bulk import path: enforce u8 dt ids for now (imports are allowed to error here).
-        // Operationally, the binary format supports widening dt to u16.
-        if dt_id > u8::MAX as u32 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "import not available: datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-            )));
-        }
-        let dt_id = dt_id as u16;
+        let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
         // 5. List index (convert Option<i32> to u32 with sentinel) — needed
         // by vector fact-identity lookup before object encode.
@@ -739,7 +719,7 @@ impl CommitResolver {
         }
         let prefix = self.lookup_prefix(ns_code);
         // +1 to reserve 0 for default graph
-        let raw = dicts.graphs.get_or_insert_parts(prefix, name) + 1;
+        let raw = dicts.graphs.graph_dict_id_or_insert_parts(prefix, name) + 1;
         if raw > u16::MAX as u32 {
             return Err(io::Error::other(format!(
                 "graph count {raw} exceeds u16::MAX"
@@ -878,8 +858,8 @@ impl CommitResolver {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
                 // The decode path uses the property's datatype to select
                 // DecodeKind, and F64→I64 mismatch corrupts values. (fluree/db-r#142)
-                let key = ObjKey::encode_f64(*v)
-                    .map_err(|e| format!("f64 encode for p_id={p_id}: {e}"))?;
+                // Every double, ±INF and NaN included, has an index key.
+                let key = ObjKey::encode_f64(*v);
                 Ok((ObjKind::NUM_F64, key))
             }
             RawObject::Str(s) => {
@@ -1129,6 +1109,13 @@ pub struct SharedResolverState {
     /// Sticky: any resolved user-data op carried a list index (`@list`
     /// value). Feeds `IndexRoot.has_list_meta` at root assembly.
     pub saw_list_meta: bool,
+    /// The `t` of each graph's latest drop among the commits this run
+    /// indexes, by graph IRI ([`fluree_db_core::DEFAULT_GRAPH_IRI`] for the
+    /// default graph): an op on a graph before its drop is not indexed. See
+    /// [`Self::set_graph_floors`].
+    graph_floors: HashMap<String, i64>,
+    /// [`Self::graph_floors`] by this run's graph ids, filled as ops meet them.
+    graph_floor_ids: HashMap<GraphId, Option<i64>>,
 }
 
 impl SharedResolverState {
@@ -1176,6 +1163,8 @@ impl SharedResolverState {
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
             saw_list_meta: false,
+            graph_floors: HashMap::new(),
+            graph_floor_ids: HashMap::new(),
         }
     }
 
@@ -1185,9 +1174,12 @@ impl SharedResolverState {
     /// from the root's inline vectors using `from_ordered_vec()` for exact
     /// ID stability. Validates critical invariants:
     /// - First 14 datatypes match `new_datatype_dict()` reserved order
-    /// - `graph_iris[0]` is the txn-meta graph IRI
+    /// - `graph_iris[0]` is a txn-meta graph IRI
+    ///
+    /// The system graphs take `ledger_id`'s IRIs, the ledger being built.
     pub fn from_index_root(
         root: &fluree_db_binary_index::format::index_root::IndexRoot,
+        ledger_id: &str,
     ) -> Result<Self, ResolverError> {
         use fluree_db_core::value_id::ValueTypeTag;
         use std::sync::Arc;
@@ -1214,14 +1206,28 @@ impl SharedResolverState {
             .collect();
         let predicates = super::global_dict::PredicateDict::from_ordered_iris(pred_iris);
 
-        let expected_txn_meta = fluree_db_core::graph_registry::txn_meta_graph_iri(&root.ledger_id);
-        if root.graph_iris.is_empty() || root.graph_iris[0] != expected_txn_meta {
+        use fluree_db_core::graph_registry::{
+            config_graph_iri, names_config_graph, names_txn_meta_graph, txn_meta_graph_iri,
+        };
+        // Any ledger's txn-meta IRI: a copy under another name, a branch, or
+        // a ledger that adopted a branch's index starts from another's root.
+        let expected_txn_meta = txn_meta_graph_iri(ledger_id);
+        if root.graph_iris.is_empty()
+            || (root.graph_iris[0] != expected_txn_meta
+                && !names_txn_meta_graph(&root.graph_iris[0]))
+        {
             return Err(ResolverError::Resolve(format!(
                 "graph_iris[0] must be txn-meta IRI '{}', got: {:?}",
                 expected_txn_meta,
                 root.graph_iris.first()
             )));
         }
+        // An index built before config graphs were read across ledgers may
+        // hold another ledger's config graph as a user graph. It keeps that
+        // graph, as the query side reads it, until a rebuild from the commits.
+        // The system graphs under this ledger's own IRIs, which the root this
+        // build writes then carries.
+        //
         // Upgrade legacy roots that only contain txn-meta by inserting the config graph IRI
         // into slot 1 (g_id=2). This aligns indexed graph IDs with in-memory graph ID
         // allocation (`GraphRegistry::apply_delta` starts user graphs at g_id=3).
@@ -1233,9 +1239,12 @@ impl SharedResolverState {
             .iter()
             .map(|s| Arc::from(s.as_str()))
             .collect();
-        if graph_iris.len() == 1 {
-            let config_iri = fluree_db_core::graph_registry::config_graph_iri(&root.ledger_id);
-            graph_iris.push(Arc::from(config_iri.as_str()));
+        graph_iris[0] = Arc::from(expected_txn_meta.as_str());
+        let own_config: Arc<str> = Arc::from(config_graph_iri(ledger_id).as_str());
+        match graph_iris.get_mut(1) {
+            Some(config) if names_config_graph(config) => *config = own_config,
+            Some(_) => {}
+            None => graph_iris.push(own_config),
         }
         let graphs = super::global_dict::PredicateDict::from_ordered_iris(graph_iris);
 
@@ -1304,6 +1313,8 @@ impl SharedResolverState {
             fulltext_hook_config: crate::fulltext_hook::FulltextHookConfig::default(),
             schema_hook: None,
             saw_list_meta: false,
+            graph_floors: HashMap::new(),
+            graph_floor_ids: HashMap::new(),
         })
     }
 
@@ -1378,7 +1389,7 @@ impl SharedResolverState {
                     config.add_per_graph(1, p_id);
                 }
                 ConfiguredFulltextScope::NamedGraph(iri) => {
-                    let raw = self.graphs.get_or_insert(iri) + 1;
+                    let raw = self.graphs.graph_dict_id_or_insert(iri) + 1;
                     if raw > u16::MAX as u32 {
                         tracing::warn!(
                             graph_iri = %iri,
@@ -1392,6 +1403,38 @@ impl SharedResolverState {
             }
         }
         self.fulltext_hook_config = config;
+    }
+
+    /// Skip every op on a graph from before the graph's latest drop among the
+    /// commits this run indexes (`Commit::graph_drops`): `floors` gives that
+    /// drop's `t` by graph IRI. Set before the first commit resolves.
+    pub fn set_graph_floors(&mut self, floors: HashMap<String, i64>) {
+        self.graph_floors = floors;
+        self.graph_floor_ids.clear();
+    }
+
+    /// Whether `op`, committed at `t`, is on a graph a later drop took.
+    fn dropped_later(&mut self, op: &RawOp<'_>, t: u32) -> Result<bool, CommitCodecError> {
+        if self.graph_floors.is_empty() {
+            return Ok(false);
+        }
+        let g_id = self
+            .resolve_graph(op.g_ns_code, op.g_name)
+            .map_err(|e| CommitCodecError::InvalidOp(format!("graph resolve: {e}")))?;
+        let floor = match self.graph_floor_ids.get(&g_id) {
+            Some(floor) => *floor,
+            None => {
+                let iri = if g_id == 0 {
+                    Some(fluree_db_core::DEFAULT_GRAPH_IRI)
+                } else {
+                    self.graphs.resolve(u32::from(g_id) - 1)
+                };
+                let floor = iri.and_then(|iri| self.graph_floors.get(iri).copied());
+                self.graph_floor_ids.insert(g_id, floor);
+                floor
+            }
+        };
+        Ok(floor.is_some_and(|floor| i64::from(t) < floor))
     }
 
     /// Resolve a single commit's ops into chunk-local RunRecords, appending to
@@ -1412,13 +1455,23 @@ impl SharedResolverState {
         self.apply_namespace_delta(&commit_ops.envelope.namespace_delta);
 
         let t = u32::try_from(commit_ops.t).map_err(|_| {
-            ResolverError::Resolve(format!("commit t={} does not fit in u32", commit_ops.t))
+            ResolverError::Unindexable(format!("commit t={} does not fit in u32", commit_ops.t))
         })?;
         let mut asserts = 0u32;
         let mut retracts = 0u32;
 
+        // A failure to resolve an op's content is a property of the commit.
+        // `for_each_op` can only return a codec error, so the failure is noted
+        // here to tell it apart from a failure to decode the op itself.
+        let mut unindexable: Option<String> = None;
+
         // Resolve user-data ops into chunk-local records.
-        commit_ops.for_each_op(|raw_op: RawOp<'_>| {
+        let walked = commit_ops.for_each_op(|raw_op: RawOp<'_>| {
+            // An op a later drop took feeds nothing: no record, no schema,
+            // no spatial or full-text entry.
+            if self.dropped_later(&raw_op, t)? {
+                return Ok(());
+            }
             // Schema extraction (rebuild only): capture class/property hierarchy
             // directly from commit ops before dict remap.
             if let Some(ref mut schema) = self.schema_hook {
@@ -1444,8 +1497,13 @@ impl SharedResolverState {
 
             // Skip vector retractions with no matching assertion: a no-op
             // shouldn't drive any side-effect (stats / spatial / fulltext).
-            let Some(record) = self.resolve_op_chunk(&raw_op, t, chunk)? else {
-                return Ok(());
+            let record = match self.resolve_op_chunk(&raw_op, t, chunk) {
+                Ok(Some(record)) => record,
+                Ok(None) => return Ok(()),
+                Err(e) => {
+                    unindexable = Some(e.to_string());
+                    return Err(e);
+                }
             };
 
             // Feed raw op to spatial hook (needs raw WKT string + resolved IDs).
@@ -1488,17 +1546,29 @@ impl SharedResolverState {
                 retracts += 1;
             }
             Ok(())
-        })?;
+        });
+        if let Err(e) = walked {
+            return Err(match unindexable {
+                Some(msg) => ResolverError::Unindexable(msg),
+                None => e.into(),
+            });
+        }
 
-        // Emit txn-meta records into the same chunk.
-        let meta_count = self.emit_txn_meta_chunk(
-            commit_hash_hex,
-            &commit_ops.envelope,
-            commit_size,
-            asserts,
-            retracts,
-            chunk,
-        )?;
+        // Emit txn-meta records into the same chunk. Its failures are about
+        // the envelope's content too.
+        let meta_count = self
+            .emit_txn_meta_chunk(
+                commit_hash_hex,
+                &commit_ops.envelope,
+                commit_size,
+                asserts,
+                retracts,
+                chunk,
+            )
+            .map_err(|e| match e {
+                ResolverError::Resolve(msg) => ResolverError::Unindexable(msg),
+                other => other,
+            })?;
 
         Ok(ResolvedCommit {
             total_records: asserts + retracts + meta_count,
@@ -1529,12 +1599,7 @@ impl SharedResolverState {
 
         // 4. Resolve datatype (global, with ValueTypeTag capture)
         let dt_id = self.resolve_datatype(op.dt_ns_code, op.dt_name);
-        if dt_id > u8::MAX as u32 {
-            return Err(CommitCodecError::InvalidOp(format!(
-                "datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-            )));
-        }
-        let dt_id = dt_id as u16;
+        let dt_id = checked_dt_id(dt_id).map_err(CommitCodecError::InvalidOp)?;
 
         // 5. List index — needed by vector fact-identity lookup before object encode.
         self.saw_list_meta |= op.i.is_some();
@@ -1602,7 +1667,7 @@ impl SharedResolverState {
             .get(&ns_code)
             .map(std::string::String::as_str)
             .unwrap_or("");
-        let raw = self.graphs.get_or_insert_parts(prefix, name) + 1;
+        let raw = self.graphs.graph_dict_id_or_insert_parts(prefix, name) + 1;
         if raw > u16::MAX as u32 {
             return Err(io::Error::other(format!(
                 "graph count {raw} exceeds u16::MAX"
@@ -1696,8 +1761,8 @@ impl SharedResolverState {
                 // NOTE: Do not optimize integral doubles to NUM_INT here.
                 // The decode path uses the property's datatype to select
                 // DecodeKind, and F64→I64 mismatch corrupts values. (fluree/db-r#142)
-                let key = ObjKey::encode_f64(*v)
-                    .map_err(|e| format!("f64 encode for p_id={p_id}: {e}"))?;
+                // Every double, ±INF and NaN included, has an index key.
+                let key = ObjKey::encode_f64(*v);
                 Ok((ObjKind::NUM_F64, key))
             }
             RawObject::Str(s) => {
@@ -2007,10 +2072,10 @@ impl SharedResolverState {
         chunk: &mut RebuildChunk,
     ) -> Result<u32, ResolverError> {
         debug_assert!(
-            !RESERVED_PREDICATE_NAMESPACES.contains(&entry.predicate_ns)
-                || is_system_txn_meta_entry(entry),
-            "TxnMetaEntry in reserved namespace {} reached resolver — extract_txn_meta guard bypassed?",
-            entry.predicate_ns
+            fluree_vocab::txn_meta::may_hold(entry.predicate_ns, &entry.predicate_name),
+            "TxnMetaEntry {}:{} in a reserved namespace reached the resolver — a txn-meta reader skipped the user-predicate check?",
+            entry.predicate_ns,
+            entry.predicate_name
         );
 
         let p_prefix = self
@@ -2073,8 +2138,7 @@ impl SharedResolverState {
                         "txn_meta does not support non-finite double values".into(),
                     ));
                 }
-                let key = ObjKey::encode_f64(*n)
-                    .map_err(|e| ResolverError::Resolve(format!("txn_meta double: {e}")))?;
+                let key = ObjKey::encode_f64(*n);
                 Ok((ObjKind::NUM_F64, key, DatatypeDictId::DOUBLE.as_u16(), 0))
             }
             TxnMetaValue::Boolean(b) => Ok((
@@ -2110,17 +2174,9 @@ impl SharedResolverState {
             } => {
                 let str_id = chunk.strings.get_or_insert(value.as_bytes());
                 let dt_id = self.resolve_datatype(*dt_ns, dt_name);
-                if dt_id > u8::MAX as u32 {
-                    return Err(ResolverError::Resolve(format!(
-                        "txn_meta datatype dict overflow (dt_id={dt_id} exceeds u8 max)"
-                    )));
-                }
-                Ok((
-                    ObjKind::LEX_ID,
-                    ObjKey::encode_u32_id(str_id),
-                    dt_id as u16,
-                    0,
-                ))
+                let dt_id = checked_dt_id(dt_id)
+                    .map_err(|e| ResolverError::Resolve(format!("txn_meta {e}")))?;
+                Ok((ObjKind::LEX_ID, ObjKey::encode_u32_id(str_id), dt_id, 0))
             }
         }
     }
@@ -2179,6 +2235,10 @@ pub enum ResolverError {
     Codec(CommitCodecError),
     Io(io::Error),
     Resolve(String),
+    /// A decoded commit's content has no index representation. Raised only
+    /// by [`SharedResolverState::resolve_commit_into_chunk`]; resolving the
+    /// same commit again fails the same way.
+    Unindexable(String),
 }
 
 impl From<CommitCodecError> for ResolverError {
@@ -2199,6 +2259,7 @@ impl std::fmt::Display for ResolverError {
             Self::Codec(e) => write!(f, "commit-codec: {e}"),
             Self::Io(e) => write!(f, "I/O: {e}"),
             Self::Resolve(msg) => write!(f, "resolve: {msg}"),
+            Self::Unindexable(msg) => write!(f, "resolve: {msg}"),
         }
     }
 }
@@ -2304,6 +2365,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
         let mut envelope_bytes = Vec::new();
         encode_envelope_fields(&envelope, &mut envelope_bytes).unwrap();
@@ -2634,6 +2696,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let count = resolver
@@ -2739,6 +2802,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let count = resolver
@@ -2808,6 +2872,7 @@ mod tests {
             ],
             graph_delta: HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let count = resolver
@@ -2893,5 +2958,46 @@ mod tests {
             Some(0),
             "txn-meta graph must be first entry (dict id=0, g_id=0+1=1)"
         );
+    }
+
+    #[test]
+    fn content_the_index_cannot_hold_is_unindexable() {
+        let flake = |dt: &str| {
+            Flake::new(
+                Sid::new(101, "x"),
+                Sid::new(101, "n"),
+                FlakeValue::String("a".to_string()),
+                Sid::new(101, dt),
+                1,
+                true,
+                None,
+            )
+        };
+        let shared_with_full_datatype_dict = || {
+            let mut shared = SharedResolverState::new_for_ledger("test:main");
+            shared
+                .ns_prefixes
+                .insert(101, "http://example.org/".to_string());
+            while shared.datatypes.len() <= u32::from(DatatypeDictId::MAX) {
+                let iri = format!("http://example.org/dt{}", shared.datatypes.len());
+                shared.datatypes.get_or_insert(&iri);
+            }
+            shared
+        };
+
+        // A commit that needs one more datatype than the dictionary can number.
+        let mut chunk = RebuildChunk::new();
+        let err = shared_with_full_datatype_dict()
+            .resolve_commit_into_chunk(&build_test_blob(&[flake("fresh")], 1), "abc", &mut chunk)
+            .unwrap_err();
+        assert!(matches!(err, ResolverError::Unindexable(_)), "{err}");
+
+        // Bytes that do not decode are not: another read may succeed.
+        let blob = build_test_blob(&[flake("fresh")], 1);
+        let mut chunk = RebuildChunk::new();
+        let err = shared_with_full_datatype_dict()
+            .resolve_commit_into_chunk(&blob[..blob.len() / 2], "abc", &mut chunk)
+            .unwrap_err();
+        assert!(matches!(err, ResolverError::Codec(_)), "{err}");
     }
 }

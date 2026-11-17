@@ -1,6 +1,6 @@
 # Query peers and replication
 
-This document describes how to run `fluree-server` in **transaction** mode (event source + transactions) and **peer** mode (read replica). It also documents the **events stream** (`/v1/fluree/events`) and **storage proxy** endpoints (`/v1/fluree/storage/*`) used to keep peers up to date and/or to proxy storage reads.
+This document describes how to run the Fluree server (`fluree server run`) in **transaction** mode (event source + transactions) and **peer** mode (read replica). It also documents the **events stream** (`/v1/fluree/events`) and **storage proxy** endpoints (`/v1/fluree/storage/*`) used to keep peers up to date and/or to proxy storage reads.
 
 This guide is written from an **operator / end-user** standpoint: what to deploy, how to configure it, and what to expect from each mode.
 
@@ -10,7 +10,7 @@ availability, and cross-cloud recovery, see
 
 ## Server roles
 
-`fluree-server` supports two roles:
+The server supports two roles:
 
 - **Transaction server** (`--server-role transaction`)
   - Write-enabled.
@@ -52,6 +52,7 @@ In peer mode:
 
 - **Write forwarding**: write and admin endpoints are forwarded to the transaction server configured by `--tx-server-url`.
 - **Read serving**: query endpoints are served locally, using ledger/index data obtained either from shared storage or via storage proxy reads (see below). History queries are executed via the standard `/query` endpoint with time range specifiers.
+- **Index retention**: a peer query reads an index version the transaction server's indexer published, and keeps reading it after a newer one arrives. That indexer's garbage collector decides how long a superseded version stays in storage, so a peer query that outlasts its age guard (15 minutes by default) or its version ceiling (10 old versions by default) can lose the version it is reading. A peer does not collect garbage itself, so set retention on the transaction server; see [Index Retention](../indexing-and-search/background-indexing.md#index-retention).
 
 ### Peer configuration (SSE subscription)
 
@@ -207,10 +208,11 @@ When a flakes format is requested and the block is a ledger leaf:
 ### Transaction server (events + storage proxy)
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8090 \
-  --server-role transaction \
   --storage-path /var/lib/fluree \
+  -- \
+  --server-role transaction \
   --events-auth-mode required \
   --events-auth-trusted-issuer did:key:z6Mk... \
   --storage-proxy-enabled
@@ -219,11 +221,12 @@ fluree-server \
 ### Query peer (shared storage)
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8091 \
+  --storage-path /var/lib/fluree \
+  -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
-  --storage-path /var/lib/fluree \
   --peer-subscribe-all \
   --peer-events-token @/etc/fluree/peer-events.jwt
 ```
@@ -233,8 +236,9 @@ fluree-server \
 In proxy storage mode, the peer does not need `--storage-path` and instead needs a storage proxy token:
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8091 \
+  -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
   --storage-access-mode proxy \

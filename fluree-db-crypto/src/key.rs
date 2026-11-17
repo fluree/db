@@ -150,6 +150,12 @@ pub trait KeyProvider: Send + Sync {
     /// - Wrong key provider is configured
     /// - Key ID was corrupted/tampered
     fn key_by_id(&self, id: u32) -> Option<Arc<EncryptionKey>>;
+
+    /// Ids of every key this provider can decrypt with, current first.
+    /// Reported for operators; never the key material.
+    fn key_ids(&self) -> Vec<u32> {
+        vec![self.current_key().id()]
+    }
 }
 
 // ============================================================================
@@ -213,6 +219,71 @@ impl KeyProvider for StaticKeyProvider {
 
 // Intentionally no Debug impl to prevent accidental key exposure
 
+// ============================================================================
+// MultiKeyProvider
+// ============================================================================
+
+/// A key provider holding several keys by id, one of them current.
+///
+/// New encryptions use the current key; decryption accepts any held key.
+/// This is the shape a rotation needs: the new key is added and made
+/// current, the old one stays held until every blob has been re-enveloped,
+/// then it is dropped from the configuration.
+pub struct MultiKeyProvider {
+    keys: Vec<Arc<EncryptionKey>>,
+    current: usize,
+}
+
+impl MultiKeyProvider {
+    /// Build from `keys`, with the key whose id is `current_id` used for new
+    /// encryptions.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EncryptionError::InvalidKey` if `keys` is empty, two keys
+    /// share an id, or no key has `current_id`.
+    pub fn new(keys: Vec<EncryptionKey>, current_id: u32) -> Result<Self> {
+        if keys.is_empty() {
+            return Err(EncryptionError::invalid_key("no encryption keys given"));
+        }
+        for (i, key) in keys.iter().enumerate() {
+            if keys[..i].iter().any(|k| k.id() == key.id()) {
+                return Err(EncryptionError::invalid_key("duplicate encryption key id"));
+            }
+        }
+        let current = keys
+            .iter()
+            .position(|k| k.id() == current_id)
+            .ok_or_else(|| EncryptionError::invalid_key("current key id is not among the keys"))?;
+        Ok(Self {
+            keys: keys.into_iter().map(Arc::new).collect(),
+            current,
+        })
+    }
+}
+
+impl KeyProvider for MultiKeyProvider {
+    fn current_key(&self) -> Arc<EncryptionKey> {
+        Arc::clone(&self.keys[self.current])
+    }
+
+    fn key_by_id(&self, id: u32) -> Option<Arc<EncryptionKey>> {
+        self.keys.iter().find(|k| k.id() == id).cloned()
+    }
+
+    fn key_ids(&self) -> Vec<u32> {
+        let mut ids = vec![self.current_key().id()];
+        ids.extend(
+            self.keys
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != self.current)
+                .map(|(_, k)| k.id()),
+        );
+        ids
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -271,6 +342,38 @@ mod tests {
 
         // Lookup by wrong ID should return None
         assert!(provider.key_by_id(999).is_none());
+    }
+
+    #[test]
+    fn multi_key_provider_serves_current_and_held_keys() {
+        let provider = MultiKeyProvider::new(
+            vec![
+                EncryptionKey::new([1; 32], 1),
+                EncryptionKey::new([2; 32], 2),
+            ],
+            2,
+        )
+        .unwrap();
+        assert_eq!(provider.current_key().id(), 2);
+        assert_eq!(provider.key_by_id(1).unwrap().expose_secret(), &[1; 32]);
+        assert_eq!(provider.key_by_id(2).unwrap().expose_secret(), &[2; 32]);
+        assert!(provider.key_by_id(3).is_none());
+        assert_eq!(provider.key_ids(), vec![2, 1]);
+    }
+
+    #[test]
+    fn multi_key_provider_rejects_bad_sets() {
+        assert!(MultiKeyProvider::new(vec![], 0).is_err());
+        let dup = MultiKeyProvider::new(
+            vec![
+                EncryptionKey::new([1; 32], 7),
+                EncryptionKey::new([2; 32], 7),
+            ],
+            7,
+        );
+        assert!(dup.is_err());
+        let missing = MultiKeyProvider::new(vec![EncryptionKey::new([1; 32], 1)], 2);
+        assert!(missing.is_err());
     }
 
     #[test]

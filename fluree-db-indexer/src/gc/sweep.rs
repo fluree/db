@@ -37,16 +37,20 @@
 use crate::error::{IndexerError, Result};
 use crate::gc::collector::PrevIndexChainWalk;
 use fluree_db_binary_index::ChainCasIds;
-use fluree_db_core::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
 use fluree_db_core::storage::{candidate_addresses, content_store_for, ContentStore};
-use fluree_db_core::{ContentId, Storage};
+use fluree_db_core::{ContentId, LedgerId, LedgerName, Storage};
+use fluree_db_nameservice::NsRecord;
 use std::collections::HashSet;
 use std::path::Path;
 
-/// Concurrent storage deletes during a sweep. Deletes are independent
-/// round trips, so a serial pass over a large backlog is almost entirely
-/// latency.
-const RELEASE_CONCURRENCY: usize = 32;
+/// Addresses per batch delete. Matches the S3 `DeleteObjects` maximum, so
+/// on an object store a batch is one request.
+const RELEASE_BATCH: usize = 1000;
+
+/// Batches in flight at once. Small on purpose: the S3 backend caps requests
+/// process-wide, and a sweep that took most of that cap starved every
+/// reader for as long as it ran.
+const RELEASE_CONCURRENCY: usize = 4;
 
 /// Concurrent branch chain walks during planning. A chain is a sequence of
 /// dependent reads — each root names the next — so it cannot be walked in
@@ -62,7 +66,7 @@ const BRANCH_WALK_CONCURRENCY: usize = 8;
 #[derive(Debug, Clone)]
 pub struct BranchIndexHead {
     /// Full ledger id (`name:branch`), which selects the storage prefix.
-    pub ledger_id: String,
+    pub ledger_id: LedgerId,
     /// The branch's published index root, when it has one.
     pub index_head_id: Option<ContentId>,
 }
@@ -107,10 +111,15 @@ pub struct SweepResult {
 /// rather than access order, so a long chain that fills the budget evicts the
 /// longest-resident leaves first, which are the hot ones. Query latency that
 /// dips after a sweep on a full cache is that, not a fault in the sweep.
+///
+/// `nested` names the other ledgers whose storage can sit under this one's
+/// prefixes (see [`nested_ledgers`]); their files are never this ledger's
+/// orphans.
 pub async fn plan_sweep<S>(
     storage: &S,
-    ledger_name: &str,
+    ledger_name: &LedgerName,
     branches: &[BranchIndexHead],
+    nested: &[LedgerId],
     artifact_cache_dir: Option<&Path>,
 ) -> Result<SweepPlan>
 where
@@ -123,14 +132,35 @@ where
     // rather than their sum.
     let (live, scanned) = futures::try_join!(
         live_addresses(storage, &method, branches, artifact_cache_dir),
-        swept_addresses(storage, &method, ledger_name, branches),
+        swept_addresses(storage, &method, ledger_name, branches, nested),
     )?;
+
+    // The difference is only sound if the listing names files the way the
+    // live set does. A listing in another form (a Windows path's `\` once)
+    // matches no live address, so every file it holds, live ones included,
+    // would read as an orphan. Each branch's head root, which the walk just
+    // read, must be in it.
+    for branch in branches {
+        let Some(head) = branch.index_head_id.as_ref() else {
+            continue;
+        };
+        let listed = candidate_addresses(&method, &branch.ledger_id, head)
+            .iter()
+            .any(|address| scanned.contains(address));
+        if !listed {
+            return Err(IndexerError::StorageRead(format!(
+                "the storage listing does not include {}'s index root {head} at any address \
+                 the index uses; refusing to sweep",
+                branch.ledger_id
+            )));
+        }
+    }
 
     let mut orphans: Vec<String> = scanned.difference(&live).cloned().collect();
     orphans.sort();
 
     tracing::debug!(
-        ledger_name,
+        ledger_name = %ledger_name,
         branches = branches.len(),
         scanned = scanned.len(),
         live = live.len(),
@@ -170,30 +200,27 @@ where
     // orphan is a blob no index chain reaches, so no later walk reads the
     // entry it leaves behind; `evict_cached_cid`'s doc lists this among the
     // states the cache does not clear.
-    let outcomes: Vec<(String, Option<String>)> =
-        futures::stream::iter(plan.orphans.iter().cloned())
-            .map(|address| async move {
-                let error = storage.delete(&address).await.err().map(|e| e.to_string());
-                (address, error)
-            })
-            .buffer_unordered(RELEASE_CONCURRENCY)
-            .collect()
-            .await;
+    let batches: Vec<_> = plan
+        .orphans
+        .chunks(RELEASE_BATCH)
+        .map(|chunk| storage.delete_many(chunk))
+        .collect();
+    let failed: Vec<Vec<(String, fluree_db_core::Error)>> = futures::stream::iter(batches)
+        .buffer_unordered(RELEASE_CONCURRENCY)
+        .collect()
+        .await;
 
     let mut result = SweepResult::default();
-    for (address, error) in outcomes {
-        match error {
-            None => result.reclaimed += 1,
-            Some(error) => {
-                tracing::warn!(
-                    address,
-                    error,
-                    "sweep could not release an orphaned artifact"
-                );
-                result.failures.push((address, error));
-            }
-        }
+    for (address, error) in failed.into_iter().flatten() {
+        let error = error.to_string();
+        tracing::warn!(
+            address,
+            error,
+            "sweep could not release an orphaned artifact"
+        );
+        result.failures.push((address, error));
     }
+    result.reclaimed = plan.orphans.len() - result.failures.len();
     result.failures.sort();
 
     tracing::info!(
@@ -351,41 +378,86 @@ where
     Ok(chain_ids.into_ids())
 }
 
-/// Every address under the swept prefixes.
+/// Every address under the swept prefixes that this ledger owns.
 ///
 /// Index artifacts are per-branch, so each branch contributes its own `index/`
 /// prefix. Dict blobs are shared across a ledger's branches and live in one
-/// namespace, listed once.
+/// namespace, listed once. Files under a `nested` ledger's own prefixes are
+/// excluded: ledger names may contain `/`, so `a/main/index/child:main` keeps
+/// its commits inside `a:main`'s index directory.
 async fn swept_addresses<S>(
     storage: &S,
     method: &str,
-    ledger_name: &str,
+    ledger_name: &LedgerName,
     branches: &[BranchIndexHead],
+    nested: &[LedgerId],
 ) -> Result<HashSet<String>>
 where
     S: Storage,
 {
     let mut prefixes = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
-        let path = ledger_id_to_path_prefix(&branch.ledger_id).map_err(|e| {
-            IndexerError::StorageRead(format!("invalid ledger id {}: {e}", branch.ledger_id))
-        })?;
-        prefixes.push(format!("fluree:{method}://{path}/index/"));
+        prefixes.push(format!(
+            "fluree:{method}://{}/index/",
+            branch.ledger_id.path_prefix()
+        ));
     }
     prefixes.push(format!(
         "fluree:{method}://{}/dicts/",
-        shared_prefix_for_path(ledger_name)
+        ledger_name.shared_prefix()
     ));
+    let foreign = nested_prefixes(method, nested);
 
     let mut scanned = HashSet::new();
     for prefix in &prefixes {
         let listed = storage.list_prefix(prefix).await.map_err(|e| {
             IndexerError::StorageRead(format!("cannot list {prefix}: {e}; refusing to sweep"))
         })?;
-        scanned.extend(listed);
+        scanned.extend(
+            listed
+                .into_iter()
+                .filter(|addr| !foreign.iter().any(|f| addr.starts_with(f.as_str()))),
+        );
     }
 
     Ok(scanned)
+}
+
+/// Address prefixes that `nested` ledgers own: each branch's directory and
+/// the ledger's `@shared/` namespace. Not the whole name, which for a ledger
+/// named `{parent}/{branch}` is the parent branch's own directory.
+///
+/// A branch an earlier release let begin with `/` has the prefix
+/// `{name}//{branch}`. A backend that keeps keys verbatim lists it that way
+/// and a filesystem lists `{name}/{branch}`, so both spellings are owned.
+pub fn nested_prefixes(method: &str, nested: &[LedgerId]) -> Vec<String> {
+    let mut prefixes: Vec<String> = nested
+        .iter()
+        .flat_map(|id| [id.path_prefix(), id.shared_prefix()])
+        .flat_map(|prefix| {
+            let collapsed = prefix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            [collapsed, prefix]
+        })
+        .map(|prefix| format!("fluree:{method}://{prefix}/"))
+        .collect();
+    prefixes.sort();
+    prefixes.dedup();
+    prefixes
+}
+
+/// The ledgers whose storage can nest under `ledger_name`'s: every recorded
+/// ledger (retracted included) whose name extends `ledger_name/`.
+pub fn nested_ledgers(records: &[NsRecord], ledger_name: &LedgerName) -> Vec<LedgerId> {
+    let prefix = format!("{ledger_name}/");
+    records
+        .iter()
+        .filter(|r| r.ledger_id.name().starts_with(&prefix))
+        .map(|r| r.ledger_id.clone())
+        .collect()
 }
 
 #[cfg(test)]
@@ -399,6 +471,10 @@ mod tests {
     use fluree_db_core::ContentKind;
 
     const NAME: &str = "mydb";
+
+    fn name(s: &str) -> LedgerName {
+        LedgerName::parse(s).unwrap()
+    }
     const MAIN: &str = "mydb:main";
 
     fn dict_cid(label: &[u8]) -> ContentId {
@@ -488,10 +564,102 @@ mod tests {
         pairs
             .iter()
             .map(|(ledger_id, head)| BranchIndexHead {
-                ledger_id: (*ledger_id).to_string(),
+                ledger_id: LedgerId::parse(ledger_id).unwrap(),
                 index_head_id: (*head).cloned(),
             })
             .collect()
+    }
+
+    /// Ledger names may contain `/`, so `mydb/main/index/child:main` keeps its
+    /// commits inside `mydb:main`'s index directory. They belong to that other
+    /// ledger and must never be planned as this one's orphans.
+    #[tokio::test]
+    async fn a_nested_ledgers_files_are_never_orphans() {
+        let storage = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let (_, dict_addr) = cid_and_addr_for(
+            MAIN,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"live-dict",
+        );
+        storage.write_bytes(&dict_addr, b"dict").await.unwrap();
+        let roots = write_chain(&storage, MAIN, 1, &dict).await;
+
+        let child = LedgerId::parse("mydb/main/index/child:main").unwrap();
+        let (_, child_commit) = cid_and_addr_for(&child, ContentKind::Commit, b"child commit");
+        storage.write_bytes(&child_commit, b"commit").await.unwrap();
+        // Its shared dictionaries sit beside its branches, not under them.
+        let (_, child_dict) = cid_and_addr_for(
+            &child,
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"child dict",
+        );
+        storage.write_bytes(&child_dict, b"dict").await.unwrap();
+        for addr in [&child_commit, &child_dict] {
+            assert!(
+                addr.contains("mydb/main/index/"),
+                "fixture must sit under the swept prefix, or this test is vacuous: {addr}"
+            );
+        }
+
+        let branches = heads(&[(MAIN, roots.last())]);
+        let unaware = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
+        for addr in [&child_commit, &child_dict] {
+            assert!(
+                unaware.orphans.contains(addr),
+                "without ownership the nested ledger's file reads as an orphan: {addr}"
+            );
+        }
+
+        let records = [
+            fluree_db_nameservice::NsRecord::new(MAIN),
+            fluree_db_nameservice::NsRecord::new(&child),
+        ];
+        let nested = nested_ledgers(&records, &name(NAME));
+        assert_eq!(nested, vec![child]);
+        let plan = plan_sweep(&storage, &name(NAME), &branches, &nested, None)
+            .await
+            .unwrap();
+        for addr in [&child_commit, &child_dict] {
+            assert!(
+                !plan.orphans.contains(addr),
+                "another ledger's file was planned for deletion: {addr}"
+            );
+        }
+    }
+
+    /// A ledger named `mydb/main` owns `mydb/main/{branch}/`, not `mydb/main/`,
+    /// which is `mydb:main`'s own directory: excluding the whole name would
+    /// keep every orphan the parent branch has.
+    #[tokio::test]
+    async fn a_nested_ledger_named_like_a_branch_leaves_its_orphans_planned() {
+        let storage = MemoryStorage::new();
+        let roots = write_chain(&storage, MAIN, 1, &dict_cid(b"live-dict")).await;
+        let (_, orphan) = cid_and_addr_for(MAIN, ContentKind::IndexLeaf, b"unreferenced");
+        storage.write_bytes(&orphan, b"leaf").await.unwrap();
+        let branches = heads(&[(MAIN, roots.last())]);
+
+        let unaware = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
+        assert!(unaware.orphans.contains(&orphan), "fixture has no orphan");
+
+        let records = [
+            fluree_db_nameservice::NsRecord::new(MAIN),
+            fluree_db_nameservice::NsRecord::new("mydb/main:trunk"),
+        ];
+        let nested = nested_ledgers(&records, &name(NAME));
+        assert_eq!(nested, [LedgerId::parse("mydb/main:trunk").unwrap()]);
+        let plan = plan_sweep(&storage, &name(NAME), &branches, &nested, None)
+            .await
+            .unwrap();
+        assert!(plan.orphans.contains(&orphan), "{:?}", plan.orphans);
     }
 
     /// Everything an intact chain references stays live, so a healthy ledger
@@ -510,9 +678,15 @@ mod tests {
         storage.write_bytes(&dict_addr, b"dict").await.unwrap();
         let roots = write_chain(&storage, MAIN, 3, &dict).await;
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
-            .await
-            .unwrap();
+        let plan = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             plan.orphans.is_empty(),
@@ -556,7 +730,8 @@ mod tests {
     /// while every root it walks is still in storage.
     #[tokio::test]
     async fn a_cached_plan_matches_an_uncached_one() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -570,8 +745,10 @@ mod tests {
         let branches = heads(&[(MAIN, roots.last())]);
         let cache_dir = empty_cache_dir("parity");
 
-        let uncached = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
-        let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+        let uncached = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
+        let cached = plan_sweep(&storage, &name(NAME), &branches, &[], Some(&cache_dir))
             .await
             .unwrap();
         assert_cache_populated(&cache_dir);
@@ -587,7 +764,8 @@ mod tests {
     /// failing the plan on the manifests that were released with it.
     #[tokio::test]
     async fn a_released_root_ends_the_chain_even_when_its_cache_entry_survives() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -609,7 +787,7 @@ mod tests {
         // and the manifest it routed through the way the collector does —
         // but *without* evicting either from the cache, which is what a crash
         // between the two leaves behind.
-        plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+        plan_sweep(&storage, &name(NAME), &branches, &[], Some(&cache_dir))
             .await
             .unwrap();
         assert_cache_populated(&cache_dir);
@@ -619,7 +797,7 @@ mod tests {
         storage.delete(&oldest_addr).await.unwrap();
         storage.delete(oldest_manifest_addr).await.unwrap();
 
-        let cached = plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+        let cached = plan_sweep(&storage, &name(NAME), &branches, &[], Some(&cache_dir))
             .await
             .expect("a released root ends the chain rather than failing the plan");
 
@@ -644,7 +822,8 @@ mod tests {
     /// the cache, pinned by `an_unreadable_head_aborts_the_plan`.
     #[tokio::test]
     async fn a_released_head_aborts_the_plan_even_when_its_cache_entry_survives() {
-        let storage = MemoryStorage::new();
+        // Only remote storage gets a disk cache.
+        let storage = MemoryStorage::new().simulating_remote();
         let dict = dict_cid(b"live-dict");
         let (_, dict_addr) = cid_and_addr_for(
             MAIN,
@@ -660,7 +839,7 @@ mod tests {
         let branches = heads(&[(MAIN, head)]);
         let cache_dir = empty_cache_dir("released-head");
 
-        plan_sweep(&storage, NAME, &branches, Some(&cache_dir))
+        plan_sweep(&storage, &name(NAME), &branches, &[], Some(&cache_dir))
             .await
             .unwrap();
         assert_cache_populated(&cache_dir);
@@ -674,7 +853,7 @@ mod tests {
         storage.delete(&head_addr).await.unwrap();
         storage.delete(head_manifest_addr).await.unwrap();
 
-        let result = plan_sweep(&storage, NAME, &branches, Some(&cache_dir)).await;
+        let result = plan_sweep(&storage, &name(NAME), &branches, &[], Some(&cache_dir)).await;
 
         assert!(
             result.is_err(),
@@ -710,9 +889,15 @@ mod tests {
             .await
             .unwrap();
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&severed))]), None)
-            .await
-            .unwrap();
+        let plan = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, Some(&severed))]),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
 
         for (t, root) in stranded.iter().enumerate() {
             let addr = candidate_addresses("memory", MAIN, root);
@@ -758,8 +943,9 @@ mod tests {
 
         let plan = plan_sweep(
             &storage,
-            NAME,
+            &name(NAME),
             &heads(&[(MAIN, main_roots.last()), (feature, feature_roots.last())]),
+            &[],
             None,
         )
         .await
@@ -801,9 +987,15 @@ mod tests {
         storage.write_bytes(&stranded_addr, b"dict").await.unwrap();
 
         let roots = write_chain(&storage, MAIN, 2, &live).await;
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
-            .await
-            .unwrap();
+        let plan = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             plan.orphans,
@@ -833,9 +1025,15 @@ mod tests {
 
         let roots = write_chain(&storage, MAIN, 1, &dict).await;
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
-            .await
-            .unwrap();
+        let plan = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(
             plan.orphans.is_empty(),
@@ -872,7 +1070,9 @@ mod tests {
             .unwrap();
 
         let branches = heads(&[(MAIN, Some(&severed))]);
-        let plan = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let plan = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
         assert_eq!(plan.orphans.len(), 3, "the three stranded roots");
 
         let result = execute_sweep(&storage, &plan).await;
@@ -888,7 +1088,9 @@ mod tests {
             "the dict it references survives"
         );
 
-        let after = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let after = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
         assert!(
             after.orphans.is_empty(),
             "a swept ledger has nothing left to reclaim: {:?}",
@@ -912,7 +1114,9 @@ mod tests {
             .unwrap();
 
         let branches = heads(&[(MAIN, Some(&severed))]);
-        let plan = plan_sweep(&storage, NAME, &branches, None).await.unwrap();
+        let plan = plan_sweep(&storage, &name(NAME), &branches, &[], None)
+            .await
+            .unwrap();
         assert!(!plan.orphans.is_empty());
 
         execute_sweep(&storage, &plan).await;
@@ -935,6 +1139,18 @@ mod tests {
 
     #[async_trait::async_trait]
     impl fluree_db_core::StorageRead for FailsToReadOne {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.inner.encryption_admin()
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             if address == self.address {
                 return Err(fluree_db_core::error::Error::storage("transient failure"));
@@ -983,6 +1199,104 @@ mod tests {
         }
     }
 
+    /// Storage whose listing separates path segments with `\`, as file
+    /// storage on Windows once did, while reads and the index use `/`.
+    #[derive(Debug, Clone)]
+    struct BackslashListing(MemoryStorage);
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageRead for BackslashListing {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.0.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.0.is_remote()
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.0.encryption_admin()
+        }
+
+        async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
+            self.0.read_bytes(address).await
+        }
+
+        async fn exists(&self, address: &str) -> fluree_db_core::Result<bool> {
+            self.0.exists(address).await
+        }
+
+        async fn list_prefix(&self, prefix: &str) -> fluree_db_core::Result<Vec<String>> {
+            Ok(self
+                .0
+                .list_prefix(prefix)
+                .await?
+                .into_iter()
+                .map(|address| match address.split_once("://") {
+                    Some((scheme, path)) => format!("{scheme}://{}", path.replace('/', "\\")),
+                    None => address,
+                })
+                .collect())
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::StorageWrite for BackslashListing {
+        async fn write_bytes(&self, address: &str, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.0.write_bytes(address, bytes).await
+        }
+
+        async fn delete(&self, address: &str) -> fluree_db_core::Result<()> {
+            self.0.delete(address).await
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl fluree_db_core::ContentAddressedWrite for BackslashListing {
+        async fn content_write_bytes_with_hash(
+            &self,
+            kind: ContentKind,
+            ledger_id: &str,
+            content_hash_hex: &str,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<fluree_db_core::ContentWriteResult> {
+            self.0
+                .content_write_bytes_with_hash(kind, ledger_id, content_hash_hex, bytes)
+                .await
+        }
+    }
+
+    impl fluree_db_core::StorageMethod for BackslashListing {
+        fn storage_method(&self) -> &str {
+            self.0.storage_method()
+        }
+    }
+
+    /// A listing that names files in another form than the index does
+    /// matches no live address. Planned anyway, every file would be an
+    /// orphan, the current index's included, so the plan refuses.
+    #[tokio::test]
+    async fn a_listing_in_another_address_form_aborts_the_plan() {
+        let inner = MemoryStorage::new();
+        let dict = dict_cid(b"live-dict");
+        let roots = write_chain(&inner, MAIN, 2, &dict).await;
+
+        let result = plan_sweep(
+            &BackslashListing(inner),
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "a listing the live set cannot match must not plan: {:?}",
+            result.map(|plan| plan.orphans)
+        );
+    }
+
     /// A root that still exists but cannot be read is not a chain ending. If
     /// the walk stopped there, the live set would be short by every root
     /// beyond it, and the difference would be reported as orphans and deleted.
@@ -997,7 +1311,14 @@ mod tests {
             inner,
         };
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None).await;
+        let result = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -1028,9 +1349,15 @@ mod tests {
         let oldest = candidate_addresses("memory", MAIN, &roots[0]);
         storage.delete(&oldest[0]).await.unwrap();
 
-        let plan = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None)
-            .await
-            .expect("a collected chain still plans");
+        let plan = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await
+        .expect("a collected chain still plans");
 
         assert!(
             !plan
@@ -1060,7 +1387,14 @@ mod tests {
             .await
             .unwrap();
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, roots.last())]), None).await;
+        let result = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, roots.last())]),
+            &[],
+            None,
+        )
+        .await;
 
         assert!(
             result.is_err(),
@@ -1075,7 +1409,14 @@ mod tests {
         let storage = MemoryStorage::new();
         let (missing, _) = cid_and_addr_for(MAIN, ContentKind::IndexRoot, b"never-written");
 
-        let result = plan_sweep(&storage, NAME, &heads(&[(MAIN, Some(&missing))]), None).await;
+        let result = plan_sweep(
+            &storage,
+            &name(NAME),
+            &heads(&[(MAIN, Some(&missing))]),
+            &[],
+            None,
+        )
+        .await;
 
         assert!(
             result.is_err(),

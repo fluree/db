@@ -21,7 +21,7 @@
 //!
 //! The execution engine is split into focused submodules:
 //!
-//! - `reasoning_prep`: Schema hierarchy, reasoning modes, derived facts
+//! - `reasoning_prep`: Reasoning modes, derived facts
 //! - `rewrite_glue`: Pattern rewriting for RDFS/OWL expansion
 //! - `pushdown`: Filter bounds extraction for index-level filtering
 //! - `where_plan`: WHERE clause operator building
@@ -54,6 +54,7 @@ pub(crate) use where_plan::{analyze_property_join_plan, collect_inner_join_block
 
 // Re-export operator tree builder and runner for custom execution pipelines
 pub use operator_tree::{build_operator_tree, fast_paths_disabled, set_fast_paths_disabled};
+pub use reasoning_prep::explain_derived_facts;
 pub use runner::{run_operator, run_operator_streaming};
 
 // Re-export pushdown utilities for tests
@@ -64,7 +65,7 @@ pub use pushdown::{
 
 pub use runner::{
     prepare_execution, prepare_execution_with_binary_store, prepare_execution_with_config,
-    PrepareConfig,
+    PrepareConfig, QueryRequest,
 };
 
 #[cfg(test)]
@@ -85,7 +86,7 @@ mod tests {
     use where_plan::collect_inner_join_block;
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     fn make_pattern(s_var: VarId, p_name: &str, o_var: VarId) -> TriplePattern {
@@ -115,7 +116,10 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
         let executable = ExecutableQuery::simple(query);
         let results = execute(db, &vars, &executable, ContextConfig::default())
@@ -145,7 +149,10 @@ mod tests {
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(
@@ -159,8 +166,9 @@ mod tests {
         );
     }
 
+    /// A sort key nothing binds orders nothing: dropped, not a plan error.
     #[test]
-    fn test_build_operator_tree_validates_sort_vars() {
+    fn test_build_operator_tree_drops_sort_keys_nothing_binds() {
         let query = Query {
             context: ParsedContext::default(),
             orig_context: None,
@@ -168,13 +176,16 @@ mod tests {
             patterns: vec![Pattern::Triple(make_pattern(VarId(0), "name", VarId(1)))],
             reasoning: ReasoningConfig::default(),
             grouping: None,
-            ordering: vec![SortSpec::asc(VarId(99))], // Invalid var
+            ordering: vec![SortSpec::asc(VarId(99))], // nothing binds ?99
             order_binds: Vec::new(),
             limit: None,
             offset: None,
             post_values: None,
             include_system_facts: false,
+            union_default_graph: None,
             cypher_vocab: None,
+            unmatched_optional: Default::default(),
+            rdf_list_view: false,
         };
 
         let result = build_operator_tree(
@@ -182,10 +193,7 @@ mod tests {
             None,
             &crate::temporal_mode::PlanningContext::current(),
         );
-        match result {
-            Err(e) => assert!(e.to_string().contains("Sort variable")),
-            Ok(_) => panic!("Expected error for invalid sort var"),
-        }
+        assert!(result.is_ok(), "{:?}", result.err());
     }
 
     #[test]
@@ -247,7 +255,7 @@ mod tests {
             )),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(
             block.end_index,
             patterns.len(),

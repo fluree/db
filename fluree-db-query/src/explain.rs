@@ -175,7 +175,7 @@ pub fn explain_execution_hints(
         match &reordered[i] {
             Pattern::Triple(_) | Pattern::Values { .. } | Pattern::Bind { .. } => {
                 let block_start = i;
-                let block = collect_inner_join_block(&reordered, i);
+                let block = collect_inner_join_block(&reordered, i, i > 0);
                 let end = block.end_index;
                 if end == i {
                     i += 1;
@@ -549,6 +549,7 @@ fn build_general_pattern_display(
 pub fn format_general_pattern(pattern: &Pattern) -> String {
     match pattern {
         Pattern::Triple(tp) => format_pattern(tp),
+        Pattern::ListView(lv) => format!("LIST-VIEW {}", format_pattern(&lv.triple)),
         Pattern::Filter(expr) => format!("FILTER({expr:?})"),
         Pattern::Bind { var, expr } => format!("BIND({:?} AS ?v{})", expr, var.0),
         Pattern::Unwind { var, list } => format!("UNWIND({:?} AS ?v{})", list, var.0),

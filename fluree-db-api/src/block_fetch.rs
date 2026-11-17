@@ -118,12 +118,12 @@ pub struct BlockAccessScope {
     /// If true, authorized for all ledgers.
     pub all_ledgers: bool,
     /// Specific ledger IDs authorized (e.g., `{"books:main", "users:main"}`).
-    pub authorized_ledgers: HashSet<String>,
+    pub authorized_ledgers: HashSet<fluree_db_core::LedgerId>,
 }
 
 impl BlockAccessScope {
     /// Check if this scope authorizes access to the given ledger ID.
-    pub fn is_authorized_for_ledger(&self, ledger_id: &str) -> bool {
+    pub fn is_authorized_for_ledger(&self, ledger_id: &fluree_db_core::LedgerId) -> bool {
         self.all_ledgers || self.authorized_ledgers.contains(ledger_id)
     }
 }
@@ -131,7 +131,10 @@ impl BlockAccessScope {
 /// Check authorization for a ledger, returning an error on failure.
 ///
 /// Callers typically map this error to 404 (no existence leak).
-pub fn authorize_ledger(scope: &BlockAccessScope, ledger_id: &str) -> Result<(), BlockFetchError> {
+pub fn authorize_ledger(
+    scope: &BlockAccessScope,
+    ledger_id: &fluree_db_core::LedgerId,
+) -> Result<(), BlockFetchError> {
     if scope.is_authorized_for_ledger(ledger_id) {
         Ok(())
     } else {
@@ -544,7 +547,10 @@ mod tests {
     fn make_scope(all: bool, ledgers: Vec<&str>) -> BlockAccessScope {
         BlockAccessScope {
             all_ledgers: all,
-            authorized_ledgers: ledgers.into_iter().map(String::from).collect(),
+            authorized_ledgers: ledgers
+                .into_iter()
+                .map(|l| fluree_db_core::LedgerId::parse(l).unwrap())
+                .collect(),
         }
     }
 
@@ -553,13 +559,20 @@ mod tests {
     #[test]
     fn test_authorize_ledger_allowed() {
         let scope = make_scope(false, vec!["books:main"]);
-        assert!(authorize_ledger(&scope, "books:main").is_ok());
+        assert!(authorize_ledger(
+            &scope,
+            &fluree_db_core::LedgerId::parse("books:main").unwrap()
+        )
+        .is_ok());
     }
 
     #[test]
     fn test_authorize_ledger_denied() {
         let scope = make_scope(false, vec!["other:main"]);
-        let result = authorize_ledger(&scope, "books:main");
+        let result = authorize_ledger(
+            &scope,
+            &fluree_db_core::LedgerId::parse("books:main").unwrap(),
+        );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), BlockFetchError::NotFound(_)));
     }
@@ -567,7 +580,11 @@ mod tests {
     #[test]
     fn test_authorize_ledger_all_ledgers() {
         let scope = make_scope(true, vec![]);
-        assert!(authorize_ledger(&scope, "any:ledger").is_ok());
+        assert!(authorize_ledger(
+            &scope,
+            &fluree_db_core::LedgerId::parse("any:ledger").unwrap()
+        )
+        .is_ok());
     }
 
     // --- Content kind allowlist tests ---

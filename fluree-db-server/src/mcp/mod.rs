@@ -4,7 +4,8 @@
 //! - `sparql_query`: Execute SPARQL queries
 //! - `get_data_model`: Get ledger schema as markdown
 //!
-//! Authentication is via Bearer token (same format as events endpoint).
+//! Authentication is via Bearer token (same format as events endpoint), or
+//! none when the server runs without data auth and no MCP issuer is set.
 
 pub mod auth;
 pub mod format;
@@ -22,7 +23,7 @@ use tools::FlureeToolService;
 /// Build the MCP router with authentication middleware.
 ///
 /// Returns a Router that can be nested at `/mcp` in the main application.
-/// All requests require a valid Bearer token from a trusted issuer.
+/// Whether requests need a Bearer token is decided by [`auth::validate_mcp_token`].
 /// The returned router has state `Arc<AppState>` and will receive state from the parent router.
 pub fn build_mcp_router(state: Arc<AppState>) -> Router<Arc<AppState>> {
     // Create factory that produces FlureeToolService instances for each session

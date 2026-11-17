@@ -29,6 +29,8 @@ api_key = "$OPENAI_API_KEY"
 
 `api` selects the wire shape for generation calls: `chat` is `/chat/completions` with `image_url` parts, what OpenAI, Ollama, vLLM and LM Studio serve; `responses` is the Responses API with `input_image` parts, what the Fluree AI gateway serves. Embeddings use `/embeddings` either way. Each field can be overridden by `FLUREE_DOC_{EMBEDDING,LLM,VLM}_{URL,MODEL,API_KEY,DIMENSIONS,API}`.
 
+A chat request carries a temperature, a JSON-mode request and an output budget alongside the turns. Each is a field some current model refuses, so each is sent optimistically and **withdrawn when the endpoint says no** — the 400 names the field, the request is resent immediately without it, and the refusal is remembered for the rest of the run. There is nothing to configure about it. See [What is sent on the wire, and what gets withdrawn](../reference/configuration.md#what-is-sent-on-the-wire-and-what-gets-withdrawn).
+
 With `doc.remote = "<remote>"`, any slot not set gets the remote's gateway URL, the stored login as its bearer token, `api = "responses"`, and a model of `auto` for `vlm` and `llm` (the gateway picks by intent) or `text-embedding-3-small` for embeddings.
 
 ## Which calls are made
@@ -39,7 +41,8 @@ Every model interaction is a separate call. There are three kinds, and they are 
 |---|---|---|---|
 | Read a crop | `POST …/responses` (or `…/chat/completions`) with the crop image and a transcription prompt, intent `doc-parse` | `vlm`, else `llm` | Per crop, only for pages and regions the deterministic pass flagged. Answered from the reading cache when the pixels were seen before. |
 | Embed chunks | `POST …/embeddings` | `embedding` | Per document, in batches. |
-| Extract entities and relations | `POST …/responses` (or `…/chat/completions`) with the ontology as system prompt and the chunk with its known entities as the user turn, intent `extraction` | `llm` | Per chunk, when `--model` is given, several chunks at once. Answered from the extraction cache when the same ask was made before. |
+| Extract entities and relations | `POST …/responses` (or `…/chat/completions`) with the ontology as system prompt and the chunk with its known entities as the user turn, intent `extraction` | `llm` | Per chunk, when `--ontology` is given, several chunks at once. Answered from the extraction cache when the same ask was made before. |
+| Read a document whole | `POST <url>` with the document, ontology and catalog as one RDF dataset ([An HTTP reader](../../cli/doc.md#an-http-reader)) | `reader` | Per document (several requests for a long one), when `--model` names a model the reader lists. Answered from the reading cache when the same request was sent before. |
 
 Against a Fluree AI gateway, the first and third go to the same route and the gateway routes each intent to the account's provider for it. Against your own endpoints, `vlm` and `llm` are simply two configurations, which may name the same model.
 
@@ -48,6 +51,7 @@ Against a Fluree AI gateway, the first and third go to the same route and the ga
 - For a crop read: a PNG of the page or region and a short prompt. Only pages the parser could not read are cropped; a document that reads deterministically sends nothing.
 - For embeddings: each chunk's text with its section path prefixed.
 - For extraction: each chunk's text, the ontology rendered as text, and the names and types of the known entities found in that chunk.
+- For a reader: the document's text and parsed structure, the ontology as it is, and each catalog record's types, labels and short description.
 
 Never the file itself, never the ledger. The parse cache and reading cache are local files under `.fluree/cache/doc/`.
 

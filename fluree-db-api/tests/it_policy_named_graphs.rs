@@ -52,7 +52,7 @@ async fn policy_applies_to_named_graph_queries() {
                 .await
                 .expect("seed trig");
 
-            let completion = handle.trigger(ledger_id, out1.receipt.t).await;
+            let completion = handle.trigger(&fluree_db_api::LedgerId::parse(ledger_id).unwrap(), out1.receipt.t).await;
             match completion.wait().await {
                 fluree_db_api::IndexOutcome::Completed { .. } => {}
                 other => panic!("indexing failed: {other:?}"),

@@ -1,4 +1,4 @@
-//! The ontology extraction is grounded on: what `--model` names.
+//! The ontology extraction is grounded on: what `--ontology` names.
 //!
 //! One inventory serves two consumers that must never disagree. The prompt
 //! renders it as the MODEL block the language model is told to use, and the

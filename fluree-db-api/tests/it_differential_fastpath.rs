@@ -76,6 +76,9 @@ use serde_json::Value;
 const N_PRODUCTS: usize = 200;
 const N_TAIL: usize = 20;
 const N_CHURNED: usize = 5;
+/// Subjects carrying the tail-only predicates (see
+/// [`tail_novel_predicate_turtle`]).
+const N_TAIL_ONLY: usize = 16;
 /// Number of `±1e16 / 1.0 / 3.5` groups in the xsd:double AVG dataset (4 rows
 /// each). Chosen to stress f64 non-associativity across the two fold orders.
 const N_DOUBLE_GROUPS: usize = 4;
@@ -156,6 +159,37 @@ fn tail_reviews_turtle() -> String {
         products: Vec::new(),
         reviews: full.reviews[N_PRODUCTS * 3..].to_vec(),
     })
+}
+
+/// Tail commit introducing predicates that appear in NO base commit.
+///
+/// Every other overlay shape here adds new subjects or churns values using
+/// predicates the base index already knows. This one adds a predicate the
+/// base index has never seen, so under `Overlay` it has no entry in the
+/// persisted predicate dictionary at all.
+///
+/// That was the harness's blind spot and the hole fluree/db#1863 lived in: a
+/// fast path that resolves a predicate against the base dictionary and reads
+/// the miss as "no rows" returns a silent wrong answer that no other condition
+/// exposes — under `Base` the predicate is indexed, and under `Novelty` there
+/// is no base dictionary to miss in. It is also the common case in production,
+/// since every newly-introduced property looks exactly like this until the
+/// next index.
+///
+/// The subjects already exist in the base, so this is "add a property to
+/// existing rows, then aggregate over it" — the user-facing shape of #1863.
+fn tail_novel_predicate_turtle() -> String {
+    let mut buf = String::from(
+        "@prefix ex: <http://example.org/ns/> .\n\
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n",
+    );
+    for i in 0..N_TAIL_ONLY {
+        buf.push_str(&format!(
+            "ex:product-{i:06} ex:tailScore \"{}\"^^xsd:integer ; ex:tailTag \"tag-{i:06}\" .\n",
+            100 + i * 3,
+        ));
+    }
+    buf
 }
 
 // -----------------------------------------------------------------------------
@@ -256,6 +290,7 @@ async fn setup(cond: Condition) -> (tempfile::TempDir, Fluree, String) {
     for (label, turtle) in [
         ("insert tail entities", tail_entities_turtle()),
         ("insert tail reviews", tail_reviews_turtle()),
+        ("insert tail-only predicates", tail_novel_predicate_turtle()),
     ] {
         let r = fluree
             .insert_turtle_with_opts(
@@ -321,6 +356,47 @@ fn catalog() -> Vec<Case> {
             ordered: false,
             known_divergence: None,
             sparql: "SELECT (COUNT(?s) AS ?c) WHERE { ?s bsbm:price ?o }",
+        },
+        // Same detectors, but over a predicate with NO base-index entry in the
+        // `Overlay` condition (see `tail_novel_predicate_turtle`). Any fast
+        // path that range-bounds a cursor on a base `p_id` must defer here
+        // rather than answer from the base alone. `count_tail_only_rows`
+        // returned 0 instead of 16 before fluree/db#1863 was fixed.
+        Case {
+            name: "count_tail_only_rows",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT (COUNT(?s) AS ?c) WHERE { ?s <http://example.org/ns/tailScore> ?o }",
+        },
+        Case {
+            name: "count_all_tail_only_rows",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT (COUNT(*) AS ?c) WHERE { ?s <http://example.org/ns/tailScore> ?o }",
+        },
+        Case {
+            name: "sum_tail_only",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT (SUM(?o) AS ?t) WHERE { ?s <http://example.org/ns/tailScore> ?o }",
+        },
+        Case {
+            name: "minmax_tail_only_string",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT (MIN(?o) AS ?lo) (MAX(?o) AS ?hi) WHERE { ?s <http://example.org/ns/tailTag> ?o }",
+        },
+        Case {
+            name: "group_by_tail_only",
+            ordered: false,
+            known_divergence: None,
+            sparql: "SELECT ?o (COUNT(?s) AS ?c) WHERE { ?s <http://example.org/ns/tailScore> ?o } GROUP BY ?o",
+        },
+        Case {
+            name: "select_tail_only_rows",
+            ordered: true,
+            known_divergence: None,
+            sparql: "SELECT ?s ?o WHERE { ?s <http://example.org/ns/tailScore> ?o } ORDER BY ?o",
         },
         // detect_count_triples
         Case {

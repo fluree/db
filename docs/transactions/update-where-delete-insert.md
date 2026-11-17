@@ -33,6 +33,12 @@ This:
 2. Deletes that age value
 3. Inserts the new age value
 
+A DELETE retracts only facts that are stored. A template instantiated with a
+value the ledger does not hold (a constant that is absent, or a value bound by
+a different pattern) retracts nothing, and cannot cancel an INSERT of the same
+triple: `DELETE { x } INSERT { x } WHERE {}` inserts `x` when it is absent.
+See [Retraction Semantics](retractions.md#retraction-semantics).
+
 ## WHERE clause capabilities
 
 The update transaction `where` clause uses the **same pattern grammar as JSON-LD queries**, so you can use rich patterns like OPTIONAL, UNION, FILTER, VALUES, and subqueries.
@@ -78,8 +84,9 @@ Use a top-level `graph` key to scope the update to a named graph **as the defaul
 ```
 
 This is the JSON-LD UPDATE analog of SPARQL UPDATE `WITH <iri>`:
-- WHERE patterns are evaluated against the named graph
+- WHERE patterns are evaluated against the named graph (unless `from` is also given)
 - DELETE/INSERT templates without an explicit graph are written to that named graph
+- A graph that doesn't exist reads as empty, so the WHERE matches nothing; it never falls back to the ledger's default graph
 
 ### Writing templates to specific graphs
 
@@ -106,8 +113,23 @@ There are two ways to target graphs in `insert` / `delete` templates:
 ```
 
 Notes:
-- `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`)
+- `graph` is a **graph IRI** (a string like `"http://example.org/graphs/audit"`), a compact IRI your `@context` expands, or a `fromNamed` alias. A relative graph name is resolved against the context's `@base`, and refused without one. Two keywords name built-in graphs: `"default"` (the default graph) and `"config"` (the ledger's config graph).
+- The ledger's own address (`urn:fluree:mydb:main`, `mydb:main` or `mydb`, with no `#fragment` and no time pin) names the ledger's **default graph** in every graph position: a top-level `graph`, `from`, `fromNamed`, a per-node `@graph` and a `["graph", …]` template. The update reads and writes the default graph and never creates a named graph called by the address, and `mydb:main#<graph IRI>` names that graph. A `graph` or `@graph` spelled as the address is accepted even when the `@context` defines no `mydb` prefix, as `from` is. See [the ledger's own address in a graph position](../concepts/datasets-and-named-graphs.md#the-ledgers-own-address-in-a-graph-position). `urn:fluree:mydb:main#config` is the config graph, not the address.
+- `urn:default` names the default graph in a top-level `graph`, in `from` and `fromNamed`, and in a `where` graph pattern (`["graph", "urn:default", …]`, or a node's `"@graph": "urn:default"`). In a template, a node's `@graph` or a `["graph", …]` naming `urn:default` is refused with a `400`, since the default graph is not a named graph. A `fromNamed` alias spelled `urn:default` that names another graph is refused with a `400` too: the name already means the default graph (listing `urn:default` itself is fine).
+- A node's graph covers the nodes nested in it: every template a node and its nested nodes produce goes to the node's `@graph`, or the enclosing scope's graph when it has none. A nested node's own `@graph` wins for its subtree, so `"@graph": "default"` on a nested node sends that subtree to the default graph.
+- A graph name can be a WHERE variable, as with SPARQL `GRAPH ?g`: `"@graph": "?g"` (or `["graph", "?g", ...]`) writes into the graph `?g` is bound to for each solution. Variables are accepted only in update templates.
+- A node-level `@graph` in `where` (on a top-level or a nested node) resolves its name exactly as in `insert` and `delete`: a compact IRI expands against the `@context`, a `fromNamed` alias matches its graph, `"config"` and `"txn-meta"` name this ledger's graphs, and `"default"` names the ledger's default graph, as `"urn:default"` does, also when a top-level `graph` or `from` gives the where another default graph (an update's `where` never reads a [union default graph](../concepts/datasets-and-named-graphs.md#union-default-graph)). So `{"where": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}, "delete": {"@id": "ex:a", "@graph": "ex:g", "ex:p": "?v"}}` deletes what an insert with the same `"@graph": "ex:g"` wrote, and `{"graph": "ex:g", "where": {"@id": "?s", "@graph": "default", "ex:p": "?o"}, "delete": {"@id": "?s", "@graph": "default", "ex:p": "?o"}, "insert": {"@id": "?s", "ex:p": "?o"}}` moves `ex:p` from the default graph into `ex:g`. A `where` pattern cannot leave the graph an enclosing selector chose, so `"default"` inside one is refused. A `["query", …]` subquery in `where` names graphs as the `where` around it does: the same aliases and keywords, and the same refusal inside an enclosing graph. A request's `opts.unionDefaultGraph` is refused on an update with a `400`, as a SPARQL update refuses the `union-default-graph` pragma.
+- Edge annotations (`@annotation`) inside a template follow their edge into its graph.
 - Named-graph reads are available after indexing completes (see `docs/query/datasets.md`)
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "where":  [["graph", "?g", { "@id": "ex:event1", "ex:status": "?old" }]],
+  "delete": [["graph", "?g", { "@id": "ex:event1", "ex:status": "?old" }]],
+  "insert": [["graph", "?g", { "@id": "ex:event1", "ex:status": "closed" }]]
+}
+```
 
 ## Dataset scoping for WHERE (`from` / `fromNamed`)
 
@@ -115,6 +137,15 @@ JSON-LD update reuses the **same dataset keys as JSON-LD query** to control wher
 
 - **`from`**: scopes the default graph used for `where` evaluation (equivalent to SPARQL UPDATE `USING <iri>`)
 - **`fromNamed`**: restricts which named graphs are visible to `where` `["graph", ...]` patterns (equivalent to SPARQL UPDATE `USING NAMED <iri>`)
+
+Their values resolve in the ledger being updated, as SPARQL `USING` does: the
+ledger's own address (`"mydb:main"`, `"urn:fluree:mydb:main"`) names its default
+graph, `"mydb:main#config"` the config graph, and a registered graph IRI (a
+prefix the `@context` defines expands) that graph. A graph the ledger does not
+have contributes nothing, so the `where` binds nothing, including an IRI that
+also reads as another ledger's address (`"urn:g1"`, `"other:main"`). An address
+that can only name another ledger (`"other"`), or an address with a time pin,
+is refused with a 400.
 
 This is why JSON-LD update uses `from` rather than introducing new keywords: it matches the existing JSON-LD query language vocabulary and keeps dataset configuration consistent across read-only queries and updates.
 
@@ -129,7 +160,8 @@ Notes:
 - `from` can be:
   - a string graph IRI (shorthand for `{"graph": "<iri>"}`)
   - an object with `{"graph": "<iri>"}` (or `{"graph": ["<iri1>", "<iri2>"]}`)
-  - an array of graph IRIs/selectors (multiple graphs are evaluated as a merged default graph)
+  - an array of graph IRIs/selectors (multiple graphs are evaluated as a merged default graph); `"default"` (or `"urn:default"`) in the array adds the default graph to the merge
+- A `from` graph that doesn't exist contributes nothing, so a lone unknown `from` graph gives the `where` an empty default graph.
 - If your `insert` / `delete` templates write into the same graph as the top-level `graph`, you can omit per-template graph selection. The top-level `graph` becomes the default target for templates that don't specify `@graph` (or `["graph", ...]` sugar).
 - If you want to write to **multiple** graphs in one update, keep a top-level `graph` as the default (optional) and use per-template `["graph", ...]` for the exceptions.
 
@@ -163,11 +195,12 @@ Example: read from one graph, write to two graphs
 Use `fromNamed` to allow (and optionally alias) named graphs for `where` `["graph", ...]` patterns:
 
 Notes:
-- In `where` GRAPH patterns, you can reference the graph by **alias** (e.g. `"g2"`) or by the **graph IRI** (e.g. `"http://example.org/g2"`). Aliases are just convenience names for matching.
+- In `where` `["graph", …]` patterns, you can reference the graph by **alias** (e.g. `"g2"`), by the **graph IRI** (e.g. `"http://example.org/g2"`), or by a compact IRI your `@context` expands. A name a `fromNamed` entry spells (its alias, or its graph as listed) is taken as written, even when it reads as a compact IRI. Aliases are just convenience names for matching. A node-level `@graph` in `where` also takes compact IRIs and the keywords, as templates do (see the notes above).
 - In `insert` / `delete` templates, graph selection is a **write target**. You can use:
   - the full graph IRI (`"http://example.org/g2"`)
   - a compact IRI/term that expands via `@context` (e.g. `"ex:g2"`)
   - the `fromNamed` **alias** (e.g. `"g2"`) for consistency within the same update transaction
+- Each name in `fromNamed` (a graph's IRI, its alias, and the name it is listed by) must mean one graph across the list, as a query's dataset aliases must: a list that gives one name to two graphs is refused with a `400`, since the `where` and the templates would read it differently. Listing one graph twice is fine.
 
 ```json
 {
@@ -685,11 +718,11 @@ Updates ALL entities with status="pending".
 
 | Feature | WHERE/DELETE/INSERT | Replace Mode |
 |---------|---------------------|--------------|
-| **Granularity** | Property-level | Entity-level |
-| **Other properties** | Preserved | Removed |
+| **Granularity** | Value-level | Predicate-level (every value, every language) |
+| **Other properties** | Preserved | Preserved |
 | **Conditional** | Yes (with filters) | No |
 | **Pattern matching** | Yes | No |
-| **Idempotent** | Depends on logic | Yes |
+| **Idempotent** | Depends on logic | Yes, with one exception (see [Upsert](upsert.md#idempotency)) |
 | **Use case** | Partial updates | Complete replacement |
 
 ## Best Practices

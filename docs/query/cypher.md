@@ -360,24 +360,59 @@ ORDER BY / SKIP / LIMIT
   (`RETURN n, count(*) AS c`) implicitly group by the non-aggregate
   projections.
 - `WITH ... [WHERE/ORDER BY/SKIP/LIMIT/DISTINCT]` and `WITH *` — subquery
-  boundary. WHERE that references aggregate aliases lowers to HAVING
-  rather than a pre-aggregation Filter. Nested WITHs nest Subqueries. A
+  boundary. A `WITH`'s `WHERE` filters the clause's results, so it applies
+  after its `ORDER BY`, `SKIP` and `LIMIT`: `WITH x ORDER BY x LIMIT 5 WHERE
+  x > 3` keeps at most two rows. After a plain `WITH`, the `WHERE` can also
+  read the variables from before the `WITH`. After an aggregating `WITH`, and
+  after a `DISTINCT` one with `SKIP` or `LIMIT`, it can read only what the
+  clause projects; reading anything else is an error. WHERE that
+  references aggregate aliases lowers to HAVING
+  rather than a pre-aggregation Filter; it sees the whole projection,
+  composite aliases included (`WITH p, count(f) + 0 AS c WHERE c > 1`).
+  After an aggregating `WITH` or `RETURN`, its `WHERE` and `ORDER BY` can
+  read a property of a node it projects (`WITH p, count(f) AS c WHERE
+  p.age > 30`, `ORDER BY p.age + 1`) or sort on an expression over its
+  aggregates (`ORDER BY c + 1`). The property is read after the
+  aggregation, as a following `WITH p, c WHERE p.age > 30` would read it,
+  so a read in `WHERE` or `ORDER BY` does not change the clause's
+  aggregates. A node the clause does not project is out of scope there,
+  and reading its property is an error. Nested WITHs nest Subqueries. A
   `collect()` projected by a `WITH` carries forward as a real list to the next
-  stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`); only
-  `ORDER BY` directly on a collected list is rejected (sorting a list value is
-  unsupported in v1).
+  stage (`WITH p, collect(f) AS fs … RETURN size(fs)` / `UNWIND fs …`). An
+  `ORDER BY` key whose value is a collected list, or a list built from one
+  (`ORDER BY fs`, `ORDER BY tail(fs)`), is rejected (sorting a list value is
+  unsupported in v1); a key that reads the list and yields a single value
+  (`ORDER BY size(fs)`, `ORDER BY any(x IN fs WHERE x = 'a')`) sorts after
+  the aggregation.
+- **Properties with several values.** A property read joins every value of
+  the property, as `MATCH (p) WHERE p.age > 30` does. So in `WHERE` it
+  gives the row once per value that passes; in `ORDER BY` it gives the row
+  once per value, and `WITH DISTINCT` keeps those copies (the sort key is
+  projected with them) while `RETURN DISTINCT` removes them; and an
+  aggregate in a later clause counts every
+  copy (`… WHERE p.age > 30 RETURN count(*)` counts a node with two passing
+  ages twice). A read inside an aggregate's argument (`avg(n.age)`,
+  `collect(p.age)`) is joined before grouping, so a property with several
+  values repeats the group's rows for every aggregate of that clause:
+  `WITH p, count(f) AS c, collect(p.age) AS ages` counts each friend once
+  per age. Properties with a single value are unaffected.
 - `CALL [(a, b) | (*)] { … }` — a read-only subquery clause in the pipeline.
   The scope clause `(a, b)` imports those outer variables (the subquery is
   correlated on them), `(*)` imports the whole visible outer scope, and
   `CALL { … }` with no scope clause runs once and broadcasts its result.
   The body is `MATCH` / `OPTIONAL MATCH` / `WITH` / `UNWIND` / nested `CALL`
   ending in `RETURN` (explicit columns, not `*`); outer rows flow in and the
-  RETURN columns continue downstream. The body may be a `UNION` / `UNION ALL`
+  RETURN columns continue downstream. The body runs once per imported row, so a
+  `WITH` in it slices, deduplicates and aggregates per import: `CALL (p) {
+  MATCH (p)-[:knows]->(f) WITH f ORDER BY f.age LIMIT 1 RETURN f.name AS n }`
+  gives each `p` its youngest friend. The body may be a `UNION` / `UNION ALL`
   of branches with a common column shape (`UNION` dedups per correlation group;
   every branch references the same imports and projects the same columns).
-  A correlated aggregating CALL (`CALL (p) { … RETURN count(f) }`) is grouped
-  per import, so an import with **zero inner matches yields no row** — wrap the
-  inner `MATCH` in `OPTIONAL MATCH` to retain it as a `0`. **Scope is strict:**
+  An aggregate in a correlated CALL body (`CALL (p) { … RETURN count(f) }`, or
+  `WITH count(f) AS c` inside it) is grouped per import, so an import with
+  **zero inner matches yields no row**, even for an aggregate with no grouping
+  key — wrap the inner `MATCH` in `OPTIONAL MATCH` to retain it as a `0` (or
+  `[]` for `collect`). **Scope is strict:**
   every import must already be bound outside, a RETURN may not re-bind any
   outer name, and the body may not reuse an outer variable's name internally
   without importing it (rename it, or add it to the scope clause, or use
@@ -446,7 +481,13 @@ error listing the supported set.
   and relationship sidecar metadata.
 - **`REMOVE`** — remove a property (`REMOVE n.age`) or a label (`REMOVE n:Admin`).
 - **`DELETE` / `DETACH DELETE`** — delete nodes/relationships. `DETACH DELETE`
-  removes a node together with its relationships.
+  removes a node together with its relationships. `DELETE r` retracts the
+  edge `r` was matched on, so it is refused when that edge carries another
+  relationship too (a parallel relationship between the same endpoints, with
+  the same type), whether or not the `MATCH` filters that one out. A
+  `DETACH DELETE` of one of the edge's endpoints in the same clause
+  (`DETACH DELETE a, r`) takes every relationship on that node, so that edge
+  isn't refused.
 - **`FOREACH`** — unroll a write over a **constant** list (inline literal,
   constant `range()`, or a `$param` array), running a `CREATE` / `SET` /
   `REMOVE` body per element:
@@ -511,8 +552,9 @@ error listing the supported set.
   the edge is inserted — idempotent in RDF, but redundant.
 - **Multi-clause write composition** — a statement may chain multiple write
   clauses (`MERGE` chains, `CREATE`+`MERGE` mixes, interleaved `SET` /
-  `REMOVE`), with each clause observing the writes of the clauses before it
-  and rows piping downstream — the standard Cypher loading idioms:
+  `REMOVE` / `DETACH DELETE` / a relationship's `DELETE`), with each clause
+  observing the writes of the clauses before it and rows piping downstream —
+  the standard Cypher loading idioms:
 
   ```cypher
   UNWIND $rows AS row
@@ -536,8 +578,22 @@ error listing the supported set.
   `ON MATCH SET`). Property accessors are valid `MERGE`-key and `SET` values
   (`MERGE (t:Team {name: p.team})`).
 
-  Deferred in a multi-clause statement (clear errors): `DELETE` / `FOREACH`
-  members, `OPTIONAL MATCH` / `CALL { … }` in the read prefix. See
+  The last write to a property or label holds, as in Cypher:
+  `SET n.name = "y" SET n.name = "w"` leaves `"w"`, `REMOVE n.name SET n.name =
+  "x"` leaves `"x"`, and `SET n.name = "y", n.name = "w"` (one clause) leaves
+  `"w"`. A write that ends where the stored value was commits nothing. A
+  `CREATE` after a `SET`, `REMOVE` or `DETACH DELETE` creates once per matched
+  row. A relationship's `DELETE` takes the properties earlier clauses set on
+  it, and a `CREATE` of the same edge after it creates the one new
+  relationship; it is refused when the edge carries another relationship in
+  the state the clauses before it leave. A row an `OPTIONAL MATCH` leaves
+  unbound skips a clause's writes to the unbound variable and keeps its
+  writes to the others.
+
+  Deferred in a multi-clause statement (clear errors): a bare node `DELETE`
+  and `FOREACH` members, `CALL { … }` in the read prefix, and
+  `OPTIONAL MATCH` in the read prefix of a statement with a `CREATE` or
+  `MERGE`. See
   `docs/design/cypher-sequential-writes.md` for the execution model.
 - **`MATCH … CREATE/SET/REMOVE/DELETE`** — pattern-driven write templates (find
   rows, then write per match). Write-side `MATCH` supports labels, inline
@@ -553,9 +609,11 @@ error listing the supported set.
   post-projection `WHERE` that gates which rows are written
   (`WITH p, p.age AS age WHERE age >= 30 SET p.adult = true`). `WITH` applies
   Cypher scoping — only projected names are visible to the write. Works before
-  `CREATE` / `SET` / `REMOVE`; `WITH` before `DELETE` is rejected (delete
-  resolution keys off the raw MATCH variables and can't honor a rename/horizon —
-  `DELETE` directly off the MATCH variables). Aggregation, `DISTINCT`, and
+  `CREATE` / `SET` / `REMOVE`; `WITH` before a lone `DELETE` is rejected
+  (delete resolution keys off the raw MATCH variables and can't honor a
+  rename/horizon — `DELETE` directly off the MATCH variables). A multi-clause
+  statement whose clauses meet stages a `DELETE` after a `WITH` in the
+  sequential driver, which honors the `WITH`'s scope. Aggregation, `DISTINCT`, and
   `ORDER BY` / `SKIP` / `LIMIT` on a write-side `WITH` are deferred.
 - **`… RETURN <created>`** — a trailing `RETURN` of *created* entities:
   `CREATE (n:Person {name: "Alice"}) RETURN n`,

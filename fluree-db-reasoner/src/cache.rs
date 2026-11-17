@@ -189,6 +189,15 @@ pub struct ReasoningDiagnostics {
     pub duration: Duration,
     /// Count of how many times each rule fired
     pub rules_fired: hashbrown::HashMap<String, usize>,
+    /// Datalog rules whose evaluation the cap cut short: those of the
+    /// groups still running when it fired. Empty unless capped.
+    pub capped_rules: Vec<String>,
+    /// Datalog rules that never ran because the cap fired first. Empty
+    /// unless capped.
+    pub pending_rules: Vec<String>,
+    /// The time datalog rule bodies evaluated `NOW()` and `TODAY()` at, when
+    /// a rule called either.
+    pub evaluation_time: Option<String>,
 }
 
 impl ReasoningDiagnostics {
@@ -200,7 +209,7 @@ impl ReasoningDiagnostics {
             capped: false,
             capped_reason: None,
             duration,
-            rules_fired: hashbrown::HashMap::new(),
+            ..Self::default()
         }
     }
 

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use crate::ast::annotation::ReifierId;
 use crate::ast::expr::Expression;
 use crate::ast::pattern::{GraphPattern, TriplePattern};
-use crate::ast::term::{BlankNode, BlankNodeValue, SubjectTerm, Term};
+use crate::ast::term::{BlankNode, SubjectTerm, Term};
 use crate::diag::{DiagCode, Diagnostic, Label};
 use crate::span::SourceSpan;
 
@@ -209,10 +209,7 @@ impl BnodeScopeChecker<'_> {
     }
 
     fn record_bnode(&mut self, bnode: &BlankNode, scope: usize) {
-        let BlankNodeValue::Labeled(label) = &bnode.value else {
-            // `[]` anonymous blank nodes have no label to reuse.
-            return;
-        };
+        let label = &bnode.label;
         match self.labels.get_mut(label) {
             None => {
                 self.labels.insert(

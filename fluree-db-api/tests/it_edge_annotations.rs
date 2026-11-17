@@ -2099,6 +2099,49 @@ async fn opts_include_system_facts_surfaces_f_reifies() {
     );
 }
 
+/// SPARQL twin of `opts_include_system_facts_surfaces_f_reifies`.
+#[tokio::test]
+async fn pragma_include_system_facts_surfaces_f_reifies() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "it/edge-annotations:pragma-include-system-facts");
+    let txn = json!({
+        "@context": ctx(),
+        "@id": "ex:alice",
+        "ex:worksFor": {
+            "@id": "ex:acme",
+            "@annotation": { "@id": "ex:emp/alice-acme", "ex:role": "Engineer" }
+        }
+    });
+    let committed = fluree
+        .insert(ledger0, &txn)
+        .await
+        .expect("annotated insert");
+
+    let query = "SELECT ?p WHERE { <http://example.org/emp/alice-acme> ?p ?o }";
+    let reifies = |rows: &JsonValue| {
+        rows.to_string()
+            .matches("https://ns.flur.ee/db#reifies")
+            .count()
+    };
+
+    let hidden = support::query_sparql_formatted(&fluree, &committed.ledger, query)
+        .await
+        .expect("query without the pragma");
+    assert_eq!(reifies(&hidden), 0, "hidden without the pragma: {hidden}");
+
+    let shown = support::query_sparql_formatted(
+        &fluree,
+        &committed.ledger,
+        &format!("# PRAGMA include-system-facts: true\n{query}"),
+    )
+    .await
+    .expect("query with the pragma");
+    assert!(
+        reifies(&shown) >= 3,
+        "the pragma must surface the f:reifies* bundle: {shown}"
+    );
+}
+
 #[tokio::test]
 async fn opts_include_system_facts_propagates_through_dataset_path() {
     // The dataset/connection query path
@@ -4150,7 +4193,7 @@ async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
     let g_id = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(graph_iri)
+        .assigned_graph_id(graph_iri)
         .expect("named graph registered");
     let graph_sid = ledger.snapshot.encode_iri(graph_iri).expect("graph sid");
     let subject_sid = ledger
@@ -5545,7 +5588,7 @@ fn graph_id(ledger: &MemoryLedger, iri: &str) -> fluree_db_core::GraphId {
     ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .unwrap_or_else(|| panic!("graph {iri} must be registered"))
 }
 
@@ -6450,4 +6493,517 @@ async fn replaying_a_commit_does_not_refuse_a_reifier_an_older_build_wrote() {
         replayed.is_ok(),
         "replaying an already-authored commit must apply, not strand the ledger"
     );
+}
+
+// ===========================================================================
+// Annotation-form DELETE: the full spelling matrix (issue #1861)
+//
+// Two separate rules combine into a result that surprises people, and the
+// docs used to describe each one only in isolation:
+//
+//   1. The annotation form ASSERTS the base triple. RDF 1.2 Turtle §2.11.1
+//      defines `s p o ~ :r {| … |}` as "both reify and assert" the triple, and
+//      SPARQL 1.2 Update §3.1.2 routes `DELETE DATA`'s QuadData through the
+//      same production. So the annotation form of a delete is a base-edge
+//      retraction. This is spec-mandated, not a Fluree choice.
+//   2. Retracting a base edge cascades to EVERY reifier attached to it, not
+//      just the one named. This one IS a Fluree choice — neither spec entails
+//      it — and it is why sibling claims lose their attachment.
+//
+// The rows below are measured, not assumed. `docs/concepts/edge-annotations.md`
+// quotes this table; if a row changes here, that section is wrong.
+// ===========================================================================
+
+/// The issue's seed: one edge, two independent claims about it.
+const ANNOTATION_MATRIX_SEED: &str = r"@prefix : <http://example.org/> .
+:alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .
+:alice :knows :bob ~ :claim2 {| :confidence 0.6 ; :source :sourceB |} .
+";
+
+/// What survives a write, counted the way a user would check.
+#[derive(Debug, PartialEq, Eq)]
+struct Survivors {
+    /// Rows for `:alice :knows ?o` — 0 means the base edge is gone.
+    base: usize,
+    /// Body properties still on `:claim1` (the `f:reifies*` bundle is hidden).
+    claim1_body: usize,
+    /// Body properties still on `:claim2`.
+    claim2_body: usize,
+    /// Reifiers still attached to `:alice :knows :bob`.
+    attached: usize,
+    /// Rows for `:alice :knows :carol` — 1 means the object was rewritten.
+    new_object: usize,
+}
+
+async fn annotation_matrix_survivors(fluree: &MemoryFluree, ledger_id: &str) -> Survivors {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let count = |q: &'static str| {
+        let ledger = &ledger;
+        async move {
+            support::query_sparql(fluree, ledger, q)
+                .await
+                .ok()
+                .and_then(|v| v.to_jsonld(&ledger.snapshot).ok())
+                .and_then(|v| v.as_array().map(Vec::len))
+                .unwrap_or(0)
+        }
+    };
+    Survivors {
+        base: count("PREFIX : <http://example.org/> SELECT ?o WHERE { :alice :knows ?o }").await,
+        claim1_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim1 ?p ?v }")
+            .await,
+        claim2_body: count("PREFIX : <http://example.org/> SELECT ?p ?v WHERE { :claim2 ?p ?v }")
+            .await,
+        attached: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?c WHERE { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
+        )
+        .await,
+        new_object: count(
+            "PREFIX : <http://example.org/> \
+             SELECT ?o WHERE { :alice :knows ?o . FILTER(?o = :carol) }",
+        )
+        .await,
+    }
+}
+
+/// How a row's write is spelled.
+enum MatrixOp {
+    Sparql(&'static str),
+    /// A Turtle `upsert` — not a delete at all, but it retracts the old edge.
+    UpsertTurtle(&'static str),
+    /// The JSON-LD `@annotation` delete.
+    JsonLdAnnotation,
+}
+
+/// Every spelling of "remove this annotated edge", and what each one leaves.
+///
+/// Rows 2, 7 and 10 are the ones issue #1861 does not mention, and two of
+/// them change what the documentation has to say:
+///
+/// - **Row 10** (`~ :claim1` with no block) reads as "detach claim1" and is
+///   the worst outcome in the table: the edge goes, BOTH claims are detached,
+///   and BOTH bodies are left standing as well-formed-looking orphans.
+/// - **Row 7** is an `upsert`, with no delete written anywhere, and it fires
+///   the identical cascade.
+#[tokio::test]
+async fn annotation_form_delete_matrix() {
+    let rows: Vec<(&str, MatrixOp, Option<Survivors>)> = vec![
+        // Row 1 — the issue's own spelling. The named claim's body goes with
+        // the edge; the sibling's body is orphaned.
+        (
+            "explicit reifier + body block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 0,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 2 — a variable reifier matches EVERY reifier on the edge and
+        // strips exactly the properties the block names, from all of them.
+        // The result is not "claim1 withdrawn" but "both claims gutted".
+        (
+            "DELETE WHERE with a variable reifier",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE WHERE \
+                 { :alice :knows :bob ~ ?c {| :confidence ?f |} }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 1,
+                claim2_body: 1,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 3 — the ONLY spelling that means "detach exactly this claim".
+        // The edge stands, both bodies stand, and claim2 stays attached.
+        (
+            "JSON-LD @annotation delete",
+            MatrixOp::JsonLdAnnotation,
+            Some(Survivors {
+                base: 1,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 1,
+                new_object: 0,
+            }),
+        ),
+        // Row 4 — property-level retraction: what a reader usually means by
+        // "withdraw claim1". Pass 2 then retires the now-empty reifier.
+        (
+            "property-level retraction of the claim body",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :claim1 :confidence 0.8 ; :source :sourceA }",
+            ),
+            Some(Survivors {
+                base: 1,
+                claim1_body: 0,
+                claim2_body: 2,
+                attached: 1,
+                new_object: 0,
+            }),
+        ),
+        // Row 6 — the baseline: deleting the bare edge detaches both claims.
+        (
+            "bare base edge",
+            MatrixOp::Sparql("PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob }"),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+        // Row 7 — an upsert that changes the object. No delete is written and
+        // the same cascade fires.
+        (
+            "upsert changing the object",
+            MatrixOp::UpsertTurtle(
+                "@prefix : <http://example.org/> .\n\
+                 :alice :knows :carol ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} .\n",
+            ),
+            Some(Survivors {
+                base: 1,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 1,
+            }),
+        ),
+        // Row 8 — refused. An anonymous block would introduce a blank node,
+        // which SPARQL 1.2 Update §3.1.2 forbids in DELETE DATA.
+        (
+            "anonymous annotation block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA \
+                 { :alice :knows :bob {| :confidence 0.8 |} }",
+            ),
+            None,
+        ),
+        // Row 10 — the sharpest footgun, and absent from the issue. Reads as
+        // "detach claim1"; removes the edge and orphans both bodies.
+        (
+            "bare reifier, no body block",
+            MatrixOp::Sparql(
+                "PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob ~ :claim1 }",
+            ),
+            Some(Survivors {
+                base: 0,
+                claim1_body: 2,
+                claim2_body: 2,
+                attached: 0,
+                new_object: 0,
+            }),
+        ),
+    ];
+
+    for (label, op, expected) in rows {
+        let fluree = FlureeBuilder::memory().build_memory();
+        // Labels carry `@` (as in `@annotation`), which ledger ids reserve.
+        let ledger_id = format!("ann-matrix/{}:main", label.replace([' ', '@'], "-"));
+        let seeded = fluree
+            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .await
+            .expect("seed the annotated edge");
+        assert_eq!(seeded.ledger.t(), 1, "[{label}] seed must commit");
+
+        let graph = fluree.graph(&ledger_id);
+        let jsonld = json!({
+            "@context": {"ex": "http://example.org/"},
+            "delete": {
+                "@id": "ex:alice",
+                "ex:knows": {"@id": "ex:bob", "@annotation": {"@id": "ex:claim1"}}
+            }
+        });
+        let result = match op {
+            MatrixOp::Sparql(q) => graph.transact().sparql_update(q).commit().await,
+            MatrixOp::UpsertTurtle(t) => graph.transact().upsert_turtle(t).commit().await,
+            MatrixOp::JsonLdAnnotation => graph.transact().update(&jsonld).commit().await,
+        };
+
+        match expected {
+            None => {
+                let err = result
+                    .err()
+                    .unwrap_or_else(|| panic!("[{label}] must be refused"));
+                assert!(
+                    err.to_string().contains("anonymous annotation block"),
+                    "[{label}] expected the anonymous-block refusal, got: {err}"
+                );
+            }
+            Some(want) => {
+                result.unwrap_or_else(|e| panic!("[{label}] must commit: {e}"));
+                let got = annotation_matrix_survivors(&fluree, &ledger_id).await;
+                assert_eq!(got, want, "[{label}] survivor set changed");
+            }
+        }
+    }
+}
+
+/// The half of the matrix that is spec-mandated, stated on its own so a
+/// regression names the right cause.
+///
+/// `~ :r {| … |}` and the bare `~ :r` tail both expand to include the base
+/// triple (RDF 1.2 Turtle §2.11.1; SPARQL 1.2 Update §3.1.2 admits the
+/// production into `DELETE DATA`). A store that kept the edge here would be
+/// the one diverging from spec.
+#[tokio::test]
+async fn annotation_form_delete_retracts_the_base_edge_in_both_spellings() {
+    for (label, q) in [
+        (
+            "with a body block",
+            "PREFIX : <http://example.org/> DELETE DATA \
+             { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+        ),
+        (
+            "bare reifier",
+            "PREFIX : <http://example.org/> DELETE DATA { :alice :knows :bob ~ :claim1 }",
+        ),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger_id = format!("ann-base/{}:main", label.replace(' ', "-"));
+        fluree
+            .insert_turtle(genesis_ledger(&fluree, &ledger_id), ANNOTATION_MATRIX_SEED)
+            .await
+            .expect("seed");
+        fluree
+            .graph(&ledger_id)
+            .transact()
+            .sparql_update(q)
+            .commit()
+            .await
+            .expect("delete");
+        assert_eq!(
+            annotation_matrix_survivors(&fluree, &ledger_id).await.base,
+            0,
+            "[{label}] the annotation form asserts the base triple, so deleting \
+             it must retract the base edge"
+        );
+    }
+}
+
+/// The half that is Fluree's own semantics: the cascade reaches reifiers the
+/// delete never named.
+///
+/// Pinned separately and explicitly because nothing in RDF 1.2 or SPARQL 1.2
+/// entails it — SPARQL 1.2 Update §3.1.2 Example 6 makes the converse point,
+/// that deleting a reifying triple leaves the asserted triple alone. A reader
+/// who checks the spec and finds Fluree deleting more will otherwise conclude
+/// there is a second bug.
+#[tokio::test]
+async fn base_edge_retraction_detaches_sibling_reifiers_the_delete_never_named() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "ann-sibling-cascade:main";
+    fluree
+        .insert_turtle(genesis_ledger(&fluree, ledger_id), ANNOTATION_MATRIX_SEED)
+        .await
+        .expect("seed");
+
+    let before = annotation_matrix_survivors(&fluree, ledger_id).await;
+    assert_eq!(before.attached, 2, "both claims start attached to the edge");
+
+    // Names :claim1 and nothing else.
+    fluree
+        .graph(ledger_id)
+        .transact()
+        .sparql_update(
+            "PREFIX : <http://example.org/> DELETE DATA \
+             { :alice :knows :bob ~ :claim1 {| :confidence 0.8 ; :source :sourceA |} }",
+        )
+        .commit()
+        .await
+        .expect("delete");
+
+    let after = annotation_matrix_survivors(&fluree, ledger_id).await;
+    assert_eq!(
+        after.attached, 0,
+        ":claim2 is detached though it was never named"
+    );
+    assert_eq!(
+        after.claim2_body, 2,
+        ":claim2's body survives its attachment — this is the orphan state the \
+         docs must warn about"
+    );
+}
+
+// =============================================================================
+// Annotation deletes address the edge's graph; reverse-defined terms
+// =============================================================================
+
+/// The annotations reifying `(s, p, o)` in `graph` (or the default graph),
+/// by `@reifies`, which joins the edge itself.
+async fn reifiers_of(
+    fluree: &MemoryFluree,
+    ledger_id: &str,
+    graph: Option<&str>,
+    s: &str,
+    p: &str,
+    o: &str,
+) -> Vec<JsonValue> {
+    let from = match graph {
+        Some(g) => format!("{ledger_id}#{g}"),
+        None => ledger_id.to_string(),
+    };
+    let q = json!({
+        "@context": ctx(), "from": from, "select": ["?ann"],
+        "where": {"@id": "?ann", "@reifies": {"@id": s, p: {"@id": o}}}
+    });
+    let result = fluree.query_connection(&q).await.expect("query");
+    let ledger = fluree.ledger(ledger_id).await.expect("load");
+    result
+        .to_jsonld(&ledger.snapshot)
+        .expect("jsonld")
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// An edge is in its subject's graph, whatever `@graph` its object node
+/// carries, and so is its annotation: deleting the annotated edge with the
+/// same document (by `@id`, or by selector) retracts the annotation there.
+#[tokio::test]
+async fn annotated_edge_delete_addresses_the_edge_graph_not_the_object_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, annotation) in [
+        json!({"@id": "ex:ann", "ex:since": 2020}),
+        json!({"ex:since": 2020}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-object-graph-{i}:main");
+        let node = |annotation: JsonValue| json!({"@id": "ex:a", "ex:knows": {"@id": "ex:b", "@graph": "ex:g2", "@annotation": annotation}});
+        let mut doc = node(json!({"@id": "ex:ann", "ex:since": 2020}));
+        doc["@context"] = ctx();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "the annotation is beside its edge, in the default graph"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(
+                ledger,
+                &json!({"@context": ctx(), "delete": node(annotation)}),
+            )
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "case {i}: the annotation is retracted from the edge's graph"
+        );
+    }
+}
+
+/// A selector-form annotation delete names its graph as any `where` and
+/// template does: `"default"`, a `fromNamed` alias, a compact IRI.
+#[tokio::test]
+async fn selector_annotation_delete_resolves_its_graph_name() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (graph_name, stored_in, from_named)) in [
+        ("default", None, None),
+        (
+            "two",
+            Some("http://example.org/g2"),
+            Some(json!([{"alias": "two", "graph": "ex:g2"}])),
+        ),
+        ("ex:g2", Some("http://example.org/g2"), None),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-selector-graph-{i}:main");
+        let mut node = json!({"@context": ctx(), "@id": "ex:a",
+            "ex:knows": {"@id": "ex:b", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}});
+        if stored_in.is_some() {
+            node["@graph"] = json!("ex:g2");
+        }
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &node)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .len(),
+            1,
+            "{graph_name}: inserted"
+        );
+        let mut delete = json!({"@context": ctx(), "delete": {"@id": "ex:a", "@graph": graph_name,
+            "ex:knows": {"@id": "ex:b", "@annotation": {"ex:since": 2020}}}});
+        if let Some(from_named) = from_named {
+            delete["fromNamed"] = from_named;
+        }
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &delete)
+            .await
+            .expect("selector delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, stored_in, "ex:a", "ex:knows", "ex:b")
+                .await
+                .is_empty(),
+            "{graph_name}: the selector delete retracts the annotation"
+        );
+    }
+}
+
+/// An annotation on an edge stated through a term defined with `@reverse`
+/// (or under the `@reverse` keyword) reifies the edge as stored, `mom
+/// ex:child kid`, and the same document deletes it.
+#[tokio::test]
+async fn annotation_on_a_reverse_property_reifies_the_stored_edge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut reverse_ctx = ctx();
+    reverse_ctx["childOf"] = json!({"@reverse": "ex:child"});
+    reverse_ctx["parent"] = json!({"@reverse": "ex:child", "@type": "@id"});
+    for (i, node) in [
+        json!({"@id": "ex:kid", "childOf": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "parent": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}),
+        json!({"@id": "ex:kid", "@reverse": {"ex:child": {"@id": "ex:mom", "@annotation": {"@id": "ex:ann", "ex:since": 2020}}}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ledger_id = format!("it/edge-annotations-reverse-{i}:main");
+        let mut doc = node.clone();
+        doc["@context"] = reverse_ctx.clone();
+        fluree
+            .insert(genesis_ledger(&fluree, &ledger_id), &doc)
+            .await
+            .expect("insert");
+        assert_eq!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid").await.len(),
+            1,
+            "case {i}: the annotation reifies the stored edge"
+        );
+        let ledger = fluree.ledger(&ledger_id).await.unwrap();
+        fluree
+            .update(ledger, &json!({"@context": reverse_ctx, "delete": node}))
+            .await
+            .expect("delete");
+        assert!(
+            reifiers_of(&fluree, &ledger_id, None, "ex:mom", "ex:child", "ex:kid")
+                .await
+                .is_empty(),
+            "case {i}: the same document deletes it"
+        );
+    }
 }

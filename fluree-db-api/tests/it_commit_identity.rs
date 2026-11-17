@@ -123,9 +123,9 @@ async fn every_spelling_of_a_commit_resolves_to_the_same_state() {
 /// does not exist.
 ///
 /// Both surfaces are asserted, because they do not share an error path:
-/// `build_source_view` rewrites any `is_not_found()` coming out of `db_at`
-/// into "ledger not found", so a commit-resolution failure only survives the
-/// `from` clause while it is typed the way its neighbours are. Pinning both
+/// `load_view_from_source` takes any `is_not_found()` coming out of `db_at` to
+/// mean "not a ledger", so a commit-resolution failure only survives the
+/// `from` clause while it is not typed `NotFound`. Pinning both
 /// makes that coupling visible if someone retypes the error later.
 #[tokio::test]
 async fn an_abbreviated_cid_is_refused_by_name() {
@@ -140,11 +140,12 @@ async fn an_abbreviated_cid_is_refused_by_name() {
     for len in [7usize, 11, 15] {
         let short = &cid[..len];
 
-        let via_db_at = fluree
+        let err = fluree
             .db_at(ledger_id, TimeSpec::AtCommit(short.to_string()))
             .await
-            .expect_err("an abbreviated CID cannot be resolved")
-            .to_string();
+            .expect_err("an abbreviated CID cannot be resolved");
+        assert_eq!(err.status_code(), 400, "the caller's mistake: {err}");
+        let via_db_at = err.to_string();
         assert!(
             via_db_at.contains("abbreviated CID"),
             "db_at at {len} characters should name the cause, got: {via_db_at}"

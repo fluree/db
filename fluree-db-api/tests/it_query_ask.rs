@@ -268,3 +268,88 @@ async fn ask_sparql_parity() {
     assert_eq!(jsonld_json, JsonValue::Bool(true));
     assert_eq!(sparql_json["boolean"], true);
 }
+
+/// ASK is true when a solution remains after the solution modifiers and the
+/// trailing VALUES clause (SPARQL 1.1 §16.3, §18.2.4–5): OFFSET and LIMIT 0
+/// can leave none, and a trailing VALUES joins the solutions before them (the
+/// grammar allows one after every query form). OFFSET and LIMIT were dropped
+/// and a trailing VALUES did not parse; the JSON-LD `ask` dropped `offset`,
+/// `limit` and `values`. Alice (30) and Bob (25) have names and ages.
+#[tokio::test]
+async fn ask_applies_offset_limit_and_values() {
+    let (fluree, ledger) = seed_people().await;
+    let sparql = |body: &'static str| {
+        let (fluree, ledger) = (&fluree, &ledger);
+        async move {
+            let query = format!("PREFIX ex: <http://example.org/ns/> {body}");
+            support::query_sparql(fluree, ledger, &query)
+                .await
+                .unwrap_or_else(|e| panic!("{e}\n{query}"))
+                .to_sparql_json(&ledger.snapshot)
+                .expect("to_sparql_json")["boolean"]
+                .clone()
+        }
+    };
+    const NAMES: &str = "ASK { ?p ex:name ?n }";
+    const AGES: &str = "ASK { ?p ex:age ?a } GROUP BY ?a";
+    for (rest, expected) in [
+        ("OFFSET 1", true),
+        ("OFFSET 2", false),
+        ("LIMIT 0", false),
+        ("LIMIT 5 OFFSET 1", true),
+        ("ORDER BY ?n OFFSET 1", true),
+        (r#"VALUES ?n { "Alice" }"#, true),
+        (r#"VALUES ?n { "Charlie" }"#, false),
+        (r#"OFFSET 1 VALUES ?n { "Alice" "Bob" }"#, true),
+        (r#"OFFSET 1 VALUES ?n { "Alice" }"#, false),
+        (r#"VALUES (?p ?n) { (ex:bob "Bob") }"#, true),
+        (r#"VALUES (?p ?n) { (ex:bob "Alice") }"#, false),
+    ] {
+        let body: &'static str = Box::leak(format!("{NAMES} {rest}").into_boxed_str());
+        assert_eq!(sparql(body).await, JsonValue::Bool(expected), "{body}");
+    }
+    // Grouped: OFFSET counts the groups that pass HAVING, and the trailing
+    // VALUES joins before grouping.
+    for (rest, expected) in [
+        ("HAVING (COUNT(?p) >= 1) OFFSET 1", true),
+        ("HAVING (COUNT(?p) >= 1) OFFSET 2", false),
+        ("HAVING (?a > 26) VALUES ?a { 25 }", false),
+        ("HAVING (?a > 26) VALUES ?a { 30 }", true),
+    ] {
+        let body: &'static str = Box::leak(format!("{AGES} {rest}").into_boxed_str());
+        assert_eq!(sparql(body).await, JsonValue::Bool(expected), "{body}");
+    }
+
+    // The JSON-LD twin.
+    let where_names = json!({"@id": "?p", "ex:name": "?n"});
+    for (options, expected) in [
+        (json!({"offset": 1}), true),
+        (json!({"offset": 2}), false),
+        (json!({"limit": 0}), false),
+        (json!({"limit": 5, "offset": 1}), true),
+        (json!({"values": ["?n", ["Alice"]]}), true),
+        (json!({"values": ["?n", ["Charlie"]]}), false),
+        (
+            json!({"offset": 1, "values": ["?n", ["Alice", "Bob"]]}),
+            true,
+        ),
+        (json!({"offset": 1, "values": ["?n", ["Alice"]]}), false),
+        (
+            json!({"groupBy": "?n", "having": "(>= (count ?p) 1)", "offset": 2}),
+            false,
+        ),
+    ] {
+        let mut query = json!({"@context": ctx(), "ask": where_names.clone()});
+        for (key, value) in options.as_object().expect("options") {
+            query[key] = value.clone();
+        }
+        let result = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        let json = result
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("to_jsonld_async");
+        assert_eq!(json, JsonValue::Bool(expected), "{query}");
+    }
+}

@@ -110,25 +110,67 @@ fn novelty_doc() -> Value {
     })
 }
 
-/// The third commit, covering the *under*-count half of #1391. Novelty accepts
-/// every retraction — `apply_commit`'s dedup gate short-circuits on
-/// `flake.op &&` and never examines one — so a ground DELETE that matches
-/// nothing still lands as a retraction flake and, under a blind delta log,
-/// subtracts one from a count that never included it.
-///
-/// * `ex:w2 ex:name "never-existed"` matches nothing: must charge zero;
-/// * `ex:w1 ex:size 1` is a real base fact: must charge `-1`, taking
-///   `ex:size`'s ledger-wide count to zero so the property drops out of
-///   `apoc.meta.data` and `db.propertyKeys()` entirely.
+/// The third commit, covering the *under*-count half of #1391: `ex:w1
+/// ex:size 1` is a real base fact and must charge `-1`, taking `ex:size`'s
+/// ledger-wide count to zero so the property drops out of `apoc.meta.data`
+/// and `db.propertyKeys()` entirely.
 fn deletion_doc() -> Value {
     json!({
         "@context": {"ex": "http://example.org/ns/"},
         "where": {},
         "delete": [
-            {"@id": "ex:w2", "ex:name": "never-existed"},
             {"@id": "ex:w1", "ex:size": 1}
         ]
     })
+}
+
+/// The fourth commit: a retraction of `ex:w2 ex:name "never-existed"`, which
+/// matches nothing and must charge zero. Novelty accepts every retraction —
+/// `apply_commit`'s dedup gate short-circuits on `flake.op &&` and never
+/// examines one — so under a blind delta log it subtracts one from a count
+/// that never included it.
+///
+/// A transaction no longer writes such a retraction (a DELETE of an absent
+/// fact stages nothing), but commits written before that, and commits
+/// replayed from elsewhere, still carry them. So the commit is built by hand
+/// and staged the way a replayed commit is.
+async fn commit_noop_retraction(
+    fluree: &Fluree,
+    ledger: fluree_db_api::LedgerState,
+    index_config: &IndexConfig,
+) {
+    use fluree_db_core::{Flake, FlakeValue, Sid};
+    let s = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/w2")
+        .expect("ex:w2");
+    let p = ledger
+        .snapshot
+        .encode_iri("http://example.org/ns/name")
+        .expect("ex:name");
+    let xsd_string = Sid::new(fluree_vocab::namespaces::XSD, "string");
+    let t = ledger.t() + 1;
+    let noop = Flake::new(
+        s,
+        p,
+        FlakeValue::String("never-existed".into()),
+        xsd_string,
+        t,
+        false,
+        None,
+    );
+    let ns = fluree_db_transact::NamespaceRegistry::from_db(&ledger.snapshot);
+    let view = fluree_db_transact::stage_flakes(
+        ledger,
+        vec![noop],
+        fluree_db_transact::StageOptions::new(),
+    )
+    .await
+    .expect("stage the no-op retraction");
+    fluree
+        .commit_staged(view, ns, index_config, CommitOpts::default())
+        .await
+        .expect("commit the no-op retraction");
 }
 
 /// `(label, property)` pairs the schema shims report, each paired with the
@@ -275,6 +317,8 @@ async fn setup() -> (tempfile::TempDir, Fluree) {
         )
         .await
         .expect("deletion update");
+    let ledger = fluree.ledger(ALIAS).await.expect("reload after deletion");
+    commit_noop_retraction(&fluree, ledger, &index_config).await;
 
     let ledger = fluree.ledger(ALIAS).await.expect("reload after deletion");
     let retractions = ledger

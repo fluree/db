@@ -34,7 +34,8 @@ mod tests;
 
 pub use diagnostic::{DiagCode, Diagnostic, Severity};
 pub use input::{
-    EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride, TypedBound,
+    DeclaredForeignKey, EmitColumn, EmitColumnStats, EmitTableSchema, TableKey, TableOverride,
+    TypedBound,
 };
 pub use ir::{ColumnMapping, ForeignKey, PrefixDecl, StructuredR2rmlMapping, TableMapping};
 
@@ -94,6 +95,8 @@ pub struct EmitOptions {
     /// (always emit a saveable subject); a per-table override may force
     /// [`SubjectStrategy::Identifier`] (strict) or `Auto` for a single table.
     pub subject_strategy: SubjectStrategy,
+    /// What a table's declared key is, for the diagnostics that mention it.
+    pub declared_key_source: String,
 }
 
 impl EmitOptions {
@@ -117,6 +120,7 @@ impl Default for EmitOptions {
             keep_fk_keys_as_literals: true,
             per_table_overrides: HashMap::new(),
             subject_strategy: SubjectStrategy::Auto,
+            declared_key_source: "Iceberg identifier_field_ids".to_string(),
         }
     }
 }
