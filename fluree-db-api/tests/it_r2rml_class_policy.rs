@@ -15,6 +15,9 @@
 #[cfg(feature = "sql")]
 #[path = "support/fake_sql.rs"]
 mod fake_sql;
+#[cfg(feature = "sql")]
+#[path = "support/span_capture.rs"]
+mod span_capture;
 
 use fluree_db_api::{
     set_fast_paths_disabled, Fluree, FlureeBuilder, GovernanceOptions, R2rmlCreateConfig,
@@ -649,16 +652,41 @@ async fn a_subject_several_rows_mint_holds_every_rows_class() {
     let _serial = SERIAL.lock().await;
     allow_fixture_roots();
     let fluree = FlureeBuilder::memory().build_memory();
-    let mut graph = Vec::new();
-    for (id, name, city) in HISTORY {
-        let Some(id) = id else { continue };
-        let mut node = json!({ "@id": ex(&format!("customer/{id}")), ex("name"): name });
-        if let Some(c) = city {
-            node["@type"] = json!(ex(&format!("city/{c}")));
+    let source = history_source(history_graph());
+    let lanes = register(&fluree, &source).await;
+    let mut wrong = Vec::new();
+    let policies = [policy("ex:p", false, on_class(&ex("city/Boston")))];
+    for jsonld in [false, true] {
+        for lane in &lanes {
+            for fast in [true, false] {
+                set_fast_paths_disabled(!fast);
+                let got = run(&fluree, lane, &names(), &policies, true, jsonld).await;
+                set_fast_paths_disabled(false);
+                if !refused_on_history(&got) {
+                    wrong.push(format!("{lane} jsonld={jsonld} fast={fast}: {got:?}"));
+                }
+            }
         }
-        graph.push(node);
     }
-    let source = Source {
+    // A class no row's template can mint changes no decision.
+    let other = [policy("ex:p", false, on_class(&ex("Other")))];
+    wrong.extend(disagreements(&fluree, &source, &lanes, &[names()], &other, true).await);
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The refusal naming the history map and its remedies, as the only row.
+fn refused_on_history(got: &[String]) -> bool {
+    got.len() == 1
+        && got[0].contains("cannot be decided")
+        && got[0].contains("mapping#History")
+        && got[0].contains("f:key")
+        && got[0].contains("rr:sqlQuery")
+}
+
+/// `sets.customers_history`, typed by city, with no key: several rows mint
+/// one customer.
+fn history_source(graph: Vec<Value>) -> Source {
+    Source {
         alias: "history-classes".to_string(),
         namespace: "sets",
         mapping: format!(
@@ -686,30 +714,99 @@ async fn a_subject_several_rows_mint_holds_every_rows_class() {
                 .map(|(id, n, c)| vec![json!(id), json!(n), json!(c)])
                 .collect(),
         )],
+    }
+}
+
+fn history_graph() -> Vec<Value> {
+    let mut graph = Vec::new();
+    for (id, name, city) in HISTORY {
+        let Some(id) = id else { continue };
+        let mut node = json!({ "@id": ex(&format!("customer/{id}")), ex("name"): name });
+        if let Some(c) = city {
+            node["@type"] = json!(ex(&format!("city/{c}")));
+        }
+        graph.push(node);
+    }
+    graph
+}
+
+/// The SQL lane's answers come from the pushdown lane when fast paths are on
+/// (its routing stamp proceeds, and its per-class verdicts are what decide)
+/// and from the per-scan lane when they are off (no stamp): the class and
+/// property policy over the column-typed map agrees with the native ledger on
+/// both, and the history map's refusal comes from each lane, the pushdown
+/// lane refusing while it plans the block.
+#[cfg(feature = "sql")]
+#[tokio::test]
+async fn the_sql_cases_run_on_each_sql_lane() {
+    let _serial = SERIAL.lock().await;
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let (store, _tracing) = span_capture::init_test_tracing();
+    let site_outcomes = |from: usize| -> Vec<String> {
+        store.find_events("fast-path outcome")[from..]
+            .iter()
+            .filter(|e| e.fields.get("site").map(String::as_str) == Some("sql_block_pushdown"))
+            .filter_map(|e| e.fields.get("outcome").cloned())
+            .collect()
     };
-    let lanes = register(&fluree, &source).await;
+    let lane_refusals =
+        |from: usize| store.find_events("sql pushdown refused: policy").len() - from;
     let mut wrong = Vec::new();
-    let policies = [policy("ex:p", false, on_class(&ex("city/Boston")))];
+
+    let kinds = kinds_source("lane-kinds");
+    let lanes = register(&fluree, &kinds).await;
+    let sql = lanes.last().expect("the SQL lane").clone();
+    let policies = [policy(
+        "ex:p",
+        false,
+        on_class_property(&kind("alice"), &ex("name")),
+    )];
     for jsonld in [false, true] {
-        for lane in &lanes {
-            for fast in [true, false] {
-                set_fast_paths_disabled(!fast);
-                let got = run(&fluree, lane, &names(), &policies, true, jsonld).await;
-                set_fast_paths_disabled(false);
-                let refused = got.len() == 1
-                    && got[0].contains("cannot be decided")
-                    && got[0].contains("mapping#History")
-                    && got[0].contains("f:key")
-                    && got[0].contains("rr:sqlQuery");
-                if !refused {
-                    wrong.push(format!("{lane} jsonld={jsonld} fast={fast}: {got:?}"));
-                }
+        let native = format!("{}-native:main", kinds.alias);
+        let want = run(&fluree, &native, &names(), &policies, true, jsonld).await;
+        assert_eq!(want.len(), 4, "native hides alice's name: {want:?}");
+        for fast in [true, false] {
+            set_fast_paths_disabled(!fast);
+            let from = store.find_events("fast-path outcome").len();
+            let got = run(&fluree, &sql, &names(), &policies, true, jsonld).await;
+            set_fast_paths_disabled(false);
+            let outcomes = site_outcomes(from);
+            let expected: Vec<String> = if fast {
+                vec!["proceed".into()]
+            } else {
+                Vec::new()
+            };
+            if got != want || outcomes != expected {
+                wrong.push(format!(
+                    "kinds jsonld={jsonld} fast={fast}: {got:?} (native {want:?}), \
+                     stamps {outcomes:?}, expected {expected:?}"
+                ));
             }
         }
     }
-    // A class no row's template can mint changes no decision.
-    let other = [policy("ex:p", false, on_class(&ex("Other")))];
-    wrong.extend(disagreements(&fluree, &source, &lanes, &[names()], &other, true).await);
+
+    let history = history_source(history_graph());
+    let lanes = register(&fluree, &history).await;
+    let sql = lanes.last().expect("the SQL lane").clone();
+    let policies = [policy("ex:p", false, on_class(&ex("city/Boston")))];
+    for jsonld in [false, true] {
+        for fast in [true, false] {
+            set_fast_paths_disabled(!fast);
+            let from = store.find_events("sql pushdown refused: policy").len();
+            let stamps_from = store.find_events("fast-path outcome").len();
+            let got = run(&fluree, &sql, &names(), &policies, true, jsonld).await;
+            set_fast_paths_disabled(false);
+            let by_lane = lane_refusals(from);
+            let stamps = site_outcomes(stamps_from);
+            if !refused_on_history(&got) || (by_lane > 0) != fast || !stamps.is_empty() {
+                wrong.push(format!(
+                    "history jsonld={jsonld} fast={fast}: {got:?}, pushdown-lane refusals \
+                     {by_lane}, stamps {stamps:?}"
+                ));
+            }
+        }
+    }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 

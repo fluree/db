@@ -316,8 +316,11 @@ pub(super) async fn resolve_block(
         None => None,
         Some(mut gate) => match gate
             .static_verdicts(&graph_ctx, &mapping, caps.keyset_max_rows)
-            .await?
-        {
+            .await
+            .inspect_err(|e| {
+                // The lane decided the block, and the decision is a refusal.
+                tracing::debug!(graph = %iri, error = %e, "sql pushdown refused: policy");
+            })? {
             Some(v) => Some(v),
             None => {
                 tracing::debug!(graph = %iri, "sql pushdown declined: policy is not static");
