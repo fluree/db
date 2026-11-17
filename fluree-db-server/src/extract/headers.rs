@@ -297,6 +297,7 @@ impl FlureeHeaders {
     pub const TRACK_POLICY: &'static str = "fluree-track-policy";
     pub const MAX_FUEL: &'static str = "fluree-max-fuel";
     pub const MIN_T: &'static str = "fluree-min-t";
+    pub const CACHE: &'static str = "fluree-cache";
 
     /// Parse headers from a HeaderMap
     pub fn from_headers(headers: &HeaderMap) -> Result<Self> {
@@ -558,6 +559,12 @@ impl FlureeHeaders {
             .unwrap_or(false)
     }
 
+    /// Whether `Fluree-Cache: true` asks for the query-result cache.
+    pub fn wants_result_cache(&self) -> bool {
+        get_header_str(&self.raw, Self::CACHE)
+            .is_some_and(|v| v.trim().eq_ignore_ascii_case("true"))
+    }
+
     /// Get the max-bytes value from the `Fluree-Max-Bytes` header.
     ///
     /// Used by AgentJson format to set the byte budget for response truncation.
@@ -700,6 +707,10 @@ impl FlureeHeaders {
                     opts.insert("max-fuel".to_string(), JsonValue::Number(n));
                 }
             }
+        }
+
+        if self.wants_result_cache() && !opts.contains_key("cache") {
+            opts.insert("cache".to_string(), JsonValue::Bool(true));
         }
 
         // Inject tracking options into meta if any tracking is enabled via headers

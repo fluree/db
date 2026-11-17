@@ -7,6 +7,7 @@ mod graph_source;
 pub(crate) mod helpers;
 pub mod multi;
 pub mod nameservice_builder;
+pub mod result_cache;
 
 use fluree_db_core::VerifiedIdentity;
 use serde_json::Value as JsonValue;
@@ -94,6 +95,46 @@ impl fmt::Debug for QueryExecutionOptions {
 }
 
 impl QueryExecutionOptions {
+    /// Hash the options that can change a query's answer, for the
+    /// query-result cache. `Err` names one it cannot key.
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            cancellation: _,
+            trust_fk_refs,
+            deterministic_scans,
+            rdf_list_view,
+            server_identity,
+            params,
+            lifecycle_guard: _,
+            view_is_the_dataset,
+            ledger_times,
+        } = self;
+        if ledger_times.is_some() {
+            return Err("pinned ledger times");
+        }
+        trust_fk_refs.hash(h);
+        deterministic_scans.hash(h);
+        rdf_list_view.hash(h);
+        view_is_the_dataset.hash(h);
+        server_identity
+            .as_ref()
+            .map(VerifiedIdentity::as_str)
+            .hash(h);
+        match params {
+            None => 0u8.hash(h),
+            Some(params) => {
+                1u8.hash(h);
+                let bytes = serde_json::to_vec(params.as_ref()).map_err(|_| "parameters")?;
+                bytes.hash(h);
+            }
+        }
+        Ok(())
+    }
+
     /// Create empty execution options.
     pub fn new() -> Self {
         Self::default()

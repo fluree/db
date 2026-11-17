@@ -202,7 +202,9 @@ specialty arenas cannot read across named graphs.
 frequency-aware memory budget
 ([`LeafletCache`](../../fluree-db-binary-index/src/read/leaflet_cache.rs)), keyed
 by content-addressed leaf identity, the query's effective `t`, and the overlay
-epoch. Remote blobs are fetched through a single-flight disk cache
+epoch. The budget is split by key hash into one shard per core, each at least
+256 MiB, so cache hits on different cores do not contend on one shared
+structure. Remote blobs are fetched through a single-flight disk cache
 ([`disk_cache.rs`](../../fluree-db-core/src/disk_cache.rs)), so concurrent
 requests for the same blob share one fetch.
 

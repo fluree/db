@@ -1,9 +1,10 @@
 //! Unified LRU cache for decoded leaflet regions and dictionary leaves.
 //!
-//! Uses a **single** `moka::sync::Cache` (synchronous — `BinaryCursor` is
+//! Uses one `moka::sync::SegmentedCache` (synchronous — `BinaryCursor` is
 //! sync) with TinyLFU eviction. All entry types — Region 1, Region 2, and
 //! dictionary tree leaves — share one pool so TinyLFU decides what stays
-//! based on actual access patterns rather than fixed budget splits.
+//! based on actual access patterns rather than fixed budget splits. The pool
+//! is split by key hash into shards; see [`pool_segments`].
 //!
 //! History is **never cached** — it lives outside the leaflet entirely, in the
 //! per-leaf history sidecar (`FHS1`, located via `LeafEntry.sidecar_cid`). It's
@@ -38,6 +39,10 @@ use fluree_db_core::wasm_cache::Cache;
 #[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache;
 use std::collections::HashSet;
+#[cfg(not(target_arch = "wasm32"))]
+type Pool<K, V> = moka::sync::SegmentedCache<K, V>;
+#[cfg(target_arch = "wasm32")]
+type Pool<K, V> = Cache<K, V>;
 use std::io;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -501,7 +506,7 @@ impl CachedEntry {
 // ============================================================================
 
 /// Unified LRU cache for decoded leaflet regions and dictionary tree leaves,
-/// backed by a single moka TinyLFU pool.
+/// backed by one moka TinyLFU pool split into key-hashed shards.
 ///
 /// All entry types share one memory budget — TinyLFU decides what stays
 /// based on actual access frequency/recency rather than fixed splits.
@@ -595,7 +600,9 @@ struct Stages {
     dictionary_cap: u64,
     /// Pools by stage: [`Stages::index`] of whether the fenced-leaf pool is
     /// still reserved and the allowance's level.
-    pools: Box<[OnceLock<Cache<CacheKey, CachedEntry>>]>,
+    pools: Box<[OnceLock<Pool<CacheKey, CachedEntry>>]>,
+    /// Cores the pools are sharded for; see [`pool_segments`].
+    cores: usize,
     current: AtomicUsize,
     /// Distinct packs the allowance could hold, and their bytes.
     promotable: Mutex<(HashSet<u128>, u64)>,
@@ -606,7 +613,7 @@ struct Stages {
 
 /// Apply `pool`'s pending removals until it holds nothing: one pass applies
 /// only a batch.
-fn drain(pool: &Cache<CacheKey, CachedEntry>) {
+fn drain(pool: &Pool<CacheKey, CachedEntry>) {
     for _ in 0..4096 {
         pool.run_pending_tasks();
         if pool.entry_count() == 0 && pool.weighted_size() == 0 {
@@ -615,8 +622,16 @@ fn drain(pool: &Cache<CacheKey, CachedEntry>) {
     }
 }
 
-fn leaflet_pool(capacity: u64) -> Cache<CacheKey, CachedEntry> {
-    Cache::builder()
+fn leaflet_pool(capacity: u64, cores: usize) -> Pool<CacheKey, CachedEntry> {
+    #[cfg(not(target_arch = "wasm32"))]
+    let builder = Pool::builder(pool_segments(capacity, cores));
+    // The wasm32 stand-in is single-threaded: nothing to shard.
+    #[cfg(target_arch = "wasm32")]
+    let builder = {
+        let _ = cores;
+        Pool::builder()
+    };
+    builder
         .weigher(|_key: &CacheKey, val: &CachedEntry| val.byte_size().min(u32::MAX as usize) as u32)
         .max_capacity(capacity)
         .build()
@@ -626,19 +641,23 @@ impl Stages {
     /// Allowance levels: the cap, its halvings, and none.
     const LEVELS: usize = DICTIONARY_LEVELS as usize + 2;
 
-    fn new(budget: u64, fence_budget: u64, dictionary_cap: u64) -> Self {
+    fn new(budget: u64, fence_budget: u64, dictionary_cap: u64, cores: usize) -> Self {
         let pools: Box<[OnceLock<_>]> = (0..2 * Self::LEVELS).map(|_| OnceLock::new()).collect();
         let stages = Self {
             budget,
             fence_budget,
             dictionary_cap,
             pools,
+            cores,
             current: AtomicUsize::new(0),
             promotable: Mutex::new((HashSet::new(), 0)),
             fenced: AtomicBool::new(false),
             moving: Mutex::new(()),
         };
-        let _ = stages.pools[0].set(leaflet_pool(budget.saturating_sub(stages.reserved_at(0))));
+        let _ = stages.pools[0].set(leaflet_pool(
+            budget.saturating_sub(stages.reserved_at(0)),
+            cores,
+        ));
         stages
     }
 
@@ -673,7 +692,7 @@ impl Stages {
         (if fences { self.fence_budget } else { 0 }) + self.allowance_at(level)
     }
 
-    fn pool(&self) -> &Cache<CacheKey, CachedEntry> {
+    fn pool(&self) -> &Pool<CacheKey, CachedEntry> {
         self.pools[self.current.load(Ordering::Acquire)]
             .get()
             .expect("the current stage's pool is built before the stage is")
@@ -702,7 +721,12 @@ impl Stages {
         }
         let old = self.pools[from].get().expect("current stage built");
         let new = self.pools[stage]
-            .get_or_init(|| leaflet_pool(self.budget.saturating_sub(self.reserved_at(stage))));
+            .get_or_init(|| {
+                leaflet_pool(
+                    self.budget.saturating_sub(self.reserved_at(stage)),
+                    self.cores,
+                )
+            });
         // The new pool is larger: everything carries over, where pools can
         // be walked.
         #[cfg(not(target_arch = "wasm32"))]
@@ -727,12 +751,12 @@ impl Stages {
 /// See [`LeafletCache::writing`].
 struct Writing<'a> {
     cache: &'a LeafletCache,
-    pool: &'a Cache<CacheKey, CachedEntry>,
+    pool: &'a Pool<CacheKey, CachedEntry>,
     key: CacheKey,
 }
 
 impl std::ops::Deref for Writing<'_> {
-    type Target = Cache<CacheKey, CachedEntry>;
+    type Target = Pool<CacheKey, CachedEntry>;
     fn deref(&self) -> &Self::Target {
         self.pool
     }
@@ -784,6 +808,34 @@ fn fenced_leaf_weight(leaf: &Option<Arc<FencedLeaf>>) -> usize {
         .map_or(std::mem::size_of::<Option<Arc<FencedLeaf>>>(), |leaf| {
             leaf.cache_weight()
         })
+}
+
+/// Cores this process may run on, which [`pool_segments`] shards for.
+fn available_cores() -> usize {
+    std::thread::available_parallelism().map_or(1, std::num::NonZero::get)
+}
+
+/// Smallest budget a leaflet pool shard is given.
+///
+/// moka never caches an entry heavier than its shard, and a vector shard
+/// alone can weigh tens of megabytes, so a shard must stay far larger than
+/// any single entry.
+#[cfg(not(target_arch = "wasm32"))]
+const MIN_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Number of shards for a leaflet pool of `max_bytes` on `cores` cores.
+///
+/// Each moka cache records every hit in one bounded channel that all threads
+/// share, so at high core counts hits spend their time contending on it. A
+/// shard has its own channel, so one shard per core spreads that contention
+/// out. Shards hold `max_bytes / n` each, so their count is capped to keep
+/// every shard at least [`MIN_SEGMENT_BYTES`]; budgets under twice that stay
+/// one pool. Always a power of two, as moka rounds up to one.
+#[cfg(not(target_arch = "wasm32"))]
+fn pool_segments(max_bytes: u64, cores: usize) -> usize {
+    let by_budget = (max_bytes / MIN_SEGMENT_BYTES).max(1);
+    let by_budget = 1usize << by_budget.ilog2().min(usize::BITS - 2);
+    cores.max(1).next_power_of_two().min(by_budget)
 }
 
 /// Run a moka single-flight call (`get_with`/`try_get_with`) under a Tokio
@@ -870,11 +922,15 @@ impl LeafletCache {
     /// none of it: it holds no dictionary pack whole and no fenced reverse
     /// leaf.
     ///
-    /// One TinyLFU pool and budget for every leaflet-derived entry type. Query
-    /// planner stats views get a separate LRU pool sized from the same budget;
-    /// see [`stats_view_pool`].
+    /// One TinyLFU pool and budget for every leaflet-derived entry type,
+    /// sharded per [`pool_segments`]. Query planner stats views get a separate
+    /// LRU pool sized from the same budget; see [`stats_view_pool`].
     pub fn with_max_bytes(max_bytes: u64) -> Self {
-        Self::with_stages(max_bytes, 0, 0)
+        Self::with_max_bytes_on(max_bytes, available_cores())
+    }
+
+    fn with_max_bytes_on(max_bytes: u64, cores: usize) -> Self {
+        Self::with_stages(max_bytes, 0, 0, cores)
     }
 
     /// A cache of `max_bytes` for storage that decrypts on read: a
@@ -904,12 +960,13 @@ impl LeafletCache {
             max_bytes,
             fenced_leaf_budget(max_bytes - dictionary),
             dictionary,
+            available_cores(),
         )
     }
 
-    fn with_stages(budget: u64, fence_budget: u64, dictionary_cap: u64) -> Self {
+    fn with_stages(budget: u64, fence_budget: u64, dictionary_cap: u64, cores: usize) -> Self {
         Self {
-            stages: Stages::new(budget, fence_budget, dictionary_cap),
+            stages: Stages::new(budget, fence_budget, dictionary_cap, cores),
             stats_views: stats_view_pool(budget.saturating_sub(dictionary_cap)),
             fenced_leaves: fenced_leaf_pool(fence_budget.max(1)),
             fenced_leaf_max: (fence_budget / 2) as usize,
@@ -917,7 +974,7 @@ impl LeafletCache {
         }
     }
 
-    fn pool(&self) -> &Cache<CacheKey, CachedEntry> {
+    fn pool(&self) -> &Pool<CacheKey, CachedEntry> {
         self.stages.pool()
     }
 
@@ -1075,6 +1132,14 @@ impl LeafletCache {
         }
         self.stats_views.invalidate_all();
         self.fenced_leaves.invalidate_all();
+    }
+
+    /// Number of shards the pool is split into; see [`pool_segments`].
+    pub fn shard_count(&self) -> usize {
+        #[cfg(not(target_arch = "wasm32"))]
+        return self.pool().policy().num_segments();
+        #[cfg(target_arch = "wasm32")]
+        1
     }
 
     // ========================================================================
@@ -2473,5 +2538,61 @@ mod tests {
             cache.get_stats_view(1).is_none(),
             "the least recently used view makes room"
         );
+    }
+
+    #[test]
+    fn pool_has_a_shard_per_core_within_the_shard_floor() {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        // Budgets under two shards' floor stay one pool, whatever the cores.
+        for max_bytes in [0, 4 << 20, 2 * MIN_SEGMENT_BYTES - 1] {
+            assert_eq!(pool_segments(max_bytes, 64), 1, "{max_bytes} bytes");
+        }
+        assert_eq!(pool_segments(2 * MIN_SEGMENT_BYTES, 64), 2);
+        // Cores bound a large budget, rounded up to a power of two.
+        assert_eq!(pool_segments(64 * GIB, 0), 1);
+        assert_eq!(pool_segments(64 * GIB, 1), 1);
+        assert_eq!(pool_segments(64 * GIB, 6), 8);
+        assert_eq!(pool_segments(64 * GIB, 64), 64);
+        // The floor bounds many cores, rounded down to a power of two.
+        assert_eq!(pool_segments(16 * GIB, 192), 64);
+        assert_eq!(pool_segments(24 * GIB, 192), 64);
+        for max_bytes in [GIB, 3 * GIB, 51 * GIB, 150 * GIB] {
+            for cores in [1, 3, 32, 64, 96, 192, 1024] {
+                let shards = pool_segments(max_bytes, cores);
+                assert!(shards.is_power_of_two());
+                assert!(max_bytes / shards as u64 >= MIN_SEGMENT_BYTES);
+            }
+        }
+    }
+
+    /// The floor is what keeps heavy entries cacheable: a 48 MiB entry fits a
+    /// 256 MiB shard, but not one of the 64 shards of 16 MiB that one shard per
+    /// core would give this budget.
+    #[test]
+    fn sharded_pool_still_caches_an_entry_heavier_than_a_core_share() {
+        let max_bytes = 1024 * 1024 * 1024;
+        let cache = LeafletCache::with_max_bytes_on(max_bytes, 64);
+        assert_eq!(cache.shard_count(), 4);
+
+        let heavy = 48 * 1024 * 1024;
+        assert!(heavy as u64 > max_bytes / 64);
+        cache.insert_dict_leaf(u128::MAX, Arc::from(vec![0u8; heavy]));
+        for key in 0..256u128 {
+            cache.insert_dict_leaf(key, Arc::from(vec![key as u8; 64]));
+        }
+        cache.pool().run_pending_tasks();
+
+        assert_eq!(cache.get_dict_leaf(u128::MAX).map(|b| b.len()), Some(heavy));
+        for key in 0..256u128 {
+            assert_eq!(
+                cache.get_dict_leaf(key).as_deref(),
+                Some(&[key as u8; 64][..])
+            );
+        }
+        assert_eq!(cache.entry_count(), 257);
+
+        cache.invalidate_all();
+        assert!(cache.get_dict_leaf(7).is_none());
+        assert!(cache.get_dict_leaf(u128::MAX).is_none());
     }
 }

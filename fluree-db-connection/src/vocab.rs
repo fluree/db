@@ -107,6 +107,8 @@ pub const FIELD_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#cacheMaxMb";
 /// On encrypted storage, the megabytes of the cache that dictionary packs may
 /// hold decrypted whole
 pub const FIELD_CACHE_DICTIONARY_MAX_MB: &str = "https://ns.flur.ee/system#cacheDictionaryMaxMb";
+/// Query-result cache ceiling in megabytes, in addition to `cacheMaxMb`
+pub const FIELD_QUERY_RESULT_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#queryResultCacheMaxMb";
 
 /// Index storage reference
 pub const FIELD_INDEX_STORAGE: &str = "https://ns.flur.ee/system#indexStorage";

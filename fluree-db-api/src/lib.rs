@@ -253,6 +253,9 @@ pub use query::builder::{
 };
 pub use query::helpers::sparql_pragma_tracking;
 pub use query::nameservice_builder::NameserviceQueryBuilder;
+pub use query::result_cache::{
+    jsonld_requests_result_cache, ResultCacheOutcome, ResultCacheStatus,
+};
 pub use query::{QueryExecutionOptions, QueryResult, TrackedErrorResponse, TrackedQueryResponse};
 pub use rebase::{
     ConflictStrategy, PendingReplay, RebaseConflict, RebaseFailure, RebaseReport, StagedRebase,
@@ -2449,6 +2452,17 @@ impl FlureeBuilder {
         self
     }
 
+    /// Set the query-result cache ceiling in MB.
+    ///
+    /// Opted-in answers are kept in a pool of their own, in addition to the
+    /// [`cache_max_mb`](Self::cache_max_mb) budget, and nothing is allocated
+    /// until a query opts in. Defaults to 10% of `cache_max_mb`; `0` disables
+    /// result caching.
+    pub fn query_result_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.cache.query_result_max_mb = Some(max_mb);
+        self
+    }
+
     /// Set the maximum **on-disk** cache budget in MB, shared globally across
     /// Fluree's object storage and Iceberg data files.
     ///
@@ -3684,6 +3698,9 @@ impl FlureeBuilder {
         let (backend, nameservice) = apply_remote_mounts(backend, nameservice, remote_mounts);
         let backend = with_artifact_cache(backend, ledger_cache_config.as_ref());
         let leaflet_cache = make_leaflet_cache(&config, &backend);
+        let result_cache = std::sync::Arc::new(query::result_cache::ResultCache::with_max_mb(
+            config.cache.query_result_mb(),
+        ));
         let governance_cache = std::sync::Arc::new(cross_ledger::GovernanceCache::new());
 
         // Register SPARQL lowering hooks for f:sparql policy queries and
@@ -3723,6 +3740,7 @@ impl FlureeBuilder {
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache,
+            result_cache,
             indexing_mode,
             index_config,
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -4082,6 +4100,9 @@ pub struct Fluree {
     /// this instance that references the same model graph at the
     /// same model head commit.
     governance_cache: std::sync::Arc<cross_ledger::GovernanceCache>,
+    /// Opted-in query answers, in a pool of their own beside the leaflet
+    /// cache's budget; see `query::result_cache`.
+    result_cache: std::sync::Arc<query::result_cache::ResultCache>,
     /// Indexing mode (disabled or background with handle)
     pub indexing_mode: tx::IndexingMode,
     /// Novelty backpressure thresholds used by commits and soft-trigger logic.
@@ -4176,6 +4197,9 @@ impl Fluree {
     ) -> Self {
         let leaflet_cache = make_leaflet_cache(&config, &backend);
         let config_content_hash = config.content_hash;
+        let result_cache = std::sync::Arc::new(query::result_cache::ResultCache::with_max_mb(
+            config.cache.query_result_mb(),
+        ));
         let event_bus = Arc::new(fluree_db_nameservice::LedgerEventBus::new(1024));
         let retention = Arc::<retention::RetentionRuntime>::default();
         // Writes made through this instance reach its bus, so what it keeps
@@ -4196,6 +4220,7 @@ impl Fluree {
             nameservice_mode: nameservice,
             leaflet_cache,
             governance_cache: std::sync::Arc::new(cross_ledger::GovernanceCache::new()),
+            result_cache,
             indexing_mode: tx::IndexingMode::Disabled,
             index_config: server_defaults::default_index_config(),
             r2rml_cache: std::sync::Arc::new(graph_source::R2rmlCache::with_defaults()),
@@ -4606,6 +4631,17 @@ impl Fluree {
     /// Global cache budget in MB.
     pub fn cache_budget_mb(&self) -> usize {
         self.config().cache.max_mb
+    }
+
+    /// Query-result cache ceiling in MB (in addition to [`Self::cache_budget_mb`]).
+    pub fn result_cache_budget_mb(&self) -> usize {
+        self.config().cache.query_result_mb()
+    }
+
+    /// Entries and weighted bytes in the query-result cache; `None` until a
+    /// query has opted in.
+    pub fn result_cache_usage(&self) -> Option<(u64, u64)> {
+        self.result_cache.usage()
     }
 
     /// Check if ledger caching is enabled (true by default).
