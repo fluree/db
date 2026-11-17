@@ -73,6 +73,23 @@ impl OverlayProvider for CompositeOverlay {
             .try_fold(0usize, |acc, o| Some(acc + o.overlay_flake_count(g_id)?))
     }
 
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // A component's whole-graph count bounds its range count.
+        self.overlays.iter().try_fold(0usize, |acc, o| {
+            let n = o
+                .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+                .or_else(|| o.overlay_flake_count(g_id))?;
+            Some(acc + n)
+        })
+    }
+
     fn for_each_overlay_flake(
         &self,
         g_id: GraphId,

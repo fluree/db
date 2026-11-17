@@ -8,6 +8,7 @@ use crate::graph_source::config::VectorCreateConfig;
 #[cfg(feature = "vector")]
 use crate::graph_source::helpers::{
     expand_ids_in_results, expand_prefixed_iri, expand_properties_in_results, extract_prefix_map,
+    latest_drop_read,
 };
 #[cfg(feature = "vector")]
 use crate::graph_source::result::{
@@ -470,6 +471,21 @@ impl crate::Fluree {
                 new_watermark: old_watermark,
                 was_full_resync: false,
             });
+        }
+
+        // A drop since the last sync of a graph the query reads takes the full
+        // rebuild, as in `sync_bm25_index`: the commit walk cannot find what it
+        // took. The index keeps no history to retire.
+        if let Some(floor) =
+            latest_drop_read(&ledger.snapshot, &query).filter(|floor| *floor > old_watermark)
+        {
+            info!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                drop_t = floor,
+                "A graph the indexing query reads was dropped since the last sync; running a full resync"
+            );
+            return self.resync_vector_index(graph_source_id).await;
         }
 
         // 4. Get head commit CID for tracing

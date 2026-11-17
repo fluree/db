@@ -150,3 +150,84 @@ async fn bm25_index_answers_to_its_branchless_name() {
     assert_eq!(idx.num_docs(), 2);
     fluree.drop_full_text_index("note-search").await.unwrap();
 }
+
+/// A graph-source type this version does not recognize (one a newer build
+/// registered into a shared nameservice) has no reader here: every route
+/// refuses it as unsupported (501), not as a missing ledger or an empty graph,
+/// and not as an index, which the nameservice files an unknown type as.
+#[tokio::test]
+async fn an_unrecognized_graph_source_type_is_refused_as_unsupported() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .publisher()
+        .expect("read-write nameservice")
+        .publish_graph_source(
+            "future",
+            "main",
+            fluree_db_nameservice::GraphSourceType::Unknown("f:FutureSource".into()),
+            "{}",
+            &[],
+        )
+        .await
+        .expect("publish");
+    let gs = "future:main";
+    let jsonld_from = serde_json::json!({
+        "from": gs, "select": ["?s"], "where": {"@id": "?s", "?p": "?o"}
+    });
+    let jsonld_target = serde_json::json!({
+        "select": ["?s"], "where": {"@id": "?s", "?p": "?o"}
+    });
+    let target = fluree.graph(gs);
+    for (route, result) in [
+        (
+            "SPARQL FROM",
+            fluree
+                .query_from()
+                .sparql(&format!("SELECT ?s FROM <{gs}> WHERE {{ ?s ?p ?o }}"))
+                .execute_formatted()
+                .await,
+        ),
+        (
+            "JSON-LD from",
+            fluree
+                .query_from()
+                .jsonld(&jsonld_from)
+                .execute_formatted()
+                .await,
+        ),
+        (
+            "SPARQL target",
+            target
+                .query()
+                .sparql("SELECT ?s WHERE { ?s ?p ?o }")
+                .execute_formatted()
+                .await,
+        ),
+        (
+            "JSON-LD target",
+            target
+                .query()
+                .jsonld(&jsonld_target)
+                .execute_formatted()
+                .await,
+        ),
+    ] {
+        let err = match result {
+            Ok(answer) => panic!("{route}: answered instead of refusing: {answer}"),
+            Err(err) => err,
+        };
+        assert_eq!(
+            err.error_type(),
+            "err:db/GraphSourceUnsupported",
+            "{route}: {err}"
+        );
+        assert_eq!(err.status_code(), 501, "{route}: {err}");
+        assert!(
+            err.to_string().contains(
+                "graph source 'future:main' is a 'f:FutureSource' graph source, which this \
+                 build cannot read: it does not recognize that type"
+            ),
+            "{route}: {err}"
+        );
+    }
+}

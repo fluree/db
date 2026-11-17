@@ -551,6 +551,8 @@ println!("Upserted: {}, Removed: {}", sync_result.upserted, sync_result.removed)
 
 Sync is incremental only when the indexing query's dependencies can be tracked completely; the shape rules are the same as for [BM25 syncing](bm25.md#syncing). Outside that shape every sync re-embeds the whole corpus, and the decline is logged at `warn` with the reason. Within it, a window that touches none of the tracked properties (the embedding property is always one of them) advances the watermark without re-embedding anything.
 
+A sync whose window holds a `DROP` of a graph the indexing query reads re-embeds in full, for the reason and by the rules given under [BM25 syncing](bm25.md#syncing). A vector index keeps only its latest snapshot, so there is no earlier one to retire.
+
 #### Full Resync
 
 Rebuild the entire index from scratch:

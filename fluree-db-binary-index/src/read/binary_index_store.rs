@@ -21,10 +21,10 @@ use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::GraphId;
 use fluree_db_core::{
     ContentId, ContentStore, FlakeMeta, FlakeValue, PrefixTrie, RuntimeSmallDicts, Sid,
 };
+use fluree_db_core::{GraphId, NO_ARENA_GRAPH};
 use fluree_vocab::{geo_names, jsonld_names, namespaces, rdf_names, xsd_names};
 use parking_lot::RwLock;
 
@@ -359,8 +359,10 @@ pub struct BinaryIndexStore {
     /// Process-unique instance id (see [`NEXT_STORE_ID`]) — the identity of this
     /// store's frozen dictionary id-assignment, for the per-segment cache key.
     store_id: u64,
-    dicts: DictionarySet,
-    graph_indexes: HashMap<GraphId, GraphIndex>,
+    /// Shared with the stores [`Self::without_graphs`] derives.
+    dicts: Arc<DictionarySet>,
+    /// Shared per graph with the stores [`Self::without_graphs`] derives.
+    graph_indexes: HashMap<GraphId, Arc<GraphIndex>>,
     /// o_type table: full list (for iteration / serialization).
     o_type_table: Vec<OTypeTableEntry>,
     /// O(1) lookup: o_type value → index into o_type_table.
@@ -473,7 +475,7 @@ impl BinaryIndexStore {
     pub fn empty(cache_dir: PathBuf) -> Self {
         Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts: DictionarySet {
+            dicts: Arc::new(DictionarySet {
                 predicates: PredicateDict::new(),
                 predicate_reverse: HashMap::new(),
                 graphs_reverse: HashMap::new(),
@@ -488,7 +490,7 @@ impl BinaryIndexStore {
                 prefix_trie: Arc::new(PrefixTrie::new()),
                 language_tags: LanguageTagDict::new(),
                 dt_sids: Vec::new(),
-            },
+            }),
             graph_indexes: HashMap::new(),
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
@@ -569,7 +571,7 @@ impl BinaryIndexStore {
             root,
             cache_dir,
             leaflet_cache.as_ref(),
-            prev.map(|p| &p.dicts),
+            prev.map(|p| &*p.dicts),
         )
         .await?;
 
@@ -678,8 +680,11 @@ impl BinaryIndexStore {
         let disk_cache = super::artifact_cache::DiskArtifactCache::for_dir(cache_dir);
         Ok(Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts,
-            graph_indexes,
+            dicts: Arc::new(dicts),
+            graph_indexes: graph_indexes
+                .into_iter()
+                .map(|(g_id, gi)| (g_id, Arc::new(gi)))
+                .collect(),
             o_type_table,
             o_type_index,
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
@@ -718,6 +723,12 @@ impl BinaryIndexStore {
         self.store_id
     }
 
+    /// The dictionaries, to write in a test's hand-built store.
+    #[cfg(test)]
+    fn dicts_mut(&mut self) -> &mut DictionarySet {
+        Arc::get_mut(&mut self.dicts).expect("a test store does not share its dictionaries")
+    }
+
     pub fn max_t(&self) -> i64 {
         self.max_t
     }
@@ -742,6 +753,74 @@ impl BinaryIndexStore {
     #[inline]
     pub fn lex_sorted_string_ids(&self) -> bool {
         self.lex_sorted_string_ids
+    }
+
+    /// This store less what it holds of `g_ids`: their branches, leaves and
+    /// arenas. Everything else — the dictionaries, the other graphs, the leaf
+    /// caches — is shared, so this costs a map clone, not a load.
+    ///
+    /// For a ledger that dropped those graphs after this store's `max_t`:
+    /// the index still holds their facts from before the drop, which no read
+    /// may return. Without an index of its own, a graph reads from novelty
+    /// alone, exactly as one created since the last index build does — so
+    /// every reader, scans, fast paths and arenas alike, sees what the drop
+    /// left without knowing about drops.
+    ///
+    /// The derived store gets its own id: a cache keyed by store id may hold
+    /// what this store read of the removed graphs.
+    pub fn without_graphs(&self, g_ids: &[GraphId]) -> Self {
+        // Short u16 slices scan cheaply, so keep those allocation-free.
+        // Large drops must not scan the list for every indexed graph
+        // (quadratic for DROP ALL); amortize the set over a large store too.
+        const LINEAR_DROP_LIMIT: usize = 512;
+        let dropped: Option<std::collections::HashSet<GraphId>> = (g_ids.len() > LINEAR_DROP_LIMIT
+            && self.graph_indexes.len() > LINEAR_DROP_LIMIT)
+            .then(|| g_ids.iter().copied().collect());
+        Self {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            dicts: Arc::clone(&self.dicts),
+            graph_indexes: self
+                .graph_indexes
+                .iter()
+                .filter(|(g_id, _)| {
+                    !dropped
+                        .as_ref()
+                        .map_or_else(|| g_ids.contains(g_id), |ids| ids.contains(*g_id))
+                })
+                .map(|(g_id, gi)| (*g_id, Arc::clone(gi)))
+                .collect(),
+            o_type_table: self.o_type_table.clone(),
+            o_type_index: self.o_type_index.clone(),
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: self.residency_mode,
+            cas: self.cas.clone(),
+            cache_dir: self.cache_dir.clone(),
+            _disk_cache: Arc::clone(&self._disk_cache),
+            leaflet_cache: self.leaflet_cache.clone(),
+            remote_leaf_metadata: RwLock::new(HashMap::new()),
+            remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: self.remote_leaf_fetch,
+            max_t: self.max_t,
+            base_t: self.base_t,
+            language_tags: self.language_tags.clone(),
+            lex_sorted_string_ids: self.lex_sorted_string_ids,
+            ns_split_mode: self.ns_split_mode,
+            ns_split_mode_set: self.ns_split_mode_set,
+            p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
+            decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
+            vector_pins: RwLock::new(HashMap::new()),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Whether this store holds an index (branches or arenas) for `g_id`.
+    pub fn has_graph_index(&self, g_id: GraphId) -> bool {
+        self.graph_indexes.contains_key(&g_id)
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -2662,9 +2741,8 @@ impl BinaryIndexStore {
         p_id: u32,
         arena: crate::arena::numbig::NumBigArena,
     ) {
-        self.graph_indexes
-            .entry(g_id)
-            .or_insert_with(|| GraphIndex {
+        let gi = self.graph_indexes.entry(g_id).or_insert_with(|| {
+            Arc::new(GraphIndex {
                 orders: HashMap::new(),
                 order_cids: HashMap::new(),
                 numbig: HashMap::new(),
@@ -2672,6 +2750,9 @@ impl BinaryIndexStore {
                 spatial: HashMap::new(),
                 fulltext: HashMap::new(),
             })
+        });
+        Arc::get_mut(gi)
+            .expect("set_numbig_arena_for_test on a store whose graph index is shared")
             .numbig
             .insert(p_id, arena);
     }
@@ -3049,9 +3130,14 @@ impl BinaryIndexStore {
         // be shared with the previous store; `make_mut` unshares only when
         // there is something to add.
         if !new_entries.is_empty() {
-            let codes = Arc::make_mut(&mut self.dicts.namespace_codes);
-            let trie = Arc::make_mut(&mut self.dicts.prefix_trie);
-            let reverse = Arc::make_mut(&mut self.dicts.namespace_reverse);
+            // A store shares its dictionaries only with the stores derived
+            // from it once it was loaded, and loading is where it is augmented.
+            let dicts = Arc::get_mut(&mut self.dicts).ok_or_else(|| {
+                io::Error::other("cannot augment the namespaces of a derived index store")
+            })?;
+            let codes = Arc::make_mut(&mut dicts.namespace_codes);
+            let trie = Arc::make_mut(&mut dicts.prefix_trie);
+            let reverse = Arc::make_mut(&mut dicts.namespace_reverse);
             for (code, prefix) in new_entries {
                 codes.insert(code, prefix.clone());
                 if !prefix.is_empty() {
@@ -3126,7 +3212,7 @@ impl BinaryIndexStore {
     }
 
     /// Lookup graph IRI → `GraphId`. Returns `None` if the IRI is not known.
-    pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<GraphId> {
         self.dicts.graphs_reverse.get(iri).copied()
     }
 
@@ -3640,7 +3726,15 @@ impl ArenaVector {
     }
 }
 
-/// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
+/// A store's decoder for terms that are the same in every graph: subjects,
+/// predicates, string-dictionary values and inline literals, read through the
+/// store's dictionaries and, when `dict_novelty` is present, its novelty
+/// dictionaries.
+///
+/// It has no graph. An arena-backed literal (a big number or a vector) is a
+/// handle into one graph's arena, so decoding one takes that graph
+/// explicitly ([`Self::decode_value_from_kind`]): the literal's own, never
+/// the view's.
 ///
 /// When `dict_novelty` is present, all decode methods automatically perform
 /// watermark-based routing: IDs at or below the watermark delegate to the
@@ -3649,9 +3743,8 @@ impl ArenaVector {
 ///
 /// When `dict_novelty` is `None`, all methods delegate straight to the store
 /// with zero overhead (single well-predicted branch).
-pub struct BinaryGraphView {
+pub struct TermView {
     store: Arc<BinaryIndexStore>,
-    g_id: GraphId,
     dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     namespace_codes_fallback: Option<Arc<HashMap<u16, String>>>,
     /// Optional fuel tracker. When set, each forward-pack dict touch (a call
@@ -3664,7 +3757,7 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
-    /// The vector shard this view's keys read last, and that predicate's
+    /// The vector shard this view's keys read last, and that arena's
     /// identity table if it was built. See [`Self::arena_vector`].
     vector_cursor: VectorCursor,
     /// Where keys read from this view record a read failure they can't
@@ -3673,10 +3766,15 @@ pub struct BinaryGraphView {
     key_read_errors: Arc<KeyReadErrors>,
 }
 
+/// A vector arena of a store: its graph and predicate. A [`TermView`] has no
+/// graph, and a union of graphs keys vectors of several through one view, so
+/// everything its cursor holds is per arena.
+type ArenaId = (GraphId, u32);
+
 /// Where a view's vector keys read: the shard read last, by
-/// `(p_id, shard index)` (a scan reads handles mostly in runs, so a key
+/// `(arena, shard index)` (a scan reads handles mostly in runs, so a key
 /// usually skips the shared cache's probe), and the identity table of the
-/// predicate read last. One shard only, so the view never holds more of an
+/// arena read last. One shard only, so the view never holds more of an
 /// arena than the cache's eviction allows; a key's own slice keeps its shard
 /// for as long as the key lives, and keys share one copy of each shard.
 #[derive(Default)]
@@ -3684,17 +3782,17 @@ struct VectorCursor(std::sync::Mutex<VectorCursorInner>);
 
 #[derive(Default)]
 struct VectorCursorInner {
-    shard: Option<(u32, usize, Arc<crate::arena::vector::VectorShard>)>,
-    identity: Option<(u32, Option<Arc<VectorIdentity>>)>,
+    shard: Option<(ArenaId, usize, Arc<crate::arena::vector::VectorShard>)>,
+    identity: Option<(ArenaId, Option<Arc<VectorIdentity>>)>,
     /// Every shard this view has handed to a key, weakly: while some key
     /// still holds a shard, a later key reuses that copy rather than load
     /// another once the shared cache has evicted it, so keys never hold more
     /// than one copy of the arena. Holds nothing alive itself.
     handed_out:
-        rustc_hash::FxHashMap<(u32, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
-    /// The store's [`ShardPins`] for this view's graph, weakly, so a key
+        rustc_hash::FxHashMap<(ArenaId, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
+    /// The store's [`ShardPins`] for the graph keyed last, weakly, so a key
     /// skips the store's lock while the pins live.
-    pins: std::sync::Weak<ShardPins>,
+    pins: Option<(GraphId, std::sync::Weak<ShardPins>)>,
 }
 
 impl VectorCursor {
@@ -3702,6 +3800,23 @@ impl VectorCursor {
         self.0
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A [`TermView`] bound to one graph, for a reader of that graph's index:
+/// it decodes the graph's own rows by `o_type` ([`Self::decode_value`]) and
+/// names its graph ([`Self::g_id`]). Everything else it decodes as its
+/// [`TermView`] does.
+pub struct BinaryGraphView {
+    terms: TermView,
+    g_id: GraphId,
+}
+
+impl std::ops::Deref for BinaryGraphView {
+    type Target = TermView;
+
+    fn deref(&self) -> &TermView {
+        &self.terms
     }
 }
 
@@ -3737,17 +3852,7 @@ impl<V: Clone> SubjectMemo<V> {
 
 impl BinaryGraphView {
     pub fn new(store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
-        Self {
-            store,
-            g_id,
-            dict_novelty: None,
-            namespace_codes_fallback: None,
-            tracker: None,
-            subject_sids: SubjectMemo::new(),
-            subject_iris: SubjectMemo::new(),
-            vector_cursor: VectorCursor::default(),
-            key_read_errors: Arc::default(),
-        }
+        Self::with_novelty(store, g_id, None)
     }
 
     /// Create a novelty-aware graph view.
@@ -3762,8 +3867,65 @@ impl BinaryGraphView {
         dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     ) -> Self {
         Self {
-            store,
+            terms: TermView::new(store, dict_novelty),
             g_id,
+        }
+    }
+
+    /// Attach a fuel tracker ([`TermView::with_tracker`]).
+    pub fn with_tracker(mut self, tracker: fluree_db_core::Tracker) -> Self {
+        self.terms = self.terms.with_tracker(tracker);
+        self
+    }
+
+    /// [`TermView::with_namespace_codes_fallback`].
+    pub fn with_namespace_codes_fallback(
+        mut self,
+        namespace_codes_fallback: Option<Arc<HashMap<u16, String>>>,
+    ) -> Self {
+        self.terms = self
+            .terms
+            .with_namespace_codes_fallback(namespace_codes_fallback);
+        self
+    }
+
+    /// [`TermView::with_key_read_errors`].
+    pub fn with_key_read_errors(mut self, slot: Arc<KeyReadErrors>) -> Self {
+        self.terms = self.terms.with_key_read_errors(slot);
+        self
+    }
+
+    pub fn g_id(&self) -> GraphId {
+        self.g_id
+    }
+
+    /// The view's terms, without its graph.
+    pub fn terms(&self) -> &TermView {
+        &self.terms
+    }
+
+    /// [`Self::terms`], by value.
+    pub fn into_terms(self) -> TermView {
+        self.terms
+    }
+
+    /// Decode a value of this graph's rows from `(o_type, o_key)`, an arena
+    /// handle through this graph's arena. Novelty-aware when `dict_novelty`
+    /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
+    /// watermark checks; all other types delegate directly to the store.
+    pub fn decode_value(&self, o_type: u16, o_key: u64, p_id: u32) -> io::Result<FlakeValue> {
+        self.terms.decode_value_in(o_type, o_key, p_id, self.g_id)
+    }
+}
+
+impl TermView {
+    /// A decoder over `store`'s dictionaries and, when present, `dict_novelty`.
+    pub fn new(
+        store: Arc<BinaryIndexStore>,
+        dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+    ) -> Self {
+        Self {
+            store,
             dict_novelty,
             namespace_codes_fallback: None,
             tracker: None,
@@ -3820,10 +3982,14 @@ impl BinaryGraphView {
         self.namespace_codes_fallback.clone()
     }
 
-    /// Decode a value from `(o_type, o_key)`. Novelty-aware when `dict_novelty`
-    /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
-    /// watermark checks; all other types delegate directly to the store.
-    pub fn decode_value(&self, o_type: u16, o_key: u64, p_id: u32) -> io::Result<FlakeValue> {
+    /// [`BinaryGraphView::decode_value`] for graph `g_id`'s rows.
+    fn decode_value_in(
+        &self,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        g_id: GraphId,
+    ) -> io::Result<FlakeValue> {
         let ot = OType::from_u16(o_type);
         let kind = ot.decode_kind();
         if let Some(ref dn) = self.dict_novelty {
@@ -3871,10 +4037,16 @@ impl BinaryGraphView {
         ) {
             self.charge_dict_touch()?;
         }
-        self.store.decode_value_v3(o_type, o_key, p_id, self.g_id)
+        self.store.decode_value_v3(o_type, o_key, p_id, g_id)
     }
 
     /// Decode a value from `(o_kind, dt_id, lang_id)` fields. Novelty-aware.
+    ///
+    /// `arena_g_id` is the graph whose arena an arena-backed literal (a big
+    /// number or a vector) indexes: the literal's own, as it was bound. Every
+    /// other kind ignores it and carries [`NO_ARENA_GRAPH`]; an arena-backed
+    /// literal that carries it has no graph to be read through, and is an
+    /// error rather than a value read from some graph's arena.
     ///
     /// See [`BinaryIndexStore::decode_value_from_kind`] for the persisted path.
     pub fn decode_value_from_kind(
@@ -3884,7 +4056,16 @@ impl BinaryGraphView {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: GraphId,
     ) -> io::Result<FlakeValue> {
+        if arena_g_id == NO_ARENA_GRAPH
+            && (o_kind == ObjKind::NUM_BIG.as_u8() || o_kind == ObjKind::VECTOR_ID.as_u8())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an arena-backed literal (kind {o_kind:#x}, handle {o_key}) has no graph"),
+            ));
+        }
         let novelty_initialized = self
             .dict_novelty
             .as_ref()
@@ -3916,10 +4097,10 @@ impl BinaryGraphView {
         }
         let result = self
             .store
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, self.g_id);
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id);
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
+                arena_g_id,
                 o_kind,
                 o_key,
                 p_id,
@@ -3928,7 +4109,7 @@ impl BinaryGraphView {
                 has_dict_novelty = self.dict_novelty.is_some(),
                 novelty_initialized,
                 error = %err,
-                "BinaryGraphView decode_value_from_kind failed"
+                "TermView decode_value_from_kind failed"
             );
         }
         result
@@ -3950,10 +4131,9 @@ impl BinaryGraphView {
                 if let Some(result) = self.resolve_novel_subject_iri(dn, s_id) {
                     if let Err(err) = &result {
                         tracing::debug!(
-                            g_id = self.g_id,
                             s_id,
                             error = %err,
-                            "BinaryGraphView novelty subject lookup failed"
+                            "TermView novelty subject lookup failed"
                         );
                     }
                     return result;
@@ -3973,11 +4153,10 @@ impl BinaryGraphView {
         });
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
                 s_id,
                 has_dict_novelty = self.dict_novelty.is_some(),
                 error = %err,
-                "BinaryGraphView persisted subject lookup failed"
+                "TermView persisted subject lookup failed"
             );
         }
         result
@@ -4015,17 +4194,31 @@ impl BinaryGraphView {
         &self.store
     }
 
-    /// `handle` of `p_id`'s vector arena in this view's graph, as a key.
-    /// When the arena's identity table is built, the key is the table's hash
-    /// and canonical handle, and no shard is read. Otherwise it is a
-    /// zero-copy slice of its shard, hashed in place with the same function.
-    /// This never builds the table: a small query would pay for the whole
-    /// arena. `None` for a handle the arena does not hold, such as a novelty
-    /// handle.
-    pub fn arena_vector(&self, p_id: u32, handle: u32) -> io::Result<Option<ArenaVector>> {
+    /// `handle` of graph `g_id`'s vector arena for `p_id`, as a key: the
+    /// arena the literal was read from, which it carries (`arena_g_id`), never
+    /// a graph the view assumes. When the arena's identity table is built, the
+    /// key is the table's hash and canonical handle, and no shard is read.
+    /// Otherwise it is a zero-copy slice of its shard, hashed in place with
+    /// the same function. This never builds the table: a small query would
+    /// pay for the whole arena. `None` for a handle the arena does not hold,
+    /// such as a novelty handle. A literal that carries no graph
+    /// ([`NO_ARENA_GRAPH`]) is an error, as in [`Self::decode_value_from_kind`].
+    pub fn arena_vector(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        handle: u32,
+    ) -> io::Result<Option<ArenaVector>> {
+        if g_id == NO_ARENA_GRAPH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a vector literal (handle {handle} of p_id {p_id}) has no graph"),
+            ));
+        }
+        let arena_id = (g_id, p_id);
         let mut cursor = self.vector_cursor.lock();
-        if !matches!(&cursor.identity, Some((p, _)) if *p == p_id) {
-            cursor.identity = Some((p_id, self.store.built_vector_identity(self.g_id, p_id)));
+        if !matches!(&cursor.identity, Some((id, _)) if *id == arena_id) {
+            cursor.identity = Some((arena_id, self.store.built_vector_identity(g_id, p_id)));
         }
         // With the identity table built, the key is its hash and canonical
         // handle: no shard is read or held, and the arena isn't looked up.
@@ -4034,16 +4227,21 @@ impl BinaryGraphView {
             .as_ref()
             .and_then(|(_, identity)| identity.as_ref()?.of(handle))
         {
-            let pins = cursor.pins.upgrade().unwrap_or_else(|| {
-                let pins = BinaryIndexStore::shard_pins(&self.store, self.g_id);
-                cursor.pins = Arc::downgrade(&pins);
+            let held = cursor
+                .pins
+                .as_ref()
+                .filter(|(g, _)| *g == g_id)
+                .and_then(|(_, pins)| pins.upgrade());
+            let pins = held.unwrap_or_else(|| {
+                let pins = BinaryIndexStore::shard_pins(&self.store, g_id);
+                cursor.pins = Some((g_id, Arc::downgrade(&pins)));
                 pins
             });
             drop(cursor);
             return Ok(Some(ArenaVector {
                 hash,
                 store_id: self.store.store_id(),
-                g_id: self.g_id,
+                g_id,
                 p_id,
                 handle,
                 form: ArenaVectorForm::Canonical {
@@ -4056,7 +4254,7 @@ impl BinaryGraphView {
         let Some(arena) = self
             .store
             .graph_indexes
-            .get(&self.g_id)
+            .get(&g_id)
             .and_then(|gi| gi.vectors.get(&p_id))
         else {
             return Ok(None);
@@ -4067,12 +4265,12 @@ impl BinaryGraphView {
         let held = cursor
             .shard
             .as_ref()
-            .filter(|(p, i, _)| *p == p_id && *i == shard_idx)
+            .filter(|(id, i, _)| *id == arena_id && *i == shard_idx)
             .map(|(_, _, shard)| Arc::clone(shard));
         let held = held.or_else(|| {
             cursor
                 .handed_out
-                .get(&(p_id, shard_idx))
+                .get(&(arena_id, shard_idx))
                 .and_then(std::sync::Weak::upgrade)
         });
         let shard = match held {
@@ -4084,12 +4282,12 @@ impl BinaryGraphView {
                 cursor = self.vector_cursor.lock();
                 cursor
                     .handed_out
-                    .insert((p_id, shard_idx), Arc::downgrade(&shard));
+                    .insert((arena_id, shard_idx), Arc::downgrade(&shard));
                 shard
             }
         };
-        if !matches!(&cursor.shard, Some((p, i, _)) if *p == p_id && *i == shard_idx) {
-            cursor.shard = Some((p_id, shard_idx, Arc::clone(&shard)));
+        if !matches!(&cursor.shard, Some((id, i, _)) if *id == arena_id && *i == shard_idx) {
+            cursor.shard = Some((arena_id, shard_idx, Arc::clone(&shard)));
         }
         drop(cursor);
         let Some(slice) = crate::arena::vector::VectorSlice::new(shard, offset) else {
@@ -4098,7 +4296,7 @@ impl BinaryGraphView {
         Ok(Some(ArenaVector {
             hash: fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
             store_id: self.store.store_id(),
-            g_id: self.g_id,
+            g_id,
             p_id,
             handle,
             form: ArenaVectorForm::Slice(slice),
@@ -4107,10 +4305,6 @@ impl BinaryGraphView {
 
     pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
         Arc::clone(&self.store)
-    }
-
-    pub fn g_id(&self) -> GraphId {
-        self.g_id
     }
 
     /// Check whether this view has DictNovelty attached.
@@ -4783,19 +4977,35 @@ pub(crate) mod tests {
     fn view_with_vector_arenas(
         arenas: Vec<(u32, crate::arena::vector::LazyVectorArena)>,
     ) -> BinaryGraphView {
-        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
-        let gi = store.graph_indexes.entry(0).or_insert_with(|| GraphIndex {
-            orders: HashMap::new(),
-            order_cids: HashMap::new(),
-            numbig: HashMap::new(),
-            vectors: HashMap::new(),
-            spatial: HashMap::new(),
-            fulltext: HashMap::new(),
-        });
-        for (p_id, arena) in arenas {
-            gi.vectors.insert(p_id, arena);
-        }
+        let store = store_with_vector_arenas(arenas.into_iter().map(|(p, a)| (0, p, a)).collect());
         BinaryGraphView::new(Arc::new(store), 0)
+    }
+
+    /// A store holding each `(g_id, p_id, arena)` as that graph's vector
+    /// arena for that predicate.
+    fn store_with_vector_arenas(
+        arenas: Vec<(GraphId, u32, crate::arena::vector::LazyVectorArena)>,
+    ) -> BinaryIndexStore {
+        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
+        let mut graphs: HashMap<GraphId, GraphIndex> = HashMap::new();
+        for (g_id, p_id, arena) in arenas {
+            graphs
+                .entry(g_id)
+                .or_insert_with(|| GraphIndex {
+                    orders: HashMap::new(),
+                    order_cids: HashMap::new(),
+                    numbig: HashMap::new(),
+                    vectors: HashMap::new(),
+                    spatial: HashMap::new(),
+                    fulltext: HashMap::new(),
+                })
+                .vectors
+                .insert(p_id, arena);
+        }
+        for (g_id, gi) in graphs {
+            store.graph_indexes.insert(g_id, Arc::new(gi));
+        }
+        store
     }
 
     fn slice_of(key: &ArenaVector) -> &crate::arena::vector::VectorSlice {
@@ -4818,11 +5028,11 @@ pub(crate) mod tests {
         let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
         let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
         let view = view_with_vector_arena(7, arena);
-        let first = view.arena_vector(7, 0).unwrap().unwrap();
+        let first = view.arena_vector(0, 7, 0).unwrap().unwrap();
         // Move the view's cursor to the other shard, then evict everything.
-        let _other = view.arena_vector(7, 2).unwrap().unwrap();
+        let _other = view.arena_vector(0, 7, 2).unwrap().unwrap();
         cache.invalidate_all();
-        let again = view.arena_vector(7, 1).unwrap().unwrap();
+        let again = view.arena_vector(0, 7, 1).unwrap().unwrap();
         assert_eq!(slice_of(&again).as_f32(), &[0.0, 1.0]);
         assert!(
             slice_of(&first).same_shard(slice_of(&again)),
@@ -4859,7 +5069,7 @@ pub(crate) mod tests {
         let arena = vector_arena_of(&dir, 3, 2, &shards);
         let view = view_with_vector_arena(7, arena);
         let off: Vec<ArenaVector> = (0..8)
-            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
             .collect();
         assert!(off.iter().all(|k| k.canonical().is_none()));
 
@@ -4868,7 +5078,7 @@ pub(crate) mod tests {
         // A fresh view, as a later query has, sees the built table.
         let view = BinaryGraphView::new(view.clone_store(), 0);
         let on: Vec<ArenaVector> = (0..8)
-            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
             .collect();
         let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
         for i in 0..8 {
@@ -4918,7 +5128,7 @@ pub(crate) mod tests {
         let view = BinaryGraphView::new(view.clone_store(), 0);
         let keys: Vec<ArenaVector> = (0..5)
             .map(|h| {
-                view.arena_vector(7, h)
+                view.arena_vector(0, 7, h)
                     .unwrap_or_else(|e| panic!("handle {h} read its shard: {e}"))
                     .unwrap()
             })
@@ -4969,7 +5179,7 @@ pub(crate) mod tests {
         let keys: Vec<ArenaVector> = (0..4)
             .map(|h| {
                 BinaryGraphView::new(Arc::clone(&store), 0)
-                    .arena_vector(7, h)
+                    .arena_vector(0, 7, h)
                     .unwrap()
                     .unwrap()
             })
@@ -5007,10 +5217,10 @@ pub(crate) mod tests {
         view.store().vector_identity(0, 8).unwrap().unwrap();
         let view = BinaryGraphView::new(view.clone_store(), 0);
         let ka: Vec<ArenaVector> = (0..2)
-            .map(|h| view.arena_vector(7, h).unwrap().unwrap())
+            .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
             .collect();
         let kb: Vec<ArenaVector> = (0..3)
-            .map(|h| view.arena_vector(8, h).unwrap().unwrap())
+            .map(|h| view.arena_vector(0, 8, h).unwrap().unwrap())
             .collect();
         assert!(ka.iter().chain(&kb).all(|k| k.canonical().is_some()));
         for (i, x) in ka.iter().enumerate() {
@@ -5025,6 +5235,67 @@ pub(crate) mod tests {
         }
         // `[1.0, 0.0]` is canonical handle 0 of one arena and 1 of the other.
         assert_eq!((ka[0].canonical(), kb[1].canonical()), (Some(0), Some(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One predicate's vector arenas in two graphs, keyed through one view
+    /// (as a union of graphs keys them): a handle keys the value of the graph
+    /// the literal carries, so one handle in each graph holding different
+    /// vectors is two keys, and equal vectors in the two graphs are one
+    /// value. Reading the graphs alternately, the view's cursor never answers
+    /// one graph's key from the other's shard or identity table, with the
+    /// tables built or not. A literal with no graph is refused.
+    #[test]
+    fn vector_keys_are_read_from_the_graph_the_literal_carries() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_two_graphs");
+        std::fs::create_dir_all(dir.join("g1")).unwrap();
+        std::fs::create_dir_all(dir.join("g2")).unwrap();
+        let g1 = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let g2 = vec![vec![vec![0.5f32, 0.5], vec![0.25, 0.75]]];
+        let store = Arc::new(store_with_vector_arenas(vec![
+            (1, 7, vector_arena_of(&dir.join("g1"), 2, 2, &g1)),
+            (2, 7, vector_arena_of(&dir.join("g2"), 2, 2, &g2)),
+        ]));
+        let values = |g_id: GraphId| if g_id == 1 { &g1[0] } else { &g2[0] };
+        for tabled in [false, true] {
+            if tabled {
+                store.vector_identity(1, 7).unwrap().unwrap();
+                store.vector_identity(2, 7).unwrap().unwrap();
+            }
+            let view = TermView::new(Arc::clone(&store), None);
+            let mut keys = Vec::new();
+            for handle in 0..2u32 {
+                for g_id in [1, 2] {
+                    let key = view.arena_vector(g_id, 7, handle).unwrap().unwrap();
+                    assert_eq!(key.canonical().is_some(), tabled);
+                    let read = key.components().unwrap().unwrap();
+                    assert_eq!(
+                        read.as_f32(),
+                        values(g_id)[handle as usize].as_slice(),
+                        "graph {g_id} handle {handle}, tabled {tabled}"
+                    );
+                    keys.push((g_id, handle, key));
+                }
+            }
+            for (ga, ha, a) in &keys {
+                for (gb, hb, b) in &keys {
+                    let same = values(*ga)[*ha as usize] == values(*gb)[*hb as usize];
+                    assert_eq!(
+                        a.same_value(b).unwrap(),
+                        same,
+                        "{ga}/{ha} against {gb}/{hb}, tabled {tabled}"
+                    );
+                    if same {
+                        assert_eq!(a.hash, b.hash);
+                    }
+                }
+            }
+        }
+        let view = TermView::new(store, None);
+        let err = view
+            .arena_vector(NO_ARENA_GRAPH, 7, 0)
+            .expect_err("a vector literal with no graph");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -5058,6 +5329,34 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// An arena-backed literal is decoded through the graph it carries, and
+    /// one that carries none is refused before any graph's arena is read.
+    #[test]
+    fn an_arena_literal_without_a_graph_is_refused() {
+        let dir = std::env::temp_dir().join(format!("arena-graph-{}", std::process::id()));
+        let terms = TermView::new(Arc::new(BinaryIndexStore::empty(dir)), None);
+        for kind in [ObjKind::NUM_BIG, ObjKind::VECTOR_ID] {
+            let err = terms
+                .decode_value_from_kind(kind.as_u8(), 0, 1, 0, 0, NO_ARENA_GRAPH)
+                .expect_err("no graph to read the arena through");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{kind:?}: {err}");
+            // With a graph, the arena is looked up there (this store has none).
+            let err = terms
+                .decode_value_from_kind(kind.as_u8(), 0, 1, 0, 0, 2)
+                .expect_err("no arena in an empty store");
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{kind:?}: {err}");
+        }
+        // A store-wide kind ignores the graph.
+        let long = terms.decode_value_from_kind(
+            ObjKind::NUM_INT.as_u8(),
+            ObjKey::encode_i64(7).as_u64(),
+            1,
+            DatatypeDictId::INTEGER.as_u16(),
+            0,
+            NO_ARENA_GRAPH,
+        );
+        assert!(long.is_ok(), "{long:?}");
+    }
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::o_type::OType;
@@ -5213,6 +5512,40 @@ pub(crate) mod tests {
         store.cas = Some(cs);
         store.max_t = 1;
         store
+    }
+
+    #[test]
+    fn masking_graphs_keeps_shared_indexes_and_handles_unordered_duplicate_ids() {
+        let cache = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache.clone());
+        for g_id in 0..2048 {
+            store.graph_indexes.insert(
+                g_id,
+                Arc::new(GraphIndex {
+                    orders: HashMap::new(),
+                    order_cids: HashMap::new(),
+                    numbig: HashMap::new(),
+                    vectors: HashMap::new(),
+                    spatial: HashMap::new(),
+                    fulltext: HashMap::new(),
+                }),
+            );
+        }
+        let mut many: Vec<GraphId> = (0..2048).step_by(2).rev().collect();
+        many.extend([2, 2, u16::MAX]);
+        for dropped in [Vec::new(), vec![6, 2, 6, u16::MAX], many] {
+            let masked = store.without_graphs(&dropped);
+            assert_ne!(masked.store_id, store.store_id);
+            assert!(Arc::ptr_eq(&masked.dicts, &store.dicts));
+            for g_id in 0..2048 {
+                assert!(store.has_graph_index(g_id));
+                assert_eq!(masked.has_graph_index(g_id), !dropped.contains(&g_id));
+                if let Some(kept) = masked.graph_indexes.get(&g_id) {
+                    assert!(Arc::ptr_eq(kept, &store.graph_indexes[&g_id]));
+                }
+            }
+        }
+        std::fs::remove_dir_all(cache).unwrap();
     }
 
     fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, t: u32) -> RunRecordV2 {
@@ -5719,7 +6052,7 @@ pub(crate) mod tests {
 
         let cache_dir = temp_cache_dir();
         let mut binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
-        binary_store.dicts.subject_reverse_tree = Some(Arc::new(tree));
+        binary_store.dicts_mut().subject_reverse_tree = Some(Arc::new(tree));
         let binary_store = Arc::new(binary_store);
 
         // Cold: the translation lookup misses, typed and registered.
@@ -6064,7 +6397,7 @@ pub(crate) mod tests {
         binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
         binary_store.graph_indexes.insert(
             0,
-            GraphIndex {
+            Arc::new(GraphIndex {
                 orders: HashMap::from([(
                     RunSortOrder::Post,
                     Arc::new(crate::format::branch::BranchManifest { leaves }),
@@ -6074,7 +6407,7 @@ pub(crate) mod tests {
                 vectors: HashMap::new(),
                 spatial: HashMap::new(),
                 fulltext: HashMap::new(),
-            },
+            }),
         );
 
         let ids = binary_store.list_predicate_ids().expect("list predicates");
@@ -6129,7 +6462,7 @@ pub(crate) mod tests {
         };
         binary_store.graph_indexes.insert(
             0,
-            GraphIndex {
+            Arc::new(GraphIndex {
                 orders: HashMap::from([(
                     RunSortOrder::Spot,
                     Arc::new(crate::format::branch::BranchManifest { leaves: vec![leaf] }),
@@ -6139,7 +6472,7 @@ pub(crate) mod tests {
                 vectors: HashMap::new(),
                 spatial: HashMap::new(),
                 fulltext: HashMap::new(),
-            },
+            }),
         );
 
         let holds = |s_id| binary_store.subject_holds_lists(0, s_id).unwrap();
@@ -6605,7 +6938,7 @@ pub(crate) mod tests {
                 drop(view);
                 Arc::get_mut(&mut store)
                     .unwrap()
-                    .dicts
+                    .dicts_mut()
                     .subject_forward_packs
                     .insert(
                         ns_code,
@@ -6649,20 +6982,20 @@ pub(crate) mod tests {
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
         store.set_ns_split_mode(NsSplitMode::MostGranular);
         // Full-IRI namespaces have no prefix, as in a real store.
-        store.dicts.namespace_codes = Arc::new(HashMap::from([
+        store.dicts_mut().namespace_codes = Arc::new(HashMap::from([
             (EX, "https://example.org/".to_string()),
             (EX_A, "https://example.org/a/".to_string()),
             (DUP, "https://example.org/".to_string()),
             (EX_C, "https://example.org/c".to_string()),
         ]));
-        store.dicts.namespace_reverse = Arc::new(HashMap::from([
+        store.dicts_mut().namespace_reverse = Arc::new(HashMap::from([
             ("https://example.org/".to_string(), EX),
             ("https://example.org/a/".to_string(), EX_A),
             ("https://example.org/c/".to_string(), EX_C),
         ]));
         let mut reverse = Vec::new();
         for (ns_code, suffix) in subjects {
-            store.dicts.subject_forward_packs.insert(
+            store.dicts_mut().subject_forward_packs.insert(
                 ns_code,
                 ForwardPackReader::from_memory(vec![Arc::from(
                     make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
@@ -6676,7 +7009,7 @@ pub(crate) mod tests {
         }
         reverse.sort_by(|a, b| a.key.cmp(&b.key));
         let tree = Arc::new(build_reverse_reader(reverse));
-        store.dicts.subject_reverse_tree = Some(Arc::clone(&tree));
+        store.dicts_mut().subject_reverse_tree = Some(Arc::clone(&tree));
         let store = Arc::new(store);
         let view = BinaryGraphView::new(Arc::clone(&store), 0);
 
@@ -6721,14 +7054,14 @@ pub(crate) mod tests {
             let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
             store.set_ns_split_mode(NsSplitMode::MostGranular);
             if twin_ns == VENDORS {
-                store.dicts.namespace_codes =
+                store.dicts_mut().namespace_codes =
                     Arc::new(HashMap::from([(VENDORS, VENDORS_PREFIX.to_string())]));
-                store.dicts.namespace_reverse =
+                store.dicts_mut().namespace_reverse =
                     Arc::new(HashMap::from([(VENDORS_PREFIX.to_string(), VENDORS)]));
             }
             let mut reverse = Vec::new();
             for (ns_code, suffix) in [(twin_ns, twin_suffix), (namespaces::OVERFLOW, IRI)] {
-                store.dicts.subject_forward_packs.insert(
+                store.dicts_mut().subject_forward_packs.insert(
                     ns_code,
                     ForwardPackReader::from_memory(vec![Arc::from(
                         make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
@@ -6741,7 +7074,7 @@ pub(crate) mod tests {
                 });
             }
             reverse.sort_by(|a, b| a.key.cmp(&b.key));
-            store.dicts.subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
+            store.dicts_mut().subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
             let store = Arc::new(store);
             assert_eq!(
                 store.find_subject_sid(IRI).unwrap(),
@@ -6774,9 +7107,9 @@ pub(crate) mod tests {
 
         let cache_dir = temp_cache_dir();
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
-        store.dicts.namespace_codes =
+        store.dicts_mut().namespace_codes =
             Arc::new(HashMap::from([(100, "https://example.org/".to_string())]));
-        store.dicts.subject_forward_packs.insert(
+        store.dicts_mut().subject_forward_packs.insert(
             100,
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(1, b"product")]).into_boxed_slice(),
@@ -6820,7 +7153,7 @@ pub(crate) mod tests {
         for initialized in [true, false] {
             let cache_dir = temp_cache_dir();
             let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
-            store.dicts.namespace_codes = Arc::new(HashMap::from([
+            store.dicts_mut().namespace_codes = Arc::new(HashMap::from([
                 (100, "https://example.org/".to_string()),
                 (namespaces::BLANK_NODE, "_:".to_string()),
             ]));
@@ -6864,7 +7197,7 @@ pub(crate) mod tests {
         let full_iri = "https://dblp.org/streams/conf/IEEEpact";
         let s_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
 
-        store.dicts.subject_reverse_tree =
+        store.dicts_mut().subject_reverse_tree =
             Some(Arc::new(build_reverse_reader(vec![ReverseEntry {
                 key: crate::dict::reverse_leaf::subject_reverse_key(
                     namespaces::OVERFLOW,
@@ -6872,7 +7205,7 @@ pub(crate) mod tests {
                 ),
                 id: s_id,
             }])));
-        store.dicts.subject_forward_packs.insert(
+        store.dicts_mut().subject_forward_packs.insert(
             namespaces::OVERFLOW,
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(7, full_iri.as_bytes())]).into_boxed_slice(),

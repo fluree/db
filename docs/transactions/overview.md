@@ -132,8 +132,8 @@ Defines namespace mappings:
 
 The @context can be:
 - Inline (as above)
-- External URL: `"@context": "http://example.org/context.jsonld"`
-- Array of contexts: `"@context": [url1, {...}]`
+- A string, which Fluree does not fetch: it becomes the vocabulary (`@vocab`), so `"@context": "https://schema.org"` reads `name` as `https://schema.org/name`
+- An array of contexts, applied in order: `"@context": ["https://schema.org", {...}]`
 
 ### @graph
 

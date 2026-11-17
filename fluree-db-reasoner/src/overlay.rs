@@ -21,8 +21,9 @@ use fluree_db_core::flake::Flake;
 use fluree_db_core::graph_registry::DEFAULT_GRAPH_ID;
 use fluree_db_core::overlay::OverlayProvider;
 use fluree_db_core::{GraphId, Sid};
+use std::any::Any;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use crate::same_as::FrozenSameAs;
 
@@ -45,6 +46,24 @@ pub struct DerivedFactsOverlay {
     /// same base-overlay epoch under different rule configs / ontologies —
     /// caches keyed on overlay identity must incorporate this id.
     instance_id: u64,
+    /// Derived state a reader keeps for as long as this materialization
+    /// lives, such as a query engine's translated view of it. Shared by
+    /// clones, so every query reading this materialization sees one copy.
+    attachment: Attachment,
+}
+
+/// See [`DerivedFactsOverlay::attachment`].
+#[derive(Clone, Default)]
+struct Attachment(Arc<OnceLock<Arc<dyn Any + Send + Sync>>>);
+
+impl std::fmt::Debug for Attachment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.0.get().is_some() {
+            "Attachment(set)"
+        } else {
+            "Attachment(empty)"
+        })
+    }
 }
 
 /// The derived facts of one graph.
@@ -101,6 +120,23 @@ impl GraphFacts {
         }
     }
 
+    /// Positions [`OverlayProvider::for_each_overlay_flake`] visits: `first`
+    /// exclusive (unless `leftmost`), `rhs` inclusive.
+    fn range(
+        &self,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> std::ops::Range<usize> {
+        let start = match first {
+            Some(first) if !leftmost => self.upper_bound(index, first),
+            _ => 0,
+        };
+        let end = rhs.map_or(self.spot.len(), |rhs| self.upper_bound(index, rhs));
+        start..end.max(start)
+    }
+
     /// Binary search for the first flake > target in the given index
     fn upper_bound(&self, index: IndexType, target: &Flake) -> usize {
         let view = self.view(index);
@@ -138,6 +174,7 @@ impl DerivedFactsOverlay {
             same_as,
             epoch,
             instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+            attachment: Attachment::default(),
         }
     }
 
@@ -175,12 +212,33 @@ impl DerivedFactsOverlay {
             same_as,
             epoch,
             instance_id: fluree_db_core::overlay::next_overlay_content_version(),
+            attachment: Attachment::default(),
         }
     }
 
     /// Process-unique identity of this materialization (stable across clones).
     pub fn instance_id(&self) -> u64 {
         self.instance_id
+    }
+
+    /// The reader state attached to this materialization, created by `init`
+    /// on first use. It lives exactly as long as the materialization: when a
+    /// cache evicts it and the last query reading it ends, the state goes too.
+    /// `None` when a reader attached state of another type.
+    pub fn attachment<T: Any + Send + Sync>(&self, init: impl FnOnce() -> T) -> Option<Arc<T>> {
+        let state = self.attachment.0.get_or_init(|| Arc::new(init()));
+        Arc::clone(state).downcast::<T>().ok()
+    }
+
+    /// Estimated memory this materialization holds: its facts (as
+    /// [`approx_flake_bytes`](crate::approx_flake_bytes) counts them toward
+    /// the reasoning memory budget) plus the three position permutations.
+    pub fn approx_bytes(&self) -> usize {
+        self.graphs
+            .iter()
+            .flat_map(|g| g.spot.iter())
+            .map(|flake| crate::approx_flake_bytes(flake) + 3 * std::mem::size_of::<u32>())
+            .sum()
     }
 
     /// Get the sameAs equivalence structure
@@ -285,35 +343,26 @@ impl OverlayProvider for DerivedFactsOverlay {
             return;
         };
         let view = graph.view(index);
-        if view.len() == 0 {
-            return;
-        }
-
-        // Determine start position
-        let start = if leftmost {
-            0
-        } else if let Some(first) = first {
-            // Exclusive left boundary: start after first
-            graph.upper_bound(index, first)
-        } else {
-            0
-        };
-
-        // Determine end position
-        let end = if let Some(rhs) = rhs {
-            // Inclusive right boundary: include rhs
-            graph.upper_bound(index, rhs)
-        } else {
-            view.len()
-        };
-
-        // Emit flakes in range, filtered by to_t
-        for i in start..end {
+        for i in graph.range(index, first, rhs, leftmost) {
             let flake = view.get(i);
             if flake.t <= to_t {
                 callback(flake);
             }
         }
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        Some(
+            self.graph(g_id)
+                .map_or(0, |g| g.range(index, first, rhs, leftmost).len()),
+        )
     }
 }
 
@@ -404,6 +453,73 @@ mod tests {
         assert!(overlay.is_empty());
         assert_eq!(overlay.len(), 0);
         assert_eq!(overlay.epoch(), 0);
+    }
+
+    #[test]
+    fn range_count_matches_the_walk() {
+        let mut builder = DerivedFactsBuilder::new();
+        for s in 1..=5 {
+            builder.push(make_flake(s, 1, 100, 1));
+        }
+        for s in 1..=3 {
+            builder.push(make_flake(s, 2, 100, 1));
+        }
+        let overlay =
+            builder.build_routed(
+                FrozenSameAs::empty(),
+                1,
+                |f| {
+                    if f.p == sid(2) {
+                        0
+                    } else {
+                        4
+                    }
+                },
+            );
+        let bracket = |p: u16| {
+            let lo = Flake::new(
+                Sid::min(),
+                sid(p),
+                FlakeValue::min(),
+                Sid::min(),
+                i64::MIN,
+                false,
+                None,
+            );
+            let hi = Flake::new(
+                Sid::max(),
+                sid(p),
+                FlakeValue::max(),
+                Sid::max(),
+                i64::MAX,
+                true,
+                None,
+            );
+            (lo, hi)
+        };
+        for (g_id, p) in [(4, 1), (0, 2), (0, 1), (4, 2), (9, 1)] {
+            let (lo, hi) = bracket(p);
+            let mut walked = 0;
+            overlay.for_each_overlay_flake(
+                g_id,
+                IndexType::Psot,
+                Some(&lo),
+                Some(&hi),
+                false,
+                i64::MAX,
+                &mut |_| walked += 1,
+            );
+            let counted = overlay.overlay_range_flake_count(
+                g_id,
+                IndexType::Psot,
+                Some(&lo),
+                Some(&hi),
+                false,
+            );
+            assert_eq!(counted, Some(walked), "graph {g_id}, predicate {p}");
+        }
+        let counted = overlay.overlay_range_flake_count(4, IndexType::Spot, None, None, true);
+        assert_eq!(counted, Some(5));
     }
 
     #[test]

@@ -30,7 +30,7 @@
 use crate::namespaces::default_namespace_codes;
 use crate::prefix_trie::PrefixTrie;
 use crate::sid::Sid;
-use fluree_vocab::namespaces::{is_full_iri, OVERFLOW, USER_START};
+use fluree_vocab::namespaces::{is_full_iri, EMPTY, OVERFLOW, USER_START};
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::Arc;
@@ -204,6 +204,21 @@ pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
         split_hierarchical(iri, mode, authority_start)
     } else {
         split_opaque(iri, mode)
+    }
+}
+
+/// Encode `iri` by its canonical split without allocating: the code `code_of`
+/// gives its prefix, or `Sid(EMPTY, iri)` when the prefix has none.
+#[inline]
+pub fn encode_registered(
+    iri: &str,
+    mode: NsSplitMode,
+    code_of: impl FnOnce(&str) -> Option<u16>,
+) -> Sid {
+    let (prefix, suffix) = canonical_split(iri, mode);
+    match code_of(prefix) {
+        Some(code) => Sid::new(code, suffix),
+        None => Sid::new(EMPTY, iri),
     }
 }
 

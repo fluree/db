@@ -1,3 +1,5 @@
+#[path = "support/merge_race.rs"]
+mod race_nameservice;
 #[path = "support/mod.rs"]
 mod support;
 
@@ -7,6 +9,8 @@ mod it_flpack_round_trip;
 mod it_import;
 #[path = "it_import_class_stats.rs"]
 mod it_import_class_stats;
+#[path = "it_import_into_graph.rs"]
+mod it_import_into_graph;
 #[path = "it_import_jsonld_graph_scope.rs"]
 mod it_import_jsonld_graph_scope;
 #[path = "it_import_ndjson.rs"]
@@ -17,6 +21,8 @@ mod it_import_ns_split_mode;
 mod it_import_remote;
 #[path = "it_import_skolem.rs"]
 mod it_import_skolem;
+#[path = "it_import_string_keyed_values.rs"]
+mod it_import_string_keyed_values;
 #[path = "it_import_turtle_star.rs"]
 mod it_import_turtle_star;
 #[path = "it_import_v3.rs"]

@@ -7,12 +7,13 @@ use crate::annotation_edge_probe::AnnotationSidecarCache;
 use crate::bm25::{Bm25IndexProvider, Bm25SearchProvider};
 use crate::dataset::{ActiveGraph, ActiveGraphs, DataSet, MemberKind};
 use crate::error::QueryError;
+use crate::index_scope::{IndexMember, IndexScope, MemberSet, ScopeKind};
 use crate::policy::QueryPolicyEnforcer;
 use crate::r2rml::{R2rmlProvider, R2rmlTableProvider};
 use crate::remote_service::RemoteServiceExecutor;
 use crate::var_registry::VarRegistry;
 use crate::vector::VectorIndexProvider;
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, FulltextArena, TermView};
 use fluree_db_core::comparator::IndexType;
 use fluree_db_core::dict_novelty::DictNovelty;
 use fluree_db_core::{
@@ -226,6 +227,9 @@ pub type TranslatedOverlayCache = Arc<
     >,
 >;
 
+/// The store and dictionary novelty a [`TermView`] was built from, by address.
+type TermViewKey = (Option<usize>, Option<usize>);
+
 /// Execution context providing access to database and query state.
 ///
 /// # Dataset Support
@@ -260,6 +264,11 @@ pub struct ExecutionContext<'a> {
     /// When present, scan operators should use this for per-leaf batch filtering
     /// via `filter_flakes`. This provides full f:query support without deadlocks.
     pub policy_enforcer: Option<Arc<QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is: the query's primary
+    /// (a ledger or a graph source) when the caller resolves policy per
+    /// graph, `None` when it does not. A graph-source scan outside a dataset
+    /// reads this context's policy only when it is that source's own.
+    pub policy_source: Option<Arc<str>>,
     /// Optional BM25 index provider for `Pattern::IndexSearch` (legacy, returns raw index)
     pub bm25_provider: Option<&'a dyn Bm25IndexProvider>,
     /// Optional BM25 search provider for `Pattern::IndexSearch` (preferred, returns search results)
@@ -319,6 +328,12 @@ pub struct ExecutionContext<'a> {
     /// present-but-dangling FK differs (templated vs omitted). Read only for the
     /// injected true-wildcard scan of a crawl (see `R2rmlScanOperator`).
     pub trust_fk_refs: bool,
+    /// When true, every graph-source table scan emits a fixed row order, even
+    /// where the planner found no LIMIT or OFFSET in the query (see
+    /// [`crate::r2rml::ScanOrder`]). For a caller that slices the answer itself,
+    /// outside the query: the graph-source browse crawl pages subjects after the
+    /// query returns. Default `false`.
+    pub deterministic_scans: bool,
     /// Most pairs a property path may compute before returning its first
     /// row — one whose endpoints are both free or both constant; past it the
     /// path fails with [`QueryError::ResourceLimit`]. `None` (the default)
@@ -332,6 +347,13 @@ pub struct ExecutionContext<'a> {
     /// to `range_with_overlay()`.
     pub binary_store: Option<Arc<BinaryIndexStore>>,
     /// Graph ID for binary index scans (typically 0 for default graph).
+    ///
+    /// Under a default graph of several graphs this names one member only,
+    /// so reading it there reads that member alone. A lane takes its graph
+    /// from [`Self::index_scope`] instead; the remaining readers are listed by
+    /// this deprecation (allowed at the crate root until the field is made
+    /// private, #2075).
+    #[deprecated(note = "take the graph from `ExecutionContext::index_scope()` (#2075)")]
     pub binary_g_id: GraphId,
     /// Dictionary novelty layer for subject/string lookups in binary scans.
     ///
@@ -408,6 +430,11 @@ pub struct ExecutionContext<'a> {
     /// by an EXACT `rr:class` match and a subclass-entailed subject would be
     /// silently dropped. Defaults to `false` (no reasoning).
     pub reasoning_active: bool,
+    /// The reasoning materialization's translated overlay ops, shared across
+    /// the queries reading it (see [`crate::reasoning_ops`]). Set with
+    /// `reasoning_active` when the query has derived facts; propagated across
+    /// per-graph derivations, which use it only while reading its overlay.
+    pub reasoning_ops: Option<crate::reasoning_ops::ReasoningOpsHandle>,
     /// The snapshot this context was originally constructed from.
     ///
     /// Equal to `active_snapshot` in the common single-graph case. In per-graph
@@ -451,6 +478,13 @@ pub struct ExecutionContext<'a> {
     /// Per-query memo for `STR()` of late-materialized subjects — see
     /// [`SubjectIriCache`].
     pub subject_iri_cache: SubjectIriCache,
+    /// [`Self::term_view`], built once for the callers that decode a value at
+    /// a time ([`Self::with_term_view`]): under a union, building it walks
+    /// the dataset and its members. Kept with the store and dictionary
+    /// novelty it was built from, which a context can drop after it is built
+    /// (the range fallback does); the builders that change its other inputs
+    /// reset it.
+    term_view_once: std::sync::OnceLock<(TermViewKey, Option<TermView>)>,
     /// Per-query parent-lookup memo (PR-8b): the cross-operator-rebuild extension
     /// of PR-4's per-operator parent cache, so an inner join that rebuilds its
     /// R2RML operator per driving batch (an interposed non-pushable FILTER + LIMIT)
@@ -509,6 +543,15 @@ pub(crate) fn reencode_sid(
         .and_then(|iri| target.encode_iri(&iri))
 }
 
+/// Whether a SID in namespace `ns_code` names the same IRI, coded the same
+/// way, in every ledger: the built-in prefixes (`xsd:`, `rdf:`, …). A user
+/// namespace's code is allocated per ledger, and a full-IRI code (`EMPTY`,
+/// `OVERFLOW`) holds an IRI another ledger may code under a namespace, so a
+/// SID in either needs re-coding to cross ledgers.
+pub(crate) fn namespace_code_is_shared(ns_code: u16) -> bool {
+    ns_code != fluree_vocab::namespaces::EMPTY && ns_code < fluree_vocab::namespaces::USER_START
+}
+
 impl<'a> ExecutionContext<'a> {
     /// Create a new execution context
     pub fn new(snapshot: &'a LedgerSnapshot, vars: &'a VarRegistry) -> Self {
@@ -520,6 +563,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000, // Default batch size
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -535,6 +579,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -550,12 +595,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -584,6 +631,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -599,6 +647,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -614,12 +663,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -652,6 +703,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(db.overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -667,6 +719,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store,
             binary_g_id: db.g_id,
@@ -682,12 +735,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: db.eager,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: db.snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -709,6 +764,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: None,
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -724,6 +780,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -739,12 +796,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -765,6 +824,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -780,6 +840,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -795,12 +856,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -823,6 +886,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: Some(overlay),
             batch_size: 1000,
             policy_enforcer: None,
+            policy_source: None,
             bm25_provider: None,
             bm25_search_provider: None,
             vector_provider: None,
@@ -838,6 +902,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: None,
             evaluation_time: None,
             trust_fk_refs: false,
+            deterministic_scans: false,
             path_pair_limit: None,
             binary_store: None,
             binary_g_id: 0,
@@ -853,12 +918,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: false,
             reasoning_active: false,
+            reasoning_ops: None,
             original_snapshot: snapshot,
             scan_provenance_ledger: None,
             annotation_sidecar_cache: AnnotationSidecarCache::default(),
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: crate::r2rml::R2rmlParentMemo::default(),
             overlay_ops_cache: SharedOverlayOpsCache::default(),
             translated_overlay_cache: TranslatedOverlayCache::default(),
@@ -938,6 +1005,7 @@ impl<'a> ExecutionContext<'a> {
     /// Attach an execution tracker to this context.
     pub fn with_tracker(mut self, tracker: Tracker) -> Self {
         self.tracker = tracker;
+        self.term_view_once = std::sync::OnceLock::new();
         self
     }
 
@@ -1046,6 +1114,12 @@ impl<'a> ExecutionContext<'a> {
     /// `QueryExecutionOptions::trust_fk_refs` on the graph-source crawl path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// See [`ExecutionContext::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
         self
     }
 
@@ -1227,6 +1301,7 @@ impl<'a> ExecutionContext<'a> {
     pub fn with_dataset(mut self, dataset: &'a DataSet<'a>) -> Self {
         self.multi_ledger = Self::compute_multi_ledger(Some(dataset), &self.active_graph);
         self.dataset = Some(dataset);
+        self.term_view_once = std::sync::OnceLock::new();
         self
     }
 
@@ -1313,39 +1388,124 @@ impl<'a> ExecutionContext<'a> {
         fn overlay_free(overlay: &dyn OverlayProvider) -> bool {
             overlay.epoch() == 0 || overlay.is_effectively_empty()
         }
-        match self.active_graphs() {
-            ActiveGraphs::Single => overlay_free(self.overlay()),
-            ActiveGraphs::Many(graphs) => match graphs.as_slice() {
-                [g] => overlay_free(g.overlay),
-                _ => false,
-            },
-        }
-    }
-
-    /// Check whether the binary index fast path is available.
-    ///
-    /// Returns `true` when a binary store is present and the query is in
-    /// single-ledger mode. Individual call sites may layer additional
-    /// conditions (e.g. `to_t >= base_t`).
-    pub fn has_binary_store(&self) -> bool {
-        if self.is_multi_ledger() || self.binary_store.is_none() {
+        if !self.reads_exactly_one_graph() {
             return false;
         }
-        // Binary scan fast paths only support a single active graph.
-        match (&self.dataset, &self.active_graph) {
-            (None, _) => true,
-            (Some(ds), ActiveGraph::Default) => ds.default_graphs().len() == 1,
-            (Some(ds), ActiveGraph::Named(iri)) => ds.named_graph(iri).is_some(),
+        match self.active_graphs() {
+            ActiveGraphs::Single => overlay_free(self.overlay()),
+            ActiveGraphs::Many(graphs) => graphs.first().is_some_and(|g| overlay_free(g.overlay)),
         }
     }
 
-    /// Return a `BinaryGraphView` for the current graph, combining the binary store
-    /// with `binary_g_id`.
+    /// How many graphs this scope's active graph reads ([`ScopeKind::of`]),
+    /// which the planner's [`PlanningContext::index_scope_kind`] answers too,
+    /// so a lane the planner admits is a lane the runtime admits.
     ///
-    /// Returns `None` if no binary store is attached. Callers should grab this
-    /// once at operator construction and store it — not call it in tight loops
-    /// (each call clones an Arc).
-    pub fn graph_view(&self) -> Option<BinaryGraphView> {
+    /// [`PlanningContext::index_scope_kind`]: crate::temporal_mode::PlanningContext::index_scope_kind
+    pub fn scope_kind(&self) -> ScopeKind {
+        ScopeKind::of(&self.active_graph, self.dataset)
+    }
+
+    /// Whether this scope reads exactly one graph ([`ScopeKind::One`]): no
+    /// dataset, or a dataset whose active graph is one graph (a named graph,
+    /// or a default graph of one). A default graph of several graphs, of one
+    /// ledger or of several, reads several; `FROM NAMED` alone, a default
+    /// graph of none, reads none.
+    ///
+    /// The structural half of [`Self::index_scope`], for a single-graph lane
+    /// that needs no index (the partitioned GROUP BY) or that discharges the
+    /// view policy per predicate itself (the batched probe lanes). A lane that
+    /// reads the index takes its graph from [`Self::index_scope`] instead.
+    pub fn reads_exactly_one_graph(&self) -> bool {
+        self.scope_kind() == ScopeKind::One
+    }
+
+    /// Whether this scope reads exactly one graph through its binary index
+    /// ([`ScopeKind::reads_one_graph_index`]: one graph, a store attached, and
+    /// a dataset that does not span ledgers), which the planner answers too.
+    /// Individual call sites may layer additional conditions (e.g.
+    /// `to_t >= base_t`).
+    pub fn has_binary_store(&self) -> bool {
+        self.scope_kind().reads_one_graph_index(
+            self.binary_store.is_some(),
+            self.dataset.is_some_and(DataSet::spans_multiple_ledgers),
+        )
+    }
+
+    /// What this scope reads through the ledger's binary index, or `None`
+    /// where no index lane may run: no store attached, a dataset that spans
+    /// ledgers, a history range, a view policy that filters, or a default
+    /// graph whose members are not all read through this context's store and
+    /// dictionary novelty.
+    ///
+    /// - [`IndexScope::One`]: the graph `binary_g_id` names, at this
+    ///   context's overlay and `t`, as every single-graph lane has read it.
+    /// - [`IndexScope::Union`]: each member of the default graph, at its own
+    ///   overlay and `t`.
+    /// - [`IndexScope::Empty`]: a default graph of none.
+    ///
+    /// A lane that reads the index gets its graph here and matches on the
+    /// result; a lane that reads one graph declines every arm but `One`.
+    pub fn index_scope(&self) -> Option<IndexScope<'_>> {
+        if !self.allow_unfiltered() {
+            return None;
+        }
+        self.index_scope_policy_cleared()
+    }
+
+    /// [`Self::index_scope`] with the view policy **already discharged by the
+    /// caller**: use only after the policy gate for every predicate the lane
+    /// reads returned `Allow` (`cursor_fast_path_for_predicate`,
+    /// `policy_lane_for_predicates`).
+    pub fn index_scope_policy_cleared(&self) -> Option<IndexScope<'_>> {
+        let store = self.binary_store.as_ref()?;
+        if self.is_history_range() {
+            return None;
+        }
+        match self.scope_kind() {
+            ScopeKind::One => {
+                if self.dataset.is_some_and(DataSet::spans_multiple_ledgers) {
+                    return None;
+                }
+                Some(IndexScope::One(IndexMember::new(
+                    store,
+                    self.binary_g_id,
+                    self.overlay(),
+                    self.to_t,
+                )))
+            }
+            // The members' ids are comparable only if every member reads this
+            // store's dictionaries and this dictionary novelty; a dataset
+            // shares them per ledger and time (`LedgerLoads`, fluree-db-api).
+            ScopeKind::Union => {
+                let dict_novelty = self.dict_novelty.as_ref()?;
+                let members = self
+                    .dataset?
+                    .default_graphs()
+                    .iter()
+                    .map(|g| {
+                        let provider = Self::binary_range_provider(g.snapshot)?;
+                        (Arc::ptr_eq(provider.store(), store)
+                            && Arc::ptr_eq(provider.dict_novelty(), dict_novelty))
+                        .then(|| IndexMember::new(store, g.g_id, g.overlay, g.to_t))
+                    })
+                    .collect::<Option<_>>()?;
+                MemberSet::new(store, members).map(IndexScope::Union)
+            }
+            ScopeKind::Empty => Some(IndexScope::Empty),
+            ScopeKind::None => None,
+        }
+    }
+
+    /// The view of the one graph this scope reads through the binary index
+    /// ([`Self::has_binary_store`]): its terms, and its own rows' values by
+    /// `o_type`. `None` over a default graph of several graphs, which has no
+    /// one graph; a reader that only decodes bindings takes
+    /// [`Self::term_view`] instead.
+    ///
+    /// Callers should grab this once at operator construction and store it —
+    /// not call it in tight loops (each call clones an Arc).
+    pub fn one_graph_view(&self) -> Option<BinaryGraphView> {
         if !self.has_binary_store() {
             return None;
         }
@@ -1358,12 +1518,66 @@ impl<'a> ExecutionContext<'a> {
         Some(view)
     }
 
+    /// The decoder for this scope's encoded bindings: its store's terms,
+    /// which are the same in every graph of the store, and each arena
+    /// literal through the graph it carries. `Some` wherever this scope's
+    /// encoded bindings name one store's ids: one graph read through the
+    /// index, or a default graph whose members are all read through this
+    /// context's store and dictionary novelty ([`IndexScope::Union`]).
+    ///
+    /// It has no graph, so it cannot read any graph's index; a reader of one
+    /// graph takes [`Self::one_graph_view`].
+    pub fn term_view(&self) -> Option<TermView> {
+        let union = || {
+            matches!(
+                self.index_scope_policy_cleared(),
+                Some(IndexScope::Union(_))
+            )
+        };
+        if !self.has_binary_store() && !union() {
+            return None;
+        }
+        let store = self.binary_store.as_ref()?;
+        // Keys built through it record the reads they can't return in the
+        // query's slot, which the operators that key rows check.
+        let terms = TermView::new(Arc::clone(store), self.dict_novelty.clone())
+            .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
+            .with_tracker(self.tracker.clone())
+            .with_key_read_errors(Arc::clone(&self.key_read_errors));
+        Some(terms)
+    }
+
+    /// `f` over this scope's decoder ([`Self::term_view`]), built once per
+    /// context: for a caller that decodes one value at a time, where building
+    /// it per value would cost more than the decode under a union. `None`
+    /// where [`Self::term_view`] is.
+    pub fn with_term_view<R>(&self, f: impl FnOnce(&TermView) -> R) -> Option<R> {
+        let key = self.term_view_key();
+        let (built_for, terms) = self.term_view_once.get_or_init(|| (key, self.term_view()));
+        if *built_for == key {
+            return terms.as_ref().map(f);
+        }
+        self.term_view().as_ref().map(f)
+    }
+
+    /// The store and dictionary novelty [`Self::term_view`] reads, by address.
+    fn term_view_key(&self) -> TermViewKey {
+        (
+            self.binary_store.as_ref().map(|s| Arc::as_ptr(s) as usize),
+            self.dict_novelty.as_ref().map(|d| Arc::as_ptr(d) as usize),
+        )
+    }
+
     /// Decode an `EncodedLit` binding value using DictNovelty-aware routing.
     ///
     /// Thin wrapper around [`BinaryGraphView::decode_value_from_kind`] which
     /// handles watermark routing automatically when `dict_novelty` is present.
     ///
+    /// `arena_g_id` is the binding's own: the graph an arena-backed literal's
+    /// handle indexes ([`BinaryGraphView::decode_value_from_kind`]).
+    ///
     /// Returns `None` if no binary store is attached.
+    #[allow(clippy::too_many_arguments)]
     pub fn decode_encoded_value(
         &self,
         o_kind: u8,
@@ -1371,6 +1585,7 @@ impl<'a> ExecutionContext<'a> {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: GraphId,
     ) -> Option<std::io::Result<fluree_db_core::FlakeValue>> {
         use fluree_db_core::ids::DatatypeDictId;
         use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -1391,8 +1606,9 @@ impl<'a> ExecutionContext<'a> {
         {
             return Some(Ok(FlakeValue::Double(ObjKey::from_u64(o_key).decode_f64())));
         }
-        let gv = self.graph_view()?;
-        Some(gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id))
+        self.with_term_view(|gv| {
+            gv.decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id)
+        })
     }
 
     /// Resolve a binding-level `lang_id` to its language tag, memoized per
@@ -1453,8 +1669,7 @@ impl<'a> ExecutionContext<'a> {
     ///
     /// Returns `None` if no binary store is attached.
     pub fn resolve_subject_iri(&self, s_id: u64) -> Option<std::io::Result<String>> {
-        let gv = self.graph_view()?;
-        Some(gv.resolve_subject_iri(s_id))
+        self.with_term_view(|gv| gv.resolve_subject_iri(s_id))
     }
 
     /// Get the default graphs slice without allocation (for scan hot path).
@@ -1512,15 +1727,47 @@ impl<'a> ExecutionContext<'a> {
     /// `None` when the query names a dataset (`FROM` / `FROM NAMED`), the IRI
     /// names no graph, or it names a reserved system graph or the default graph
     /// (the ledger's own address, even if a registered graph shares the text).
+    ///
+    /// A graph dropped as of `to_t` names no graph here either, as one that
+    /// was never written does not.
     pub fn single_db_user_graph_id(&self, iri: &str) -> Option<GraphId> {
         match self.single_db_graph_position(iri)? {
             fluree_db_core::GraphPosition::Registered { g_id, .. }
-                if g_id >= FIRST_USER_GRAPH_ID =>
+                if g_id >= FIRST_USER_GRAPH_ID
+                    && self
+                        .active_snapshot
+                        .graph_registry
+                        .visible_at(g_id, self.to_t) =>
             {
                 Some(g_id)
             }
             _ => None,
         }
+    }
+
+    /// Refuse a `GRAPH <iri>` naming a user graph that a commit after `to_t`
+    /// dropped: the query asks what the graph held then, which the drop took,
+    /// and reading that as an empty graph would answer something else.
+    pub fn refuse_dropped_graph(&self, iri: &str) -> crate::error::Result<()> {
+        if !self.active_snapshot.graph_registry.has_drops() {
+            return Ok(());
+        }
+        if let Some(fluree_db_core::GraphPosition::Registered { g_id, .. }) =
+            self.single_db_graph_position(iri)
+        {
+            if let Some(floor) = self
+                .active_snapshot
+                .graph_registry
+                .drop_after(g_id, self.to_t)
+            {
+                return Err(crate::error::QueryError::GraphDropped {
+                    graph: iri.to_string(),
+                    floor,
+                    t: self.to_t,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Whether `GRAPH <iri>` names this single-ledger view's default graph:
@@ -1545,7 +1792,7 @@ impl<'a> ExecutionContext<'a> {
         let registry = &self.active_snapshot.graph_registry;
         let target = fluree_db_core::TargetLedger::new(&self.active_snapshot.ledger_id, registry);
         registry
-            .iter_entries()
+            .iter_visible_entries(self.to_t)
             .filter(|(g, _)| *g >= FIRST_USER_GRAPH_ID)
             .filter_map(|(g, iri)| {
                 target
@@ -1578,6 +1825,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1593,6 +1841,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1608,12 +1857,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             subject_iri_cache: self.subject_iri_cache.clone(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1645,6 +1896,7 @@ impl<'a> ExecutionContext<'a> {
             overlay: self.overlay,
             batch_size: self.batch_size,
             policy_enforcer: self.policy_enforcer.clone(),
+            policy_source: self.policy_source.clone(),
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1660,6 +1912,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: self.binary_store.clone(),
             binary_g_id,
@@ -1675,12 +1928,14 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: Self::compute_multi_ledger(self.dataset, &ActiveGraph::Default),
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             scan_provenance_ledger: self.scan_provenance_ledger.clone(),
             annotation_sidecar_cache: self.annotation_sidecar_cache.clone(),
             const_sid_cache: self.const_sid_cache.clone(),
             lang_tag_cache: self.lang_tag_cache.clone(),
             subject_iri_cache: self.subject_iri_cache.clone(),
+            term_view_once: std::sync::OnceLock::new(),
             r2rml_parent_memo: self.r2rml_parent_memo.clone(),
             overlay_ops_cache: self.overlay_ops_cache.clone(),
             translated_overlay_cache: self.translated_overlay_cache.clone(),
@@ -1708,6 +1963,12 @@ impl<'a> ExecutionContext<'a> {
                 .policy_enforcer
                 .clone()
                 .or_else(|| self.policy_enforcer.clone()),
+            // A graph's own enforcer is built for that graph.
+            policy_source: if graph.policy_enforcer.is_some() {
+                Some(Arc::clone(&graph.ledger_id))
+            } else {
+                self.policy_source.clone()
+            },
             bm25_provider: self.bm25_provider,
             bm25_search_provider: self.bm25_search_provider,
             vector_provider: self.vector_provider,
@@ -1723,6 +1984,7 @@ impl<'a> ExecutionContext<'a> {
             cypher_vocab: self.cypher_vocab.clone(),
             evaluation_time: self.evaluation_time.clone(),
             trust_fk_refs: self.trust_fk_refs,
+            deterministic_scans: self.deterministic_scans,
             path_pair_limit: self.path_pair_limit,
             binary_store: Self::extract_binary_store(graph.snapshot),
             binary_g_id: graph.g_id,
@@ -1738,6 +2000,7 @@ impl<'a> ExecutionContext<'a> {
             multi_ledger: false,
             eager_materialization: self.eager_materialization,
             reasoning_active: self.reasoning_active,
+            reasoning_ops: self.reasoning_ops.clone(),
             original_snapshot: self.original_snapshot,
             // A fresh per-graph scope: dataset members are stamped at the
             // member boundary by their owning `DatasetOperator`, and the
@@ -1755,6 +2018,7 @@ impl<'a> ExecutionContext<'a> {
             const_sid_cache: ConstSidCache::default(),
             lang_tag_cache: LangTagCache::default(),
             subject_iri_cache: SubjectIriCache::default(),
+            term_view_once: std::sync::OnceLock::new(),
             // The R2RML parent-lookup memo, by contrast, is SAFE to share here
             // (F19): its key carries `graph_source_id` + `as_of_t`
             // (`R2rmlParentMemoKey`, r2rml/operator.rs), so a lookup cached under
@@ -1776,11 +2040,16 @@ impl<'a> ExecutionContext<'a> {
     /// Cost: one `TypeId` comparison. Returns `None` when no range provider is
     /// attached (e.g. genesis / metadata-only snapshot).
     pub(crate) fn extract_binary_store(snapshot: &LedgerSnapshot) -> Option<Arc<BinaryIndexStore>> {
+        Self::binary_range_provider(snapshot).map(|brp| Arc::clone(brp.store()))
+    }
+
+    /// The snapshot's `RangeProvider` as a [`BinaryRangeProvider`]: the store
+    /// and dictionary novelty a per-graph context reads it through.
+    fn binary_range_provider(snapshot: &LedgerSnapshot) -> Option<&BinaryRangeProvider> {
         snapshot
             .range_provider
             .as_ref()
             .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
-            .map(|brp| Arc::clone(brp.store()))
     }
 
     /// Extract `DictNovelty` from a snapshot's `RangeProvider` via downcast.
@@ -1813,6 +2082,7 @@ impl<'a> ExecutionContext<'a> {
     /// the `range_with_overlay` fallback for reading from binary columnar indexes.
     pub fn with_binary_store(mut self, store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
         self.binary_store = Some(store);
+        self.term_view_once = std::sync::OnceLock::new();
         self.binary_g_id = g_id;
         // Store identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
@@ -1823,6 +2093,7 @@ impl<'a> ExecutionContext<'a> {
     /// Attach a dictionary novelty layer for binary scan subject/string lookups.
     pub fn with_dict_novelty(mut self, dict_novelty: Arc<DictNovelty>) -> Self {
         self.dict_novelty = Some(dict_novelty);
+        self.term_view_once = std::sync::OnceLock::new();
         // Dict-novelty identity is part of the overlay-ops cache binding.
         self.overlay_ops_cache = SharedOverlayOpsCache::default();
         self.translated_overlay_cache = TranslatedOverlayCache::default();
@@ -1841,6 +2112,12 @@ impl<'a> ExecutionContext<'a> {
     /// Force eager materialization of binary-scan bindings.
     pub fn with_eager_materialization(mut self) -> Self {
         self.eager_materialization = true;
+        self
+    }
+
+    /// See [`reasoning_ops`](Self::reasoning_ops).
+    pub fn with_reasoning_ops(mut self, ops: crate::reasoning_ops::ReasoningOpsHandle) -> Self {
+        self.reasoning_ops = Some(ops);
         self
     }
 
@@ -2232,5 +2509,55 @@ mod dataset_scope_tests {
             .with_default_graph(graph(0, "other:main"));
         let ctx = ExecutionContext::new(&snapshot, &vars).with_dataset(&two_ledgers);
         assert!(ctx.path_graphs().is_err());
+    }
+}
+
+#[cfg(test)]
+mod term_view_once_tests {
+    use super::*;
+    use crate::var_registry::VarRegistry;
+    use fluree_db_core::dict_novelty::DictNovelty;
+    use fluree_db_core::LedgerSnapshot;
+
+    /// The decoder built once per context is the one a later call gets, until
+    /// the store or dictionary novelty it read changes: then a call reads the
+    /// new ones, and none at all once the store is gone.
+    #[test]
+    fn a_context_keeps_its_decoder_until_its_store_changes() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let store = Arc::new(BinaryIndexStore::empty(std::env::temp_dir()));
+        let first_novelty = Arc::new(DictNovelty::new_uninitialized());
+        let mut ctx = ExecutionContext::new(&snapshot, &vars)
+            .with_binary_store(Arc::clone(&store), 0)
+            .with_dict_novelty(Arc::clone(&first_novelty));
+        let built = |ctx: &ExecutionContext<'_>| {
+            ctx.with_term_view(|terms| std::ptr::from_ref(terms) as usize)
+        };
+        let first = built(&ctx).expect("a decoder");
+        assert_eq!(built(&ctx), Some(first), "built once");
+        assert_eq!(
+            ctx.term_view_once.get().map(|(key, _)| *key),
+            Some(ctx.term_view_key())
+        );
+
+        // A dictionary novelty set after the decoder was built.
+        ctx.dict_novelty = Some(Arc::new(DictNovelty::new_uninitialized()));
+        let key = ctx.term_view_key();
+        assert_ne!(ctx.term_view_once.get().map(|(k, _)| *k), Some(key));
+        assert!(
+            ctx.with_term_view(|terms| {
+                terms
+                    .dict_novelty()
+                    .zip(ctx.dict_novelty.as_ref())
+                    .is_some_and(|(read, set)| Arc::ptr_eq(read, set))
+            })
+            .expect("a decoder"),
+            "reads the context's dictionary novelty"
+        );
+
+        // A store dropped after it was built (the range fallback does).
+        ctx.binary_store = None;
+        assert!(built(&ctx).is_none(), "no store, no decoder");
     }
 }

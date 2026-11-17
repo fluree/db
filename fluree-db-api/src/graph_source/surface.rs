@@ -196,7 +196,6 @@ impl From<CatalogModeError> for GraphSourceInputError {
             CatalogModeError::UnknownMode(_) => "mode",
             CatalogModeError::MissingField { field, .. }
             | CatalogModeError::NotForMode { field, .. } => field,
-            CatalogModeError::MissingTable { .. } => "table",
         };
         Self::new(field, InputErrorKind::Mode(e))
     }
@@ -875,21 +874,16 @@ pub fn iceberg_connection_from_json(
 }
 
 /// An Iceberg graph source's create config from a `map` request's connection
-/// fields; `table` and `has_mapping` are as for
-/// [`IcebergCreateConfig::from_mode`].
+/// fields; `table` is as for [`IcebergCreateConfig::from_mode`].
 pub fn iceberg_create_from_json(
     name: &str,
     table: Option<&str>,
-    has_mapping: bool,
     input: Map<String, Value>,
     rules: &SecretRules,
 ) -> Result<IcebergCreateConfig, GraphSourceInputError> {
     let connection = iceberg_connection_from_json(input, rules)?;
     Ok(IcebergCreateConfig::from_connection_for(
-        name,
-        connection,
-        table,
-        has_mapping,
+        name, connection, table,
     )?)
 }
 

@@ -22,7 +22,9 @@
 
 use crate::support::span_capture::{init_test_tracing, SpanStore};
 use crate::support::FAST_PATH_SWITCH;
-use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphSnapshot};
+use fluree_db_api::{
+    set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, GraphSnapshot, ReindexOptions,
+};
 use serde_json::{json, Value};
 use std::io::Write;
 use tempfile::TempDir;
@@ -653,7 +655,7 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
     assert!(
         !stamped(&store, before, "fallback")
             .iter()
-            .any(|s| s == "partitioned GROUP BY"),
+            .any(|s| s == "partitioned_group_by"),
         "a string key does not decline the partitioned lane"
     );
     let spans = store.find_spans("group_aggregate_streaming").len();
@@ -670,7 +672,7 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
     assert!(
         stamped(&store, before, "fallback")
             .iter()
-            .any(|s| s == "partitioned GROUP BY"),
+            .any(|s| s == "partitioned_group_by"),
         "a vector key declines the partitioned lane: {:?}",
         stamped(&store, before, "")
     );
@@ -742,7 +744,7 @@ ex:h ex:j1 "[0.75, 0.25]"^^f:embeddingVector ; ex:k1 "s" .
             &["n=2"],
         ),
         (
-            "partitioned GROUP BY",
+            "partitioned_group_by",
             "SELECT ?v (COUNT(?s) AS ?n) WHERE { ?s ex:j1 ?v } GROUP BY ?v",
             &["n=1,v=[0.125,0.875]", "n=2,v=[0.75,0.25]"],
         ),
@@ -754,7 +756,7 @@ ex:h ex:j1 "[0.75, 0.25]"^^f:embeddingVector ; ex:k1 "s" .
         if got != rows {
             failures.push(format!("{query}: {got:?}, want {rows:?}"));
         }
-        if site != "partitioned GROUP BY" && served(&store, before, site) {
+        if site != "partitioned_group_by" && served(&store, before, site) {
             failures.push(format!("{site} served novelty over the arena: {query}"));
         }
     }
@@ -931,4 +933,244 @@ async fn a_failed_vector_read_while_keying_fails_the_query() {
     let _switch = FAST_PATH_SWITCH.write().await;
     let _restore = FastPathsGuard;
     cross_arena_queries_fail_without_their_shards(&fluree, &db, &dirs).await;
+}
+
+/// Two named graphs, each holding one vector under `ex:v` and one under
+/// `ex:w`, so every `(graph, predicate)` arena holds one handle, 0. Handle 0
+/// of `ex:v` is `[1, 0]` in one graph and `[0, 1]` in the other; handle 0 of
+/// `ex:w` is `[0.5, 0.5]` in both.
+const UNION_TRIG: &str = r#"@prefix ex: <http://example.org/> .
+@prefix f: <https://ns.flur.ee/db#> .
+GRAPH <urn:vg1> {
+  ex:a ex:v "[1.0, 0.0]"^^f:embeddingVector .
+  ex:c ex:w "[0.5, 0.5]"^^f:embeddingVector .
+}
+GRAPH <urn:vg2> {
+  ex:b ex:v "[0.0, 1.0]"^^f:embeddingVector .
+  ex:d ex:w "[0.5, 0.5]"^^f:embeddingVector .
+}
+"#;
+
+const UNION_LEDGER: &str = "vector-identity/union:main";
+const UNION_GRAPHS: [&str; 2] = ["urn:vg1", "urn:vg2"];
+
+/// Queries over the union of both graphs (`{ds}`), and their rows. Keyed by
+/// handle without the graph, `ex:v`'s two vectors are one; keyed by graph
+/// and handle without the value, `ex:w`'s one vector is two.
+fn union_cases() -> Vec<(&'static str, &'static str, &'static [&'static str])> {
+    vec![
+        (
+            "one graph reads its own arena",
+            "SELECT DISTINCT ?v FROM <urn:vg2> WHERE { ?s ex:v ?v }",
+            &["v=[0.0,1.0]"],
+        ),
+        (
+            "DISTINCT over one handle holding a different vector in each graph",
+            "SELECT DISTINCT ?v {ds} WHERE { ?s ex:v ?v }",
+            &["v=[0.0,1.0]", "v=[1.0,0.0]"],
+        ),
+        (
+            "DISTINCT over one vector in each graph",
+            "SELECT DISTINCT ?v {ds} WHERE { ?s ex:w ?v }",
+            &["v=[0.5,0.5]"],
+        ),
+        (
+            "GROUP BY over one predicate in each graph",
+            "SELECT ?v (COUNT(?s) AS ?n) {ds} WHERE { ?s ex:w ?v } GROUP BY ?v",
+            &["n=2,v=[0.5,0.5]"],
+        ),
+        (
+            "GROUP BY over both predicates",
+            "SELECT ?v (COUNT(?s) AS ?n) {ds} WHERE { { ?s ex:v ?v } UNION { ?s ex:w ?v } } \
+             GROUP BY ?v",
+            &["n=1,v=[0.0,1.0]", "n=1,v=[1.0,0.0]", "n=2,v=[0.5,0.5]"],
+        ),
+        (
+            "COUNT(DISTINCT) over both predicates",
+            "SELECT (COUNT(DISTINCT ?v) AS ?n) {ds} WHERE { { ?s ex:v ?v } UNION { ?s ex:w ?v } }",
+            &["n=3"],
+        ),
+        (
+            "join on one vector across the graphs",
+            "SELECT ?a ?b {ds} WHERE { ?a ex:w ?v . ?b ex:w ?v FILTER(?a != ?b) }",
+            &["a=c,b=d", "a=d,b=c"],
+        ),
+        (
+            "join on one handle holding a different vector in each graph",
+            "SELECT ?a ?b {ds} WHERE { ?a ex:v ?v . ?b ex:v ?v FILTER(?a != ?b) }",
+            &[],
+        ),
+    ]
+}
+
+/// The JSON-LD twins of the DISTINCT and GROUP BY cases, over both graphs.
+fn union_jsonld_cases() -> Vec<(&'static str, Value, Vec<Value>)> {
+    let from: Vec<String> = UNION_GRAPHS
+        .iter()
+        .map(|g| format!("{UNION_LEDGER}#{g}"))
+        .collect();
+    let ctx = json!({"ex": EX});
+    vec![
+        (
+            "JSON-LD selectDistinct over one handle holding a different vector in each graph",
+            json!({
+                "@context": ctx, "from": from,
+                "selectDistinct": ["?v"],
+                "where": {"@id": "?s", "ex:v": "?v"}
+            }),
+            vec![json!([[0.0, 1.0]]), json!([[1.0, 0.0]])],
+        ),
+        (
+            "JSON-LD selectDistinct over one vector in each graph",
+            json!({
+                "@context": ctx, "from": from,
+                "selectDistinct": ["?v"],
+                "where": {"@id": "?s", "ex:w": "?v"}
+            }),
+            vec![json!([[0.5, 0.5]])],
+        ),
+        (
+            "JSON-LD groupBy over one vector in each graph",
+            json!({
+                "@context": ctx, "from": from,
+                "select": ["?v", "(as (count ?s) ?n)"],
+                "where": {"@id": "?s", "ex:w": "?v"},
+                "groupBy": ["?v"]
+            }),
+            vec![json!([[0.5, 0.5], 2])],
+        ),
+    ]
+}
+
+/// Every union case against the ledger's current state, with the fast paths
+/// on when `fast` and off otherwise; wrong answers are collected.
+async fn run_union(fluree: &Fluree, state: &str, fast: bool, failures: &mut Vec<String>) {
+    let lane = if fast {
+        "fast paths on"
+    } else {
+        "fast paths off"
+    };
+    let handle = fluree.ledger_cached(UNION_LEDGER).await.expect("ledger");
+    let view = GraphDb::from_ledger_state(&handle.snapshot().await.to_ledger_state());
+    let ds = UNION_GRAPHS
+        .iter()
+        .map(|g| format!("FROM <{g}>"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    for (name, body, want) in union_cases() {
+        let query = format!(
+            "PREFIX ex: <http://example.org/>\n{}",
+            body.replace("{ds}", &ds)
+        );
+        let results = view
+            .query(fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        let got = sparql_rows(&results);
+        if got != want {
+            failures.push(format!(
+                "{state}, {lane}: {name}\n  want {want:?}\n  got  {got:?}"
+            ));
+        }
+    }
+    let ledger = fluree.ledger(UNION_LEDGER).await.expect("ledger");
+    for (name, query, mut want) in union_jsonld_cases() {
+        want.sort_by_key(ToString::to_string);
+        let result = fluree
+            .query_connection(&query)
+            .await
+            .unwrap_or_else(|e| panic!("{e}\n{query}"));
+        let json: Value = result
+            .to_jsonld_async(ledger.as_graph_db_ref(0))
+            .await
+            .expect("format");
+        let mut got: Vec<Value> = json.as_array().expect("rows").clone();
+        got.sort_by_key(ToString::to_string);
+        if got != want {
+            failures.push(format!(
+                "{state}, {lane}: {name}\n  want {want:?}\n  got  {got:?}"
+            ));
+        }
+    }
+}
+
+/// [`run_union`] with the fast paths on, then off.
+async fn run_union_both_lanes(fluree: &Fluree, state: &str, failures: &mut Vec<String>) {
+    {
+        let _switch = FAST_PATH_SWITCH.read().await;
+        run_union(fluree, state, true, failures).await;
+    }
+    let _switch = FAST_PATH_SWITCH.write().await;
+    set_fast_paths_disabled(true);
+    let _restore = FastPathsGuard;
+    run_union(fluree, state, false, failures).await;
+}
+
+/// The built identity tables of the four `(graph, predicate)` arenas, in
+/// graph-then-predicate order, building them first when `build`.
+async fn union_tables(fluree: &Fluree, build: bool) -> Vec<bool> {
+    let handle = fluree.ledger_cached(UNION_LEDGER).await.expect("ledger");
+    let view = handle.snapshot().await;
+    let store = view.binary_store.clone().expect("indexed");
+    let mut built = Vec::new();
+    for graph in UNION_GRAPHS {
+        let g_id = view
+            .snapshot
+            .graph_registry
+            .assigned_graph_id(graph)
+            .expect("named graph registered");
+        for p in ["v", "w"] {
+            let p_id = store
+                .find_predicate_id(&format!("{EX}{p}"))
+                .expect("predicate");
+            if build {
+                store
+                    .vector_identity(g_id, p_id)
+                    .expect("read the arena")
+                    .expect("an arena");
+            }
+            built.push(store.built_vector_identity(g_id, p_id).is_some());
+        }
+    }
+    built
+}
+
+/// Vectors over a union of graphs compare by value, read from the graph
+/// each one came from: in each graph one handle of one predicate holds a
+/// different vector, and one handle of another holds the same one. Each of
+/// DISTINCT, GROUP BY, COUNT(DISTINCT) and a join answers by value in
+/// novelty, indexed without the arenas' identity tables, and indexed with
+/// them, on SPARQL and JSON-LD, with the fast paths on and off.
+#[tokio::test]
+async fn vectors_over_a_union_of_graphs_compare_by_value() {
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    fluree.create_ledger(UNION_LEDGER).await.expect("create");
+    let handle = fluree.ledger_cached(UNION_LEDGER).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle(UNION_TRIG)
+        .execute()
+        .await
+        .expect("seed");
+    let mut failures = Vec::new();
+    run_union_both_lanes(&fluree, "novelty", &mut failures).await;
+
+    fluree
+        .reindex(UNION_LEDGER, ReindexOptions::default())
+        .await
+        .expect("index");
+    fluree.disconnect_ledger(UNION_LEDGER).await;
+    assert_eq!(
+        union_tables(&fluree, false).await,
+        [false; 4],
+        "fresh store"
+    );
+    run_union_both_lanes(&fluree, "indexed", &mut failures).await;
+
+    assert_eq!(union_tables(&fluree, true).await, [true; 4], "tables built");
+    run_union_both_lanes(&fluree, "indexed, tables built", &mut failures).await;
+
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

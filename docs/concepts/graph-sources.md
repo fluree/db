@@ -4,10 +4,9 @@
 
 ## What Are Graph Sources?
 
-A **graph source** is anything you can address by a graph name/IRI in Fluree query execution. Graph sources may be backed by:
-- **Ledger graphs** (default graph and named graphs stored as RDF triples)
-- **Index graph sources** (BM25 and vector/HNSW indexes)
-- **Mapped graph sources** (R2RML and Iceberg-backed mappings)
+A **graph source** is a source a Fluree query can read besides a ledger's own graphs. There are two kinds, reached differently:
+- **Mapped graph sources** (R2RML over Iceberg, SQL or Delta tables) are graphs: address one by its name/IRI in `FROM`, `FROM NAMED` or `GRAPH`, or as the query target, as you would a ledger.
+- **Index graph sources** (BM25 and vector/HNSW indexes) are not graphs: a search pattern names one (`f:graphSource`), and the dataset is its source ledger. Naming an index where a graph is read is refused with `err:db/GraphSourceNotAGraph`.
 
 ### Key Characteristics
 
@@ -191,16 +190,18 @@ Graph sources maintain their own indexes:
 
 ### Querying
 
-Graph sources are queried like regular ledgers:
+A mapped graph source is queried like a regular ledger:
 
 ```sparql
-# Query any graph source
+# Query a mapped graph source (Iceberg, R2RML, SQL, Delta)
 SELECT ?result
 FROM <graph-source-name:branch>
 WHERE {
-  # Query patterns specific to graph source type
+  # Triple patterns over the source's mapped triples
 }
 ```
+
+An index graph source is queried with a search pattern that names it, with its source ledger as the dataset (see [BM25 Full-Text Search](#bm25-full-text-search) and [Vector Similarity Search](#vector-similarity-search-ann) above); it is not a dataset member.
 
 ### Time Travel
 

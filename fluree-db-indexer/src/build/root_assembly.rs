@@ -240,6 +240,41 @@ pub(crate) struct Fir6Inputs {
     /// prior root — without it a full rebuild under `Augment` coverage
     /// silently drops a previously-sealed arena.
     pub prev_index: Option<BinaryPrevIndexRef>,
+    /// Each dropped graph's latest drop `t`, by graph IRI: no annotation
+    /// event on its edges from before then reaches the arena, whether the
+    /// caller supplied it or the previous arena held it.
+    pub graph_floors: std::collections::HashMap<String, i64>,
+    /// The graphs a commit in the build dropped, with what each latest drop
+    /// left, by this build's graph ids (`IndexRoot.graph_drops`).
+    pub graph_drops: Vec<(fluree_db_core::GraphId, fluree_db_core::GraphDrop)>,
+}
+
+/// `events` less those on edges of a graph from before the graph's latest
+/// drop (`floors`, by graph IRI, resolved through `ns_prefixes`): the drop
+/// took the edge, and the arena must not bring its annotations back.
+fn retain_undropped_events(
+    events: &mut Vec<(fluree_db_core::EdgeKey, fluree_db_core::Sid, i64, bool)>,
+    floors: &std::collections::HashMap<String, i64>,
+    ns_prefixes: &std::collections::HashMap<u16, String>,
+) {
+    if floors.is_empty() {
+        return;
+    }
+    let floor_of = |graph: &Option<fluree_db_core::Sid>| -> Option<i64> {
+        let iri = match graph {
+            None => fluree_db_core::DEFAULT_GRAPH_IRI.to_string(),
+            Some(sid) => format!(
+                "{}{}",
+                ns_prefixes
+                    .get(&sid.namespace_code)
+                    .map(String::as_str)
+                    .unwrap_or(""),
+                sid.name
+            ),
+        };
+        floors.get(&iri).copied()
+    };
+    events.retain(|(edge, _, t, _)| floor_of(&edge.g).is_none_or(|floor| *t >= floor));
 }
 
 /// Encode an `IndexRoot` (FIR6), write to CAS, and return an `IndexResult`.
@@ -339,6 +374,7 @@ pub(crate) async fn encode_and_write_root_v6(
         // exclusively on the incremental path.
         had_annotation_arena: false,
         has_list_meta: Some(inputs.saw_list_meta),
+        graph_drops: inputs.graph_drops,
     };
 
     // `IndexStats.size` is defined as total commit data size (bytes) for the ledger.
@@ -381,6 +417,7 @@ pub(crate) async fn encode_and_write_root_v6(
     match inputs.attachment_events {
         Some(AttachmentEventCoverage::Authoritative(mut events)) => {
             events.retain(|(_, _, t, _)| *t <= job_t);
+            retain_undropped_events(&mut events, &inputs.graph_floors, &inputs.commit_derived_ns);
             let result = crate::build::annotation_arena::build_and_persist_annotation_arena(
                 content_store,
                 None,
@@ -434,6 +471,11 @@ pub(crate) async fn encode_and_write_root_v6(
                             merged.sort();
                             merged.dedup();
                             merged.retain(|(_, _, t, _)| *t <= job_t);
+                            retain_undropped_events(
+                                &mut merged,
+                                &inputs.graph_floors,
+                                &inputs.commit_derived_ns,
+                            );
                             // `previous_index: None`: the prior arena's blobs
                             // stay reachable from the previous root and follow
                             // the same old-generation GC lifecycle as every
@@ -635,6 +677,7 @@ mod tests {
             has_annotations: false,
             had_annotation_arena: false,
             has_list_meta: None,
+            graph_drops: Vec::new(),
             annotation_index: None,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),

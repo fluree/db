@@ -1,7 +1,8 @@
 //! Ontologies from what people already have: table and column names, a CSV
 //! header, a workbook, SQL DDL, a warehouse's semantic layer (a Snowflake
 //! semantic view, a Databricks Genie space, a dbt project's semantic models
-//! and model properties, an Apache Ossie semantic model). An Ossie ontology,
+//! and model properties, an Apache Ossie semantic model), a Neo4j graph's
+//! schema. An Ossie ontology,
 //! already conceptual, is written straight to RDF ([`ossie::ontology`]).
 //!
 //! Every source is read into one [`Model`] of tables and columns, and one
@@ -23,6 +24,7 @@
 //!   tables, not things.
 
 pub mod dbt;
+pub mod neo4j;
 pub mod ossie;
 pub mod semantic;
 pub mod sql;
@@ -94,6 +96,10 @@ pub struct Column {
     pub values: Vec<String>,
     /// The table this column references, as a foreign key.
     pub references: Option<String>,
+    /// A property label given by the source, used before one made from the
+    /// name: a Neo4j relationship type is a verb (`HAS_KEY`, "has key"), not a
+    /// key column to strip a suffix from.
+    pub label: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -497,8 +503,11 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                 .as_ref()
                 .and_then(|t| class_of.get(&t.to_lowercase()).cloned());
             if let Some((range, target_label)) = target {
-                let label =
-                    property_label(&column.name, true).unwrap_or_else(|| target_label.clone());
+                let label = column
+                    .label
+                    .clone()
+                    .or_else(|| property_label(&column.name, true))
+                    .unwrap_or_else(|| target_label.clone());
                 // with no description of its own, one is written once every
                 // table using the relation is known
                 let text = comment(column.description.as_deref(), &column.synonyms);
@@ -564,7 +573,11 @@ pub fn emit(model: &Model, options: &EmitOptions) -> Converted {
                 );
             } else {
                 let fk = column.references.is_some();
-                let Some(label) = property_label(&column.name, fk) else {
+                let Some(label) = column
+                    .label
+                    .clone()
+                    .or_else(|| property_label(&column.name, fk))
+                else {
                     no_label.push(format!("{}.{}", table.name, column.name));
                     continue;
                 };

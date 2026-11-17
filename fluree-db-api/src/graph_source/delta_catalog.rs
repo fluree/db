@@ -18,7 +18,8 @@ use serde::Serialize;
 use super::delta::{open_placed, DeltaCreateConfig};
 use super::iceberg_generate::{emit_options, validate_base_namespace, GenerateOptions};
 use super::iceberg_validate::{
-    compile_for_validate, cross_check_live, LiveColumn, ValidateR2rmlResponse, Wording,
+    compile_for_validate, cross_check_live, declared_table_keys, keyless_generated_maps,
+    keyless_map_diagnostics, KeyRemedy, LiveColumn, QueryTables, ValidateR2rmlResponse, Wording,
 };
 use super::R2rmlMappingInput;
 use crate::Result;
@@ -251,10 +252,19 @@ fn generate_from(
         ..emit_options(base_namespace, options, overrides)
     };
     let output = emit_r2rml(&schemas, &emit_options);
+    let mut diagnostics = output.diagnostics;
+    // A Delta table reports no key of its own, so a generated map is keyed
+    // only by what the mapping declares.
+    diagnostics.extend(keyless_generated_maps(
+        &output.turtle,
+        declared_table_keys,
+        QueryTables::Alias,
+        KeyRemedy::Declare,
+    ));
     Ok(GenerateDeltaR2rmlResponse {
         turtle: output.turtle,
         structured: output.structured,
-        diagnostics: output.diagnostics,
+        diagnostics,
         tables: tables.iter().map(|t| t.full_name.clone()).collect(),
     })
 }
@@ -466,8 +476,19 @@ impl crate::Fluree {
             &schemas,
             &unread,
             DELTA_WORDING,
+            QueryTables::Alias,
         ));
         diagnostics.extend(unmappable_columns(&compiled, &schemas));
+        // A Delta table reports no key of its own: a map's keys are the ones
+        // its mapping declares. Only tables that were read, as above.
+        let mut keys = declared_table_keys(&compiled);
+        keys.retain(|table, _| schemas.contains_key(table));
+        diagnostics.extend(keyless_map_diagnostics(
+            &compiled,
+            &keys,
+            QueryTables::Alias,
+            KeyRemedy::Declare,
+        ));
 
         Ok(ValidateR2rmlResponse {
             compiled_ok: true,
@@ -819,7 +840,13 @@ mod tests {
             "main.sales.returns".to_string(),
             "Unity Catalog, table 'main.sales.returns': not found (404)".to_string(),
         )]);
-        let mut found = cross_check_live(&compiled, &schemas, &unread, DELTA_WORDING);
+        let mut found = cross_check_live(
+            &compiled,
+            &schemas,
+            &unread,
+            DELTA_WORDING,
+            QueryTables::Alias,
+        );
         found.extend(unmappable_columns(&compiled, &schemas));
         let of = |code: DiagCode| -> Vec<&Diagnostic> {
             found.iter().filter(|d| d.code == code).collect()

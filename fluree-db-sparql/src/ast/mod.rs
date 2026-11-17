@@ -46,8 +46,8 @@ pub use query::{
     SelectVariables, SolutionModifiers, SparqlAst, VarOrIri, WhereClause,
 };
 pub use term::{
-    BlankNode, BlankNodeValue, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm,
-    QtReifier, QuotedTriple, Spanned, SubjectTerm, Term, Var,
+    BlankNode, Iri, IriValue, Literal, LiteralValue, ObjectTerm, PredicateTerm, QtReifier,
+    QuotedTriple, Spanned, SubjectTerm, Term, Var,
 };
 pub use update::{
     Create, DeleteData, DeleteWhere, GraphMgmtRef, GraphOrDefault, GraphRefAll, GraphTransfer,

@@ -28,9 +28,10 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::try_normalize_pred_sid;
 use crate::fast_path_common::{
-    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, ObjectProbeOps,
-    ProbeLanePlan, ProbeOps,
+    branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, LaneOutput,
+    ObjectProbeOps, ProbeLanePlan, ProbeOps,
 };
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -436,13 +437,15 @@ impl PatternOptionalBuilder {
         let Some(pred_sid) = try_normalize_pred_sid(store, &self.pattern.p) else {
             return Ok(None);
         };
-        Ok(match object_probe_lane_plan(ctx, store, &pred_sid)? {
-            ProbeLanePlan::Decline => None,
-            plan => Some((Arc::clone(store), pred_sid, plan)),
-        })
+        Ok(
+            match object_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)? {
+                ProbeLanePlan::Decline => None,
+                plan => Some((Arc::clone(store), pred_sid, plan)),
+            },
+        )
     }
 
-    /// The bound-object lane: one sorted OPST pass over every required row's
+    /// The bound-object lane: one sorted POST pass over every required row's
     /// object answers the whole batch, binding the optional-only subject.
     /// Without it each row ran its own lookup, and before the substitution
     /// covered encoded objects, its own scan of the whole predicate (#1973).
@@ -450,7 +453,7 @@ impl PatternOptionalBuilder {
     /// Declines — to the per-row path, which handles every form — when the
     /// lane is not admitted. Leaves to the per-row path each row whose object
     /// is not a ref with an id: an unbound object (the triple's object is then
-    /// free), a literal (the OPST ref probe cannot see literal objects), or an
+    /// free), a literal (the probe reads only ref objects), or an
     /// IRI the dictionaries do not hold.
     fn build_object_probe_batch(
         &self,
@@ -499,30 +502,31 @@ impl PatternOptionalBuilder {
         let branch = branch_or_none(
             &store,
             ctx.binary_g_id,
-            fluree_db_binary_index::RunSortOrder::Opst,
+            fluree_db_binary_index::RunSortOrder::Post,
             merging,
         )?;
         let p_id = p_id_or_none(&store, &pred_sid, || Ok(merging))?;
         if let (Some(p_id), Some(branch)) = (p_id, branch) {
             let slots_by_object: Vec<&[usize]> =
                 objects.iter().map(|o| object_slots[o].as_slice()).collect();
+            let ref_type = fluree_db_core::o_type::OType::IRI_REF.as_u16();
             let mut probe_ops = match &lane_plan {
-                ProbeLanePlan::Merge(ops) => ObjectProbeOps::new(ops),
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::for_type(ops, ref_type),
                 _ => None,
             };
             for_each_object_probe_match(
                 ctx,
                 &store,
                 branch,
-                p_id,
+                (p_id, ref_type),
                 &objects,
                 probe_ops.as_mut(),
-                |obj_idx, s_id| {
+                |obj_idx, s_ids| {
                     for &slot in slots_by_object[obj_idx] {
-                        values[slot].push(Binding::encoded_sid(s_id));
-                        matched += 1;
+                        values[slot].extend(s_ids.iter().copied().map(Binding::encoded_sid));
+                        matched += s_ids.len();
                     }
-                    Ok(())
+                    Ok(std::ops::ControlFlow::Continue(()))
                 },
             )?;
         }
@@ -621,7 +625,7 @@ impl PatternOptionalBuilder {
         let mut pattern = self.pattern.clone();
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
-        let mut view: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let mut view: Option<Option<fluree_db_binary_index::TermView>> = None;
         let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             if object_to_unify && instr.position == PatternPosition::Object {
@@ -635,7 +639,7 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                view.get_or_insert_with(|| ctx.graph_view()).as_ref()
+                view.get_or_insert_with(|| ctx.term_view()).as_ref()
             } else {
                 None
             };
@@ -712,6 +716,7 @@ fn push_cache_key_component(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if position == PatternPosition::Object => {
             key.push(b'L');
@@ -720,6 +725,9 @@ fn push_cache_key_component(
             key.extend_from_slice(&p_id.to_le_bytes());
             key.extend_from_slice(&dt_id.to_le_bytes());
             key.extend_from_slice(&lang_id.to_le_bytes());
+            // An arena handle names its value only with its graph: two
+            // graphs' handle 0 are two values.
+            key.extend_from_slice(&arena_g_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term
@@ -763,13 +771,13 @@ impl OptionalBuilder for PatternOptionalBuilder {
             return false;
         };
         !matches!(
-            subject_probe_lane_plan(ctx, store, &pred_sid),
+            subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
             Err(_) | Ok(ProbeLanePlan::Decline)
         )
     }
 
     /// The bound-object lane coalesces at most the window the join's own
-    /// bound-object lane flushes at: the OPST pass costs a seek per distinct
+    /// bound-object lane flushes at: the POST pass costs a seek per distinct
     /// object, so a larger window saves little, while main answered these
     /// OPTIONALs row by row and buffered nothing.
     fn seed_coalesce_cap(&self) -> usize {
@@ -840,7 +848,7 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
         // Novelty merges per probed subject; unmergeable overlays fall back
         // to the per-row scan (whose cursor merges the overlay).
-        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+        let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
         if matches!(lane_plan, ProbeLanePlan::Decline) {
             return Ok(None);
         }
@@ -1181,7 +1189,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 return false;
             };
             !matches!(
-                subject_probe_lane_plan(ctx, store, &pred_sid),
+                subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded),
                 Err(_) | Ok(ProbeLanePlan::Decline)
             )
         })
@@ -1229,6 +1237,17 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 predicate_count = self.triples.len(),
                 start_row,
                 reason = "datatype-constraint",
+                "grouped optional builder fallback"
+            );
+            return Ok(None);
+        }
+        // Admission declines this encoded lane for an eager caller at
+        // planning; say so before resolving every row's subject id.
+        if crate::fast_path_common::eager_with_overlay(ctx) {
+            tracing::debug!(
+                predicate_count = self.triples.len(),
+                start_row,
+                reason = "eager-materialization",
                 "grouped optional builder fallback"
             );
             return Ok(None);
@@ -1305,7 +1324,7 @@ impl OptionalBuilder for GroupedPatternOptionalBuilder {
                 );
                 return Ok(None);
             };
-            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid)?;
+            let lane_plan = subject_probe_lane_plan(ctx, store, &pred_sid, LaneOutput::Encoded)?;
             if matches!(lane_plan, ProbeLanePlan::Decline) {
                 tracing::debug!(
                     predicate_count = self.triples.len(),
@@ -1787,13 +1806,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .try_collect_vec()?;
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .try_collect_vec()?;
             if seen_seed.insert(seed_key) {
                 seed_rows.push(
                     seed_cols
@@ -1873,7 +1892,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
                     .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
-                    .collect();
+                    .try_collect_vec()?;
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
                     .map(|&c| batch.get_by_col(r, c).clone())
@@ -2231,7 +2250,7 @@ impl AnnotationValueOptionalBuilder {
     async fn sidecar_maps(
         &self,
         ctx: &ExecutionContext<'_>,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        view: Option<&fluree_db_binary_index::TermView>,
     ) -> Result<Arc<crate::annotation_edge_probe::AnnotationSidecarMaps>> {
         crate::annotation_edge_probe::AnnotationSidecarMaps::shared(
             &self.r_subj,
@@ -2250,7 +2269,7 @@ impl AnnotationValueOptionalBuilder {
         pos: &crate::annotation_edge_probe::EdgePos,
         batch: &Batch,
         row: usize,
-        view: Option<&fluree_db_binary_index::BinaryGraphView>,
+        view: Option<&fluree_db_binary_index::TermView>,
     ) -> Result<Option<fluree_db_core::Sid>> {
         use crate::annotation_edge_probe::EdgePos;
         match pos {
@@ -2287,8 +2306,8 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
         {
             return Ok(None);
         }
-        let view = ctx.graph_view();
-        let view = view.as_ref();
+        let view = ctx.one_graph_view();
+        let view = view.as_deref();
 
         // One pass over each reifies predicate (overlay-merged, policy-
         // filtered planned scans) — cached across required batches — then
@@ -2302,7 +2321,7 @@ impl OptionalBuilder for AnnotationValueOptionalBuilder {
                 self.row_sid(&self.p_src, required_batch, row, view)?,
             );
             let o =
-                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view);
+                crate::annotation_edge_probe::row_obj_key(required_batch, row, &self.o_src, view)?;
             let ((Some(s), Some(p)), false) = (
                 key,
                 matches!(o, crate::group_aggregate::GroupKeyOwned::Absent),
@@ -4689,6 +4708,7 @@ mod tests {
             lang_id: 0,
             i_val: i32::MIN,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let free = Some(vec![b'u']);
         let positions = [

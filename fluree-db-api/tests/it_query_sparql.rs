@@ -1581,6 +1581,51 @@ ex:cart ex:has [ rdfs:label "Apple" ; ex:qty 3 ] , [ rdfs:label "Pear" ; ex:qty 
 }
 
 #[tokio::test]
+async fn sparql_anonymous_subject_is_one_node_across_lists() {
+    // A `;` or `,` list copies its `[]` subject into each triple; every copy
+    // is the one node, so only a subject with the whole list matches. `[]`
+    // stays out of `SELECT *`.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "anon-list:main");
+    let ttl = r#"@prefix ex: <http://example.org/> .
+ex:a ex:p "one" ; ex:r ex:x .
+ex:b ex:q "two" ; ex:r ex:y .
+ex:c ex:p "three" ; ex:q "four" ; ex:r ex:x , ex:y .
+"#;
+    let ledger = fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger;
+    for (q, expected) in [
+        (
+            "SELECT ?o ?z WHERE { [] ex:p ?o ; ex:q ?z }",
+            json!([["three", "four"]]),
+        ),
+        (
+            "SELECT * WHERE { [] ex:p ?o ; ex:q ?z }",
+            json!([{"?o": "three", "?z": "four"}]),
+        ),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { [] ex:r ex:x , ex:y }",
+            json!([[1]]),
+        ),
+    ] {
+        let jsonld = support::query_sparql(
+            &fluree,
+            &ledger,
+            &format!("PREFIX ex: <http://example.org/> {q}"),
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+        assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected), "{q}");
+    }
+}
+
+#[tokio::test]
 async fn sparql_subquery_full_modifier_stack() {
     // Pattern 8: GROUP BY + HAVING + aggregate ORDER BY + LIMIT in one subquery.
     assert_index_defaults();

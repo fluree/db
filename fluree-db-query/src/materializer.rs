@@ -253,7 +253,7 @@ pub struct Materializer {
     /// Graph-scoped view (store + graph ID) for decoding.
     ///
     /// When constructed with a novelty-aware `BinaryGraphView` (via
-    /// `ExecutionContext::graph_view()`), all decode methods automatically
+    /// `ExecutionContext::one_graph_view()`), all decode methods automatically
     /// handle watermark routing for novelty-only subject/string IDs.
     graph_view: BinaryGraphView,
     /// Cache: s_id -> Sid (for terminal output)
@@ -349,17 +349,22 @@ impl Materializer {
             }),
 
             // An arena handle (NUM_BIG, VECTOR_ID) is not a term identity: it is
-            // scoped per predicate, and the vector arena does not deduplicate.
-            // Key it by its decoded value.
+            // scoped per (graph, predicate), and the vector arena does not
+            // deduplicate. Key it by its decoded value, read through the graph
+            // the literal carries.
             Binding::EncodedLit {
                 o_kind,
                 o_key,
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
-            } if fluree_db_core::ObjKind::from_u8(*o_kind).is_arena_handle() => {
-                match crate::group_aggregate::materialize_encoded(binding, Some(&self.graph_view)) {
+            } if crate::binding::is_arena_kind(*o_kind) => {
+                match crate::group_aggregate::materialize_encoded(
+                    binding,
+                    Some(self.graph_view.terms()),
+                )? {
                     Binding::Lit { val, dtc, .. } => JoinKey::MaterializedLit(MaterializedLitKey {
                         val: FlakeValueKey(val),
                         dtc,
@@ -367,7 +372,7 @@ impl Materializer {
                     _ => {
                         return Err(decode_error(
                             "decode arena literal",
-                            format!("o_kind={o_kind} o_key={o_key} p_id={p_id}"),
+                            format!("o_kind={o_kind} o_key={o_key} p_id={p_id} g_id={arena_g_id}"),
                             format!("dt_id={dt_id} lang_id={lang_id}"),
                         ))
                     }
@@ -435,10 +440,16 @@ impl Materializer {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
-            } => flake_value_to_comparable(
-                &self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?,
-            ),
+            } => flake_value_to_comparable(&self.decode_lit(
+                *o_kind,
+                *o_key,
+                *p_id,
+                *dt_id,
+                *lang_id,
+                *arena_g_id,
+            )?),
 
             Binding::Grouped(_) => None,
 
@@ -479,9 +490,10 @@ impl Materializer {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => Some(Arc::from(
-                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                     .to_string(),
             )),
 
@@ -534,7 +546,8 @@ impl Materializer {
                 lang_id,
                 i_val,
                 t,
-            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)? {
+                arena_g_id,
+            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)? {
                 FlakeValue::Ref(sid) => Binding::sid(sid),
                 val => {
                     let dt_sid = self
@@ -637,9 +650,10 @@ impl Materializer {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: fluree_db_core::GraphId,
     ) -> Result<FlakeValue> {
         self.graph_view
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id)
             .map_err(|e| {
                 decode_error(
                     "decode literal",

@@ -443,6 +443,37 @@ async fn incremental_index(
     build::incremental::incremental_index(content_store, tracker, ledger_id, record, config).await
 }
 
+/// Merge already-resolved `novelty` into its base root and write the new
+/// root: the phases of an incremental build after commit resolution.
+///
+/// For a caller that produces novelty itself rather than from the commits
+/// after the published index — a bulk import into an existing ledger.
+/// `base_root_id` is the published root `novelty.base_root` derives from,
+/// and `replaced_cids` its artifacts the caller already superseded.
+pub async fn index_novelty(
+    content_store: std::sync::Arc<dyn fluree_db_core::ContentStore>,
+    ledger_id: &str,
+    base_root_id: fluree_db_core::ContentId,
+    novelty: run_index::IncrementalNovelty,
+    config: IndexerConfig,
+    replaced_cids: Vec<fluree_db_core::ContentId>,
+) -> Result<IndexResult> {
+    build::incremental::index_novelty(
+        content_store,
+        fluree_db_core::tracking::Tracker::disabled(),
+        ledger_id,
+        base_root_id,
+        novelty,
+        config,
+        replaced_cids,
+    )
+    .await
+}
+
+pub use build::dict_extend::extend_dicts;
+pub use build::incremental::{predicate_sids, DictNoveltyUpdate};
+pub use build::upload_dicts::{upload_numbig_arenas_from_disk, upload_vector_arenas_from_disk};
+
 /// Upload index artifacts (FLI3 leaves, FHS1 sidecars, FBR3 branches) to CAS.
 pub async fn upload_indexes_to_cas(
     content_store: &dyn fluree_db_core::ContentStore,
@@ -470,6 +501,40 @@ pub async fn upload_dicts_from_disk(
         trust_sorted_order_invariants,
     )
     .await
+}
+
+/// Refuse to publish a build of `built` whose head is no longer on the
+/// branch's line: a rebase moved the branch while it was built. Published,
+/// the index would serve the replaced line under the new head, and when the
+/// rebase left the head at the index's `t`, no later build would replace it.
+/// Walks the commits the branch gained during the build, usually none.
+pub async fn refuse_build_off_the_line(
+    nameservice: &dyn NameServiceLookup,
+    cs: &dyn ContentStore,
+    built: &fluree_db_nameservice::NsRecord,
+) -> Result<()> {
+    let Some(built_head) = built.commit_head_id.as_ref() else {
+        return Ok(());
+    };
+    let current = nameservice
+        .lookup(built.ledger_id.as_str())
+        .await
+        .map_err(|e| IndexerError::NameService(e.to_string()))?;
+    let Some(current_head) = current.as_ref().and_then(|r| r.commit_head_id.as_ref()) else {
+        return Ok(());
+    };
+    if current_head == built_head {
+        return Ok(());
+    }
+    let line =
+        fluree_db_core::collect_first_parent_cids(cs, current_head, built.commit_t - 1).await?;
+    match line.last() {
+        Some((t, cid)) if *t == built.commit_t && cid == built_head => Ok(()),
+        _ => Err(IndexerError::Other(format!(
+            "the branch moved off the built head {built_head} at t={} during the build",
+            built.commit_t
+        ))),
+    }
 }
 
 /// Publish index result to nameservice. Takes the narrower

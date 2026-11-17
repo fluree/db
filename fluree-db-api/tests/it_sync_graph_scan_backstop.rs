@@ -130,5 +130,13 @@ async fn whole_graph_scan_backstop_fails_loud_before_materializing() {
         .await
         .expect("disabled cap syncs normally");
     assert!(!report.committed);
+
+    // A drop reads none of the graph, so the cap never applies to it.
+    std::env::set_var("FLUREE_MAX_GRAPH_SCAN_FLAKES", "2");
+    let dropped = fluree
+        .drop_named_graph(ledger_id, ONT_IRI)
+        .await
+        .expect("a drop over the cap");
+    assert!(dropped.committed);
     std::env::remove_var("FLUREE_MAX_GRAPH_SCAN_FLAKES");
 }

@@ -844,7 +844,7 @@ async fn compiled_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache
 /// blocking a runtime worker on it would risk starving the very executor the
 /// reads need to make progress.
 async fn compile_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache>> {
-    let g_ids = crate::tx::resolve_shapes_source_g_ids(db.ledger_config(), &db.snapshot)
+    let g_ids = crate::tx::resolve_shapes_source_g_ids(db.ledger_config(), &db.snapshot, db.t)
         .unwrap_or_else(|_| vec![0]);
     let views: Vec<GraphDb> = g_ids
         .iter()

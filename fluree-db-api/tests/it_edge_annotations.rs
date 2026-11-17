@@ -4193,7 +4193,7 @@ async fn trig_star_in_graph_block_matches_jsonld_named_graph_annotation() {
     let g_id = ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(graph_iri)
+        .assigned_graph_id(graph_iri)
         .expect("named graph registered");
     let graph_sid = ledger.snapshot.encode_iri(graph_iri).expect("graph sid");
     let subject_sid = ledger
@@ -5588,7 +5588,7 @@ fn graph_id(ledger: &MemoryLedger, iri: &str) -> fluree_db_core::GraphId {
     ledger
         .snapshot
         .graph_registry
-        .graph_id_for_iri(iri)
+        .assigned_graph_id(iri)
         .unwrap_or_else(|| panic!("graph {iri} must be registered"))
 }
 

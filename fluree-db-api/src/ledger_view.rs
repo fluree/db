@@ -109,7 +109,7 @@ impl CommitRef {
     }
 }
 
-/// A ledger head's graph names, read as [`LedgerView::graph_id_for_iri`]
+/// A ledger head's graph names, read as [`LedgerView::assigned_graph_id`]
 /// reads them, without the rest of a view: two shared handles, so taking one
 /// copies nothing ([`LedgerHandle::graph_names`](crate::LedgerHandle::graph_names)).
 #[derive(Clone)]
@@ -120,7 +120,7 @@ pub struct GraphNames {
 
 impl GraphNames {
     /// The graph id registered under `iri`, if any.
-    pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
         self.table().graph_id(iri)
     }
 
@@ -203,7 +203,7 @@ impl LedgerView {
     /// the snapshot's graph registry, then the binary index store's. A
     /// borrowed lookup: nothing is copied, so a request pays O(1) per
     /// reference however many graphs the ledger holds.
-    pub fn graph_id_for_iri(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
         HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
             .graph_id(iri)
     }

@@ -2886,15 +2886,15 @@ async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
     let txn_meta_iri = fluree_db_core::txn_meta_graph_iri("wl-reserved-neg:main");
 
     // 1. Relative and foreign spellings are refused by FROM: a relative
-    //    `#config` is not an IRI at all, and another ledger's reserved IRI
-    //    names that other ledger. (The bare keywords `config` / `txn-meta` are
-    //    an explicit naming of this ledger's reserved graph, as on every
-    //    ledger-scoped surface.)
+    //    `#config` is not an IRI at all, and another ledger's config graph IRI
+    //    names that ledger's, with a refusal naming this ledger's own. (The
+    //    bare keywords `config` / `txn-meta` are an explicit naming of this
+    //    ledger's reserved graph, as on every ledger-scoped surface.)
     let foreign_config = fluree_db_core::config_graph_iri("some-other:main");
     for (iri, needle) in [
         ("#config", "neither a ledger address"),
         ("#txn-meta", "neither a ledger address"),
-        (foreign_config.as_str(), "not in this ledger"),
+        (foreign_config.as_str(), config_iri.as_str()),
     ] {
         let sparql = format!(
             "PREFIX schema: <http://schema.org/> \
@@ -2909,6 +2909,19 @@ async fn sparql_reserved_graphs_stay_unreachable_when_not_named_in_full() {
             "expected the within-ledger rejection for FROM <{iri}>, got: {err}"
         );
     }
+    // The JSON-LD twin: a `from` member's graph naming another ledger's
+    // config graph is not this ledger's config graph.
+    let err = fluree
+        .query_from()
+        .jsonld(&json!({
+            "from": {"@id": "wl-reserved-neg:main", "graph": foreign_config},
+            "select": "?s",
+            "where": {"@id": "?s", "?p": "?o"}
+        }))
+        .execute_formatted()
+        .await
+        .expect_err("a from graph naming another ledger's config graph must be rejected");
+    assert!(err.to_string().contains(&foreign_config), "{err}");
 
     // 2. `GRAPH <reserved>` with no FROM NAMED resolves to nothing. The
     //    reserved graphs hold data here (txn-meta always does), so an empty
@@ -4376,85 +4389,205 @@ async fn a_named_only_dataset_advises_when_the_query_reads_its_empty_default_gra
     assert!(QueryAdvisory::EmptyDefaultGraph.message().contains("FROM"));
 }
 
-/// On a branch, the main branch's config URN (which the branch inherited)
-/// reads what main wrote under it, the branch's own URN and the `config`
-/// keyword read the branch's config graph, and a user graph named
-/// `urn:fluree:…#…` is a graph, never an address. On the branch's own view
-/// (SPARQL `FROM`, and `FROM NAMED` + `GRAPH`) and through `query_from()` (the
-/// JSON-LD `from` object form).
+/// On a branch, its own config URN and the `config` keyword read its config
+/// graph, which holds what main wrote there before the fork; main's config URN
+/// names main's config graph, so the branch's view and `query_from()` naming
+/// the branch refuse it, naming the branch's own (SPARQL `FROM`, `FROM NAMED`
+/// + `GRAPH`, and the JSON-LD `from` object). A connection query naming main's
+/// URN reads main's config. Main's txn-meta URN is refused the same way. A
+/// user graph named `urn:fluree:…#…` is a graph, never an address. On a branch
+/// of an unindexed main, and of an indexed one, whose system graph slots hold
+/// main's URNs.
 #[tokio::test]
-async fn a_branch_reads_config_by_the_main_urn_and_urn_named_graphs_stay_graphs() {
-    let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = fluree.create_ledger("so1").await.unwrap();
-    fluree
-        .stage_owned(ledger)
-        .upsert_turtle(
-            r#"@prefix ex: <http://example.org/ns/> .
-               ex:a ex:setting "in-default" .
-               GRAPH <urn:fluree:so1:main#config> { ex:cfg ex:setting "in-config" . }
-               GRAPH <urn:fluree:so1:main#resolution-config> { ex:r ex:setting "in-user-graph" . }"#,
-        )
-        .execute()
-        .await
-        .expect("seed");
-    fluree
-        .create_branch("so1", "feature", None, None)
-        .await
-        .unwrap();
-    let branch = fluree.ledger("so1:feature").await.unwrap();
-    let branch = fluree
-        .stage_owned(branch)
-        .upsert_turtle(
-            r#"@prefix ex: <http://example.org/ns/> .
-               GRAPH <urn:fluree:so1:feature#config> { ex:bcfg ex:setting "in-branch-config" . }"#,
-        )
-        .execute()
-        .await
-        .expect("the branch's own config")
-        .ledger;
+async fn a_branch_reads_config_by_its_own_urn_and_urn_named_graphs_stay_graphs() {
+    for indexed in [false, true] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = if indexed { "so1i" } else { "so1u" };
+        let main_config = format!("urn:fluree:{name}:main#config");
+        let user_graph = format!("urn:fluree:{name}:main#resolution-config");
+        let branch_id = format!("{name}:feature");
+        let branch_config = format!("urn:fluree:{branch_id}#config");
+        let ledger = fluree.create_ledger(name).await.unwrap();
+        fluree
+            .stage_owned(ledger)
+            .upsert_turtle(&format!(
+                r#"@prefix ex: <http://example.org/ns/> .
+                   ex:a ex:setting "in-default" .
+                   GRAPH <{main_config}> {{ ex:cfg ex:setting "in-config" . }}
+                   GRAPH <{user_graph}> {{ ex:r ex:setting "in-user-graph" . }}"#
+            ))
+            .execute()
+            .await
+            .expect("seed");
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &format!("{name}:main")).await;
+        }
+        fluree
+            .create_branch(name, "feature", None, None)
+            .await
+            .unwrap();
+        let branch = fluree.ledger(&branch_id).await.unwrap();
+        let branch = fluree
+            .stage_owned(branch)
+            .upsert_turtle(&format!(
+                r#"@prefix ex: <http://example.org/ns/> .
+                   GRAPH <{branch_config}> {{ ex:bcfg ex:setting "in-branch-config" . }}"#
+            ))
+            .execute()
+            .await
+            .expect("the branch's own config")
+            .ledger;
+        let main_txn_meta = format!("urn:fluree:{name}:main#txn-meta");
+        let branch_txn_meta = format!("urn:fluree:{branch_id}#txn-meta");
+        for (g_id, main_iri, branch_iri) in [
+            (
+                fluree_db_core::graph_registry::CONFIG_GRAPH_ID,
+                &main_config,
+                &branch_config,
+            ),
+            (
+                fluree_db_core::graph_registry::TXN_META_GRAPH_ID,
+                &main_txn_meta,
+                &branch_txn_meta,
+            ),
+        ] {
+            let slot = branch.snapshot.graph_registry.iri_for_graph_id(g_id);
+            let expected = if indexed { main_iri } else { branch_iri };
+            assert_eq!(
+                slot,
+                Some(expected.as_str()),
+                "indexed={indexed}, slot {g_id}"
+            );
+        }
+        let case = |graph: &str| format!("indexed={indexed}, graph {graph}");
 
-    for (graph, want) in [
-        ("urn:fluree:so1:main#config", "in-config"),
-        ("urn:fluree:so1:feature#config", "in-branch-config"),
-        ("config", "in-branch-config"),
-        ("urn:fluree:so1:main#resolution-config", "in-user-graph"),
-    ] {
-        let sparql =
-            format!("SELECT ?v FROM <{graph}> WHERE {{ ?s <http://example.org/ns/setting> ?v }}");
-        let rows = view_names(&fluree, &branch, &sparql).await;
-        assert!(
-            rows.contains(&json!([want])) && !rows.contains(&json!(["in-default"])),
-            "the branch's view, FROM <{graph}>: {rows:?}"
+        for (graph, want) in [
+            (
+                branch_config.as_str(),
+                &["in-config", "in-branch-config"][..],
+            ),
+            ("config", &["in-config", "in-branch-config"][..]),
+            (user_graph.as_str(), &["in-user-graph"][..]),
+        ] {
+            let sparql = format!(
+                "SELECT ?v FROM <{graph}> WHERE {{ ?s <http://example.org/ns/setting> ?v }}"
+            );
+            let rows = view_names(&fluree, &branch, &sparql).await;
+            for want in want {
+                assert!(
+                    rows.contains(&json!([want])) && !rows.contains(&json!(["in-default"])),
+                    "the branch's view, FROM: {}: {rows:?}",
+                    case(graph)
+                );
+            }
+            let query = json!({
+                "from": {"@id": branch_id, "graph": graph},
+                "select": "?v",
+                "where": {"@id": "?s", "http://example.org/ns/setting": "?v"}
+            });
+            let result = fluree
+                .query_from()
+                .jsonld(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("query_from(): {}: {e}", case(graph)));
+            let values = result.as_array().cloned().unwrap_or_default();
+            for want in want {
+                assert!(
+                    values.contains(&json!(want)) && !values.contains(&json!("in-default")),
+                    "query_from(): {}: {result}",
+                    case(graph)
+                );
+            }
+        }
+        let names = format!(
+            "SELECT ?v FROM NAMED <{user_graph}> \
+             WHERE {{ GRAPH <{user_graph}> {{ ?s <http://example.org/ns/setting> ?v }} }}"
         );
-        let query = json!({
-            "from": {"@id": "so1:feature", "graph": graph},
-            "select": "?v",
-            "where": {"@id": "?s", "http://example.org/ns/setting": "?v"}
-        });
-        let result = fluree
+        let rows = view_names(&fluree, &branch, &names).await;
+        assert!(
+            rows.contains(&json!(["in-user-graph"])),
+            "the branch's view, FROM NAMED: {}: {rows:?}",
+            case(&user_graph)
+        );
+
+        // Main's config URN names main's config graph.
+        let refused = |err: fluree_db_api::ApiError, surface: &str| {
+            assert_eq!(
+                err.status_code(),
+                400,
+                "{surface}: {}: {err}",
+                case(&main_config)
+            );
+            assert!(
+                err.to_string().contains(&branch_config),
+                "{surface} names the branch's own config graph: {err}"
+            );
+        };
+        for sparql in [
+            format!(
+                "SELECT ?v FROM <{main_config}> WHERE {{ ?s <http://example.org/ns/setting> ?v }}"
+            ),
+            format!(
+                "SELECT ?v FROM NAMED <{main_config}> \
+                 WHERE {{ GRAPH <{main_config}> {{ ?s <http://example.org/ns/setting> ?v }} }}"
+            ),
+        ] {
+            let err = support::query_sparql(&fluree, &branch, &sparql)
+                .await
+                .map(|_| ())
+                .expect_err(&sparql);
+            refused(err, "the branch's view");
+        }
+        let err = fluree
             .query_from()
-            .jsonld(&query)
+            .jsonld(&json!({
+                "from": {"@id": branch_id, "graph": main_config},
+                "select": "?v",
+                "where": {"@id": "?s", "http://example.org/ns/setting": "?v"}
+            }))
             .execute_formatted()
             .await
-            .unwrap_or_else(|e| panic!("query_from(), graph {graph}: {e}"));
-        let values = result.as_array().cloned().unwrap_or_default();
+            .map(|_| ())
+            .expect_err("query_from() naming the branch and main's config URN");
+        refused(err, "query_from()");
+        // Main's txn-meta URN names main's txn-meta graph, as main's config URN
+        // names its config graph: refused, naming the branch's own where the
+        // branch holds main's at its slot.
+        let err = support::query_sparql(
+            &fluree,
+            &branch,
+            &format!("SELECT ?s FROM <{main_txn_meta}> WHERE {{ ?s ?p ?o }}"),
+        )
+        .await
+        .map(|_| ())
+        .expect_err("main's txn-meta URN on the branch's view");
+        assert_eq!(err.status_code(), 400, "{}: {err}", case(&main_txn_meta));
+        if indexed {
+            assert!(
+                err.to_string().contains(&branch_txn_meta),
+                "names the branch's own txn-meta graph: {err}"
+            );
+        }
+        let rows = fluree
+            .query_from()
+            .sparql(&format!(
+                "SELECT ?v FROM <{main_config}> WHERE {{ ?s <http://example.org/ns/setting> ?v }}"
+            ))
+            .format(fluree_db_api::FormatterConfig::sparql_json())
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("a connection query: {}: {e}", case(&main_config)));
+        let values: Vec<&str> = rows["results"]["bindings"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|binding| binding["v"]["value"].as_str())
+            .collect();
         assert!(
-            values.contains(&json!(want)) && !values.contains(&json!("in-default")),
-            "query_from(), graph {graph}: {result}"
-        );
-    }
-    for (graph, want) in [
-        ("urn:fluree:so1:main#config", "in-config"),
-        ("urn:fluree:so1:main#resolution-config", "in-user-graph"),
-    ] {
-        let sparql = format!(
-            "SELECT ?v FROM NAMED <{graph}> \
-             WHERE {{ GRAPH <{graph}> {{ ?s <http://example.org/ns/setting> ?v }} }}"
-        );
-        let rows = view_names(&fluree, &branch, &sparql).await;
-        assert!(
-            rows.contains(&json!([want])),
-            "the branch's view, FROM NAMED <{graph}>: {rows:?}"
+            values.contains(&"in-config") && !values.contains(&"in-branch-config"),
+            "a connection query reads main's config: {}: {rows}",
+            case(&main_config)
         );
     }
 }
@@ -4620,4 +4753,128 @@ fn the_embedder_surface_on_the_hard_keep_list_still_compiles() {
         fluree_db_api::sparql_dataset_ledger_ids("SELECT * FROM <mydb:main> WHERE { ?s ?p ?o }")
             .unwrap();
     assert_eq!(ids, ["mydb:main"]);
+}
+
+/// A language-tagged constant read through the range path (a dataset that
+/// spans ledgers reads every member that way) reads its tag's rows only: each
+/// tag is its own object type, so the range read narrows to it as it does to
+/// a custom datatype's. With three-row leaflets and ten tags, the read returns
+/// one tag's rows and reads a fraction of the leaflets a read of every tag's
+/// does. The tag matches whatever its case, and a tag only novelty holds is
+/// still read.
+#[tokio::test]
+async fn a_tagged_constant_reads_only_its_tags_rows_across_ledgers() {
+    use fluree_db_api::admin::ReindexOptions;
+    use fluree_db_indexer::IndexerConfig;
+    const A: &str = "it/dataset-tagged-a:main";
+    const B: &str = "it/dataset-tagged-b:main";
+    const TAGS: [&str; 10] = ["de", "en", "es", "fi", "fr", "it", "ja", "nl", "pt", "sv"];
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let labels: String = (0..60)
+        .map(|i| format!("ex:s{i} ex:label \"chat\"@{} .\n", TAGS[i % TAGS.len()]))
+        .collect();
+    for (ledger, turtle) in [
+        (A, labels),
+        (B, "ex:t ex:label \"chat\"@fr .\n".to_string()),
+    ] {
+        fluree.create_ledger(ledger).await.expect("create");
+        let handle = fluree.ledger_cached(ledger).await.expect("cache");
+        fluree
+            .stage(&handle)
+            .upsert_turtle(&format!("@prefix ex: <http://example.org/ns/> .\n{turtle}"))
+            .execute()
+            .await
+            .expect("seed");
+        fluree
+            .reindex(
+                ledger,
+                ReindexOptions::default()
+                    .with_indexer_config(IndexerConfig::default().with_leaflet_rows(3)),
+            )
+            .await
+            .expect("index");
+        fluree.disconnect_ledger(ledger).await;
+    }
+    // A tag only novelty holds.
+    let handle = fluree.ledger_cached(A).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle("@prefix ex: <http://example.org/ns/> .\nex:n ex:label \"chat\"@ko .")
+        .execute()
+        .await
+        .expect("novelty");
+
+    // The range read itself, tracked: with the tag, and without one.
+    let db = fluree.db(A).await.expect("db");
+    let read = |lang: Option<&str>| {
+        let tracker = fluree_db_core::Tracker::new(fluree_db_core::TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
+        let snapshot = &db.snapshot;
+        let match_val = fluree_db_core::RangeMatch {
+            p: snapshot.encode_iri("http://example.org/ns/label"),
+            o: Some(fluree_db_core::FlakeValue::String("chat".into())),
+            dt: snapshot.encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"),
+            lang: lang.map(std::sync::Arc::from),
+            ..Default::default()
+        };
+        let opts = fluree_db_core::RangeOptions {
+            to_t: Some(db.t),
+            ..Default::default()
+        };
+        async move {
+            let flakes = fluree_db_core::range::range_with_overlay_tracked(
+                snapshot,
+                0,
+                &fluree_db_core::NoOverlay,
+                fluree_db_core::IndexType::Post,
+                fluree_db_core::RangeTest::Eq,
+                match_val,
+                opts,
+                Some(&tracker),
+            )
+            .await
+            .expect("range read");
+            let fuel = tracker.tally().and_then(|t| t.fuel).expect("fuel");
+            (flakes.len(), fuel)
+        }
+    };
+    let (tagged, tagged_fuel) = read(Some("fr")).await;
+    let (any_tag, any_tag_fuel) = read(None).await;
+    assert_eq!(
+        (tagged, any_tag),
+        (6, 60),
+        "the tag's rows, and every tag's"
+    );
+    assert!(
+        tagged_fuel * 3.0 < any_tag_fuel,
+        "one of ten tags read {tagged_fuel} fuel, every tag {any_tag_fuel}"
+    );
+
+    let run = |object: &str| {
+        let query = format!(
+            "PREFIX ex: <http://example.org/ns/>
+             SELECT ?s FROM <{A}> FROM <{B}> WHERE {{ ?s ex:label {object} }}"
+        );
+        let fluree = fluree.clone();
+        async move {
+            let json = fluree
+                .query_from()
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            json["results"]["bindings"].as_array().map_or(0, Vec::len)
+        }
+    };
+    assert_eq!(
+        run("\"chat\"@fr").await,
+        7,
+        "one tag's rows over both ledgers"
+    );
+    assert_eq!(run("?o").await, 62, "every label");
+    assert_eq!(run("\"chat\"@FR").await, 7, "a tag matches in any case");
+    assert_eq!(run("\"chat\"@ko").await, 1, "a tag only novelty holds");
+    assert_eq!(run("\"chat\"@zz").await, 0, "a tag nothing holds");
 }

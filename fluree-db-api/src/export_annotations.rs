@@ -52,6 +52,9 @@ pub struct AnnotationProbe<'a> {
     /// Bundles recovered by scanning the base index, for a ledger whose arena
     /// was never sealed. Resolved once at export start; empty otherwise.
     scanned: HashMap<EdgeKey, Vec<Sid>>,
+    /// The graphs a drop took after the index, as edges name them: the arena
+    /// predates those drops, so an edge of theirs is read from novelty alone.
+    arena_dropped_graphs: Vec<Option<Sid>>,
     as_of_t: i64,
     /// Reifiers named by a `~ <r>` marker somewhere in this export.
     named: Mutex<HashSet<Sid>>,
@@ -73,6 +76,7 @@ impl<'a> AnnotationProbe<'a> {
             reader: arena.map(|(root, store)| AnnotationArenaReader::new(root, store.as_ref())),
             novelty,
             scanned: HashMap::new(),
+            arena_dropped_graphs: Vec::new(),
             as_of_t,
             named: Mutex::new(HashSet::new()),
             in_scope: Mutex::new(HashSet::new()),
@@ -190,7 +194,11 @@ impl<'a> AnnotationProbe<'a> {
             return Ok(Some(probe));
         }
         match (&snapshot.annotation_index, &snapshot.content_store) {
-            (Some(root), Some(store)) => Ok(Some(Self::new(Some((root, store)), novelty, as_of_t))),
+            (Some(root), Some(store)) => {
+                let mut probe = Self::new(Some((root, store)), novelty, as_of_t);
+                probe.arena_dropped_graphs = snapshot.edge_graphs_dropped_since_index();
+                Ok(Some(probe))
+            }
             (Some(_), None) => Err(ApiError::internal(
                 "ledger has a sealed annotation arena but no content store to read it from",
             )),
@@ -213,6 +221,29 @@ impl<'a> AnnotationProbe<'a> {
     /// Entry `i` is empty when `edges[i]` carries no annotation whose latest
     /// event at or before `as_of_t` is an assert.
     pub(crate) async fn live_reifiers(&self, edges: &[EdgeKey]) -> io::Result<Vec<Vec<Sid>>> {
+        let mut live = self.arena_or_novelty_reifiers(edges).await?;
+        if !self.arena_dropped_graphs.is_empty() {
+            // The arena predates the drop of these edges' graphs, which took
+            // all it holds of them.
+            for (edge, live) in edges.iter().zip(live.iter_mut()) {
+                if self.arena_dropped_graphs.contains(&edge.g) {
+                    *live = self
+                        .novelty
+                        .map(|novelty| {
+                            novelty
+                                .current_annotations_for_at(edge, self.as_of_t)
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                }
+            }
+        }
+        Ok(live)
+    }
+
+    /// [`Self::live_reifiers`] as the arena, the base-index scan and novelty
+    /// hold them.
+    async fn arena_or_novelty_reifiers(&self, edges: &[EdgeKey]) -> io::Result<Vec<Vec<Sid>>> {
         if edges.is_empty() {
             return Ok(Vec::new());
         }

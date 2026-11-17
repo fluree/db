@@ -32,6 +32,25 @@ fn fluree_cmd(work_dir: &TempDir) -> Command {
     cmd
 }
 
+/// `iceberg map` needs `--r2rml`. Writes a mapping of `sales.orders` into
+/// `dir` and returns its absolute path.
+fn write_mapping(dir: &std::path::Path) -> String {
+    let path = dir.join("orders.ttl");
+    std::fs::write(
+        &path,
+        r#"@prefix rr: <http://www.w3.org/ns/r2rml#> .
+@prefix ex: <http://example.org/> .
+
+<http://example.org/mapping#Orders> a rr:TriplesMap ;
+    rr:logicalTable [ rr:tableName "sales.orders" ] ;
+    rr:subjectMap [ rr:template "http://example.org/order/{id}" ] ;
+    rr:predicateObjectMap [ rr:predicate ex:id ; rr:objectMap [ rr:column "id" ] ] .
+"#,
+    )
+    .unwrap();
+    path.to_str().unwrap().to_string()
+}
+
 fn google_federation_flags() -> Vec<&'static str> {
     vec![
         "--catalog-uri",
@@ -51,9 +70,11 @@ fn google_federation_flags() -> Vec<&'static str> {
 fn a_local_map_stores_the_google_identity_its_flags_name() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
+    let mapping = write_mapping(tmp.path());
     fluree_cmd(&tmp)
         .args(["iceberg", "map", "orders"])
         .args(google_federation_flags())
+        .args(["--r2rml", &mapping])
         .assert()
         .success();
 
@@ -73,6 +94,7 @@ fn a_local_map_stores_the_google_identity_its_flags_name() {
 fn a_local_map_refuses_flags_that_cannot_mean_anything_in_their_spelling() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
+    let mapping = write_mapping(tmp.path());
     for (flags, refusal) in [
         (
             vec![
@@ -124,6 +146,7 @@ fn a_local_map_refuses_flags_that_cannot_mean_anything_in_their_spelling() {
         fluree_cmd(&tmp)
             .args(["iceberg", "map", "gs"])
             .args(&flags)
+            .args(["--r2rml", &mapping])
             .assert()
             .failure()
             .stderr(predicate::str::contains(refusal));
@@ -162,7 +185,11 @@ mod seam {
         std::env::set_var(fluree_db_api::SECRET_ENV_VARS_ENV, SA_KEY_VAR);
         std::env::remove_var(SA_KEY_VAR);
 
-        let args = map_args(&google_federation_flags());
+        let mapping_dir = tempfile::tempdir().unwrap();
+        let mapping = write_mapping(mapping_dir.path());
+        let mut flags = google_federation_flags();
+        flags.extend(["--r2rml", mapping.as_str()]);
+        let args = map_args(&flags);
         let body = fluree_db_cli::commands::iceberg::args_to_json(&args).unwrap();
         assert!(
             body.get("catalog").is_some() && body.get("auth_google_service_account_env").is_none(),
@@ -205,13 +232,25 @@ mod seam {
             .await
             .unwrap()
             .expect("registered");
-        let remote: serde_json::Value = serde_json::from_str(&record.config).unwrap();
-        let local = serde_json::to_value(
+        let mut remote: serde_json::Value = serde_json::from_str(&record.config).unwrap();
+        let mut local = serde_json::to_value(
             fluree_db_cli::commands::iceberg::build_iceberg_config(&args)
                 .unwrap()
                 .to_iceberg_gs_config(),
         )
         .unwrap();
+        // The connection config carries no mapping; registration stores the
+        // mapping it was sent and records where.
+        let mapping = remote.as_object_mut().unwrap().remove("mapping");
+        assert_eq!(
+            mapping.as_ref().map(|m| &m["media_type"]),
+            Some(&serde_json::json!("text/turtle")),
+            "the server stores the mapping: {mapping:?}"
+        );
+        assert_eq!(
+            local.as_object_mut().unwrap().remove("mapping"),
+            Some(serde_json::Value::Null)
+        );
         assert_eq!(remote, local);
         assert_eq!(
             remote["catalog"]["auth"]["credentials"]["key"]["env_var"],

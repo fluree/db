@@ -39,7 +39,7 @@ As the protocol specifies, an empty `PUT` body empties the graph. Unlike `/sync`
 
 ### DELETE: remove
 
-`DELETE` on a named graph is `DROP GRAPH`; on the default graph it is `CLEAR DEFAULT`.
+`DELETE` on a named graph is `DROP GRAPH`: the graph and its history are no longer queryable, and only an identity without a restricting policy may do it. On the default graph it is `CLEAR DEFAULT`, which keeps the default graph's history.
 
 ### Graph existence
 

@@ -172,6 +172,102 @@ async fn a_sparql_aggregate_subquery_counts_per_group() {
     );
 }
 
+/// A count is folded into its group as rows arrive. A group with no
+/// aggregate, or with one that needs all of its rows (GROUP_CONCAT here),
+/// is collected first, by another operator. Either way the head copies the
+/// group key, over an index as over novelty.
+#[tokio::test]
+async fn a_collected_group_derives_one_fact_per_group() {
+    let subquery_rule = |select: Value, predicate: &str| {
+        json!({
+            "@context": ctx(),
+            "where": [["query", {
+                "@context": ctx(),
+                "select": select,
+                "where": {"@id": "?t", "ex:account": "?acct"},
+                "groupBy": ["?acct"]
+            }]],
+            "insert": {"@id": "?acct", predicate: {"@id": "ex:book"}}
+        })
+    };
+    for storage in STORAGE {
+        let ledger_id = format!("datalog/agg-collected-{storage:?}:main").to_lowercase();
+        let (fluree, ledger) = load(&ledger_id, &accounts(), storage).await;
+        for (predicate, select) in [
+            ("ex:activeIn", json!(["?acct"])),
+            (
+                "ex:listedIn",
+                json!(["?acct", "(as (groupconcat ?t) ?txns)"]),
+            ),
+        ] {
+            let query = json!({
+                "@context": ctx(),
+                "select": ["?a", "?book"],
+                "where": {"@id": "?a", predicate: "?book"},
+                "reasoning": "datalog",
+                "rules": [subquery_rule(select, predicate)]
+            });
+            assert_eq!(
+                rows(&fluree, &ledger, &query).await,
+                vec![json!(["ex:a1", "ex:book"]), json!(["ex:a2", "ex:book"])],
+                "{predicate} {storage:?}"
+            );
+        }
+    }
+}
+
+/// The SPARQL twin, as stored rules.
+#[tokio::test]
+async fn a_sparql_collected_group_derives_one_fact_per_group() {
+    let sparql_rule = |name: &str, construct: &str| {
+        json!({
+            "@id": format!("http://example.org/rule/{name}"),
+            "f:rule": {
+                "@type": "f:sparql",
+                "@value": format!("PREFIX ex: <http://example.org/> {construct}")
+            }
+        })
+    };
+    let mut data = accounts();
+    data["@context"]["f"] = json!("https://ns.flur.ee/db#");
+    data["@graph"].as_array_mut().unwrap().extend([
+        sparql_rule(
+            "active",
+            "CONSTRUCT { ?acct ex:activeIn ex:book } WHERE { \
+             { SELECT ?acct WHERE { ?t ex:account ?acct } GROUP BY ?acct } }",
+        ),
+        sparql_rule(
+            "listed",
+            "CONSTRUCT { ?acct ex:listedIn ex:book } WHERE { \
+             { SELECT ?acct (GROUP_CONCAT(?t) AS ?txns) WHERE { ?t ex:account ?acct } \
+               GROUP BY ?acct } }",
+        ),
+    ]);
+    for storage in STORAGE {
+        let ledger_id = format!("datalog/agg-collected-sparql-{storage:?}:main").to_lowercase();
+        let (fluree, ledger) = load(&ledger_id, &data, storage).await;
+        for predicate in ["ex:activeIn", "ex:listedIn"] {
+            let rows = crate::support::query_sparql(
+                &fluree,
+                &ledger,
+                &format!(
+                    "# PRAGMA reasoning: datalog\nPREFIX ex: <http://example.org/>\n\
+                     SELECT ?a ?book WHERE {{ ?a {predicate} ?book }} ORDER BY ?a"
+                ),
+            )
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("format");
+            assert_eq!(
+                normalize_rows(&rows),
+                vec![json!(["ex:a1", "ex:book"]), json!(["ex:a2", "ex:book"])],
+                "{predicate} {storage:?}"
+            );
+        }
+    }
+}
+
 /// An aggregate over a recursive relation counts the finished closure. The
 /// recursion takes many passes; a count taken any earlier would be low.
 #[tokio::test]

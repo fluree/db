@@ -87,14 +87,10 @@ pub enum MaterializeError {
         cap_bytes: usize,
         table_count: usize,
     },
-    /// A parent join key resolved to more than one distinct parent subject (a
-    /// fan-out this builder does not yet emit). The twin builder REFUSES this by
-    /// default: last-wins would bake ONE arbitrary parent per key and silently drop
-    /// the others, and — before the deterministic keep-min tie-break — which one was
-    /// even kept raced the scan order, breaking the stamp's reproducibility contract.
-    /// Overridable with `--allow-duplicate-parent-keys` (the twin then records the
-    /// anomaly in its stamp). The true R2RML RefObjectMap fan-out is a tracked
-    /// follow-up; once it lands, re-materialization heals existing twins.
+    /// No longer returned. Builders that kept one parent subject per join key
+    /// refused a parent key matching several; the builder now emits one edge per
+    /// distinct parent subject (R2RML's fan-out), so nothing is refused. Kept so
+    /// callers matching on it still compile.
     #[error(
         "duplicate parent join keys detected — {summary}. The twin builder refuses these by \
          default (a key mapping to multiple parents makes the foreign-key edge target ambiguous; \
@@ -411,12 +407,12 @@ pub struct WatermarkStamp {
     /// subjects are auditable and reproducible (and so a later verify can widen
     /// coverage by rotating it). Derived deterministically from `mapping_hash`.
     pub sample_seed: u64,
-    /// Ambiguous parent join-key counts per parent TriplesMap IRI, recorded ONLY
-    /// when the twin was built with `--allow-duplicate-parent-keys` over a source
-    /// that has them (otherwise empty, and the stamp is byte-identical to a clean
-    /// twin's). An overridden twin thus self-documents the fan-out anomaly it baked:
-    /// each ambiguous key kept ONE deterministically-chosen parent and dropped the
-    /// rest (the R2RML RefObjectMap fan-out is a tracked follow-up).
+    /// Per parent TriplesMap IRI, the parent join keys an older builder resolved
+    /// to one of several parent subjects, as its stamp recorded them (only a twin
+    /// built with `--allow-duplicate-parent-keys` over such a source has any). The
+    /// current builder emits an edge to every parent subject a key matches, so the
+    /// twins it stamps have none and this is empty; rebuilding an old twin that
+    /// records some restores the edges it dropped.
     pub dup_parent_keys: HashMap<String, u64>,
 }
 
@@ -468,14 +464,11 @@ fn require_nonempty_watermark(
 
 /// Assemble the twin's completion stamp from the provider's captured watermark,
 /// the mapping hash, and the builder version. Fails loud on an empty watermark
-/// for a non-empty table set. `dup_parent_keys` is non-empty only when the build
-/// ran with the duplicate-parent-key override — it self-documents the fan-out
-/// anomaly the twin baked.
+/// for a non-empty table set.
 fn build_watermark_stamp(
     provider: &dyn R2rmlBuildProvider,
     graph_source_id: &str,
     mapping: &CompiledR2rmlMapping,
-    dup_parent_keys: HashMap<String, u64>,
 ) -> Result<WatermarkStamp, MaterializeError> {
     let tables = provider.build_watermark(graph_source_id);
     require_nonempty_watermark(&tables, mapping)?;
@@ -486,42 +479,8 @@ fn build_watermark_stamp(
         mapping_hash: hash,
         tables,
         sample_seed,
-        dup_parent_keys,
+        dup_parent_keys: HashMap::new(),
     })
-}
-
-/// One-clause-per-parent summary of the duplicate-parent-key anomaly for the decline
-/// error: the parent table, its join column(s), and the ambiguous-key count. Sorted
-/// so the message is deterministic.
-fn format_dup_parent_keys(
-    dups: &HashMap<String, u64>,
-    parents: &ParentIndexSet,
-    mapping: &CompiledR2rmlMapping,
-) -> String {
-    let mut clauses: Vec<String> = dups
-        .iter()
-        .map(|(tm_iri, count)| {
-            let table = mapping
-                .triples_maps
-                .get(tm_iri)
-                .and_then(|tm| tm.table_name())
-                .unwrap_or(tm_iri.as_str());
-            let cols = parents
-                .needed_columns(tm_iri)
-                .map(|sets| {
-                    let mut cs: Vec<String> = sets
-                        .iter()
-                        .map(|set| format!("[{}]", set.join(", ")))
-                        .collect();
-                    cs.sort();
-                    cs.join(" / ")
-                })
-                .unwrap_or_default();
-            format!("table '{table}' (join column(s): {cols}): {count} ambiguous key(s)")
-        })
-        .collect();
-    clauses.sort();
-    clauses.join("; ")
 }
 
 /// Namespace of the twin's completion-stamp predicates.
@@ -531,9 +490,9 @@ const STAMP_PRED_BUILDER: &str = "builderVersion";
 const STAMP_PRED_MAPPING_HASH: &str = "mappingHash";
 const STAMP_PRED_WATERMARK: &str = "watermark";
 const STAMP_PRED_SAMPLE_SEED: &str = "sampleSeed";
-/// Optional stamp predicate: present ONLY when the twin was built with the
-/// duplicate-parent-key override over a source that has them. Its absence keeps a
-/// clean twin's stamp byte-identical to before this field existed.
+/// Optional stamp predicate: present only on a twin an older builder made with the
+/// duplicate-parent-key override over a source that has them. The current builder
+/// never writes it (see [`WatermarkStamp::dup_parent_keys`]); it is still read.
 const STAMP_PRED_DUP_PARENT_KEYS: &str = "dupParentKeys";
 
 /// Deterministic JSON (sorted by parent TM IRI) of the ambiguous parent-key counts,
@@ -998,7 +957,6 @@ pub async fn drive_virtual_import(
     chunk_size_bytes: usize,
     parallelism: usize,
     memory_budget_bytes: usize,
-    allow_duplicate_parent_keys: bool,
     ctx: &VirtualChunkContext<'_>,
     result_tx: std::sync::mpsc::SyncSender<ChunkResult>,
 ) -> Result<MaterializeStats, MaterializeError> {
@@ -1206,22 +1164,15 @@ pub async fn drive_virtual_import(
         }
     }
 
-    // Duplicate-parent-key decline gate (dupkey-adjudication.md ruling C2). The
-    // deterministic keep-min tie-break in `index_batch` already made WHICH parent
-    // survives reproducible; this refuses to silently BAKE the fan-out loss (each
-    // ambiguous key keeps one parent, drops the rest) unless the operator opts in.
-    // Checked after the full index build (every parent, including those indexed
-    // during their own emit wave). Returning Err aborts the build BEFORE the
-    // completion stamp is written, so no valid (stamped) twin is ever published for a
-    // declined source — the emit chunks already sent stay unstamped and the overall
-    // import fails.
-    let dup_parent_keys = parents.dup_parent_keys();
-    if !dup_parent_keys.is_empty() && !allow_duplicate_parent_keys {
-        return Err(MaterializeError::DuplicateParentKeys {
-            summary: format_dup_parent_keys(&dup_parent_keys, &parents, &mapping),
-        });
+    // A parent key whose rows mint several subjects gave each referencing row one
+    // edge per subject (#1583); count those keys for the build's stats.
+    total_stats.dup_parent_keys = parents.dup_parent_keys();
+    if !total_stats.dup_parent_keys.is_empty() {
+        tracing::info!(
+            fan_out_keys = ?total_stats.dup_parent_keys,
+            "materialize: parent join keys matching several parent subjects (one edge each)"
+        );
     }
-    total_stats.dup_parent_keys = dup_parent_keys.clone();
 
     // MAJOR-2 (#1529 review): every table has now been scanned, so re-check that
     // none moved snapshots mid-build (a source commit during the build). Fail loud
@@ -1234,9 +1185,8 @@ pub async fn drive_virtual_import(
     // Assemble + ship the completion stamp on the FINAL chunk (highest idx →
     // committed last → the twin's head; a head-walk finds the stamp iff the build
     // completed, §17(a)). With parallel workers the stamp always rides its own
-    // final commit (0-triple + stamp) — the already-supported empty-stamp shape. The
-    // dup-key counts are recorded in the stamp only when the override built over them.
-    let stamp = build_watermark_stamp(provider, graph_source_id, &mapping, dup_parent_keys)?;
+    // final commit (0-triple + stamp) — the already-supported empty-stamp shape.
+    let stamp = build_watermark_stamp(provider, graph_source_id, &mapping)?;
     tracing::info!(
         builder_version = %stamp.builder_version,
         mapping_hash = %stamp.mapping_hash,
@@ -2395,6 +2345,111 @@ mod tests {
         );
     }
 
+    /// A mapping exercising every term-map form the compiled mapping carries:
+    /// an `rr:sqlQuery` logical table, a per-row graph map, `rr:column` and
+    /// constant subjects, a blank-node subject, two classes, constant IRI and
+    /// language-tagged objects, a typed column, an IRI template object, and a
+    /// referencing object map with a composite join.
+    const FEATURE_WIDE_MAPPING: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+
+        <http://example.org/m#Orders> a rr:TriplesMap ;
+            rr:logicalTable [ rr:sqlQuery """SELECT order_id, region, amount FROM sales.orders""" ] ;
+            rr:subjectMap [
+                rr:template "http://example.org/order/{region}/{order_id}" ;
+                rr:class ex:Order ; rr:class ex:Document ;
+                rr:graphMap [ rr:template "http://example.org/graph/{region}" ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:amount ;
+                rr:objectMap [ rr:column "amount" ; rr:datatype xsd:decimal ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:status ;
+                rr:objectMap [ rr:constant ex:Open ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:label ;
+                rr:objectMap [ rr:constant "order"@en ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:region ;
+                rr:objectMap [ rr:template "http://example.org/region/{region}" ; rr:termType rr:IRI ]
+            ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:customer ;
+                rr:objectMap [
+                    rr:parentTriplesMap <http://example.org/m#Customers> ;
+                    rr:joinCondition [ rr:child "customer_id" ; rr:parent "customer_id" ] ;
+                    rr:joinCondition [ rr:child "region" ; rr:parent "region" ]
+                ]
+            ] .
+
+        <http://example.org/m#Customers> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales/customers" ] ;
+            rr:subjectMap [ rr:column "customer_iri" ] ;
+            rr:predicateObjectMap [
+                rr:predicate ex:name ;
+                rr:objectMap [ rr:column "name" ; rr:language "en" ]
+            ] .
+
+        <http://example.org/m#Notes> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales.notes" ] ;
+            rr:subjectMap [ rr:template "note{note_id}" ; rr:termType rr:BlankNode ] ;
+            rr:predicateObjectMap [ rr:predicate ex:text ; rr:objectMap [ rr:column "text" ] ] .
+
+        <http://example.org/m#Catalog> a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "sales.catalog" ] ;
+            rr:subject ex:TheCatalog ;
+            rr:predicateObjectMap [ rr:predicate ex:item ; rr:objectMap [ rr:column "item" ] ] .
+    "#;
+
+    /// `mapping_hash` stamps every twin, so a change to how an EXISTING mapping
+    /// serializes would invalidate every twin built from it. These hashes were
+    /// taken from mappings compiled before the mapping types grew any field for
+    /// declared table keys; a mapping that declares none must keep them.
+    #[test]
+    fn mapping_hash_of_existing_mappings_is_pinned() {
+        let hash = |ttl: &str| {
+            let compiled = fluree_db_r2rml::loader::R2rmlLoader::from_turtle(ttl)
+                .expect("parse")
+                .compile()
+                .expect("compile");
+            super::mapping_hash(&compiled)
+        };
+        let cases = [
+            (
+                "customers_orders",
+                include_str!("../../scripts/glue-local/mappings/customers_orders.ttl"),
+                "053f6aa4b39179daa92a30becff49db2ec187adf638384b60d720058d1f0bdcc",
+            ),
+            (
+                "customers_hinted",
+                include_str!("../../scripts/glue-local/mappings/customers_hinted.ttl"),
+                "27d95e201e53275f886b323f0ed5a0700a3c955b24fd895715c9d9cf54a2672a",
+            ),
+            (
+                "enterprise_default",
+                include_str!("../../fluree-db-r2rml/src/emit/testdata/enterprise_default.ttl"),
+                "3bf4da6638205f263084c8d745d3b9abaec9afe1b3d246baba0b82371814dc91",
+            ),
+            (
+                "feature_wide",
+                FEATURE_WIDE_MAPPING,
+                "ab81c83439de463c4e7d86d2257037fdfea5e9b68ec063cae6d26ee226bab9a6",
+            ),
+        ];
+        let got: Vec<(&str, String)> = cases
+            .iter()
+            .map(|(name, ttl, _)| (*name, hash(ttl)))
+            .collect();
+        for ((name, _, want), (_, actual)) in cases.iter().zip(&got) {
+            assert_eq!(actual, want, "{name}: the mapping hash moved; all: {got:?}");
+        }
+    }
+
     #[test]
     fn watermark_guard_rejects_empty_for_nonempty_tables() {
         use fluree_db_query::r2rml::TableWatermark;
@@ -2991,7 +3046,7 @@ mod tests {
                 spool_dir: &spool_dir,
                 spool_config: None,
             };
-            super::drive_virtual_import(&provider, "mock-gs", 64, 2, 0, true, &ctx, tx).await
+            super::drive_virtual_import(&provider, "mock-gs", 64, 2, 0, &ctx, tx).await
         });
         let chunks_sent = drain.join().unwrap();
         let _ = std::fs::remove_dir_all(&spool_dir);
@@ -3396,8 +3451,7 @@ mod tests {
                 "mock-gs",
                 64, // tiny chunk budget → many chunks
                 parallelism,
-                0,    // parent-index budget guard disabled
-                true, // allow duplicate parent keys — this differential test isn't the decline gate
+                0, // parent-index budget guard disabled
                 &ctx,
                 tx,
             )
@@ -3583,7 +3637,7 @@ mod tests {
                     spool_dir: &spool_dir,
                     spool_config: None,
                 };
-                super::drive_virtual_import(&provider, "mock-gs", 64, 2, 0, true, &ctx, tx).await
+                super::drive_virtual_import(&provider, "mock-gs", 64, 2, 0, &ctx, tx).await
             });
             let _ = std::fs::remove_dir_all(&spool_dir);
             drain.join().unwrap();

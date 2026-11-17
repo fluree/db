@@ -138,7 +138,7 @@ impl Harness {
         let ledger = self.ledger();
         let g_id = match graph {
             None => 0,
-            Some(iri) => match ledger.snapshot.graph_registry.graph_id_for_iri(iri) {
+            Some(iri) => match ledger.snapshot.graph_registry.assigned_graph_id(iri) {
                 Some(g) => g,
                 None => return Vec::new(),
             },

@@ -18,8 +18,8 @@ pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir, direct: bool) -
     if let Some(remote_name) = args.remote.as_deref() {
         let client = crate::context::build_remote_client(remote_name, dirs).await?;
         let result = run_delta_map_remote(&client, &args).await.map_err(|e| {
-            CliError::Remote(format!(
-                "failed to map Delta graph source on '{remote_name}': {e}"
+            e.context(format!(
+                "failed to map Delta graph source on '{remote_name}'"
             ))
         });
         crate::context::persist_refreshed_tokens(&client, remote_name, dirs).await;
@@ -30,7 +30,7 @@ pub async fn run_delta_map(args: DeltaMapArgs, dirs: &FlureeDir, direct: bool) -
         if let Some(client) = crate::context::try_server_route_client(dirs) {
             return run_delta_map_remote(&client, &args)
                 .await
-                .map_err(|e| CliError::Remote(format!("failed to map Delta graph source: {e}")));
+                .map_err(|e| e.context("failed to map Delta graph source"));
         }
     }
 
@@ -194,6 +194,7 @@ async fn run_delta_map_remote(
             .unwrap_or(false),
     );
     super::iceberg::print_model_warnings(&super::iceberg::model_warnings_of(&result));
+    report_diagnostics(&result);
     Ok(())
 }
 
@@ -288,6 +289,7 @@ async fn run_delta_map_local(args: DeltaMapArgs, dirs: &FlureeDir) -> CliResult<
         result.mapping_validated,
     );
     super::iceberg::print_model_warnings(&result.model_warnings);
+    super::iceberg::print_diagnostics(&result.diagnostics);
     Ok(())
 }
 
@@ -676,21 +678,7 @@ pub async fn run_delta_verify(
     }
 }
 
-/// Diagnostics on standard error; true if any is an error.
-fn report_diagnostics(answer: &Value) -> bool {
-    let mut any_error = false;
-    for d in answer["diagnostics"].as_array().into_iter().flatten() {
-        let severity = text(d, "severity");
-        any_error |= severity == "error";
-        let place = match (text(d, "table"), text(d, "column")) {
-            ("", _) => String::new(),
-            (table, "") => format!(" {table}:"),
-            (table, column) => format!(" {table}.{column}:"),
-        };
-        eprintln!("{severity}:{place} {}", text(d, "message"));
-    }
-    any_error
-}
+use super::iceberg::report_diagnostics;
 
 pub async fn run_delta_generate(
     args: DeltaGenerateArgs,

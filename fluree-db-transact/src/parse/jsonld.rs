@@ -2284,22 +2284,30 @@ fn parse_literal_value_with_meta(
 
             // Handle @json specially
             if type_iri == "@json" || expanded_type == rdf::JSON {
+                // A template variable, written bare or as the JSON string a
+                // `@json`-typed term serializes it to.
+                if let (true, Value::String(s)) = (object_var_parsing, val) {
+                    let name = s
+                        .strip_prefix('"')
+                        .and_then(|rest| rest.strip_suffix('"'))
+                        .unwrap_or(s);
+                    if name.starts_with('?') && !name.contains(['"', '\\']) {
+                        let var_id = vars.get_or_insert(name);
+                        return Ok(ParsedValue::new(TemplateTerm::Var(var_id)));
+                    }
+                }
                 // Canonicalizing here gives one term per value, regardless
                 // of how the writer serialized it (#1781). A string `@value`
-                // holds an already serialized document, so it is
-                // canonicalized in place when it parses and stored as written
-                // when it does not.
-                let json_string = match val {
-                    Value::String(s) => {
-                        fluree_graph_ir::canonicalize_json(s).unwrap_or_else(|_| s.clone())
-                    }
-                    _ => fluree_graph_ir::canonicalize_json_value(val),
+                // holds an already serialized document, parsed as `INSERT
+                // DATA` and a Turtle transaction parse `"…"^^rdf:JSON`: one
+                // that is not JSON fails the write with their error.
+                let value = match val {
+                    Value::String(s) => crate::value_convert::typed_lexical(s, rdf::JSON)?,
+                    _ => FlakeValue::Json(fluree_graph_ir::canonicalize_json_value(val)),
                 };
                 let datatype_sid = ns_registry.sid_for_iri(rdf::JSON);
-                return Ok(
-                    ParsedValue::new(TemplateTerm::Value(FlakeValue::Json(json_string)))
-                        .with_dtc(DatatypeConstraint::Explicit(datatype_sid)),
-                );
+                return Ok(ParsedValue::new(TemplateTerm::Value(value))
+                    .with_dtc(DatatypeConstraint::Explicit(datatype_sid)));
             }
 
             // Handle @vector shorthand: "@vector" or full IRI both route
@@ -2696,6 +2704,111 @@ mod tests {
         assert!(ns_registry.has_prefix("http://example.org/"));
     }
 
+    /// A context's coercion writes what the explicit form beside it does: a
+    /// `@vocab` term an IRI, a `@json` term one JSON literal, a typed term no
+    /// default language, a term's `"@language": null` no language, a `null`
+    /// term nothing, and an `@index` map the values under its keys.
+    #[test]
+    fn context_coercions_write_their_explicit_forms() {
+        let templates = |ctx: Value, body: Value| {
+            let mut doc = json!({"@context": ctx, "@id": "ex:s"});
+            doc.as_object_mut()
+                .unwrap()
+                .extend(body.as_object().unwrap().clone());
+            parse_doc(&doc, TxnType::Insert)
+                .map(|txn| format!("{:?}", txn.insert_templates))
+                .map_err(|e| e.to_string())
+        };
+        let ex = json!({"ex": "http://example.org/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
+        let with = |terms: Value| {
+            let mut ctx = ex.clone();
+            ctx.as_object_mut()
+                .unwrap()
+                .extend(terms.as_object().unwrap().clone());
+            ctx
+        };
+        let cases = [
+            (
+                with(json!({"k": {"@id": "ex:k", "@type": "@vocab"}, "K": "ex:K"})),
+                json!({"k": "K"}),
+                json!({"ex:k": {"@id": "ex:K"}}),
+            ),
+            (
+                with(json!({"d": {"@id": "ex:d", "@type": "@json"}})),
+                json!({"d": [1, {"a": true}]}),
+                json!({"ex:d": {"@value": [1, {"a": true}], "@type": "@json"}}),
+            ),
+            // A string is a JSON string, not a serialized document.
+            (
+                with(json!({"d": {"@id": "ex:d", "@type": "@json"}})),
+                json!({"d": "5"}),
+                json!({"ex:d": {"@value": "\"5\"", "@type": "@json"}}),
+            ),
+            (
+                with(json!({"@language": "en", "n": {"@id": "ex:n", "@type": "xsd:integer"}})),
+                json!({"n": "5"}),
+                json!({"ex:n": {"@value": "5", "@type": "xsd:integer"}}),
+            ),
+            (
+                with(json!({"@language": "en", "t": {"@id": "ex:t", "@language": null}})),
+                json!({"t": "v"}),
+                json!({"ex:t": "v"}),
+            ),
+            (
+                with(json!({"@vocab": "http://example.org/", "gone": null})),
+                json!({"gone": "x", "ex:u": "w"}),
+                json!({"ex:u": "w"}),
+            ),
+            (
+                with(json!({"m": {"@id": "ex:m", "@container": "@index"}})),
+                json!({"m": {"a": {"@id": "ex:o"}, "b": "x"}}),
+                json!({"ex:m": [{"@id": "ex:o"}, "x"]}),
+            ),
+        ];
+        let differing: Vec<String> = cases
+            .into_iter()
+            .filter(|(ctx, coerced, explicit)| {
+                let expected = templates(ex.clone(), explicit.clone());
+                expected.is_err() || templates(ctx.clone(), coerced.clone()) != expected
+            })
+            .map(|(ctx, coerced, _)| format!("{coerced} under {ctx}"))
+            .collect();
+        assert!(differing.is_empty(), "{differing:#?}");
+    }
+
+    /// A string `@value` under `@json` (or `rdf:JSON`) is a serialized
+    /// document: one that parses is stored canonicalized, and one that does
+    /// not fails the write with the error `INSERT DATA` gives.
+    #[test]
+    fn a_json_literal_string_must_be_json() {
+        let ctx = json!({"ex": "http://example.org/",
+                         "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"});
+        let write = |value: Value, ty: &str| {
+            parse_doc(
+                &json!({"@context": ctx, "@id": "ex:s",
+                        "ex:d": {"@value": value, "@type": ty}}),
+                TxnType::Insert,
+            )
+            .map(|txn| format!("{:?}", txn.insert_templates[0].object))
+            .map_err(|e| e.to_string())
+        };
+        for ty in ["@json", "rdf:JSON"] {
+            assert_eq!(
+                write(json!("{\"b\": 1, \"a\": 2}"), ty),
+                Ok(format!(
+                    "{:?}",
+                    TemplateTerm::Value(FlakeValue::Json(r#"{"a":2,"b":1}"#.into()))
+                )),
+                "{ty}"
+            );
+            let refused = write(json!("not json"), ty).expect_err(ty);
+            assert!(
+                refused.contains("Cannot parse 'not json' as rdf:JSON"),
+                "{ty}: {refused}"
+            );
+        }
+    }
+
     /// `rdf:type` as a key writes the type `@type` would, also as a list,
     /// and refuses a literal, which would type the node with a string.
     #[test]
@@ -3005,6 +3118,39 @@ mod tests {
         ));
         let dtc = result.dtc.as_ref().expect("should have dtc");
         assert!(dtc.datatype().name.as_ref().contains("integer"));
+    }
+
+    /// A value object under a term typed `@id` or `@vocab` inserts the
+    /// literal it would under an untyped term, not an IRI.
+    #[test]
+    fn value_object_under_id_or_vocab_term_inserts_a_literal() {
+        let templates = |unit: Value, value: Value| {
+            let doc = json!({
+                "@context": {
+                    "ex": "http://example.org/",
+                    "xsd": "http://www.w3.org/2001/XMLSchema#",
+                    "unit": unit
+                },
+                "@id": "ex:price",
+                "unit": value
+            });
+            parse_doc(&doc, TxnType::Insert)
+                .map(|txn| format!("{:?}", txn.insert_templates))
+                .map_err(|e| e.to_string())
+        };
+        for value in [
+            json!({"@value": "TWD"}),
+            json!({"@value": "TWD", "@language": "en"}),
+            json!({"@value": "TWD", "@type": "xsd:string"}),
+            json!({"@value": 5}),
+        ] {
+            let untyped = templates(json!("ex:unit"), value.clone()).unwrap();
+            for coercion in ["@id", "@vocab"] {
+                let coerced =
+                    templates(json!({"@id": "ex:unit", "@type": coercion}), value.clone());
+                assert_eq!(coerced.as_ref(), Ok(&untyped), "{value} under {coercion}");
+            }
+        }
     }
 
     #[test]

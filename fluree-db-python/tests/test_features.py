@@ -217,9 +217,12 @@ def test_graphs_are_listed_and_dropped(conn):
     assert ledger.graphs() == [IRI(STAFF_GRAPH)]
     before = ledger.log()[0].t
     commit = ledger.drop_graph(STAFF_GRAPH)
-    assert commit.retracts == 1
+    assert commit.t == before + 1 and commit.retracts == 0
+    assert ledger.graphs() == []
     assert ledger.query(P + f"ASK {{ GRAPH <{STAFF_GRAPH}> {{ ?s ?p ?o }} }}") is False
-    assert ledger.at(t=before).query(P + f"ASK {{ GRAPH <{STAFF_GRAPH}> {{ ?s ?p ?o }} }}") is True
+    # The drop took the graph's history too.
+    with pytest.raises(Exception, match="dropped at t="):
+        ledger.at(t=before).query(P + f"ASK {{ GRAPH <{STAFF_GRAPH}> {{ ?s ?p ?o }} }}")
     assert ledger.query(P + "ASK { ex:dave ex:name ?n }") is True
 
 

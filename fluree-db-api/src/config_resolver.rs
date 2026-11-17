@@ -86,6 +86,37 @@ pub async fn resolve_ledger_config(
     overlay: &dyn OverlayProvider,
     to_t: i64,
 ) -> Result<Option<LedgerConfig>> {
+    // Residency mode: the read is a pure function of resident state, and
+    // view construction runs it outside any query's retry frame, so a miss
+    // is fetched and the read run again here. Any other error surfaces.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    if let Some(cs) = crate::residency::content_store(snapshot) {
+        use fluree_db_binary_index::read::need_fetch::{RetryBudget, DEFAULT_FETCH_WIDTH};
+        let _guard = cs.query_guard();
+        let mut budget = RetryBudget::default();
+        loop {
+            match read_ledger_config(snapshot, overlay, to_t).await {
+                Ok(config) => return Ok(config),
+                Err(e) => {
+                    let retried = budget
+                        .after_error(cs.as_ref(), DEFAULT_FETCH_WIDTH)
+                        .await
+                        .map_err(|re| crate::error::ApiError::internal(re.to_string()))?;
+                    if !retried {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+    read_ledger_config(snapshot, overlay, to_t).await
+}
+
+async fn read_ledger_config(
+    snapshot: &LedgerSnapshot,
+    overlay: &dyn OverlayProvider,
+    to_t: i64,
+) -> Result<Option<LedgerConfig>> {
     #[cfg(test)]
     if config_read_fault::armed() {
         return Err(crate::error::ApiError::internal(
@@ -714,7 +745,11 @@ pub(crate) async fn unenforced_shapes(
             Some(sel) if sel == config_iris::DEFAULT_GRAPH => {
                 Some(fluree_db_core::DEFAULT_GRAPH_ID)
             }
-            Some(sel) => snapshot.graph_registry.graph_id_for_iri(sel),
+            Some(sel) => snapshot
+                .graph_registry
+                .existing_graph_id(sel, to_t)
+                .ok()
+                .flatten(),
         },
         None => Some(fluree_db_core::DEFAULT_GRAPH_ID),
     };
@@ -1267,6 +1302,11 @@ impl MergeableGroup for ShaclDefaults {
         ShaclDefaults {
             enabled: self.enabled.or(base.enabled),
             shapes_source: self.shapes_source.clone().or(base.shapes_source.clone()),
+            additional_data_sources: if self.additional_data_sources.is_empty() {
+                base.additional_data_sources.clone()
+            } else {
+                self.additional_data_sources.clone()
+            },
             validation_mode: self.validation_mode.or(base.validation_mode),
             override_control: base.override_control.effective_min(&self.override_control),
         }
@@ -1834,12 +1874,21 @@ async fn read_shacl_fields(
         config_iris::SHAPES_SOURCE,
     )
     .await?;
+    let additional_data_sources = read_graph_source_refs(
+        snapshot,
+        overlay,
+        to_t,
+        group_sid,
+        config_iris::ADDITIONAL_DATA_SOURCE,
+    )
+    .await?;
     let validation_mode = read_validation_mode(snapshot, overlay, to_t, group_sid).await?;
     let override_control = read_override_control(snapshot, overlay, to_t, group_sid).await?;
 
     Ok(ShaclDefaults {
         enabled,
         shapes_source,
+        additional_data_sources,
         validation_mode,
         override_control,
     })
@@ -2938,6 +2987,7 @@ mod tests {
             shacl: Some(ShaclDefaults {
                 enabled: Some(true),
                 shapes_source: None,
+                additional_data_sources: Vec::new(),
                 validation_mode: Some(ValidationMode::Reject),
                 override_control: control,
             }),
@@ -2970,6 +3020,7 @@ mod tests {
             shacl: Some(ShaclDefaults {
                 enabled: Some(true),
                 shapes_source: None,
+                additional_data_sources: Vec::new(),
                 validation_mode: Some(ValidationMode::Warn),
                 override_control: OverrideControl::None,
             }),

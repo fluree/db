@@ -16,6 +16,9 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
+mod segment_sums;
+pub(crate) use segment_sums::SegmentSumsSlot;
+
 #[derive(Debug, thiserror::Error)]
 pub enum StatsAssemblyError {
     #[error("{0}")]
@@ -173,6 +176,9 @@ pub fn assemble_planner_stats(
 ) -> Arc<IndexStats> {
     if merge_is_identity(indexed, snapshot, novelty, to_t) {
         return Arc::clone(indexed);
+    }
+    if let Some(stats) = segment_sums::planner_stats(indexed, snapshot, novelty, to_t, lookup) {
+        return Arc::new(stats);
     }
     let mut deltas = NoveltyDeltaResolver::new(indexed, snapshot, novelty, NoveltyMerge::Estimate);
     let stats = assemble_fast_stats_inner(
@@ -1221,7 +1227,7 @@ fn graph_id_for_flake(snapshot: &LedgerSnapshot, flake: &Flake) -> GraphId {
     };
     snapshot
         .decode_sid(g_sid)
-        .and_then(|iri| snapshot.graph_registry.graph_id_for_iri(&iri))
+        .and_then(|iri| snapshot.graph_registry.assigned_graph_id(&iri))
         .unwrap_or(0)
 }
 
@@ -2945,6 +2951,202 @@ mod tests {
             "flakes={} size={} since={:?}\nproperties={:?}\nclasses={:?}\ngraphs={:?}",
             stats.flakes, stats.size, stats.historical_since_t, stats.properties, classes, graphs
         )
+    }
+
+    /// The planner merge as the walk computes it, which segment sums replace.
+    fn walked_planner_stats(
+        indexed: &IndexStats,
+        snapshot: &LedgerSnapshot,
+        novelty: &Novelty,
+        to_t: i64,
+        lookup: Option<&dyn StatsLookup>,
+    ) -> IndexStats {
+        let mut deltas =
+            NoveltyDeltaResolver::new(indexed, snapshot, novelty, NoveltyMerge::Estimate);
+        let stats = assemble_fast_stats_inner(
+            indexed,
+            snapshot,
+            novelty,
+            to_t,
+            lookup,
+            &mut deltas,
+            RestatedAttribution::IntraPass,
+            ClassDetail::CountsOnly,
+        );
+        deltas.finish();
+        stats
+    }
+
+    /// [`planner_projection`] with each graph property's datatype breakdown
+    /// in tag order: the walk lists tags first-seen, the sums sorted.
+    fn sorted_planner_projection(stats: &IndexStats) -> String {
+        let mut stats = stats.clone();
+        for graph in stats.graphs.iter_mut().flatten() {
+            for property in &mut graph.properties {
+                property.datatypes.sort_unstable();
+            }
+        }
+        planner_projection(&stats)
+    }
+
+    /// Several commits over an indexed base: new and base facts asserted and
+    /// retracted, a type gained and lost, a predicate the index has no ndv
+    /// for, a language-tagged string and commit metadata. Every segment sums
+    /// to what walking every flake gives.
+    #[test]
+    fn segment_sums_match_the_walk() {
+        let (score, name, fresh, class_a) = (
+            sid(10, "score"),
+            sid(10, "name"),
+            sid(10, "fresh"),
+            sid(10, "A"),
+        );
+        let string_dt = Sid::new(fluree_vocab::namespaces::XSD, "string");
+        let lang_dt = Sid::new(fluree_vocab::namespaces::RDF, "langString");
+        let name_flake = |s: &str, v: &str, t: i64| {
+            Flake::new(
+                sid(10, s),
+                name.clone(),
+                FlakeValue::String(v.into()),
+                string_dt.clone(),
+                t,
+                true,
+                None,
+            )
+        };
+        let indexed = IndexStats {
+            flakes: 40,
+            size: 400,
+            properties: Some(vec![
+                PropertyStatEntry {
+                    sid: (10, "score".into()),
+                    count: 20,
+                    ndv_values: 10,
+                    ndv_subjects: 20,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 20)],
+                    observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
+                    historical_datatypes: vec![],
+                },
+                PropertyStatEntry {
+                    sid: (10, "name".into()),
+                    count: 20,
+                    ndv_values: 20,
+                    ndv_subjects: 20,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::STRING.as_u8(), 20)],
+                    observed_datatypes: vec![ValueTypeTag::STRING.as_u8()],
+                    historical_datatypes: vec![],
+                },
+            ]),
+            classes: Some(vec![class_entry(&class_a, 20, &[])]),
+            graphs: Some(vec![GraphStatsEntry {
+                g_id: 0,
+                flakes: 40,
+                size: 400,
+                properties: vec![GraphPropertyStatEntry {
+                    p_id: 7,
+                    count: 20,
+                    ndv_values: 10,
+                    ndv_subjects: 20,
+                    last_modified_t: 1,
+                    datatypes: vec![(ValueTypeTag::INTEGER.as_u8(), 20)],
+                    observed_datatypes: vec![ValueTypeTag::INTEGER.as_u8()],
+                    historical_datatypes: vec![],
+                }],
+                classes: None,
+            }]),
+            historical_since_t: Some(0),
+        };
+
+        let mut novelty = Novelty::new(1);
+        let commits: Vec<Vec<Flake>> = vec![
+            vec![
+                prop_flake(sid(10, "a1"), score.clone(), 5, 2),
+                prop_flake(sid(10, "a2"), score.clone(), 6, 2),
+                retracted(prop_flake(sid(10, "b1"), score.clone(), 1, 2)),
+                type_flake(sid(10, "n1"), class_a.clone(), 2),
+                name_flake("n1", "new one", 2),
+                prop_flake(
+                    sid(fluree_vocab::namespaces::FLUREE_COMMIT, "c2"),
+                    sid(10, "t"),
+                    2,
+                    2,
+                ),
+            ],
+            vec![
+                prop_flake(sid(10, "n1"), fresh.clone(), 1, 3),
+                prop_flake(sid(10, "n2"), fresh.clone(), 1, 3),
+                prop_flake(sid(10, "n3"), fresh.clone(), 2, 3),
+                Flake::new(
+                    sid(10, "n2"),
+                    name.clone(),
+                    FlakeValue::String("bonjour".into()),
+                    lang_dt,
+                    3,
+                    true,
+                    Some(FlakeMeta::with_lang("fr")),
+                ),
+            ],
+            vec![
+                retracted(type_flake(sid(10, "n1"), class_a.clone(), 4)),
+                retracted(prop_flake(sid(10, "n2"), fresh.clone(), 1, 4)),
+                retracted(name_flake("b2", "old", 4)),
+                prop_flake(sid(10, "a1"), score.clone(), 5, 4),
+            ],
+        ];
+        for (t, flakes) in (2..).zip(commits) {
+            novelty.apply_commit(flakes, t, &HashMap::new()).unwrap();
+        }
+        let lookup = StubLookup {
+            p_ids: HashMap::from([
+                (score, RuntimePredicateId::from_u32(7)),
+                (name, RuntimePredicateId::from_u32(8)),
+                (fresh, RuntimePredicateId::from_u32(9)),
+            ]),
+            classes: HashMap::new(),
+        };
+        let snapshot = LedgerSnapshot::genesis("test:main");
+
+        for lookup in [Some(&lookup as &dyn StatsLookup), None] {
+            let summed = segment_sums::planner_stats(&indexed, &snapshot, &novelty, 4, lookup)
+                .expect("every segment is at or below t=4");
+            let walked = walked_planner_stats(&indexed, &snapshot, &novelty, 4, lookup);
+            assert_eq!(
+                sorted_planner_projection(&summed),
+                sorted_planner_projection(&walked)
+            );
+            // Twice: the second answer is served from the segment cache.
+            let again = segment_sums::planner_stats(&indexed, &snapshot, &novelty, 4, lookup)
+                .expect("cached");
+            assert_eq!(
+                sorted_planner_projection(&again),
+                sorted_planner_projection(&walked)
+            );
+        }
+        let fresh_entry = segment_sums::planner_stats(&indexed, &snapshot, &novelty, 4, None)
+            .and_then(|stats| stats.properties)
+            .and_then(|props| props.into_iter().find(|p| p.sid.1 == "fresh"))
+            .expect("the window's new predicate");
+        assert_eq!(
+            (
+                fresh_entry.count,
+                fresh_entry.ndv_values,
+                fresh_entry.ndv_subjects
+            ),
+            (2, 2, 2),
+            "ndv for a predicate the index has none for comes from the window"
+        );
+
+        // A segment past `to_t` cannot be summed whole: the walk answers.
+        assert!(segment_sums::planner_stats(&indexed, &snapshot, &novelty, 3, None).is_none());
+        let historical =
+            assemble_planner_stats(&Arc::new(indexed.clone()), &snapshot, &novelty, 3, None);
+        let walked = walked_planner_stats(&indexed, &snapshot, &novelty, 3, None);
+        assert_eq!(
+            sorted_planner_projection(&historical),
+            sorted_planner_projection(&walked)
+        );
     }
 
     /// A base with a populated class table and a window that exercises every

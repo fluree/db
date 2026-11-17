@@ -77,6 +77,10 @@ pub struct DictNovelty {
     pub subjects: SubjectDictNovelty,
     pub strings: StringDictNovelty,
     initialized: bool,
+    /// The novelty `t` through which this dictionary is known to hold every
+    /// novel subject and string: see [`Self::covers`]. `i64::MIN` when no
+    /// owner has vouched for it.
+    covered_t: i64,
 }
 
 impl DictNovelty {
@@ -89,6 +93,7 @@ impl DictNovelty {
             subjects: SubjectDictNovelty::default(),
             strings: StringDictNovelty::default(),
             initialized: true,
+            covered_t: i64::MIN,
         }
     }
 
@@ -102,6 +107,7 @@ impl DictNovelty {
             subjects: SubjectDictNovelty::default(),
             strings: StringDictNovelty::default(),
             initialized: false,
+            covered_t: i64::MIN,
         }
     }
 
@@ -135,6 +141,7 @@ impl DictNovelty {
                 parent: None,
             },
             initialized: true,
+            covered_t: i64::MIN,
         }
     }
 
@@ -187,6 +194,7 @@ impl DictNovelty {
                 parent: Some(Arc::clone(&parent)),
             },
             initialized: parent.initialized,
+            covered_t: parent.covered_t,
         }
     }
 
@@ -198,6 +206,23 @@ impl DictNovelty {
     /// Returns true if watermarks have been initialized.
     pub fn is_initialized(&self) -> bool {
         self.initialized
+    }
+
+    /// Whether this dictionary holds every subject and string of a novelty
+    /// whose latest commit is `novelty_t` that the persisted dictionary does
+    /// not: true only when an owner populated it from every commit through
+    /// `novelty_t` ([`Self::mark_covered_through`]). A dictionary that cannot
+    /// vouch reads as not covering, never the reverse, so a reader that skips
+    /// work on a miss here must treat `false` as "may be present".
+    pub fn covers(&self, novelty_t: i64) -> bool {
+        self.initialized && self.covered_t >= novelty_t
+    }
+
+    /// Record that every commit through `t` has been populated into this
+    /// dictionary. Callers populating one more commit extend it only when
+    /// [`Self::covers`] held for the commit before.
+    pub fn mark_covered_through(&mut self, t: i64) {
+        self.covered_t = t;
     }
 
     /// Assert that watermarks are initialized.

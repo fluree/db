@@ -48,6 +48,9 @@ postcard = { workspace = true }
 # write-fsync-rename discipline.
 tokio = { workspace = true }
 
+# `Uri` for the request-forwarding helpers every forwarder shares.
+http = { workspace = true }
+
 # Deterministic, fixed-seed hash for rendezvous ownership. Every node
 # must agree on hash values, so this cannot be `std`'s randomly-seeded
 # `DefaultHasher`. xxh64 is stable across releases of the crate.

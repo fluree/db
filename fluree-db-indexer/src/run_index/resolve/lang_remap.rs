@@ -21,6 +21,16 @@ use std::path::PathBuf;
 pub fn build_lang_remap_from_vocabs(
     vocab_paths: &[PathBuf],
 ) -> io::Result<(LanguageTagDict, Vec<Vec<u16>>)> {
+    build_lang_remap_over(LanguageTagDict::new(), vocab_paths)
+}
+
+/// [`build_lang_remap_from_vocabs`] over an existing ledger's tags: `base`
+/// keeps its ids, and tags it lacks follow in lexical order. The remaps are
+/// monotone only when `base` is empty (see `relocalize_sorted_commit`).
+pub fn build_lang_remap_over(
+    base: LanguageTagDict,
+    vocab_paths: &[PathBuf],
+) -> io::Result<(LanguageTagDict, Vec<Vec<u16>>)> {
     let mut local_dicts = Vec::with_capacity(vocab_paths.len());
     for path in vocab_paths {
         let local_dict = if path.exists() {
@@ -48,7 +58,7 @@ pub fn build_lang_remap_from_vocabs(
     all_tags.sort_unstable();
     all_tags.dedup();
 
-    let mut unified = LanguageTagDict::new();
+    let mut unified = base;
     for tag in all_tags {
         unified.get_or_insert(Some(tag));
     }

@@ -99,6 +99,9 @@ pub struct DerivedFactsOutcome {
     /// were configured. Datalog-only reasoning reports its own tally here;
     /// also f:reasoningMaxMemoryMb, which the ledger-config list below omits.
     pub diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// The reasoning memory budget the overlay was materialized under. What
+    /// queries keep beside it (`crate::reasoning_ops`) counts toward it too.
+    pub memory_limit_bytes: usize,
 }
 
 /// `rdfs` and `owl2ql` widen the query's own patterns, and rule bodies run
@@ -195,6 +198,7 @@ pub async fn compute_derived_facts(
             return Ok(DerivedFactsOutcome {
                 overlay: (!cached.overlay.is_empty()).then(|| cached.overlay.clone()),
                 diagnostics: Some(cached.diagnostics.clone()),
+                memory_limit_bytes: budget.max_memory_bytes,
             });
         }
         (Some(rule_set), key)
@@ -283,6 +287,7 @@ pub async fn compute_derived_facts(
                     return Ok(DerivedFactsOutcome {
                         overlay: (!result.overlay.is_empty()).then(|| result.overlay.clone()),
                         diagnostics,
+                        memory_limit_bytes: budget.max_memory_bytes,
                     });
                 }
 
@@ -444,6 +449,7 @@ pub async fn compute_derived_facts(
     Ok(DerivedFactsOutcome {
         overlay: (!derived_overlay.is_empty()).then(|| derived_overlay.clone()),
         diagnostics,
+        memory_limit_bytes: budget.max_memory_bytes,
     })
 }
 

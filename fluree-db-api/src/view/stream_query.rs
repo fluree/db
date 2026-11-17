@@ -267,9 +267,7 @@ impl Fluree {
         let db_ref = db.as_graph_db_ref();
         let union = super::union_default_dataset(db, executable);
         let mut prepare_config = PrepareConfig::current(db.binary_store.as_ref());
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
@@ -548,6 +546,9 @@ fn query_error_code(e: &fluree_db_query::QueryError) -> &'static str {
         // (mirrors the server `@type` `err:r2rml/UnsupportedPattern`) so the
         // streaming path is as machine-discriminable as the buffered one.
         QE::R2rmlUnsupportedPattern { .. } => "r2rml_unsupported_pattern",
+        QE::GraphSourceUnmapped { .. } => "graph_source_unmapped",
+        QE::GraphSourceUnsupported { .. } => "graph_source_unsupported",
+        QE::GraphSourceNotAGraph { .. } => "graph_source_not_a_graph",
         QE::InvalidQuery(_)
         | QE::UngroupedRead(_)
         | QE::InvalidFilter(_)

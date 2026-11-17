@@ -25,9 +25,9 @@ use crate::list_view::{is_member, member_binding, ListView};
 use crate::operator::{BoxedOperator, Operator};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
-};
+use fluree_db_binary_index::TermView;
+use fluree_db_core::range::range_with_overlay_tracked;
+use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
 use fluree_vocab::namespaces::XSD;
 use fluree_vocab::xsd_names;
 use std::collections::{HashMap, HashSet};
@@ -103,6 +103,9 @@ impl ListEntriesOperator {
         } else {
             Some(ctx.path_graphs()?)
         };
+        // One decoder for the batch: the scope's terms, which read no graph's
+        // index, so a default graph of several graphs decodes too.
+        let terms = ctx.term_view();
         for k in 0..self.marked.len() {
             let t = self.marked[k].0.clone();
             let mut positions = Vec::with_capacity(len);
@@ -110,15 +113,22 @@ impl ListEntriesOperator {
             // A predicate bound to an index id is checked on the id alone.
             let ids = t.p.as_var().and_then(|v| batch.column(v));
             for row in 0..len {
-                let named = match ids.map(|ids| &ids[row]) {
-                    Some(Binding::EncodedPid { p_id }) if !self.view.may_hold_lists_id(*p_id) => {
-                        None
+                let found = match &graphs {
+                    Some(graphs) => {
+                        let named = match ids.map(|ids| &ids[row]) {
+                            Some(Binding::EncodedPid { p_id })
+                                if !self.view.may_hold_lists_id(*p_id) =>
+                            {
+                                None
+                            }
+                            _ => self.named(ctx, terms.as_ref(), &batch, row, &t)?,
+                        };
+                        match named {
+                            Some(named) => self.entries(ctx, graphs, named).await?,
+                            None => None,
+                        }
                     }
-                    _ => self.named(ctx, &batch, row, &t),
-                };
-                let found = match (&graphs, named) {
-                    (Some(graphs), Some(named)) => self.entries(ctx, graphs, named).await?,
-                    _ => None,
+                    None => None,
                 };
                 match found {
                     Some((at, also)) => {
@@ -145,17 +155,24 @@ impl ListEntriesOperator {
     fn named(
         &self,
         ctx: &ExecutionContext<'_>,
+        terms: Option<&TermView>,
         batch: &Batch,
         row: usize,
         t: &TriplePattern,
-    ) -> Option<(Sid, Sid, Binding)> {
-        let p = node(ctx, batch, row, &t.p)?;
+    ) -> Result<Option<(Sid, Sid, Binding)>> {
+        let Some(p) = node(ctx, terms, batch, row, &t.p)? else {
+            return Ok(None);
+        };
         if !self.view.may_hold_lists(&p) {
-            return None;
+            return Ok(None);
         }
-        let o = t.o.as_var().and_then(|v| batch.get(row, v))?;
-        let s = node(ctx, batch, row, &t.s)?;
-        Some((s, p, decoded(ctx, o)))
+        let Some(o) = t.o.as_var().and_then(|v| batch.get(row, v)) else {
+            return Ok(None);
+        };
+        let Some(s) = node(ctx, terms, batch, row, &t.s)? else {
+            return Ok(None);
+        };
+        Ok(Some((s, p, decoded(terms, o)?)))
     }
 
     /// The positions of the entries of `s`'s list on `p` holding `o`, none
@@ -197,22 +214,33 @@ fn yes() -> Binding {
     Binding::lit(FlakeValue::Boolean(true), Sid::new(XSD, xsd_names::BOOLEAN))
 }
 
-fn decoded(ctx: &ExecutionContext<'_>, b: &Binding) -> Binding {
-    crate::group_aggregate::materialize_encoded(b, ctx.graph_view().as_ref())
+/// `b` decoded through the scope's terms; an encoded binding they cannot
+/// decode is refused rather than compared as encoded.
+fn decoded(terms: Option<&TermView>, b: &Binding) -> Result<Binding> {
+    Ok(crate::group_aggregate::materialize_encoded(b, terms)?)
 }
 
 /// The node at `r` in row `row`.
-fn node(ctx: &ExecutionContext<'_>, batch: &Batch, row: usize, r: &Ref) -> Option<Sid> {
+fn node(
+    ctx: &ExecutionContext<'_>,
+    terms: Option<&TermView>,
+    batch: &Batch,
+    row: usize,
+    r: &Ref,
+) -> Result<Option<Sid>> {
     let bound = match r {
-        Ref::Var(v) => decoded(ctx, batch.get(row, *v)?),
-        Ref::Sid(sid) => return Some(sid.clone()),
-        Ref::Iri(iri) => return ctx.active_snapshot.encode_iri(iri),
+        Ref::Var(v) => match batch.get(row, *v) {
+            Some(b) => decoded(terms, b)?,
+            None => return Ok(None),
+        },
+        Ref::Sid(sid) => return Ok(Some(sid.clone())),
+        Ref::Iri(iri) => return Ok(ctx.active_snapshot.encode_iri(iri)),
     };
-    match bound {
+    Ok(match bound {
         Binding::Sid { sid, .. } => Some(sid),
         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => ctx.active_snapshot.encode_iri(&iri),
         _ => None,
-    }
+    })
 }
 
 /// The list `s` holds under `p` in `graphs`, read under each graph's view
@@ -228,7 +256,7 @@ async fn read_held(
     let mut beside = HashSet::new();
     let mut lists = 0;
     for graph in graphs {
-        let flakes = range_with_overlay(
+        let flakes = range_with_overlay_tracked(
             graph.snapshot,
             graph.g_id,
             graph.overlay,
@@ -238,6 +266,7 @@ async fn read_held(
                 .with_subject(s.clone())
                 .with_predicate(p.clone()),
             RangeOptions::new().with_to_t(graph.to_t),
+            Some(&ctx.tracker),
         )
         .await?;
         let flakes: Vec<_> = flakes.into_iter().filter(|f| f.op).collect();

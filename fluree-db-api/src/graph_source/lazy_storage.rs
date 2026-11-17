@@ -130,6 +130,10 @@ impl<S: SendIcebergStorage> SendIcebergStorage for LazyStorage<'_, S> {
         // apply — a build-time LIST, not a per-file read).
         self.resolve().await?.list_dir(prefix).await
     }
+
+    async fn list_files(&self, prefix: &str) -> IcebergResult<Vec<String>> {
+        self.resolve().await?.list_files(prefix).await
+    }
 }
 
 #[cfg(test)]

@@ -426,10 +426,22 @@ where
 /// Address prefixes that `nested` ledgers own: each branch's directory and
 /// the ledger's `@shared/` namespace. Not the whole name, which for a ledger
 /// named `{parent}/{branch}` is the parent branch's own directory.
+///
+/// A branch an earlier release let begin with `/` has the prefix
+/// `{name}//{branch}`. A backend that keeps keys verbatim lists it that way
+/// and a filesystem lists `{name}/{branch}`, so both spellings are owned.
 pub fn nested_prefixes(method: &str, nested: &[LedgerId]) -> Vec<String> {
     let mut prefixes: Vec<String> = nested
         .iter()
         .flat_map(|id| [id.path_prefix(), id.shared_prefix()])
+        .flat_map(|prefix| {
+            let collapsed = prefix
+                .split('/')
+                .filter(|segment| !segment.is_empty())
+                .collect::<Vec<_>>()
+                .join("/");
+            [collapsed, prefix]
+        })
         .map(|prefix| format!("fluree:{method}://{prefix}/"))
         .collect();
     prefixes.sort();

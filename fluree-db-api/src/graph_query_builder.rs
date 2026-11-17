@@ -165,7 +165,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             }
             None => crate::GovernanceOptions::default(),
         };
-        opts.server_identity = self.core.execution.server_identity.clone();
+        opts.server_identity = self.core.server_identity().cloned();
         // `has_any_policy_inputs`, not the narrower `selects_policy_set`: the
         // latter ignores a `default-allow: false` that arrives on its own, and
         // such a request must not take the unrestricted path.
@@ -226,6 +226,20 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
             }
         }
 
+        // Without the iceberg feature no graph source is served here. A mapped
+        // one the target names is refused with what the build lacks, rather
+        // than reported as a ledger that is not there.
+        #[cfg(not(feature = "iceberg"))]
+        if result
+            .as_ref()
+            .is_err_and(super::error::ApiError::is_not_found)
+        {
+            self.graph
+                .fluree
+                .refuse_unreadable_graph_source(address.id())
+                .await?;
+        }
+
         self.wrap_request_policy(result?).await
     }
 
@@ -243,7 +257,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
 
         let view = self.load_view().await?;
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
@@ -276,7 +290,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
 
         let view = self.load_view().await?;
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -346,7 +360,7 @@ impl<'a, 'g> GraphQueryBuilder<'a, 'g> {
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
 
         // Intercept a virtual-dataset subgraph crawl BEFORE dispatch, exactly
@@ -522,7 +536,7 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         }
 
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {
@@ -552,7 +566,7 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         }
 
         let r2rml = self.core.r2rml.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let format_config = self
             .core
             .format
@@ -595,7 +609,7 @@ impl<'a: 'v, 'v> GraphSnapshotQueryBuilder<'a, 'v> {
         let r2rml = self.core.r2rml.take();
         let format_config = self.core.format.take();
         let tracking = self.core.tracking.take();
-        let execution = self.core.execution.clone();
+        let execution = self.core.execution();
         let input = self.core.input.take().unwrap();
         match r2rml.as_ref() {
             Some((provider, table_provider)) => {

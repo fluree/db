@@ -255,3 +255,89 @@ async fn trig_named_graph_literals_are_canonical() {
     };
     assert_eq!(stored, r#"{"a":1,"b":2}"#);
 }
+
+/// A `@json`-typed term writes its value as one JSON literal, a string
+/// included, and a `where` pattern under the same context finds it and
+/// reads it back.
+#[tokio::test]
+async fn json_typed_term_values_round_trip_through_where() {
+    let coerced = json!({
+        "ex": "http://example.org/ns/",
+        "doc": {"@id": "ex:doc", "@type": "@json"}
+    });
+    let values = [
+        json!("hello"),
+        json!("5"),
+        json!("{\"a\":1}"),
+        json!(5),
+        json!(true),
+        json!([1, {"b": 2, "a": "x"}]),
+        json!({"k": [1, 2]}),
+    ];
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let graph: Vec<_> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| json!({"@id": format!("ex:s{i}"), "doc": v}))
+        .collect();
+    let ledger = fluree
+        .insert(ledger, &json!({"@context": coerced, "@graph": graph}))
+        .await
+        .unwrap()
+        .ledger;
+
+    for (i, value) in values.iter().enumerate() {
+        let q = json!({
+            "@context": coerced,
+            "select": ["?s", "?v"],
+            "where": [{"@id": "?s", "doc": value}, {"@id": "?s", "doc": "?v"}]
+        });
+        let result = support::query_jsonld(&fluree, &ledger, &q).await.unwrap();
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        assert_eq!(rows, json!([[format!("ex:s{i}"), value]]), "{value}");
+    }
+}
+
+/// A variable under a `@json`-typed term in an update template is a
+/// variable, not the JSON string of its name.
+#[tokio::test]
+async fn json_typed_term_binds_a_template_variable() {
+    let coerced = json!({
+        "ex": "http://example.org/ns/",
+        "doc": {"@id": "ex:doc", "@type": "@json"}
+    });
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": coerced, "@id": "ex:a", "doc": {"k": 1}}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": coerced,
+                "where": {"@id": "ex:a", "doc": "?v"},
+                "delete": {"@id": "ex:a", "doc": "?v"},
+                "insert": {"@id": "ex:b", "doc": "?v"}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let q = json!({
+        "@context": coerced,
+        "select": ["?s", "?v"],
+        "where": {"@id": "?s", "doc": "?v"}
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &q).await.unwrap();
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    assert_eq!(rows, json!([["ex:b", {"k": 1}]]));
+}

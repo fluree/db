@@ -137,6 +137,8 @@ pub struct PreparedExecution {
     /// the request tracker by [`execute_prepared`] so a capped (incomplete)
     /// closure surfaces in response metadata.
     pub reasoning_diagnostics: Option<fluree_db_reasoner::ReasoningDiagnostics>,
+    /// The reasoning memory budget `derived_overlay` was materialized under.
+    pub reasoning_memory_limit: usize,
     /// Whether any reasoning/entailment mode was enabled for this query.
     ///
     /// Threaded onto the [`ExecutionContext`] in `execute_prepared_into` and
@@ -472,17 +474,23 @@ pub async fn prepare_execution_with_config(
             // Detects Triple(?s, pred, ?loc) + Bind(?dist = geof:distance(?loc, WKT)) + Filter(?dist < r)
             // and collapses them into a single Pattern::GeoSearch for index acceleration.
             // This runs for both SPARQL and JSON-LD queries — same patterns, same rewrite.
-            // The GeoSearch operator reads the binary index, so without one
-            // covering `to_t` (a ledger not yet indexed, a time before the
-            // index's base) the patterns stay as written and evaluate as such.
-            // The operator reads the store its execution context takes from
-            // the snapshot, which a caller need not have passed in here,
-            // unless execution runs with none (a multi-ledger dataset).
-            let geo_index_covers = binary_scans
-                && binary_store
-                    .cloned()
-                    .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot))
-                    .is_some_and(|store| db.t >= store.base_t());
+            // The GeoSearch operator reads one graph's binary index and has no
+            // fallback, so the patterns stay as written, evaluated as such,
+            // unless the scope reads exactly one graph through a binary index
+            // the operators will get (`planning.reads_one_graph_index`: one
+            // graph, a dataset that does not span ledgers, and a store with
+            // binary scans on; the definition the operator's refusal,
+            // `ExecutionContext::has_binary_store`, shares) and that index
+            // covers `to_t` (not a ledger yet to be indexed, nor a time before
+            // the index's base). The operator reads the store its execution
+            // context takes from the snapshot, which a caller need not have
+            // passed in here.
+            let geo_store = binary_store
+                .cloned()
+                .or_else(|| crate::context::ExecutionContext::extract_binary_store(db.snapshot));
+            let geo_index_covers = planning
+                .reads_one_graph_index(binary_scans && geo_store.is_some())
+                && geo_store.is_some_and(|store| db.t >= store.base_t());
             let rewritten_patterns = crate::geo_rewrite::rewrite_geo_patterns_if_indexed(
                 rewritten_patterns,
                 &|iri: &str| db.snapshot.encode_iri(iri),
@@ -574,6 +582,7 @@ pub async fn prepare_execution_with_config(
             operator,
             derived_overlay: derived_outcome.overlay,
             reasoning_diagnostics: derived_outcome.diagnostics,
+            reasoning_memory_limit: derived_outcome.memory_limit_bytes,
             reasoning_active: reasoning.has_any_enabled(),
         })
     }
@@ -757,6 +766,9 @@ pub struct ContextConfig<'a, 'b> {
     /// When set, scan operators will use per-leaf batch filtering via `filter_flakes`.
     /// Access the raw PolicyContext via `enforcer.policy()` if needed.
     pub policy_enforcer: Option<Arc<crate::policy::QueryPolicyEnforcer>>,
+    /// The graph whose view policy `policy_enforcer` is (see
+    /// [`ExecutionContext::policy_source`]).
+    pub policy_source: Option<Arc<str>>,
     pub dataset: Option<&'a DataSet<'a>>,
     pub r2rml: Option<(
         &'b dyn crate::r2rml::R2rmlProvider,
@@ -800,6 +812,9 @@ pub struct ContextConfig<'a, 'b> {
     /// set only by the graph-source browse-crawl path. See
     /// [`ExecutionContext::trust_fk_refs`].
     pub trust_fk_refs: bool,
+    /// Every graph-source scan emits a fixed row order; set by a caller that
+    /// slices the answer itself. See [`ExecutionContext::deterministic_scans`].
+    pub deterministic_scans: bool,
     /// See [`ExecutionContext::path_pair_limit`].
     pub path_pair_limit: Option<usize>,
     /// Binary columnar index store for `BinaryScanOperator`.
@@ -950,6 +965,15 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if prepared.reasoning_active {
         ctx = ctx.with_reasoning_active(true);
     }
+    if let Some(derived) = prepared.derived_overlay.as_ref() {
+        if let Some(ops) = crate::reasoning_ops::ReasoningOpsHandle::attach(
+            derived,
+            prepared.reasoning_memory_limit,
+            ctx.overlay().content_version(),
+        ) {
+            ctx = ctx.with_reasoning_ops(ops);
+        }
+    }
 
     if let Some(tracker) = config.tracker {
         ctx = ctx.with_tracker(tracker.clone());
@@ -973,6 +997,7 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     if let Some(enforcer) = config.policy_enforcer {
         ctx = ctx.with_policy_enforcer(enforcer);
     }
+    ctx.policy_source = config.policy_source;
     if let Some(dataset) = patched_dataset.as_ref().or(config.dataset) {
         ctx = ctx.with_dataset(dataset);
     }
@@ -997,6 +1022,9 @@ async fn execute_prepared_into<'a, S: BatchSink>(
     }
     if config.trust_fk_refs {
         ctx = ctx.with_trust_fk_refs(true);
+    }
+    if config.deterministic_scans {
+        ctx = ctx.with_deterministic_scans(true);
     }
     if let Some(limit) = config.path_pair_limit {
         ctx = ctx.with_path_pair_limit(limit);
@@ -1053,6 +1081,8 @@ async fn execute_prepared_into<'a, S: BatchSink>(
         ctx.r2rml_graph_ids = r2rml_ids;
     }
 
+    crate::fast_path_outcome::stamp_index_scope("query", &ctx);
+
     // A sub-query plans at run time; name the variables in its plan errors.
     run_operator_streaming(prepared.operator, &ctx, sink)
         .await
@@ -1076,11 +1106,7 @@ pub async fn execute<'a>(
     // the dataset paths do, so the members' scans deduplicate on full rows.
     let mut prepare_config =
         PrepareConfig::default().for_request(config.tracker, config.cancellation.as_ref());
-    prepare_config.planning = prepare_config.planning.with_multi_default_graph(
-        config
-            .dataset
-            .is_some_and(|ds| ds.default_graphs().len() >= 2),
-    );
+    prepare_config.planning = prepare_config.planning.with_dataset_scope(config.dataset);
     let prepared = prepare_execution_with_config(db, query, &prepare_config)
         .await
         .map_err(|e| e.name_variables(vars))?;

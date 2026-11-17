@@ -339,11 +339,11 @@ impl Fluree {
         let ledger_id = &LedgerId::parse(ledger_id)?;
 
         // 0) Lock ledger state for write (serialize with transactions).
-        let guard = self
+        let mut guard = self
             .lock_ledger(ledger_id)
             .await?
             .ok_or_else(|| ApiError::internal("push requires a ledger manager"))?;
-        let mut base_state = guard.clone_state();
+        let mut base_state = guard.clone_state_for_staging();
 
         // 1) Read current head ref (CAS expected). Use the lookup
         //    surface rather than the publisher's `get_ref` so this
@@ -370,6 +370,8 @@ impl Fluree {
 
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
+        validate_graph_drop_targets(&base_state.snapshot.graph_registry, &decoded)
+            .map_err(PushError::into_api_error)?;
 
         // 2.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
@@ -394,27 +396,34 @@ impl Fluree {
         // Track per-commit "all flakes" so we can update state after CAS.
         let mut accepted_all_flakes: Vec<(i64, Vec<Flake>)> = Vec::with_capacity(decoded.len());
 
-        // 4.0 Build ONE graph routing for the whole push: every graph the
+        // 4.0 The txn-meta graph's Sid once the commits apply. It stamps their
+        // metadata, screens their blobs for forged commit records and routes
+        // to the txn-meta graph, here and at apply.
+        let txn_meta_g =
+            txn_meta_sid_after(&base_state, &decoded).map_err(PushError::into_api_error)?;
+
+        // 4.0.1 Build ONE graph routing for the whole push: every graph the
         // commits write, with the id the ledger gives it once they apply.
         let routing =
             derive_graph_routing(&base_state, &decoded).map_err(PushError::into_api_error)?;
-        let mut reverse_graph = reverse_graph_lookup(&routing.graph_sids);
-        // Ensure txn-meta graph is always routable — commit metadata flakes
-        // are stamped with this graph SID after routing is derived.
-        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
-        if let Some(g_sid) = base_state.snapshot.encode_iri(&txn_meta_iri) {
-            reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
-        }
+        let mut reverse_graph = routing.graph_ids.clone();
+        reverse_graph
+            .entry(txn_meta_g.clone())
+            .or_insert(TXN_META_GRAPH_ID);
 
-        // Accumulate namespace table for cross-commit namespace conflict validation.
-        // Uses NamespaceCodes (validated bimap) rather than raw HashMap to enforce
-        // bimap uniqueness/immutability through the canonical type.
-        let mut accumulated_ns = fluree_db_core::ns_encoding::NamespaceCodes::from_code_to_prefix(
-            base_state.snapshot.namespaces().clone(),
-        )
-        .map_err(|e| {
-            PushError::Invalid(format!("base snapshot namespace corruption: {e}")).into_api_error()
-        })?;
+        // A push that drops graphs validates each commit after the drops
+        // before it, so the state it validates against registers every graph
+        // the commits write now, under the ids routing gave them: a drop or a
+        // write of a graph an earlier commit registered then finds it.
+        let pushes_drops = decoded.iter().any(|c| !c.commit.graph_drops.is_empty());
+        if pushes_drops {
+            Arc::make_mut(&mut base_state.snapshot)
+                .apply_envelope_deltas(
+                    &HashMap::new(),
+                    decoded.iter().flat_map(|c| c.commit.graph_delta.values()),
+                )
+                .map_err(|e| PushError::Internal(e.to_string()).into_api_error())?;
+        }
 
         // The namespaces these commits introduce, which reach the snapshot only
         // in `apply_pushed_commits_to_state` — after validation. Kept as a plain
@@ -437,18 +446,6 @@ impl Fluree {
                     .map(|(code, prefix)| (*code, prefix.clone())),
             );
 
-            // 4.0.1 Cross-commit namespace validation: namespace delta must be
-            // conflict-free against the accumulated namespace table from parent + prior commits.
-            accumulated_ns
-                .merge_delta(&c.commit.namespace_delta)
-                .map_err(|e| {
-                    PushError::Invalid(format!(
-                        "commit t={}: namespace delta conflict: {}",
-                        c.commit.t, e
-                    ))
-                    .into_api_error()
-                })?;
-
             // ns_split_mode immutability: locked once user namespaces are allocated.
             if let Some(mode) = c.commit.ns_split_mode {
                 std::sync::Arc::make_mut(&mut base_state.snapshot)
@@ -456,23 +453,43 @@ impl Fluree {
                     .map_err(|e| PushError::Invalid(e.to_string()).into_api_error())?;
             }
 
-            // 4.0.2 Datatype limit, ahead of the costlier validation below. A
+            // 4.0.2 Policy, built from the state before this commit, as a
+            // local write's is. Only an unrestricted identity may drop, and a
+            // commit that drops the graph holding the policy would otherwise
+            // find no policy restricting it.
+            let policy_ctx =
+                build_policy_ctx_for_push(self, &base_state, &evolving_novelty, current_t, opts)
+                    .await?;
+            if !c.commit.graph_drops.is_empty()
+                && policy_ctx.as_ref().is_some_and(|p| !p.wrapper().is_root())
+            {
+                return Err(push_error_for_stage(
+                    fluree_db_transact::drop_needs_unrestricted_identity(&format!(
+                        "Pushed commit t={}",
+                        c.commit.t
+                    )),
+                )
+                .into_api_error());
+            }
+
+            // 4.0.3 The commit's drops, ahead of everything else it does, and
+            // the dropped graphs it writes again: what follows checks its
+            // flakes against the state they land on.
+            if pushes_drops {
+                validate_after_graph_lifecycle(&mut base_state, &mut evolving_novelty, &c.commit);
+            }
+
+            // 4.0.4 Datatype limit, ahead of the costlier validation below. A
             // sender that does not enforce it can push commits the index could
-            // never hold. The datatypes are those that reach novelty at 4.5:
+            // never hold. The datatypes are those that reach novelty at 4.4:
             // the blob's flakes other than forged commit records, and the
             // typed txn-meta values. The other generated metadata flakes have
             // reserved datatypes.
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
-            let txn_meta_g = base_state.snapshot.encode_iri(&txn_meta_iri);
             let blob_datatypes = c
                 .commit
                 .flakes
                 .iter()
-                .filter(|f| {
-                    !txn_meta_g
-                        .as_ref()
-                        .is_some_and(|g| is_forged_commit_flake(f, g))
-                })
+                .filter(|f| !is_forged_commit_flake(f, &txn_meta_g))
                 .map(|f| &f.dt);
             let meta_datatypes = datatype_limit::txn_meta_datatypes(&c.commit.txn_meta);
             let adding: Vec<Sid> = datatype_limit::new_datatypes(
@@ -490,7 +507,7 @@ impl Fluree {
             .map_err(ApiError::Transact)?;
             pushed_datatypes.extend(adding);
 
-            // 4.0.3 Vectors the index can store: checked against the ledger
+            // 4.0.5 Vectors the index can store: checked against the ledger
             // and the earlier commits of this push, as a local write is.
             vector_dims::check_vectors(
                 &base_state,
@@ -518,18 +535,14 @@ impl Fluree {
                 .await
                 .map_err(PushError::into_api_error)?;
 
-            // 4.2 Policy enforcement: build policy context from opts against current state.
-            let policy_ctx =
-                build_policy_ctx_for_push(self, &base_state, &evolving_novelty, current_t, opts)
-                    .await?;
-
-            // 4.3 Stage flakes (policy/backpressure). No WHERE/cancellation; flakes are prebuilt.
+            // 4.2 Stage flakes (policy/backpressure) under the policy from
+            // 4.0.2. No WHERE/cancellation; flakes are prebuilt.
             let staged_view = match stage_commit_flakes(
                 evolving_state,
                 &c.commit.flakes,
                 index_config,
                 policy_ctx.as_ref(),
-                &routing.graph_sids,
+                &routing.graph_ids,
             )
             .await
             {
@@ -550,7 +563,7 @@ impl Fluree {
                 }
             };
 
-            // 4.4 SHACL (optional feature).
+            // 4.3 SHACL (optional feature).
             //
             // Route through the shared post-stage helper so commit replay
             // honors the ledger's current `f:shaclEnabled` / `f:validationMode`
@@ -614,7 +627,7 @@ impl Fluree {
                 let _ = &staged_view;
             }
 
-            // 4.5 Advance evolving novelty with this commit's flakes + derived metadata flakes.
+            // 4.4 Advance evolving novelty with this commit's flakes + derived metadata flakes.
             //
             // These commits come from a peer, so the blob's flakes are screened
             // before they reach novelty: a flake claiming commit provenance
@@ -625,12 +638,9 @@ impl Fluree {
             let mut all_flakes = c.commit.flakes.clone();
             let mut meta_flakes =
                 generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
-            let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
-            if let Some(g_sid) = base_state.snapshot.encode_iri(&txn_meta_iri) {
-                let dropped = drop_forged_commit_flakes(&mut all_flakes, &g_sid);
-                warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
-                stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
-            }
+            let dropped = drop_forged_commit_flakes(&mut all_flakes, &txn_meta_g);
+            warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
+            stamp_graph_on_commit_flakes(&mut meta_flakes, &txn_meta_g);
             all_flakes.extend(meta_flakes);
 
             // Note: Novelty::apply_commit bumps to max(commit_t) internally.
@@ -681,6 +691,7 @@ impl Fluree {
             &accepted_all_flakes,
             &decoded,
             &stored_commits,
+            &txn_meta_g,
         )
         .map_err(PushError::into_api_error)?;
         self.refresh_index(&mut new_state).await?;
@@ -817,8 +828,9 @@ impl PushError {
 /// The graph routing of a push: every graph the pushed commits' flakes
 /// write, with its ledger graph id.
 struct GraphRoutingResult {
-    /// Graph id → graph Sid, for staging.
-    graph_sids: HashMap<GraphId, Sid>,
+    /// Graph Sid → graph id, for staging. Several Sids can name one graph:
+    /// any ledger's config graph IRI is the config graph.
+    graph_ids: HashMap<Sid, GraphId>,
 
     /// Graph id → graph IRI, for per-graph SHACL config during replay.
     #[cfg(feature = "shacl")]
@@ -842,7 +854,7 @@ fn derive_graph_routing(
     decoded: &[PushCommitDecoded],
 ) -> std::result::Result<GraphRoutingResult, PushError> {
     let mut routing = GraphRoutingResult {
-        graph_sids: HashMap::new(),
+        graph_ids: HashMap::new(),
         #[cfg(feature = "shacl")]
         graph_iris: rustc_hash::FxHashMap::default(),
     };
@@ -887,19 +899,110 @@ fn derive_graph_routing(
                  pushed commits register"
             ))
         })?;
-        routing.graph_sids.insert(g_id, g_sid.clone());
+        routing.graph_ids.insert(g_sid.clone(), g_id);
+        // The IRI the ledger registers the graph by, whichever names it here.
         #[cfg(feature = "shacl")]
-        routing.graph_iris.insert(g_id, iri);
+        routing.graph_iris.insert(
+            g_id,
+            state
+                .snapshot
+                .graph_registry
+                .iri_for_graph_id(g_id)
+                .map_or(iri, str::to_owned),
+        );
     }
     Ok(routing)
 }
 
-/// Build a reverse lookup from graph Sid → GraphId.
-fn reverse_graph_lookup(graph_sids: &HashMap<GraphId, Sid>) -> HashMap<Sid, GraphId> {
-    graph_sids
+/// The txn-meta graph's Sid once `decoded` applies to `state`, resolved as
+/// the loader resolves it: against the namespace table the commits complete.
+/// A commit writing the ledger's own config graph registers the namespace of
+/// its system graph IRIs, so this can differ from the Sid before they apply.
+///
+/// Also checks each commit's namespace delta against the ledger's and the
+/// earlier commits'.
+fn txn_meta_sid_after(
+    state: &LedgerState,
+    decoded: &[PushCommitDecoded],
+) -> std::result::Result<Sid, PushError> {
+    let mut namespaces = fluree_db_core::ns_encoding::NamespaceCodes::from_code_to_prefix(
+        state.snapshot.namespaces().clone(),
+    )
+    .map_err(|e| PushError::Invalid(format!("base snapshot namespace corruption: {e}")))?;
+    for c in decoded {
+        namespaces
+            .merge_delta(&c.commit.namespace_delta)
+            .map_err(|e| {
+                PushError::Invalid(format!(
+                    "commit t={}: namespace delta conflict: {}",
+                    c.commit.t, e
+                ))
+            })?;
+    }
+    // As `apply_pushed_commits_to_state` sets it.
+    let mode = decoded
         .iter()
-        .map(|(&g_id, sid)| (sid.clone(), g_id))
-        .collect()
+        .rev()
+        .find_map(|c| c.commit.ns_split_mode)
+        .unwrap_or(state.snapshot.ns_split_mode());
+    Ok(fluree_db_core::ns_encoding::encode_registered(
+        &fluree_db_core::txn_meta_graph_iri(state.ledger_id()),
+        mode,
+        |prefix| namespaces.get_code(prefix),
+    ))
+}
+
+/// Refuse a commit a merge brought in that drops graphs. A merge never
+/// brings one in (`merge::refuse_merging_graph_drops`), and the receiver
+/// stores such commits without replaying them, so it would never apply the
+/// drop either.
+fn refuse_merged_graph_drops(
+    commit: &fluree_db_core::Commit,
+    which: &str,
+) -> std::result::Result<(), PushError> {
+    if commit.graph_drops.is_empty() {
+        return Ok(());
+    }
+    Err(PushError::Invalid(format!(
+        "{which} (t={}) drops graphs, which a merge cannot bring in",
+        commit.t
+    )))
+}
+
+/// Validate drop targets against the registry at each commit, before batch
+/// routing registers graphs from later commits. The batch keeps its stable
+/// graph ids; this tracks only when an IRI is introduced. A graph created
+/// and dropped within one transaction is carried in that commit's delta.
+/// Shared by push and incremental pull, ahead of any storage writes.
+fn validate_graph_drop_targets(
+    registry: &fluree_db_core::GraphRegistry,
+    decoded: &[PushCommitDecoded],
+) -> std::result::Result<(), PushError> {
+    use fluree_db_core::graph_registry::{drop_may_take, DEFAULT_GRAPH_IRI};
+
+    if !decoded.iter().any(|c| !c.commit.graph_drops.is_empty()) {
+        return Ok(());
+    }
+    let mut introduced = HashSet::new();
+    for (idx, c) in decoded.iter().enumerate() {
+        introduced.extend(c.commit.graph_delta.values().map(String::as_str));
+        for iri in &c.commit.graph_drops {
+            if iri == DEFAULT_GRAPH_IRI {
+                continue;
+            }
+            let reason = match registry.assigned_graph_id(iri) {
+                Some(g_id) if !drop_may_take(g_id) => "is a system graph",
+                Some(_) => continue,
+                None if introduced.contains(iri.as_str()) => continue,
+                None => "is not registered at this commit",
+            };
+            return Err(PushError::Invalid(format!(
+                "invalid commit[{idx}] (t={}): cannot drop graph <{iri}>, which {reason}",
+                c.commit.t
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn decode_and_validate_commit_chain(
@@ -919,8 +1022,9 @@ fn decode_and_validate_commit_chain(
         // Reject empty commits (no flakes) - keep semantics clear. A merge
         // commit is exempt: it records the merge even when the strategy
         // resolved every flake away, and dropping it would let the same
-        // branch be merged again.
-        if commit.flakes.is_empty() && commit.parents.len() < 2 {
+        // branch be merged again. So is a commit that drops graphs: the drop
+        // is its change, and it retracts nothing.
+        if commit.flakes.is_empty() && commit.parents.len() < 2 && commit.graph_drops.is_empty() {
             return Err(PushError::Invalid(format!(
                 "invalid commit[{idx}]: empty commit (no flakes)"
             )));
@@ -992,6 +1096,7 @@ fn decode_merged_commits(
             let bytes = b64.0.clone();
             let commit = fluree_db_core::commit::codec::read_commit(&bytes)
                 .map_err(|e| PushError::Invalid(format!("invalid merged_commits[{idx}]: {e}")))?;
+            refuse_merged_graph_drops(&commit, &format!("merged_commits[{idx}]"))?;
             let digest_hex = fluree_db_core::sha256_hex(&bytes);
             Ok(PushCommitDecoded {
                 commit,
@@ -1214,11 +1319,11 @@ async fn stage_commit_flakes(
     flakes: &[Flake],
     index_config: &IndexConfig,
     policy_ctx: Option<&PolicyContext>,
-    graph_sids: &HashMap<GraphId, Sid>,
+    graph_ids: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<fluree_db_ledger::StagedLedger, fluree_db_transact::TransactError> {
     let mut options = fluree_db_transact::StageOptions::new()
         .with_index_config(index_config)
-        .with_graph_sids(graph_sids)
+        .with_graph_ids(graph_ids)
         // Push applies commits that were authored and written elsewhere, so
         // authoring invariants are advisory here. See
         // `StageOptions::replaying_commit`.
@@ -1373,6 +1478,7 @@ fn apply_pushed_commits_to_state(
     accepted_all_flakes: &[(i64, Vec<Flake>)],
     decoded: &[PushCommitDecoded],
     stored_commits: &[StoredCommit],
+    txn_meta_g: &Sid,
 ) -> std::result::Result<LedgerState, PushError> {
     // Extract namespace deltas and graph IRIs from the decoded commits,
     // then apply to the snapshot so that build_reverse_graph() has complete data.
@@ -1400,29 +1506,20 @@ fn apply_pushed_commits_to_state(
             .map_err(|e| PushError::Internal(format!("apply_envelope_deltas failed: {e}")))?;
     }
 
-    // Build reverse_graph now that namespace_codes and graph_registry are complete.
-    // NOTE: We fallback to an empty map on failure because commits are already
-    // persisted at this point.  An empty reverse_graph means graph-scoped flake
-    // routing in novelty will be incomplete until the server restarts and rebuilds
-    // state from the stored commits.  Propagating an error here would mislead the
-    // caller into thinking the commit failed when it was actually stored.
-    let mut reverse_graph = base.snapshot.build_reverse_graph().unwrap_or_else(|e| {
-        error!(
-            error = ?e,
-            "post-CAS build_reverse_graph failed; in-memory graph routing will be \
-             incomplete until server restart — commits are already persisted and will \
-             be correct after reload"
-        );
-        HashMap::new()
-    });
+    // Build reverse_graph now that namespace_codes and graph_registry are
+    // complete. Callers run this before the head moves, and the loader
+    // refuses a registry it cannot route, so this does too.
+    let mut reverse_graph = base
+        .snapshot
+        .build_reverse_graph()
+        .map_err(|e| PushError::Internal(format!("build_reverse_graph failed: {e}")))?;
     // Ensure txn-meta graph is always routable for commit metadata flakes.
-    let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base.ledger_id());
-    if let Some(g_sid) = base.snapshot.encode_iri(&txn_meta_iri) {
-        reverse_graph.entry(g_sid).or_insert(TXN_META_GRAPH_ID);
-    }
+    reverse_graph
+        .entry(txn_meta_g.clone())
+        .or_insert(TXN_META_GRAPH_ID);
 
-    // Apply all flakes to novelty (we already validated them; re-apply for state).
-    let mut novelty = (*base.novelty).clone();
+    // Apply all flakes to novelty (we already validated them; re-apply for
+    // state), each commit's after its drops and before the next commit's.
     // Detach the range provider first: it pins `dict_novelty`, so mutating
     // with it attached deep-clones the dictionary and leaves the provider —
     // the copy every read through `base.snapshot` resolves against — without
@@ -1434,12 +1531,15 @@ fn apply_pushed_commits_to_state(
     // them, and the datatype limit counts them.
     let mut runtime_small_dicts = base.runtime_small_dicts.clone();
 
-    let store_opt: Option<&BinaryIndexStore> = base
-        .binary_store
+    let binary_store = base.binary_store.clone();
+    let store_opt: Option<&BinaryIndexStore> = binary_store
         .as_ref()
         .and_then(|te| te.0.as_ref().downcast_ref::<BinaryIndexStore>());
 
-    for (t, flakes) in accepted_all_flakes {
+    // The dictionary keeps covering novelty only if it did before the push.
+    let covered = dict_novelty.covers(base.novelty.t);
+    debug_assert_eq!(decoded.len(), accepted_all_flakes.len());
+    for (c, (t, flakes)) in decoded.iter().zip(accepted_all_flakes) {
         // Populate dict novelty similarly to transact commit path.
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             Arc::make_mut(&mut dict_novelty),
@@ -1450,19 +1550,25 @@ fn apply_pushed_commits_to_state(
             PushError::Internal(format!("populate_dict_novelty_safe failed at t={t}: {e}"))
         })?;
         Arc::make_mut(&mut runtime_small_dicts).populate_from_flakes(flakes);
-        // Apply to novelty.
-        novelty
+        base.apply_commit_graph_lifecycle(&c.commit);
+        Arc::make_mut(&mut base.novelty)
             .apply_commit(flakes.clone(), *t, &reverse_graph)
             .map_err(|e| {
                 PushError::Internal(format!("novelty apply_commit failed at t={t}: {e}"))
             })?;
     }
 
-    base.novelty = Arc::new(novelty);
+    if covered {
+        Arc::make_mut(&mut dict_novelty).mark_covered_through(base.novelty.t);
+    }
     base.dict_novelty = dict_novelty;
     base.runtime_small_dicts = runtime_small_dicts;
     if let Some(store) = provider_store {
         fluree_db_transact::attach_binary_provider(&mut base, store);
+    }
+    // The index still holds what the drops took.
+    if decoded.iter().any(|c| !c.commit.graph_drops.is_empty()) {
+        fluree_db_transact::hide_dropped_graphs(&mut base);
     }
     base.head_commit_id = stored_commits.last().map(|c| c.commit_id.clone());
     if let Some(ref mut r) = base.ns_record {
@@ -1472,6 +1578,23 @@ fn apply_pushed_commits_to_state(
         }
     }
     Ok(base)
+}
+
+/// [`LedgerState::apply_commit_graph_lifecycle`] on the state a push validates `commit` against:
+/// `base` for the registry, statistics and index, and `evolving`, the novelty
+/// the push's earlier commits leave. `base` keeps its own novelty, which the
+/// accepted commits apply to afterward, through the same lifecycle again.
+fn validate_after_graph_lifecycle(
+    base: &mut LedgerState,
+    evolving: &mut Novelty,
+    commit: &fluree_db_core::Commit,
+) {
+    let pre_push = std::mem::replace(&mut base.novelty, Arc::new(std::mem::take(evolving)));
+    base.apply_commit_graph_lifecycle(commit);
+    *evolving = Arc::unwrap_or_clone(std::mem::replace(&mut base.novelty, pre_push));
+    if !commit.graph_drops.is_empty() {
+        fluree_db_transact::hide_dropped_graphs(base);
+    }
 }
 
 trait LedgerStateCloneExt {
@@ -2433,7 +2556,7 @@ impl Fluree {
             .lock_ledger(ledger_id)
             .await?
             .ok_or_else(|| ApiError::internal("import requires a ledger manager"))?;
-        let base_state = guard.clone_state();
+        let base_state = guard.clone_state_for_staging();
 
         // 1) Read current head ref.
         let current_ref = self
@@ -2462,6 +2585,10 @@ impl Fluree {
         // 4) Ancestry preflight: verify first commit's parent matches local head.
         preflight_strict_next_t_and_prev(&current_ref, &decoded)
             .map_err(PushError::into_api_error)?;
+        validate_graph_drop_targets(&base_state.snapshot.graph_registry, &decoded)
+            .map_err(PushError::into_api_error)?;
+        let txn_meta_g =
+            txn_meta_sid_after(&base_state, &decoded).map_err(PushError::into_api_error)?;
 
         // 4.1) Decode the commits the chain's merges brought in, and check
         //      that no parent the bundle names is missing here.
@@ -2505,11 +2632,40 @@ impl Fluree {
             t: final_head.t,
         };
 
-        // 7) CAS update CommitHead.
+        // 7) Derive the post-pull state (novelty + dict novelty + namespace
+        //    deltas) before the head moves: commits it cannot apply would
+        //    leave a head the ledger cannot load.
+        let all_flakes: Vec<(i64, Vec<Flake>)> = decoded
+            .iter()
+            .map(|c| {
+                // Pushed commits come from a peer; screen the blob's flakes for
+                // impersonated commit provenance before they reach novelty. See
+                // the note on the clone path above and #1846.
+                let mut flakes = c.commit.flakes.clone();
+                let mut meta_flakes =
+                    generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
+                let dropped = drop_forged_commit_flakes(&mut flakes, &txn_meta_g);
+                warn_if_forged_commit_flakes_dropped(dropped, base_state.ledger_id(), c.commit.t);
+                stamp_graph_on_commit_flakes(&mut meta_flakes, &txn_meta_g);
+                flakes.extend(meta_flakes);
+                (c.commit.t, flakes)
+            })
+            .collect();
+
+        let new_state = apply_pushed_commits_to_state(
+            base_state,
+            &all_flakes,
+            &decoded,
+            &stored_commits,
+            &txn_meta_g,
+        )
+        .map_err(PushError::into_api_error)?;
+
+        // 8) CAS update CommitHead.
         match self
             .publisher()?
             .compare_and_set_ref(
-                base_state.ledger_id(),
+                new_state.ledger_id(),
                 RefKind::CommitHead,
                 Some(&current_ref),
                 &new_ref,
@@ -2527,36 +2683,6 @@ impl Fluree {
                 ));
             }
         }
-
-        // 8) Update in-memory state (novelty + dict novelty + namespace deltas).
-        let txn_meta_iri = fluree_db_core::txn_meta_graph_iri(base_state.ledger_id());
-        let txn_meta_g_sid = base_state.snapshot.encode_iri(&txn_meta_iri);
-        let all_flakes: Vec<(i64, Vec<Flake>)> = decoded
-            .iter()
-            .map(|c| {
-                // Pushed commits come from a peer; screen the blob's flakes for
-                // impersonated commit provenance before they reach novelty. See
-                // the note on the clone path above and #1846.
-                let mut flakes = c.commit.flakes.clone();
-                let mut meta_flakes =
-                    generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
-                if let Some(ref g_sid) = txn_meta_g_sid {
-                    let dropped = drop_forged_commit_flakes(&mut flakes, g_sid);
-                    warn_if_forged_commit_flakes_dropped(
-                        dropped,
-                        base_state.ledger_id(),
-                        c.commit.t,
-                    );
-                    stamp_graph_on_commit_flakes(&mut meta_flakes, g_sid);
-                }
-                flakes.extend(meta_flakes);
-                (c.commit.t, flakes)
-            })
-            .collect();
-
-        let new_state =
-            apply_pushed_commits_to_state(base_state, &all_flakes, &decoded, &stored_commits)
-                .map_err(PushError::into_api_error)?;
 
         // 9) Compute indexing status from the updated state.
         let index_config = self.default_index_config();

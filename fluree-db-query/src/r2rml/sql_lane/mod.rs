@@ -33,6 +33,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::{GraphName, Pattern};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -42,6 +43,7 @@ use crate::sort::SortSpec;
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
+use fluree_db_r2rml::TableKeys;
 
 use lower::{block_is_admissible, literal_len, lower_block, Decline, LowerInput, Lowered};
 use terms::{seed_values, Materializer};
@@ -54,7 +56,7 @@ use union::{UnionLayout, UNION_ALIAS};
 /// as one key. That is exactly right here: the set exists to avoid sending the
 /// same key twice, and two keys that render identically are the same key.
 #[derive(Clone)]
-struct SeedKey(Vec<Literal>);
+pub(super) struct SeedKey(pub(super) Vec<Literal>);
 
 impl SeedKey {
     fn hash_literal<H: std::hash::Hasher>(l: &Literal, state: &mut H) {
@@ -311,7 +313,7 @@ pub(super) async fn resolve_block(
     };
     let mapping = provider.compiled_mapping(iri, as_of_t).await?;
     let graph_ctx = ctx.with_active_graph(Arc::clone(iri));
-    let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri) {
+    let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri)? {
         None => None,
         Some(mut gate) => match gate
             .static_verdicts(&graph_ctx, &mapping, caps.keyset_max_rows)
@@ -332,10 +334,30 @@ pub(super) async fn resolve_block(
             })
         };
     let mut schemas: HashMap<RelSource, Arc<BatchSchema>> = HashMap::new();
-    for src in lower::candidate_sources(patterns, ctx.active_snapshot, &mapping) {
-        if let Some(schema) = table_provider.source_schema(iri, &src).await? {
-            schemas.insert(src, schema);
+    let sources = lower::candidate_sources(patterns, ctx.active_snapshot, &mapping);
+    for src in &sources {
+        if let Some(schema) = table_provider.source_schema(iri, src).await? {
+            schemas.insert(src.clone(), schema);
         }
+    }
+    // What proves a map's rows cannot repeat a subject: each reachable
+    // table's keys, declared and reported. A key the source refuses (one its
+    // table cannot hold) fails the query rather than being trusted.
+    let mut keys: HashMap<String, TableKeys> = HashMap::new();
+    let mut maps: Vec<&fluree_db_r2rml::mapping::TriplesMap> =
+        mapping.triples_maps.values().collect();
+    maps.sort_by(|a, b| a.iri.cmp(&b.iri));
+    for tm in maps {
+        let Some(table) = tm.table_name() else {
+            continue;
+        };
+        if keys.contains_key(table) || !sources.contains(&lower::source_of_tm(tm)) {
+            continue;
+        }
+        let table_keys =
+            crate::r2rml::effective_table_keys(table_provider, &mapping, iri, table, as_of_t)
+                .await?;
+        keys.insert(table.to_string(), table_keys);
     }
     let lowered = lower_block(LowerInput {
         patterns,
@@ -346,6 +368,7 @@ pub(super) async fn resolve_block(
         policy: verdicts.is_some().then_some(&mut verdict),
         schemas: &schemas,
         projection,
+        keys: &keys,
     })?;
     let lowered = match lowered {
         Err(Decline(why)) => {
@@ -757,7 +780,13 @@ impl SqlBlockSource {
                             Some((key, s.ascending()))
                         })
                         .collect();
-                    if let Some(keys) = keys {
+                    // A statement removing repeated solutions is a SELECT
+                    // DISTINCT, which orders only by what it selects.
+                    let selected = |keys: &[(OrderKey, bool)]| {
+                        !lowered.dedupes
+                            || !keys.iter().any(|(k, _)| matches!(k, OrderKey::Expr(_)))
+                    };
+                    if let Some(keys) = keys.filter(|k| selected(k)) {
                         order_by = keys;
                         limit = Some(*k as u64);
                     }
@@ -960,8 +989,9 @@ impl SqlBlockSource {
                     row.iter()
                         .find(|(v, b)| v == jv && b.is_bound())
                         .map(|(_, b)| join_key(b, ctx))
+                        .transpose()
                 })
-                .collect();
+                .try_collect_vec()?;
             if key.iter().all(Option::is_some) {
                 index
                     .entry(key.into_iter().map(Option::unwrap).collect())
@@ -1004,7 +1034,7 @@ impl SqlBlockSource {
                     poisoned = true;
                     break;
                 }
-                key.push(b.is_bound().then(|| join_key(b, ctx)));
+                key.push(b.is_bound().then(|| join_key(b, ctx)).transpose()?);
             }
             if poisoned {
                 continue;
@@ -1091,18 +1121,18 @@ impl SqlBlockSource {
         branch: usize,
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> Vec<Option<KeySet>> {
+    ) -> Result<Vec<Option<KeySet>>> {
         let lowered = self.lowered(branch);
         if lowered.seeds.is_empty() {
-            return vec![None];
+            return Ok(vec![None]);
         }
-        let gv = ctx.graph_view();
+        let gv = ctx.term_view();
         let child_schema = child_batch.schema();
         // Resolved once per batch, not once per seed per row.
         let mut seed_positions: Vec<usize> = Vec::with_capacity(lowered.seeds.len());
         for seed in &lowered.seeds {
             let Some(pos) = child_schema.iter().position(|v| *v == seed.var) else {
-                return vec![None];
+                return Ok(vec![None]);
             };
             seed_positions.push(pos);
         }
@@ -1117,10 +1147,10 @@ impl SqlBlockSource {
                 if !b.is_bound() {
                     // An unbound outer value joins with everything: no seeding.
                     tracing::debug!(var = ?seed.var, "sql pushdown: unbound outer value, no key set");
-                    return vec![None];
+                    return Ok(vec![None]);
                 }
                 let materialized = if matches!(b, Binding::EncodedLit { .. }) {
-                    crate::group_aggregate::materialize_encoded(b, gv.as_ref())
+                    crate::group_aggregate::materialize_encoded(b, gv.as_ref())?
                 } else {
                     b.clone()
                 };
@@ -1141,7 +1171,7 @@ impl SqlBlockSource {
             }
         }
         if rows.is_empty() {
-            return Vec::new();
+            return Ok(Vec::new());
         }
         let width = rows[0].len();
         let columns: Vec<(String, Option<fluree_db_tabular::FieldType>)> =
@@ -1160,7 +1190,7 @@ impl SqlBlockSource {
                     row_bytes,
                     "sql pushdown: outer key over the byte budget, no key set"
                 );
-                return vec![None];
+                return Ok(vec![None]);
             }
             if !current.is_empty() && (current.len() >= max_rows || bytes + row_bytes > byte_budget)
             {
@@ -1181,7 +1211,7 @@ impl SqlBlockSource {
                 rows: current,
             }));
         }
-        chunks
+        Ok(chunks)
     }
 
     fn build_join_plan(
@@ -1189,7 +1219,7 @@ impl SqlBlockSource {
         branch: usize,
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> JoinPlan {
+    ) -> Result<JoinPlan> {
         let child_schema = child_batch.schema();
         // Carry each join variable's column position, which is just its index
         // in the child schema, instead of re-scanning the schema for it once
@@ -1202,7 +1232,7 @@ impl SqlBlockSource {
             .map(|(pos, v)| (v, pos))
             .collect();
         if positioned.is_empty() {
-            return JoinPlan::Cross;
+            return Ok(JoinPlan::Cross);
         }
         let join_vars: Vec<VarId> = positioned.iter().map(|(v, _)| *v).collect();
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
@@ -1218,7 +1248,7 @@ impl SqlBlockSource {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(join_key(b, ctx)));
+                    key.push(Some(join_key(b, ctx)?));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1236,11 +1266,11 @@ impl SqlBlockSource {
                 partial_rows.push((row_idx, key));
             }
         }
-        JoinPlan::Hash {
+        Ok(JoinPlan::Hash {
             join_vars,
             full_index,
             partial_rows,
-        }
+        })
     }
 
     fn emit_row(
@@ -1293,7 +1323,7 @@ impl SqlBlockSource {
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| join_key(b, ctx))
                     })
-                    .collect();
+                    .try_collect_vec()?;
                 if pkey.len() != join_vars.len() {
                     return Ok(());
                 }
@@ -1382,16 +1412,16 @@ impl SqlBlockSource {
 /// ledger `Sid`, an `IriMatch`, a raw `Iri`) keys by its IRI string, so an
 /// outer ledger value joins the block's raw IRI; anything else uses the
 /// engine's normalized key.
-fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> GroupKeyOwned {
+fn join_key(b: &Binding, ctx: &ExecutionContext<'_>) -> Result<GroupKeyOwned> {
     match terms::iri_of_binding(b, Some(ctx.active_snapshot)) {
-        Some(iri) => GroupKeyOwned::MaterializedSid(0, iri.into()),
+        Some(iri) => Ok(GroupKeyOwned::MaterializedSid(0, iri.into())),
         None => {
-            let gv = ctx.graph_view();
-            binding_to_group_key_normalized(
+            let gv = ctx.term_view();
+            Ok(binding_to_group_key_normalized(
                 b,
                 crate::object_binding::TermDicts::of(ctx),
                 gv.as_ref(),
-            )
+            )?)
         }
     }
 }
@@ -1527,18 +1557,18 @@ impl Operator for SqlBlockSource {
                             continue;
                         }
                         seeded.push(branch);
-                        joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx));
+                        joins.push(self.build_join_plan(branch, &child_batch, &graph_ctx)?);
                     }
                     // Grouped branches seed alike, so one branch's key sets
                     // are the group's, joined to the union once. A branch
                     // no outer row can match contributes nothing.
                     if self.grouped && seeded.len() > 1 {
-                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx) {
+                        for ks in self.keysets_for(seeded[0], &child_batch, &graph_ctx)? {
                             chunks.push_back((seeded.clone(), ks));
                         }
                     } else {
                         for branch in seeded {
-                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx) {
+                            for ks in self.keysets_for(branch, &child_batch, &graph_ctx)? {
                                 chunks.push_back((vec![branch], ks));
                             }
                         }

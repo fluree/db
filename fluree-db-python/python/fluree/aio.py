@@ -602,9 +602,14 @@ class Ledger:
         return await _call(self._sync.graphs)
 
     async def drop_graph(self, graph: str) -> Commit:
-        """Retract everything in named graph ``graph`` (its full IRI) in one commit; see
+        """Drop named graph ``graph`` (its full IRI) and its history in one commit; see
         :meth:`fluree.Ledger.drop_graph`."""
         return await _call(self._sync.drop_graph, graph)
+
+    async def import_graph(self, graph: str, source: str | os.PathLike[str]) -> Commit:
+        """Bulk-load ``source`` into ``graph``, a named graph the ledger does not have yet; see
+        :meth:`fluree.Ledger.import_graph`."""
+        return await _call(self._sync.import_graph, graph, source)
 
 
 def _source(source: str | Ledger) -> str | fluree.Ledger:

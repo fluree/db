@@ -414,10 +414,11 @@ async fn setup() -> (MockServer, Fluree) {
     (server, fluree)
 }
 
-/// Cases the per-scan lane cannot run (a graph source has no native index
-/// for the engine's subquery operator), checked against the native twin
-/// of the shop fixture instead.
-const LANE_ONLY_CASES: &[&str] = &[
+/// Sub-select cases, checked against the native twin of the shop fixture as
+/// well as against the per-scan lane: both lanes evaluate a sub-select by
+/// lowering its body through the R2RML rewrite, so a defect in that shared
+/// plan would be invisible to the lane comparison alone.
+const SUB_SELECT_CASES: &[&str] = &[
     "a sub-select projects an OPTIONAL variable as nullable",
     "a grouped sub-select joins its counts to the outer rows",
     "a grouped sub-select sums in the database and finalizes in the engine",
@@ -427,7 +428,7 @@ const LANE_ONLY_CASES: &[&str] = &[
 ];
 
 /// The shop fixture as a native ledger (`shop-native:main`): the oracle for
-/// shapes the per-scan lane cannot answer.
+/// the sub-select shapes, whose plan the two graph-source lanes share.
 async fn seed_native_twin(fluree: &Fluree) {
     let ledger = fluree
         .create_ledger("shop-native:main")
@@ -1033,14 +1034,18 @@ fn cases() -> Vec<Case> {
         },
         // An entity several resolutions provide (a predicate two maps
         // mint, on the same subject or on different ones) is one derived
-        // table: the resolutions `UNION ALL`ed, each row tagged with its
-        // branch so its terms decode through that branch's maps. Two maps
-        // minting a triple alike (CustomerCountry's copy of Customer's
-        // label) count as one provider: the graph holds the triple once.
+        // table: the resolutions `UNION ALL`ed, each row tagged with how its
+        // terms decode. Two maps minting a triple alike (CustomerCountry's
+        // copy of Customer's label) count as one provider: the graph holds
+        // the triple once. Resolutions over `customers` and `profiles` both
+        // mint `customer/{id}`, so a name equal to an email would give one
+        // solution twice: they decode alike, share a tag, and the statement
+        // is a `SELECT DISTINCT`; `people` mints subjects apart and keeps a
+        // tag of its own.
         Case {
             name: "a predicate two maps provide unions the resolutions at the node",
             sparql: "SELECT ?l ?e FROM <shop-vp:main> WHERE { ?c ex:label ?l ; ex:email ?e }",
-            sql: &[r#"SELECT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t2"."email" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL) AS "u0""#],
+            sql: &[r#"SELECT DISTINCT "u0"."c3" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2", "u0"."c2" AS "c3" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", "t1"."email" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t0" JOIN "shop"."profiles" AS "t1" ON "t0"."id" = "t1"."id" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL AND "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t2"."email" AS "c2", 0 AS "c3" FROM "shop"."profiles" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL) AS "u0""#],
             rows: &[
                 "e=ada@example.org l=Ada",
                 "e=ada@example.org l=ada@example.org",
@@ -1053,7 +1058,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "maps with different subjects providing a predicate union their accesses",
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l }",
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 0 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 1 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0""#],
             // The subject has no key over the union (two templates), so it
             // decodes per branch; the object is one string column.
             rows: &[
@@ -1073,7 +1078,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a filter on a union variable pushes on the union's column",
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l FILTER(?l = \"Ada\") }",
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 0 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 1 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" WHERE "u0"."c1" = 'Ada'"#],
             rows: &[
                 "l=Ada s=http://example.org/customer/1",
                 "l=Ada s=http://example.org/person/1",
@@ -1086,7 +1091,7 @@ fn cases() -> Vec<Case> {
             sparql: "SELECT ?s ?l FROM <shop-vp:main> WHERE { ?s ex:label ?l } ORDER BY DESC(?l) LIMIT 1",
             // Every branch requires the column, so the union's is required
             // and orders exactly.
-            sql: &[r#"SELECT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 1 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 2 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
+            sql: &[r#"SELECT DISTINCT "u0"."c2" AS "c0", "u0"."c0" AS "c1", "u0"."c1" AS "c2" FROM (SELECT "t0"."id" AS "c0", "t0"."name" AS "c1", 0 AS "c2" FROM "shop"."customers" AS "t0" WHERE "t0"."id" IS NOT NULL AND "t0"."name" IS NOT NULL UNION ALL SELECT "t1"."id" AS "c0", "t1"."email" AS "c1", 0 AS "c2" FROM "shop"."profiles" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."email" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."name" AS "c1", 1 AS "c2" FROM "shop"."people" AS "t2" WHERE "t2"."id" IS NOT NULL AND "t2"."name" IS NOT NULL) AS "u0" ORDER BY "u0"."c1" DESC LIMIT 1"#],
             rows: &["l=cy@example.org s=http://example.org/customer/3"],
             routing: Routing::MustFire,
             declined: None,
@@ -1100,7 +1105,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a foreign key into a union entity joins the parent's columns",
             sparql: "SELECT ?o ?l FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c3" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."id" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."id" AS "c2", 1 AS "c3" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c2" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            sql: &[r#"SELECT DISTINCT "t0"."id" AS "c0", "u0"."c3" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."id" AS "c2", 0 AS "c3" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."id" AS "c2", 0 AS "c3" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c2" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
             rows: &[
                 "l=Ada o=http://example.org/order/10",
                 "l=Ada o=http://example.org/order/11",
@@ -1114,7 +1119,7 @@ fn cases() -> Vec<Case> {
         Case {
             name: "a foreign key into a partitioned union entity keeps its other parts",
             sparql: "SELECT ?o ?l ?k FROM <shop-vp:main> WHERE { ?o ex:customer ?c . ?c ex:label ?l ; ex:country ?k }",
-            sql: &[r#"SELECT "t0"."id" AS "c0", "u0"."c4" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4", "u0"."c3" AS "c5" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."country" AS "c2", "t1"."id" AS "c3", 0 AS "c4" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."country" AS "c2", "t3"."id" AS "c3", 1 AS "c4" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."country" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c3" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
+            sql: &[r#"SELECT DISTINCT "t0"."id" AS "c0", "u0"."c4" AS "c1", "u0"."c0" AS "c2", "u0"."c1" AS "c3", "u0"."c2" AS "c4", "u0"."c3" AS "c5" FROM "shop"."orders" AS "t0" JOIN (SELECT "t1"."id" AS "c0", "t1"."name" AS "c1", "t1"."country" AS "c2", "t1"."id" AS "c3", 0 AS "c4" FROM "shop"."customers" AS "t1" WHERE "t1"."id" IS NOT NULL AND "t1"."name" IS NOT NULL AND "t1"."country" IS NOT NULL UNION ALL SELECT "t2"."id" AS "c0", "t2"."email" AS "c1", "t3"."country" AS "c2", "t3"."id" AS "c3", 0 AS "c4" FROM "shop"."profiles" AS "t2" JOIN "shop"."customers" AS "t3" ON "t2"."id" = "t3"."id" WHERE "t2"."id" IS NOT NULL AND "t2"."email" IS NOT NULL AND "t3"."id" IS NOT NULL AND "t3"."country" IS NOT NULL) AS "u0" ON "t0"."customer_id" = "u0"."c3" WHERE "t0"."id" IS NOT NULL AND "t0"."customer_id" IS NOT NULL"#],
             rows: &[
                 "k=UK l=Ada o=http://example.org/order/10",
                 "k=UK l=Ada o=http://example.org/order/11",
@@ -1677,7 +1682,7 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
 
     for (i, c) in cases.iter().enumerate() {
         let sparql = format!("{PREFIX}{}", c.sparql);
-        if LANE_ONLY_CASES.contains(&c.name) {
+        if SUB_SELECT_CASES.contains(&c.name) {
             let native = native_rows(&fluree, &sparql).await;
             if native != by_value(&lane_rows[i]) {
                 failures.push(format!(
@@ -1685,7 +1690,6 @@ async fn admitted_shapes_send_the_expert_statement_and_match_the_scan_lane() {
                     c.name, lane_rows[i]
                 ));
             }
-            continue;
         }
         set_fast_paths_disabled(true);
         let rows = rows_of(&query(&fluree, &sparql).await);
@@ -2182,14 +2186,28 @@ async fn class_policy_on_a_derived_type_pushes_a_predicate() {
     assert!(!sent[0].contains("kind"), "{}", sent[0]);
 }
 
-/// A sub-select the lane cannot take has no other lane: a graph source has
-/// no native index for the engine's subquery operator, so the query refuses
-/// as it did before the lane took any sub-select at all. Never a silent
-/// empty answer.
+/// A sub-select the lane cannot take falls back to the per-scan lane, which
+/// evaluates it by lowering its body through the R2RML rewrite. Its rows
+/// match the native twin; never a refusal, never a silent empty answer from
+/// the source's (empty) native index. Each shape is stamped `MustNotFire`, so
+/// a change that moves one into the lane shows here, paired with a canary the
+/// lane takes so the absence is not a capture that saw nothing.
 #[tokio::test]
-async fn sub_selects_the_lane_cannot_take_still_refuse() {
+async fn sub_selects_the_lane_cannot_take_are_answered_by_the_scan_lane() {
     let _lock = KILL_SWITCH.lock().await;
     let (_server, fluree) = setup().await;
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+
+    let canary = format!(
+        "{PREFIX}SELECT ?n ?k FROM <shop-sql:main> WHERE {{ ?c ex:name ?n {{ SELECT ?c (COUNT(?o) AS ?k) WHERE {{ ?o ex:customer ?c }} GROUP BY ?c }} }}"
+    );
+    let before = store.find_events("fast-path outcome").len();
+    query(&fluree, &canary).await;
+    assert!(
+        proceeded_sites(&store, before).iter().any(|s| s == SITE),
+        "canary: the lane takes a grouped sub-select, so the capture sees `{SITE}`"
+    );
     let shapes = [
         (
             "a HAVING over an AVG",
@@ -2213,18 +2231,21 @@ async fn sub_selects_the_lane_cannot_take_still_refuse() {
         ),
     ];
     for (what, sparql) in shapes {
-        let err = fluree
+        let sparql = format!("{PREFIX}{sparql}");
+        let before = store.find_events("fast-path outcome").len();
+        let result = fluree
             .query_from()
-            .sparql(&format!("{PREFIX}{sparql}"))
+            .sparql(&sparql)
             .execute_tracked()
             .await
-            .err()
-            .map(|e| e.error.to_string())
-            .unwrap_or_else(|| panic!("{what}: expected a refusal"));
+            .unwrap_or_else(|e| panic!("{what}: {}", e.error));
         assert!(
-            err.contains("cannot be evaluated over a virtual dataset") && err.contains("subquery"),
-            "{what}: {err}"
+            !proceeded_sites(&store, before).iter().any(|s| s == SITE),
+            "{what}: `{SITE}` proceeded on a shape the lane does not take"
         );
+        let rows = by_value(&rows_of(&result.result));
+        assert!(!rows.is_empty(), "{what}: no rows");
+        assert_eq!(rows, native_rows(&fluree, &sparql).await, "{what}");
     }
 }
 
@@ -2981,14 +3002,35 @@ const MYSQL: LiveBackend = LiveBackend {
         "INSERT INTO memos VALUES (1, '10', 'gift wrap'), (2, '10-note', 'wrapped'), (3, '12', 'call first')",
         "INSERT INTO pointers VALUES (1, '10'), (2, '10-note')",
     ],
-    declines: &[],
+    // A union entity's statement needs a `SELECT DISTINCT` over string
+    // columns to answer with set semantics (its maps can mint one subject).
+    // MySQL's default collations fold case and accents, so that DISTINCT
+    // could merge two distinct values ('Ada' and 'ada'): the lane declines to
+    // the per-scan lane ("repeated solutions the statement cannot remove
+    // exactly"), whose rows these cases still check. The same rule as the
+    // live case "DISTINCT over strings runs in the engine where the database
+    // folds case".
+    declines: &[
+        "a predicate two maps provide unions the resolutions at the node",
+        "maps with different subjects providing a predicate union their accesses",
+        "a filter on a union variable pushes on the union's column",
+        "a top-k on a union variable pushes its LIMIT",
+        "a foreign key into a union entity joins the parent's columns",
+        "a foreign key into a partitioned union entity keeps its other parts",
+    ],
 };
 
 /// Maps over the dialect tables, appended to the shop mapping for live runs.
+///
+/// `tags` references `words` on `word`, which is not the word's subject
+/// column, so the registration probe checks `(id, word)` together and proves
+/// `id` alone unique for no map; the declared key does.
 const LIVE_R2RML: &str = r#"
+    @prefix f: <https://ns.flur.ee/db#> .
+
     <http://example.org/mapping#Word>
         a rr:TriplesMap ;
-        rr:logicalTable [ rr:tableName "words" ] ;
+        rr:logicalTable [ rr:tableName "words" ; f:key ( "id" ) ] ;
         rr:subjectMap [ rr:template "http://example.org/word/{id}" ; rr:class ex:Word ] ;
         rr:predicateObjectMap [ rr:predicate ex:word ; rr:objectMap [ rr:column "word" ] ] ;
         rr:predicateObjectMap [ rr:predicate ex:len ; rr:objectMap [ rr:column "len" ] ] .
@@ -3511,12 +3553,10 @@ async fn live_differential(backend: &LiveBackend) {
             .replace("shop-vp:main", "shop-vp-live:main")
             .replace("shop-typed:main", "shop-typed-live:main")
             .replace("shop-memo:main", "shop-memo-live:main");
+        // A sub-select a dialect declines falls back to the per-scan lane,
+        // which lowers its body like any other shape, so its rows are checked
+        // like the rest.
         let declines = backend.declines.contains(&c.name);
-        // A sub-select the lane declines has no other lane here: the query
-        // refuses (pinned in `sub_selects_the_lane_cannot_take_still_refuse`).
-        if declines && LANE_ONLY_CASES.contains(&c.name) {
-            continue;
-        }
         let (lane_rows, sent) = lane_run(&fluree, &sparql, c.name).await;
         match (&c.routing, c.sql.is_empty()) {
             (Routing::MustFire, false) if declines && !sent.is_empty() => {
@@ -3547,7 +3587,7 @@ async fn live_differential(backend: &LiveBackend) {
                 c.name, c.rows
             ));
         }
-        if LANE_ONLY_CASES.contains(&c.name) {
+        if SUB_SELECT_CASES.contains(&c.name) {
             let native = native_rows(&fluree, &sparql).await;
             if native != by_value(&lane_rows) {
                 failures.push(format!(
@@ -3555,7 +3595,6 @@ async fn live_differential(backend: &LiveBackend) {
                     c.name
                 ));
             }
-            continue;
         }
         let scan_rows = scan_run(&fluree, &sparql).await;
         if lane_rows != scan_rows {

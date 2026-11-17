@@ -16,6 +16,8 @@ Fluree implements the W3C RDF 1.1 specification:
 - Blank nodes
 - RDF datasets
 
+**Deviation (ill-typed literals):** RDF 1.1 admits a literal whose lexical form is not in its datatype's lexical space, such as `"xyz"^^xsd:integer`, as a literal that denotes no value. Fluree stores typed values rather than lexical forms, so every transaction refuses one. Bulk import keeps one as text under its datatype. See [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype).
+
 **Specification:** https://www.w3.org/TR/rdf11-concepts/
 
 ### RDF 1.2
@@ -70,6 +72,8 @@ Fluree supports JSON-LD 1.1:
 - @reverse, @included and @nest
 - @value and @type for literals
 - @language for language tags
+- Term definitions that coerce values with `@type` (`@id`, `@vocab`, `@json` or a datatype) or set `@language` (`null` included), and terms defined as `null`, whose properties are dropped
+- `@container` values `@list`, `@set`, `@language` and `@index`
 - Nested objects
 - Arrays
 - @json literals, stored in the canonical form the Object-to-RDF transformation requires (RFC 8785). Integers past 2^53 are kept exact rather than rounded through a double
@@ -80,6 +84,9 @@ Deviations from the JSON-LD 1.1 expansion algorithm:
 - Other `@`-keywords on a node object are refused, by a transaction and by a bulk import alike, where the algorithm drops them with a warning. A refusal names the key, so the document can drop it or rename it.
 - A type-scoped context also applies to the node objects nested in the typed node (the algorithm's default is `@propagate: false`), and a node with several types applies their scoped contexts in the order written rather than in lexicographic order.
 - A term defined only in a property-scoped context, used outside it, is kept as a bare key rather than dropped.
+- A remote context is not fetched. A string `@context` sets `@vocab` to that string, so `"@context": "https://schema.org"` reads bare terms as schema.org IRIs; inline any other definitions the document needs.
+- `@container` values `@id`, `@type` and `@graph` are refused. A property-valued `@index` is refused where an index map uses it.
+- A string `@value` on a value object typed `@json` is read as a serialized JSON document: `{"@value": "{\"a\": 1}", "@type": "@json"}` is the object, not a string. A string under a term typed `@json` is the JSON string itself.
 
 **Specification:** https://www.w3.org/TR/json-ld11/
 
@@ -120,7 +127,9 @@ Supported SPARQL features:
 
 **Trailing VALUES in a grouped query (deviation from §18.2.4.3):** A `VALUES` block after the WHERE clause, at the top level of any query form or in a sub-SELECT, is joined with the WHERE solutions before grouping, so it restricts what the aggregates count: `SELECT ?a (COUNT(?e) AS ?n) WHERE { ?e ex:area ?a } GROUP BY ?a VALUES ?e { ex:e1 }` counts `ex:e1` alone. The spec joins it after HAVING instead, pairing each group row with each VALUES row. The expressions the level evaluates before grouping (an aggregate's input expression, a `GROUP BY` expression, and the SELECT expressions placed before grouping: all of them in a query that does not group) run after the join, so they read the VALUES variables: `SELECT (SUM(?n * ?v) AS ?s) WHERE { ?e ex:n ?n } VALUES ?v { 2 }` doubles the sum, at the top level as in a sub-SELECT. HAVING still reads a VALUES variable as unbound, as it would in the spec's order, unless the WHERE binds it or it is a GROUP BY key. For queries that behave the same on any SPARQL processor, put the `VALUES` block inside the WHERE clause to restrict the aggregates' input, or move the grouped query into a sub-SELECT and put the `VALUES` block after the outer WHERE to join it with the grouped rows.
 
-**Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity, an unknown datatype IRI — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.)
+**FILTER string comparisons are term-exact:** `FILTER(?o = "a")`, and `<`, `<=`, `>`, `>=` against a plain-string constant, compare the `xsd:string` term `"a"` (§17.4.1.7, §17.3). A language-tagged `"a"@en` is not equal to it, and a literal of another datatype (`"a"^^ex:T`, `"a"^^xsd:anyURI`) is a type error, which excludes the row, as it does for `!=`. `=` never equates a plain string with a date or other temporal value, while `<`, `<=`, `>` and `>=` order a plain string against one by reading it as a value of that type, so `FILTER(?d >= "2026-01-01")` over `xsd:date` values still works, and so does `FILTER(?d < "2026-02-01"^^xsd:date)` over a plain string stored as `"2026-01-01"`. A language-tagged or custom-typed literal is never read as a temporal. `@fulltext` and `rdf:JSON` values are datatypes of their own too: `=` and `<` against a string exclude them, while the string functions (`CONTAINS`, `REGEX`, `STRSTARTS`, `SUBSTR`, `STRLEN`, `CONCAT`, …) read them as text. JSON-LD filters and Cypher `WHERE` follow the same rules. To compare the text whatever the tag, use `STR(?o) = "a"`; to match one tag, compare with `"a"@en`. A bare JSON string as a constant object in a JSON-LD `where` clause keeps its lenient matching; see [Datatypes](../concepts/datatypes.md).
+
+**Expression error semantics:** A *dynamic value* error in a `SELECT`/`BIND`/`ORDER BY` expression (e.g. arithmetic on incompatible operand types) leaves that variable unbound for the solution and the query still returns the remaining rows (SPARQL 1.1 §18.5 `Extend`); the same error in a `FILTER` eliminates the solution (§17.2). *Structural* errors — a built-in called with the wrong arity — describe a malformed query and are reported as a query error. (Transactions evaluate their `WHERE` clause in strict mode, so a computed value error fails the transaction rather than silently writing an unbound value.) `STRDT` takes any IRI as its datatype, including one in a namespace the ledger has not seen; a datatype that cannot be an IRI (a number, or a string holding a space or another character no IRI holds) is a type error, which leaves the value unbound in a query and fails a transaction.
 
 **Timezone offsets are not supported (deviation from §17.4.5.5-9 and from lexical round-tripping):** Every temporal value is canonicalized the moment it is parsed, and the source offset is retained nowhere — not in novelty, not in the commit log, not in the index. An `xsd:dateTime` is a UTC instant: the offset is *applied*, so `"2010-12-21T15:38:02-08:00"` is stored, compared, and rendered as `"2010-12-21T23:38:02Z"`, and a lexical form with no offset is read as UTC. An `xsd:date`, `xsd:time`, or gYear-family value carries no designator at all: the offset is validated and then *discarded, not applied* — `"2026-01-01+05:00"` is `"2026-01-01"` and `"17:00:00-06:00"` is `"17:00:00"`, because applying it would move a calendar day, and the index has only ever stored the day / the wall clock. Consequences a caller will see: `STR()` and every result format return the canonical form, not the lexical written (`…T09:00:00+01:00` reads back as `…T08:00:00Z`; `2001-01-01Z` as `2001-01-01`; fractional seconds lose trailing zeros); the calendar accessors read UTC components, so `HOURS("…T15:38:02-08:00")` is `23`; `TZ` is always `"Z"` and `TIMEZONE` always `"PT0S"`; and two lexicals that canonicalize alike are one value for `=`, `DISTINCT`, and `GROUP BY`. Six W3C tests that assert the source offset or lexical are registered as not-supported: `functions/tz-01`, `functions/timezone-01`, `functions/hours-01`, and `open-world/date-2`, `date-3`, `date-4`.
 
@@ -161,9 +170,13 @@ Supported:
 
 Differences from the specification:
 - Remote `LOAD` is not supported; `LOAD SILENT` is accepted as a no-op
-- Fluree has no empty named graph: `DROP` behaves like `CLEAR`, and `CREATE`
-  registers the graph without making it visible until it holds a triple, so
-  `CREATE` of an existing graph is not an error
+- `DROP` takes the graph's history with it: a query as of an earlier `t` that
+  names the graph is refused. `MOVE` drops its source the same way. Only an
+  identity without a restricting policy may drop. The commits keep the
+  dropped facts, so a branch from before the drop has them
+- `CREATE` registers the graph without making it visible until it holds a
+  triple, so `CREATE` of an existing graph is not an error, and `CLEAR` of a
+  graph that does not exist is not an error either
 - The reserved `#config` and `#txn-meta` graphs cannot be the target of graph
   management operations
 - A list is written and deleted through its members: deleting a value deletes
@@ -184,7 +197,8 @@ transactions remain available as an alternative write surface.
 
 `GET`, `HEAD`, `PUT`, `POST` and `DELETE` on `/v1/fluree/data/{ledger}` with
 `?graph={iri}` or `?default`. `PUT` commits only the difference from the
-graph's current contents. `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML.
+graph's current contents. `DELETE` of a named graph is `DROP GRAPH`, which
+takes its history; of the default graph, `CLEAR DEFAULT`, which keeps it. `GET` returns JSON-LD, Turtle, N-Triples or RDF/XML.
 Direct graph identification (the request URL as the graph IRI)
 is not supported. See [Graph Store Protocol](../api/graph-store.md).
 
@@ -361,11 +375,25 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
+#### `DROP` drops a graph's history (breaking)
+
+SPARQL `DROP GRAPH`, `DROP DEFAULT`, `DROP NAMED` and `DROP ALL` used to retract the graph's facts, as `CLEAR` does. They now take the graph out of the ledger: what it held is no longer queryable at the head or as of any earlier `t`, and a query that names the graph as of a `t` before the drop is refused with a 404. The drop commits without retracting anything, so it costs the same for any size of graph and is not limited by `FLUREE_MAX_GRAPH_SCAN_FLAKES`. Writing to the graph again starts it afresh, under the same IRI. The commits that wrote the dropped facts keep them: a branch created at a `t` before the drop reads them. A drop is therefore not a deletion: the facts stay in the ledger's storage. The same applies to `fluree graph drop`, `POST /v1/fluree/drop-graph`, the Graph Store Protocol's `DELETE` of a named graph, the Python `Ledger.drop_graph`, and the source graph of `MOVE`.
+
+- Dropping needs an identity without a restricting policy; others get a 403. `CLEAR` is unchanged and remains available under policy.
+- `DROP GRAPH` of a graph that does not exist, or that was dropped, is an error unless `SILENT` (it used to be a no-op).
+- A commit that drops a graph cannot be read by a release before this one, which refuses it rather than showing the dropped graph. A ledger that never drops a graph is unchanged and stays readable by them.
+- Merging, rebasing or reverting across a drop is supported only when the result keeps the drop as committed: a fast-forward merge or rebase. Push and pull carry a drop like any other commit. The receiver applies it as the writer did, and pushing one needs an identity without a restricting policy.
+- A BM25 or vector index whose indexing query reads a dropped graph is rebuilt at its next sync, and BM25 retires its snapshots from before the drop. Until that sync, searches serve the snapshot they had.
+- A reasoning query as of a `t` before the drop of a graph its `f:schemaSource` reads (the starting graph, or one it follows through `owl:imports`) is refused with a 404, as a query naming the graph is.
+- A governed query as of a `t` before the drop of the graph its stored policies live in is refused with a 404: the default graph after `DROP DEFAULT` or `DROP ALL`, or the `f:policySource` graph. Governing it with the policies gone would show what they hid. The same query without policy reads as it did.
+
 #### Writing schema triples is checked by modify policy
 
 Schema triples (`rdfs:subClassOf`, `rdfs:subPropertyOf`, `rdfs:domain`, `rdfs:range`, and `rdf:type` declaring a class or property) used to be exempt from `f:modify` policy, so any identity able to transact could write or retract them. A policy on a class or property also covers its subclasses and subproperties, so writing the hierarchy changes what policies allow. Schema triples are now checked like any other flake. An identity with `f:defaultAllow` or no policy is unaffected. A restricted identity that maintains the ontology needs modify permission for those triples: an `f:onProperty` policy on the four schema properties, and one on `rdf:type` whose condition admits only class and property types ([Schema writes](../security/policy-in-transactions.md#schema-writes) has the pair). This includes `CLEAR` and `DROP` of a graph holding schema triples. Reading the schema is unchanged: view policy still lets every schema triple through. See [Schema writes](../security/policy-in-transactions.md#schema-writes).
 
 The class and property hierarchy that policy targeting, SHACL targeting, GraphQL interfaces and `rdfs` reasoning read is now built from the default graph's current state alone. A retracted `rdfs:subClassOf` or `rdfs:subPropertyOf` edge stops counting at once; it used to count until the next index build. An edge in a named graph no longer counts at all; it used to count after an index build.
+
+SHACL `sh:class` now reads the same hierarchy. A retracted edge stops counting at once, and an edge in a named graph counts only when that graph is an `f:shapesSource` or [`f:additionalDataSource`](../guides/cookbook-shacl.md#validating-against-other-graphs) graph. Before, both counted for `sh:class` until the next index build, so a value that conformed only through such an edge could be accepted on an indexed ledger and refused on an unindexed one.
 
 #### SHACL is enforced only where the ledger config enables it (breaking)
 
@@ -391,7 +419,7 @@ A transaction that writes a setting group into the config graph with its fields 
 
 Each operation of a multi-operation SPARQL update, each clause of a Cypher write, and each write staged in a transaction (`Fluree::begin_transaction`) is validated against the shapes, uniqueness constraints and config in effect before the request, as a single transaction is: an earlier operation that changes the config, a shape or a constraint does not change how a later one in the same request is checked. A model ledger the config names (a cross-ledger `f:shapesSource`, say) is read at one head for the whole request: the one its first lookup found. The config checks run once, on the request's result. Explicit Bolt transactions are not requests of this kind: they commit each statement as it runs, so each statement is checked against the state before it, as separate transactions are. A write or transaction staged before another commit that declares a property unique (`f:enforceUnique`) stages again when it commits, and is checked against the declaration.
 
-A transaction that writes only the config graph is no longer validated against SHACL shapes or uniqueness constraints, and no longer needs a shapes, schema or constraints source to be resolvable, so a config repair is never blocked by the source it repairs (a policy source still applies to config writes). Shapes that target nodes in the config graph are no longer checked. Where SHACL or uniqueness is enabled and its source cannot be resolved, data writes fail with an error naming it, and a config read failure now fails a write instead of letting it through without uniqueness checks. A failure to read the ledger config answers HTTP 500 with `err:storage/ReadFailure` on the write lanes, branch operations, push and queries (a transaction, a multi-operation update, a branch operation, push, the transaction policy context, a query); it was a 400 `Parse error` (a 422 on push, and `err:system/ConfigError` for the policy context and queries).
+A transaction that writes only the config graph is no longer validated against SHACL shapes or uniqueness constraints, and no longer needs a shapes, schema or constraints source to be resolvable, so a config repair is never blocked by the source it repairs (a policy source still applies to config writes). Shapes that target nodes in the config graph are no longer checked. Where SHACL or uniqueness is enabled and its source cannot be resolved, data writes fail with an error naming it, and a config read failure now fails a write instead of letting it through without uniqueness checks. A failure to read the ledger config answers HTTP 500 with `err:storage/ReadFailure` on the write lanes, branch operations, push and queries (a transaction, a multi-operation update, a branch operation, push, the transaction policy context, a query); it was a 400 `Parse error` (a 422 on push, and `err:system/ConfigError` for the policy context and queries). Validation (`fluree validate` and `/validate`) fails the same way; it used to validate as if the ledger had no config.
 
 #### JSON-LD nested nodes are written to their enclosing node's graph
 
@@ -405,12 +433,38 @@ Related JSON-LD changes: graph names must be absolute IRIs (a relative one is re
 
 A bulk JSON-LD import (`fluree create --from`, `.jsonld` and `.jsonl`/`.ndjson`) now writes `@graph` scoping as a transaction does: a node's graph selector puts it and the nodes nested in it in that graph, and a JSON-LD named graph puts its content there, through the same graph-name table a transaction and a TriG import use. In 4.2.4 such documents imported with their graph selectors folded into the default graph and the named graphs' content dropped. A few documents that imported before now fail, naming what they cannot place: an unknown `@`-keyword on a node (it used to be dropped), and a graph name a transaction refuses as well. `"config"` and `"txn-meta"` stay refused, as in a TriG import. Each `.jsonl` line is read as a document of its own under the shared context.
 
+#### A JSON number reads as the nearest double
+
+A JSON number is now read as the double nearest to it, as the SPARQL and Turtle readers already did. Roughly one in ten numbers written with 16 or more significant digits (one in six at exactly 17), and some with an exponent past ±22 (`1e-30`), used to read as a neighbouring double: `0.9452706955539223` was stored as `0.9452706955539224`. This applied to every JSON reader (a transaction, a bulk import, a JSON-LD query's `where` and `values`), including an `xsd:decimal` or `@json` value written as a JSON number, and a SPARQL literal did not match a value written through JSON-LD.
+
+An application that embeds `fluree-db-api` gets the same reading for its own `serde_json` parsing, because Cargo enables `float_roundtrip` for the whole build. Parsing JSON that is mostly floats takes about 20–43% longer, which makes an insert of embedding vectors about 7% slower end to end; a transaction-shaped document parses as fast as before.
+
+Data already stored is not rewritten; see [Data written by an earlier release that reads differently](#data-written-by-an-earlier-release-that-reads-differently).
+
+#### JSON-LD term definitions coerce values as JSON-LD 1.1 defines
+
+A transaction, a bulk import and a JSON-LD query now read these term definitions as JSON-LD 1.1 does. A document that uses one writes different values than it did:
+
+- **`"@type": "@vocab"`**: a string value is an IRI (a term, a compact IRI, or relative to `@vocab`, else `@base`). It was stored as a string.
+- **`"@type": "@json"`**: the whole value is one JSON literal. A number, boolean or string was stored as an `xsd` value, and an array was split into separate values, its objects becoming nodes. A string is the JSON string, so `"5"` is not the number.
+- **`"@language": null`** on a term: its strings are untagged. They took the default language.
+- **A default `@language` with a datatype**, from the term or the value object: the datatype wins and the value has no language. The document was refused.
+- **`"@container": "@index"`**: the map's values are the property's values and the keys are dropped. The map was stored as a blank node with the keys as its properties.
+- **A term defined as `null`, or with `"@id": null`**: its property is dropped, and so is a `@vocab` value or `@type` that names it. The bare `null` form failed to parse, and the `"@id": null` form wrote the key as a property relative to `@vocab`.
+- **A property-valued `@index`** (`"@index": "<property>"`): an index map under such a term is refused. Its keys were dropped silently.
+
+A JSON-LD `where` clause reads a `@vocab` and a `@json` term the same way, so a pattern written under the context of the insert matches what the insert wrote: `"status": "Active"` looks for the IRI, and `"doc": 5` for the JSON literal `5`. A variable, and a value object (`{"@value": ...}`), keep their meaning under a `@json` term. A pattern on a term defined as `null` is refused. A map in `where` stays a node pattern under an `@index` term: to match a value written through an index map, write the value itself (`"m": "x"`, not `"m": {"a": "x"}`).
+
+Data already stored is not rewritten; see the next section for what that means for values these terms wrote before.
+
 #### Data written by an earlier release that reads differently
 
 No stored format changes. These kinds of earlier data behave differently after the upgrade:
 
 - **A config with two values for one setting-group pointer** (for example two `f:shaclDefaults` or `f:policyDefaults` groups on the config subject, typically a split config plus a corrected one written beside it). The reader now uses the non-empty group whose IRI sorts lowest; earlier releases could pick an empty one. A SHACL or policy group that had no effect therefore takes effect, including a stored `f:defaultAllow false`. Ledger info reports this as `ambiguous-pointer`. Remove the group you do not want, in the config graph.
 - **Edges written through a reverse-defined term** (a context term with `"@reverse"`). With `"childOf": {"@reverse": "ex:child"}`, the node `{"@id": "ex:kid", "childOf": {"@id": "ex:mom"}}` means `ex:mom ex:child ex:kid`. Earlier releases stored `ex:kid ex:child ex:mom`, as if the term were not reversed. The term is now read as JSON-LD defines it, so the same document no longer reaches an edge an earlier release stored: deleting with it does nothing. To repair a predicate that was written only through a reverse term, flip its edges once, for example `DELETE { ?s ex:child ?o } INSERT { ?o ex:child ?s } WHERE { ?s ex:child ?o }`. If it was also written in the forward direction, select only the edges the reverse term wrote.
+- **Values written through a `@vocab`, `@json` or `@index` term** (see [JSON-LD term definitions coerce values as JSON-LD 1.1 defines](#json-ld-term-definitions-coerce-values-as-json-ld-11-defines)). They keep the shape the earlier release stored, and the same context now reads and writes the new one, so a `where` pattern, a delete or an upsert written through the term no longer reaches them. A string stored through a `@vocab` term becomes the IRI with one update, here for terms relative to `http://example.org/`: `DELETE { ?s ex:status ?old } INSERT { ?s ex:status ?new } WHERE { ?s ex:status ?old FILTER(isLiteral(?old)) BIND(IRI(CONCAT("http://example.org/", STR(?old))) AS ?new) }`. Values stored through a `@json` or an `@index` term have no general rewrite (a split array does not record which values it held together): delete them by the property's full IRI and write the documents again.
+- **A JSON number an earlier release read as a neighbouring double** (see [A JSON number reads as the nearest double](#a-json-number-reads-as-the-nearest-double)). It keeps the double it was stored as, and an `xsd:decimal` its changed digit, so a JSON-LD pattern or delete that names the number no longer reaches it, inserting the same document again adds a second value beside it, and an upsert replaces it with the nearest double. Fluree cannot tell such a value from one sent as written: upsert the source documents again to repair a property, or match within a tolerance, for example `FILTER(ABS(?v - 0.9452706955539223e0) < 1e-15)`.
 - **Facts an update stored under a fallback namespace code.** A `where` constant in a namespace the ledger had not seen yet was stored under a fallback code, so once the namespace got its own code, a lookup by the IRI missed those facts. Every IRI an update writes is now stored under its canonical code. Facts already stored the fallback way stay split from the IRI's other facts; there is no migration.
 - **Vectors of more than one length on one property.** An earlier release could store vectors of several lengths on one property in one graph. Writes to such a property refuse any further length (see [A property keeps one vector length per graph](#a-property-keeps-one-vector-length-per-graph)). To fix it, export the ledger and import it into a new one, keeping one length per property or moving the others to another property.
 
@@ -479,6 +533,8 @@ Earlier data:
   DROP GRAPH <mydb:main>
   ```
 
+  `DROP` takes the old graph's history with it and needs an identity without a restricting policy. `CLEAR GRAPH <mydb:main>` in its place keeps the history, and works under policy.
+
 #### Datalog rules derive into named graphs and read the commit time
 
 - A stored JSON-LD rule whose insert names a graph (`{"@id": "ex:g", "@graph": [ … ]}`, or `"@graph": "ex:g"` on an insert node) used to derive into the default graph. It now derives into `ex:g`, and if the ledger has no graph `ex:g`, every datalog query on the ledger fails with an error naming it. Create the graph, or remove the graph name from the rule. See [Named graphs](../query/datalog-rules.md#named-graphs).
@@ -522,6 +578,10 @@ The `Garbage collection complete` log line's `retained_count` is replaced by `re
 
 The first `fluree doc ingest` after the upgrade re-parses and re-ingests every document once, and the ledger moves to the new graph shape: `doco:Document` becomes `foaf:Document`, `doco:ListItem` goes away, and every chunk, mention, relation and structure-node IRI moves. The previous extraction is retracted in full. A triple you added to a chunk or relation node stays on that node's old IRI. Triples on the document node are unaffected, since its IRI doesn't move. An embedding model whose width differs from the one the ledger holds is refused ([Mixing models](../unstructured/concepts/vector-search.md#mixing-models)). See [What gets built](../unstructured/concepts/what-gets-built.md).
 
+#### macOS builds need macOS 14 or later
+
+The CLI binary and the Python wheel for Apple silicon are built for macOS 14 (Sonoma) and later; earlier releases ran on macOS 11. On an older macOS the CLI does not start, and Homebrew refuses to install or upgrade it, leaving the installed version in place. `pip install fluree` installs the last release built for macOS 11 instead; asking for a later version by number finds no wheel.
+
 #### `fluree-track-policy` is now parsed by the server
 
 Previously the server recognised `fluree-track-meta`, `fluree-track-fuel`, and
@@ -551,6 +611,28 @@ an optional field on the terminal `end` record). It is additive and present
 only when a non-root policy context governed the request, so clients that
 ignore unknown fields are unaffected. See
 [Detecting that policy was applied](../security/policy-in-queries.md#detecting-that-policy-was-applied).
+
+#### Every transaction refuses an ill-typed literal (breaking)
+
+A typed literal whose lexical form is not in its datatype's lexical space, such as `"landed"^^xsd:integer` or `"300"^^xsd:byte`, is now refused by every transaction with the error `INSERT DATA` and the JSON-LD insert already gave ("Cannot parse 'landed' as integer"), and nothing is committed. These used to store it as text under its datatype:
+
+- an update that builds one at run time (`STRDT`, `STRDT(CONCAT(..))`, JSON-LD `str-dt`), and an `INSERT … WHERE` that copies one a ledger holds;
+- Turtle, TriG and N-Triples insert and upsert, the TriG insert fallback, graph insert and graph sync;
+- a JSON-LD value object typed `@json` (or `rdf:JSON`) whose string `@value` is not JSON.
+
+Bulk import (`fluree create --from`, `fluree graph import`) still keeps such a literal as text under its datatype, so data that carries one can be loaded as written that way. A ledger that holds an ill-typed literal keeps it, reads it back with its datatype, and can delete it through a variable ([Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)).
+
+JSON-LD results (a select and a graph crawl) print such a stored literal with its `@type`: `{"@value": "landed", "@type": "xsd:integer"}`. Under a datatype JSON-LD infers from a JSON number or boolean (`xsd:integer`, `xsd:double`, `xsd:boolean`, …) it used to print as a bare string, which reads back as an `xsd:string`. An `rdf:JSON` literal whose text is not JSON prints the same way, `{"@value": "not json", "@type": "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON"}`, in JSON-LD, typed JSON and agent JSON results; a query returning one used to fail with "Invalid JSON in @json value". A valid JSON literal prints as before.
+
+#### Bulk import stored wrong `rdf:JSON` and `xsd:duration` values (data integrity)
+
+Every release since 4.0.0 indexed the `rdf:JSON` and `xsd:duration` values of a bulk import (`fluree create --from`, and `fluree graph import` since it was added) under the wrong dictionary entry. A query read back some other text the ledger held instead of the value: a string from another statement, a file name, a hash, different from one import to the next. A JSON-LD or SPARQL result that included such a JSON value could fail with "Invalid JSON in @json value". Ledgers built by transactions were not affected. Imports now store these values as written.
+
+A ledger built or extended by an import in an earlier release, with `rdf:JSON` or `xsd:duration` values, still holds the wrong entries in its index. The ledger's commits hold the values as written, so [`fluree reindex`](../cli/reindex.md), which rebuilds the index from the commits, repairs it; a re-import is not needed. Reindex even if the ledger has been written to since the import. A value an update copied out of such a ledger before the repair (an `INSERT … WHERE` that bound it) was written with the wrong text, and a reindex does not change it.
+
+#### Bulk import keeps an out-of-range bounded integer as text
+
+A bulk import stored an out-of-range value of a bounded integer type, such as `"300"^^xsd:byte`, as the number 300 under `xsd:byte`. It now keeps it as text under its datatype, as it keeps every other literal that is not a value of its datatype (see [Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)), so it no longer compares equal to a number. A transaction refuses it ("Value 300 is out of range for byte").
 
 ## Supported Data Formats
 
@@ -615,7 +697,7 @@ Fluree works with:
 
 **Server:**
 - Linux (x86_64, aarch64)
-- macOS (Intel, Apple Silicon)
+- macOS 14 or later (Apple silicon)
 - Windows (x86_64)
 
 **Clients:**

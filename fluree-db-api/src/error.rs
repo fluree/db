@@ -694,6 +694,9 @@ impl ApiError {
             | ApiError::CommitNotFound(_)
             | ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
 
+            // A residency fetch failure surfaces while formatting, but it is
+            // an upstream read the same request can retry, not a bad request.
+            ApiError::Format(crate::format::FormatError::ResidencyFetch(_)) => 503,
             ApiError::Parse(_)
             | ApiError::Batch(_)
             | ApiError::Config(_)
@@ -914,6 +917,7 @@ impl ApiError {
             ApiError::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
             ApiError::Query(e) => match e {
                 QE::Cancelled { .. } => errors::QUERY_CANCELLED,
+                QE::GraphDropped { .. } => errors::GRAPH_NOT_FOUND,
                 QE::StorageAccessDenied { .. } => errors::STORAGE_ACCESS_DENIED,
                 QE::StorageSchemeNotServed { .. } => errors::STORAGE_SCHEME_NOT_SERVED,
                 QE::CatalogCredentialsNotVended { .. } => errors::CATALOG_CREDENTIALS_NOT_VENDED,
@@ -929,6 +933,9 @@ impl ApiError {
                 // Well-formed but unsupported on this source: still a 400,
                 // with its own code so clients can branch on it.
                 QE::R2rmlUnsupportedPattern { .. } => errors::R2RML_UNSUPPORTED_PATTERN,
+                QE::GraphSourceUnmapped { .. } => errors::GRAPH_SOURCE_UNMAPPED,
+                QE::GraphSourceUnsupported { .. } => errors::GRAPH_SOURCE_UNSUPPORTED,
+                QE::GraphSourceNotAGraph { .. } => errors::GRAPH_SOURCE_NOT_A_GRAPH,
                 // Typed as `ApiError::NameService` is: the backend's fault.
                 QE::Nameservice(_) => errors::NAMESERVICE,
                 e if query_error_status(e) == 500 => errors::INTERNAL,
@@ -1010,6 +1017,7 @@ impl ApiError {
             ApiError::NameService(_) => errors::NAMESERVICE,
             ApiError::Bm25Builder(_) | ApiError::Bm25Serialize(_) => errors::BM25,
             ApiError::Config(_) | ApiError::LedgerConfig(_) => errors::CONFIG,
+            ApiError::Format(crate::format::FormatError::ResidencyFetch(_)) => errors::STORAGE_READ,
             ApiError::Format(_) => errors::FORMAT,
             // The specific failure stays in the message; this is the umbrella.
             ApiError::CrossLedger(_) => errors::CROSS_LEDGER,
@@ -1062,6 +1070,8 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
     use fluree_db_query::QueryError as QE;
     match err {
         QE::Cancelled { .. } => 408,
+        // As a graph the ledger does not have.
+        QE::GraphDropped { .. } => 404,
         // The in-memory join/aggregate budget: distinct from the 408 timeout
         // so the caller degrades on it specifically (too memory-heavy, not
         // too slow).
@@ -1078,6 +1088,13 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         // The source's storage identity cannot serve the path: its
         // configuration, not a transient fault.
         QE::StorageSchemeNotServed { .. } => 400,
+        // The source's stored state, not the query, is what is wrong, and
+        // registering it again with a mapping clears it: a conflict with the
+        // resource, as querying a dropped source is.
+        QE::GraphSourceUnmapped { .. } => 409,
+        // The deployment lacks the reader, and no request can supply it: the
+        // server does not support what the request needs.
+        QE::GraphSourceUnsupported { .. } => 501,
         // Engine and storage faults no change to the query can clear.
         QE::Core(_)
         | QE::OperatorNotOpened
@@ -1103,6 +1120,8 @@ pub(crate) fn query_error_status(err: &fluree_db_query::QueryError) -> u16 {
         | QE::ResourceLimit(_)
         | QE::FuelLimitExceeded(_)
         | QE::R2rmlUnsupportedPattern { .. }
+        // The request names an index where a graph is read; the index is fine.
+        | QE::GraphSourceNotAGraph { .. }
         | QE::UnsupportedMode(_)
         | QE::UnsupportedFeature(_)
         | QE::TimeRangeNotCovered { .. }
@@ -1130,8 +1149,9 @@ impl From<fluree_db_core::TargetError> for ApiError {
     fn from(e: fluree_db_core::TargetError) -> Self {
         match e {
             fluree_db_core::TargetError::GraphNotFound(iri) => ApiError::GraphNotFound(iri),
-            cross @ fluree_db_core::TargetError::CrossLedger { .. } => {
-                ApiError::invalid_query(cross.to_string())
+            other @ (fluree_db_core::TargetError::CrossLedger { .. }
+            | fluree_db_core::TargetError::OtherLedgersSystemGraph { .. }) => {
+                ApiError::invalid_query(other.to_string())
             }
         }
     }
@@ -1289,6 +1309,11 @@ mod tests {
                 ApiError::Format(FormatError::InvalidBinding("x".into())),
                 400,
                 FORMAT,
+            ),
+            (
+                ApiError::Format(FormatError::ResidencyFetch("x".into())),
+                503,
+                STORAGE_READ,
             ),
             (ApiError::InvalidBranch("x".into()), 400, BAD_REQUEST),
             (
@@ -1469,6 +1494,32 @@ mod tests {
                 ApiError::GraphSourceRetracted("x".into()),
                 409,
                 GRAPH_SOURCE_RETRACTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnmapped {
+                    graph_source_id: "gs:main".into(),
+                    empty_mapping: true,
+                }),
+                409,
+                GRAPH_SOURCE_UNMAPPED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceUnsupported {
+                    graph_source_id: "gs:main".into(),
+                    family: "a 'f:FutureSource'".into(),
+                    cause: "it does not recognize that type".into(),
+                }),
+                501,
+                GRAPH_SOURCE_UNSUPPORTED,
+            ),
+            (
+                ApiError::Query(QE::GraphSourceNotAGraph {
+                    graph_source_id: "search:main".into(),
+                    index: "a BM25 index".into(),
+                    remedy: "r",
+                }),
+                400,
+                GRAPH_SOURCE_NOT_A_GRAPH,
             ),
             (ApiError::BranchConflict("x".into()), 409, COMMIT_CONFLICT),
             (ApiError::ledger_exists("db"), 409, LEDGER_EXISTS),

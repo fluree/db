@@ -52,12 +52,7 @@ fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
 fn residency_content_store(
     db: &GraphDb,
 ) -> Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> {
-    let provider = db.snapshot.range_provider.as_ref()?;
-    let brp = provider
-        .as_any()
-        .downcast_ref::<fluree_db_query::BinaryRangeProvider>()?;
-    let cs = brp.store().content_store()?.clone();
-    cs.miss_register().is_some().then_some(cs)
+    crate::residency::content_store(&db.snapshot)
 }
 
 /// A JSON-LD query on a view reads that view's ledger, whole, at the view's
@@ -183,7 +178,18 @@ fn guard_graph_source_patterns_for(
     parsed: &fluree_db_query::ir::Query,
     syntax: QuerySyntax,
 ) -> Result<()> {
-    let unsupported = fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    let mut unsupported =
+        fluree_db_query::r2rml::unsupported_outside_graph_scopes(&parsed.patterns);
+    // HAVING, ORDER BY and the binds after a trailing VALUES run outside
+    // every graph scope, wrapped or not.
+    unsupported.extend(fluree_db_query::r2rml::unsupported_query_modifiers(
+        parsed.grouping.as_ref(),
+        &parsed.order_binds,
+        parsed
+            .post_values
+            .as_ref()
+            .map_or(&[], |pv| pv.then.as_slice()),
+    ));
     if !unsupported.is_empty() {
         return Err(ApiError::Query(
             fluree_db_query::r2rml::unsupported_subscope_error(gs_ids, &unsupported),
@@ -1493,6 +1499,9 @@ impl Fluree {
                     "SPARQL FROM/FROM NAMED <{iri}> names no graph in ledger '{target}'; \
                      check the IRI against the ledger's registered graphs"
                 )),
+                other @ TargetError::OtherLedgersSystemGraph { .. } => {
+                    ApiError::invalid_query(format!("SPARQL FROM/FROM NAMED: {other}"))
+                }
             })?;
         Self::select_graph_id(db.clone(), graph.g_id)
     }
@@ -1977,9 +1986,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
@@ -2057,9 +2064,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
@@ -2709,31 +2714,37 @@ mod graph_source_guard_tests {
     /// top-level pattern with a `["graph", …]` block, the shape that suppresses
     /// the auto-wrap and reaches the guard, so an accidental refusal would
     /// surface here as an error rather than as an empty result.
+    ///
+    /// Only a mapped source is a dataset member (an index source is refused as
+    /// one), so this needs the iceberg reader. Its catalog does not exist:
+    /// registration's table check is non-fatal, and the `graph` block asks for
+    /// a predicate the mapping does not map, so nothing is scanned.
+    #[cfg(feature = "iceberg")]
     #[tokio::test]
     async fn a_named_only_graph_source_query_is_answered_not_refused() {
         let fluree = FlureeBuilder::memory().build_memory();
-        let ledger = fluree.create_ledger("gsguard-src").await.unwrap();
-        let txn = serde_json::json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "insert": [{"@id": "ex:a1", "@type": "ex:Article", "ex:title": "Graph sources"}]
-        });
-        let _ledger = fluree.insert(ledger, &txn).await.unwrap().ledger;
-
-        // A BM25 source registers in the nameservice without the iceberg
-        // feature, so the dataset resolves a real graph-source view.
-        let index_query = serde_json::json!({
-            "@context": {"ex": "http://example.org/ns/"},
-            "where": [{"@id": "?x", "@type": "ex:Article"}],
-            "select": {"?x": ["@id", "ex:title"]}
-        });
+        let mapping = r#"
+            @prefix rr: <http://www.w3.org/ns/r2rml#> .
+            <http://example.org/ns/mapping#Edge> a rr:TriplesMap ;
+                rr:logicalTable [ rr:tableName "ns.edge" ] ;
+                rr:subjectMap [ rr:template "http://example.org/ns/{src}" ] ;
+                rr:predicateObjectMap [
+                    rr:predicate <http://example.org/ns/edge> ;
+                    rr:objectMap [ rr:column "dst" ]
+                ] .
+        "#;
         let gs = fluree
-            .create_full_text_index(crate::Bm25CreateConfig::new(
-                "gsguard-search",
-                "gsguard-src:main",
-                index_query,
-            ))
+            .create_r2rml_graph_source(
+                crate::R2rmlCreateConfig::new(
+                    "gsguard-mapped",
+                    "https://example.invalid",
+                    "ns.edge",
+                    mapping,
+                )
+                .with_mapping_media_type("text/turtle"),
+            )
             .await
-            .expect("register the BM25 graph source");
+            .expect("register the mapped graph source");
 
         let body = serde_json::json!({
             "@context": {"ex": "http://example.org/ns/"},
