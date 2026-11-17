@@ -258,9 +258,10 @@ A JSON literal is stored in canonical form, per [RFC 8785](https://www.rfc-edito
 
 A literal's value is its text. Without canonical form, `{"a":1,"b":2}` and `{"b":2,"a":1}` would be two different facts. A delete, an upsert, or a merge that matched one would miss the other.
 
-Two consequences are worth knowing:
+Three consequences are worth knowing:
 
 - **A value reads back canonicalized, not as written.** Members come back in key order. A number written as `1.0` reads back as `1`. The JSON is the same. Only its spelling changes.
+- **A JSON literal a query names or builds is canonicalized too.** `"[1, 2]"^^rdf:JSON`, `STRDT("[1, 2]", rdf:JSON)` and JSON-LD's `(str-dt "[1, 2]" rdf:JSON)` are each the stored `[1,2]`, in a pattern, a `VALUES` row, a `FILTER` or a `BIND`, and `STR` of one is `"[1,2]"`.
 - **Integers keep their exact value.** RFC 8785 treats every number as a double, which rounds integers past 2^53. Fluree keeps them exact instead.
 
 `@value` may be a JSON document or a string holding one. Either is canonicalized. A string that is not valid JSON fails the transaction ("Cannot parse 'not json' as rdf:JSON"), as `"not json"^^rdf:JSON` does in SPARQL and Turtle. Bulk import keeps one as written, and it reads back as typed text (see [Text That Is Not a Value of Its Datatype](#text-that-is-not-a-value-of-its-datatype)).
