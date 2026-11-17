@@ -282,7 +282,8 @@ pub fn eval_same_term<R: RowAccess>(
 
 /// Term equality of two evaluated values. Numbers are stored by value, so a
 /// double is the same term as an equal double; every NaN is the one term
-/// `"NaN"^^xsd:double`, which `f64` equality does not see.
+/// `"NaN"^^xsd:double`, which `f64` equality does not see. A stored JSON
+/// value and a typed `rdf:JSON` constant of its text are one term.
 fn same_term(a: &ComparableValue, b: &ComparableValue) -> bool {
     match (a, b) {
         (ComparableValue::Double(x), ComparableValue::Double(y)) => {
@@ -291,7 +292,7 @@ fn same_term(a: &ComparableValue, b: &ComparableValue) -> bool {
         (ComparableValue::Float(x), ComparableValue::Float(y)) => {
             x == y || (x.is_nan() && y.is_nan())
         }
-        _ => a == b,
+        _ => a == b || super::value::same_json_term(a, b),
     }
 }
 
@@ -521,6 +522,50 @@ mod tests {
             matches!(result, Some(ComparableValue::Iri(_))),
             "IRI of unknown namespace without context should return Iri, got: {result:?}"
         );
+    }
+
+    /// A stored JSON value and a typed `rdf:JSON` constant of the same text
+    /// (which lowers to `STRDT`) are one term, for `sameTerm` and `=`; other
+    /// text, and a plain string, are not.
+    #[test]
+    fn a_stored_json_value_is_the_term_of_its_typed_constant() {
+        use crate::eval::compare::{rdf_term_equal, EqOutcome};
+        use crate::ir::Function;
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let stored = Binding::lit(
+            FlakeValue::Json("[1,2]".into()),
+            Sid::new(fluree_vocab::namespaces::RDF, "JSON"),
+        );
+        let batch = Batch::new(schema, vec![vec![stored]]).unwrap();
+        let row = batch.row_view(0).unwrap();
+        let typed = |text: &str| Expression::Call {
+            func: Function::StrDt,
+            args: vec![
+                Expression::Const(FlakeValue::String(text.into())),
+                Expression::Const(FlakeValue::String(fluree_vocab::rdf::JSON.into())),
+            ],
+        };
+        let plain = Expression::Const(FlakeValue::String("[1,2]".into()));
+        for (other, same) in [
+            (typed("[1,2]"), true),
+            (typed("[1, 2]"), false),
+            (plain, false),
+        ] {
+            let args = [Expression::Var(VarId(0)), other];
+            assert_eq!(
+                eval_same_term(&args, &row, None).unwrap(),
+                Some(ComparableValue::Bool(same)),
+                "sameTerm with {:?}",
+                args[1]
+            );
+            let a = args[0].eval_to_comparable(&row, None).unwrap().unwrap();
+            let b = args[1].eval_to_comparable(&row, None).unwrap().unwrap();
+            assert_eq!(
+                rdf_term_equal(&a, &b) == EqOutcome::Eq,
+                same,
+                "= with {b:?}"
+            );
+        }
     }
 
     #[test]
