@@ -75,6 +75,21 @@ impl SolutionGraph {
     }
 }
 
+/// Whether a write parses a lexical form of the datatype `dt` into a value:
+/// an XSD datatype outside the string family, `rdf:JSON`, `geo:wktLiteral`
+/// or `f:embeddingVector`, the datatypes
+/// [`coerce_string_value`](fluree_db_core::coerce::coerce_string_value) does
+/// not take as text. Decided on the Sid alone, so a literal under any other
+/// datatype (`xsd:anyURI`, an application's own) costs no IRI decoding.
+/// `dt` is canonical, so the namespace code is the fixed one.
+fn parses_lexical(dt: &Sid) -> bool {
+    if dt.namespace_code == XSD {
+        !fluree_vocab::xsd_names::is_string_like_name(&dt.name)
+    } else {
+        *dt == *DT_JSON || *dt == *DT_WKT_LITERAL || *dt == *DT_VECTOR
+    }
+}
+
 /// Generates flakes from triple templates
 ///
 /// The generator materializes templates by substituting variable bindings with
@@ -421,6 +436,22 @@ impl<'a> FlakeGenerator<'a> {
                 self.canonicalize(sid);
             }
             self.canonicalize(&mut dt);
+
+            // A literal bound at run time (`STRDT`, `str-dt`, a stored value
+            // a WHERE matched) arrives as text under its datatype. Parse it as
+            // an insert parses the same literal: a valid lexical form is
+            // stored as its value, and an ill-typed one fails the write with
+            // the insert's error. A template constant was parsed where it was
+            // written (`value_convert` for RDF text). A datatype whose forms
+            // are text (`xsd:string`, `xsd:anyURI`, an application's own) is
+            // told by its Sid, so its IRI is not decoded per flake.
+            if let (TemplateTerm::Var(_), FlakeValue::String(lexical)) = (&template.object, &o) {
+                if parses_lexical(&dt) {
+                    if let Some(dt_iri) = self.decode_sid(&dt) {
+                        o = crate::value_convert::typed_lexical(lexical, &dt_iri)?;
+                    }
+                }
+            }
         }
 
         // Late hard guard for storage invariants: catches (FlakeValue, dt)
@@ -944,6 +975,88 @@ mod tests {
         assert_eq!(flakes.len(), 1);
         // Check that the blank node was skolemized
         assert!(flakes[0].s.name.contains("b1"));
+    }
+
+    /// `parses_lexical` passes over a datatype only when the write paths'
+    /// parser takes every lexical form of it as text, so skipping the parse
+    /// never changes what a flake stores.
+    #[test]
+    fn a_datatype_passed_over_by_its_sid_takes_any_text() {
+        use fluree_vocab::{fluree, geo, rdf, xsd, xsd_names};
+        let mut registry = NamespaceRegistry::new();
+        let mut iris: Vec<String> = [
+            xsd_names::STRING,
+            xsd_names::NORMALIZED_STRING,
+            xsd_names::TOKEN,
+            xsd_names::LANGUAGE,
+            xsd_names::ANY_URI,
+            xsd_names::INTEGER,
+            xsd_names::BYTE,
+            xsd_names::UNSIGNED_LONG,
+            xsd_names::DECIMAL,
+            xsd_names::DOUBLE,
+            xsd_names::FLOAT,
+            xsd_names::BOOLEAN,
+            xsd_names::DATE_TIME,
+            xsd_names::DATE,
+            xsd_names::TIME,
+            xsd_names::G_YEAR,
+            xsd_names::G_MONTH_DAY,
+            xsd_names::DURATION,
+            xsd_names::DAY_TIME_DURATION,
+            xsd_names::BASE64_BINARY,
+        ]
+        .iter()
+        .map(|name| format!("{}{name}", xsd::NS))
+        .collect();
+        iris.extend(
+            [
+                rdf::JSON,
+                rdf::LANG_STRING,
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#HTML",
+                geo::WKT_LITERAL,
+                "http://www.opengis.net/ont/geosparql#gmlLiteral",
+                fluree::EMBEDDING_VECTOR,
+                fluree::FULL_TEXT,
+                "http://example.org/types#custom",
+            ]
+            .map(str::to_string),
+        );
+        let lexicals = [
+            "x",
+            "1",
+            "300",
+            "true",
+            "1.5",
+            "INF",
+            "P1D",
+            "2024",
+            "2024-01-01",
+            "2024-01-01T00:00:00Z",
+            "12:00:00",
+            "--01-01",
+            "POINT(1 2)",
+            "[1, 2]",
+            r#"{"a": 1}"#,
+        ];
+        let mut parsed = 0;
+        for iri in &iris {
+            let dt = registry.sid_for_iri(iri);
+            if parses_lexical(&dt) {
+                parsed += 1;
+                continue;
+            }
+            for lexical in lexicals {
+                assert_eq!(
+                    fluree_db_core::coerce::coerce_string_value(lexical, iri).ok(),
+                    Some(FlakeValue::String(lexical.to_string())),
+                    "{iri} is passed over, so \"{lexical}\" must be stored as text"
+                );
+            }
+        }
+        // Every non-string XSD datatype, rdf:JSON, wktLiteral and the vector.
+        assert_eq!(parsed, 18, "{iris:?}");
+        assert!(!parses_lexical(&registry.sid_for_iri(xsd::ANY_URI)));
     }
 
     #[test]
