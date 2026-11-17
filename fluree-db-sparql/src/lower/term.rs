@@ -431,6 +431,13 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                 Ok(fluree_db_core::coerce::coerce_string_value(value, &dt_iri)
                     .unwrap_or_else(|_| FlakeValue::String(value.to_string())))
             }
+            // A JSON value is stored canonical, so a constant names it in its
+            // canonical form, as a write stores it: `"[1, 2]"^^rdf:JSON` is the
+            // stored `[1,2]`. Text that is not JSON stays a string.
+            fluree_vocab::rdf::JSON => {
+                Ok(fluree_db_core::coerce::coerce_string_value(value, &dt_iri)
+                    .unwrap_or_else(|_| FlakeValue::String(value.to_string())))
+            }
             _ => {
                 // Default to string for unknown datatypes
                 Ok(FlakeValue::String(value.to_string()))
