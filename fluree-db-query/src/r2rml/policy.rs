@@ -94,10 +94,13 @@ pub(crate) struct R2rmlPolicyGate {
     /// of each `f:onProperty` restriction with classes, by property.
     targeted_any: Vec<String>,
     targeted_by_predicate: HashMap<String, Vec<String>>,
-    /// The view set holds an `f:required` or an `f:query` restriction, which
-    /// make a decision move both ways as a subject's class set grows, so the
-    /// two-point check does not settle it (see [`Self::allows`]).
-    enumerate: bool,
+    /// An `f:required` or `f:query` restriction applies to every predicate
+    /// (`enumerate_any`) or to the predicates in `enumerate_predicates`: such
+    /// a restriction makes a decision move both ways as a subject's class set
+    /// grows, so for those predicates the two-point check does not settle it
+    /// (see [`Self::allows`]).
+    enumerate_any: bool,
+    enumerate_predicates: std::collections::HashSet<String>,
     /// The source, for messages.
     graph_source_id: String,
     /// Final decisions, by map, triple and the row's classes, for
@@ -470,10 +473,25 @@ impl R2rmlPolicyGate {
         }
         targeted_any.sort();
         targeted_any.dedup();
-        let enumerate = view
+        // The `f:required` and `f:query` restrictions, which make a decision
+        // move both ways as classes are added, by the predicates they can
+        // apply to: one on properties applies to those alone, any other
+        // (class, subject or default targeting) to every predicate.
+        let mut enumerate_any = false;
+        let mut enumerate_predicates: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        for r in view
             .restrictions
             .iter()
-            .any(|r| r.required || matches!(r.value, fluree_db_policy::PolicyValue::Query(_)));
+            .filter(|r| r.required || matches!(r.value, fluree_db_policy::PolicyValue::Query(_)))
+        {
+            if r.target_mode == TargetMode::OnProperty {
+                enumerate_predicates
+                    .extend(r.targets.iter().filter_map(|t| snapshot.decode_sid(t)));
+            } else {
+                enumerate_any = true;
+            }
+        }
         // Without a class-targeted restriction no class changes a decision:
         // nothing about other maps' classes is worked out.
         let mut scope = if has_class_policies {
@@ -543,7 +561,8 @@ impl R2rmlPolicyGate {
             scope,
             targeted_any,
             targeted_by_predicate,
-            enumerate,
+            enumerate_any,
+            enumerate_predicates,
             graph_source_id: graph_source_id.to_string(),
             decision_cache: HashMap::new(),
             #[cfg(test)]
@@ -839,8 +858,9 @@ impl R2rmlPolicyGate {
     /// allows iff `A(own) ∧ ¬D(own ∪ E)`. In both cases that is
     /// `decide(own) ∧ decide(own ∪ E)`. An `f:required` restriction drops the
     /// others when it applies (so a denial can vanish as `S` grows) and an
-    /// `f:query` one can block the default, so with either every `S` is
-    /// evaluated, up to [`MAX_EXTRA_CLASSES`] extra classes.
+    /// `f:query` one can block the default, so where one of them can apply to
+    /// the predicate every `S` is evaluated, up to [`MAX_EXTRA_CLASSES`]
+    /// extra classes. One that cannot apply to it changes no decision on it.
     ///
     /// Where the decision is not "allow" for every `S`:
     /// - extra classes known from the mapping alone hide the flake, and the
@@ -895,7 +915,8 @@ impl R2rmlPolicyGate {
         }
         let mut extra = static_extra.clone();
         extra.extend(data_extra.iter().cloned());
-        let all_allow = if self.enumerate {
+        let enumerate = self.enumerate_any || self.enumerate_predicates.contains(pred);
+        let all_allow = if enumerate {
             self.check_extra_cap(tm, extra.len())?;
             let mut all = true;
             for chosen in subsets(&extra) {
@@ -1656,6 +1677,33 @@ mod tests {
         assert_eq!(all[0], Vec::<&str>::new());
         assert!(all.contains(&vec!["a", "b", "c"]));
         assert_eq!(subsets(&[]).count(), 1);
+    }
+
+    /// An `f:required` restriction on another property does not change how a
+    /// decision on this one is made: the two-point check settles it, so nine
+    /// extra classes (past the enumeration cap) hide the row instead of
+    /// refusing. On the restriction's own property every class set is
+    /// evaluated, and the cap refuses.
+    #[test]
+    fn a_required_restriction_enumerates_only_the_predicates_it_targets() {
+        let (mapping, plain, classes) = plain_and_classed(MAX_EXTRA_CLASSES + 1);
+        let refs: Vec<&str> = classes.iter().map(String::as_str).collect();
+        let mut required = restriction(TargetMode::OnProperty, &["http://ex/other"], &[], true);
+        required.required = true;
+        let mut gate = gate_for_all(
+            &mapping,
+            vec![
+                restriction(TargetMode::OnClass, &[], &refs, false),
+                required,
+            ],
+            true,
+        );
+        assert!(
+            !decide_result(&mut gate, &plain, "http://ex/name").expect("decided"),
+            "the other maps' classes deny: hidden"
+        );
+        let err = decide_result(&mut gate, &plain, "http://ex/other").expect_err("refused");
+        assert!(err.to_string().contains("at most"), "{err}");
     }
 
     #[test]
