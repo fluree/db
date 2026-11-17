@@ -65,8 +65,8 @@ so it does not linger in history or logs. Peer mode needs:
    still builds and remote mode still runs;
 2. a server with `--storage-proxy-enabled` and a trusted issuer, plus a
    bearer token carrying **both** `fluree.events.*` and `fluree.storage.*`
-   claims. The shipped `fluree-events-token` CLI only mints the events half —
-   the storage claim has to be added by hand;
+   claims — `fluree token create --events-ledger <alias> --storage-ledger
+   <alias>` mints both;
 3. `server.fs.allow` covering `fluree-react/` and `fluree-db-wasm/js/`
    (already set here). Both aliases resolve outside `demo/`, and Vite's dev
    server otherwise 403s the worker module and the `.wasm` — which surfaces
