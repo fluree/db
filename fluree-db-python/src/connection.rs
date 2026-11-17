@@ -1027,10 +1027,18 @@ impl Connection {
         block_on(py, async {
             let io = |e: std::io::Error| ApiError::internal(format!("{}: {e}", path.display()));
             let mut file = tokio::fs::File::create(&path).await.map_err(io)?;
-            fluree
-                .archive_ledger(&id, include_indexes, &mut file)
-                .await?;
-            tokio::io::AsyncWriteExt::flush(&mut file).await.map_err(io)
+            let written = match fluree.archive_ledger(&id, include_indexes, &mut file).await {
+                Ok(_) => tokio::io::AsyncWriteExt::flush(&mut file).await.map_err(io),
+                Err(e) => Err(e),
+            };
+            if written.is_err() {
+                // Close the file, then remove the partial archive: under the
+                // name asked for it would pass for a finished one, so it goes,
+                // as it does for `fluree export`.
+                drop(file);
+                let _ = std::fs::remove_file(&path);
+            }
+            written
         })?
         .map_err(api_error)
     }

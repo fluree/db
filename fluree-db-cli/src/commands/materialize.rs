@@ -251,11 +251,11 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
                 .unwrap_or_else(|| {
                     PathBuf::from(format!("{}.flpack", sanitize_filename(&twin_ledger)))
                 });
-            let mut file = tokio::fs::File::create(&path).await.map_err(|e| {
+            let file = tokio::fs::File::create(&path).await.map_err(|e| {
                 CliError::Import(format!("create pack file {}: {e}", path.display()))
             })?;
-            fluree
-                .archive_ledger(&twin_ledger, true, &mut file)
+            // A failed archive removes the partial pack, as `fluree export` does.
+            crate::commands::export::archive_into_file(fluree, &twin_ledger, true, file, &path)
                 .await
                 .map_err(|e| CliError::Import(format!("write pack: {e}")))?;
             // #1529 review (minor): `fluree drop` rejects a `:branch` suffix and

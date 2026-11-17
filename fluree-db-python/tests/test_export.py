@@ -69,6 +69,14 @@ def test_archive_and_restore(conn, people, tmp_path):
     assert [c.t for c in restored.log()] == [c.t for c in people.log()]
 
 
+def test_a_failed_archive_leaves_no_file(conn, people, tmp_path):
+    archive = tmp_path / "people.flpack"
+    conn.drop("people")
+    with pytest.raises(fluree.FlureeError):
+        people.archive(archive)
+    assert not archive.exists()
+
+
 def test_governed_ledger_cannot_export(people, tmp_path):
     governed = people.with_policy(identity=EX + "someone")
     with pytest.raises(PermissionError):
