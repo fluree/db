@@ -558,8 +558,9 @@ impl PolicySet {
 struct PolicyWrapperInner {
     /// View (query) policy set
     view: PolicySet,
-    /// `view` with class policies selected by subject, when it has any
-    reasoned_view: Option<PolicySet>,
+    /// `view` with class policies selected by subject, when it has any.
+    /// Built on first use: a query that does not reason never reads it.
+    reasoned_view: std::sync::OnceLock<Option<PolicySet>>,
     /// Modify (transaction) policy set
     modify: PolicySet,
     /// Root flag - bypasses all policies
@@ -589,8 +590,8 @@ impl PolicyWrapper {
     ) -> Self {
         Self {
             inner: Arc::new(PolicyWrapperInner {
-                reasoned_view: view.selecting_classes_by_subject(),
                 view,
+                reasoned_view: std::sync::OnceLock::new(),
                 modify,
                 root,
                 default_allow,
@@ -604,7 +605,7 @@ impl PolicyWrapper {
         Self {
             inner: Arc::new(PolicyWrapperInner {
                 view: PolicySet::default(),
-                reasoned_view: None,
+                reasoned_view: std::sync::OnceLock::new(),
                 modify: PolicySet::default(),
                 root: true,
                 default_allow: true,
@@ -633,6 +634,7 @@ impl PolicyWrapper {
     pub fn reasoned_view(&self) -> &PolicySet {
         self.inner
             .reasoned_view
+            .get_or_init(|| self.inner.view.selecting_classes_by_subject())
             .as_ref()
             .unwrap_or(&self.inner.view)
     }
