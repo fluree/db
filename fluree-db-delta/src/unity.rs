@@ -27,6 +27,24 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The Delta Kernel this reader is built on: the exact version Cargo.toml pins.
+macro_rules! kernel_version {
+    () => {
+        "0.28.0"
+    };
+}
+
+/// How every request names its caller to Unity, as space-separated
+/// `name/version` tokens. Databricks' Delta API refuses a request that does
+/// not identify its application ("The provided User-Agent '' is
+/// insufficient"), and reqwest sends none of its own.
+const USER_AGENT: &str = concat!(
+    "Fluree-DB/",
+    env!("CARGO_PKG_VERSION"),
+    " Delta-Kernel-Rust/",
+    kernel_version!()
+);
+
 /// Everything but the characters a table name is ordinarily made of.
 const NAME: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.').remove(b'_').remove(b'-');
 
@@ -600,7 +618,14 @@ impl UnityClient {
             if let Some(body) = body {
                 request = request.json(body);
             }
-            request = request.headers(self.auth.request_headers(&url).await.map_err(auth_failed)?);
+            let mut headers = self.auth.request_headers(&url).await.map_err(auth_failed)?;
+            // Ours, whatever the auth provider sent: Unity identifies the
+            // application by it.
+            headers.insert(
+                reqwest::header::USER_AGENT,
+                reqwest::header::HeaderValue::from_static(USER_AGENT),
+            );
+            request = request.headers(headers);
             let response = request
                 .send()
                 .await
@@ -1247,6 +1272,108 @@ mod tests {
         assert!(
             matches!(failed, DeltaError::Catalog { denied: false, .. }),
             "{failed:?}"
+        );
+    }
+
+    /// Unity is told who is calling on every request: Databricks' Delta API
+    /// refuses one with an empty User-Agent. Placing a table, issuing its
+    /// credentials and listing its ratified commits each carry it.
+    #[tokio::test]
+    async fn every_request_names_fluree_as_its_user_agent() {
+        assert!(USER_AGENT.starts_with(concat!("Fluree-DB/", env!("CARGO_PKG_VERSION"))));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(TABLES))
+            .and(header("User-Agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "table_id": "t-1", "data_source_format": "DELTA",
+                "storage_location": "s3://bucket/t",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CREDENTIALS))
+            .and(header("User-Agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "aws_temp_credentials": {
+                    "access_key_id": "KEY1", "secret_access_key": "s", "session_token": "t",
+                },
+                "expiration_time": ms_from_now(3600),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.1/unity-catalog/delta/v1/catalogs/main/schemas/sales/tables/orders",
+            ))
+            .and(header("User-Agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commits": [], "latest-table-version": 4,
+            })))
+            .mount(&server)
+            .await;
+        let unity = client(&server);
+        let table = unity.table("main.sales.orders").await.unwrap();
+        unity.read_credentials(&table).await.unwrap();
+        assert_eq!(unity.ratified(&table).await.unwrap().version, 4);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// An auth provider's own User-Agent does not replace Fluree's, and is
+    /// not sent alongside it.
+    #[tokio::test]
+    async fn the_auth_provider_does_not_replace_the_user_agent() {
+        #[derive(Debug)]
+        struct Branded;
+        #[async_trait]
+        impl SendCatalogAuth for Branded {
+            async fn request_headers(
+                &self,
+                _url: &str,
+            ) -> fluree_db_iceberg::Result<reqwest::header::HeaderMap> {
+                let mut headers = reqwest::header::HeaderMap::new();
+                headers.insert("authorization", "Bearer catalog-token".parse().unwrap());
+                headers.insert("user-agent", "someone-else/1.0".parse().unwrap());
+                Ok(headers)
+            }
+            async fn refresh(&self) -> fluree_db_iceberg::Result<()> {
+                Ok(())
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(TABLES))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "table_id": "t-1", "data_source_format": "DELTA",
+                "storage_location": "s3://bucket/t",
+            })))
+            .mount(&server)
+            .await;
+        let unity = UnityClient {
+            base: server.uri(),
+            auth: Arc::new(Branded),
+            http: reqwest::Client::new(),
+        };
+        unity.table("main.sales.orders").await.unwrap();
+        let sent = server.received_requests().await.unwrap();
+        let agents: Vec<_> = sent[0].headers.get_all("user-agent").iter().collect();
+        assert_eq!(agents, [USER_AGENT]);
+        assert_eq!(
+            sent[0].headers.get("authorization").unwrap(),
+            "Bearer catalog-token"
+        );
+    }
+
+    /// The kernel version the User-Agent names is the one Cargo.toml pins.
+    #[test]
+    fn the_user_agent_names_the_pinned_kernel() {
+        assert!(
+            include_str!("../Cargo.toml").contains(concat!(
+                "delta_kernel = { version = \"=",
+                kernel_version!(),
+                "\""
+            )),
+            "bump kernel_version! with the delta_kernel pin"
         );
     }
 
