@@ -186,6 +186,7 @@ pub(crate) fn sum_strlen_any_string_dict(
     g_id: GraphId,
     p_id: u32,
     cancellation: &fluree_db_core::QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     scan_string_fold(
         store,
@@ -194,6 +195,7 @@ pub(crate) fn sum_strlen_any_string_dict(
         &CompiledFold::Strlen,
         StringKindPolicy::AnyStringDict,
         cancellation,
+        tracker,
     )
 }
 
@@ -233,6 +235,7 @@ pub fn predicate_string_fold_operator(
                 &compiled,
                 StringKindPolicy::PlainOnly,
                 &ctx.cancellation,
+                &ctx.tracker,
             )?
             else {
                 return Ok(None);
@@ -266,6 +269,7 @@ fn scan_string_fold(
     fold: &CompiledFold,
     policy: StringKindPolicy,
     cancellation: &fluree_db_core::QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
@@ -313,11 +317,13 @@ fn scan_string_fold(
                 } else {
                     projection_otype_okey()
                 };
-                let batch = handle
-                    .as_ref()
-                    .expect("handle opened above")
-                    .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    handle.as_deref().expect("handle opened above"),
+                    leaflet_idx,
+                    &projection,
+                    RunSortOrder::Post,
+                    tracker,
+                )?;
 
                 for row in 0..batch.row_count {
                     let o_type = entry

@@ -4754,3 +4754,127 @@ fn the_embedder_surface_on_the_hard_keep_list_still_compiles() {
             .unwrap();
     assert_eq!(ids, ["mydb:main"]);
 }
+
+/// A language-tagged constant read through the range path (a dataset that
+/// spans ledgers reads every member that way) reads its tag's rows only: each
+/// tag is its own object type, so the range read narrows to it as it does to
+/// a custom datatype's. With three-row leaflets and ten tags, the read returns
+/// one tag's rows and reads a fraction of the leaflets a read of every tag's
+/// does. The tag matches whatever its case, and a tag only novelty holds is
+/// still read.
+#[tokio::test]
+async fn a_tagged_constant_reads_only_its_tags_rows_across_ledgers() {
+    use fluree_db_api::admin::ReindexOptions;
+    use fluree_db_indexer::IndexerConfig;
+    const A: &str = "it/dataset-tagged-a:main";
+    const B: &str = "it/dataset-tagged-b:main";
+    const TAGS: [&str; 10] = ["de", "en", "es", "fi", "fr", "it", "ja", "nl", "pt", "sv"];
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    let labels: String = (0..60)
+        .map(|i| format!("ex:s{i} ex:label \"chat\"@{} .\n", TAGS[i % TAGS.len()]))
+        .collect();
+    for (ledger, turtle) in [
+        (A, labels),
+        (B, "ex:t ex:label \"chat\"@fr .\n".to_string()),
+    ] {
+        fluree.create_ledger(ledger).await.expect("create");
+        let handle = fluree.ledger_cached(ledger).await.expect("cache");
+        fluree
+            .stage(&handle)
+            .upsert_turtle(&format!("@prefix ex: <http://example.org/ns/> .\n{turtle}"))
+            .execute()
+            .await
+            .expect("seed");
+        fluree
+            .reindex(
+                ledger,
+                ReindexOptions::default()
+                    .with_indexer_config(IndexerConfig::default().with_leaflet_rows(3)),
+            )
+            .await
+            .expect("index");
+        fluree.disconnect_ledger(ledger).await;
+    }
+    // A tag only novelty holds.
+    let handle = fluree.ledger_cached(A).await.expect("cache");
+    fluree
+        .stage(&handle)
+        .upsert_turtle("@prefix ex: <http://example.org/ns/> .\nex:n ex:label \"chat\"@ko .")
+        .execute()
+        .await
+        .expect("novelty");
+
+    // The range read itself, tracked: with the tag, and without one.
+    let db = fluree.db(A).await.expect("db");
+    let read = |lang: Option<&str>| {
+        let tracker = fluree_db_core::Tracker::new(fluree_db_core::TrackingOptions {
+            track_fuel: true,
+            ..Default::default()
+        });
+        let snapshot = &db.snapshot;
+        let match_val = fluree_db_core::RangeMatch {
+            p: snapshot.encode_iri("http://example.org/ns/label"),
+            o: Some(fluree_db_core::FlakeValue::String("chat".into())),
+            dt: snapshot.encode_iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#langString"),
+            lang: lang.map(std::sync::Arc::from),
+            ..Default::default()
+        };
+        let opts = fluree_db_core::RangeOptions {
+            to_t: Some(db.t),
+            ..Default::default()
+        };
+        async move {
+            let flakes = fluree_db_core::range::range_with_overlay_tracked(
+                snapshot,
+                0,
+                &fluree_db_core::NoOverlay,
+                fluree_db_core::IndexType::Post,
+                fluree_db_core::RangeTest::Eq,
+                match_val,
+                opts,
+                Some(&tracker),
+            )
+            .await
+            .expect("range read");
+            let fuel = tracker.tally().and_then(|t| t.fuel).expect("fuel");
+            (flakes.len(), fuel)
+        }
+    };
+    let (tagged, tagged_fuel) = read(Some("fr")).await;
+    let (any_tag, any_tag_fuel) = read(None).await;
+    assert_eq!(
+        (tagged, any_tag),
+        (6, 60),
+        "the tag's rows, and every tag's"
+    );
+    assert!(
+        tagged_fuel * 3.0 < any_tag_fuel,
+        "one of ten tags read {tagged_fuel} fuel, every tag {any_tag_fuel}"
+    );
+
+    let run = |object: &str| {
+        let query = format!(
+            "PREFIX ex: <http://example.org/ns/>
+             SELECT ?s FROM <{A}> FROM <{B}> WHERE {{ ?s ex:label {object} }}"
+        );
+        let fluree = fluree.clone();
+        async move {
+            let json = fluree
+                .query_from()
+                .sparql(&query)
+                .execute_formatted()
+                .await
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            json["results"]["bindings"].as_array().map_or(0, Vec::len)
+        }
+    };
+    assert_eq!(
+        run("\"chat\"@fr").await,
+        7,
+        "one tag's rows over both ledgers"
+    );
+    assert_eq!(run("?o").await, 62, "every label");
+    assert_eq!(run("\"chat\"@FR").await, 7, "a tag matches in any case");
+    assert_eq!(run("\"chat\"@ko").await, 1, "a tag only novelty holds");
+    assert_eq!(run("\"chat\"@zz").await, 0, "a tag nothing holds");
+}

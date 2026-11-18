@@ -219,6 +219,22 @@ async fn volatile_sparql_reports_its_bypass() {
 }
 
 #[tokio::test]
+async fn agent_json_reports_its_bypass() {
+    let (_tmp, app) = app().await;
+    let (status, cache, body) = send(
+        &app,
+        &format!("/v1/fluree/query/{LEDGER}"),
+        "application/sparql-query",
+        Some("application/vnd.fluree.agent+json"),
+        "PREFIX ex: <http://example.org/>\nSELECT ?n WHERE { ?s ex:name ?n }".to_string(),
+        &[("fluree-cache", "true")],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(cache.as_deref(), Some("bypass; reason=\"agent JSON\""));
+}
+
+#[tokio::test]
 async fn a_zero_budget_reports_the_cache_disabled() {
     let (_tmp, app) = app_with(Some(0)).await;
     let (status, cache, _) = send(

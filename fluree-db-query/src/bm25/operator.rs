@@ -286,12 +286,22 @@ impl Bm25SearchOperator {
                     p_id,
                     dt_id,
                     lang_id,
+                    arena_g_id,
                     ..
                 }) => {
-                    // Late materialization: decode only when BM25 needs the target string.
-                    if let Some(gv) = ctx.graph_view() {
-                        let val = gv
-                            .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    // Late materialization: decode only when BM25 needs the target
+                    // string, through the scope's terms (one graph or a union). An
+                    // encoded target this scope can't decode is an error, not a row
+                    // with no target.
+                    let Some(terms) = ctx.term_view() else {
+                        return Err(crate::error::QueryError::Internal(
+                            "BM25 search target is an encoded literal this scope can't decode"
+                                .into(),
+                        ));
+                    };
+                    {
+                        let val = terms
+                            .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                             .map_err(|e| {
                                 tracing::debug!(
                                     o_kind,
@@ -307,8 +317,6 @@ impl Bm25SearchOperator {
                                 ))
                             })?;
                         Ok(Some(val.to_string()))
-                    } else {
-                        Ok(None)
                     }
                 }
                 Some(Binding::Sid { sid, .. }) => {
@@ -331,7 +339,7 @@ impl Bm25SearchOperator {
                 ) => Ok(None),
                 // EncodedSid/EncodedPid: decode to IRI string if store available
                 Some(Binding::EncodedSid { s_id, .. }) => {
-                    // Novelty-aware: use graph_view() for subject resolution.
+                    // Novelty-aware: use one_graph_view() for subject resolution.
                     match ctx.resolve_subject_iri(*s_id) {
                         Some(Ok(iri)) => Ok(Some(iri)),
                         Some(Err(e)) => {
@@ -783,6 +791,62 @@ mod tests {
         // Should include id and score vars in schema.
         assert!(batch.schema().contains(&id));
         assert!(batch.schema().contains(&score));
+    }
+
+    /// An encoded search target is decoded through the scope's terms, and
+    /// one the scope can't decode fails the query rather than dropping the
+    /// row as if it had no target.
+    #[tokio::test]
+    async fn an_encoded_target_the_scope_cannot_decode_is_an_error() {
+        let snapshot = make_test_snapshot();
+        let mut vars = VarRegistry::new();
+        let id = vars.get_or_insert("?doc");
+        let target = vars.get_or_insert("?q");
+        let mut idx = Bm25Index::new();
+        idx.upsert_document(
+            DocKey::new("ledger:main", "http://example.org/doc1"),
+            [("rust", 1)].into_iter().collect(),
+        );
+        let mut provider = TestProvider::default();
+        provider
+            .map
+            .insert("search:main".to_string(), Arc::new(idx));
+
+        let encoded = Binding::EncodedLit {
+            o_kind: fluree_db_core::value_id::ObjKind::LEX_ID.as_u8(),
+            o_key: 0,
+            p_id: 0,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+            arena_g_id: 0,
+        };
+        let seed: BoxedOperator = Box::new(crate::values::ValuesOperator::new(
+            Box::new(EmptyOperator::new()),
+            vec![target],
+            vec![vec![encoded]],
+        ));
+        let isp = IndexSearchPattern::new("search:main", IndexSearchTarget::Var(target), id);
+        let mut op = build_where_operators_seeded(
+            Some(seed),
+            &[Pattern::IndexSearch(isp)],
+            None,
+            None,
+            &crate::temporal_mode::PlanningContext::current(),
+        )
+        .expect("build operators");
+        let mut ctx = ExecutionContext::new(&snapshot, &vars);
+        ctx.bm25_provider = Some(&provider);
+        op.open(&ctx).await.unwrap();
+        let mut result = Ok(());
+        while let Some(batch) = op.next_batch(&ctx).await.transpose() {
+            if let Err(e) = batch {
+                result = Err(e);
+                break;
+            }
+        }
+        assert!(result.is_err(), "the undecodable target was skipped");
     }
 
     #[tokio::test]

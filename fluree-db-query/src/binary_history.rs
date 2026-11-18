@@ -367,11 +367,15 @@ impl BinaryHistoryScanOperator {
             p: None,
             o: o_val_opt.clone(),
             dt: self.pattern.dtc.as_ref().map(|d| d.datatype().clone()),
+            lang: None,
             t: None,
         };
         let object_matches = |f: &Flake| {
             flake_matches_range_eq(f, &object_match)
-                && self.object_bounds.as_ref().is_none_or(|b| b.matches(&f.o))
+                && self
+                    .object_bounds
+                    .as_ref()
+                    .is_none_or(|b| b.matches(&f.o, &f.dt))
         };
         flakes.retain(|f| object_matches(f));
 
@@ -382,6 +386,7 @@ impl BinaryHistoryScanOperator {
                 p: p_sid.clone(),
                 o: None,
                 dt: None,
+                lang: None,
                 t: None,
             };
 
@@ -485,6 +490,9 @@ impl Operator for BinaryHistoryScanOperator {
         // `ScanDatasetBuilder` when its captured mode is `History`. The
         // current-state path goes through `BinaryScanOperator` directly and
         // never reaches this function.
+        if let Some(bounds) = self.object_bounds.as_mut() {
+            crate::binary_scan::resolve_bound_datatype(bounds, ctx, None);
+        }
         let flakes = self.collect_history_flakes(ctx).await?;
         self.inner.prime_history_flakes(ctx, flakes)
     }
