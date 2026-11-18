@@ -971,6 +971,25 @@ fn json_literal(json: FlakeValue) -> ComparableValue {
     }
 }
 
+/// Whether `a` and `b` are one `rdf:JSON` term: the same lexical form under
+/// `rdf:JSON`, carried as a JSON value by one and as a string typed
+/// `rdf:JSON` by the other. A valid constant or `STRDT` is the canonical JSON
+/// value already; text that is not JSON is the string, while an import keeps
+/// that text as a JSON value ([`json_literal`]). Derived equality tells the
+/// two apart; term identity must not.
+pub(crate) fn same_json_term(a: &ComparableValue, b: &ComparableValue) -> bool {
+    fn lexical(v: &ComparableValue) -> Option<&str> {
+        match v {
+            ComparableValue::TypedLiteral {
+                val: FlakeValue::String(s) | FlakeValue::Json(s),
+                dtc: Some(UnresolvedDatatypeConstraint::Explicit(iri)),
+            } if iri.as_ref() == fluree_vocab::rdf::JSON => Some(s),
+            _ => None,
+        }
+    }
+    matches!((lexical(a), lexical(b)), (Some(x), Some(y)) if x == y)
+}
+
 impl TryFrom<&FlakeValue> for ComparableValue {
     type Error = NullValueError;
 

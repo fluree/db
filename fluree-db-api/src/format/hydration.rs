@@ -50,7 +50,7 @@ use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid, Tracker};
-use fluree_db_policy::{is_schema_flake, PolicyContext};
+use fluree_db_policy::PolicyContext;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
@@ -2767,12 +2767,8 @@ impl<'a> HydrationFormatter<'a> {
     ///
     /// Schema flakes are always allowed. Other flakes are checked against the
     /// policy context's view set via the **async** evaluator, so `f:query`
-    /// policies run (the sync evaluator silently skips them). The subject class
-    /// cache is populated first: hydration-only-fetched subjects (direct-id
-    /// selects, nested-ref expansion) are never scanned, so the cache would
-    /// otherwise be empty and every `f:onClass` restriction would silently drop
-    /// to `default_allow`. Class membership is resolved at this view's `t` via
-    /// the GraphDbRef.
+    /// policies run (the sync evaluator silently skips them). Class membership
+    /// is resolved at this view's `t` via the GraphDbRef.
     async fn filter_flakes_by_policy(
         &self,
         flakes: Vec<Flake>,
@@ -2781,18 +2777,6 @@ impl<'a> HydrationFormatter<'a> {
         // Share the existing class cache (Arc-backed) so populated lookups carry
         // across fetches and the original policy context sees them too.
         let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
-
-        let mut subjects: Vec<Sid> = flakes
-            .iter()
-            .filter(|f| !is_schema_flake(&f.p, &f.o))
-            .map(|f| f.s.clone())
-            .collect();
-        subjects.sort();
-        subjects.dedup();
-        enforcer
-            .populate_class_cache_for_graph(self.db, &subjects)
-            .await
-            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
 
         let disabled = Tracker::disabled();
         let tracker = self.tracker.unwrap_or(&disabled);

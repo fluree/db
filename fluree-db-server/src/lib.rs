@@ -699,6 +699,12 @@ impl FlureeServerBuilder {
         self
     }
 
+    /// Set the query-result cache ceiling in MB, in addition to the cache budget
+    pub fn query_result_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.query_result_cache_max_mb = Some(max_mb);
+        self
+    }
+
     /// Attach a [`RaftIntegration`](crate::raft::RaftIntegration) and
     /// the private listener address. The resulting server mounts the
     /// leader-forward middleware over write routes and serves the

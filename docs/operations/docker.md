@@ -185,6 +185,8 @@ docker run -d --name fluree \
 
 `cache_max_mb` is the global budget for the in-memory index/flake cache. The default is tiered by effective system memory: <4GB uses 30%, 4-8GB uses 40%, and >=8GB uses 35%. On a container with a hard memory limit, the auto-tier clamps to the cgroup limit when available; set this explicitly if you need a tighter cache budget.
 
+If clients use the [query result cache](../query/result-cache.md), its answers have their own ceiling, `query_result_cache_max_mb` (`FLUREE_QUERY_RESULT_CACHE_MAX_MB`). It defaults to 10% of `cache_max_mb` and comes on top of it. Nothing is allocated for it until a request opts in.
+
 ```yaml
 # docker-compose.yml fragment
 services:

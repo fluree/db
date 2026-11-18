@@ -46,19 +46,54 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
     let mut write_clauses = Vec::new();
     let mut return_clause: Option<ReturnClause> = None;
 
+    // `Update` is a fixed reads-then-writes shape with nowhere to record that
+    // a clause came AFTER a write, so a read clause written later is silently
+    // hoisted in front of every write and the engine executes a different
+    // statement than the author wrote. fluree/db#1873.
+    //
+    // The damage depends on the shape and is not always loud:
+    //
+    //   MERGE (n:P {id:"x"}) WITH n SET n.nm = "b"
+    //     -> error blaming a policy that is not involved
+    //   MERGE (n:P {name:"Zed"}) WITH n.name AS nm SET n.marker = nm
+    //     -> COMMITS, writing one marker per pre-MERGE name onto the new node
+    //   MATCH (n) SET n.a = 1 WITH n WHERE n.a = 1 SET n.b = 2
+    //     -> COMMITS zero flakes: the filter runs before the SET it reads
+    //
+    // Rejecting here rather than downstream is deliberate. This is the only
+    // point that still HAS the ordering — by the time `Update` exists it is
+    // gone, and `validate_members` sees `[Match, With] / [Merge, Set]` for
+    // both the legal `MATCH … WITH … MERGE … SET` and the hoisted
+    // `MATCH … MERGE … WITH … SET`. It is also the only point every write
+    // path passes through; the sequential driver's own validation never sees
+    // the third case above, which does not route to it.
+    let mut wrote = false;
+
     loop {
         match s.peek_kind() {
             TokenKind::Match => {
+                if wrote {
+                    return Err(hoisted_read_error(s, "MATCH"));
+                }
                 read_clauses.push(ReadClause::Match(parse_match(s, false)?));
             }
             TokenKind::Optional => {
+                if wrote {
+                    return Err(hoisted_read_error(s, "OPTIONAL MATCH"));
+                }
                 s.advance();
                 read_clauses.push(ReadClause::OptionalMatch(parse_match(s, true)?));
             }
             TokenKind::With => {
+                if wrote {
+                    return Err(hoisted_read_error(s, "WITH"));
+                }
                 read_clauses.push(ReadClause::With(parse_with(s)?));
             }
             TokenKind::Unwind => {
+                if wrote {
+                    return Err(hoisted_read_error(s, "UNWIND"));
+                }
                 read_clauses.push(ReadClause::Unwind(parse_unwind(s)?));
             }
             TokenKind::Call if matches!(s.peek_at(1), TokenKind::Ident(_)) => {
@@ -68,6 +103,9 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                 ));
             }
             TokenKind::Call => {
+                if wrote {
+                    return Err(hoisted_read_error(s, "CALL { … }"));
+                }
                 read_clauses.push(ReadClause::CallSubquery(parse_call_subquery(s)?));
             }
             TokenKind::Return => {
@@ -76,18 +114,23 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
             }
             TokenKind::Create => {
                 write_clauses.push(WriteClause::Create(parse_create(s)?));
+                wrote = true;
             }
             TokenKind::Merge => {
                 write_clauses.push(WriteClause::Merge(parse_merge(s)?));
+                wrote = true;
             }
             TokenKind::Set => {
                 write_clauses.push(WriteClause::Set(parse_set(s)?));
+                wrote = true;
             }
             TokenKind::Remove => {
                 write_clauses.push(WriteClause::Remove(parse_remove(s)?));
+                wrote = true;
             }
             TokenKind::Delete => {
                 write_clauses.push(WriteClause::Delete(parse_delete(s, false)?));
+                wrote = true;
             }
             TokenKind::Detach => {
                 s.advance();
@@ -95,9 +138,11 @@ fn parse_statement_inner(s: &mut TokenStream) -> Result<Statement, Diagnostic> {
                     return Err(s.error(DiagCode::UnexpectedToken, "expected DELETE after DETACH"));
                 }
                 write_clauses.push(WriteClause::Delete(parse_delete(s, true)?));
+                wrote = true;
             }
             TokenKind::Ident(w) if w.eq_ignore_ascii_case("foreach") => {
                 write_clauses.push(WriteClause::Foreach(parse_foreach(s)?));
+                wrote = true;
             }
             TokenKind::Eof => break,
             other => {
@@ -276,6 +321,21 @@ fn parse_call_subquery(s: &mut TokenStream) -> Result<CallSubqueryClause, Diagno
         query: Box::new(query),
         span: start.union(end),
     })
+}
+
+/// The diagnostic for a read clause written after a write clause — see the
+/// comment in `parse_statement_inner`. The span points at the read clause
+/// rather than the write, because the read is the clause the author moves.
+fn hoisted_read_error(s: &TokenStream, keyword: &str) -> Diagnostic {
+    s.error(
+        DiagCode::UnexpectedToken,
+        format!(
+            "`{keyword}` after a write clause is not supported — the clause order would be \
+             silently rearranged so that every read runs before every write, which changes \
+             what the statement does. Put the reads before the first write \
+             (`MATCH … WITH … MERGE … SET …`), or split this into two statements."
+        ),
+    )
 }
 
 /// Parse the body of a `CALL { … }` subquery: read clauses terminating in

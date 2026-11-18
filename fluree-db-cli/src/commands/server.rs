@@ -1293,6 +1293,13 @@ fn print_resolved_config(config: &ServerConfig, dirs: &FlureeDir) {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "(default: tiered by RAM: <4GB 30%, 4-8GB 40%, >=8GB 35%)".into())
     );
+    eprintln!(
+        "  query_result_cache_max_mb: {}",
+        config
+            .query_result_cache_max_mb
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(default: 10% of cache_max_mb, in addition to it)".into())
+    );
     eprintln!("  server_role:  {:?}", config.server_role);
     eprintln!("  pid_file:     {}", pid_path(dirs.data_dir()).display());
     eprintln!("  log_file:     {}", log_path(dirs.data_dir()).display());
