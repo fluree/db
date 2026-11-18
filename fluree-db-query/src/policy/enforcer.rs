@@ -228,9 +228,8 @@ impl QueryPolicyEnforcer {
     }
 
     /// Cache, under `state`, the classes of every subject the checks of
-    /// `flakes` read. A caller's prefetch is not enough: a miss reads as no
-    /// classes, and a state of an overlay with no content version matches
-    /// only itself.
+    /// `flakes` read. Callers need no prefetch: a miss reads as no classes,
+    /// so the check resolves its own, under the state it reads with.
     async fn cache_subject_classes(
         &self,
         state: ClassState,
@@ -243,7 +242,11 @@ impl QueryPolicyEnforcer {
         if !self.policy.wrapper().has_class_policies() {
             return Ok(());
         }
-        let mut subjects: Vec<Sid> = flakes.iter().map(|f| f.s.clone()).collect();
+        let mut subjects: Vec<Sid> = flakes
+            .iter()
+            .filter(|f| !is_schema_flake(&f.p, &f.o))
+            .map(|f| f.s.clone())
+            .collect();
         subjects.sort();
         subjects.dedup();
         let db = fluree_db_core::GraphDbRef::new(snapshot, g_id, overlay, to_t);
@@ -252,9 +255,12 @@ impl QueryPolicyEnforcer {
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
     }
 
-    /// Populate the class cache for subjects using a graph database reference.
-    ///
-    /// Call this before filtering to ensure class lookups are cached.
+    /// Prefetch the classes of `subjects` for a run of
+    /// [`allow_flake_for_graph`](Self::allow_flake_for_graph) checks, which
+    /// otherwise look up one subject at a time. A subject with no classes is
+    /// cached too, so its check does not read its `rdf:type` again.
+    /// [`filter_flakes_for_graph`](Self::filter_flakes_for_graph) needs no
+    /// prefetch: it resolves its batch's subjects in one lookup.
     pub async fn populate_class_cache_for_graph(
         &self,
         db: fluree_db_core::GraphDbRef<'_>,
