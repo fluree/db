@@ -143,7 +143,13 @@ fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64
             if ec.overlay {
                 execute_chain_overlay(chain, ec)
             } else {
-                execute_chain(chain, ec.store, ec.g_id, &ec.ctx.cancellation)
+                execute_chain(
+                    chain,
+                    ec.store,
+                    ec.g_id,
+                    &ec.ctx.cancellation,
+                    &ec.ctx.tracker,
+                )
             }
         }
         CountPlanRoot::OptionalChainHead { p1, p2, p3 } => {
@@ -278,7 +284,8 @@ fn subject_groups<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<Subject
     } else {
         Ok(Some(SubjectGroups::Meta(
             PsotSubjectCountIter::new(store, ec.g_id, p_id)?
-                .with_cancellation(&ec.ctx.cancellation),
+                .with_cancellation(&ec.ctx.cancellation)
+                .with_tracker(&ec.ctx.tracker),
         )))
     }
 }
@@ -304,7 +311,10 @@ fn subject_keys_sorted(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<Vec<u6
             return Ok(Some(Vec::new()));
         };
         Ok(Some(collect_subjects_for_predicate_sorted(
-            ec.store, ec.g_id, p_id,
+            ec.store,
+            ec.g_id,
+            p_id,
+            &ec.ctx.tracker,
         )?))
     }
 }
@@ -331,7 +341,7 @@ fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
         let mut total: u64 = 0;
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+            .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
         {
             ec.ctx.check_cancelled()?;
             total = total
@@ -363,7 +373,13 @@ fn post_object_filtered_sum(
         return Ok(if ec.overlay { None } else { Some(0) });
     };
     if !ec.overlay {
-        return sum_post_object_counts_filtered(ec.store, ec.g_id, p_id, allowed_sorted);
+        return sum_post_object_counts_filtered(
+            ec.store,
+            ec.g_id,
+            p_id,
+            allowed_sorted,
+            &ec.ctx.tracker,
+        );
     }
 
     let Some(mut cursor) = build_post_cursor_for_predicate(
@@ -384,7 +400,7 @@ fn post_object_filtered_sum(
     let mut total: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         ec.ctx.check_cancelled()?;
         for row in 0..batch.row_count {
@@ -417,7 +433,13 @@ fn subjects_with_object_in(
         return Ok(if ec.overlay { None } else { Some(Vec::new()) });
     };
     if !ec.overlay {
-        return collect_subjects_with_object_in_set(ec.store, ec.g_id, p_id, object_set);
+        return collect_subjects_with_object_in_set(
+            ec.store,
+            ec.g_id,
+            p_id,
+            object_set,
+            &ec.ctx.tracker,
+        );
     }
 
     let Some(mut cursor) = build_psot_cursor_for_predicate(
@@ -437,7 +459,7 @@ fn subjects_with_object_in(
     let mut cur_ok = false;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         ec.ctx.check_cancelled()?;
         for row in 0..batch.row_count {
@@ -688,8 +710,9 @@ fn try_modifier_seek(
         let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
             return Ok(None);
         };
-        let mut b_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_b).with_cancellation(&ec.ctx.cancellation);
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut acc: u128 = 0;
         while let Some((s, count_a)) = a_groups.next_group()? {
             let present = b_seek.subject_present(s)?;
@@ -705,8 +728,9 @@ fn try_modifier_seek(
         let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
             return Ok(None);
         };
-        let mut a_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_a).with_cancellation(&ec.ctx.cancellation);
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut matched: u128 = 0;
         while let Some((s, _)) = b_groups.next_group()? {
             if let Some(count_a) = a_seek.count_for_subject(s)? {
@@ -835,6 +859,7 @@ fn merge_count_range(
     g_id: fluree_db_core::GraphId,
     p_ids: &[u32],
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -842,7 +867,8 @@ fn merge_count_range(
     for &p_id in p_ids {
         iters.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p_id, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
     let Some(mut heads) = InnerMergeHeads::prime(&mut iters)? else {
@@ -866,12 +892,14 @@ fn merge_count_range(
 /// `opt_groups` lists each optional group's present predicate ids; an empty group
 /// is `always_one` (multiplier 1 — an absent optional predicate). BASE index only
 /// (no overlay), no exclude/include (the caller gates that).
+#[allow(clippy::too_many_arguments)]
 fn merge_optional_count_range(
     store: &BinaryIndexStore,
     g_id: fluree_db_core::GraphId,
     req_pids: &[u32],
     opt_groups: &[Vec<u32>],
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -879,7 +907,8 @@ fn merge_optional_count_range(
     for &p in req_pids {
         req_iters.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
 
@@ -902,7 +931,8 @@ fn merge_optional_count_range(
         for &p in grp {
             iters.push(
                 PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                    .with_cancellation(cancellation),
+                    .with_cancellation(cancellation)
+                    .with_tracker(tracker),
             );
         }
         let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
@@ -1082,7 +1112,17 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
         driver_p,
         total_rows,
         &ec.ctx.cancellation,
-        |lo, hi| merge_count_range(ec.store, ec.g_id, &p_ids, &ec.ctx.cancellation, lo, hi),
+        |lo, hi| {
+            merge_count_range(
+                ec.store,
+                ec.g_id,
+                &p_ids,
+                &ec.ctx.cancellation,
+                &ec.ctx.tracker,
+                lo,
+                hi,
+            )
+        },
     )
 }
 
@@ -1101,6 +1141,7 @@ fn merge_count_range_overlay(
     ops_per_pred: &[SharedOverlayOps],
     to_t: i64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1116,6 +1157,7 @@ fn merge_count_range_overlay(
             hi,
             sliced,
             to_t,
+            tracker,
         ) else {
             return Ok(0); // PSOT branch absent => empty intersection
         };
@@ -1212,6 +1254,7 @@ fn sum_star_join_overlay_parallel(
                 ops_ref,
                 to_t,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1299,6 +1342,7 @@ fn sum_optional_join_parallel(
                 &req_pids,
                 &opt_groups,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1323,6 +1367,7 @@ fn merge_optional_count_range_overlay(
     opt_ops: &[Vec<SharedOverlayOps>],
     to_t: i64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1337,6 +1382,7 @@ fn merge_optional_count_range_overlay(
             hi,
             sliced,
             to_t,
+            tracker,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -1523,6 +1569,7 @@ fn sum_optional_join_overlay_parallel(
                 opt_ops,
                 to_t,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1554,16 +1601,19 @@ fn merge_modifier_intersect_range(
     inner_pids: &[u32],
     is_anti: bool,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
     let mut outer = PsotSubjectCountIter::new_bounded(store, g_id, outer_pid, lo, hi)?
-        .with_cancellation(cancellation);
+        .with_cancellation(cancellation)
+        .with_tracker(tracker);
     let mut inner: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(inner_pids.len());
     for &p in inner_pids {
         inner.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
     let mut i_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(inner.len());
@@ -1685,6 +1735,7 @@ fn try_modifier_intersect_parallel(
                 &inner_pids,
                 is_anti,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1744,6 +1795,7 @@ fn merge_modifier_intersect_range_overlay(
     is_anti: bool,
     to_t: i64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1758,6 +1810,7 @@ fn merge_modifier_intersect_range_overlay(
             hi,
             sliced,
             to_t,
+            tracker,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -1882,6 +1935,7 @@ fn try_modifier_intersect_overlay_parallel(
                 is_anti,
                 to_t,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -2119,7 +2173,9 @@ fn try_sum_star_join_seek(
         .enumerate()
         .filter(|(i, _)| *i != driver_idx)
         .map(|(_, &p_id)| {
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_id).with_cancellation(&ec.ctx.cancellation)
+            PsotSubjectSeek::new(ec.store, ec.g_id, p_id)
+                .with_cancellation(&ec.ctx.cancellation)
+                .with_tracker(&ec.ctx.tracker)
         })
         .collect();
 
@@ -2198,8 +2254,9 @@ fn try_optional_seek(
         let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
             return Ok(None);
         };
-        let mut b_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_b).with_cancellation(&ec.ctx.cancellation);
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut acc: u128 = 0;
         while let Some((s, count_a)) = a_groups.next_group()? {
             let mult = b_seek.count_for_subject(s)?.unwrap_or(0).max(1);
@@ -2211,8 +2268,9 @@ fn try_optional_seek(
         let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
             return Ok(None);
         };
-        let mut a_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_a).with_cancellation(&ec.ctx.cancellation);
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut bonus: u128 = 0;
         while let Some((s, count_b)) = b_groups.next_group()? {
             // count_B == 1 yields no bonus; skip the seek (targets stay ascending).
@@ -2474,7 +2532,10 @@ fn execute_keyset_as_hash_set(
                 return Ok(Some(FxHashSet::default()));
             };
             Ok(Some(collect_subjects_for_predicate_set(
-                ec.store, ec.g_id, p_id,
+                ec.store,
+                ec.g_id,
+                p_id,
+                &ec.ctx.tracker,
             )?))
         }
         _ => {
@@ -2513,6 +2574,7 @@ fn execute_chain(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     // Matches the overlay twin `execute_chain_overlay`: a malformed chain is a
     // planner bug, not a runtime condition — never panic a release query path.
@@ -2642,6 +2704,8 @@ fn execute_chain(
         /// every row gets the `non_iri_weight` without checking `o_key`.
         all_non_iri: bool,
         mode: P2WeightMode<'m>,
+        /// Charged one index touch per leaflet read.
+        tracker: fluree_db_core::Tracker,
     }
 
     impl<'a, 'm> PsotSeekSumCursor<'a, 'm> {
@@ -2650,6 +2714,7 @@ fn execute_chain(
             g_id: GraphId,
             p_id: u32,
             mode: P2WeightMode<'m>,
+            tracker: &fluree_db_core::Tracker,
         ) -> Self {
             let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
             Self {
@@ -2664,9 +2729,12 @@ fn execute_chain(
                 mixed: false,
                 all_non_iri: false,
                 mode,
+                tracker: tracker.clone(),
             }
         }
 
+        // Left inline, unlike the count iterators' refills: out of line it
+        // measured slower on the chain fold this cursor serves.
         fn load_next_batch(&mut self, target_b: u64) -> Result<Option<()>> {
             use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
             loop {
@@ -2728,6 +2796,7 @@ fn execute_chain(
                         idx,
                         &projection,
                         RunSortOrder::Psot,
+                        &self.tracker,
                     )?;
 
                     self.row = 0;
@@ -2820,7 +2889,8 @@ fn execute_chain(
         match &chain.tail_weight {
             TailWeight::None => {
                 let mut iter = PsotSubjectCountIter::new(store, g_id, p_ids[n - 1])?
-                    .with_cancellation(cancellation);
+                    .with_cancellation(cancellation)
+                    .with_tracker(tracker);
                 while let Some((s, count)) = iter.next_group()? {
                     if count > 0 {
                         v2_weights.insert(s, count);
@@ -2832,13 +2902,14 @@ fn execute_chain(
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
                     let mut mult_map: FxHashMap<u64, u64> = FxHashMap::default();
                     let mut iter = PsotSubjectCountIter::new(store, g_id, tail_p_id)?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((c, count)) = iter.next_group()? {
                         mult_map.insert(c, count.max(1));
                     }
                     let Some(mut ws_iter) =
                         PsotSubjectWeightedSumIter::new(store, g_id, p_ids[n - 1], &mult_map, 1)?
-                            .map(|it| it.with_cancellation(cancellation))
+                            .map(|it| it.with_cancellation(cancellation).with_tracker(tracker))
                     else {
                         return Ok(None);
                     };
@@ -2849,7 +2920,8 @@ fn execute_chain(
                     }
                 } else {
                     let mut iter = PsotSubjectCountIter::new(store, g_id, p_ids[n - 1])?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((s, count)) = iter.next_group()? {
                         if count > 0 {
                             v2_weights.insert(s, count);
@@ -2860,13 +2932,15 @@ fn execute_chain(
             TailWeight::Minus { tail_pred } => {
                 let tail_sid = normalize_pred_sid(store, tail_pred)?;
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
-                    let excluded = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                    let excluded =
+                        collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                     let Some(mut iter) = PsotObjectFilterCountIter::new(
                         store,
                         g_id,
                         p_ids[n - 1],
                         &excluded,
                         ObjectFilterMode::NotInSet,
+                        tracker,
                     )?
                     else {
                         return Ok(None);
@@ -2878,7 +2952,8 @@ fn execute_chain(
                     }
                 } else {
                     let mut iter = PsotSubjectCountIter::new(store, g_id, p_ids[n - 1])?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((s, count)) = iter.next_group()? {
                         if count > 0 {
                             v2_weights.insert(s, count);
@@ -2891,7 +2966,7 @@ fn execute_chain(
                 let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) else {
                     return Ok(Some(0));
                 };
-                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                 if included.is_empty() {
                     return Ok(Some(0));
                 }
@@ -2901,6 +2976,7 @@ fn execute_chain(
                     p_ids[n - 1],
                     &included,
                     ObjectFilterMode::InSet,
+                    tracker,
                 )?
                 else {
                     return Ok(None);
@@ -2922,7 +2998,7 @@ fn execute_chain(
         for i in (2..n - 1).rev() {
             let Some(mut iter) =
                 PsotSubjectWeightedSumIter::new(store, g_id, p_ids[i], &v2_weights, 0)?
-                    .map(|it| it.with_cancellation(cancellation))
+                    .map(|it| it.with_cancellation(cancellation).with_tracker(tracker))
             else {
                 return Ok(None);
             };
@@ -2940,7 +3016,7 @@ fn execute_chain(
     }
 
     // 2) Stream POST(p1) grouped by object `b`, and for each `b` seek PSOT(p2) to compute w(b).
-    let Some(mut it1) = PostObjectGroupCountIter::new(store, g_id, p_ids[0])? else {
+    let Some(mut it1) = PostObjectGroupCountIter::new(store, g_id, p_ids[0], tracker)? else {
         return Ok(None);
     };
 
@@ -2953,7 +3029,8 @@ fn execute_chain(
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
                     let mut mult_map: FxHashMap<u64, u64> = FxHashMap::default();
                     let mut iter = PsotSubjectCountIter::new(store, g_id, tail_p_id)?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((c, count)) = iter.next_group()? {
                         mult_map.insert(c, count.max(1));
                     }
@@ -2969,7 +3046,8 @@ fn execute_chain(
             TailWeight::Minus { tail_pred } => {
                 let tail_sid = normalize_pred_sid(store, tail_pred)?;
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
-                    let excluded = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                    let excluded =
+                        collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                     P2WeightMode::NotInSetOwned {
                         set: excluded,
                         non_iri_weight: 1,
@@ -2983,7 +3061,7 @@ fn execute_chain(
                 let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) else {
                     return Ok(Some(0));
                 };
-                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                 if included.is_empty() {
                     return Ok(Some(0));
                 }
@@ -3001,7 +3079,7 @@ fn execute_chain(
         }
     };
 
-    let mut p2_cursor = PsotSeekSumCursor::new(store, g_id, p_ids[1], p2_mode);
+    let mut p2_cursor = PsotSeekSumCursor::new(store, g_id, p_ids[1], p2_mode, tracker);
 
     let mut total: u64 = 0;
     while let Some((b, n1)) = it1.next_group()? {
@@ -3113,7 +3191,7 @@ fn psot_weighted_subject_sums(
     let overflow = || QueryError::execution("COUNT(*) overflow in chain join");
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         for row in 0..batch.row_count {
             let s = batch.s_id.get(row);
@@ -3161,7 +3239,7 @@ fn psot_weighted_total(
     let mut total: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         for row in 0..batch.row_count {
             let w = weight.weight(batch.o_type.get(row), batch.o_key.get(row));
@@ -3356,7 +3434,7 @@ fn execute_optional_chain_head(
     // If either inner predicate is absent, the OPTIONAL chain can never match,
     // so every `?a p1 ?b` row contributes exactly 1 (multiplier 1 for all b).
     let (Some(p2_id), Some(p3_id)) = (p2_id, p3_id) else {
-        let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+        let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id, &ec.ctx.tracker)?.ok_or(
             QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
         )?;
         let mut total = 0u64;
@@ -3368,18 +3446,22 @@ fn execute_optional_chain_head(
 
     // Precompute n3(c) = count_{p3}(c).
     let mut n3: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut it3 =
-        PsotSubjectCountIter::new(store, g_id, p3_id)?.with_cancellation(&ec.ctx.cancellation);
+    let mut it3 = PsotSubjectCountIter::new(store, g_id, p3_id)?
+        .with_cancellation(&ec.ctx.cancellation)
+        .with_tracker(&ec.ctx.tracker);
     while let Some((c, n)) = it3.next_group()? {
         n3.insert(c, n);
     }
 
-    let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+    let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id, &ec.ctx.tracker)?.ok_or(
         QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
     )?;
     // default_weight=0: objects not in n3 contribute nothing to the sum
     let mut it2 = PsotSubjectWeightedSumIter::new(store, g_id, p2_id, &n3, 0)?
-        .map(|it| it.with_cancellation(&ec.ctx.cancellation))
+        .map(|it| {
+            it.with_cancellation(&ec.ctx.cancellation)
+                .with_tracker(&ec.ctx.tracker)
+        })
         .ok_or(QueryError::Internal(
             "optional chain-head: PSOT iterator unavailable".into(),
         ))?;
@@ -3487,10 +3569,17 @@ struct PsotSoIter<'a> {
     handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
     batch: Option<fluree_db_binary_index::ColumnBatch>,
     projection: fluree_db_binary_index::ColumnProjection,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSoIter<'a> {
-    fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+    fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        tracker: &fluree_db_core::Tracker,
+    ) -> Self {
         let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
         Self {
             store,
@@ -3502,9 +3591,14 @@ impl<'a> PsotSoIter<'a> {
             handle: None,
             batch: None,
             projection: projection_sid_otype_okey(),
+            tracker: tracker.clone(),
         }
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         loop {
             if self.handle.is_none() {
@@ -3536,9 +3630,13 @@ impl<'a> PsotSoIter<'a> {
                 if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
                     continue;
                 }
-                let batch = handle
-                    .load_columns(idx, &self.projection, RunSortOrder::Psot)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    handle.as_ref(),
+                    idx,
+                    &self.projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 return Ok(Some(()));
@@ -3604,7 +3702,7 @@ impl CursorSoIter {
                 self.current = self
                     .cursor
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?;
                 self.row = 0;
                 if self.current.is_none() {
                     return Ok(None);
@@ -3686,7 +3784,10 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
         Ok(Some(SoRows::Cursor(Box::new(CursorSoIter::new(cursor)))))
     } else {
         Ok(Some(SoRows::Meta(Box::new(PsotSoIter::new(
-            store, ec.g_id, p_id,
+            store,
+            ec.g_id,
+            p_id,
+            &ec.ctx.tracker,
         )))))
     }
 }
@@ -3718,6 +3819,7 @@ fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Resul
                 ec.g_id,
                 p_id,
                 (ec.ctx.to_t < ec.store.max_t()).then_some(ec.ctx.to_t),
+                &ec.ctx.tracker,
             )? {
                 return Ok(None);
             }

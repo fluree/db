@@ -463,10 +463,9 @@ async fn build_policy_context_from_opts_inner(
     // the assembler prunes zero-count entries before policy sees them, so a
     // spurious `-1` can delete a property from a class's list. In the
     // `f:onClass` Allow direction that fails closed, which is the safe way to
-    // be wrong; in `compute_class_check_needed`'s subset test it could drop a
-    // runtime class check, which is not. Left on the estimate lane anyway —
-    // an uncached per-query builder cannot afford base probes — but the
-    // exposure is a count-drift one, not a no-op.
+    // be wrong; a Deny that loses the property the same way is not. Left on
+    // the estimate lane anyway — an uncached per-query builder cannot afford
+    // base probes — but the exposure is a count-drift one, not a no-op.
     let stats: Option<Arc<IndexStats>> = if restrictions.is_empty() {
         // Empty policy sets never consult stats. Avoid scanning accumulated
         // novelty while preserving the default-allow/root decision below.

@@ -26,12 +26,6 @@ fn rdf_type_property() -> Sid {
     Sid::new(RDF, "type")
 }
 
-/// Check if a property is implicit (@id or rdf:type)
-fn is_implicit_property(sid: &Sid) -> bool {
-    (sid.namespace_code == JSON_LD && sid.name.as_ref() == "id")
-        || (sid.namespace_code == RDF && sid.name.as_ref() == "type")
-}
-
 /// Build indexed policy set from restrictions.
 ///
 /// # Arguments
@@ -121,12 +115,9 @@ pub fn build_policy_set(
                 // Modify sets index class policies by class, selected at
                 // evaluation time by the subject's classes (see
                 // `PolicySet::by_class`). The view-set stats expansion below
-                // is wrong for writes on both axes: it misses properties the
-                // class has never used in committed data (an allow silently
-                // fails to cover them), and its exclusive-property shortcut
-                // skips the class check exactly when the staged flake is the
-                // first counterexample to the stats (an allow leaks to
-                // non-instances).
+                // misses properties the class has never used in committed
+                // data, so for a write an allow would silently fail to cover
+                // them.
                 for class_sid in &restriction.for_classes {
                     set.by_class.entry(class_sid.clone()).or_default().push(idx);
                 }
@@ -148,21 +139,17 @@ pub fn build_policy_set(
                 props_for_restriction.insert(id_property());
                 props_for_restriction.insert(rdf_type_property());
 
-                // Index this restriction ONCE per property with per-property class_check_needed
+                // Index this restriction ONCE per property, always checking
+                // the subject's classes. Statistics credit a property only to
+                // typed subjects, so "only the target classes use it" says
+                // nothing of an untyped subject that carries it.
                 for prop in props_for_restriction {
-                    // Compute class_check_needed for THIS property:
-                    // - Implicit properties (@id, rdf:type) always need check
-                    // - If all classes using this property are in for_classes, no check needed
-                    // - Otherwise, check needed
-                    let class_check_needed =
-                        compute_class_check_needed(&restriction.for_classes, &prop, stats);
-
                     set.by_property
                         .entry(prop)
                         .or_default()
                         .push(PropertyPolicyEntry {
                             idx,
-                            class_check_needed,
+                            class_check_needed: true,
                         });
                 }
             }
@@ -195,57 +182,6 @@ fn get_properties_for_class(class_sid: &Sid, stats: &IndexStats) -> Vec<Sid> {
     }
 
     vec![]
-}
-
-/// Get all classes that use a given property from stats.
-///
-/// Returns an empty HashSet if the property is not found or stats are unavailable.
-pub fn get_all_classes_for_property(property_sid: &Sid, stats: &IndexStats) -> HashSet<Sid> {
-    let Some(ref classes) = stats.classes else {
-        return HashSet::new();
-    };
-
-    let mut result = HashSet::new();
-    for class_entry in classes {
-        for prop_usage in &class_entry.properties {
-            if &prop_usage.property_sid == property_sid {
-                result.insert(class_entry.class_sid.clone());
-                break;
-            }
-        }
-    }
-
-    result
-}
-
-/// Determine if runtime class check is needed for a class policy property.
-///
-/// Class check needed iff:
-/// 1. Property is implicit (@id or rdf:type), OR
-/// 2. Some class OUTSIDE the policy's target classes also uses this property
-///
-/// This means: check needed = implicit || !all_classes.is_subset(for_classes)
-pub fn compute_class_check_needed(
-    for_classes: &HashSet<Sid>,
-    property_sid: &Sid,
-    stats: Option<&IndexStats>,
-) -> bool {
-    // Implicit properties always need class check (shared across all classes)
-    if is_implicit_property(property_sid) {
-        return true;
-    }
-
-    let Some(db_stats) = stats else {
-        // Without stats, we must assume check is needed
-        return true;
-    };
-
-    // Get all classes that use this property from stats
-    let all_classes = get_all_classes_for_property(property_sid, db_stats);
-
-    // Check if all_classes is a subset of for_classes
-    // If NOT a subset, some class outside our targets uses this property → need check
-    !all_classes.is_subset(for_classes)
 }
 
 #[cfg(test)]
@@ -459,8 +395,7 @@ mod tests {
 
     /// A stats-"exclusive" property must NOT make a modify class policy apply
     /// to a non-instance: the staged flake can be the first counterexample to
-    /// the stats. (The view-set exclusivity shortcut would skip the class
-    /// check here.)
+    /// the stats.
     #[test]
     fn test_modify_class_policy_does_not_leak_via_exclusive_property() {
         let person_class = make_sid(100, "Person");
@@ -482,6 +417,28 @@ mod tests {
             entries.is_empty(),
             "class policy must not apply to a non-instance"
         );
+    }
+
+    /// A view class policy checks the subject's classes even on a property
+    /// statistics credit only to its classes: an untyped subject carrying the
+    /// property counts toward no class.
+    #[test]
+    fn test_view_class_policy_checks_classes_on_an_exclusive_property() {
+        let person_class = make_sid(100, "Person");
+        let ssn_prop = make_sid(100, "ssn");
+        let stats = make_stats_with_class(person_class.clone(), vec![ssn_prop.clone()]);
+
+        let set = build_policy_set(
+            vec![make_class_restriction("c1", person_class)],
+            Some(&stats),
+            PolicyAction::View,
+            None,
+        );
+
+        let untyped = make_sid(100, "b");
+        let entries = set.policy_entries_for_flake(&untyped, &ssn_prop, &[]);
+        assert_eq!(entries.len(), 1);
+        assert!(entries[0].class_check_needed);
     }
 
     #[test]
@@ -517,88 +474,5 @@ mod tests {
         let modify_set = build_policy_set(restrictions, None, PolicyAction::Modify, None);
         assert_eq!(modify_set.restrictions.len(), 1);
         assert_eq!(modify_set.restrictions[0].id, "m1");
-    }
-
-    #[test]
-    fn test_class_check_needed_implicit() {
-        let for_classes: HashSet<Sid> = [make_sid(100, "Person")].into_iter().collect();
-
-        // @id is implicit, always needs check
-        assert!(compute_class_check_needed(
-            &for_classes,
-            &id_property(),
-            None
-        ));
-
-        // rdf:type is implicit, always needs check
-        assert!(compute_class_check_needed(
-            &for_classes,
-            &rdf_type_property(),
-            None
-        ));
-    }
-
-    #[test]
-    fn test_class_check_needed_exclusive_property() {
-        let person = make_sid(100, "Person");
-        let company = make_sid(100, "Company");
-        let name_prop = make_sid(100, "name");
-        let ssn_prop = make_sid(100, "ssn");
-
-        // Stats: Person uses name, ssn; Company uses name only
-        let stats = IndexStats {
-            flakes: 100,
-            size: 5000,
-            properties: None,
-            classes: Some(vec![
-                ClassStatEntry {
-                    class_sid: person.clone(),
-                    count: 10,
-                    properties: vec![
-                        ClassPropertyUsage {
-                            property_sid: name_prop.clone(),
-                            datatypes: Vec::new(),
-                            langs: Vec::new(),
-                            ref_classes: Vec::new(),
-                        },
-                        ClassPropertyUsage {
-                            property_sid: ssn_prop.clone(),
-                            datatypes: Vec::new(),
-                            langs: Vec::new(),
-                            ref_classes: Vec::new(),
-                        },
-                    ],
-                },
-                ClassStatEntry {
-                    class_sid: company.clone(),
-                    count: 5,
-                    properties: vec![ClassPropertyUsage {
-                        property_sid: name_prop.clone(),
-                        datatypes: Vec::new(),
-                        langs: Vec::new(),
-                        ref_classes: Vec::new(),
-                    }],
-                },
-            ]),
-            graphs: None,
-            historical_since_t: None,
-            links: None,
-        };
-
-        let person_only: HashSet<Sid> = [person.clone()].into_iter().collect();
-
-        // name is used by both Person and Company, needs check
-        assert!(compute_class_check_needed(
-            &person_only,
-            &name_prop,
-            Some(&stats)
-        ));
-
-        // ssn is only used by Person, no check needed
-        assert!(!compute_class_check_needed(
-            &person_only,
-            &ssn_prop,
-            Some(&stats)
-        ));
     }
 }

@@ -31,6 +31,7 @@ use crate::fast_path_common::{
     branch_or_none, object_probe_lane_plan, p_id_or_none, subject_probe_lane_plan, LaneOutput,
     ObjectProbeOps, ProbeLanePlan, ProbeOps,
 };
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::Pattern;
@@ -624,7 +625,7 @@ impl PatternOptionalBuilder {
         let mut pattern = self.pattern.clone();
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
-        let mut view: Option<Option<fluree_db_binary_index::BinaryGraphView>> = None;
+        let mut view: Option<Option<fluree_db_binary_index::TermView>> = None;
         let object_to_unify = self.object_left_to_unify(required_batch, row);
         for instr in &self.bind_instructions {
             if object_to_unify && instr.position == PatternPosition::Object {
@@ -638,7 +639,7 @@ impl PatternOptionalBuilder {
                     | Binding::EncodedLit { .. }
             );
             let view = if encoded {
-                view.get_or_insert_with(|| ctx.graph_view()).as_ref()
+                view.get_or_insert_with(|| ctx.term_view()).as_ref()
             } else {
                 None
             };
@@ -715,6 +716,7 @@ fn push_cache_key_component(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if position == PatternPosition::Object => {
             key.push(b'L');
@@ -723,6 +725,9 @@ fn push_cache_key_component(
             key.extend_from_slice(&p_id.to_le_bytes());
             key.extend_from_slice(&dt_id.to_le_bytes());
             key.extend_from_slice(&lang_id.to_le_bytes());
+            // An arena handle names its value only with its graph: two
+            // graphs' handle 0 are two values.
+            key.extend_from_slice(&arena_g_id.to_le_bytes());
             true
         }
         // A literal OBJECT is pushed down by value (plus a string term
@@ -1801,13 +1806,13 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .try_collect_vec()?;
             let seed_key: Vec<GroupKeyOwned> = seed_cols
                 .iter()
                 .map(|&c| {
                     binding_to_group_key_normalized(required_batch.get_by_col(row, c), dicts, gv)
                 })
-                .collect();
+                .try_collect_vec()?;
             if seen_seed.insert(seed_key) {
                 seed_rows.push(
                     seed_cols
@@ -1887,7 +1892,7 @@ impl OptionalBuilder for PlanTreeOptionalBuilder {
                 let key: Vec<GroupKeyOwned> = out_corr_cols
                     .iter()
                     .map(|&c| binding_to_group_key_normalized(batch.get_by_col(r, c), dicts, gv))
-                    .collect();
+                    .try_collect_vec()?;
                 let projected: Vec<Binding> = out_opt_cols
                     .iter()
                     .map(|&c| batch.get_by_col(r, c).clone())
@@ -4513,6 +4518,7 @@ mod tests {
             lang_id: 0,
             i_val: fluree_db_core::list_index::NONE,
             t: 0,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
         };
         let free = Some(vec![b'u']);
         let positions = [

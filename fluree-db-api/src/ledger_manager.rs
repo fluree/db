@@ -1307,7 +1307,8 @@ use fluree_db_query::BinaryRangeProvider;
 
 /// Residency mode (F8): prewarm the reverse-dict leaves that overlay
 /// translation of this snapshot's novelty will touch, in one concurrent
-/// fetch round at load time. Novelty replay stays the load model; its
+/// fetch round after an index apply or a catch-up (a load warms these
+/// leaves before its own probes). Novelty replay stays the load model; its
 /// query-time miss sources (sync `find_subject_id_by_parts` /
 /// `find_string_id` per novelty entry) are prefetched here so a cold
 /// residency peer does not spend a retry round per reverse-tree leaf.
@@ -1320,10 +1321,51 @@ async fn prefetch_novelty_translation(
     if dict_novelty.subjects.is_empty() && dict_novelty.strings.is_empty() {
         return;
     }
+    let wants = store.novelty_reverse_wants(
+        dict_novelty.subjects.iter_entries(),
+        dict_novelty.strings.iter_values(),
+    );
     let outcome = store
-        .prefetch_novelty_reverse_wants(
-            dict_novelty.subjects.iter_entries(),
-            dict_novelty.strings.iter_values(),
+        .prefetch_wants(
+            wants,
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch"
+        );
+    }
+}
+
+/// Residency mode: fetch the reverse-dict leaves that
+/// `populate_dict_novelty_safe` probes for every novelty subject and string.
+/// Those probes are sync and a load runs in no retry frame, so a cold leaf
+/// fails the load. Covers the leaves [`prefetch_novelty_translation`] warms,
+/// since every DictNovelty entry comes from these flakes.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_dict_probes(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    novelty: &fluree_db_novelty::Novelty,
+) {
+    use fluree_db_core::FlakeValue;
+    let mut subjects: Vec<(u16, &str)> = Vec::new();
+    let mut strings: Vec<&str> = Vec::new();
+    for f in novelty.iter_flakes(fluree_db_core::IndexType::Post) {
+        subjects.push((f.s.namespace_code, &f.s.name));
+        match &f.o {
+            FlakeValue::Ref(sid) => subjects.push((sid.namespace_code, &sid.name)),
+            FlakeValue::String(s) | FlakeValue::Json(s) => strings.push(s),
+            _ => {}
+        }
+    }
+    let wants = store.novelty_reverse_wants(subjects.into_iter(), strings.into_iter());
+    let outcome = store
+        .prefetch_wants(
+            wants,
             fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
         )
         .await;
@@ -1471,6 +1513,8 @@ pub(crate) async fn attach_binary_store_from(
     // This prevents minting a second internal ID for an already-indexed IRI/string.
     if !state.novelty.is_empty() {
         let novelty = state.novelty.as_ref();
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        prefetch_novelty_dict_probes(&arc_store, novelty).await;
         let dn = Arc::make_mut(&mut state.dict_novelty);
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
@@ -1495,9 +1539,6 @@ pub(crate) async fn attach_binary_store_from(
     // loaded BinaryIndexStore, DictNovelty, and runtime dictionary state.
     let snap = Arc::make_mut(&mut state.snapshot);
     snap.range_provider = Some(Arc::new(provider));
-
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
 
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
@@ -1813,17 +1854,45 @@ impl LedgerManager {
     ///
     /// Uses single-flight pattern: concurrent requests for same ledger ID
     /// will share one load operation, not stampede.
-    ///
-    /// The ledger_id is normalized to canonical form (e.g., "mydb" -> "mydb:main")
-    /// before caching to ensure consistent cache keys regardless of input form.
     pub async fn get_or_load(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
-        // Normalize ledger_id to canonical form for consistent cache keys
-        // This ensures "mydb" and "mydb:main" use the same cache entry
-        let canonical_alias = ledger_id.clone();
         // The head this node had applied when the request arrived. Commits
         // applied after it are not waited for, so a reader never chases
         // a head that steady writes keep moving.
-        let target = self.head_watermark(&canonical_alias);
+        let target = self.head_watermark(ledger_id);
+        if let Some(handle) = self.cached_handle(ledger_id).await? {
+            if Self::holds(&handle, target).await {
+                return Ok(handle);
+            }
+        }
+        // Boxed so the ledger lifecycle (catch-up, cold load, index install)
+        // stays out of every caller's future: inlined, it nests past rustc's
+        // layout depth limit in downstream crates.
+        Box::pin(self.acquire(ledger_id, target)).await
+    }
+
+    /// The cached handle a request may be served from, or the error of a
+    /// failed load still inside its retry window. Releases the `entries`
+    /// guard before returning ([`Self::ready_handle`]).
+    async fn cached_handle(&self, ledger_id: &LedgerId) -> Result<Option<LedgerHandle>> {
+        let entries = self.entries.read().await;
+        let cached = match entries.get(ledger_id) {
+            // A reload in flight serves the state it replaces.
+            Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
+                Ok(Some(handle.clone()))
+            }
+            Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
+                Err(ApiError::http(error.status_code(), error.to_string()))
+            }
+            _ => Ok(None),
+        };
+        drop(entries);
+        cached
+    }
+
+    /// [`Self::get_or_load`] for a ledger that is not cached at `target`:
+    /// catch the cached handle up, or join or lead its load.
+    async fn acquire(&self, ledger_id: &LedgerId, target: Option<i64>) -> Result<LedgerHandle> {
+        let canonical_alias = ledger_id.clone();
 
         // A pass returns, or ends with this caller leading a load. It repeats
         // when the load this caller joined ended without a result — its
@@ -1833,45 +1902,30 @@ impl LedgerManager {
         // its head when it began, so the handle is checked against the
         // target like any cached one.
         let generation = loop {
-            // Fast path: already loaded
-            {
-                let entries = self.entries.read().await;
-                let cached = match entries.get(&canonical_alias) {
-                    // A reload in flight serves the state it replaces.
-                    Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
-                        Some(handle.clone())
+            if let Some(handle) = self.cached_handle(&canonical_alias).await? {
+                match self.catch_up(&handle, target).await {
+                    Ok(true) => return Ok(handle),
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::debug!(alias = %canonical_alias, %error, "ledger.catch_up.failed");
                     }
-                    Some(LoadState::Failed { error, retry_at }) if Instant::now() < *retry_at => {
-                        return Err(ApiError::http(error.status_code(), error.to_string()));
-                    }
-                    _ => None,
-                };
-                drop(entries);
-                if let Some(handle) = cached {
-                    match self.catch_up(&handle, target).await {
-                        Ok(true) => return Ok(handle),
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::debug!(alias = %canonical_alias, %error, "ledger.catch_up.failed");
-                        }
-                    }
-                    // Still behind: evict it and fall through to the load
-                    // path — if it is still the entry. The catch-up waited on
-                    // the handle's locks, and meanwhile another caller may
-                    // have evicted it and begun a load or reload, whose
-                    // waiters a removal would cancel, or published a newer
-                    // handle.
-                    let mut entries = self.entries.write().await;
-                    if matches!(
-                        entries.get(&canonical_alias),
-                        Some(LoadState::Ready(cached)) if cached.is_same(&handle)
-                    ) {
-                        entries.remove(&canonical_alias);
-                    }
+                }
+                // Still behind: evict it and fall through to the load
+                // path — if it is still the entry. The catch-up waited on
+                // the handle's locks, and meanwhile another caller may
+                // have evicted it and begun a load or reload, whose
+                // waiters a removal would cancel, or published a newer
+                // handle.
+                let mut entries = self.entries.write().await;
+                if matches!(
+                    entries.get(&canonical_alias),
+                    Some(LoadState::Ready(cached)) if cached.is_same(&handle)
+                ) {
+                    entries.remove(&canonical_alias);
                 }
             }
 
-            // Slow path: need to coordinate loading
+            // Coordinate the load
             enum Wait {
                 Load(oneshot::Receiver<std::result::Result<LedgerHandle, Arc<ApiError>>>),
                 Reload(oneshot::Receiver<std::result::Result<(), Arc<ApiError>>>),
@@ -2522,7 +2576,16 @@ impl LedgerManager {
 /// Maximum number of commits to catch up incrementally before falling back to
 /// full reload. For gaps larger than this, the cost of N individual commit loads
 /// exceeds the cost of a single full reload.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_INCREMENTAL_COMMITS: i64 = 5;
+/// Browser peers: an SSE reconnect after a tab sleeps routinely wakes tens
+/// of commits behind, and a full re-open drops warm per-store state (the
+/// overlay-translation cache is store-id-keyed) that catch-up preserves.
+/// The parent-chain walk is one sequential fetch per commit, so the cap is
+/// where ~gap × RTT stops beating a re-open's concurrent artifact loads —
+/// past it, reload (which still fires the head-change signal) wins.
+#[cfg(target_arch = "wasm32")]
+const MAX_INCREMENTAL_COMMITS: i64 = 64;
 
 /// Decision from comparing cached state to nameservice record
 ///
@@ -2877,6 +2940,12 @@ impl LedgerManager {
 
                 commits.reverse(); // oldest → newest
 
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                let translation_prefetch: Option<(
+                    Arc<fluree_db_binary_index::BinaryIndexStore>,
+                    Arc<fluree_db_core::dict_novelty::DictNovelty>,
+                )>;
+
                 // Apply commits under write lock (brief — all sync).
                 // Re-check state.t() under lock to guard against concurrent updates.
                 {
@@ -2951,6 +3020,16 @@ impl LedgerManager {
                     // (`apply_single_commit` mutates the dicts in place now that the
                     // provider no longer pins them.) Runs unconditionally — even
                     // after an apply error — so the provider is never left detached.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    {
+                        translation_prefetch = provider_store.as_ref().map(|store| {
+                            (
+                                Arc::clone(store),
+                                Arc::clone(&write_guard.state().dict_novelty),
+                            )
+                        });
+                    }
+
                     if let Some(store) = provider_store {
                         let dn = Arc::clone(&write_guard.state().dict_novelty);
                         let runtime_small_dicts =
@@ -2988,6 +3067,19 @@ impl LedgerManager {
                             self.config.leaflet_cache.clone(),
                         )
                         .await?;
+                }
+
+                // Caught-up commits introduced new novelty entries whose
+                // overlay translation reverse-looks-up the persisted dict
+                // trees at query time: prewarm those leaves now (the same F8
+                // treatment the load and index-apply paths get), so a
+                // head-change → re-query is a pure hit instead of a retry
+                // round. Runs outside the write guard; when an index update
+                // swapped the store above, its apply-path prefetch already
+                // covered the new store and this is a resident no-op.
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                if let Some((store, dict_novelty)) = translation_prefetch {
+                    prefetch_novelty_translation(&store, &dict_novelty).await;
                 }
 
                 Ok(NotifyResult::CommitsApplied { count: gap })

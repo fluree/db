@@ -3102,6 +3102,7 @@ pub(crate) async fn index_novelty(
                                 rdf_type_p_id,
                                 part,
                                 base_root.index_t,
+                                &fluree_db_core::Tracker::disabled(),
                             )
                         }) {
                             Ok(base_map) => {
@@ -3419,6 +3420,7 @@ pub(crate) async fn index_novelty(
                                     g_id,
                                     part,
                                     base_root.index_t,
+                                    &fluree_db_core::Tracker::disabled(),
                                 )
                             }) {
                                 Ok(m) => m,
@@ -3608,6 +3610,7 @@ pub(crate) async fn index_novelty(
                                     g_id,
                                     part,
                                     base_root.index_t,
+                                    &fluree_db_core::Tracker::disabled(),
                                 )
                             }) {
                                 Ok(inbound) => {
@@ -3678,6 +3681,7 @@ pub(crate) async fn index_novelty(
                                         rdf_type_p_id,
                                         part,
                                         base_root.index_t,
+                                        &fluree_db_core::Tracker::disabled(),
                                     )
                                 }) {
                                     Ok(m) => m,

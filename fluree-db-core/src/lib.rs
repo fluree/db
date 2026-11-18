@@ -149,7 +149,7 @@ pub use graph_registry::{
 };
 pub use ids::{
     DatatypeDictId, GraphId, LangId, ListIndex, PredicateId, RuntimeDatatypeId, RuntimePredicateId,
-    StringId, TxnT,
+    StringId, TxnT, NO_ARENA_GRAPH,
 };
 pub use index_schema::{IndexSchema, SchemaPredicateInfo, SchemaPredicates};
 pub use index_stats::{
@@ -185,7 +185,8 @@ pub use overlay::{NoOverlay, OverlayProvider, OverlaySegmentMeta};
 pub use prefix_trie::PrefixTrie;
 pub use range::{
     flake_matches_range_eq, overlay_eq_bounds, range, range_bounded_with_overlay,
-    range_with_overlay, ObjectBounds, RangeMatch, RangeOptions, RangeTest, BATCHED_JOIN_SIZE,
+    range_with_overlay, ObjectBounds, RangeMatch, RangeOptions, RangeTest, StringDatatype,
+    BATCHED_JOIN_SIZE,
 };
 pub use range_provider::{RangeProvider, RangeQuery};
 pub use runtime_small_dicts::RuntimeSmallDicts;

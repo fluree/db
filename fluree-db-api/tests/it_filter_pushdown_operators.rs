@@ -198,6 +198,9 @@ async fn filters_over_a_function_of_the_object_answer_alike_on_every_lane() {
         std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
         "FLUREE_DISABLE_QUERY_FAST_PATHS is set; the fast-paths-on runs would not run"
     );
+    // The switch is process-global: hold its write side so this binary's
+    // routing tests, which hold the read side, never run inside the window.
+    let _switch = crate::support::FAST_PATH_SWITCH.write().await;
     let _guard = FastPathGuard;
     let mut expected: Vec<(String, Vec<String>)> = Vec::new();
     for (filter, keeps) in CASES {
@@ -280,6 +283,9 @@ async fn novelty_rows_the_index_cannot_encode_meet_the_compiled_filters() {
     let ledger = fluree.ledger(id).await.expect("ledger");
     assert!(ledger.snapshot.range_provider.is_some(), "setup: indexed");
 
+    // The switch is process-global: hold its write side so this binary's
+    // routing tests, which hold the read side, never run inside the window.
+    let _switch = crate::support::FAST_PATH_SWITCH.write().await;
     let _guard = FastPathGuard;
     let mut failures = Vec::new();
     for fast in [true, false] {

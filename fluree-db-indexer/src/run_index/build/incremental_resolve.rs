@@ -1621,6 +1621,7 @@ async fn base_attachment_states(
             g_id,
             &anns,
             root.index_t,
+            &fluree_db_core::Tracker::disabled(),
         )?;
         for ann in anns {
             let mut state: [Option<SlotValue>; 3] = [None; 3];

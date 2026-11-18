@@ -1274,6 +1274,7 @@ pub(super) async fn stored_terms(
             p: Some(flake.p.clone()),
             o: Some(flake.o.clone()),
             dt: Some(flake.dt.clone()),
+            lang: None,
             t: None,
         },
         fluree_db_core::RangeOptions {

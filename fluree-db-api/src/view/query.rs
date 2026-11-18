@@ -52,12 +52,7 @@ fn explain_policy_notice(mut result: JsonValue, view: &GraphDb) -> JsonValue {
 fn residency_content_store(
     db: &GraphDb,
 ) -> Option<std::sync::Arc<dyn fluree_db_core::ContentStore>> {
-    let provider = db.snapshot.range_provider.as_ref()?;
-    let brp = provider
-        .as_any()
-        .downcast_ref::<fluree_db_query::BinaryRangeProvider>()?;
-    let cs = brp.store().content_store()?.clone();
-    cs.miss_register().is_some().then_some(cs)
+    crate::residency::content_store(&db.snapshot)
 }
 
 /// A JSON-LD query on a view reads that view's ledger, whole, at the view's
@@ -2210,9 +2205,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
@@ -2309,9 +2302,7 @@ impl Fluree {
             db.binary_store.as_ref(),
             allow_semantic_elision,
         );
-        prepare_config.planning = prepare_config
-            .planning
-            .with_multi_default_graph(union.is_some());
+        prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)

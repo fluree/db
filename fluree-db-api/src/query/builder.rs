@@ -875,7 +875,9 @@ impl<'a> FromQueryBuilder<'a> {
                 .apply_source_or_global_policy(view, alias, &opts)
                 .await?
         };
-        crate::graph_source::crawl::maybe_expand_crawl(
+        // Boxed: the expansion runs a query of its own, so inlined, every
+        // query's future would hold a second one.
+        Box::pin(crate::graph_source::crawl::maybe_expand_crawl(
             self.fluree,
             &view,
             Some(json),
@@ -883,7 +885,7 @@ impl<'a> FromQueryBuilder<'a> {
             tracker,
             execution.clone(),
             format_config,
-        )
+        ))
         .await
     }
 

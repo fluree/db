@@ -522,13 +522,11 @@ impl<'a> NodeHydrator<'a> {
     }
 
     /// Run one subject batch's raw-SPOT fetch through the view policy — the
-    /// same two-step enforcement the scan path applies
-    /// (`BinaryScanOperator::filter_flakes_by_policy`): populate the class
-    /// cache for `f:onClass` targeting, then per-flake filtering with
-    /// `f:query` support against the view's own snapshot/overlay/t.
+    /// same per-flake enforcement the scan path applies
+    /// (`BinaryScanOperator::filter_flakes_by_policy`), with `f:query`
+    /// support, against the view's own snapshot/overlay/t.
     async fn apply_view_policy(
         &self,
-        subjects: &[Sid],
         flakes: Vec<fluree_db_core::Flake>,
     ) -> Result<Vec<fluree_db_core::Flake>> {
         let Some(enforcer) = self.enforcer.as_ref() else {
@@ -538,10 +536,6 @@ impl<'a> NodeHydrator<'a> {
             return Ok(flakes);
         }
         let db = self.view.as_graph_db_ref();
-        enforcer
-            .populate_class_cache_for_graph(db, subjects)
-            .await
-            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
         let tracker = fluree_db_core::Tracker::disabled();
         enforcer
             .filter_flakes_for_graph(db.snapshot, db.g_id, db.overlay, db.t, &tracker, flakes)
@@ -661,6 +655,8 @@ impl<'a> NodeHydrator<'a> {
                 g_id,
                 &s_ids,
                 self.view.t,
+                // Formatting is not priced (see the per-flake filter above).
+                &fluree_db_core::Tracker::disabled(),
             )
             .map_err(|e| {
                 FormatError::InvalidBinding(format!("batched subject crawl failed: {e}"))
@@ -891,14 +887,14 @@ impl<'a> NodeHydrator<'a> {
             return Ok(());
         }
 
-        // Policy runs over the whole batch (one class-cache populate),
-        // then the flakes regroup by subject — including empty groups, so
+        // Policy runs over the whole batch (one class lookup), then the
+        // flakes regroup by subject — including empty groups, so
         // fully-filtered subjects cache as property-less instead of
         // refetching on the row walk.
         let subjects: Vec<Sid> = fetched.iter().map(|(s, _)| s.clone()).collect();
         let all: Vec<fluree_db_core::Flake> =
             fetched.into_iter().flat_map(|(_, flakes)| flakes).collect();
-        let visible = self.apply_view_policy(&subjects, all).await?;
+        let visible = self.apply_view_policy(all).await?;
         let mut grouped: HashMap<Sid, Vec<fluree_db_core::Flake>> =
             subjects.into_iter().map(|sid| (sid, Vec::new())).collect();
         for flake in visible {
@@ -929,9 +925,7 @@ impl<'a> NodeHydrator<'a> {
             )
             .await
             .map_err(|e| FormatError::InvalidBinding(format!("node property fetch failed: {e}")))?;
-        let flakes = self
-            .apply_view_policy(std::slice::from_ref(sid), flakes)
-            .await?;
+        let flakes = self.apply_view_policy(flakes).await?;
         let flakes = Arc::new(flakes);
         self.flake_cache.insert(sid.clone(), Arc::clone(&flakes));
         Ok(flakes)

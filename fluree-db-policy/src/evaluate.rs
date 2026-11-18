@@ -119,6 +119,14 @@ impl ClassState {
             overlay,
         }
     }
+
+    /// Whether another lookup can take this state: false when its index root
+    /// or its overlay is shared with nothing, so the state matches only
+    /// itself.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.overlay, OverlayState::Version(_))
+            && !matches!(self.root, RootState::Unshared(_))
+    }
 }
 
 /// Shared state -> subject -> classes cache for runtime class-membership
@@ -1109,9 +1117,7 @@ fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
 /// membership in C is an operation ON C).
 ///
 /// Class-targeted candidates are ALWAYS checked precisely here — candidate
-/// selection may over-select via the superset classes, and the view-set
-/// exclusivity shortcut (`class_check_needed == false`) is unsound for
-/// writes.
+/// selection may over-select via the superset classes.
 fn write_applicable(r: &PolicyRestriction, write: &WriteFlakeInfo<'_>) -> bool {
     match r.verbs {
         None => {

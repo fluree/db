@@ -114,6 +114,8 @@ pub mod rdf;
 pub mod reasoning_index;
 mod rebase;
 pub mod remote_service;
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+pub(crate) mod residency;
 pub mod retention;
 mod revert;
 mod revert_preview;
@@ -5438,17 +5440,7 @@ impl Fluree {
     /// `FlureeBuilder::without_ledger_caching()`, returns an ephemeral
     /// handle that wraps a fresh load.
     pub async fn ledger_cached(&self, ledger_id: &str) -> Result<LedgerHandle> {
-        // Not a call to `ledger_handle`: awaiting it would nest one more future
-        // in every caller's, and some test futures sit at the type-layout
-        // depth limit.
-        let ledger_id = LedgerId::parse(ledger_id)?;
-        match &self.ledger_manager {
-            Some(mgr) => mgr.get_or_load(&ledger_id).await,
-            None => Ok(Self::ephemeral_handle(
-                &ledger_id,
-                self.ledger(&ledger_id).await?,
-            )),
-        }
+        self.ledger_handle(&LedgerId::parse(ledger_id)?).await
     }
 
     /// [`ledger_cached`](Self::ledger_cached) for an id the caller has
@@ -5457,9 +5449,11 @@ impl Fluree {
     pub async fn ledger_handle(&self, ledger_id: &LedgerId) -> Result<LedgerHandle> {
         match &self.ledger_manager {
             Some(mgr) => mgr.get_or_load(ledger_id).await,
+            // Boxed like the manager's own load path
+            // ([`LedgerManager::get_or_load`]), and as rare: every call loads.
             None => Ok(Self::ephemeral_handle(
                 ledger_id,
-                self.ledger(ledger_id).await?,
+                Box::pin(self.ledger(ledger_id)).await?,
             )),
         }
     }
