@@ -5089,9 +5089,13 @@ pub(crate) fn untyped_numeric_slices(
         // per-datatype seeks, adding the exact decimal representation a bare
         // number can equal under FlakeValue::numeric_cmp.
         if store.decimal_encoding().inlines() {
+            // The inline key is canonical, so one slice holds every scale of
+            // the value (`1.5`, `1.50`).
             let decimal = match value {
                 FlakeValue::Long(n) => Some(bigdecimal::BigDecimal::from(*n)),
                 FlakeValue::Double(d) => bigdecimal::BigDecimal::try_from(*d).ok(),
+                FlakeValue::Decimal(d) => Some((**d).clone()),
+                FlakeValue::BigInt(b) => Some(bigdecimal::BigDecimal::from((**b).clone())),
                 _ => None,
             };
             if let Some(key) = decimal.as_ref().and_then(ObjKey::encode_decimal) {
