@@ -60,7 +60,7 @@ pub use evaluate::{
     build_policy_values_clause, filter_by_required, ClassState, PolicyContext,
     UNBOUND_IDENTITY_PREFIX,
 };
-pub use index::{build_policy_set, compute_class_check_needed, get_all_classes_for_property};
+pub use index::build_policy_set;
 pub use query_eval::{NoOpQueryExecutor, PolicyQueryExecutor, PolicyQueryFut};
 pub use schema::{is_schema_flake, is_schema_predicate};
 pub use types::{

@@ -306,18 +306,15 @@ pub struct PolicyRestriction {
 
 /// Entry in the property index
 ///
-/// For class policies, `class_check_needed` indicates whether runtime class
-/// membership checking is required for this specific property. This varies
-/// by property because:
-/// - Exclusive properties (only used by target classes) don't need checks
-/// - Shared properties (used by other classes too) need checks
-/// - Implicit properties (@id, rdf:type) always need checks
+/// `class_check_needed` is set for every class policy's entry: statistics
+/// list the properties a class's typed members use, never which subjects
+/// carry a property, so the subject's classes are always checked.
 #[derive(Debug, Clone, Copy)]
 pub struct PropertyPolicyEntry {
     /// Index into the restrictions vector
     pub idx: usize,
-    /// Whether class membership check is needed for THIS property
-    /// (only meaningful for class policies)
+    /// Whether the subject's classes are checked (only meaningful for class
+    /// policies)
     pub class_check_needed: bool,
 }
 
@@ -343,10 +340,8 @@ pub struct PolicySet {
     /// classes at evaluation time instead of being pre-expanded into
     /// `by_property` via class→property stats. Stats describe committed
     /// data — exactly what a write is about to change: pre-expansion
-    /// misses properties the class has never used, and the
-    /// exclusive-property shortcut (`class_check_needed = false`) would
-    /// let a class allow apply to a non-instance when the staged flake
-    /// itself contradicts the stats. View sets keep the stats expansion
+    /// misses properties the class has never used. View sets keep the stats
+    /// expansion
     /// (committed data matches stats there, and scan volume makes the
     /// precomputed property index worthwhile), except for a query that
     /// reads reasoned facts: see [`Self::selecting_classes_by_subject`].
@@ -362,8 +357,8 @@ pub struct PolicySet {
 pub struct FlakePolicyEntry {
     /// Index into the restrictions vector
     pub idx: usize,
-    /// Whether class membership check is needed for THIS property
-    /// (only meaningful for class policies)
+    /// Whether the subject's classes are still to be checked: false when the
+    /// entry was selected by them (only meaningful for class policies)
     pub class_check_needed: bool,
 }
 
@@ -658,9 +653,7 @@ impl PolicyWrapper {
     /// Returns true if there are any class policies (f:onClass).
     /// This is used to decide whether to pre-populate the class cache.
     ///
-    /// Note: With per-property class_check_needed, ANY class policy may need
-    /// class checking for implicit properties (@id, rdf:type) which are always
-    /// indexed with class_check_needed=true. So we check for class_policy alone.
+    /// Every class policy checks the subject's classes, so any one needs them.
     pub fn has_class_policies(&self) -> bool {
         let view_has = self.inner.view.restrictions.iter().any(|r| r.class_policy);
 

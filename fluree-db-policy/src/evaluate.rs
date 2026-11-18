@@ -1073,9 +1073,7 @@ fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
 /// membership in C is an operation ON C).
 ///
 /// Class-targeted candidates are ALWAYS checked precisely here — candidate
-/// selection may over-select via the superset classes, and the view-set
-/// exclusivity shortcut (`class_check_needed == false`) is unsound for
-/// writes.
+/// selection may over-select via the superset classes.
 fn write_applicable(r: &PolicyRestriction, write: &WriteFlakeInfo<'_>) -> bool {
     match r.verbs {
         None => {
