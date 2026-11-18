@@ -581,7 +581,12 @@ fn parse_value_object(
         (Some(_), Some(_)) => return Err(JsonLdError::LanguageWithType),
         (t, l) => (t, l.map(std::string::ToString::to_string)),
     };
-    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref()) {
+    // A value object typed `@id` gets its own message below, which names
+    // its fix: a string IRI.
+    if (val.is_array() || val.is_object())
+        && type_iri.as_deref() != Some("@id")
+        && !holds_structured_value(type_iri.as_deref(), val)
+    {
         return Err(JsonLdError::InvalidKeywordValue {
             keyword: "@value",
             reason: "a value object whose @value is an array or a map needs its own \
@@ -647,15 +652,16 @@ fn keep_lifetime_shorthand(map: &Map<String, JsonValue>, result: &mut Map<String
     }
 }
 
-/// Whether a value object typed `type_iri` may hold an array or a map: a JSON
-/// literal, or a vector (an array only, which the vector parser checks).
-fn holds_structured_value(type_iri: Option<&str>) -> bool {
-    matches!(
-        type_iri,
-        Some(
-            "@json" | "@vector" | fluree_vocab::rdf::JSON | fluree_vocab::fluree::EMBEDDING_VECTOR
-        )
-    )
+/// Whether a value object typed `type_iri` may hold `val`, an array or a map:
+/// a JSON literal holds either, a vector only an array. Refused here, a map
+/// under a vector type fails every reader alike; a bulk import reaches no
+/// vector parser to refuse it.
+fn holds_structured_value(type_iri: Option<&str>, val: &JsonValue) -> bool {
+    match type_iri {
+        Some("@json" | fluree_vocab::rdf::JSON) => true,
+        Some("@vector" | fluree_vocab::fluree::EMBEDDING_VECTOR) => val.is_array(),
+        _ => false,
+    }
 }
 
 /// A value object's `@direction`, which Fluree joins to its language tag as
@@ -2628,5 +2634,56 @@ mod tests {
         }
         // `@` and `@foo.bar` are not in keyword form.
         crate::expand(&json!({"@context": ctx, "p": [{"@id": "@"}, {"@id": "@foo.bar"}]})).unwrap();
+    }
+
+    /// An array or map `@value` needs a `@json` type, or `@vector` for an
+    /// array: without one it has no literal to stand for.
+    #[test]
+    fn structured_value_object_needs_a_json_or_vector_type() {
+        let p = EX.to_owned() + "p";
+        for (term, value) in [
+            (json!(p), json!({"@value": [0.5]})),
+            (json!(p), json!({"@value": {"a": 1}})),
+            (json!(p), json!({"@value": [0.5], "@type": XSD_INTEGER})),
+            (
+                json!({"@id": p, "@type": XSD_INTEGER}),
+                json!({"@value": [0.5]}),
+            ),
+            // A vector holds an array only.
+            (json!(p), json!({"@value": {"a": 1}, "@type": "@vector"})),
+            (
+                json!(p),
+                json!({"@value": {"a": 1}, "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}),
+            ),
+            (
+                json!({"@id": p, "@type": "@vector"}),
+                json!({"@value": {"a": 1}}),
+            ),
+        ] {
+            let ctx = json!({"p": term});
+            let err = crate::expand(&json!({"@context": ctx, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(r#""@type": "@json""#), "{ctx} {value}: {err}");
+        }
+
+        let ctx = json!({"f": "https://ns.flur.ee/db#", "p": p});
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": ctx, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
+
+        // Typed `@id`, an array or a map is told the IRI must be a string.
+        for value in [json!(["ex:a"]), json!({"@id": "ex:a"})] {
+            let doc = json!({"@context": {"p": p}, "p": {"@value": value, "@type": "@id"}});
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "{value}: {err}");
+        }
     }
 }
