@@ -208,9 +208,6 @@ impl FsstTable {
             )
         };
         let n = *bytes.first().ok_or_else(|| invalid("is empty"))? as usize;
-        if n == 255 {
-            return Err(invalid("has 255 symbols; code 255 is the escape"));
-        }
         let end = 1 + 9 * n;
         if bytes.len() < end {
             return Err(invalid("is truncated"));
@@ -1665,6 +1662,62 @@ mod tests {
         }
     }
 
+    /// A full table, 255 symbols on codes 0..=254 with 255 the escape, is
+    /// written and read back.
+    #[test]
+    fn a_full_symbol_table_reads_back() {
+        let pairs: Vec<[u8; 2]> = (b'a'..=b'z')
+            .flat_map(|a| (b'a'..=b'z').map(move |b| [a, b]))
+            .take(255)
+            .collect();
+        let mut builder = fsst::CompressorBuilder::new();
+        for pair in &pairs {
+            let mut symbol = [0u8; 8];
+            symbol[..2].copy_from_slice(pair);
+            assert!(builder.insert(fsst::Symbol::from_slice(&symbol), 2));
+        }
+        let compressor = builder.build();
+        assert_eq!(compressor.n_symbols(), 255);
+        let entries: Vec<(u64, Vec<u8>)> = (0..1_000u64)
+            .map(|id| {
+                let value: Vec<u8> = (0..20u64)
+                    .flat_map(|k| pairs[((id * 31 + k * 7) % 255) as usize])
+                    .chain(*b"!?")
+                    .collect();
+                (id, value)
+            })
+            .collect();
+        let coded: Vec<Vec<u8>> = entries
+            .iter()
+            .map(|(_, v)| compressor.compress(v))
+            .collect();
+        assert!(coded.iter().flatten().any(|&code| code == 254));
+        let coded_entries: Vec<(u64, &[u8])> = entries
+            .iter()
+            .zip(&coded)
+            .map(|((id, _), codes)| (*id, codes.as_slice()))
+            .collect();
+        let table = FsstTable::from_compressor(compressor);
+        let bytes = encode_pack_with(
+            &coded_entries,
+            KIND_STRING_FWD,
+            0,
+            4096,
+            &PackCodecs::coded(table),
+        )
+        .unwrap();
+        assert_eq!(
+            parse_pack_meta(&bytes)
+                .unwrap()
+                .codecs
+                .table(0)
+                .unwrap()
+                .len,
+            255
+        );
+        read_back(&bytes, &entries);
+    }
+
     /// Values FSST cannot shrink are stored as they are.
     #[test]
     fn a_string_pack_codes_shrink_nothing_stays_raw() {
@@ -1744,10 +1797,9 @@ mod tests {
         let codecs = PACK_HEADER_SIZE;
         let table = codecs + 4 + 5;
         let symbols = bytes[table] as usize;
-        let corruptions: [(&str, usize, u8); 5] = [
+        let corruptions: [(&str, usize, u8); 4] = [
             ("first run past page 0", codecs + 4, 1),
             ("unknown codec", codecs + 8, 7),
-            ("255 symbols", table, 255),
             ("symbol length 0", table + 1, 0),
             ("symbol length 9", table + symbols, 9),
         ];
