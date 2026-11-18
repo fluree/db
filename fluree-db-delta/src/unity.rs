@@ -150,6 +150,89 @@ impl TableRecord {
     }
 }
 
+/// What Unity has ratified of a catalog-managed table: its version, and the
+/// commits at the end of it not yet published to `_delta_log/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Ratified {
+    pub(crate) version: u64,
+    /// Ascending by version.
+    pub(crate) unpublished: Vec<RatifiedCommit>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RatifiedCommit {
+    pub(crate) version: u64,
+    /// A staged commit (`<version>.<uuid>.json`, under
+    /// `_delta_log/_staged_commits/`) or, once published, `<version>.json`.
+    pub(crate) file_name: String,
+    pub(crate) file_size: u64,
+    pub(crate) modified_ms: i64,
+}
+
+/// The ratified tail as either Unity API returns it: the Delta-Tables
+/// `load_table` response (kebab-case) or the older Delta-Commits one
+/// (snake_case).
+#[derive(Deserialize)]
+struct CommitsRecord {
+    #[serde(default)]
+    commits: Option<Vec<CommitRecord>>,
+    #[serde(default, alias = "latest-table-version")]
+    latest_table_version: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct CommitRecord {
+    version: i64,
+    #[serde(alias = "file-name")]
+    file_name: String,
+    #[serde(alias = "file-size")]
+    file_size: i64,
+    #[serde(default, alias = "file-modification-timestamp")]
+    file_modification_timestamp: i64,
+}
+
+impl CommitsRecord {
+    fn ratified(self) -> std::result::Result<Ratified, String> {
+        let mut unpublished = self
+            .commits
+            .unwrap_or_default()
+            .into_iter()
+            .map(|c| {
+                Ok(RatifiedCommit {
+                    version: u64::try_from(c.version)
+                        .map_err(|_| format!("commit version {} is negative", c.version))?,
+                    file_size: u64::try_from(c.file_size)
+                        .map_err(|_| format!("commit file size {} is negative", c.file_size))?,
+                    file_name: c.file_name,
+                    modified_ms: c.file_modification_timestamp,
+                })
+            })
+            .collect::<std::result::Result<Vec<_>, String>>()?;
+        // The Delta-Tables API lists newest first.
+        unpublished.sort_by_key(|c| c.version);
+        let version = match self.latest_table_version {
+            Some(v) => u64::try_from(v).map_err(|_| format!("table version {v} is negative"))?,
+            None => unpublished
+                .last()
+                .map(|c| c.version)
+                .ok_or("no ratified table version")?,
+        };
+        Ok(Ratified {
+            version,
+            unpublished,
+        })
+    }
+}
+
+/// How Unity answered a request it understood.
+enum Answer {
+    Ok(serde_json::Value),
+    Refused {
+        status: reqwest::StatusCode,
+        said: String,
+    },
+}
+
 #[derive(Deserialize)]
 struct TemporaryCredentials {
     #[serde(default)]
@@ -429,6 +512,55 @@ impl UnityClient {
         Ok(Vended { secret, expires })
     }
 
+    /// The commits Unity has ratified for a catalog-managed table, which a
+    /// snapshot of it must be built from: Kernel will not read such a table
+    /// past what the catalog vouches for, and the newest commits may exist
+    /// only as staged files the log listing never sees.
+    ///
+    /// Asks the Delta-Tables `load_table` API, which upstream Kernel's Unity
+    /// client uses; where that endpoint is absent, the older Delta-Commits API
+    /// it replaced.
+    pub(crate) async fn ratified(&self, table: &UnityTable) -> Result<Ratified> {
+        let about = Subject::Table(&table.full_name);
+        let unreadable = |e: String| about.failed(format!("unreadable ratified commits: {e}"));
+        let mut answer = None;
+        if let [catalog, schema, name] = table.full_name.split('.').collect::<Vec<_>>()[..] {
+            let path = format!(
+                "/api/2.1/unity-catalog/delta/v1/catalogs/{}/schemas/{}/tables/{}",
+                utf8_percent_encode(catalog, NAME),
+                utf8_percent_encode(schema, NAME),
+                utf8_percent_encode(name, NAME),
+            );
+            answer = Some(
+                self.exchange(about, reqwest::Method::GET, &path, None)
+                    .await?,
+            );
+        }
+        let answer = match answer {
+            Some(Answer::Refused { status, .. }) if endpoint_absent(status) => None,
+            other => other,
+        };
+        let answer = match answer {
+            Some(answer) => answer,
+            None => {
+                let body = serde_json::json!({
+                    "table_id": table.id,
+                    "table_uri": table.location,
+                });
+                self.exchange(
+                    about,
+                    reqwest::Method::GET,
+                    "/api/2.1/unity-catalog/delta/preview/commits",
+                    Some(&body),
+                )
+                .await?
+            }
+        };
+        let record: CommitsRecord = serde_json::from_value(about.answered(answer)?)
+            .map_err(|e| unreadable(e.to_string()))?;
+        record.ratified().map_err(unreadable)
+    }
+
     /// One authenticated request; a 401 refreshes the catalog token once.
     async fn send(
         &self,
@@ -436,6 +568,22 @@ impl UnityClient {
         path: &str,
         body: Option<&serde_json::Value>,
     ) -> Result<serde_json::Value> {
+        let method = match body {
+            Some(_) => reqwest::Method::POST,
+            None => reqwest::Method::GET,
+        };
+        about.answered(self.exchange(about, method, path, body).await?)
+    }
+
+    /// One authenticated request, its refusal kept apart from a failure to
+    /// get an answer at all; a 401 refreshes the catalog token once.
+    async fn exchange(
+        &self,
+        about: Subject<'_>,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&serde_json::Value>,
+    ) -> Result<Answer> {
         let failed = |message: String| about.failed(message);
         // The catalog identity's own refusals stay typed; other auth failures
         // are this request failing.
@@ -448,10 +596,10 @@ impl UnityClient {
         };
         let url = format!("{}{path}", self.base);
         for retried in [false, true] {
-            let mut request = match body {
-                Some(body) => self.http.post(&url).json(body),
-                None => self.http.get(&url),
-            };
+            let mut request = self.http.request(method.clone(), &url);
+            if let Some(body) = body {
+                request = request.json(body);
+            }
             request = request.headers(self.auth.request_headers(&url).await.map_err(auth_failed)?);
             let response = request
                 .send()
@@ -468,6 +616,7 @@ impl UnityClient {
                 .map_err(|e| failed(format!("unreadable response: {e}")))?;
             if status.is_success() {
                 return serde_json::from_str(&text)
+                    .map(Answer::Ok)
                     .map_err(|e| failed(format!("unreadable response: {e}")));
             }
             // Unity's own message names the missing table or privilege.
@@ -475,16 +624,20 @@ impl UnityClient {
                 .ok()
                 .and_then(|v| v.get("message")?.as_str().map(str::to_string))
                 .unwrap_or(text);
-            return Err(about.refused(
-                format!("{said} ({status})"),
-                matches!(
-                    status,
-                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
-                ),
-            ));
+            return Ok(Answer::Refused { status, said });
         }
         unreachable!("the second pass returns")
     }
+}
+
+/// A status saying the endpoint, not the table, is missing here.
+fn endpoint_absent(status: reqwest::StatusCode) -> bool {
+    matches!(
+        status,
+        reqwest::StatusCode::NOT_FOUND
+            | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            | reqwest::StatusCode::NOT_IMPLEMENTED
+    )
 }
 
 /// What a request to Unity is about, for the error it may end in.
@@ -497,6 +650,19 @@ enum Subject<'a> {
 }
 
 impl Subject<'_> {
+    fn answered(self, answer: Answer) -> Result<serde_json::Value> {
+        match answer {
+            Answer::Ok(value) => Ok(value),
+            Answer::Refused { status, said } => Err(self.refused(
+                format!("{said} ({status})"),
+                matches!(
+                    status,
+                    reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+                ),
+            )),
+        }
+    }
+
     fn failed(self, message: String) -> DeltaError {
         self.refused(message, false)
     }
