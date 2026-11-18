@@ -4134,7 +4134,13 @@ pub fn empty_batch(schema: Arc<[VarId]>) -> Result<Batch> {
 /// Resolve a bound predicate `Ref` to its binary-index predicate ID (`u32`).
 ///
 /// Uses `ExecutionContext` to decode `Sid` variants. Returns an error for `Ref::Var`.
-pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref) -> Result<u32> {
+/// `None` when the index has never seen the predicate: a fast path reading the
+/// index at its own `t` with no novelty then has no rows for it.
+pub fn ref_to_p_id(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    r: &Ref,
+) -> Result<Option<u32>> {
     let iri: Arc<str> = match r {
         Ref::Sid(sid) => ctx
             .decode_sid(sid)
@@ -4147,9 +4153,7 @@ pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref
             ))
         }
     };
-    store.find_predicate_id(iri.as_ref()).ok_or_else(|| {
-        QueryError::execution(format!("predicate not found in binary index dict: {iri}"))
-    })
+    Ok(store.find_predicate_id(iri.as_ref()))
 }
 
 /// Resolve a bound `Term` (IRI or Sid) to its internal subject ID (`u64`).
