@@ -840,10 +840,11 @@ fn vector_shard_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Queries that key `ex:j1`'s and `ex:j2`'s vectors into one hash table
-/// (DISTINCT, GROUP BY, COUNT(DISTINCT), a join, MINUS), with their answers.
-/// The two predicates share one vector, each under its own arena, so the
-/// tables meet equal vectors from two arenas. None renders a vector.
-const CROSS_ARENA: [(&str, &[&str]); 5] = [
+/// (DISTINCT, GROUP BY, COUNT(DISTINCT), a join, MINUS, and the EXISTS
+/// semijoin both ways), with their answers. The two predicates share one
+/// vector, each under its own arena, so the tables meet equal vectors from
+/// two arenas. None renders a vector.
+const CROSS_ARENA: [(&str, &[&str]); 7] = [
     (
         "SELECT (COUNT(*) AS ?n) WHERE { SELECT DISTINCT ?v \
          WHERE { { ?s ex:j1 ?v } UNION { ?s ex:j2 ?v } } }",
@@ -865,6 +866,16 @@ const CROSS_ARENA: [(&str, &[&str]); 5] = [
     // MINUS keys a vector by its decoded value, not its arena entry.
     (
         "SELECT ?s WHERE { ?s ex:j1 ?v MINUS { ?t ex:j2 ?v } }",
+        &["s=g"],
+    ),
+    // A failed comparison counted unequal would drop `ex:f` here, and keep
+    // it in the NOT EXISTS form, with no error.
+    (
+        "SELECT ?s WHERE { ?s ex:j1 ?v FILTER EXISTS { ?t ex:j2 ?v } }",
+        &["s=f"],
+    ),
+    (
+        "SELECT ?s WHERE { ?s ex:j1 ?v FILTER NOT EXISTS { ?t ex:j2 ?v } }",
         &["s=g"],
     ),
 ];
