@@ -892,7 +892,7 @@ mod tests {
         ForwardPack::from_bytes(&bytes)
             .unwrap()
             .lookup(id)
-            .map(<[u8]>::to_vec)
+            .map(std::borrow::Cow::into_owned)
     }
 
     #[tokio::test]
