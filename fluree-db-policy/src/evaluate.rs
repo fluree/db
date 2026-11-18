@@ -185,6 +185,65 @@ impl PolicyContext {
         &self.wrapper
     }
 
+    /// Hash what decides which data a query under this context sees, for
+    /// keying a query-result cache.
+    ///
+    /// The restrictions are built from the ledger state, so the caller's key
+    /// must cover that state too. Returns `false` when the answer also
+    /// depends on something else: an `f:query` restriction runs a query of
+    /// its own, which can call `NOW()` or `RAND()`.
+    pub fn hash_view_policy<H: std::hash::Hasher>(&self, h: &mut H) -> bool {
+        use std::hash::Hash;
+        let wrapper = &self.wrapper;
+        wrapper.is_root().hash(h);
+        if wrapper.is_root() {
+            return true;
+        }
+        wrapper.default_allow().hash(h);
+        // Every unbound identity is a fresh random IRI that matches nothing,
+        // so they are all one input.
+        let unbound = self.identity.namespace_code == 0
+            && self.identity.name.starts_with(UNBOUND_IDENTITY_PREFIX);
+        unbound.hash(h);
+        if !unbound {
+            self.identity.hash(h);
+        }
+        let mut values: Vec<_> = wrapper.policy_values().iter().collect();
+        values.sort();
+        values.hash(h);
+        for restriction in &wrapper.view().restrictions {
+            let PolicyRestriction {
+                id,
+                target_mode,
+                targets,
+                action,
+                verbs,
+                value,
+                required,
+                message,
+                class_policy,
+                for_classes,
+                class_check_needed,
+            } = restriction;
+            match value {
+                PolicyValue::Allow => 0u8.hash(h),
+                PolicyValue::Deny => 1u8.hash(h),
+                PolicyValue::Query(_) => return false,
+            }
+            id.hash(h);
+            std::mem::discriminant(target_mode).hash(h);
+            sorted_sids(targets).hash(h);
+            std::mem::discriminant(action).hash(h);
+            verbs.map(|v| (v.create, v.update, v.delete)).hash(h);
+            required.hash(h);
+            message.hash(h);
+            class_policy.hash(h);
+            sorted_sids(for_classes).hash(h);
+            class_check_needed.hash(h);
+        }
+        true
+    }
+
     /// Check if a view flake is allowed by policy
     ///
     /// This method uses the NoOp evaluator for f:query policies, which cannot
@@ -1041,6 +1100,12 @@ impl PolicyContext {
 /// no identity was provided. The policy_eval code can check for this prefix
 /// to handle unbound identities specially.
 pub const UNBOUND_IDENTITY_PREFIX: &str = "urn:fluree:unbound:identity:";
+
+fn sorted_sids(set: &HashSet<Sid>) -> Vec<&Sid> {
+    let mut sids: Vec<&Sid> = set.iter().collect();
+    sids.sort();
+    sids
+}
 
 /// Ensure identity is always ground (bound) in policy queries.
 ///

@@ -507,6 +507,7 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("x-fdb-policy-enforcement"),
             HeaderName::from_static("x-fdb-reasoning"),
             HeaderName::from_static("x-fdb-warning"),
+            HeaderName::from_static("x-fdb-cache"),
         ])
         .max_age(std::time::Duration::from_secs(86400))
 }
