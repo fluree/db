@@ -1101,6 +1101,12 @@ impl PolicyContext {
 /// to handle unbound identities specially.
 pub const UNBOUND_IDENTITY_PREFIX: &str = "urn:fluree:unbound:identity:";
 
+fn sorted_sids(set: &HashSet<Sid>) -> Vec<&Sid> {
+    let mut sids: Vec<&Sid> = set.iter().collect();
+    sids.sort();
+    sids
+}
+
 /// Ensure identity is always ground (bound) in policy queries.
 ///
 /// If no identity is provided, generates a random IRI that can never exist in real data.
@@ -1110,12 +1116,6 @@ pub const UNBOUND_IDENTITY_PREFIX: &str = "urn:fluree:unbound:identity:";
 /// 1. Is a valid IRI (so it can be encoded/decoded properly)
 /// 2. Will never match real data in the database
 /// 3. Can be detected by the UNBOUND_IDENTITY_PREFIX constant
-fn sorted_sids(set: &HashSet<Sid>) -> Vec<&Sid> {
-    let mut sids: Vec<&Sid> = set.iter().collect();
-    sids.sort();
-    sids
-}
-
 fn ensure_ground_identity(identity: Option<Sid>) -> Sid {
     identity.unwrap_or_else(|| {
         // Generate a random URN that can never exist in real data
