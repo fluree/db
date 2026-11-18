@@ -372,7 +372,7 @@ pub fn update_reverse_tree(
             // Fetch, decode, merge, re-encode
             let leaf_bytes = fetch_leaf(i)?;
             let decoded = ReverseLeaf::from_bytes(&leaf_bytes)?;
-            let merged = merge_leaf_entries(&decoded, slice);
+            let merged = merge_leaf_entries(&decoded, slice)?;
 
             let split_threshold = (target_leaf_bytes as f64 * SPLIT_FACTOR) as usize;
             let estimated_bytes = estimate_leaf_bytes(&merged);
@@ -521,7 +521,14 @@ fn slice_entries_to_leaves<'a>(
 }
 
 /// Merge new entries into a decoded leaf, producing a sorted combined list.
-fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<ReverseEntry> {
+///
+/// A new entry whose key the leaf already holds under another id is an
+/// error: two values sharing a key, or one value given two ids, never
+/// overwrites what the tree holds.
+fn merge_leaf_entries(
+    leaf: &ReverseLeaf<'_>,
+    new: &[ReverseEntry],
+) -> io::Result<Vec<ReverseEntry>> {
     // Collect existing entries via iterator
     let existing: Vec<ReverseEntry> = leaf
         .iter()
@@ -546,8 +553,16 @@ fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<Rever
                 ni += 1;
             }
             std::cmp::Ordering::Equal => {
-                // New entry replaces existing (shouldn't happen for new IDs, but safe)
-                result.push(new[ni].clone());
+                if existing[ei].id != new[ni].id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "reverse tree: a new entry's key is already held under id {}, not {}",
+                            existing[ei].id, new[ni].id
+                        ),
+                    ));
+                }
+                result.push(existing[ei].clone());
                 ei += 1;
                 ni += 1;
             }
@@ -557,7 +572,7 @@ fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<Rever
     // Drain remaining
     result.extend_from_slice(&existing[ei..]);
     result.extend_from_slice(&new[ni..]);
-    result
+    Ok(result)
 }
 
 /// Estimate a set of entries' size as a `DLR1` leaf, the measure leaves are
@@ -1063,6 +1078,34 @@ mod tests {
         assert!(leaf.is_front_coded());
         assert_eq!(leaf.lookup(&gone), None);
         assert_eq!(leaf.lookup(&added[1].key), Some(added[1].id));
+    }
+
+    /// A new entry whose key the tree already holds under another id is
+    /// refused rather than replacing it; under the same id it is a no-op.
+    #[test]
+    fn an_existing_key_under_another_id_is_refused() {
+        let entries: Vec<ReverseEntry> = ["alpha", "beta", "gamma"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| make_reverse_entry(k, i as u64 + 1))
+            .collect();
+        let tree = build_reverse_tree(entries, DEFAULT_TARGET_LEAF_BYTES).unwrap();
+        let leaf = tree.leaves[0].bytes.clone();
+        let update = |id| {
+            update_reverse_tree(
+                &tree.branch,
+                &[make_reverse_entry("beta", id)],
+                DEFAULT_TARGET_LEAF_BYTES,
+                LeafFormat::Plain,
+                &mut |_| Ok(leaf.clone()),
+            )
+        };
+        let err = update(9).err().expect("a second id for one key is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let same = update(2).unwrap();
+        let rewritten = ReverseLeaf::from_bytes(&same.new_leaves[0].bytes).unwrap();
+        assert_eq!(rewritten.entry_count(), 3);
+        assert_eq!(rewritten.lookup(b"beta"), Some(2));
     }
 
     #[test]

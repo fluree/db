@@ -547,6 +547,7 @@ where
 async fn build_string_reverse_tree<F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
+    spill_dir: &std::path::Path,
     mut next_entry: F,
 ) -> Result<DictTreeRefs>
 where
@@ -565,7 +566,9 @@ where
     let mut leaf_cids: Vec<ContentId> = Vec::new();
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
 
-    let mut order = KeyOrder::new(scheme);
+    let mut order = KeyOrder::spilling(scheme, spill_dir);
+    let spill_error =
+        |e: std::io::Error| IndexerError::StorageWrite(format!("string key order: {e}"));
     let mut writer = FrontCodedLeafWriter::new(false);
     let mut chunk_bytes: usize = 0;
     let mut first_key: Option<Vec<u8>> = None;
@@ -576,14 +579,16 @@ where
         match next_entry()? {
             Some(entry) => {
                 let off = entry.off as usize;
-                order.push(&fwd[off..off + entry.len as usize], entry.id);
+                order
+                    .push(&fwd[off..off + entry.len as usize], entry.id)
+                    .map_err(spill_error)?;
             }
             None => {
-                order.finish();
+                order.finish().map_err(spill_error)?;
                 drained = true;
             }
         }
-        while let Some((key, id)) = order.pop() {
+        while let Some((key, id)) = order.pop().map_err(spill_error)? {
             if (!writer.is_empty() || !branch_entries.is_empty()) && key <= last_key {
                 return Err(IndexerError::StorageWrite(
                     "string reverse keys out of order, or two strings share a key".into(),
@@ -1001,7 +1006,8 @@ pub async fn upload_dicts_from_disk(
                                 None => Ok(None),
                             }
                         };
-                        build_string_reverse_tree(content_store, &str_fwd_data, next).await?
+                        build_string_reverse_tree(content_store, &str_fwd_data, run_dir, next)
+                            .await?
                     };
 
                     tracing::info!("string dict artifacts uploaded");
@@ -1095,7 +1101,8 @@ pub async fn upload_dicts_from_disk(
                                 None => Ok(None),
                             }
                         };
-                        build_string_reverse_tree(content_store, &str_fwd_data, next).await?
+                        build_string_reverse_tree(content_store, &str_fwd_data, run_dir, next)
+                            .await?
                     };
 
                     tracing::info!("string dict artifacts uploaded");
@@ -1605,7 +1612,8 @@ mod tests {
         }
         let cs = MemoryContentStore::new();
         let mut next = entries.into_iter();
-        let refs = build_string_reverse_tree(&cs, &fwd, || Ok(next.next()))
+        let dir = tempfile::tempdir().unwrap();
+        let refs = build_string_reverse_tree(&cs, &fwd, dir.path(), || Ok(next.next()))
             .await
             .unwrap();
 

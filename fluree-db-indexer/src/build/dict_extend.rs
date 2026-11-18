@@ -192,7 +192,11 @@ impl EntryCursor {
         let mut cursor = Self {
             reader: terms.reader().map_err(read_error)?,
             key_of,
-            order: KeyOrder::new(scheme),
+            // Large runs spill beside the terms file.
+            order: KeyOrder::spilling(
+                scheme,
+                terms.path.parent().unwrap_or(std::path::Path::new(".")),
+            ),
             value: Vec::new(),
             drained: false,
             next: None,
@@ -203,7 +207,7 @@ impl EntryCursor {
 
     fn read(&mut self) -> Result<Option<ReverseEntry>> {
         loop {
-            if let Some((key, id)) = self.order.pop() {
+            if let Some((key, id)) = self.order.pop().map_err(read_error)? {
                 return Ok(Some(ReverseEntry { key, id }));
             }
             if self.drained {
@@ -212,10 +216,10 @@ impl EntryCursor {
             match self.reader.next_term().map_err(read_error)? {
                 Some((id, value)) => {
                     (self.key_of)(id, value, &mut self.value);
-                    self.order.push(&self.value, id);
+                    self.order.push(&self.value, id).map_err(read_error)?;
                 }
                 None => {
-                    self.order.finish();
+                    self.order.finish().map_err(read_error)?;
                     self.drained = true;
                 }
             }

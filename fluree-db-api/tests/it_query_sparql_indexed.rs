@@ -8453,7 +8453,7 @@ async fn indexed_long_strings_resolve_by_value_and_prefix() {
                     {"@id": "ex:a", "ex:text": text("alpha")},
                     {"@id": "ex:b", "ex:text": text("beta")},
                     {"@id": "ex:c", "ex:text": "A short one"},
-                    {"@id": "ex:d", "ex:text": "A long value that shares only its first letter, padded past sixty-five bytes"}
+                    {"@id": "ex:d", "ex:text": "A long value that shares only its first letter with the others, padded well past eighty-one bytes"}
                 ]
             });
             let ledger = fluree
