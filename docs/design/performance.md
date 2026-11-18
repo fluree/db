@@ -204,7 +204,9 @@ frequency-aware memory budget
 by content-addressed leaf identity, the query's effective `t`, and the overlay
 epoch. The budget is split by key hash into one shard per core, each at least
 256 MiB, so cache hits on different cores do not contend on one shared
-structure. Remote blobs are fetched through a single-flight disk cache
+structure. Each shard enforces its share at its own housekeeping pass, so
+between passes a burst of inserts can run the pool over budget by more as the
+shard count grows. Remote blobs are fetched through a single-flight disk cache
 ([`disk_cache.rs`](../../fluree-db-core/src/disk_cache.rs)), so concurrent
 requests for the same blob share one fetch.
 
