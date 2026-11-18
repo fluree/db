@@ -526,8 +526,7 @@ fn display_name(
     if fluree_db_core::is_rdf_reifies(sid) {
         return None;
     }
-    let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
-    let iri = format!("{}{}", prefix, sid.name);
+    let iri = snapshot.decode_sid(sid)?;
     if iri.starts_with("https://ns.flur.ee/") {
         return None;
     }

@@ -16,6 +16,9 @@ mod it_graph_scope_streams;
 #[path = "it_novelty_subject_iri_formats.rs"]
 mod it_novelty_subject_iri_formats;
 
+#[path = "it_overflow_iri_bound_lookups.rs"]
+mod it_overflow_iri_bound_lookups;
+
 #[path = "it_issue_1721_repro.rs"]
 mod it_issue_1721_repro;
 #[path = "it_issue_1723_sameterm_fold.rs"]

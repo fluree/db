@@ -107,8 +107,7 @@ async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
         .expect("upsert")
         .ledger;
 
-    // Pending: reads that bind no overflow IRI. Binding one is #1842.
-    let joins = [
+    let mut checks: Vec<(String, usize)> = vec![
         (format!("SELECT ?s WHERE {{ ?s <{VENDOR}> ?v }}"), 2),
         (format!("SELECT ?s WHERE {{ ?s <{PAGE}> ?pg }}"), 2),
         (
@@ -116,16 +115,6 @@ async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
             1,
         ),
     ];
-    let mut failures = Vec::new();
-    for (q, want) in &joins {
-        let got = rows(&fluree, &ledger, q).await;
-        if got != *want {
-            failures.push(format!("pending: {q}: {got} rows, want {want}"));
-        }
-    }
-    drop(ledger);
-
-    let mut checks: Vec<(String, usize)> = joins.to_vec();
     for o in [O1, O2, O3] {
         checks.push((format!("SELECT ?p ?o WHERE {{ <{o}> ?p ?o }}"), 0));
     }
@@ -133,6 +122,15 @@ async fn deletes_of_overflow_iri_objects_read_the_same_once_indexed() {
     checks.push((format!("SELECT ?s WHERE {{ ?s <{VENDOR}> <{V2}> }}"), 1));
     checks.push((format!("SELECT ?v WHERE {{ <{O5}> <{VENDOR}> ?v }}"), 1));
     checks.push((format!("SELECT ?p ?x WHERE {{ <{V}> ?p ?x }}"), 2));
+    let mut failures = Vec::new();
+    for (q, want) in &checks {
+        let got = rows(&fluree, &ledger, q).await;
+        if got != *want {
+            failures.push(format!("pending: {q}: {got} rows, want {want}"));
+        }
+    }
+    drop(ledger);
+
     support::build_incrementally_and_publish_index(&fluree, id).await;
     let incremental = fluree.ledger(id).await.expect("reload");
     for (q, want) in &checks {
