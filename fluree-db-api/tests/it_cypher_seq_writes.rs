@@ -2076,7 +2076,7 @@ async fn issue1873_hoisted_read_after_write_is_rejected_not_committed() {
             r#"MATCH (n:Person {name: "Alice"}) SET n.a = 1 WITH n SET n.b = 2"#,
         ),
     ] {
-        let l = seed_1873(&fluree, &format!("it/1873:r{}", stmt.len())).await;
+        let l = seed_1873(&fluree, &format!("it/1873-r{}:main", stmt.len())).await;
         let err = fluree
             .transact_cypher(l, stmt)
             .await
@@ -2113,7 +2113,7 @@ async fn issue1873_reads_before_writes_still_commit_their_flakes() {
         ),
         (2, r#"CREATE (n:P {id: "c9"})"#),
     ] {
-        let l = seed_1873(&fluree, &format!("it/1873:a{}", stmt.len())).await;
+        let l = seed_1873(&fluree, &format!("it/1873-a{}:main", stmt.len())).await;
         let res = fluree
             .transact_cypher(l, stmt)
             .await

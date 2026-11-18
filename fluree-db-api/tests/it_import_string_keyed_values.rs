@@ -148,7 +148,8 @@ async fn imports_read_back_json_and_duration_values_as_written() {
     let second = [("delta", 4), ("echo", 5)];
 
     let (src, default_rows) = source_dir(&first);
-    fluree_at(db.path())
+    let fluree = fluree_at(db.path());
+    fluree
         .create(LEDGER)
         .import(src.path())
         .threads(2)
@@ -156,7 +157,6 @@ async fn imports_read_back_json_and_duration_values_as_written() {
         .execute()
         .await
         .expect("bulk import");
-    let fluree = fluree_at(db.path());
     let ledger = fluree.ledger(LEDGER).await.unwrap();
     assert_eq!(
         literals(&fluree, &ledger, None).await,
@@ -197,6 +197,8 @@ async fn imports_read_back_json_and_duration_values_as_written() {
         .reindex(LEDGER, ReindexOptions::default())
         .await
         .expect("reindex");
+    // Reopened, so the rebuilt index is read from disk.
+    drop(fluree);
     let fluree = fluree_at(db.path());
     let ledger = fluree.ledger(LEDGER).await.unwrap();
     assert_eq!(
