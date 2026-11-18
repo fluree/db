@@ -420,6 +420,16 @@ impl QueryError {
         matches!(self, Self::Arithmetic(_) | Self::Comparison(_))
     }
 
+    /// Whether this error ends the query wherever it is met: a cancellation,
+    /// or an exhausted memory budget or fuel. A fast path that declines to
+    /// the general plan when a read fails raises these instead.
+    pub fn ends_the_query(&self) -> bool {
+        matches!(
+            self,
+            Self::Cancelled { .. } | Self::MemoryBudgetExceeded { .. } | Self::FuelLimitExceeded(_)
+        )
+    }
+
     /// Create an execution error (runtime configuration/environment issue).
     pub fn execution(msg: impl Into<String>) -> Self {
         Self::Internal(msg.into())

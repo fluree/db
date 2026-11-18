@@ -1439,18 +1439,19 @@ async fn batched_subject_join_loads_only_leaflets_holding_probed_subjects() {
     assert_eq!(vals(&rows), [115, 600, 1150], "reindexed: {rows:?}");
 }
 
-/// Three subjects probed over leaves of two small leaflets: the nested-loop
+/// Four subjects probed over leaves of two small leaflets: the nested-loop
 /// join, the OPTIONAL probe and the property join's SPOT walk each open only
 /// the leaves that can hold a probed subject, where they opened every leaf
-/// between the lowest and highest one. A time-travel read, which opens them
-/// all, still restores a changed value and a subject whose only value was
-/// retracted.
+/// between the lowest and highest one. The partition's first subject sits in
+/// a leaf that starts inside another predicate, where the PSOT bound is
+/// open-ended. A time-travel read, which opens them all, still restores a
+/// changed value and a subject whose only value was retracted.
 #[tokio::test]
 async fn subject_probes_open_only_leaves_holding_probed_subjects() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/join-batched-leaf-skip:main";
     let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
-    let probed = [5, 60, 115];
+    let probed = [0, 5, 60, 115];
     let graph: Vec<serde_json::Value> = (0..120)
         .map(|i| {
             let mut s = json!({
@@ -1469,7 +1470,8 @@ async fn subject_probes_open_only_leaves_holding_probed_subjects() {
         .expect("base insert");
     // Refs minted with the hub would take adjacent subject ids.
     let hub = json!({"@context": ctx(), "@id": "ex:hub", "ex:ref": [
-        {"@id": "ex:s005"}, {"@id": "ex:s060"}, {"@id": "ex:s115"}
+        {"@id": "ex:s000"}, {"@id": "ex:s005"}, {"@id": "ex:s060"},
+        {"@id": "ex:s115"}
     ]});
     let receipt = fluree.insert(receipt.ledger, &hub).await.expect("hub");
     let base_t = receipt.ledger.t();
@@ -1507,14 +1509,14 @@ async fn subject_probes_open_only_leaves_holding_probed_subjects() {
             "join batched binary scan complete",
             r"PREFIX ex: <http://example.org/ns/>
             SELECT ?s ?v WHERE { ex:hub ex:ref ?s . ?s ex:val ?v }",
-            3,
+            4,
         ),
         (
             "optional",
             "batched subject probe complete",
             r"PREFIX ex: <http://example.org/ns/>
             SELECT ?s ?v WHERE { ex:hub ex:ref ?s . OPTIONAL { ?s ex:val ?v } }",
-            3,
+            4,
         ),
         (
             "spot star",
@@ -1522,7 +1524,7 @@ async fn subject_probes_open_only_leaves_holding_probed_subjects() {
             r#"PREFIX ex: <http://example.org/ns/>
             SELECT ?s ?v ?t ?n
             WHERE { ?s ex:group "g" . ?s ex:val ?v . ?s ex:tag ?t . ?s ex:num ?n }"#,
-            6,
+            8,
         ),
     ];
     // The OPTIONAL lane keeps s115 with ?v unbound; only bound values count.
@@ -1543,7 +1545,7 @@ async fn subject_probes_open_only_leaves_holding_probed_subjects() {
     for (lane, event, query, max_leaves) in &lanes {
         let before = spans.find_events(event).len();
         let rows = run_query(&fluree, &view, query).await;
-        assert_eq!(vals(&rows), [5, 600], "{lane}: {rows:?}");
+        assert_eq!(vals(&rows), [0, 5, 600], "{lane}: {rows:?}");
         let opened: Vec<u64> = spans.find_events(event)[before..]
             .iter()
             .map(|e| e.fields["leaves_opened"].parse().expect("count"))
@@ -1558,6 +1560,10 @@ async fn subject_probes_open_only_leaves_holding_probed_subjects() {
     let view = fluree.db_at_t(ledger_id, base_t).await.expect("base view");
     for (lane, _, query, _) in &lanes {
         let rows = run_query(&fluree, &view, query).await;
-        assert_eq!(vals(&rows), [5, 60, 115], "{lane} at the base t: {rows:?}");
+        assert_eq!(
+            vals(&rows),
+            [0, 5, 60, 115],
+            "{lane} at the base t: {rows:?}"
+        );
     }
 }

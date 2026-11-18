@@ -530,6 +530,12 @@ const MIN_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 /// out. Shards hold `max_bytes / n` each, so their count is capped to keep
 /// every shard at least [`MIN_SEGMENT_BYTES`]; budgets under twice that stay
 /// one pool. Always a power of two, as moka rounds up to one.
+///
+/// Each shard enforces its share of the budget when its housekeeping runs,
+/// which moka does once a shard has queued 64 writes or a short interval has
+/// passed. Until then fresh inserts sit above the budget, so the transient
+/// overshoot grows with the shard count: up to about `64 × n` entries rather
+/// than 64.
 #[cfg(not(target_arch = "wasm32"))]
 fn pool_segments(max_bytes: u64, cores: usize) -> usize {
     let by_budget = (max_bytes / MIN_SEGMENT_BYTES).max(1);

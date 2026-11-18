@@ -104,6 +104,60 @@ commands are uniformly small (the nameservice) is safe leaving it `None`; one
 embedding `kv` should set it from its policies' `max_key_bytes + max_value_bytes`
 plus the command envelope.
 
+## Removing compacted entries from disk
+
+openraft compacts by snapshotting and purging the log behind the snapshot, and a
+purge is logical. The filesystem backend keeps entries in 4 MiB segments and
+unlinks only a segment whose every entry is purged, so the segment holding the
+purge point keeps its bytes. On a quiet group that segment is usually the whole
+log, and anything appended after the snapshot (a write, a sweep, the empty entry
+a leader writes on election) keeps it alive. With the default policy (a snapshot
+every 5,000 entries, purges keeping 1,000) a value deleted from the state machine
+can stay readable under `log/` for months.
+
+`RaftGroup::compact_log` is for an application that needs such a value gone, for
+example before the storage directory is copied. Given `covering`, the index of
+the write whose effect must go (the delete's `Proposed::log_id` from
+`forward::propose_via_leader`, which reports it on whichever node proposed the
+delete), it:
+
+1. waits until this node has applied `covering`;
+2. seals the tail segment, so later appends start a new one, and takes its last
+   index N;
+3. waits until entries through N are applied, then snapshots until a snapshot
+   covers N;
+4. purges through N and waits for the purge to finish;
+5. removes every superseded snapshot, failing if any removal fails;
+6. fails with `CompactionError::Retained` unless the oldest entry still on disk
+   is above N.
+
+A backend that cannot report which entries it retains, or cannot discard
+superseded snapshots, makes it refuse before step 1. Each node holds its own log,
+so a cluster runs it on every node, each with the same `covering`. A seal lives
+in memory only: if the process stops before `compact_log` returns, run it again.
+The filesystem log finishes a purge a crash interrupted when it next opens.
+
+What `compact_log` does not cover:
+
+- **A delete it was not given.** Without `covering`, a node that has not yet
+  applied the delete seals short of it, snapshots a state that still holds the
+  value, and reports success.
+- **A value that expired rather than was deleted.** kv keeps an expired record in
+  its fragment, and so in every snapshot, until the sweep's `Evict` or the next
+  write to that key reclaims it. Evict before compacting.
+- **Values removed after it returns.** It removes what the log held when it
+  sealed. Nothing records a pending compaction or re-runs one after a restart, so
+  call it right before the directory is copied rather than right after the
+  delete.
+- **The device's freed blocks.** Unlinking keeps the value out of a file-level
+  copy made afterwards, but a block-level image of the volume can still hold the
+  freed blocks. Encryption at rest covers that case.
+
+Sealing, rather than rewriting the straddling segment's suffix into a new file,
+keeps `purge_through`'s crash ordering as it was: whole segments only, oldest
+first, each unlink durable before the next. The scan on open refuses overlapping
+segments, so a rewrite would need a recovery path of its own.
+
 ## Leader-only tasks
 
 `spawn_leader_watcher` runs a task factory only while this node leads. On

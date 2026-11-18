@@ -31,11 +31,9 @@ pub fn extract_bounds_from_filters(
         let mut filter_vars_matched = 0;
         for &var in &object_vars {
             if let Some(new_bounds) = extract_object_bounds_for_var(expr, var) {
-                filter_vars_matched += 1;
-                bounds
-                    .entry(var)
-                    .and_modify(|existing| *existing = merge_object_bounds(existing, &new_bounds))
-                    .or_insert(new_bounds);
+                if push_bounds(&mut bounds, var, new_bounds) {
+                    filter_vars_matched += 1;
+                }
             }
         }
 
@@ -88,17 +86,13 @@ pub fn extract_lookahead_bounds_with_consumption(
                 // Check if this filter can be fully consumed
                 let mut filter_vars_matched = 0;
 
-                // Try to extract bounds for each object variable
+                // Try to extract bounds for each object variable, merging
+                // with existing bounds for this var (intersection)
                 for &var in &object_vars {
                     if let Some(new_bounds) = extract_object_bounds_for_var(expr, var) {
-                        filter_vars_matched += 1;
-                        // Merge with existing bounds for this var (intersection)
-                        bounds
-                            .entry(var)
-                            .and_modify(|existing| {
-                                *existing = merge_object_bounds(existing, &new_bounds);
-                            })
-                            .or_insert(new_bounds);
+                        if push_bounds(&mut bounds, var, new_bounds) {
+                            filter_vars_matched += 1;
+                        }
                     }
                 }
 
@@ -121,6 +115,21 @@ pub fn extract_lookahead_bounds_with_consumption(
     (bounds, consumed_indices)
 }
 
+/// Add `new` to the bounds pushed for `var`, merged with any already there.
+/// Returns `false`, pushing nothing, when the two cannot be merged; the
+/// caller then keeps the filter `new` came from.
+fn push_bounds(bounds: &mut HashMap<VarId, ObjectBounds>, var: VarId, new: ObjectBounds) -> bool {
+    let merged = match bounds.get(&var) {
+        Some(existing) => match merge_object_bounds(existing, &new) {
+            Some(merged) => merged,
+            None => return false,
+        },
+        None => new,
+    };
+    bounds.insert(var, merged);
+    true
+}
+
 /// Count unique variables referenced in a filter expression
 pub fn count_filter_vars(expr: &Expression) -> usize {
     // Use the existing variables() method on Expression
@@ -133,11 +142,54 @@ pub fn count_filter_vars(expr: &Expression) -> usize {
 /// For lower bounds, takes the higher value (more restrictive).
 /// For upper bounds, takes the lower value (more restrictive).
 /// When values are equal, takes the exclusive bound (more restrictive).
-pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> ObjectBounds {
-    ObjectBounds {
+///
+/// Returns `None` when two bounds on one side cannot be ordered against each
+/// other (a number and a string, a date and a time, or two strings a temporal
+/// row reads as temporals): the tighter one is then unknowable, and keeping
+/// either would drop the other's filter. So do string bounds of two
+/// datatypes (a typed string bound and a plain one, or two typed ones of
+/// different datatypes): they are different terms, and a bound carries one
+/// datatype.
+pub fn merge_object_bounds(a: &ObjectBounds, b: &ObjectBounds) -> Option<ObjectBounds> {
+    let has_string = |x: &ObjectBounds| {
+        [&x.lower, &x.upper]
+            .into_iter()
+            .flatten()
+            .any(|(v, _)| matches!(v, FlakeValue::String(_)))
+    };
+    let datatype = |x: &ObjectBounds| x.string_datatype.as_ref().map(|d| d.iri().to_string());
+    if has_string(a) && has_string(b) && datatype(a) != datatype(b) {
+        return None;
+    }
+    // Both sets of bounds hold, so an `=` in either rules out comparing a
+    // string with a temporal.
+    let temporal_string_ordering = a.temporal_string_ordering && b.temporal_string_ordering;
+    let orderable = |x: Option<&(FlakeValue, bool)>, y: Option<&(FlakeValue, bool)>| match (x, y) {
+        (Some((x, _)), Some((y, _))) => {
+            (x.is_numeric() && y.is_numeric())
+                || (std::mem::discriminant(x) == std::mem::discriminant(y)
+                    // Two strings order by text, but a temporal row orders
+                    // them by their temporal reading, which can disagree.
+                    && !(temporal_string_ordering
+                        && (ObjectBounds::string_orders_temporals(x)
+                            || ObjectBounds::string_orders_temporals(y))))
+        }
+        _ => true,
+    };
+    if !orderable(a.lower.as_ref(), b.lower.as_ref())
+        || !orderable(a.upper.as_ref(), b.upper.as_ref())
+    {
+        return None;
+    }
+    Some(ObjectBounds {
         lower: merge_lower_bound(a.lower.as_ref(), b.lower.as_ref()),
         upper: merge_upper_bound(a.upper.as_ref(), b.upper.as_ref()),
-    }
+        temporal_string_ordering,
+        string_datatype: a
+            .string_datatype
+            .clone()
+            .or_else(|| b.string_datatype.clone()),
+    })
 }
 
 /// Merge lower bounds - take the higher value (tighter constraint)
@@ -299,13 +351,15 @@ mod tests {
         let a = ObjectBounds {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
+            ..ObjectBounds::new()
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
+            ..ObjectBounds::new()
         };
 
-        let merged = merge_object_bounds(&a, &b);
+        let merged = merge_object_bounds(&a, &b).expect("numeric bounds merge");
 
         // Lower: max(10, 20) = 20
         let (lower_val, _) = merged.lower.as_ref().unwrap();
@@ -314,6 +368,54 @@ mod tests {
         // Upper: min(100, 80) = 80
         let (upper_val, _) = merged.upper.as_ref().unwrap();
         assert_eq!(*upper_val, FlakeValue::Long(80));
+    }
+
+    /// Two filters whose bounds on one side cannot be ordered (a number and a
+    /// string) cannot merge: the second keeps its filter and pushes nothing,
+    /// rather than one bound silently replacing the other.
+    #[test]
+    fn test_extract_bounds_unorderable_filters_keep_the_second() {
+        let triples = vec![make_pattern(VarId(0), "p", VarId(1))];
+        let filters = vec![
+            Expression::gt(
+                Expression::Var(VarId(1)),
+                Expression::Const(FlakeValue::Long(1)),
+            ),
+            Expression::gt(
+                Expression::Var(VarId(1)),
+                Expression::Const(FlakeValue::String("a".to_string())),
+            ),
+        ];
+
+        let (bounds, consumed) = extract_bounds_from_filters(&triples, &filters);
+
+        assert_eq!(consumed, vec![0]);
+        let (lower, _) = bounds[&VarId(1)].lower.as_ref().unwrap();
+        assert_eq!(*lower, FlakeValue::Long(1));
+    }
+
+    /// An `=` in either filter rules out comparing a string with a temporal
+    /// in the merged bounds; two ranges keep it.
+    #[test]
+    fn test_merge_object_bounds_keeps_equality() {
+        let a = || Some((FlakeValue::String("a".to_string()), true));
+        let ranged = ObjectBounds {
+            lower: a(),
+            temporal_string_ordering: true,
+            ..ObjectBounds::new()
+        };
+        let equal = ObjectBounds {
+            lower: a(),
+            upper: a(),
+            temporal_string_ordering: false,
+            string_datatype: None,
+        };
+        let merged = |x: &ObjectBounds, y: &ObjectBounds| {
+            merge_object_bounds(x, y).unwrap().temporal_string_ordering
+        };
+        assert!(merged(&ranged, &ranged));
+        assert!(!merged(&ranged, &equal));
+        assert!(!merged(&equal, &ranged));
     }
 
     #[test]
