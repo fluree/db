@@ -1265,6 +1265,10 @@ pub(crate) fn count_distinct_lead_groups(
 /// from "counted the arena slice exactly".
 const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 
+/// `fast-path outcome` site the whole-graph distinct-object count stamps when
+/// it counts the graph's vectors from their arenas' identity tables.
+const VECTOR_EXACT_SITE: &str = "distinct object COUNT (vector exact)";
+
 /// Kill switch for the exact NumBig branch: when set, a graph whose NumBig
 /// arenas hold more entries than this in total declines the whole count to
 /// the general pipeline. Unset means no cap.
@@ -1313,9 +1317,6 @@ pub(crate) fn count_distinct_objects(
     g_id: GraphId,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
-    if store.graph_holds_vectors(g_id) {
-        return Ok(None);
-    }
     let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
     else {
         return Ok(None);
@@ -1323,14 +1324,124 @@ pub(crate) fn count_distinct_objects(
     if walk.skipped_non_identifying_rows == 0 {
         return Ok(Some(walk.count));
     }
-    let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
-        return Ok(None);
+    // The walk left out the arena-keyed objects (big numbers and vectors),
+    // whose keys are not graph-wide identities; each kind counts exactly
+    // from its arenas. No value of one kind equals a value of the other.
+    let numbig = if store.numbig_arenas(g_id).any(|(_, a)| !a.is_empty()) {
+        let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
+            return Ok(None);
+        };
+        crate::fast_path_outcome::stamp_fast_path(
+            NUMBIG_EXACT_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Proceed,
+        );
+        exact
+    } else {
+        0
     };
-    crate::fast_path_outcome::stamp_fast_path(
-        NUMBIG_EXACT_SITE,
-        crate::fast_path_outcome::FastPathOutcome::Proceed,
-    );
-    Ok(Some(walk.count.saturating_add(exact)))
+    let vectors = if store.graph_holds_vectors(g_id) {
+        let Some(exact) = count_distinct_vector_objects(store, g_id, tracker)? else {
+            return Ok(None);
+        };
+        crate::fast_path_outcome::stamp_fast_path(
+            VECTOR_EXACT_SITE,
+            crate::fast_path_outcome::FastPathOutcome::Proceed,
+        );
+        exact
+    } else {
+        0
+    };
+    Ok(Some(
+        walk.count.saturating_add(numbig).saturating_add(vectors),
+    ))
+}
+
+/// Exact distinct-value count over the graph's vector objects, from the
+/// arenas' identity tables rather than the rows.
+///
+/// A vector arena gives each stored fact its own handle, so its handles are
+/// not values; its identity table gives each handle its value's hash and its
+/// canonical handle (the lowest handle holding an equal vector), so the
+/// distinct canonical handles of an arena's live handles are its distinct
+/// values. Liveness is proved per predicate from POST directories, as for
+/// big numbers ([`count_live_arena_handles`]): an arena keeps the handles of
+/// retracted facts, and only a predicate that holds some pays to read which
+/// handles are live. Across predicates, equal vectors hash alike, so only a
+/// hash that two arenas share needs their components compared, bitwise as
+/// every other vector equality is.
+///
+/// Builds each vector predicate's identity table on first use (once per
+/// store; see [`BinaryIndexStore::vector_identity`]).
+fn count_distinct_vector_objects(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<u64>> {
+    let vector = OType::VECTOR.as_u16();
+    // (value hash, predicate, canonical handle): one per distinct value of an
+    // arena once deduplicated.
+    let mut keys: Vec<(u64, u32, u32)> = Vec::new();
+    for p_id in store.vector_predicates(g_id) {
+        let Some(table) = store
+            .vector_identity(g_id, p_id)
+            .map_err(|e| QueryError::from_io("vector identity table", e))?
+        else {
+            continue;
+        };
+        let live = count_live_arena_handles(store, g_id, p_id, vector, tracker)?;
+        if live == 0 {
+            continue;
+        }
+        if live == table.len() as u64 {
+            // Every handle is live, so each canonical handle is one value.
+            keys.extend((0..table.len() as u32).filter_map(|h| {
+                let (hash, canonical) = table.of(h)?;
+                (canonical == h).then_some((hash, p_id, canonical))
+            }));
+            continue;
+        }
+        for h in live_arena_handles(store, g_id, p_id, vector, tracker)? {
+            let (hash, canonical) = table.of(h).ok_or_else(|| {
+                QueryError::Internal(format!(
+                    "vector handle {h} beyond the identity table for g_id={g_id}, p_id={p_id}"
+                ))
+            })?;
+            keys.push((hash, p_id, canonical));
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    let mut count = 0u64;
+    for run in keys.chunk_by(|a, b| a.0 == b.0) {
+        if run.len() == 1 {
+            count += 1;
+            continue;
+        }
+        // One hash in several arenas (or a collision within one): compare.
+        let mut values: Vec<fluree_db_binary_index::arena::vector::VectorSlice> = Vec::new();
+        for &(_, p_id, canonical) in run {
+            let slice = store
+                .vector_slice(g_id, p_id, canonical)
+                .map_err(|e| QueryError::from_io("vector read", e))?
+                .ok_or_else(|| {
+                    QueryError::Internal(format!(
+                        "vector handle {canonical} missing for g_id={g_id}, p_id={p_id}"
+                    ))
+                })?;
+            let same = |held: &fluree_db_binary_index::arena::vector::VectorSlice| {
+                let (a, b) = (held.as_f32(), slice.as_f32());
+                a.len() == b.len()
+                    && a.iter()
+                        .map(|x| x.to_bits())
+                        .eq(b.iter().map(|x| x.to_bits()))
+            };
+            if !values.iter().any(same) {
+                values.push(slice);
+            }
+        }
+        count += values.len() as u64;
+    }
+    Ok(Some(count))
 }
 
 /// Exact distinct-term count over the graph's `NUM_BIG_OVERFLOW` objects,
@@ -1386,7 +1497,8 @@ fn count_distinct_numbig_objects(
     let mut keys: Vec<NumBigDistinctKey> = Vec::new();
     for (p_id, arena) in arenas {
         let normalized = arena.values_are_normalized();
-        let live = count_live_numbig_handles(store, g_id, p_id, tracker)?;
+        let live =
+            count_live_arena_handles(store, g_id, p_id, OType::NUM_BIG_OVERFLOW.as_u16(), tracker)?;
         if live == 0 {
             continue;
         }
@@ -1399,7 +1511,8 @@ fn count_distinct_numbig_objects(
             );
             continue;
         }
-        let handles = live_numbig_handles(store, g_id, p_id, tracker)?;
+        let handles =
+            live_arena_handles(store, g_id, p_id, OType::NUM_BIG_OVERFLOW.as_u16(), tracker)?;
         let mapped: Result<Vec<NumBigDistinctKey>> = handles
             .par_iter()
             .map(|&h| {
@@ -1477,53 +1590,55 @@ fn i128_from_signed_le(bytes: &[u8]) -> Option<i128> {
     Some(i128::from_le_bytes(buf))
 }
 
-/// How one predicate's POST leaflet relates to the `NUM_BIG_OVERFLOW` range.
-enum NumBigLeaflet {
-    /// Holds no NumBig row, or belongs to another predicate.
+/// How one predicate's POST leaflet relates to an arena o_type's range
+/// (`NUM_BIG_OVERFLOW` or `VECTOR`).
+enum ArenaLeaflet {
+    /// Holds no row of the o_type, or belongs to another predicate.
     Outside,
-    /// Every row is NumBig: `lead_group_count` is its distinct-handle count.
+    /// Every row is of the o_type: `lead_group_count` is its distinct-handle
+    /// count.
     Pure,
-    /// Straddles the NumBig range (or predates `lead_group_count`): rows
-    /// must be decoded to find its NumBig handles.
+    /// Straddles the o_type's range (or predates `lead_group_count`): rows
+    /// must be decoded to find its handles.
     Decode,
 }
 
-fn classify_numbig_leaflet(
+fn classify_arena_leaflet(
     entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
     p_id: u32,
-) -> NumBigLeaflet {
+    arena_o_type: u16,
+) -> ArenaLeaflet {
     if entry.row_count == 0 || entry.p_const != Some(p_id) {
-        return NumBigLeaflet::Outside;
+        return ArenaLeaflet::Outside;
     }
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    if entry.o_type_const == Some(numbig) {
+    if entry.o_type_const == Some(arena_o_type) {
         return if entry.lead_group_count > 0 {
-            NumBigLeaflet::Pure
+            ArenaLeaflet::Pure
         } else {
-            NumBigLeaflet::Decode
+            ArenaLeaflet::Decode
         };
     }
     // POST keys sort by `(p_id, o_type, o_key, …)`, so the entry's own key
     // interval bounds every o_type it holds.
     let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
     let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
-    if lo <= numbig && numbig <= hi {
-        NumBigLeaflet::Decode
+    if lo <= arena_o_type && arena_o_type <= hi {
+        ArenaLeaflet::Decode
     } else {
-        NumBigLeaflet::Outside
+        ArenaLeaflet::Outside
     }
 }
 
-/// Per-chunk partial for a run of NumBig handles under one predicate: distinct
+/// Per-chunk partial for a run of arena handles under one predicate: distinct
 /// handles seen, plus the first and last handle for seam dedup.
 #[derive(Default)]
-struct NumBigHandlePartial {
+struct ArenaHandlePartial {
     count: u64,
     first: Option<u64>,
     last: Option<u64>,
 }
 
-impl NumBigHandlePartial {
+impl ArenaHandlePartial {
     fn push_run(&mut self, count: u64, first: u64, last: u64) {
         self.count = self.count.saturating_add(count);
         if self.last == Some(first) {
@@ -1554,16 +1669,17 @@ impl NumBigHandlePartial {
     }
 }
 
-/// Distinct NumBig handles in one decoded POST leaflet: `(count, first, last)`
-/// over its NumBig rows only, or `None` when it holds none. Rows are sorted by
-/// `(o_type, o_key, …)` within the predicate, so equal handles are adjacent.
-fn decode_numbig_handle_run(
+/// Distinct `arena_o_type` handles in one decoded POST leaflet:
+/// `(count, first, last)` over its rows of that o_type only, or `None` when it
+/// holds none. Rows are sorted by `(o_type, o_key, …)` within the predicate,
+/// so equal handles are adjacent.
+fn decode_arena_handle_run(
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     leaflet_idx: usize,
     o_type_const: Option<u16>,
+    arena_o_type: u16,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<(u64, u64, u64)>> {
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
     let batch = crate::fast_path_common::load_leaflet_columns_charged(
         handle,
         leaflet_idx,
@@ -1576,7 +1692,7 @@ fn decode_numbig_handle_run(
     let mut first = None;
     let mut prev = None;
     for row in 0..batch.row_count {
-        if batch.o_type.get_or(row, o_type_default) != numbig {
+        if batch.o_type.get_or(row, o_type_default) != arena_o_type {
             continue;
         }
         let k = batch.o_key.get(row);
@@ -1589,15 +1705,17 @@ fn decode_numbig_handle_run(
     Ok(first.zip(prev).map(|(f, l)| (count, f, l)))
 }
 
-/// Number of distinct NumBig handles with a live row under `p_id`, from POST
-/// leaflet directories: `lead_group_count` over type-pure NumBig leaflets with
-/// seam dedup on the handle, decoding only a leaflet that straddles the NumBig
-/// range or predates `lead_group_count`. Compared against the arena's size, this
-/// says whether every arena entry is still live without reading a row.
-fn count_live_numbig_handles(
+/// Number of distinct `arena_o_type` handles (big numbers, vectors) with a
+/// live row under `p_id`, from POST leaflet directories: `lead_group_count`
+/// over type-pure leaflets with seam dedup on the handle, decoding only a
+/// leaflet that straddles the o_type's range or predates `lead_group_count`.
+/// Compared against the arena's size, this says whether every arena entry is
+/// still live without reading a row.
+fn count_live_arena_handles(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    arena_o_type: u16,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
@@ -1605,22 +1723,22 @@ fn count_live_numbig_handles(
         return Ok(0);
     }
 
-    let map = |chunk: &[LeafEntry]| -> Result<Option<NumBigHandlePartial>> {
-        let mut partial = NumBigHandlePartial::default();
+    let map = |chunk: &[LeafEntry]| -> Result<Option<ArenaHandlePartial>> {
+        let mut partial = ArenaHandlePartial::default();
         for leaf_entry in chunk {
             let dir = store
                 .open_leaf_dir(&leaf_entry.leaf_cid)
                 .map_err(|e| QueryError::Internal(format!("leaf dir open: {e}")))?;
             let mut handle = None;
             for (idx, entry) in dir.entries.iter().enumerate() {
-                match classify_numbig_leaflet(entry, p_id) {
-                    NumBigLeaflet::Outside => {}
-                    NumBigLeaflet::Pure => {
+                match classify_arena_leaflet(entry, p_id, arena_o_type) {
+                    ArenaLeaflet::Outside => {}
+                    ArenaLeaflet::Pure => {
                         let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_key;
                         let last = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_key;
                         partial.push_run(u64::from(entry.lead_group_count), first, last);
                     }
-                    NumBigLeaflet::Decode => {
+                    ArenaLeaflet::Decode => {
                         let handle = match &handle {
                             Some(h) => h,
                             None => handle.insert(
@@ -1633,10 +1751,11 @@ fn count_live_numbig_handles(
                                     .map_err(|e| QueryError::from_io("leaf open", e))?,
                             ),
                         };
-                        if let Some((count, first, last)) = decode_numbig_handle_run(
+                        if let Some((count, first, last)) = decode_arena_handle_run(
                             handle.as_ref(),
                             idx,
                             entry.o_type_const,
+                            arena_o_type,
                             tracker,
                         )? {
                             partial.push_run(count, first, last);
@@ -1650,26 +1769,26 @@ fn count_live_numbig_handles(
 
     let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
     Ok(
-        parallel_leaf_chunk_reduce(leaves, parallel, map, NumBigHandlePartial::combine)?
+        parallel_leaf_chunk_reduce(leaves, parallel, map, ArenaHandlePartial::combine)?
             .map_or(0, |p| p.count),
     )
 }
 
-/// The set of NumBig handles with a live row under `p_id`, sorted and
-/// deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
-/// leaflet) over the predicate's NumBig leaflets only — the fallback for a
-/// predicate whose arena holds retracted values.
-fn live_numbig_handles(
+/// The set of `arena_o_type` handles with a live row under `p_id`, sorted
+/// and deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
+/// leaflet) over the predicate's leaflets of that o_type only — the fallback
+/// for a predicate whose arena holds retracted values.
+fn live_arena_handles(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    arena_o_type: u16,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<u32>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(Vec::new());
     }
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
 
     let map = |chunk: &[LeafEntry]| -> Result<Option<Vec<u32>>> {
         let mut handles: Vec<u32> = Vec::new();
@@ -1682,7 +1801,10 @@ fn live_numbig_handles(
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| {
-                    !matches!(classify_numbig_leaflet(e, p_id), NumBigLeaflet::Outside)
+                    !matches!(
+                        classify_arena_leaflet(e, p_id, arena_o_type),
+                        ArenaLeaflet::Outside
+                    )
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -1703,7 +1825,7 @@ fn live_numbig_handles(
                 )?;
                 let o_type_default = entry.o_type_const.unwrap_or(0);
                 for row in 0..batch.row_count {
-                    if batch.o_type.get_or(row, o_type_default) != numbig {
+                    if batch.o_type.get_or(row, o_type_default) != arena_o_type {
                         continue;
                     }
                     let h = batch.o_key.get(row) as u32;
@@ -2448,22 +2570,22 @@ mod tests {
 
     #[test]
     fn numbig_handle_partials_dedup_seams_and_preserve_empty_chunks() {
-        let mut left = NumBigHandlePartial::default();
+        let mut left = ArenaHandlePartial::default();
         left.push_run(2, 0, 1);
         left.push_run(2, 1, 2);
         assert_eq!((left.count, left.first, left.last), (3, Some(0), Some(2)));
-        let left = NumBigHandlePartial::combine(NumBigHandlePartial::default(), left);
-        let left = NumBigHandlePartial::combine(left, NumBigHandlePartial::default());
-        let mut right = NumBigHandlePartial::default();
+        let left = ArenaHandlePartial::combine(ArenaHandlePartial::default(), left);
+        let left = ArenaHandlePartial::combine(left, ArenaHandlePartial::default());
+        let mut right = ArenaHandlePartial::default();
         right.push_run(2, 2, 3);
-        let merged = NumBigHandlePartial::combine(left, right);
+        let merged = ArenaHandlePartial::combine(left, right);
         assert_eq!(
             (merged.count, merged.first, merged.last),
             (4, Some(0), Some(3))
         );
-        let mut disjoint = NumBigHandlePartial::default();
+        let mut disjoint = ArenaHandlePartial::default();
         disjoint.push_run(2, 5, 6);
-        let merged = NumBigHandlePartial::combine(merged, disjoint);
+        let merged = ArenaHandlePartial::combine(merged, disjoint);
         assert_eq!(
             (merged.count, merged.first, merged.last),
             (6, Some(0), Some(6))

@@ -1836,6 +1836,14 @@ impl BinaryIndexStore {
             .filter(|&dims| dims != 0)
     }
 
+    /// The predicates of `g_id` that have a vector arena.
+    pub fn vector_predicates(&self, g_id: GraphId) -> impl Iterator<Item = u32> + '_ {
+        self.graph_indexes
+            .get(&g_id)
+            .into_iter()
+            .flat_map(|gi| gi.vectors.keys().copied())
+    }
+
     /// Whether any predicate of `g_id` has a vector arena, whose object keys
     /// are not value identities even within the predicate
     /// (`OType::o_key_is_predicate_identifying`).
@@ -3520,6 +3528,16 @@ impl VectorIdentity {
             *self.hashes.get(handle as usize)?,
             *self.canonical.get(handle as usize)?,
         ))
+    }
+
+    /// How many handles the table covers: the arena's.
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    /// Whether the arena holds no handle.
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
     }
 
     /// Whether no value is held twice: every handle is its own canonical one.

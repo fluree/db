@@ -702,3 +702,110 @@ async fn check_liveness(
         }
     }
 }
+
+/// The vector twin of [`EXACT_SITE`]: the whole-graph count's branch that
+/// counts the graph's vectors from their arenas' identity tables.
+const VECTOR_EXACT_SITE: &str = "distinct object COUNT (vector exact)";
+
+/// Vectors on two predicates beside a string: `[0.5, 0.5]` twice under `v1`
+/// and once under `v2` (one value), `[1, 0]` under `v1` only and `[0, 1]`
+/// under `v2` only. Four distinct objects.
+const F_VECTORS: &str = r#"
+<http://ex/a1> <http://ex/v1> "[1.0, 0.0]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/a2> <http://ex/v1> "[0.5, 0.5]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/a3> <http://ex/v1> "[0.5, 0.5]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/b1> <http://ex/v2> "[0.5, 0.5]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/b2> <http://ex/v2> "[0.0, 1.0]"^^<https://ns.flur.ee/db#embeddingVector> .
+<http://ex/a1> <http://ex/name> "alpha" .
+"#;
+
+/// The whole-graph distinct-object count serves a graph holding vectors and
+/// counts them by value from their arenas: a vector repeated under one
+/// predicate, and one held by two, each count once. Arenas keep the handles
+/// of retracted facts, so after retractions (a rebuild, then an incremental
+/// build that leaves one predicate with no live vector) the count is the
+/// live values', and the fast lane, the general pipeline and the truth agree.
+#[tokio::test(flavor = "current_thread")]
+async fn distinct_object_count_counts_vectors_by_value() {
+    assert!(
+        std::env::var_os("FLUREE_DISABLE_QUERY_FAST_PATHS").is_none(),
+        "FLUREE_DISABLE_QUERY_FAST_PATHS is set: the fast lane would run generically"
+    );
+    let _guard = FastPathGuard;
+    let (_db, _data, fluree, ledger_id) = build_indexed(F_VECTORS, "vectors").await;
+    let ctx = json!({"ex": "http://ex/"});
+    let vector =
+        |v: [f64; 2]| json!({"@value": v, "@type": "https://ns.flur.ee/db#embeddingVector"});
+    let mut failures = Vec::new();
+    check_count(&fluree, &ledger_id, "4", "imported", &mut failures).await;
+
+    // `[1, 0]` is gone; `[0.5, 0.5]` survives under v1.
+    let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "delete": [
+                    {"@id": "ex:a1", "ex:v1": vector([1.0, 0.0])},
+                    {"@id": "ex:b1", "ex:v2": vector([0.5, 0.5])},
+                ]
+            }),
+        )
+        .await
+        .expect("retract two vectors");
+    support::rebuild_and_publish_index(&fluree, &ledger_id).await;
+    check_count(&fluree, &ledger_id, "3", "after rebuild", &mut failures).await;
+
+    // v2 keeps no live vector.
+    let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx,
+                "delete": [{"@id": "ex:b2", "ex:v2": vector([0.0, 1.0])}]
+            }),
+        )
+        .await
+        .expect("retract v2");
+    support::build_and_publish_index(&fluree, &ledger_id).await;
+    check_count(&fluree, &ledger_id, "2", "after incremental", &mut failures).await;
+
+    assert!(
+        failures.is_empty(),
+        "distinct-object vector count failures:\n  {}",
+        failures.join("\n  ")
+    );
+}
+
+/// [`check_liveness`] for the vector branch.
+async fn check_count(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    truth: &str,
+    when: &str,
+    failures: &mut Vec<String>,
+) {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let (store, tracing_guard) = span_capture::init_test_tracing();
+    set_fast_paths_disabled(false);
+    let fast = scalar(&run(fluree, &ledger, Q_COUNT).await);
+    let sites = proceeded(&store, 0);
+    drop(tracing_guard);
+    set_fast_paths_disabled(true);
+    let generic = scalar(&run(fluree, &ledger, Q_COUNT).await);
+    set_fast_paths_disabled(false);
+    if fast != truth || generic != truth {
+        failures.push(format!(
+            "{when}: fast {fast}, generic {generic}, expected {truth} [proceeded: {sites:?}]"
+        ));
+    }
+    for site in [OBJECT_SITE, VECTOR_EXACT_SITE] {
+        if !sites.iter().any(|s| s == site) {
+            failures.push(format!(
+                "{when}: `{site}` did not proceed [proceeded: {sites:?}]"
+            ));
+        }
+    }
+}

@@ -627,17 +627,25 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
         );
     }
 
-    // The whole-graph distinct-object count: this graph holds vectors.
+    // The whole-graph distinct-object count serves a graph that holds
+    // vectors, counting them by value from their arenas' identity tables:
+    // `[0.5,0.5]` twice under `ex:w` is one value, and `ex:f`'s vector under
+    // both `ex:j1` and `ex:j2` is one.
     let before = store.find_events("fast-path outcome").len();
     assert_eq!(
         sparql(&db, "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }").await,
         ["n=14"]
     );
-    assert!(
-        !served(&store, before, "distinct object COUNT"),
-        "{:?}",
-        stamped(&store, before, "")
-    );
+    for site in [
+        "distinct object COUNT",
+        "distinct object COUNT (vector exact)",
+    ] {
+        assert!(
+            served(&store, before, site),
+            "{site}: {:?}",
+            stamped(&store, before, "")
+        );
+    }
 
     // The partitioned GROUP BY lane: a string key stays on it; a vector key
     // folds by value and stamps the decline.
