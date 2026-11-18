@@ -997,6 +997,20 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
     }
 }
 
+/// `xxh3` over a vector's `f64` bits: the hash [`FlakeValue`]'s `Hash` gives
+/// a decoded vector, consistent with its bitwise equality.
+fn vector_bits_hash(components: &[f64]) -> u64 {
+    // SAFETY: `f64` has no padding and any byte is a valid `u8`; the byte
+    // slice covers exactly `components`' memory and borrows it.
+    let bytes = unsafe {
+        std::slice::from_raw_parts(
+            components.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(components),
+        )
+    };
+    xxhash_rust::xxh3::xxh3_64(bytes)
+}
+
 /// The hash of a vector's value, for in-memory hash keys. One function for
 /// every form a vector takes: [`vector_value_hash`] for decoded components
 /// and [`vector_value_hash_f32`] for an arena's `f32` slice give equal
@@ -1210,7 +1224,12 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                vector_value_hash(v).hash(state);
+                // A table of decoded values (MINUS, the union's fact dedup)
+                // hashes a vector on every probe, so this is one `xxh3` pass
+                // over its bits, which bitwise-equal vectors share. It needn't
+                // agree with [`vector_value_hash`], which keys stored and
+                // decoded vectors against each other and narrows to `f32`.
+                vector_bits_hash(v).hash(state);
             }
             FlakeValue::GeoPoint(bits) => {
                 self.type_discriminant().hash(state);
