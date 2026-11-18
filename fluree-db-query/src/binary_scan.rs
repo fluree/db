@@ -2836,13 +2836,15 @@ impl Operator for BinaryScanOperator {
 
         let mut order = index_type_to_sort_order(self.index);
         // Decode only columns needed for correctness:
-        // - `o_i`, a row's list place, only for hiding list members and for
-        //   history. A row's value never depends on it, so a scan of a
-        //   property holding lists decodes no list places; the cursor adds
-        //   them where it reads them, merging novelty and replaying history.
+        // - `o_i`, a row's list place, only for hiding list members, for
+        //   history, and for a union member's recorded facts, where two list
+        //   members of one value are two facts. A row's value never depends
+        //   on it, so a scan of a property holding lists decodes no list
+        //   places; the cursor adds them where it reads them, merging novelty
+        //   and replaying history.
         // - `t` is only required for history mode
         let mut output = ColumnSet::CORE;
-        if self.hide_list_members || self.mode.is_history() {
+        if self.hide_list_members || self.mode.is_history() || self.row_facts.is_some() {
             output.insert(ColumnId::OI);
         }
         if self.mode.is_history() || inline_ops_need_t(&self.inline_ops) {
