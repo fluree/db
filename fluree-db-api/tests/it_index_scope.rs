@@ -15,6 +15,9 @@
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
+#[path = "support/placement.rs"]
+mod placement;
+
 use fluree_db_api::dataset::GraphSel;
 use fluree_db_api::{
     DatasetSpec, Fluree, FlureeBuilder, GraphDb, GraphSource, LedgerHandle, LedgerRef,
@@ -52,9 +55,10 @@ async fn indexed(fluree: &Fluree, ledger_id: &str, trig: &str) -> LedgerHandle {
         .await
         .expect("create ledger");
     let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+    let pin = placement::dedicated_named_graphs_trig(ledger_id);
     fluree
         .stage(&handle)
-        .upsert_turtle(trig)
+        .upsert_turtle(&format!("{trig}\n{pin}"))
         .execute()
         .await
         .expect("seed");
@@ -424,6 +428,9 @@ async fn from_several_graphs_shares_one_load_of_the_ledger() {
         "query=union/2/stale",
     );
 
+    // One instance holds file storage at a time.
+    drop(handle);
+    drop(fluree);
     let uncached = FlureeBuilder::file(path)
         .without_ledger_caching()
         .without_indexing()

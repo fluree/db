@@ -174,6 +174,7 @@ async fn union_ledger(state: State) -> (Fluree, LedgerHandle) {
         .create_ledger(ledger_id)
         .await
         .expect("create ledger");
+    support::placement::pin_named_graphs_dedicated(&fluree, ledger_id).await;
     let mut handle = fluree.ledger_cached(ledger_id).await.expect("cache");
     if matches!(state, State::Novelty) {
         for doc in union_base_edges() {

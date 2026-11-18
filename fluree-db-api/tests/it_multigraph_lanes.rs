@@ -17,6 +17,9 @@
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
+#[path = "support/placement.rs"]
+mod placement;
+
 #[path = "support/multigraph.rs"]
 mod multigraph;
 
@@ -561,9 +564,10 @@ async fn per_predicate_count_union_keys_big_numbers_by_value() {
         .await
         .expect("create ledger");
     let handle = fluree.ledger_cached(NUMBIG_LEDGER).await.expect("cache");
+    let pin = placement::dedicated_named_graphs_trig(NUMBIG_LEDGER);
     fluree
         .stage(&handle)
-        .upsert_turtle(NUMBIG_TRIG)
+        .upsert_turtle(&format!("{NUMBIG_TRIG}\n{pin}"))
         .execute()
         .await
         .expect("seed");
@@ -1288,27 +1292,29 @@ async fn grouped_count_union_group_counts_over_from_graphs() {
         (
             g0g1g2,
             GroupCase {
-                label: "big numbers, by object",
+                label: "decimals, by object",
                 sparql: "SELECT ?v (COUNT(*) AS ?k) {ds} WHERE { ?s ex:big ?v } GROUP BY ?v",
                 jsonld: None,
                 columns: &["v", "k"],
                 typed: false,
                 want: rows(&[&["1.5", "1"], &["2.5", "1"]]),
-                fires: false,
-                decline: Some("fallback:arena_type"),
+                // 1.5 and 2.5 are inline decimals, whose key is canonical and
+                // the same in every member, not arena handles.
+                fires: true,
+                decline: None,
             },
         ),
         (
             g0g1g2,
             GroupCase {
-                label: "big numbers, by subject",
+                label: "decimals, by subject",
                 sparql: "SELECT ?s (COUNT(*) AS ?k) {ds} WHERE { ?s ex:big ?v } GROUP BY ?s",
                 jsonld: None,
                 columns: &["s", "k"],
                 typed: false,
                 want: rows(&[&["b", "2"]]),
-                fires: false,
-                decline: Some("fallback:arena_type"),
+                fires: true,
+                decline: None,
             },
         ),
     ];

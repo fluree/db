@@ -428,9 +428,10 @@ impl Fixture {
         ] {
             fluree.create_ledger(ledger).await.expect("create");
             let handle = fluree.ledger_cached(ledger).await.expect("cache");
+            let pin = crate::placement::dedicated_named_graphs_trig(ledger);
             fluree
                 .stage(&handle)
-                .insert_turtle(&trig)
+                .insert_turtle(&format!("{trig}\n{pin}"))
                 .execute()
                 .await
                 .expect("seed");

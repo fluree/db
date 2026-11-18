@@ -219,9 +219,10 @@ impl Fixture {
 async fn seed(fluree: &Fluree, ledger: &str, trig: &str) {
     fluree.create_ledger(ledger).await.expect("create ledger");
     let handle = fluree.ledger_cached(ledger).await.expect("cache");
+    let pin = crate::placement::dedicated_named_graphs_trig(ledger);
     fluree
         .stage(&handle)
-        .upsert_turtle(trig)
+        .upsert_turtle(&format!("{trig}\n{pin}"))
         .execute()
         .await
         .expect("seed");

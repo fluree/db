@@ -1606,16 +1606,26 @@ async fn indexed_trig_commits(ledger_id: &str, trigs: &[&str]) -> (Fluree, Ledge
         .create_ledger(ledger_id)
         .await
         .expect("create ledger");
-    for trig in trigs {
+    let pin = crate::support::placement::dedicated_named_graphs_trig(ledger_id);
+    for (i, trig) in trigs.iter().enumerate() {
         let handle = fluree.ledger_cached(ledger_id).await.expect("cache");
+        let trig = if i == 0 {
+            format!("{trig}\n{pin}")
+        } else {
+            (*trig).to_string()
+        };
         fluree
             .stage(&handle)
-            .upsert_turtle(trig)
+            .upsert_turtle(&trig)
             .execute()
             .await
             .expect("seed TriG");
     }
-    rebuild_and_publish_index(&fluree, ledger_id).await;
+    // Through the API, which applies the ledger config's placement.
+    fluree
+        .reindex(ledger_id, fluree_db_api::ReindexOptions::default())
+        .await
+        .expect("index");
     fluree.disconnect_ledger(ledger_id).await;
     let handle = fluree.ledger_cached(ledger_id).await.expect("reload");
     let view = handle.snapshot().await;
@@ -3280,11 +3290,13 @@ async fn object_count_over_one_graph_and_a_union() {
             ObjectCount::Union(None),
         ),
         (
-            "T5 FROM g2 + g3, decimal objects (arena handles)",
+            "T5 FROM g2 + g3, decimal objects (inline keys)",
             topk("", from23, "ex:m"),
             // The general plan writes the decimal `1.0` as "1".
             rows(&[&["1", "1"], &["1", "1"]]),
-            ObjectCount::UnionDeclines("arena_type", None),
+            // An inline decimal's key is canonical and the same in every
+            // member, so the lane reads it; an arena handle would decline.
+            ObjectCount::Union(None),
         ),
         (
             "T6 FROM NAMED g2 alone: an empty default graph",
@@ -3509,10 +3521,11 @@ async fn numeric_object_count_over_one_graph_and_a_union() {
             Some(ObjectCount::One),
         ),
         (
-            "1.5, g1 + g2: a in both, by value: handles in both members",
+            "1.5, g1 + g2: a in both, by value",
             count(both, "ex:price 1.5"),
             "4",
-            Some(ObjectCount::UnionDeclines("arena_type", None)),
+            // Inline decimals: one canonical key in both members.
+            Some(ObjectCount::Union(None)),
         ),
         (
             "3.25, g1: in no arena of g1",

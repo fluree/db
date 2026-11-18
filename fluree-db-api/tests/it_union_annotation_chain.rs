@@ -17,6 +17,9 @@
 #[path = "support/span_capture.rs"]
 mod span_capture;
 
+#[path = "support/placement.rs"]
+mod placement;
+
 use fluree_db_api::{set_fast_paths_disabled, Fluree, FlureeBuilder, GraphDb, ReindexOptions};
 use serde_json::{json, Value as JsonValue};
 
@@ -94,7 +97,11 @@ async fn build(indexed: bool) -> Fluree {
         (LEDGER_B, txn(g2_edges(None))),
         (FLOOR, floor_txn()),
     ] {
-        let created = fluree.create_ledger(ledger).await.expect("create");
+        let mut created = fluree.create_ledger(ledger).await.expect("create");
+        if ledger == LEDGER {
+            placement::pin_named_graphs_dedicated(&fluree, ledger).await;
+            created = fluree.ledger(ledger).await.expect("reload");
+        }
         fluree.insert(created, &txn).await.expect("insert");
         if indexed {
             fluree
