@@ -27,6 +27,24 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(300);
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// The Delta Kernel this reader is built on: the exact version Cargo.toml pins.
+macro_rules! kernel_version {
+    () => {
+        "0.28.0"
+    };
+}
+
+/// How every request names its caller to Unity, as space-separated
+/// `name/version` tokens. Databricks' Delta API refuses a request that does
+/// not identify its application ("The provided User-Agent '' is
+/// insufficient"), and reqwest sends none of its own.
+const USER_AGENT: &str = concat!(
+    "Fluree-DB/",
+    env!("CARGO_PKG_VERSION"),
+    " Delta-Kernel-Rust/",
+    kernel_version!()
+);
+
 /// Everything but the characters a table name is ordinarily made of.
 const NAME: &AsciiSet = &NON_ALPHANUMERIC.remove(b'.').remove(b'_').remove(b'-');
 
@@ -582,14 +600,25 @@ impl UnityClient {
             if let Some(body) = body {
                 request = request.json(body);
             }
+            let mut headers = reqwest::header::HeaderMap::new();
             if let Some(header) = self
                 .auth
                 .authorization_header()
                 .await
                 .map_err(|e| failed(format!("catalog auth: {e}")))?
             {
-                request = request.header("Authorization", header);
+                headers.insert(
+                    reqwest::header::AUTHORIZATION,
+                    header
+                        .parse()
+                        .map_err(|e| failed(format!("catalog auth: {e}")))?,
+                );
             }
+            headers.insert(
+                reqwest::header::USER_AGENT,
+                reqwest::header::HeaderValue::from_static(USER_AGENT),
+            );
+            request = request.headers(headers);
             let response = request
                 .send()
                 .await
@@ -1118,6 +1147,63 @@ mod tests {
         assert!(
             matches!(failed, DeltaError::Catalog { denied: false, .. }),
             "{failed:?}"
+        );
+    }
+
+    /// Unity is told who is calling on every request: Databricks' Delta API
+    /// refuses one with an empty User-Agent. Placing a table, issuing its
+    /// credentials and listing its ratified commits each carry it.
+    #[tokio::test]
+    async fn every_request_names_fluree_as_its_user_agent() {
+        assert!(USER_AGENT.starts_with(concat!("Fluree-DB/", env!("CARGO_PKG_VERSION"))));
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(TABLES))
+            .and(header("User-Agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "table_id": "t-1", "data_source_format": "DELTA",
+                "storage_location": "s3://bucket/t",
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(CREDENTIALS))
+            .and(header("User-Agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "aws_temp_credentials": {
+                    "access_key_id": "KEY1", "secret_access_key": "s", "session_token": "t",
+                },
+                "expiration_time": ms_from_now(3600),
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.1/unity-catalog/delta/v1/catalogs/main/schemas/sales/tables/orders",
+            ))
+            .and(header("User-Agent", USER_AGENT))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "commits": [], "latest-table-version": 4,
+            })))
+            .mount(&server)
+            .await;
+        let unity = client(&server);
+        let table = unity.table("main.sales.orders").await.unwrap();
+        unity.read_credentials(&table).await.unwrap();
+        assert_eq!(unity.ratified(&table).await.unwrap().version, 4);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    }
+
+    /// The kernel version the User-Agent names is the one Cargo.toml pins.
+    #[test]
+    fn the_user_agent_names_the_pinned_kernel() {
+        assert!(
+            include_str!("../Cargo.toml").contains(concat!(
+                "delta_kernel = { version = \"=",
+                kernel_version!(),
+                "\""
+            )),
+            "bump kernel_version! with the delta_kernel pin"
         );
     }
 
