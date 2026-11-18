@@ -3476,6 +3476,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber 0.3.22",
  "ulid",
+ "uuid",
  "wasm-bindgen-futures",
  "wiremock",
  "xxhash-rust",

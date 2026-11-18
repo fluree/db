@@ -121,6 +121,8 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
     // Keep logging lightweight and periodic: one line per minute.
     let cache = Arc::clone(fluree.leaflet_cache());
     let budget_mb = fluree.cache_budget_mb();
+    let results = Arc::downgrade(fluree);
+    let result_budget_mb = fluree.result_cache_budget_mb();
     let budget_bytes = (budget_mb as u64).saturating_mul(1024 * 1024);
 
     tokio::spawn(async move {
@@ -147,6 +149,15 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
                 cache_budget_pct = pct,
                 "LeafletCache stats"
             );
+            // Logged once a request has opted in; until then there is no pool.
+            if let Some((entries, bytes)) = results.upgrade().and_then(|f| f.result_cache_usage()) {
+                tracing::info!(
+                    result_cache_entries = entries,
+                    result_cache_weighted_bytes = bytes,
+                    result_cache_budget_mb = result_budget_mb,
+                    "Query result cache stats"
+                );
+            }
         }
     })
 }
@@ -552,6 +563,9 @@ async fn build_direct_fluree(
     if let Some(max_mb) = config.disk_cache_max_mb {
         builder = builder.disk_cache_max_mb(max_mb);
     }
+    if let Some(max_mb) = config.query_result_cache_max_mb {
+        builder = builder.query_result_cache_max_mb(max_mb);
+    }
     if let Some(bus) = event_bus {
         builder = builder.with_event_bus(bus);
     }
@@ -690,7 +704,10 @@ fn build_proxy_fluree(
     let nameservice = ProxyNameService::new(tx_url, token);
 
     let ns_mode = NameServiceMode::ReadOnly(Arc::new(nameservice));
-    let builder = FlureeBuilder::memory();
+    let mut builder = FlureeBuilder::memory();
+    if let Some(max_mb) = config.query_result_cache_max_mb {
+        builder = builder.query_result_cache_max_mb(max_mb);
+    }
     #[cfg(feature = "iceberg")]
     let builder = builder.with_host_identity_policy(fluree_db_api::HostIdentityPolicy::from_env());
     let fluree = builder.build_with(storage, ns_mode);

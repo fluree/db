@@ -112,6 +112,9 @@ sha2.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
+# The query-result cache seeds its key hash per pool (wasm randomness is
+# unified in fluree-db-core).
+uuid = { version = "1", features = ["v4"] }
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true

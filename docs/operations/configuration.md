@@ -56,6 +56,7 @@ graphql_max_complexity = 1000  # GraphQL fields per document; 0 disables
 # cache_max_mb = 4096  # global in-memory cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
 # cache_dictionary_max_mb = 2048  # encrypted storage: part of cache_max_mb for whole dictionary packs, given back if unusable; default: 60%
 # disk_cache_max_mb = 20480  # global on-disk cache budget (MB), shared across object storage + Iceberg; default: auto-detect; 0 disables
+# query_result_cache_max_mb = 200  # opted-in query answers (MB), in addition to cache_max_mb; default: 10% of cache_max_mb; 0 disables
 # iceberg_local_roots = "/data/warehouse:/srv/lake"  # allow catalog-less Iceberg tables under these dirs; default: unset (local-filesystem tables disabled)
 
 [server.query_refresh]
@@ -491,6 +492,14 @@ Global cache budget (MB):
 | ----------------- | -------------------- | ---------------------- |
 | `--cache-max-mb`  | `FLUREE_CACHE_MAX_MB`| Tiered by RAM: `<4GB: 30%, 4-8GB: 40%, >=8GB: 35%`    |
 | `--disk-cache-max-mb` | `FLUREE_DISK_CACHE_MAX_MB`| Auto-detect from free disk; `0` disables. Shared across object storage + Iceberg |
+| `--query-result-cache-max-mb` | `FLUREE_QUERY_RESULT_CACHE_MAX_MB` | 10% of `--cache-max-mb`, in addition to it; `0` disables. Allocated only once a request opts in — see [Query Result Cache](../query/result-cache.md) |
+
+`--query-result-cache-max-mb` is the ceiling for [cached query answers](../query/result-cache.md).
+It is its own budget, on top of `--cache-max-mb`, so cached answers never take memory from the
+index cache. It is a ceiling, not a reservation: nothing is allocated until a request asks for the
+result cache (`Fluree-Cache: true` or `opts.cache`), and then only as answers are stored. Under a
+memory limit, size for `--cache-max-mb` plus `--query-result-cache-max-mb` if clients use the
+result cache. Set it to `0` to turn result caching off.
 
 ### Background Indexing
 
@@ -1067,6 +1076,7 @@ fluree server run \
 | `FLUREE_IO_STATS`                       | Diagnostic: count artifact reads and decryption work per process, for investigating storage costs. Off costs one atomic load per read; on, every count takes a process-wide lock, so timings taken with it on are not comparable to those without. Counts carry artifact kinds only, never addresses, plaintext or keys | Off |
 | `FLUREE_DISK_CACHE_MAX_MB`              | Global on-disk cache budget (MB), shared across object storage + Iceberg | Auto-detect from free disk; `0` disables |
 | `FLUREE_DISK_CACHE_BUDGET_BYTES`        | On-disk cache budget (bytes); overrides `FLUREE_DISK_CACHE_MAX_MB`        | Auto-detect from free disk; `0` disables |
+| `FLUREE_QUERY_RESULT_CACHE_MAX_MB`      | Query-result cache ceiling (MB), in addition to `FLUREE_CACHE_MAX_MB`; allocated only once a request opts in | 10% of the cache budget; `0` disables |
 | `FLUREE_REMOTE_LEAF_FETCH`              | How index leaves are read from remote storage (S3, HTTP). `whole` fetches a leaf in one request on first access, shared by concurrent readers and kept in the disk cache; `ranged` reads the header and directory, then byte ranges per leaflet, until the leaf is reopened or scanned | `whole` |
 | `FLUREE_ICEBERG_LOCAL_ROOTS`            | Colon-separated absolute directories under which catalog-less Iceberg tables may be read from the local filesystem. Unset disables local-filesystem tables entirely | Unset (local tables disabled) |
 | `FLUREE_BODY_LIMIT`                     | Max request body bytes                          | `52428800`                                                              |

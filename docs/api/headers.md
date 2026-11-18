@@ -481,6 +481,10 @@ Query and transaction responses carry no `ETag` or `Cache-Control` headers, and 
 not answer conditional requests (`If-None-Match`) for them. Only the storage proxy's block
 endpoints, used for replication, send an `ETag` and an immutable `Cache-Control`.
 
+A query sent with `fluree-cache: true` is answered from the server's
+[query result cache](../query/result-cache.md) when it can be, and its response carries
+`x-fdb-cache: hit`, `miss` or `bypass; reason="…"`.
+
 ## Fluree Request Headers
 
 | Header | Value | Effect |
@@ -497,10 +501,11 @@ endpoints, used for replication, send an `ETag` and an immutable `Cache-Control`
 | `fluree-track-policy` | `true` | Report per-policy statistics |
 | `fluree-max-fuel` | Number | Fail the query once it consumes this much fuel |
 | `fluree-min-t` | Transaction `t` | See [Fluree-Min-T](#fluree-min-t) |
+| `fluree-cache` | `true` | Answer from the [query result cache](../query/result-cache.md) when possible |
 
 A SPARQL request can carry these options in its text instead, as
-[`# PRAGMA` comments](../query/sparql.md#request-options--pragma) (all but `fluree-ledger` and the
-inline `fluree-policy`). A pragma wins over the header that names the same option, except that
+[`# PRAGMA` comments](../query/sparql.md#request-options--pragma) (all but `fluree-ledger`, the
+inline `fluree-policy` and `fluree-cache`). A pragma wins over the header that names the same option, except that
 `meta` adds to the header's tracking, `max-fuel` takes the smaller of the two and, on an
 authenticated request, a policy pragma may only repeat the policy the headers select (see
 [Request options](../query/sparql.md#request-options--pragma)).

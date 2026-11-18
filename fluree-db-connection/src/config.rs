@@ -227,15 +227,29 @@ pub struct CacheConfig {
     /// On encrypted storage, the MB of `max_mb` that dictionary packs may
     /// hold decrypted whole; by default a fixed share of it.
     pub dictionary_max_mb: Option<usize>,
+    /// Ceiling for the query-result cache in MB, a pool of its own beside
+    /// `max_mb`. `None` means [`Self::DEFAULT_QUERY_RESULT_PERCENT`] of
+    /// `max_mb`; `Some(0)` disables result caching.
+    pub query_result_max_mb: Option<usize>,
 }
 
 impl CacheConfig {
+    /// The query-result ceiling when none is set, as a percentage of `max_mb`.
+    pub const DEFAULT_QUERY_RESULT_PERCENT: usize = 10;
+
     /// Create a cache config with the given max MB.
     pub fn with_max_mb(max_mb: usize) -> Self {
         CacheConfig {
             max_mb,
             dictionary_max_mb: None,
+            query_result_max_mb: None,
         }
+    }
+
+    /// The query-result cache ceiling in MB.
+    pub fn query_result_mb(&self) -> usize {
+        self.query_result_max_mb
+            .unwrap_or(self.max_mb * Self::DEFAULT_QUERY_RESULT_PERCENT / 100)
     }
 }
 
@@ -422,6 +436,9 @@ impl ConnectionConfig {
         let cache_dictionary_max_mb =
             resolve_u64(&graph, conn_node, vocab::FIELD_CACHE_DICTIONARY_MAX_MB)
                 .map(|v| v as usize);
+        let query_result_max_mb =
+            resolve_u64(&graph, conn_node, vocab::FIELD_QUERY_RESULT_CACHE_MAX_MB)
+                .map(|v| v as usize);
 
         // 5. Resolve storage references using resolve_first (single-valued fields)
         let index_storage = conn_node
@@ -463,6 +480,7 @@ impl ConnectionConfig {
             parallelism,
             cache: CacheConfig {
                 dictionary_max_mb: cache_dictionary_max_mb,
+                query_result_max_mb,
                 ..CacheConfig::with_max_mb(cache_max_mb)
             },
             index_storage,
@@ -890,7 +908,8 @@ impl CacheConfig {
     ///   "maxMb": {
     ///     "https://ns.flur.ee/system#envVar": "FLUREE_CACHE_MAX_MB",
     ///     "https://ns.flur.ee/system#defaultVal": "1000"
-    ///   }
+    ///   },
+    ///   "queryResultMaxMb": 100
     /// }
     /// ```
     pub fn from_json(json: &JsonValue) -> Result<Self> {
@@ -900,6 +919,7 @@ impl CacheConfig {
 
         let mut max_mb: Option<usize> = None;
         let mut dictionary_max_mb: Option<usize> = None;
+        let mut query_result_max_mb: Option<usize> = None;
 
         for (key, value) in obj {
             match key.as_str() {
@@ -915,6 +935,9 @@ impl CacheConfig {
                 "dictionaryMaxMb" | "dictionary_max_mb" | "cacheDictionaryMaxMb" => {
                     dictionary_max_mb = Some(resolve_config_value_usize(value)?);
                 }
+                "queryResultMaxMb" | "query_result_max_mb" | "queryResultCacheMaxMb" => {
+                    query_result_max_mb = Some(resolve_config_value_usize(value)?);
+                }
                 _ => {
                     return Err(ConnectionError::invalid_config(format!(
                         "Unknown cache configuration field: '{key}'"
@@ -929,6 +952,7 @@ impl CacheConfig {
         };
         Ok(CacheConfig {
             dictionary_max_mb,
+            query_result_max_mb,
             ..base
         })
     }
@@ -1283,6 +1307,17 @@ mod tests {
 
         let config = ConnectionConfig::from_json(&json).unwrap();
         assert_eq!(config.cache.max_mb, 256);
+        assert_eq!(config.cache.query_result_max_mb, None);
+        assert_eq!(
+            config.cache.query_result_mb(),
+            25,
+            "10% of the cache budget"
+        );
+
+        let json = json!({ "cache": { "maxMb": 256, "queryResultMaxMb": 0 } });
+        let config = ConnectionConfig::from_json(&json).unwrap();
+        assert_eq!(config.cache.max_mb, 256);
+        assert_eq!(config.cache.query_result_mb(), 0);
     }
 
     #[test]
@@ -1725,12 +1760,14 @@ mod tests {
                     "@type": "Connection",
                     "parallelism": 16,
                     "cacheMaxMb": 2000,
+                    "queryResultCacheMaxMb": 150,
                     "indexStorage": {"@id": "fs"}
                 }
             ]
         });
 
         let parsed = ConnectionConfig::from_json_ld(&config).expect("Should parse");
+        assert_eq!(parsed.cache.query_result_mb(), 150);
         assert_eq!(parsed.parallelism, 16);
         assert_eq!(parsed.cache.max_mb, 2000);
         assert_eq!(parsed.index_storage.path.as_deref(), Some("/path/to/data"));

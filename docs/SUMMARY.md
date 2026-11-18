@@ -150,6 +150,7 @@
   - [Graph crawl](query/graph-crawl.md)
   - [Explain plans](query/explain.md)
   - [Tracking and fuel limits](query/tracking-and-fuel.md)
+  - [Query result cache](query/result-cache.md)
   - [Reasoning in queries](query/reasoning.md)
   - [Materialized reasoning](query/materialized-reasoning.md)
   - [Datalog rules](query/datalog-rules.md)
