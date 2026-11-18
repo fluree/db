@@ -2805,15 +2805,17 @@ impl LedgerManager {
                     "notify: applying index update (incremental)"
                 );
                 let cs = cs_for_record().await?;
-                let installed = handle
-                    .apply_index_v2(
-                        &index_head_id,
-                        cs,
-                        &self.config.cache_dir,
-                        self.config.leaflet_cache.clone(),
-                        planned_on,
-                    )
-                    .await?;
+                // Boxed: an index install loads the index, and inline it
+                // nests that load in every caller that reaches `notify`,
+                // `get_or_load` among them, past the future layout limit.
+                let installed = Box::pin(handle.apply_index_v2(
+                    &index_head_id,
+                    cs,
+                    &self.config.cache_dir,
+                    self.config.leaflet_cache.clone(),
+                    planned_on,
+                ))
+                .await?;
                 Ok(if installed {
                     NotifyResult::IndexUpdated
                 } else {
@@ -2992,15 +2994,15 @@ impl LedgerManager {
                 // Apply index update if present (after commits so novelty has latest flakes).
                 // Reuse the same branch-aware store built above for the commit walk.
                 if let Some((index_head_id, _index_t)) = index_update {
-                    handle
-                        .apply_index_v2(
-                            &index_head_id,
-                            Arc::clone(&cs),
-                            &self.config.cache_dir,
-                            self.config.leaflet_cache.clone(),
-                            planned_on,
-                        )
-                        .await?;
+                    // Boxed, as in the index-only plan above.
+                    Box::pin(handle.apply_index_v2(
+                        &index_head_id,
+                        Arc::clone(&cs),
+                        &self.config.cache_dir,
+                        self.config.leaflet_cache.clone(),
+                        planned_on,
+                    ))
+                    .await?;
                 }
 
                 // Caught-up commits introduced new novelty entries whose
