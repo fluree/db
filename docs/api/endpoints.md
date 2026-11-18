@@ -1151,8 +1151,9 @@ ledger. `/snapshot` filters results to the principal's authorized scope
 (`storage_all` returns everything; otherwise results are filtered to
 `storage_ledgers` and graph sources are excluded).
 
-**Availability:** These endpoints are only available on transaction servers
-(direct storage mode). Proxy-mode instances return `404 Not Found`.
+**Availability:** These endpoints run on the transaction server, whose
+nameservice they read and advance. A query peer, in either storage mode,
+forwards them to its transaction server, as it does transactions.
 
 ### POST /nameservice/refs/{alias}/commit
 
