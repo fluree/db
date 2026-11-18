@@ -19,6 +19,9 @@ crate-type = ["cdylib", "rlib"]
 # --no-default-features`). Native-only subsystems (indexer, import, spatial,
 # memmap) are target-gated inside the api crate, not selected here.
 fluree-db-api = { path = "../fluree-db-api", default-features = false }
+# Peer mode: BrowserPeer assembly (driver, CAS storage, head tracking).
+fluree-db-browser = { path = "../fluree-db-browser" }
+futures = { workspace = true }
 # Only for QueryCancellation (the per-query memory-budget handle).
 fluree-db-core = { path = "../fluree-db-core", default-features = false }
 # Only to name QueryError variants (Cancelled, MemoryBudgetExceeded) when
@@ -29,6 +32,12 @@ wasm-bindgen = "0.2.108"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 console_error_panic_hook = "0.1"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# F3 per-query wall-clock timeout: a TimeoutFuture on the worker event loop,
+# raced against the query and dropped (clearing its setTimeout) when the query
+# wins. wasm-only — the timer is a browser setTimeout.
+gloo-timers = { version = "0.3", features = ["futures"] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"

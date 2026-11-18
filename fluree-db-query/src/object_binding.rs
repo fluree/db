@@ -4,7 +4,7 @@ use fluree_db_core::dict_novelty::{DictNovelty, StringDictNovelty, SubjectDictNo
 use fluree_db_core::ids::DatatypeDictId;
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::{DatatypeConstraint, FlakeValue, Sid};
+use fluree_db_core::{DatatypeConstraint, FlakeValue, GraphId, Sid, NO_ARENA_GRAPH};
 use fluree_vocab::xsd_names;
 use std::sync::{Arc, OnceLock};
 
@@ -75,6 +75,7 @@ pub(crate) fn inline_numeric_encoded_lit(
         lang_id: 0,
         i_val: encoded_i_val(o_i),
         t,
+        arena_g_id: NO_ARENA_GRAPH,
     })
 }
 
@@ -84,6 +85,10 @@ pub(crate) fn inline_numeric_encoded_lit(
 /// then flows onto ref-valued bindings (`EncodedSid` / blank-node `Sid`)
 /// alongside `t`, mirroring how literal-valued objects already carry the
 /// metadata. Callers outside history mode pass `None`.
+///
+/// `g_id` is the graph the row was read from: an arena-backed literal (a big
+/// number or a vector) carries it, since its handle names a value only in
+/// that graph's arena.
 pub(crate) fn late_materialized_object_binding(
     o_type: u16,
     o_key: u64,
@@ -91,6 +96,7 @@ pub(crate) fn late_materialized_object_binding(
     t: i64,
     o_i: u32,
     op: Option<bool>,
+    g_id: GraphId,
 ) -> Option<Binding> {
     let ot = OType::from_u16(o_type);
     match ot.decode_kind() {
@@ -134,6 +140,7 @@ pub(crate) fn late_materialized_object_binding(
                 lang_id,
                 i_val: encoded_i_val(o_i),
                 t,
+                arena_g_id: NO_ARENA_GRAPH,
             })
         }
         DecodeKind::JsonArena => Some(Binding::EncodedLit {
@@ -144,6 +151,7 @@ pub(crate) fn late_materialized_object_binding(
             lang_id: 0,
             i_val: encoded_i_val(o_i),
             t,
+            arena_g_id: NO_ARENA_GRAPH,
         }),
         DecodeKind::VectorArena => Some(Binding::EncodedLit {
             o_kind: ObjKind::VECTOR_ID.as_u8(),
@@ -153,6 +161,7 @@ pub(crate) fn late_materialized_object_binding(
             lang_id: 0,
             i_val: encoded_i_val(o_i),
             t,
+            arena_g_id: g_id,
         }),
         // The arena holds overflow integers and decimals alike, so `dt_id` is
         // a placeholder: decode, then resolve via
@@ -165,6 +174,7 @@ pub(crate) fn late_materialized_object_binding(
             lang_id: 0,
             i_val: encoded_i_val(o_i),
             t,
+            arena_g_id: g_id,
         }),
         // Inline integer/float values whose datatype has a reserved dict id:
         // keep them encoded so they hash/compare/clone as cheap ints through
@@ -186,6 +196,7 @@ pub(crate) fn late_materialized_object_binding(
                 lang_id: 0,
                 i_val: encoded_i_val(o_i),
                 t,
+                arena_g_id: NO_ARENA_GRAPH,
             })
         }
         _ => None,
@@ -339,6 +350,7 @@ pub(crate) fn encoded_equivalent(binding: &Binding, dicts: TermDicts<'_>) -> Opt
                 lang_id,
                 i_val: i32::MIN,
                 t: t.unwrap_or(0),
+                arena_g_id: NO_ARENA_GRAPH,
             })
         }
         _ => None,
@@ -452,7 +464,7 @@ impl<'a> TermDicts<'a> {
     }
 
     /// The dictionaries a novelty-aware graph view resolves through.
-    pub(crate) fn of_view(view: &'a fluree_db_binary_index::BinaryGraphView) -> Self {
+    pub(crate) fn of_view(view: &'a fluree_db_binary_index::TermView) -> Self {
         Self::new(view.store(), view.dict_novelty().map(|dn| &**dn))
     }
 
@@ -620,7 +632,7 @@ pub(crate) struct EqualityNorm {
     novel_strings: bool,
     /// See [`TermDicts`]'s field of the same name.
     novel_predicate_subjects: NovelPredicateSubjects,
-    gv: Option<fluree_db_binary_index::BinaryGraphView>,
+    gv: Option<fluree_db_binary_index::TermView>,
 }
 
 impl EqualityNorm {
@@ -641,7 +653,7 @@ impl EqualityNorm {
         norm: &Option<Self>,
     ) -> (
         Option<TermDicts<'_>>,
-        Option<&fluree_db_binary_index::BinaryGraphView>,
+        Option<&fluree_db_binary_index::TermView>,
     ) {
         match norm {
             Some(n) => (Some(n.dicts()), n.gv.as_ref()),
@@ -673,7 +685,7 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
         novel_subjects,
         novel_strings,
         novel_predicate_subjects: NovelPredicateSubjects::default(),
-        gv: ctx.graph_view(),
+        gv: ctx.term_view(),
     })
 }
 
@@ -681,56 +693,51 @@ pub(crate) fn equality_norm(ctx: &crate::context::ExecutionContext<'_>) -> Optio
 pub(crate) fn normalize_for_key(
     binding: &Binding,
     dicts: Option<TermDicts<'_>>,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
-) -> Binding {
-    normalize_for_key_cow(binding, dicts, gv).into_owned()
+    gv: Option<&fluree_db_binary_index::TermView>,
+) -> Result<Binding, crate::group_aggregate::Undecodable> {
+    Ok(normalize_for_key_cow(binding, dicts, gv)?.into_owned())
 }
 
 /// [`normalize_for_key`] without the clone: an already-encoded binding (the
 /// common case on the indexed scan path) is returned borrowed, so a hot
 /// equality surface such as `DISTINCT` can hash and probe a row without
 /// copying it and only materializes the key for rows it actually keeps.
+///
+/// Fails closed: an arena-backed literal is keyed by its value, so one that
+/// cannot be decoded (no view, or an id the view does not hold) is an error,
+/// never a key by its handle.
 pub(crate) fn normalize_for_key_cow<'a>(
     binding: &'a Binding,
     dicts: Option<TermDicts<'_>>,
-    gv: Option<&fluree_db_binary_index::BinaryGraphView>,
-) -> std::borrow::Cow<'a, Binding> {
+    gv: Option<&fluree_db_binary_index::TermView>,
+) -> Result<std::borrow::Cow<'a, Binding>, crate::group_aggregate::Undecodable> {
     use std::borrow::Cow;
     // An encoded subject id is its own canonical key: the commonest key pays
     // nothing else.
     if let Binding::EncodedSid { .. } = binding {
-        return Cow::Borrowed(binding);
+        return Ok(Cow::Borrowed(binding));
     }
-    // A key over an arena handle with no view to decode it would key by a
-    // graph-scoped handle; member scans of a union of graphs decode them.
-    debug_assert!(
-        gv.is_some() || !is_arena_encoded(binding),
-        "arena-backed literal keyed with no graph view: {binding:?}"
-    );
     if let Some(canonical) = dicts.and_then(|d| encoded_iri_canonical(binding, d)) {
-        return match canonical {
+        return Ok(match canonical {
             Some(b) => Cow::Owned(b),
             None => Cow::Borrowed(binding),
-        };
+        });
     }
-    // Arena-keyed NUM_BIG values normalize by DECODING: handles are scoped
-    // per (graph, predicate), so the encoded form is not a canonical key for
-    // one value across predicates or against decoded rows (VALUES, BIND,
-    // novelty raw-merge). The decoded BigDecimal/BigInt compares and hashes
-    // by numeric value.
-    if is_numbig_encoded(binding) {
-        if let Some(gv) = gv {
-            let materialized = crate::group_aggregate::materialize_encoded(binding, Some(gv));
-            if !matches!(materialized, Binding::EncodedLit { .. }) {
-                return Cow::Owned(materialized);
-            }
-        }
-        return Cow::Borrowed(binding);
+    // Arena-backed literals (NUM_BIG, VECTOR) normalize by DECODING: handles
+    // are scoped per (graph, predicate), and one predicate's arena can hold
+    // one value under two handles, so the encoded form is not a canonical key
+    // for one value across handles, predicates or graphs, or against decoded
+    // rows (VALUES, BIND, novelty raw-merge). The decoded value compares and
+    // hashes by value.
+    if is_arena_encoded(binding) {
+        return Ok(Cow::Owned(crate::group_aggregate::materialize_encoded(
+            binding, gv,
+        )?));
     }
-    match dicts.and_then(|d| encoded_equivalent(binding, d)) {
+    Ok(match dicts.and_then(|d| encoded_equivalent(binding, d)) {
         Some(encoded) => Cow::Owned(encoded),
         None => Cow::Borrowed(binding),
-    }
+    })
 }
 
 /// Whether two bindings are one RDF term, across the forms one term takes:
@@ -739,7 +746,8 @@ pub(crate) fn normalize_for_key_cow<'a>(
 /// structurally and answers `false` across them.
 ///
 /// Equal bindings answer at once, and two bindings of one form other than
-/// NUM_BIG literals (whose encoded key is scoped per predicate) are two terms;
+/// arena-backed literals (whose handles one value can have several of) are
+/// two terms;
 /// only a pair of different forms pays for canonicalization, through the same
 /// [`normalize_for_key_cow`] the keyed equality surfaces use. `norm` is the
 /// caller's, built once ([`equality_norm`]).
@@ -770,7 +778,7 @@ pub(crate) fn same_term(
                 return Ok(same);
             }
             let (dicts, gv) = EqualityNorm::parts(norm);
-            normalize_for_key_cow(a, dicts, gv) == normalize_for_key_cow(b, dicts, gv)
+            normalize_for_key_cow(a, dicts, gv)? == normalize_for_key_cow(b, dicts, gv)?
         }
     })
 }
@@ -796,7 +804,7 @@ fn undecodable_arena_literal(a: &Binding, b: &Binding) -> crate::error::QueryErr
 fn encoded_against_decoded_subject(
     a: &Binding,
     b: &Binding,
-    gv: &fluree_db_binary_index::BinaryGraphView,
+    gv: &fluree_db_binary_index::TermView,
 ) -> Option<bool> {
     let (s_id, sid) = match (a, b) {
         (Binding::EncodedSid { s_id, .. }, Binding::Sid { sid, .. })
@@ -824,20 +832,21 @@ pub(crate) fn same_term_in(
         Some(same) => same,
         None => {
             let dicts = ctx.and_then(equality_dicts);
-            normalize_for_key_cow(a, dicts, None) == normalize_for_key_cow(b, dicts, None)
+            normalize_for_key_cow(a, dicts, None)? == normalize_for_key_cow(b, dicts, None)?
         }
     })
 }
 
 /// The answer [`same_term`] gives without canonicalizing: `true` for equal
-/// bindings, `false` for two of one form (other than NUM_BIG), `None` for a
+/// bindings, `false` for two of one form (other than arena-backed literals),
+/// `None` for a
 /// pair of forms that must be canonicalized to compare.
 #[inline]
 fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
     if a == b {
         return Some(true);
     }
-    if std::mem::discriminant(a) == std::mem::discriminant(b) && !is_numbig_encoded(a) {
+    if std::mem::discriminant(a) == std::mem::discriminant(b) && !is_arena_encoded(a) {
         return Some(false);
     }
     None
@@ -850,90 +859,80 @@ fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
 pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
     matches!(
         binding,
-        Binding::EncodedLit { o_kind, .. }
-            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
-                || *o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8()
+        Binding::EncodedLit { o_kind, .. } if crate::binding::is_arena_kind(*o_kind)
     )
 }
 
-/// True if this is an arena-backed (NUM_BIG) encoded literal.
-pub(crate) fn is_numbig_encoded(binding: &Binding) -> bool {
-    matches!(
-        binding,
-        Binding::EncodedLit { o_kind, .. }
-            if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
-    )
+/// What crosses between a context and a scope derived from it (a `GRAPH`
+/// scope, a `SERVICE` body) that the receiving side could not decode.
+///
+/// An encoded binding names a term of its store, and an arena literal carries
+/// the graph it was read from, so scopes over one store pass bindings on
+/// encoded, both ways. Only a side with no [`term_view`] gets them decoded,
+/// through the other side's view: a cross-ledger body, which runs with no
+/// store, on the way in; an outer default graph whose members are not
+/// certified to one store (they decode as they scan) on the way out.
+///
+/// [`term_view`]: crate::context::ExecutionContext::term_view
+pub(crate) struct ScopeCrossing {
+    /// Decodes what enters a scope that cannot decode it.
+    enter: Option<fluree_db_binary_index::TermView>,
+    /// Decodes what leaves for an outer context that cannot decode it.
+    leave: Option<fluree_db_binary_index::TermView>,
 }
 
-/// What an arena-backed literal needs to cross between a context and a scope
-/// that reads another graph (a GRAPH scope): a handle names its value only
-/// within the graph that bound it, so one crossing in either direction is
-/// decoded through that graph. Nothing is decoded when both sides read the
-/// same single graph, where a handle means the same value on either side.
-pub(crate) struct ArenaCrossing {
-    /// The outer graph: decodes the handles the seeding row carries in.
-    enter: Option<fluree_db_binary_index::BinaryGraphView>,
-    /// The scope's graph: decodes the handles its rows carry out.
-    leave: Option<fluree_db_binary_index::BinaryGraphView>,
-    /// Decode every encoded binding leaving, not only arena handles: the
-    /// outer context spans several graphs, whose members decode as they scan.
-    leave_all: bool,
-}
-
-impl ArenaCrossing {
-    /// The crossing between `outer` and a `scope` derived from it. An outer
-    /// context that spans several graphs (a union) has no graph to decode a
-    /// binding through, so everything encoded leaving the scope for it is
-    /// decoded.
+impl ScopeCrossing {
+    /// The crossing between `outer` and a `scope` derived from it.
     pub(crate) fn between(
         outer: &crate::context::ExecutionContext<'_>,
         scope: &crate::context::ExecutionContext<'_>,
     ) -> Self {
-        let same_graph = outer.has_binary_store()
-            && scope.has_binary_store()
-            && outer.binary_g_id == scope.binary_g_id;
-        if same_graph {
-            return Self {
-                enter: None,
-                leave: None,
-                leave_all: false,
-            };
-        }
-        Self {
-            enter: outer.graph_view(),
-            leave: scope.graph_view(),
-            leave_all: !outer.has_binary_store(),
-        }
-    }
-
-    /// Nothing crosses that needs decoding: both sides read one single graph,
-    /// or neither has a graph to decode through.
-    pub(crate) fn is_noop(&self) -> bool {
-        self.enter.is_none() && self.leave.is_none()
-    }
-
-    /// Decode, through the outer graph, the arena handles in a row that seeds
-    /// the scope.
-    pub(crate) fn enter(&self, row: &mut [Binding]) {
-        let Some(gv) = self.enter.as_ref() else {
-            return;
+        let (outer_view, scope_view) = (outer.term_view(), scope.term_view());
+        let (enter, leave) = match (outer_view, scope_view) {
+            (Some(outer_view), None) => (Some(outer_view), None),
+            (None, Some(scope_view)) => (None, Some(scope_view)),
+            _ => (None, None),
         };
-        for binding in row.iter_mut().filter(|b| is_arena_encoded(b)) {
-            *binding = crate::group_aggregate::materialize_encoded(binding, Some(gv));
-        }
+        Self { enter, leave }
     }
 
-    /// `binding`, bound inside the scope, decoded through the scope's graph
-    /// when it is an arena handle, or any encoded binding for a union.
-    pub(crate) fn leave(&self, binding: Binding) -> Binding {
-        let decode = if self.leave_all {
-            binding.is_encoded()
-        } else {
-            is_arena_encoded(&binding)
+    /// Decode the encoded bindings of a row that seeds the scope, when the
+    /// scope cannot decode them.
+    pub(crate) fn enter(&self, row: &mut [Binding]) -> crate::error::Result<()> {
+        let Some(view) = self.enter.as_ref() else {
+            return Ok(());
         };
+        for binding in row.iter_mut().filter(|b| b.is_encoded()) {
+            *binding = crate::group_aggregate::materialize_encoded(binding, Some(view))?;
+        }
+        Ok(())
+    }
+
+    /// [`Self::enter`] for a whole seeding batch.
+    pub(crate) fn enter_batch(
+        &self,
+        batch: &crate::binding::Batch,
+    ) -> crate::error::Result<crate::binding::Batch> {
+        if self.enter.is_none() {
+            return Ok(batch.clone());
+        }
+        let (schema, mut columns, len) = batch.clone().into_parts();
+        for column in &mut columns {
+            self.enter(column)?;
+        }
+        crate::binding::Batch::from_parts(schema, columns, len)
+            .map_err(|e| crate::error::QueryError::Internal(e.to_string()))
+    }
+
+    /// `binding`, bound inside the scope, decoded when the outer context
+    /// cannot decode it.
+    pub(crate) fn leave(&self, binding: Binding) -> crate::error::Result<Binding> {
         match &self.leave {
-            Some(gv) if decode => crate::group_aggregate::materialize_encoded(&binding, Some(gv)),
-            _ => binding,
+            Some(view) if binding.is_encoded() => Ok(crate::group_aggregate::materialize_encoded(
+                &binding,
+                Some(view),
+            )?),
+            _ => Ok(binding),
         }
     }
 }
@@ -987,6 +986,7 @@ mod tests {
             0,
             u32::MAX,
             None,
+            0,
         )
         .expect("xsd:date should stay encoded");
 
@@ -1012,6 +1012,7 @@ mod tests {
             0,
             u32::MAX,
             None,
+            0,
         )
         .expect("xsd:dateTime should stay encoded");
 
@@ -1039,7 +1040,7 @@ mod tests {
             (OType::lang_string(3), DatatypeDictId::LANG_STRING, 3),
         ] {
             let binding =
-                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None)
+                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None, 0)
                     .unwrap_or_else(|| panic!("{o_type:?} should stay encoded"));
             assert!(
                 matches!(
@@ -1075,7 +1076,7 @@ mod tests {
                 "{o_type:?} is expected to be a string-dictionary type"
             );
             assert!(
-                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None)
+                late_materialized_object_binding(o_type.as_u16(), 42, 5, 0, u32::MAX, None, 0)
                     .is_none(),
                 "{o_type:?} must not borrow another datatype's dictionary id"
             );
@@ -1091,7 +1092,7 @@ mod tests {
         use crate::binding::is_string_dict_term;
 
         for o_type in [OType::XSD_STRING, OType::FULLTEXT, OType::lang_string(1)] {
-            let b = late_materialized_object_binding(o_type.as_u16(), 1, 1, 0, u32::MAX, None)
+            let b = late_materialized_object_binding(o_type.as_u16(), 1, 1, 0, u32::MAX, None, 0)
                 .unwrap_or_else(|| panic!("{o_type:?} should stay encoded"));
             assert!(is_string_dict_term(&b), "encoded {o_type:?}");
         }
@@ -1106,9 +1107,16 @@ mod tests {
         }
         // Numerics are outside the lane on both sides — the join stays lenient
         // across their subtypes.
-        let n =
-            late_materialized_object_binding(OType::XSD_INTEGER.as_u16(), 1, 1, 0, u32::MAX, None)
-                .expect("xsd:integer stays encoded");
+        let n = late_materialized_object_binding(
+            OType::XSD_INTEGER.as_u16(),
+            1,
+            1,
+            0,
+            u32::MAX,
+            None,
+            0,
+        )
+        .expect("xsd:integer stays encoded");
         assert!(!is_string_dict_term(&n));
         assert!(!is_string_dict_term(&Binding::lit(
             FlakeValue::Long(1),

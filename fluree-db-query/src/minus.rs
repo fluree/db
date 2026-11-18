@@ -120,7 +120,7 @@ impl MinusOperator {
     #[cfg(test)]
     fn build_hash_index(&mut self, batches: Vec<Batch>) {
         for batch in &batches {
-            self.index_minus_batch(batch);
+            self.index_minus_batch(batch).unwrap();
         }
     }
 
@@ -135,6 +135,7 @@ impl MinusOperator {
             dicts,
             gv,
         )
+        .unwrap()
     }
 
     /// True when no input row can be eliminated: nothing is shared, or the
@@ -147,26 +148,33 @@ impl MinusOperator {
     }
 
     /// Per-row keep flags for `batch`.
-    fn keep_mask(&self, batch: &Batch) -> Vec<bool> {
+    fn keep_mask(&self, batch: &Batch) -> Result<Vec<bool>> {
         let mut input_bindings = Vec::with_capacity(self.shared_vars.len());
         let mut probe = MinusKey(Vec::with_capacity(self.shared_vars.len()));
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
         (0..batch.len())
             .map(|row_idx| {
-                !self.row_eliminated(batch, row_idx, &mut input_bindings, &mut probe, dicts, gv)
+                Ok(!self.row_eliminated(
+                    batch,
+                    row_idx,
+                    &mut input_bindings,
+                    &mut probe,
+                    dicts,
+                    gv,
+                )?)
             })
             .collect()
     }
 
     /// Add one batch of MINUS rows to the hash set and wildcard list.
-    fn index_minus_batch(&mut self, batch: &Batch) {
+    fn index_minus_batch(&mut self, batch: &Batch) -> Result<()> {
         if let [var] = self.shared_vars.as_slice() {
             let Some(column) = batch.column(*var) else {
-                return;
+                return Ok(());
             };
             let (dicts, gv) = EqualityNorm::parts(&self.norm);
             for binding in column.iter().filter(|b| b.is_matchable()) {
-                let key = normalize_for_key_cow(binding, dicts, gv);
+                let key = normalize_for_key_cow(binding, dicts, gv)?;
                 if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
                     self.minus_subjects.insert(*s_id);
                 } else {
@@ -175,7 +183,7 @@ impl MinusOperator {
             }
             // With one shared variable, an unbound right row has no shared
             // bound domain and therefore cannot eliminate any left row.
-            return;
+            return Ok(());
         }
         let (dicts, gv) = EqualityNorm::parts(&self.norm);
         for row_idx in 0..batch.len() {
@@ -186,7 +194,7 @@ impl MinusOperator {
                 let binding = batch.column(var).map(|col| &col[row_idx]);
                 match binding {
                     Some(b) if b.is_matchable() => {
-                        key_bindings.push(Some(normalize_for_key(b, dicts, gv)));
+                        key_bindings.push(Some(normalize_for_key(b, dicts, gv)?));
                     }
                     _ => {
                         key_bindings.push(None);
@@ -208,6 +216,7 @@ impl MinusOperator {
                 self.minus_hash.insert(key);
             }
         }
+        Ok(())
     }
 
     /// Check if an input row is eliminated by the MINUS.
@@ -230,25 +239,25 @@ impl MinusOperator {
         input_bindings: &mut Vec<Option<Binding>>,
         probe: &mut MinusKey,
         dicts: Option<TermDicts<'_>>,
-        gv: Option<&fluree_db_binary_index::BinaryGraphView>,
-    ) -> bool {
+        gv: Option<&fluree_db_binary_index::TermView>,
+    ) -> Result<bool> {
         if let [var] = self.shared_vars.as_slice() {
             let Some(binding) = input_batch.column(*var).map(|col| &col[row_idx]) else {
-                return false;
+                return Ok(false);
             };
             if let Binding::EncodedSid { s_id, .. } = binding {
-                return self.minus_subjects.contains(s_id);
+                return Ok(self.minus_subjects.contains(s_id));
             }
             if !binding.is_matchable() {
-                return false;
+                return Ok(false);
             }
-            let key = normalize_for_key_cow(binding, dicts, gv);
+            let key = normalize_for_key_cow(binding, dicts, gv)?;
             if let Binding::EncodedSid { s_id, .. } = key.as_ref() {
-                return self.minus_subjects.contains(s_id);
+                return Ok(self.minus_subjects.contains(s_id));
             }
             probe.0.clear();
             probe.0.push(key.into_owned());
-            return self.minus_hash.contains(probe);
+            return Ok(self.minus_hash.contains(probe));
         }
         // Extract input shared-var bindings
         input_bindings.clear();
@@ -258,7 +267,7 @@ impl MinusOperator {
             let binding = input_batch.column(var).map(|col| &col[row_idx]);
             match binding {
                 Some(b) if b.is_matchable() => {
-                    input_bindings.push(Some(normalize_for_key(b, dicts, gv)));
+                    input_bindings.push(Some(normalize_for_key(b, dicts, gv)?));
                 }
                 _ => {
                     input_bindings.push(None);
@@ -277,19 +286,19 @@ impl MinusOperator {
                     .map(|opt| opt.take().expect("checked: no wildcard")),
             );
             if self.minus_hash.contains(probe) {
-                return true;
+                return Ok(true);
             }
 
             // Check wildcard minus rows — O(W), W typically 0. A wildcard
             // minus row matches if every matchable position equals the input.
             if self.minus_wildcards.is_empty() {
-                return false;
+                return Ok(false);
             }
             input_bindings.clear();
             input_bindings.extend(probe.0.iter().cloned().map(Some));
             for wc_row in &self.minus_wildcards {
                 if wildcard_matches(input_bindings, wc_row) {
-                    return true;
+                    return Ok(true);
                 }
             }
         } else {
@@ -299,19 +308,19 @@ impl MinusOperator {
             // Check minus_hash entries
             for entry in &self.minus_hash {
                 if matches_partial(input_bindings, &entry.0) {
-                    return true;
+                    return Ok(true);
                 }
             }
 
             // Check wildcard minus rows
             for wc_row in &self.minus_wildcards {
                 if wildcard_matches(input_bindings, wc_row) {
-                    return true;
+                    return Ok(true);
                 }
             }
         }
 
-        false
+        Ok(false)
     }
 }
 
@@ -446,7 +455,7 @@ impl Operator for MinusOperator {
                         self.minus_hash.len(),
                         self.minus_wildcards.len(),
                     );
-                    self.index_minus_batch(&batch);
+                    self.index_minus_batch(&batch)?;
                     // Approximate retained keys, excluding table slack and
                     // shared payloads, charged only when the index grows.
                     let tuple_bytes = std::mem::size_of::<MinusKey>()
@@ -498,7 +507,7 @@ impl Operator for MinusOperator {
                 return Ok(Some(input_batch));
             }
 
-            let keep = self.keep_mask(&input_batch);
+            let keep = self.keep_mask(&input_batch)?;
             if let Some(kept) = input_batch.filter_rows(&keep) {
                 return Ok(Some(kept));
             }
@@ -530,7 +539,7 @@ impl Operator for MinusOperator {
                     let kept = if self.keeps_all() {
                         batch.len()
                     } else {
-                        self.keep_mask(&batch).iter().filter(|&&k| k).count()
+                        self.keep_mask(&batch)?.iter().filter(|&&k| k).count()
                     };
                     count = count.checked_add(kept as u64).ok_or_else(|| {
                         QueryError::execution("COUNT(*) overflow in MINUS drain_count")

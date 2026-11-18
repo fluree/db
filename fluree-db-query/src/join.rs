@@ -25,12 +25,15 @@ use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, CountGroup, Operator,
     OperatorState,
 };
+use crate::union_fact::{FactRef, UnionFactSet};
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore};
+use fluree_db_binary_index::{BinaryGraphView, BinaryIndexStore, TermView};
 use fluree_db_core::clock::Instant;
 use fluree_db_core::subject_id::SubjectId;
-use fluree_db_core::{DatatypeDictId, GraphId, IndexType, ObjectBounds, Sid, BATCHED_JOIN_SIZE};
+use fluree_db_core::{
+    DatatypeDictId, GraphId, IndexType, OType, ObjectBounds, Sid, BATCHED_JOIN_SIZE,
+};
 use rustc_hash::{FxBuildHasher, FxHashMap};
 use std::collections::{HashSet, VecDeque};
 use std::sync::Arc;
@@ -111,7 +114,7 @@ struct GroupedCountDrain {
     output_columns: Vec<usize>,
     groups: hashbrown::HashMap<CompositeGroupKey, CountGroup, FxBuildHasher>,
     key: CompositeGroupKey,
-    graph_view: Option<BinaryGraphView>,
+    graph_view: Option<TermView>,
     counted_rows: u64,
 }
 
@@ -127,13 +130,13 @@ impl GroupedCountDrain {
         };
         self.key.0.clear();
         let dicts = self.graph_view.as_ref().map(TermDicts::of_view);
-        self.key.0.extend(columns.iter().map(|&col| {
-            binding_to_group_key_normalized(
+        for &col in columns {
+            self.key.0.push(binding_to_group_key_normalized(
                 batch.get_by_col(row, col),
                 dicts,
                 self.graph_view.as_ref(),
-            )
-        }));
+            )?);
+        }
         let (_, group) = self
             .groups
             .raw_entry_mut()
@@ -179,16 +182,20 @@ impl LeafScan {
     /// Load one leaflet's `proj` columns, through the store's leaflet cache
     /// when it has one, and replay it to `replay_to` on a historical read. An
     /// empty-after-retract leaflet starts empty so the replay can rebuild it.
+    /// Charges `tracker` one index touch for the read, as the cursor does.
     pub(crate) fn load_leaflet(
         &self,
         store: &BinaryIndexStore,
         leaflet_idx: usize,
         proj: &fluree_db_binary_index::ColumnProjection,
         replay_to: Option<i64>,
+        tracker: &fluree_db_core::Tracker,
     ) -> Result<fluree_db_binary_index::ColumnBatch> {
         use fluree_db_binary_index::read::column_loader::{
             load_leaflet_columns, load_leaflet_columns_cached, LeafletDecodeSpec,
         };
+
+        crate::fast_path_common::charge_leaflet(tracker)?;
 
         let entry = &self.dir.entries[leaflet_idx];
         let batch = if entry.row_count == 0 {
@@ -220,7 +227,7 @@ impl LeafScan {
                     self.header.order,
                 ),
             }
-            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
+            .map_err(|e| QueryError::from_io("load columns", e))?
         };
         let Some(to_t) = replay_to else {
             return Ok(batch);
@@ -340,6 +347,62 @@ pub(crate) fn prepare_leaf_for_scan(
     })
 }
 
+/// Whether a PSOT leaflet's directory entry leaves room for any of the sorted
+/// `s_ids` under `p_id`, judged before its columns are loaded.
+///
+/// A scattered probe set spans most of the predicate partition but touches
+/// few of its leaflets, so this declines the rest before the column load and
+/// p-run walk. Only predicate-homogeneous leaflets are judged: a mixed one
+/// restarts `s_id` at each predicate boundary, so its key range is no
+/// subject interval. A history replay is never declined, since a
+/// current-state key range can omit subjects that existed at an earlier `t`.
+fn psot_leaflet_may_hold_subjects(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+    p_id: u32,
+    s_ids: &[u64],
+    replays_history: bool,
+) -> bool {
+    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
+    use fluree_db_binary_index::RunSortOrder;
+
+    if entry.p_const != Some(p_id) || replays_history {
+        return true;
+    }
+    let lo = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key)
+        .s_id
+        .as_u64();
+    let hi = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key)
+        .s_id
+        .as_u64();
+    s_ids.partition_point(|&x| x < lo) < s_ids.partition_point(|&x| x <= hi)
+}
+
+/// The `[start, end)` rows of `p_id` in a loaded PSOT leaflet. A
+/// predicate-homogeneous leaflet is all `p_id`, so it skips the row walks.
+///
+/// `p_const` is taken over the live rows. A history replay can restore rows
+/// of another predicate (indexes built before v4.1.6 filed a fully retracted
+/// predicate's history under the next predicate's leaflet), so a replayed
+/// leaflet is walked.
+fn psot_p_run(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+    batch: &fluree_db_binary_index::ColumnBatch,
+    p_id: u32,
+    replays_history: bool,
+) -> (usize, usize) {
+    let row_count = batch.row_count;
+    if entry.p_const == Some(p_id) && !replays_history {
+        return (0, row_count);
+    }
+    let p_start = (0..row_count)
+        .position(|i| batch.p_id.get_or(i, 0) >= p_id)
+        .unwrap_or(row_count);
+    let p_end = (p_start..row_count)
+        .position(|i| batch.p_id.get_or(i, 0) > p_id)
+        .map_or(row_count, |offset| p_start + offset);
+    (p_start, p_end)
+}
+
 /// Binary search for the first row in `batch.s_id[start..end]` where `s_id >= target`.
 #[inline]
 fn lower_bound_s_id(
@@ -386,6 +449,8 @@ fn upper_bound_s_id(
 pub(crate) struct BatchedSubjectProbeMatch {
     pub subject_id: u64,
     pub object: Option<Binding>,
+    /// The fact's list position; `u32::MAX` when it is not a list item.
+    pub o_i: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -513,9 +578,9 @@ pub(crate) fn substitute_binding(
     pattern: &mut TriplePattern,
     position: PatternPosition,
     binding: &Binding,
-    gv: Option<&BinaryGraphView>,
+    gv: Option<&TermView>,
 ) -> Result<Substitution> {
-    let resolve_subject = |gv: &BinaryGraphView, s_id: u64| -> Result<Arc<str>> {
+    let resolve_subject = |gv: &TermView, s_id: u64| -> Result<Arc<str>> {
         let iri = gv.resolve_subject_iri(s_id).map_err(|e| {
             tracing::debug!(s_id, error = %e, "failed to resolve encoded subject binding");
             QueryError::dictionary_lookup(format!(
@@ -525,7 +590,7 @@ pub(crate) fn substitute_binding(
         Ok(Arc::from(iri))
     };
     let resolve_predicate =
-        |gv: &BinaryGraphView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
+        |gv: &TermView, p_id: u32| gv.store().resolve_predicate_iri(p_id).map(Arc::from);
 
     match position {
         PatternPosition::Subject | PatternPosition::Predicate => {
@@ -585,6 +650,7 @@ pub(crate) fn substitute_binding(
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => {
                 // Decode the encoded literal (novelty-aware via BinaryGraphView).
@@ -595,7 +661,7 @@ pub(crate) fn substitute_binding(
                     return Ok(Substitution::Free);
                 };
                 let val = gv
-                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                    .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                     .map_err(|e| {
                         tracing::debug!(
                             o_kind,
@@ -683,6 +749,101 @@ fn grouped_in_substitution() -> QueryError {
     QueryError::Internal(
         "grouped (list-valued) binding reached a correlated substitution".to_string(),
     )
+}
+
+/// Routing-stamp site of the nested-loop join's batched probe lanes over one
+/// graph (subject, object and existence probes).
+pub const NESTED_LOOP_BATCHED_SITE: &str = "nested-loop-batched";
+
+/// Routing-stamp site of the same probes over a default graph of several
+/// graphs of one ledger ([`UnionProbe`]).
+pub const NESTED_LOOP_BATCHED_UNION_SITE: &str = "nested-loop-batched-union";
+
+/// One row a batched subject probe matched ([`NestedLoopJoinOperator::scan_matches`]).
+struct SubjectMatch<'m> {
+    /// The probed subject.
+    s_id: u64,
+    /// The accumulated left rows that probed it.
+    accum: &'m [usize],
+    /// The object the row binds.
+    object: &'m Binding,
+    /// The fact's list position; `u32::MAX` when it is not a list item.
+    o_i: u32,
+}
+
+/// The batched probes over a default graph of several graphs of one ledger
+/// (`IndexScope::Union`): each member's leaves are probed under the context
+/// `DatasetOperator` would give it (its graph, novelty and `t`), and the
+/// matches become one row per fact of the union ([`UnionFactSet`], the key
+/// the general plan's dedup uses). `plans` holds one probe plan per member, in
+/// `ctx.active_graphs()` order.
+struct UnionProbe {
+    plans: Vec<ProbeLanePlan>,
+}
+
+/// Where a batched subject probe reads: one graph's PSOT leaves, or every
+/// member of a union ([`UnionProbe`]).
+enum SubjectProbeSource<'b> {
+    One {
+        branch: &'b fluree_db_binary_index::BranchManifest,
+        leaf_range: std::ops::Range<usize>,
+        probe_ops: Option<ProbeOps>,
+    },
+    Union(Arc<UnionProbe>),
+}
+
+/// A match a union probe collected from one member, before the union keeps
+/// one row per fact.
+struct UnionMatch {
+    /// The probed key: a subject (subject and existence probes) or an object
+    /// (the object probe's `objs` index).
+    key: u64,
+    member: usize,
+    /// The term the row binds, as the member's probe bound it: encoded where
+    /// the index holds it encoded. The union's term view decodes it later,
+    /// and the fact is keyed on it through [`UnionFactSet::insert`], which keys an
+    /// arena literal (it carries its graph) by value.
+    object: Binding,
+    o_i: u32,
+}
+
+impl UnionMatch {
+    fn new(key: u64, member: usize, object: &Binding, o_i: u32) -> Self {
+        Self {
+            key,
+            member,
+            object: object.clone(),
+            o_i,
+        }
+    }
+
+    fn list_index(&self) -> Option<u32> {
+        (self.o_i != u32::MAX).then_some(self.o_i)
+    }
+}
+
+/// The matches a union probe keeps, in member order: every match of a key
+/// only one member matched (a graph holds each fact once), and the first row
+/// of each fact of a key two or more members matched. `insert` puts the fact a
+/// match is into a set of facts of `bindings` bindings
+/// ([`UnionFactSet::insert`]).
+fn union_keep(
+    matches: &[UnionMatch],
+    bindings: usize,
+    mut insert: impl FnMut(&mut UnionFactSet, &UnionMatch) -> Result<bool>,
+) -> Result<Vec<bool>> {
+    let mut first_member: FxHashMap<u64, (usize, bool)> = FxHashMap::default();
+    for m in matches {
+        let entry = first_member.entry(m.key).or_insert((m.member, false));
+        if entry.0 != m.member {
+            entry.1 = true;
+        }
+    }
+    let mut seen = UnionFactSet::new(bindings);
+    matches
+        .iter()
+        .map(|m| Ok(!first_member[&m.key].1 || insert(&mut seen, m)?))
+        .collect()
 }
 
 /// Identifies the source of a left row in `pending_output`.
@@ -999,6 +1160,10 @@ pub struct NestedLoopJoinOperator {
     out_schema: Option<Arc<[VarId]>>,
     /// Emit the runtime path decision once per open().
     logged_runtime_mode: bool,
+    /// The batched probes over a union of graphs, decided once per `open()`
+    /// (`plan_union_probe`): `None` until decided, `Some(None)` when they
+    /// stand down.
+    union_probe: Option<Option<Arc<UnionProbe>>>,
     /// Temporal mode captured at planner-time for the late per-row right scan.
     mode: crate::temporal_mode::TemporalMode,
     /// The object→subject hash-join decision that was evaluated and *lost* for
@@ -1232,6 +1397,7 @@ impl NestedLoopJoinOperator {
             right_index_hint,
             out_schema: None,
             logged_runtime_mode: false,
+            union_probe: None,
             mode,
             hj_decision: None,
         }
@@ -1309,7 +1475,7 @@ impl NestedLoopJoinOperator {
         &self,
         left_batch: &Batch,
         left_row: usize,
-        view: Option<&BinaryGraphView>,
+        view: Option<&TermView>,
     ) -> Result<Option<TriplePattern>> {
         let mut pattern = self.right_pattern.clone();
         for instr in &self.bind_instructions {
@@ -1437,6 +1603,10 @@ impl Operator for NestedLoopJoinOperator {
             "right".into(),
             crate::explain::format_pattern(&self.right_pattern).into(),
         );
+        // A FILTER pushed into the right side's probes, as a scan reports it.
+        if self.object_bounds.is_some() {
+            m.insert("object-bounds".into(), true.into());
+        }
         if let Some(d) = &self.hj_decision {
             d.write_details(&mut m);
         }
@@ -1479,6 +1649,9 @@ impl Operator for NestedLoopJoinOperator {
         // Open left operator
         self.left.open(ctx).await?;
         self.norm = equality_norm(ctx);
+        if let Some(bounds) = self.object_bounds.as_mut() {
+            crate::binary_scan::resolve_bound_datatype(bounds, ctx, ctx.binary_store.as_deref());
+        }
 
         // Reset state for fresh execution
         self.pending_output.clear();
@@ -1493,6 +1666,7 @@ impl Operator for NestedLoopJoinOperator {
         self.active_right_batch_ref = None;
         self.active_right_left_row = 0;
         self.logged_runtime_mode = false;
+        self.union_probe = None;
         self.batched_key_memo.clear();
         self.batched_overlay_deferred = false;
         self.batched_keys_unresolved = false;
@@ -1562,15 +1736,12 @@ impl Operator for NestedLoopJoinOperator {
                 // does. Multi-ledger eager rows also need `IriMatch`
                 // provenance, which only the per-row path stamps.
                 && !(ctx.eager_materialization && ctx.is_multi_ledger())
-                && match ctx.active_graphs() {
-                    // Object-batched path currently emits `Binding::EncodedSid` for the new
-                    // subject var. Keep it single-ledger only to avoid dataset-mode IriMatch
-                    // requirements.
-                    ActiveGraphs::Single => true,
-                    ActiveGraphs::Many(graphs) => {
-                        (self.batched_eligible || self.batched_exists_eligible) && graphs.len() == 1
-                    }
-                };
+                // The batched lanes read one graph's leaves (`binary_g_id`'s).
+                && ctx.reads_exactly_one_graph()
+                // Object-batched path currently emits `Binding::EncodedSid` for the new
+                // subject var. Keep it to a scope with no dataset, to avoid dataset-mode
+                // IriMatch requirements.
+                && (ctx.dataset.is_none() || self.batched_eligible || self.batched_exists_eligible);
 
         if !self.logged_runtime_mode {
             let (active_graph_mode, active_graph_count) = match ctx.active_graphs() {
@@ -1587,12 +1758,30 @@ impl Operator for NestedLoopJoinOperator {
                 active_graph_count,
                 "nested loop join runtime path"
             );
+            if use_batched {
+                crate::fast_path_outcome::stamp_fast_path(
+                    NESTED_LOOP_BATCHED_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
             self.logged_runtime_mode = true;
         }
+        // Over a union of graphs of one ledger the one-graph lanes stand
+        // down (`reads_exactly_one_graph`); the union variant probes every
+        // member instead. Decided once per open, before anything accumulates.
+        if self.union_probe.is_none() {
+            let plan = if use_batched {
+                None
+            } else {
+                self.plan_union_probe(ctx)?.map(Arc::new)
+            };
+            self.union_probe = Some(plan);
+        }
+        let use_batched = use_batched || matches!(self.union_probe, Some(Some(_)));
 
         // Built once for the whole next_batch call (avoids repeated Arc::clone
         // + construction per row).
-        let cached_view = ctx.graph_view();
+        let cached_view = ctx.term_view();
 
         // Process until we have output or exhaust input
         loop {
@@ -1803,12 +1992,14 @@ impl Operator for NestedLoopJoinOperator {
         &mut self,
         ctx: &ExecutionContext<'_>,
         group_vars: &[VarId],
+        bound_vars: &[VarId],
     ) -> Result<Option<Vec<CountGroup>>> {
         if !self.state.can_next()
             || !self.batched_eligible
             || self.right_new_vars.is_empty()
             || self.inline_has_bind()
             || group_vars.is_empty()
+            || !bound_vars.is_empty()
         {
             return Ok(None);
         }
@@ -1828,7 +2019,7 @@ impl Operator for NestedLoopJoinOperator {
             output_columns,
             groups: hashbrown::HashMap::with_hasher(FxBuildHasher),
             key: CompositeGroupKey(Vec::with_capacity(group_vars.len())),
-            graph_view: ctx.graph_view(),
+            graph_view: ctx.term_view(),
             counted_rows: 0,
         });
         let result: Result<u64> = async {
@@ -2015,7 +2206,7 @@ impl NestedLoopJoinOperator {
         ctx: &ExecutionContext<'_>,
         batch_idx: usize,
         left_row: usize,
-        view: Option<&BinaryGraphView>,
+        view: Option<&TermView>,
     ) -> Result<()> {
         let left_batch = &self.stored_left_batches[batch_idx];
         let Some(bound_pattern) = self.substitute_pattern_with_store(left_batch, left_row, view)?
@@ -2172,7 +2363,11 @@ impl NestedLoopJoinOperator {
             }
             self.batched_overlay_mode = self.compute_batched_overlay_mode(ctx)?;
         }
-        if matches!(self.batched_overlay_mode, ProbeLanePlan::Decline) {
+        // The union variant carries its members' own plans; the one-graph
+        // plan declines every union scope (`probe_lane_admission`).
+        if self.union_plans().is_none()
+            && matches!(self.batched_overlay_mode, ProbeLanePlan::Decline)
+        {
             tracing::debug!(
                 input_rows = self.batched_accumulator.len(),
                 "join batched probe: overlay plan declined; per-row"
@@ -2226,6 +2421,110 @@ impl NestedLoopJoinOperator {
         }
     }
 
+    /// The batched probes over a default graph of several graphs of one
+    /// ledger, or `None` where they stand down (stamped at
+    /// [`NESTED_LOOP_BATCHED_UNION_SITE`] when the scope is such a union).
+    ///
+    /// Each member is read under the context `DatasetOperator` gives it, and
+    /// must be the member `IndexScope::Union` certified (one store, its
+    /// graph and `t`). A member whose own graph has novelty for the probed
+    /// predicate declines the variant for now (`Novelty`); a member with no
+    /// novelty and no branch holds nothing for it and is no reason to
+    /// decline.
+    fn plan_union_probe(&self, ctx: &ExecutionContext<'_>) -> Result<Option<UnionProbe>> {
+        use crate::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
+        use crate::index_scope::IndexScope;
+        if self.hide_list_members {
+            // The request reads this triple as RDF lists (the Graph Store
+            // `GET`), which no stored row is (`hiding_list_members` turned the
+            // probes off).
+            if let Some(IndexScope::Union(_)) = ctx.index_scope_policy_cleared() {
+                let reason = if crate::execute::fast_paths_disabled() {
+                    FastPathFallback::KillSwitch
+                } else {
+                    FastPathFallback::ListView
+                };
+                stamp_fast_path(
+                    NESTED_LOOP_BATCHED_UNION_SITE,
+                    FastPathOutcome::Fallback(reason),
+                );
+            }
+            return Ok(None);
+        }
+        if !(self.batched_eligible || self.batched_object_eligible || self.batched_exists_eligible)
+        {
+            return Ok(None);
+        }
+        let Some(IndexScope::Union(set)) = ctx.index_scope_policy_cleared() else {
+            return Ok(None);
+        };
+        let decline = |reason| {
+            stamp_fast_path(
+                NESTED_LOOP_BATCHED_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+            Ok(None)
+        };
+        if crate::execute::fast_paths_disabled() {
+            return decline(FastPathFallback::KillSwitch);
+        }
+        let (Some(pred), Some(store)) =
+            (self.batched_predicate.as_ref(), ctx.binary_store.as_ref())
+        else {
+            return decline(FastPathFallback::GateDeclined);
+        };
+        if ctx.is_history_range() || ctx.eager_materialization {
+            return decline(FastPathFallback::GateDeclined);
+        }
+        if !matches!(
+            crate::fast_path_common::policy_lane_for_predicates(
+                ctx,
+                &[pred],
+                crate::fast_path_common::POLICY_PREDICATE_PROBE_SITE,
+            ),
+            crate::fast_path_common::PredicateFastPath::Allow
+        ) {
+            return decline(FastPathFallback::GateDeclined);
+        }
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return decline(FastPathFallback::StoreMismatch);
+        };
+        if graphs.len() != set.members().len() || !Arc::ptr_eq(store, set.store()) {
+            return decline(FastPathFallback::StoreMismatch);
+        }
+        let mut plans = Vec::with_capacity(graphs.len());
+        for (graph, certified) in graphs.iter().zip(set.members()) {
+            let member_ctx = ctx.with_graph_ref(graph);
+            match member_ctx.index_scope_policy_cleared() {
+                Some(IndexScope::One(member))
+                    if Arc::ptr_eq(member.store(), set.store())
+                        && member.g_id() == certified.g_id()
+                        && member.to_t() == certified.to_t() => {}
+                _ => return decline(FastPathFallback::StoreMismatch),
+            }
+            // `Encoded`: the union variant emits encoded rows and never runs
+            // under eager materialization (declined above).
+            let plan = if self.batched_object_eligible {
+                object_probe_lane_plan(&member_ctx, store, pred, LaneOutput::Encoded)?
+            } else {
+                subject_probe_lane_plan(&member_ctx, store, pred, LaneOutput::Encoded)?
+            };
+            match plan {
+                ProbeLanePlan::Clean => plans.push(plan),
+                ProbeLanePlan::Merge(_) | ProbeLanePlan::Decline => {
+                    return decline(FastPathFallback::Novelty)
+                }
+            }
+        }
+        stamp_fast_path(NESTED_LOOP_BATCHED_UNION_SITE, FastPathOutcome::Proceed);
+        Ok(Some(UnionProbe { plans }))
+    }
+
+    /// The union probe's plans, when the union variant is running.
+    fn union_plans(&self) -> Option<Arc<UnionProbe>> {
+        self.union_probe.clone().flatten()
+    }
+
     /// Decide how the batched lanes handle the active overlay this call.
     ///
     /// The subject-probe and exists lanes merge overlay ops per probed
@@ -2269,10 +2568,14 @@ impl NestedLoopJoinOperator {
     ///
     /// Returns `None` if the predicate is not in the binary index (no results
     /// possible), and refuses when the lane merges its novelty
-    /// ([`p_id_or_none`]).
+    /// ([`p_id_or_none`]): one graph's, or any union member's.
     fn resolve_batched_predicate(&self, store: &BinaryIndexStore) -> Result<Option<u32>> {
         let pred_sid = self.batched_predicate.as_ref().unwrap();
-        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+        let merges = |plan: &ProbeLanePlan| matches!(plan, ProbeLanePlan::Merge(_));
+        let merging = match self.union_plans() {
+            Some(union) => union.plans.iter().any(merges),
+            None => merges(&self.batched_overlay_mode),
+        };
         p_id_or_none(store, pred_sid, || Ok(merging))
     }
 
@@ -2383,8 +2686,135 @@ impl NestedLoopJoinOperator {
         branch.find_leaves_in_range(&min_key, &max_key, cmp)
     }
 
+    /// Phase 4, from wherever the probe reads ([`SubjectProbeSource`]).
+    #[allow(clippy::too_many_arguments)]
+    fn probe_subjects(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        p_id: u32,
+        unique_s_ids: &[u64],
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
+        dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
+        source: &mut SubjectProbeSource<'_>,
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        match source {
+            SubjectProbeSource::One {
+                branch,
+                leaf_range,
+                probe_ops,
+            } => self.scan_matches(
+                ctx,
+                store,
+                branch,
+                leaf_range.clone(),
+                p_id,
+                unique_s_ids,
+                s_id_to_accum,
+                dict_overlay,
+                probe_ops.as_mut(),
+                on_match,
+            ),
+            SubjectProbeSource::Union(union) => self.scan_matches_union(
+                ctx,
+                store,
+                p_id,
+                unique_s_ids,
+                s_id_to_accum,
+                &union.plans,
+                on_match,
+            ),
+        }
+    }
+
+    /// [`Self::scan_matches`] over every member of a union of one ledger's
+    /// graphs, each under its own context, then one row per fact of the union
+    /// ([`union_keep`]). Rows leave decoded ([`UnionMatch`]).
+    #[allow(clippy::too_many_arguments)]
+    fn scan_matches_union(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        p_id: u32,
+        unique_s_ids: &[u64],
+        s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
+        plans: &[ProbeLanePlan],
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
+    ) -> Result<()> {
+        use fluree_db_binary_index::RunSortOrder;
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return Err(QueryError::Internal(
+                "a union probe ran without the union's graphs".into(),
+            ));
+        };
+        let mut matches: Vec<UnionMatch> = Vec::new();
+        for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
+            let member_ctx = ctx.with_graph_ref(graph);
+            // A member with no branch holds nothing for the probe, and a merge
+            // over one is refused ([`branch_or_none`]), as on one graph.
+            let merging = matches!(plan, ProbeLanePlan::Merge(_));
+            let Some(branch) =
+                branch_or_none(store, member_ctx.binary_g_id, RunSortOrder::Psot, merging)?
+            else {
+                continue;
+            };
+            let leaf_range = Self::find_psot_leaf_range(
+                branch,
+                member_ctx.binary_g_id,
+                p_id,
+                unique_s_ids[0],
+                *unique_s_ids.last().expect("non-empty probe"),
+            );
+            let dict_overlay = make_dict_overlay(&member_ctx, store);
+            let mut probe_ops = match plan {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
+            self.scan_matches(
+                &member_ctx,
+                store,
+                branch,
+                leaf_range,
+                p_id,
+                unique_s_ids,
+                s_id_to_accum,
+                &dict_overlay,
+                probe_ops.as_mut(),
+                &mut |m| {
+                    matches.push(UnionMatch::new(m.s_id, member, m.object, m.o_i));
+                    Ok(())
+                },
+            )?;
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let keep = union_keep(&matches, 2, |set, m| {
+            Ok(set.insert(
+                [&Binding::encoded_sid(m.key), &m.object],
+                Some(FactRef {
+                    object: None,
+                    list_index: m.list_index(),
+                }),
+                dicts,
+                gv,
+            )?)
+        })?;
+        for (m, keep) in matches.iter().zip(keep) {
+            let Some(accum) = s_id_to_accum.get(&m.key).filter(|_| keep) else {
+                continue;
+            };
+            on_match(SubjectMatch {
+                s_id: m.key,
+                accum,
+                object: &m.object,
+                o_i: m.o_i,
+            })?;
+        }
+        Ok(())
+    }
+
     /// Phase 4: Scan PSOT leaves, matching accumulated subjects and invoking
-    /// `on_match` per matched (left-row group, object) pair.
+    /// `on_match` per matched (left-row group, object) pair ([`SubjectMatch`]).
     ///
     /// Uses V3 column-based leaf loading via `get_leaf_bytes_sync` + `load_leaflet_columns_cached`,
     /// binary-searches for matching subjects within each leaflet's p_id segment, and builds the
@@ -2403,7 +2833,7 @@ impl NestedLoopJoinOperator {
         s_id_to_accum: &FxHashMap<u64, Vec<usize>>,
         dict_overlay: &Option<crate::dict_overlay::DictOverlay>,
         mut probe_ops: Option<&mut ProbeOps>,
-        on_match: &mut dyn FnMut(&[usize], &Binding) -> Result<()>,
+        on_match: &mut dyn FnMut(SubjectMatch<'_>) -> Result<()>,
     ) -> Result<()> {
         let scan_start = Instant::now();
 
@@ -2420,7 +2850,6 @@ impl NestedLoopJoinOperator {
 
             for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
                 ctx.check_cancelled()?;
-                leaflets_scanned += 1;
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
                 // by the indexer for time-travel replay. Skip only when there is
                 // also no history past `to_t` to reconstruct.
@@ -2434,24 +2863,20 @@ impl NestedLoopJoinOperator {
                 if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                     continue;
                 }
+                if !psot_leaflet_may_hold_subjects(entry, p_id, unique_s_ids, needs_history_replay)
+                {
+                    continue;
+                }
 
-                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+                leaflets_scanned += 1;
+                let batch =
+                    leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
                 // Rows restored by replay keep their own types, which the
                 // constant, taken over the live rows, does not describe.
                 let o_type_const = entry.o_type_const_for(needs_history_replay);
                 ctx.check_cancelled()?;
 
-                let row_count = batch.row_count;
-
-                // For PSOT, leaflets are sorted by p_id then s_id.
-                // Find the contiguous segment for our p_id.
-                let p_start = (0..row_count)
-                    .position(|i| batch.p_id.get_or(i, 0) >= p_id)
-                    .unwrap_or(row_count);
-                let p_end = (p_start..row_count)
-                    .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-                    .map(|offset| p_start + offset)
-                    .unwrap_or(row_count);
+                let (p_start, p_end) = psot_p_run(entry, &batch, p_id, needs_history_replay);
                 if p_start == p_end {
                     continue;
                 }
@@ -2488,8 +2913,8 @@ impl NestedLoopJoinOperator {
                         let o_type_val =
                             o_type_const.unwrap_or_else(|| batch.o_type.get_or(row, 0));
                         let o_key_val = batch.o_key.get(row);
+                        let o_i_val = batch.o_i.get_or(row, u32::MAX);
                         if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
-                            let o_i_val = batch.o_i.get_or(row, u32::MAX);
                             if probe.base_row_fate(win, p_id, o_type_val, o_key_val, o_i_val)
                                 == RowFate::Drop
                             {
@@ -2513,11 +2938,16 @@ impl NestedLoopJoinOperator {
                             p_id,
                             o_type_val,
                             o_key_val,
-                            batch.o_i.get_or(row, u32::MAX),
+                            o_i_val,
                             batch.t.get_or(row, 0) as i64,
                         )?;
 
-                        on_match(accum_indices, &obj_binding)?;
+                        on_match(SubjectMatch {
+                            s_id,
+                            accum: accum_indices,
+                            object: &obj_binding,
+                            o_i: o_i_val,
+                        })?;
                     }
                 }
             }
@@ -2554,7 +2984,12 @@ impl NestedLoopJoinOperator {
                         op.t,
                     )?;
                     matched_rows += 1;
-                    on_match(accum_indices, &obj_binding)
+                    on_match(SubjectMatch {
+                        s_id,
+                        accum: accum_indices,
+                        object: &obj_binding,
+                        o_i: op.o_i,
+                    })
                 })?;
             }
         }
@@ -2590,7 +3025,7 @@ impl NestedLoopJoinOperator {
         let val = store
             .decode_value_v3(o_type, o_key, p_id, g_id)
             .map_err(|e| QueryError::Internal(format!("decode_value_v3 (batched bounds): {e}")))?;
-        Ok(bounds.matches(&val))
+        Ok(bounds.matches_encoded(&val, OType::from_u16(o_type)))
     }
 
     /// Object-bounds check for an injected novelty assert. Ids minted in dict
@@ -2609,7 +3044,7 @@ impl NestedLoopJoinOperator {
             return Ok(true);
         };
         let val = decode_overlay_object(ctx, store, dict_overlay.as_ref(), p_id, o_type, o_key)?;
-        Ok(bounds.matches(&val))
+        Ok(bounds.matches_encoded(&val, OType::from_u16(o_type)))
     }
 
     /// Phase 5: Assemble scattered results into output batches in left-row order.
@@ -2775,27 +3210,39 @@ impl NestedLoopJoinOperator {
             self.clear_batched_state();
             return Ok(());
         }
-        // A graph the index has no PSOT branch for holds nothing for the
-        // probe, so its left rows (from novelty) match nothing.
-        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
-        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Psot, merging)?
-        else {
-            self.clear_batched_state();
-            return Ok(());
-        };
-        let leaf_range = Self::find_psot_leaf_range(
-            branch,
-            ctx.binary_g_id,
-            p_id,
-            unique_s_ids[0],
-            *unique_s_ids.last().unwrap(),
-        );
-
-        // One reconciler per flush: probed keys recur across flushes with new
-        // left rows, so consumed-state must not outlive this flush.
-        let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
-            _ => None,
+        let mut source = match self.union_plans() {
+            Some(union) => SubjectProbeSource::Union(union),
+            None => {
+                // A graph the index has no PSOT branch for holds nothing for
+                // the probe, so its left rows (from novelty) match nothing.
+                // A merge over one is refused ([`branch_or_none`]).
+                let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+                let Some(branch) =
+                    branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Psot, merging)?
+                else {
+                    self.clear_batched_state();
+                    return Ok(());
+                };
+                let leaf_range = Self::find_psot_leaf_range(
+                    branch,
+                    ctx.binary_g_id,
+                    p_id,
+                    unique_s_ids[0],
+                    *unique_s_ids.last().unwrap(),
+                );
+                // One reconciler per flush: probed keys recur across flushes
+                // with new left rows, so consumed-state must not outlive this
+                // flush.
+                let probe_ops = match &self.batched_overlay_mode {
+                    ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                    _ => None,
+                };
+                SubjectProbeSource::One {
+                    branch,
+                    leaf_range,
+                    probe_ops,
+                }
+            }
         };
 
         // Phase 4+5: Scan leaves, scatter matches by accumulator position, emit
@@ -2830,7 +3277,8 @@ impl NestedLoopJoinOperator {
                 vec![Vec::new(); self.batched_accumulator.len()]
             };
             {
-                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                let mut on_match = |m: SubjectMatch<'_>| -> Result<()> {
+                    let (accum_indices, obj) = (m.accum, m.object);
                     // Right-side tail (object + any right-scan inline outputs) is
                     // independent of the left row, so build it once per match.
                     let mut right_bindings = Vec::with_capacity(self.right_new_vars.len());
@@ -2869,16 +3317,14 @@ impl NestedLoopJoinOperator {
                     }
                     Ok(())
                 };
-                self.scan_matches(
+                self.probe_subjects(
                     ctx,
                     &store,
-                    branch,
-                    leaf_range,
                     p_id,
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
-                    probe_ops.as_mut(),
+                    &mut source,
                     &mut on_match,
                 )?;
             }
@@ -2914,7 +3360,8 @@ impl NestedLoopJoinOperator {
             let mut scatter: Vec<Vec<Vec<Binding>>> =
                 vec![Vec::new(); self.batched_accumulator.len()];
             {
-                let mut on_match = |accum_indices: &[usize], obj: &Binding| -> Result<()> {
+                let mut on_match = |m: SubjectMatch<'_>| -> Result<()> {
+                    let (accum_indices, obj) = (m.accum, m.object);
                     for &accum_idx in accum_indices {
                         let (batch_idx, row_idx, _) = &self.batched_accumulator[accum_idx];
                         let left_batch = &self.stored_left_batches[*batch_idx];
@@ -2945,23 +3392,25 @@ impl NestedLoopJoinOperator {
                     }
                     Ok(())
                 };
-                self.scan_matches(
+                self.probe_subjects(
                     ctx,
                     &store,
-                    branch,
-                    leaf_range,
                     p_id,
                     &unique_s_ids,
                     &s_id_to_accum,
                     &dict_overlay,
-                    probe_ops.as_mut(),
+                    &mut source,
                     &mut on_match,
                 )?;
             }
             self.emit_scatter_to_output(scatter, ctx.batch_size)?;
         }
 
-        if let Some(probe) = &probe_ops {
+        if let SubjectProbeSource::One {
+            probe_ops: Some(probe),
+            ..
+        } = &source
+        {
             tracing::debug!(
                 dropped_rows = probe.dropped_rows,
                 injected_rows = probe.injected_rows,
@@ -3016,66 +3465,102 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
-        let Some(branch) = branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Post, merging)?
-        else {
-            self.clear_batched_state();
-            return Ok(());
-        };
-        let branch = Arc::clone(branch);
-
-        let overlay_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => Some(ops),
-            _ => None,
-        };
-
-        // One walk per object type: POST keeps each type's rows in one run.
-        // Base and injected matches land in the same lists. A type's walk
-        // reconciles against that type's ops alone, with one reconciler per
-        // flush (see `flush_batched_accumulator_binary`).
         let list_count: usize = groups.iter().map(|group| group.keys.len()).sum();
         let mut subjects: Vec<Vec<u64>> = vec![Vec::new(); list_count];
         let mut streamed = LazyFlags::default();
         let mut discarded = 0u64;
         let mut leaflets_read = 0usize;
-        let mut merged: Option<(u64, u64)> = None;
-        for group in &groups {
-            let mut probe_ops =
-                overlay_ops.and_then(|ops| ObjectProbeOps::for_type(ops, group.o_type));
-            let cap = object_probe_match_cap(group.o_type);
-            leaflets_read += for_each_object_probe_match(
-                ctx,
-                &store,
-                &branch,
-                (p_id, group.o_type),
-                &group.keys,
-                probe_ops.as_mut(),
-                |obj_idx, s_ids| {
-                    let list = group.lists[obj_idx] as usize;
-                    debug_assert!(!streamed.get(list), "match for a closed object");
-                    let held = &mut subjects[list];
-                    if s_ids.len() > cap - held.len() {
-                        discarded += cap as u64 + 1;
-                        *held = Vec::new();
-                        streamed.set(list, list_count);
-                        return Ok(std::ops::ControlFlow::Break(()));
+
+        if let Some(union) = self.union_plans() {
+            // Over a union each member's walk keeps its matches' list
+            // positions, and one match per fact of the union is kept
+            // (`Self::object_matches_union`). The members share one store
+            // and its dictionary novelty, so a ref or string object's key is
+            // one key in every member. A left row on any other object goes to
+            // the per-row scan, which reads the union.
+            let ref_type = fluree_db_core::o_type::OType::IRI_REF.as_u16();
+            for group in &groups {
+                if group.o_type != ref_type && !object_probe_covers(group.o_type) {
+                    for &list in &group.lists {
+                        streamed.set(list as usize, list_count);
                     }
-                    held.extend_from_slice(s_ids);
-                    Ok(std::ops::ControlFlow::Continue(()))
-                },
-            )?;
-            if let Some(probe) = &probe_ops {
-                let (dropped, injected) = merged.get_or_insert((0, 0));
-                *dropped += probe.dropped_rows;
-                *injected += probe.injected_rows;
+                    continue;
+                }
+                for m in self.object_matches_union(
+                    ctx,
+                    &store,
+                    p_id,
+                    group.o_type,
+                    &group.keys,
+                    &union.plans,
+                )? {
+                    let Binding::EncodedSid { s_id, .. } = m.object else {
+                        return Err(QueryError::Internal(
+                            "a union object probe matched a subject that is not an encoded ref"
+                                .into(),
+                        ));
+                    };
+                    subjects[group.lists[m.key as usize] as usize].push(s_id);
+                }
             }
-        }
-        if let Some((dropped_rows, injected_rows)) = merged {
-            tracing::debug!(
-                dropped_rows,
-                injected_rows,
-                "join batched object flush merged novelty overlay"
-            );
+        } else {
+            let merging = matches!(self.batched_overlay_mode, ProbeLanePlan::Merge(_));
+            let Some(branch) =
+                branch_or_none(&store, ctx.binary_g_id, RunSortOrder::Post, merging)?
+            else {
+                self.clear_batched_state();
+                return Ok(());
+            };
+            let branch = Arc::clone(branch);
+
+            let overlay_ops = match &self.batched_overlay_mode {
+                ProbeLanePlan::Merge(ops) => Some(ops),
+                _ => None,
+            };
+
+            // One walk per object type: POST keeps each type's rows in one run.
+            // Base and injected matches land in the same lists. A type's walk
+            // reconciles against that type's ops alone, with one reconciler per
+            // flush (see `flush_batched_accumulator_binary`).
+            let mut merged: Option<(u64, u64)> = None;
+            for group in &groups {
+                let mut probe_ops =
+                    overlay_ops.and_then(|ops| ObjectProbeOps::for_type(ops, group.o_type));
+                let cap = object_probe_match_cap(group.o_type);
+                leaflets_read += for_each_object_probe_match(
+                    ctx,
+                    &store,
+                    &branch,
+                    (p_id, group.o_type),
+                    &group.keys,
+                    probe_ops.as_mut(),
+                    |obj_idx, s_ids| {
+                        let list = group.lists[obj_idx] as usize;
+                        debug_assert!(!streamed.get(list), "match for a closed object");
+                        let held = &mut subjects[list];
+                        if s_ids.len() > cap - held.len() {
+                            discarded += cap as u64 + 1;
+                            *held = Vec::new();
+                            streamed.set(list, list_count);
+                            return Ok(std::ops::ControlFlow::Break(()));
+                        }
+                        held.extend_from_slice(s_ids);
+                        Ok(std::ops::ControlFlow::Continue(()))
+                    },
+                )?;
+                if let Some(probe) = &probe_ops {
+                    let (dropped, injected) = merged.get_or_insert((0, 0));
+                    *dropped += probe.dropped_rows;
+                    *injected += probe.injected_rows;
+                }
+            }
+            if let Some((dropped_rows, injected_rows)) = merged {
+                tracing::debug!(
+                    dropped_rows,
+                    injected_rows,
+                    "join batched object flush merged novelty overlay"
+                );
+            }
         }
 
         let matched_rows: u64 = entry_list
@@ -3121,6 +3606,146 @@ impl NestedLoopJoinOperator {
             });
         }
         Ok(())
+    }
+
+    /// The object probe over every member of a union, one match per fact of
+    /// the union ([`union_keep`]): a match is `(subject, probed object, list
+    /// position)`, keyed by the probed object's index in `objs`.
+    fn object_matches_union(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        p_id: u32,
+        o_type: u16,
+        objs: &[u64],
+        plans: &[ProbeLanePlan],
+    ) -> Result<Vec<UnionMatch>> {
+        use fluree_db_binary_index::RunSortOrder;
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return Err(QueryError::Internal(
+                "a union probe ran without the union's graphs".into(),
+            ));
+        };
+        let mut matches: Vec<UnionMatch> = Vec::new();
+        for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
+            let member_ctx = ctx.with_graph_ref(graph);
+            let merging = matches!(plan, ProbeLanePlan::Merge(_));
+            let Some(branch) =
+                branch_or_none(store, member_ctx.binary_g_id, RunSortOrder::Opst, merging)?
+            else {
+                continue;
+            };
+            let mut probe_ops = match plan {
+                ProbeLanePlan::Merge(ops) => ObjectProbeOps::for_type(ops, o_type),
+                _ => None,
+            };
+            // Charged as the one-graph lane charges: per match, by the flush.
+            for_each_object_probe_match_by_fact(
+                &member_ctx,
+                store,
+                branch,
+                p_id,
+                o_type,
+                objs,
+                probe_ops.as_mut(),
+                true,
+                |obj_idx, s_id, o_i| {
+                    matches.push(UnionMatch::new(
+                        obj_idx as u64,
+                        member,
+                        &Binding::encoded_sid(s_id),
+                        o_i,
+                    ));
+                    Ok(())
+                },
+            )?;
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let keep = union_keep(&matches, 2, |set, m| {
+            Ok(set.insert(
+                [&m.object, &Binding::encoded_sid(objs[m.key as usize])],
+                Some(FactRef {
+                    object: None,
+                    list_index: m.list_index(),
+                }),
+                dicts,
+                gv,
+            )?)
+        })?;
+        Ok(matches
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(m, keep)| keep.then_some(m))
+            .collect())
+    }
+
+    /// The existence probe over every member of a union, one match per fact
+    /// of the union ([`union_keep`]): a match is `(subject, the term the
+    /// constant object matched, list position)`.
+    fn exists_matches_union(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        store: &Arc<BinaryIndexStore>,
+        pred: &Sid,
+        unique_s_ids: &[u64],
+        plans: &[ProbeLanePlan],
+    ) -> Result<Vec<BatchedSubjectProbeMatch>> {
+        let ActiveGraphs::Many(graphs) = ctx.active_graphs() else {
+            return Err(QueryError::Internal(
+                "a union probe ran without the union's graphs".into(),
+            ));
+        };
+        let mut matches: Vec<UnionMatch> = Vec::new();
+        for (member, (graph, plan)) in graphs.iter().zip(plans).enumerate() {
+            let member_ctx = ctx.with_graph_ref(graph);
+            let mut probe_ops = match plan {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
+            let dict_overlay = make_dict_overlay(&member_ctx, store);
+            let found = batched_subject_probe_binary(
+                &member_ctx,
+                store,
+                &SubjectProbeParams {
+                    pred_sid: pred,
+                    subject_ids: unique_s_ids,
+                    object_bounds: None,
+                    bound_object: Some(&self.right_pattern.o),
+                    emit_object: true,
+                    dict_overlay: dict_overlay.as_ref(),
+                },
+                probe_ops.as_mut(),
+            )?;
+            for m in found {
+                let object = m.object.as_ref().ok_or_else(|| {
+                    QueryError::Internal("an object-emitting probe returned no object".into())
+                })?;
+                matches.push(UnionMatch::new(m.subject_id, member, object, m.o_i));
+            }
+        }
+        let (dicts, gv) = EqualityNorm::parts(&self.norm);
+        let keep = union_keep(&matches, 1, |set, m| {
+            Ok(set.insert(
+                [&Binding::encoded_sid(m.key)],
+                Some(FactRef {
+                    object: Some(&m.object),
+                    list_index: m.list_index(),
+                }),
+                dicts,
+                gv,
+            )?)
+        })?;
+        Ok(matches
+            .into_iter()
+            .zip(keep)
+            .filter_map(|(m, keep)| {
+                keep.then_some(BatchedSubjectProbeMatch {
+                    subject_id: m.key,
+                    object: None,
+                    o_i: m.o_i,
+                })
+            })
+            .collect())
     }
 
     /// The next output of a bound-object flush, from its pending matches in
@@ -3252,37 +3877,43 @@ impl NestedLoopJoinOperator {
             return Ok(());
         }
 
-        // One reconciler per flush (see `flush_batched_accumulator_binary`).
-        let mut probe_ops = match &self.batched_overlay_mode {
-            ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
-            _ => None,
+        let pred = self
+            .batched_predicate
+            .as_ref()
+            .expect("batched predicate set");
+        let probe_matches = if let Some(union) = self.union_plans() {
+            self.exists_matches_union(ctx, &store, pred, &unique_s_ids, &union.plans)?
+        } else {
+            // One reconciler per flush (see `flush_batched_accumulator_binary`).
+            let mut probe_ops = match &self.batched_overlay_mode {
+                ProbeLanePlan::Merge(ops) => ProbeOps::new(ops.clone()),
+                _ => None,
+            };
+            // Needed to decode novelty-minted object values for the
+            // bound-object filter on injected asserts.
+            let dict_overlay = make_dict_overlay(ctx, &store);
+            let probe_matches = batched_subject_probe_binary(
+                ctx,
+                &store,
+                &SubjectProbeParams {
+                    pred_sid: pred,
+                    subject_ids: &unique_s_ids,
+                    object_bounds: None,
+                    bound_object: Some(&self.right_pattern.o),
+                    emit_object: false,
+                    dict_overlay: dict_overlay.as_ref(),
+                },
+                probe_ops.as_mut(),
+            )?;
+            if let Some(probe) = &probe_ops {
+                tracing::debug!(
+                    dropped_rows = probe.dropped_rows,
+                    injected_rows = probe.injected_rows,
+                    "join batched existence flush merged novelty overlay"
+                );
+            }
+            probe_matches
         };
-        // Needed to decode novelty-minted object values for the bound-object
-        // filter on injected asserts.
-        let dict_overlay = make_dict_overlay(ctx, &store);
-        let probe_matches = batched_subject_probe_binary(
-            ctx,
-            &store,
-            &SubjectProbeParams {
-                pred_sid: self
-                    .batched_predicate
-                    .as_ref()
-                    .expect("batched predicate set"),
-                subject_ids: &unique_s_ids,
-                object_bounds: None,
-                bound_object: Some(&self.right_pattern.o),
-                emit_object: false,
-                dict_overlay: dict_overlay.as_ref(),
-            },
-            probe_ops.as_mut(),
-        )?;
-        if let Some(probe) = &probe_ops {
-            tracing::debug!(
-                dropped_rows = probe.dropped_rows,
-                injected_rows = probe.injected_rows,
-                "join batched existence flush merged novelty overlay"
-            );
-        }
 
         let accum_len = self.batched_accumulator.len();
         let mut scatter: Vec<Vec<Vec<Binding>>> = vec![Vec::new(); accum_len];
@@ -3513,7 +4144,7 @@ fn build_probe_object_binding(
     t: i64,
 ) -> Result<Binding> {
     if let Some(binding) =
-        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None)
+        late_materialized_object_binding(o_type_val, o_key_val, p_id, t, o_i, None, ctx.binary_g_id)
     {
         // Eager callers get what the per-row scan emits: a datalog rule head
         // rejects an encoded binding.
@@ -3792,7 +4423,7 @@ pub(crate) fn for_each_object_probe_match(
             }
 
             ctx.check_cancelled()?;
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             leaflets_read += 1;
             let rows = post_rows_of(&batch, want);
             if rows.is_empty() {
@@ -3897,6 +4528,261 @@ pub(crate) fn for_each_object_probe_match(
     Ok(leaflets_read)
 }
 
+/// The union probe's walk over objects of `o_type`: OPST, handing over each
+/// match's list position,
+/// which a union's fact identity keys on ([`union_keep`]). The one-graph
+/// lanes walk POST ([`for_each_object_probe_match`]), which hands over a run's
+/// subjects alone.
+///
+/// Walk OPST for the `IRI_REF` rows of predicate `p_id` whose object is one of
+/// `objs` (sorted, deduplicated), calling `visit(obj_idx, s_id)` — `obj_idx`
+/// indexes `objs` — for each live row: base rows the overlay does not retract,
+/// then each novelty-only assert when `probe_ops` merges one.
+///
+/// Each OPST leaf holding any of the objects is read at most once, and inside a
+/// leaflet the `o_key` column is binary-searched per object, so the work tracks
+/// the matches rather than the leaflet or predicate size. Shared by the
+/// nested-loop join's bound-object lane and OPTIONAL's.
+#[allow(clippy::too_many_arguments)]
+fn for_each_object_probe_match_by_fact(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    branch: &fluree_db_binary_index::BranchManifest,
+    p_id: u32,
+    o_type: u16,
+    objs: &[u64],
+    mut probe_ops: Option<&mut ObjectProbeOps>,
+    with_list_index: bool,
+    mut visit: impl FnMut(usize, u64, u32) -> Result<()>,
+) -> Result<()> {
+    use fluree_db_binary_index::format::run_record_v2::{
+        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
+    };
+    use fluree_db_binary_index::read::column_types::{ColumnProjection, ColumnSet};
+    use fluree_db_binary_index::RunSortOrder;
+
+    if objs.is_empty() {
+        return Ok(());
+    }
+    let cmp = cmp_v2_for_order(RunSortOrder::Opst);
+
+    // Collect leaf indices for all object keys.
+    let mut leaf_indices: Vec<usize> = Vec::new();
+    for &o_s_id in objs {
+        let min_key = RunRecordV2 {
+            s_id: SubjectId(0),
+            o_key: o_s_id,
+            p_id,
+            t: 0,
+            o_i: 0,
+            o_type,
+            g_id: ctx.binary_g_id,
+        };
+        let max_key = RunRecordV2 {
+            s_id: SubjectId(u64::MAX),
+            o_key: o_s_id,
+            p_id,
+            t: u32::MAX,
+            o_i: u32::MAX,
+            o_type,
+            g_id: ctx.binary_g_id,
+        };
+        let r = branch.find_leaves_in_range(&min_key, &max_key, cmp);
+        leaf_indices.extend(r);
+    }
+    leaf_indices.sort_unstable();
+    leaf_indices.dedup();
+
+    let need_replay = ctx.to_t < store.max_t();
+    let replay_to = need_replay.then_some(ctx.to_t);
+    for leaf_idx in leaf_indices {
+        ctx.check_cancelled()?;
+        let leaf_entry = &branch.leaves[leaf_idx];
+        let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
+
+        for (leaflet_idx, entry) in leaf.dir.entries.iter().enumerate() {
+            ctx.check_cancelled()?;
+            let needs_history_replay = entry.replays_history(replay_to);
+            if entry.row_count == 0 && !needs_history_replay {
+                continue;
+            }
+            if entry.p_const.is_some() && entry.p_const != Some(p_id) {
+                continue;
+            }
+            if entry.o_type_const.is_some() && entry.o_type_const != Some(o_type) {
+                continue;
+            }
+
+            // Quick reject based on leaflet key range.
+            let first = read_ordered_key_v2(RunSortOrder::Opst, &entry.first_key);
+            let last = read_ordered_key_v2(RunSortOrder::Opst, &entry.last_key);
+            let first_o = first.o_key;
+            let last_o = last.o_key;
+            if last_o < objs[0] || first_o > *objs.last().unwrap() {
+                continue;
+            }
+            // If no object keys fall within [first_o, last_o], skip.
+            let start = objs.partition_point(|&x| x < first_o);
+            let end = objs.partition_point(|&x| x <= last_o);
+            if start >= end {
+                continue;
+            }
+
+            // We only need core identity columns for this join, but for
+            // historical snapshots we also need `T` so `replay_leaflet_at_t`
+            // can detect base rows that postdate `to_t`. The overlay merge
+            // additionally needs `OI`: CORE lacks it, and a fate check
+            // reading `o_i` as a default would mis-reconcile retracts on
+            // multi-entry (`@list`) refs in BOTH cache configurations.
+            let proj = if need_replay {
+                ColumnProjection::all()
+            } else if probe_ops.is_some() || with_list_index {
+                ColumnProjection {
+                    output: ColumnSet::CORE.union(ColumnSet::single(
+                        fluree_db_binary_index::format::column_block::ColumnId::OI,
+                    )),
+                    internal: ColumnSet::EMPTY,
+                }
+            } else {
+                ColumnProjection {
+                    output: ColumnSet::CORE,
+                    internal: ColumnSet::EMPTY,
+                }
+            };
+            // The cache keys on the decoded column set, so this narrow
+            // entry never collides with a wider one.
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
+            ctx.check_cancelled()?;
+
+            // OPST leaflets are ordered by (o_type, o_key, p_id, s_id, t...).
+            // Instead of scanning every row in the leaflet, binary-search the
+            // `o_key` column for just the object IDs we care about and only
+            // visit those row ranges. This keeps work proportional to matches
+            // rather than leaflet size.
+            let fluree_db_binary_index::read::column_types::ColumnData::Block(o_keys) =
+                &batch.o_key
+            else {
+                // o_key is required; AbsentDefault cannot occur here.
+                // Const(o_key) would mean the entire leaflet shares one object key,
+                // which is extremely rare for OPST; fall back to row-scan in that case.
+                for row in 0..batch.row_count {
+                    let ot = batch.o_type.get_or(row, 0);
+                    if ot != o_type {
+                        continue;
+                    }
+                    let pid = batch.p_id.get_or(row, 0);
+                    if pid != p_id {
+                        continue;
+                    }
+                    let o_key = batch.o_key.get_or(row, 0);
+                    let Ok(obj_idx) = objs.binary_search(&o_key) else {
+                        continue;
+                    };
+                    let s_id = batch.s_id.get_or(row, 0);
+                    let o_i_val = batch.o_i.get_or(row, u32::MAX);
+                    if let Some(probe) = probe_ops.as_mut() {
+                        let win = probe.object_window(o_key);
+                        if probe.base_row_fate(&win, s_id, o_i_val) == RowFate::Drop {
+                            continue;
+                        }
+                    }
+                    visit(obj_idx, s_id, o_i_val)?;
+                }
+                continue;
+            };
+
+            // Only consider the subset of objects that intersect this leaflet's object range.
+            let mut obj_idx = start;
+            let o_keys_slice: &[u64] = o_keys.as_ref();
+
+            // Fast path: if o_type/p_id are const and already filtered by leaflet
+            // metadata, we can skip per-row checks.
+            let ot_const_ok = batch.o_type.is_const() && batch.o_type.get_or(0, 0) == o_type;
+            let pid_const_ok = batch.p_id.is_const() && batch.p_id.get_or(0, 0) == p_id;
+
+            // Start scanning at the first possible match within this leaflet.
+            let mut row = 0usize;
+            while row < batch.row_count && obj_idx < end {
+                let target = objs[obj_idx];
+
+                // Seek row to the first o_key >= target.
+                if o_keys_slice[row] < target {
+                    let next = o_keys_slice[row..].partition_point(|&x| x < target);
+                    row = row.saturating_add(next);
+                    if row >= batch.row_count {
+                        break;
+                    }
+                }
+
+                let cur = o_keys_slice[row];
+                if cur > target {
+                    obj_idx += 1;
+                    continue;
+                }
+                // cur == target: process run [row, run_end).
+                let run_end = row + o_keys_slice[row..].partition_point(|&x| x == target);
+
+                let probe_window = probe_ops
+                    .as_ref()
+                    .map(|p| p.object_window(target))
+                    .filter(|w| !w.is_empty());
+
+                for r in row..run_end {
+                    if !ot_const_ok {
+                        let ot = batch.o_type.get_or(r, 0);
+                        if ot != o_type {
+                            continue;
+                        }
+                    }
+                    if !pid_const_ok {
+                        let pid = batch.p_id.get_or(r, 0);
+                        if pid != p_id {
+                            continue;
+                        }
+                    }
+
+                    let s_id = batch.s_id.get_or(r, 0);
+                    // Read only where it is needed: the overlay merge, and a
+                    // union's fact identity.
+                    let o_i_val = if probe_window.is_some() || with_list_index {
+                        batch.o_i.get_or(r, u32::MAX)
+                    } else {
+                        u32::MAX
+                    };
+                    if let (Some(probe), Some(win)) = (probe_ops.as_mut(), &probe_window) {
+                        if probe.base_row_fate(win, s_id, o_i_val) == RowFate::Drop {
+                            continue;
+                        }
+                    }
+                    visit(obj_idx, s_id, o_i_val)?;
+                }
+
+                row = run_end;
+                obj_idx += 1;
+            }
+        }
+    }
+
+    // Inject novelty-only matches: unconsumed asserts per probed object.
+    // Novelty-asserting subjects are visited by id, the same representation
+    // overlay-merged cursor rows use.
+    if let Some(probe) = probe_ops {
+        for (obj_idx, &o_key) in objs.iter().enumerate() {
+            let mut injected: Vec<u64> = Vec::new();
+            probe.drain_asserts_for_object(o_key, |s_id| {
+                injected.push(s_id);
+                Ok(())
+            })?;
+            for s_id in injected {
+                // The union probe merges no novelty yet (`plan_union_probe`
+                // declines it), so no caller reads a novelty fact's position.
+                visit(obj_idx, s_id, u32::MAX)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Bundled parameters for [`batched_subject_probe_binary`].
 pub(crate) struct SubjectProbeParams<'a> {
     pub pred_sid: &'a Sid,
@@ -3923,9 +4809,34 @@ pub(crate) fn batched_subject_probe_binary(
     params: &SubjectProbeParams<'_>,
     probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
+    let resolved = resolved_bounds(params.object_bounds, ctx, store);
+    let resolved_params;
+    let params = match &resolved {
+        Some(bounds) => {
+            resolved_params = SubjectProbeParams {
+                object_bounds: Some(bounds),
+                ..*params
+            };
+            &resolved_params
+        }
+        None => params,
+    };
     let matches = batched_subject_probe_binary_uncharged(ctx, store, params, probe_ops)?;
     charge_probe_rows(ctx, matches.len())?;
     Ok(matches)
+}
+
+/// `bounds` resolved for `store`'s index when they hold a typed string bound
+/// ([`crate::binary_scan::resolve_bound_datatype`]); `None` when there is
+/// nothing to resolve.
+fn resolved_bounds(
+    bounds: Option<&ObjectBounds>,
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+) -> Option<ObjectBounds> {
+    let mut bounds = bounds.filter(|b| b.string_datatype.is_some())?.clone();
+    crate::binary_scan::resolve_bound_datatype(&mut bounds, ctx, Some(store));
+    Some(bounds)
 }
 
 /// Charge a batch of index-probe rows at [`PER_ROW_MICRO_FUEL`].
@@ -3949,9 +4860,7 @@ fn batched_subject_probe_binary_uncharged(
     params: &SubjectProbeParams<'_>,
     mut probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSubjectProbeMatch>> {
-    use fluree_db_binary_index::format::run_record_v2::{
-        cmp_v2_for_order, read_ordered_key_v2, RunRecordV2,
-    };
+    use fluree_db_binary_index::format::run_record_v2::{cmp_v2_for_order, RunRecordV2};
     use fluree_db_binary_index::{ColumnProjection, RunSortOrder};
 
     if params.subject_ids.is_empty() {
@@ -4019,51 +4928,15 @@ fn batched_subject_probe_binary_uncharged(
             if entry.p_const.is_some() && entry.p_const != Some(p_id) {
                 continue;
             }
-
-            // Directory-level subject skip: for a predicate-homogeneous leaflet
-            // the stored keys ascend by subject, so first_key/last_key bound its
-            // subject range. A scattered probe set spans the whole predicate
-            // partition but only touches a few leaflets — decline the rest here,
-            // before the (expensive) column decode + p-run scan, rather than
-            // after it (the `subj_start >= subj_end` check below). Only sound on
-            // homogeneous leaflets — a mixed-predicate leaflet resets s_id at each
-            // predicate boundary, so its key range isn't a clean subject interval
-            // — and only when not replaying history (a current-state key range can
-            // omit subjects that existed at an earlier `t`).
-            if entry.p_const == Some(p_id) && !needs_history_replay {
-                let lo = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key)
-                    .s_id
-                    .as_u64();
-                let hi = read_ordered_key_v2(RunSortOrder::Psot, &entry.last_key)
-                    .s_id
-                    .as_u64();
-                let a = unique_s_ids.partition_point(|&x| x < lo);
-                let b = unique_s_ids.partition_point(|&x| x <= hi);
-                if a >= b {
-                    continue;
-                }
+            if !psot_leaflet_may_hold_subjects(entry, p_id, &unique_s_ids, needs_history_replay) {
+                continue;
             }
 
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             let o_type_const = entry.o_type_const_for(needs_history_replay);
             ctx.check_cancelled()?;
 
-            let row_count = batch.row_count;
-            // A p-homogeneous leaflet is entirely this predicate — its p-run is
-            // the whole leaflet, so skip the two linear scans that would walk
-            // every row only to rediscover [0, row_count).
-            let (p_start, p_end) = if entry.p_const == Some(p_id) {
-                (0, row_count)
-            } else {
-                let p_start = (0..row_count)
-                    .position(|i| batch.p_id.get_or(i, 0) >= p_id)
-                    .unwrap_or(row_count);
-                let p_end = (p_start..row_count)
-                    .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-                    .map(|offset| p_start + offset)
-                    .unwrap_or(row_count);
-                (p_start, p_end)
-            };
+            let (p_start, p_end) = psot_p_run(entry, &batch, p_id, needs_history_replay);
             if p_start == p_end {
                 continue;
             }
@@ -4108,7 +4981,7 @@ fn batched_subject_probe_binary_uncharged(
                                 ))
                             })?;
                         if let Some(bounds) = params.object_bounds {
-                            if !bounds.matches(&decoded) {
+                            if !bounds.matches_encoded(&decoded, OType::from_u16(o_type_val)) {
                                 continue;
                             }
                         }
@@ -4137,6 +5010,7 @@ fn batched_subject_probe_binary_uncharged(
                     out.push(BatchedSubjectProbeMatch {
                         subject_id: s_id,
                         object,
+                        o_i: batch.o_i.get_or(row, u32::MAX),
                     });
                 }
             }
@@ -4158,7 +5032,7 @@ fn batched_subject_probe_binary_uncharged(
                         op.o_key,
                     )?;
                     if let Some(bounds) = params.object_bounds {
-                        if !bounds.matches(&decoded) {
+                        if !bounds.matches_encoded(&decoded, OType::from_u16(op.o_type)) {
                             return Ok(());
                         }
                     }
@@ -4185,6 +5059,7 @@ fn batched_subject_probe_binary_uncharged(
                 out.push(BatchedSubjectProbeMatch {
                     subject_id: s_id,
                     object,
+                    o_i: op.o_i,
                 });
                 Ok(())
             })?;
@@ -4205,6 +5080,27 @@ pub(crate) fn batched_subject_star_spot(
     dict_overlay: Option<&crate::dict_overlay::DictOverlay>,
     probe_ops: Option<&mut ProbeOps>,
 ) -> Result<Vec<BatchedSpotStarMatch>> {
+    let resolved: Vec<Option<ObjectBounds>> = predicates
+        .iter()
+        .map(|p| resolved_bounds(p.object_bounds, ctx, store))
+        .collect();
+    let resolved_predicates: Vec<SpotStarPredicateParams<'_>>;
+    let predicates = if resolved.iter().any(Option::is_some) {
+        resolved_predicates = predicates
+            .iter()
+            .zip(&resolved)
+            .map(|(p, bounds)| SpotStarPredicateParams {
+                predicate_idx: p.predicate_idx,
+                pred_sid: p.pred_sid.clone(),
+                object_bounds: bounds.as_ref().or(p.object_bounds),
+                bound_object: p.bound_object,
+                emit_object: p.emit_object,
+            })
+            .collect();
+        resolved_predicates.as_slice()
+    } else {
+        predicates
+    };
     let matches = batched_subject_star_spot_uncharged(
         ctx,
         store,
@@ -4320,7 +5216,7 @@ fn batched_subject_star_spot_uncharged(
             leaflets_read += 1;
             leaflets_replayed += u64::from(needs_history_replay);
 
-            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to)?;
+            let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             let o_type_const = entry.o_type_const_for(needs_history_replay);
 
             let row_count = batch.row_count;
@@ -4373,7 +5269,7 @@ fn batched_subject_star_spot_uncharged(
                                 ))
                             })?;
                         if let Some(bounds) = predicate.object_bounds {
-                            if !bounds.matches(&decoded) {
+                            if !bounds.matches_encoded(&decoded, OType::from_u16(o_type_val)) {
                                 continue;
                             }
                         }
@@ -4435,7 +5331,7 @@ fn batched_subject_star_spot_uncharged(
                         op.o_key,
                     )?;
                     if let Some(bounds) = predicate.object_bounds {
-                        if !bounds.matches(&decoded) {
+                        if !bounds.matches_encoded(&decoded, OType::from_u16(op.o_type)) {
                             return Ok(());
                         }
                     }
@@ -4475,7 +5371,101 @@ fn batched_subject_star_spot_uncharged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
+    use fluree_db_binary_index::{ColumnBatch, ColumnData};
     use fluree_db_core::Sid;
+
+    /// A PSOT leaflet directory entry keyed from `first` to `last`, each a
+    /// `(p_id, s_id)`.
+    fn psot_leaflet(
+        p_const: Option<u32>,
+        first: (u32, u64),
+        last: (u32, u64),
+    ) -> LeafletDirEntryV3 {
+        use fluree_db_binary_index::format::run_record_v2::{
+            write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+        };
+        use fluree_db_binary_index::RunSortOrder;
+
+        let key = |(p_id, s_id): (u32, u64)| {
+            let mut buf = [0u8; ORDERED_KEY_V2_SIZE];
+            let rec = RunRecordV2 {
+                s_id: SubjectId::from_u64(s_id),
+                o_key: 0,
+                p_id,
+                t: 0,
+                o_i: 0,
+                o_type: 0,
+                g_id: 0,
+            };
+            write_ordered_key_v2(RunSortOrder::Psot, &rec, &mut buf);
+            buf
+        };
+        LeafletDirEntryV3 {
+            row_count: 1,
+            lead_group_count: 1,
+            first_key: key(first),
+            last_key: key(last),
+            p_const,
+            o_type_const: None,
+            flags: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            column_refs: Vec::new(),
+            history_offset: 0,
+            history_len: 0,
+            history_min_t: 0,
+            history_max_t: 0,
+        }
+    }
+
+    fn batch_of_predicates(p_ids: &[u32]) -> ColumnBatch {
+        ColumnBatch {
+            row_count: p_ids.len(),
+            p_id: ColumnData::Block(Arc::from(p_ids)),
+            ..ColumnBatch::empty()
+        }
+    }
+
+    #[test]
+    fn p_run_walks_mixed_and_replayed_leaflets() {
+        let mixed = psot_leaflet(None, (5, 0), (9, 0));
+        let rows = batch_of_predicates(&[5, 5, 7, 7, 7, 9]);
+        assert_eq!(psot_p_run(&mixed, &rows, 7, false), (2, 5));
+        assert_eq!(psot_p_run(&mixed, &rows, 9, false), (5, 6));
+        assert_eq!(psot_p_run(&mixed, &rows, 6, false), (2, 2));
+
+        let homogeneous = psot_leaflet(Some(7), (7, 0), (7, 9));
+        let live = ColumnBatch {
+            row_count: 4,
+            p_id: ColumnData::Const(7),
+            ..ColumnBatch::empty()
+        };
+        assert_eq!(psot_p_run(&homogeneous, &live, 7, false), (0, 4));
+
+        // Replay restored rows of predicate 5 into the leaflet whose live rows
+        // are all 7, so `p_const` no longer describes the batch.
+        let replayed = batch_of_predicates(&[5, 5, 7, 7]);
+        assert_eq!(psot_p_run(&homogeneous, &replayed, 7, true), (2, 4));
+    }
+
+    #[test]
+    fn leaflet_keys_decline_only_at_head_and_only_when_homogeneous() {
+        let probed = [10, 20, 30];
+        let may_hold = |p_const, first, last, replays| {
+            psot_leaflet_may_hold_subjects(&psot_leaflet(p_const, first, last), 7, &probed, replays)
+        };
+        // Both key endpoints are inclusive.
+        assert!(may_hold(Some(7), (7, 11), (7, 20), false));
+        assert!(may_hold(Some(7), (7, 30), (7, 40), false));
+        assert!(!may_hold(Some(7), (7, 11), (7, 19), false));
+        assert!(!may_hold(Some(7), (7, 31), (7, 99), false));
+        // A mixed leaflet's keys are no subject interval.
+        assert!(may_hold(None, (5, 11), (7, 19), false));
+        // A replay can restore subjects the live keys leave out.
+        assert!(may_hold(Some(7), (7, 11), (7, 19), true));
+        assert!(may_hold(Some(7), (7, 31), (7, 99), true));
+    }
 
     fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
@@ -4541,7 +5531,7 @@ mod tests {
         join.batched_output.push_back(buffered_count_rows(&join, 3));
         assert_eq!(join.drain_count(&ctx).await.unwrap(), None);
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .is_none());
@@ -4610,7 +5600,7 @@ mod tests {
         let ctx = ExecutionContext::new(&snapshot, &vars);
         let mut join = count_join(vec![], vec![]).with_out_schema(Some(&[VarId(0)]));
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .is_none());
@@ -4630,13 +5620,13 @@ mod tests {
         // A key introduced on the right or absent after projection must decline
         // without consuming even already-buffered output.
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(1)])
+            .drain_grouped_count(&ctx, &[VarId(1)], &[])
             .await
             .unwrap()
             .is_none());
         assert_eq!(join.next_batch(&ctx).await.unwrap().unwrap().len(), 2);
         let groups = join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .unwrap();
@@ -4663,7 +5653,7 @@ mod tests {
         let mut join = count_join(vec![], vec![]);
         join.open(&ctx).await.unwrap();
         assert!(join
-            .drain_grouped_count(&ctx, &[VarId(0)])
+            .drain_grouped_count(&ctx, &[VarId(0)], &[])
             .await
             .unwrap()
             .unwrap()
@@ -4688,7 +5678,7 @@ mod tests {
             join.open(&ctx).await.unwrap();
             join.batched_output.push_back(buffered_count_rows(&join, 1));
             let err = join
-                .drain_grouped_count(&ctx, &[VarId(0)])
+                .drain_grouped_count(&ctx, &[VarId(0)], &[])
                 .await
                 .unwrap_err();
             if cancelled {
