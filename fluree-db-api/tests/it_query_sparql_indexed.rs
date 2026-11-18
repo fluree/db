@@ -8414,6 +8414,145 @@ async fn indexed_strstarts_sum_counts_prefix_matches() {
         .await;
 }
 
+/// Long strings that share more than the string tree's 48-byte key prefix
+/// resolve through the index by value and by prefix, after the full build
+/// and after an incremental one adds more of them. A prefix longer than 48
+/// bytes reaches every long string sharing the first 48, and the store's
+/// prefix scan must keep only those that really start with it.
+#[tokio::test]
+async fn indexed_long_strings_resolve_by_value_and_prefix() {
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory()
+        .with_ledger_cache_config(LedgerManagerConfig::default())
+        .build_memory();
+    let ledger_id = "it/indexed-long-strings:main";
+
+    let (local, handle) = start_background_indexer_local(
+        fluree.backend().clone(),
+        fluree
+            .nameservice_mode()
+            .publisher_arc()
+            .expect("test setup requires ReadWrite nameservice mode"),
+        fluree_db_indexer::IndexerConfig::small(),
+    );
+
+    local
+        .run_until(async move {
+            let index_cfg = IndexConfig {
+                reindex_min_bytes: 0,
+                reindex_max_bytes: 10_000_000,
+            };
+            let shared = "A review text that every long value here begins with: ";
+            assert!(shared.len() > 48);
+            let text = |tail: &str| format!("{shared}{tail} and enough words after it to be long");
+
+            let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+            let baseline = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:a", "ex:text": text("alpha")},
+                    {"@id": "ex:b", "ex:text": text("beta")},
+                    {"@id": "ex:c", "ex:text": "A short one"},
+                    {"@id": "ex:d", "ex:text": "A long value that shares only its first letter, padded past sixty-five bytes"}
+                ]
+            });
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &baseline,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("baseline insert")
+                .ledger;
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+
+            let check = |t: i64, value: String, id: &'static str, prefix: String, matches: i64| {
+                let fluree = &fluree;
+                async move {
+                    let view = fluree.db_at_t(ledger_id, t).await.expect("indexed view");
+                    let by_value = format!(
+                        r#"PREFIX ex: <http://example.org/ns/>
+                           SELECT ?s WHERE {{ ?s ex:text "{value}" }}"#
+                    );
+                    let rows = fluree
+                        .query(&view, QueryInput::Sparql(&by_value))
+                        .await
+                        .expect("query by value")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld");
+                    assert_eq!(
+                        normalize_rows(&rows),
+                        normalize_rows(&json!([[id]])),
+                        "t={t} by value"
+                    );
+                    let by_prefix = format!(
+                        r#"PREFIX ex: <http://example.org/ns/>
+                           PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                           SELECT (SUM(xsd:integer(STRSTARTS(?text, "{prefix}"))) AS ?n)
+                           WHERE {{ ?s ex:text ?text }}"#
+                    );
+                    let rows = fluree
+                        .query(&view, QueryInput::Sparql(&by_prefix))
+                        .await
+                        .expect("query by prefix")
+                        .to_jsonld(&view.snapshot)
+                        .expect("to_jsonld");
+                    assert_eq!(
+                        normalize_rows(&rows),
+                        normalize_rows(&json!([[matches]])),
+                        "t={t} prefix {prefix:?}"
+                    );
+                    // The pushdowns' own scan, which a query only reaches
+                    // when a fast path fires.
+                    let store = view.binary_store().expect("indexed view has a store");
+                    let found: Vec<String> = store
+                        .find_strings_by_prefix(&prefix)
+                        .expect("prefix scan")
+                        .into_iter()
+                        .map(|id| store.resolve_string_value(id).expect("string value"))
+                        .collect();
+                    assert!(
+                        found.iter().all(|v| v.starts_with(prefix.as_str())),
+                        "t={t} prefix scan {prefix:?}: {found:?}"
+                    );
+                    assert_eq!(found.len() as i64, matches, "t={t} prefix scan {prefix:?}");
+                }
+            };
+
+            check(1, text("beta"), "ex:b", "A ".into(), 4).await;
+            check(1, text("alpha"), "ex:a", format!("{shared}al"), 1).await;
+            check(1, text("beta"), "ex:b", format!("{shared}be"), 1).await;
+
+            let more = json!({
+                "@context": { "ex": "http://example.org/ns/" },
+                "@graph": [
+                    {"@id": "ex:e", "ex:text": text("alps")},
+                    {"@id": "ex:f", "ex:text": text("gamma")}
+                ]
+            });
+            let ledger = fluree
+                .insert_with_opts(
+                    ledger,
+                    &more,
+                    TxnOpts::default(),
+                    CommitOpts::default(),
+                    &index_cfg,
+                )
+                .await
+                .expect("second insert")
+                .ledger;
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+
+            check(2, text("alps"), "ex:e", format!("{shared}al"), 2).await;
+            check(2, text("gamma"), "ex:f", "A ".into(), 6).await;
+            check(2, text("beta"), "ex:b", shared.to_string(), 4).await;
+        })
+        .await;
+}
+
 /// Regression: filtering by a novelty-only ref object must return matches.
 ///
 /// Exercises the ref-object path in `binary_range_eq_v3` where

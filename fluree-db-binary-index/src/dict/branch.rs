@@ -19,14 +19,33 @@
 //!
 //! Leaf entries are sorted by their key range. Binary search on `first_key`
 //! finds the correct leaf for any lookup key.
+//!
+//! A tree whose keys are not its values (see [`KeyScheme`]) has a `DTB2`
+//! branch, whose header adds the scheme after `leaf_count`:
+//!
+//! ```text
+//! [magic: 4B "DTB2"] [leaf_count: u32] [scheme: u8] [prefix_len: u8] [reserved: 2B]
+//! ```
+//!
+//! scheme 1 is [`KeyScheme::PrefixHash`]. A raw tree's branch is `DTB1`.
 
 use std::io;
+
+use super::key_scheme::KeyScheme;
 
 /// Magic bytes for a dictionary tree branch.
 pub const BRANCH_MAGIC: [u8; 4] = *b"DTB1";
 
+/// Magic bytes for a branch that records its tree's key scheme.
+pub const SCHEMED_BRANCH_MAGIC: [u8; 4] = *b"DTB2";
+
 /// Header size: magic (4) + leaf_count (4).
 const HEADER_SIZE: usize = 8;
+
+/// `DTB2` header: magic (4) + leaf_count (4) + scheme (1) + prefix_len (1) + reserved (2).
+const SCHEMED_HEADER_SIZE: usize = 12;
+
+const SCHEME_PREFIX_HASH: u8 = 1;
 
 /// A single leaf descriptor within a branch.
 #[derive(Debug, Clone)]
@@ -42,9 +61,11 @@ pub struct BranchLeafEntry {
 }
 
 /// Decoded dictionary tree branch.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DictBranch {
     pub leaves: Vec<BranchLeafEntry>,
+    /// How the tree's keys are made from its values.
+    pub key_scheme: KeyScheme,
 }
 
 impl DictBranch {
@@ -65,12 +86,25 @@ impl DictBranch {
             })
             .sum();
 
-        let total = HEADER_SIZE + offset_table_size + entries_size;
+        let header_size = match self.key_scheme {
+            KeyScheme::Raw => HEADER_SIZE,
+            KeyScheme::PrefixHash { .. } => SCHEMED_HEADER_SIZE,
+        };
+        let total = header_size + offset_table_size + entries_size;
         let mut buf = Vec::with_capacity(total);
 
         // Header
-        buf.extend_from_slice(&BRANCH_MAGIC);
-        buf.extend_from_slice(&leaf_count.to_le_bytes());
+        match self.key_scheme {
+            KeyScheme::Raw => {
+                buf.extend_from_slice(&BRANCH_MAGIC);
+                buf.extend_from_slice(&leaf_count.to_le_bytes());
+            }
+            KeyScheme::PrefixHash { prefix_len } => {
+                buf.extend_from_slice(&SCHEMED_BRANCH_MAGIC);
+                buf.extend_from_slice(&leaf_count.to_le_bytes());
+                buf.extend_from_slice(&[SCHEME_PREFIX_HASH, prefix_len, 0, 0]);
+            }
+        }
 
         // Offset table
         let mut offset: u32 = 0;
@@ -103,14 +137,35 @@ impl DictBranch {
                 "dict branch: too small for header",
             ));
         }
-        if data[0..4] != BRANCH_MAGIC {
+        let (key_scheme, offset_table_start) = if data[0..4] == BRANCH_MAGIC {
+            (KeyScheme::Raw, HEADER_SIZE)
+        } else if data[0..4] == SCHEMED_BRANCH_MAGIC {
+            if data.len() < SCHEMED_HEADER_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "dict branch: too small for header",
+                ));
+            }
+            let scheme = match data[8] {
+                0 => KeyScheme::Raw,
+                SCHEME_PREFIX_HASH => KeyScheme::PrefixHash {
+                    prefix_len: data[9],
+                },
+                other => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("dict branch: unknown key scheme {other}"),
+                    ));
+                }
+            };
+            (scheme, SCHEMED_HEADER_SIZE)
+        } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "dict branch: invalid magic",
             ));
-        }
+        };
         let leaf_count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-        let offset_table_start = HEADER_SIZE;
         let data_section_start = offset_table_start + leaf_count * 4;
 
         if data.len() < data_section_start {
@@ -157,7 +212,7 @@ impl DictBranch {
             });
         }
 
-        Ok(Self { leaves })
+        Ok(Self { leaves, key_scheme })
     }
 
     /// Find the leaf index whose key range contains `target_key`.
@@ -234,6 +289,7 @@ mod tests {
                     address: "cas://leaf_2".into(),
                 },
             ],
+            ..Default::default()
         }
     }
 
@@ -247,6 +303,36 @@ mod tests {
         assert_eq!(decoded.leaves[0].entry_count, 100);
         assert_eq!(decoded.leaves[0].address, "cas://leaf_0");
         assert_eq!(decoded.leaves[2].address, "cas://leaf_2");
+    }
+
+    /// A raw tree's branch is the `DTB1` it always was; a hashed tree's
+    /// is `DTB2` and carries its scheme back.
+    #[test]
+    fn a_branch_records_its_key_scheme() {
+        let raw = make_branch();
+        let raw_blob = raw.encode();
+        assert_eq!(raw_blob[..4], BRANCH_MAGIC);
+        assert_eq!(
+            DictBranch::decode(&raw_blob).unwrap().key_scheme,
+            KeyScheme::Raw
+        );
+
+        let hashed = DictBranch {
+            key_scheme: KeyScheme::PrefixHash { prefix_len: 48 },
+            ..make_branch()
+        };
+        let blob = hashed.encode();
+        assert_eq!(blob[..4], SCHEMED_BRANCH_MAGIC);
+        assert_eq!(blob.len(), raw_blob.len() + 4);
+        let decoded = DictBranch::decode(&blob).unwrap();
+        assert_eq!(decoded.key_scheme, KeyScheme::PrefixHash { prefix_len: 48 });
+        assert_eq!(decoded.leaves.len(), 3);
+        assert_eq!(decoded.leaves[2].address, "cas://leaf_2");
+        assert_eq!(decoded.find_leaf(&id_to_branch_key(150)), Some(1));
+
+        let mut unknown = blob.clone();
+        unknown[8] = 9;
+        assert!(DictBranch::decode(&unknown).is_err());
     }
 
     #[test]
@@ -266,6 +352,7 @@ mod tests {
                     address: "cas://b_leaf".into(),
                 },
             ],
+            ..Default::default()
         };
 
         assert_eq!(branch.find_leaf(b"abc"), Some(0));
@@ -275,7 +362,7 @@ mod tests {
 
     #[test]
     fn test_empty_branch() {
-        let branch = DictBranch { leaves: vec![] };
+        let branch = DictBranch::default();
         let blob = branch.encode();
         let decoded = DictBranch::decode(&blob).unwrap();
         assert_eq!(decoded.leaves.len(), 0);

@@ -10,6 +10,7 @@
 //! whatever the import's size.
 
 use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
+use fluree_db_binary_index::dict::key_scheme::{KeyOrder, KeyScheme};
 use fluree_db_binary_index::dict::reverse_leaf::{LeafFormat, ReverseEntry, ReverseLeaf};
 use fluree_db_binary_index::{DictRefs, DictTreeRefs, PackBranchEntry};
 use fluree_db_core::subject_id::SubjectId;
@@ -153,7 +154,7 @@ fn subject_key(sid64: u64, suffix: &[u8], key: &mut Vec<u8>) {
     key.extend_from_slice(suffix);
 }
 
-/// A string's reverse key: the string.
+/// A string's reverse value: the string, which the tree's scheme keys.
 fn string_key(_id: u64, value: &[u8], key: &mut Vec<u8>) {
     key.clear();
     key.extend_from_slice(value);
@@ -174,17 +175,26 @@ fn read_error(e: std::io::Error) -> IndexerError {
 // ============================================================================
 
 /// The new terms as reverse entries, in key order, one ahead.
+///
+/// Terms arrive in value order; the tree's scheme may key a run of values
+/// sharing a prefix in another order, which [`KeyOrder`] restores.
 struct EntryCursor {
     reader: crate::run_index::NewTermReader,
     key_of: KeyOf,
+    order: KeyOrder,
+    value: Vec<u8>,
+    drained: bool,
     next: Option<ReverseEntry>,
 }
 
 impl EntryCursor {
-    fn open(terms: &NewTerms, key_of: KeyOf) -> Result<Self> {
+    fn open(terms: &NewTerms, key_of: KeyOf, scheme: KeyScheme) -> Result<Self> {
         let mut cursor = Self {
             reader: terms.reader().map_err(read_error)?,
             key_of,
+            order: KeyOrder::new(scheme),
+            value: Vec::new(),
+            drained: false,
             next: None,
         };
         cursor.next = cursor.read()?;
@@ -192,12 +202,24 @@ impl EntryCursor {
     }
 
     fn read(&mut self) -> Result<Option<ReverseEntry>> {
-        let Some((id, value)) = self.reader.next_term().map_err(read_error)? else {
-            return Ok(None);
-        };
-        let mut key = Vec::new();
-        (self.key_of)(id, value, &mut key);
-        Ok(Some(ReverseEntry { key, id }))
+        loop {
+            if let Some((key, id)) = self.order.pop() {
+                return Ok(Some(ReverseEntry { key, id }));
+            }
+            if self.drained {
+                return Ok(None);
+            }
+            match self.reader.next_term().map_err(read_error)? {
+                Some((id, value)) => {
+                    (self.key_of)(id, value, &mut self.value);
+                    self.order.push(&self.value, id);
+                }
+                None => {
+                    self.order.finish();
+                    self.drained = true;
+                }
+            }
+        }
     }
 
     fn peek(&self) -> Option<&ReverseEntry> {
@@ -222,24 +244,28 @@ impl EntryCursor {
 ///
 /// Leaf `i` owns `[first_key[i], first_key[i + 1])`; the first leaf also
 /// owns everything below it and the last everything above.
-fn leaves_receiving(branch: &DictBranch, terms: &NewTerms, key_of: KeyOf) -> Result<Vec<usize>> {
+fn leaves_receiving(
+    branch: &DictBranch,
+    terms: &NewTerms,
+    key_of: KeyOf,
+    scheme: KeyScheme,
+) -> Result<Vec<usize>> {
     let mut touched = Vec::new();
     if branch.leaves.is_empty() {
         return Ok(touched);
     }
-    let mut reader = terms.reader().map_err(read_error)?;
-    let mut key = Vec::new();
+    let mut cursor = EntryCursor::open(terms, key_of, scheme)?;
     let mut leaf = 0usize;
-    while let Some((id, value)) = reader.next_term().map_err(read_error)? {
-        key_of(id, value, &mut key);
+    while let Some(entry) = cursor.peek() {
         while leaf + 1 < branch.leaves.len()
-            && key.as_slice() >= branch.leaves[leaf + 1].first_key.as_slice()
+            && entry.key.as_slice() >= branch.leaves[leaf + 1].first_key.as_slice()
         {
             leaf += 1;
         }
         if touched.last() != Some(&leaf) {
             touched.push(leaf);
         }
+        cursor.take()?;
     }
     Ok(touched)
 }
@@ -359,6 +385,12 @@ async fn extend_reverse_tree(
         .map_err(|e| IndexerError::StorageRead(format!("load reverse branch: {e}")))?;
     let branch = DictBranch::decode(&branch_bytes)
         .map_err(|e| IndexerError::StorageRead(format!("decode reverse branch: {e}")))?;
+    // An empty tree takes a new tree's scheme; any other keeps its own.
+    let scheme = if branch.leaves.is_empty() {
+        KeyScheme::for_new_tree(dict)
+    } else {
+        branch.key_scheme
+    };
     if branch.leaves.len() != existing.leaves.len() {
         return Err(IndexerError::StorageRead(format!(
             "reverse branch names {} leaves, its refs {}",
@@ -367,7 +399,7 @@ async fn extend_reverse_tree(
         )));
     }
 
-    let touched = leaves_receiving(&branch, terms, key_of)?;
+    let touched = leaves_receiving(&branch, terms, key_of, scheme)?;
     // Owned ids: a stream of futures borrowing through a closure argument
     // is not `Send` for every lifetime, which a spawned import needs.
     let to_fetch: Vec<ContentId> = touched
@@ -378,12 +410,12 @@ async fn extend_reverse_tree(
         .map(|cid| async move { content_store.get(&cid).await })
         .buffered(LEAF_PREFETCH);
 
-    let mut cursor = EntryCursor::open(terms, key_of)?;
+    let mut cursor = EntryCursor::open(terms, key_of, scheme)?;
     let mut cutter = LeafCutter::new(target_leaf_bytes);
     let mut writer = TreeWriter {
         content_store,
         kind,
-        format: LeafFormat::for_dict(dict),
+        format: LeafFormat::for_tree(dict, scheme),
         leaves: Vec::with_capacity(branch.leaves.len()),
         leaf_cids: Vec::with_capacity(branch.leaves.len()),
     };
@@ -462,6 +494,7 @@ async fn extend_reverse_tree(
 
     let new_branch = DictBranch {
         leaves: writer.leaves,
+        key_scheme: scheme,
     };
     let branch_cid = content_store
         .put(kind, &new_branch.encode())
@@ -890,7 +923,7 @@ mod tests {
                     ContentKind::DictBlob {
                         dict: DictKind::StringReverse,
                     },
-                    &DictBranch { leaves: Vec::new() }.encode(),
+                    &DictBranch::default().encode(),
                 )
                 .await
                 .unwrap(),
@@ -961,7 +994,7 @@ mod tests {
                     ContentKind::DictBlob {
                         dict: DictKind::SubjectReverse,
                     },
-                    &DictBranch { leaves: Vec::new() }.encode(),
+                    &DictBranch::default().encode(),
                 )
                 .await
                 .unwrap(),
@@ -1179,7 +1212,7 @@ mod tests {
                     branch: store
                         .put(
                             ContentKind::DictBlob { dict },
-                            &DictBranch { leaves: Vec::new() }.encode(),
+                            &DictBranch::default().encode(),
                         )
                         .await
                         .unwrap(),

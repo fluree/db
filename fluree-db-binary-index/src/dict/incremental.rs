@@ -333,6 +333,8 @@ pub struct IncrementalTreeResult {
 /// [`super::builder::finalize_branch`] after CAS upload to set real addresses.
 ///
 /// Rewritten leaves are written in `format`, whatever format they were read in.
+/// `new_entries` are keyed by `existing_branch.key_scheme`, which the result
+/// keeps, empty tree or not.
 pub fn update_reverse_tree(
     existing_branch: &DictBranch,
     new_entries: &[ReverseEntry],
@@ -342,7 +344,12 @@ pub fn update_reverse_tree(
 ) -> io::Result<IncrementalTreeResult> {
     // Empty branch: build from scratch using new entries only
     if existing_branch.leaves.is_empty() {
-        return build_fresh_tree(new_entries, target_leaf_bytes, format);
+        return build_fresh_tree(
+            new_entries,
+            target_leaf_bytes,
+            format,
+            existing_branch.key_scheme,
+        );
     }
 
     if new_entries.is_empty() {
@@ -390,6 +397,7 @@ pub fn update_reverse_tree(
 
     let branch = DictBranch {
         leaves: branch_entries,
+        key_scheme: existing_branch.key_scheme,
     };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
@@ -467,6 +475,7 @@ pub fn remove_from_reverse_tree(
 
     let branch = DictBranch {
         leaves: branch_entries,
+        key_scheme: existing_branch.key_scheme,
     };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
@@ -589,8 +598,14 @@ fn build_fresh_tree(
     entries: &[ReverseEntry],
     target_leaf_bytes: usize,
     format: LeafFormat,
+    key_scheme: super::key_scheme::KeyScheme,
 ) -> io::Result<IncrementalTreeResult> {
-    let tree = super::builder::build_reverse_tree_as(entries.to_vec(), target_leaf_bytes, format)?;
+    let tree = super::builder::build_reverse_tree_as(
+        entries.to_vec(),
+        target_leaf_bytes,
+        format,
+        key_scheme,
+    )?;
     Ok(IncrementalTreeResult {
         branch: tree.branch,
         branch_bytes: tree.branch_bytes,
@@ -827,7 +842,7 @@ mod tests {
 
     #[test]
     fn test_reverse_tree_update_empty_branch() {
-        let branch = DictBranch { leaves: vec![] };
+        let branch = DictBranch::default();
         let new_entries = vec![
             make_reverse_entry("hello", 1),
             make_reverse_entry("world", 2),

@@ -50,6 +50,7 @@ use std::io;
 
 use fluree_db_core::DictKind;
 
+use super::key_scheme::KeyScheme;
 use super::varint::{decode_varint, encode_varint};
 
 /// Magic bytes for a reverse leaf file.
@@ -82,14 +83,18 @@ pub enum LeafFormat {
 }
 
 impl LeafFormat {
-    /// The format `dict`'s reverse tree is written in. Subject keys are a
-    /// namespace code and a local name, which neighbours share most of;
-    /// string keys share too little for front coding to pay for the scan it
-    /// adds to a lookup.
-    pub fn for_dict(dict: DictKind) -> Self {
-        match dict {
-            DictKind::SubjectReverse => Self::FrontCoded {
+    /// The format a reverse tree of `dict` keyed by `scheme` is written in.
+    /// Subject keys are a namespace code and a local name, which neighbours
+    /// share most of. Raw string keys share too little for front coding to
+    /// pay for the scan it adds to a lookup, but hashed string keys are
+    /// short, and their ids gain from varints.
+    pub fn for_tree(dict: DictKind, scheme: KeyScheme) -> Self {
+        match (dict, scheme) {
+            (DictKind::SubjectReverse, _) => Self::FrontCoded {
                 ns_relative_ids: true,
+            },
+            (DictKind::StringReverse, KeyScheme::PrefixHash { .. }) => Self::FrontCoded {
+                ns_relative_ids: false,
             },
             _ => Self::Plain,
         }
@@ -1140,26 +1145,33 @@ mod tests {
             })
             .collect();
         let plain = encode_reverse_leaf(&entries).len();
-        let front_coded = LeafFormat::for_dict(DictKind::SubjectReverse)
+        let front_coded = LeafFormat::for_tree(DictKind::SubjectReverse, KeyScheme::Raw)
             .encode(&entries)
             .len();
         assert!(front_coded * 3 < plain, "{front_coded} vs {plain}");
     }
 
     #[test]
-    fn only_subject_trees_are_front_coded() {
-        assert!(matches!(
-            LeafFormat::for_dict(DictKind::SubjectReverse),
+    fn subject_and_hashed_string_trees_are_front_coded() {
+        let hashed = KeyScheme::PrefixHash { prefix_len: 48 };
+        assert_eq!(
+            LeafFormat::for_tree(DictKind::SubjectReverse, KeyScheme::Raw),
             LeafFormat::FrontCoded {
                 ns_relative_ids: true
             }
-        ));
+        );
         assert_eq!(
-            LeafFormat::for_dict(DictKind::StringReverse),
+            LeafFormat::for_tree(DictKind::StringReverse, hashed),
+            LeafFormat::FrontCoded {
+                ns_relative_ids: false
+            }
+        );
+        assert_eq!(
+            LeafFormat::for_tree(DictKind::StringReverse, KeyScheme::Raw),
             LeafFormat::Plain
         );
         assert_eq!(
-            LeafFormat::for_dict(DictKind::TermReverse),
+            LeafFormat::for_tree(DictKind::TermReverse, KeyScheme::Raw),
             LeafFormat::Plain
         );
     }

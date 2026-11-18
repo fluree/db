@@ -143,25 +143,48 @@ pub(crate) async fn remove_from_reverse_tree_async(
 }
 
 /// `remove`: take `entries`' keys out of the tree instead of inserting them.
+///
+/// `entries` carry values; they are keyed here by the tree's own scheme, or
+/// by a new tree's when the existing one is empty.
 async fn upload_incremental_reverse_tree_core(
     content_store: &dyn ContentStore,
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
-    entries: Vec<fluree_db_binary_index::dict::reverse_leaf::ReverseEntry>,
+    mut entries: Vec<fluree_db_binary_index::dict::reverse_leaf::ReverseEntry>,
     warm_cache: Option<&LeafletCache>,
     remove: bool,
 ) -> Result<UpdatedReverseTree> {
+    use fluree_db_binary_index::dict::key_scheme::KeyScheme;
+    use fluree_db_binary_index::dict::reverse_leaf::LeafFormat;
+
     let kind = ContentKind::DictBlob { dict };
-    let format = fluree_db_binary_index::dict::reverse_leaf::LeafFormat::for_dict(dict);
 
     // 1. Async fetch existing branch.
     let existing_branch_bytes = content_store
         .get(&existing_refs.branch)
         .await
         .map_err(|e| IndexerError::StorageRead(format!("load reverse branch: {e}")))?;
-    let existing_branch =
+    let mut existing_branch =
         fluree_db_binary_index::dict::branch::DictBranch::decode(&existing_branch_bytes)
             .map_err(|e| IndexerError::StorageRead(format!("decode reverse branch: {e}")))?;
+    if existing_branch.leaves.is_empty() {
+        existing_branch.key_scheme = KeyScheme::for_new_tree(dict);
+    }
+    let scheme = existing_branch.key_scheme;
+    let format = LeafFormat::for_tree(dict, scheme);
+    if scheme.reorders() {
+        for entry in &mut entries {
+            entry.key = scheme.key(&entry.key).into_owned();
+        }
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        if remove {
+            entries.dedup_by(|a, b| a.key == b.key);
+        } else if entries.windows(2).any(|w| w[0].key == w[1].key) {
+            return Err(IndexerError::StorageWrite(format!(
+                "two new {dict:?} values share a reverse-tree key"
+            )));
+        }
+    }
 
     // 2. Build address→CID map for existing leaves.
     let mut address_to_cid: std::collections::HashMap<String, ContentId> =
