@@ -108,6 +108,22 @@ pub fn txn_meta_graph_iri(ledger_id: &str) -> String {
     format!("urn:fluree:{ledger_id}#txn-meta")
 }
 
+/// A character no IRI reference holds: whitespace, C0, DEL, or one RFC 3987
+/// excludes (`<`, `>`, `"`, `{`, `}`, `|`, `\\`, `^`, `` ` ``).
+fn excluded_from_iris(c: char) -> bool {
+    matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
+        || c.is_whitespace()
+        || c <= '\u{20}'
+        || c == '\u{7F}'
+}
+
+/// Whether `value` can be an IRI reference: nonempty, with no character
+/// [`validate_absolute_graph_iri`] excludes, which is what SPARQL's `<…>`
+/// admits. It needs no scheme: a datatype name with none (`<T>`) is one.
+pub fn is_iri_reference(value: &str) -> bool {
+    !value.is_empty() && !value.chars().any(excluded_from_iris)
+}
+
 /// Validate that `value` is an absolute IRI acceptable as a graph target.
 ///
 /// A minimal check, not a full RFC 3987 parser: no whitespace / C0 / DEL /
@@ -118,12 +134,7 @@ pub fn validate_absolute_graph_iri(value: &str) -> std::result::Result<(), Strin
     if value.is_empty() {
         return Err("graph IRI is required and cannot be empty".to_string());
     }
-    if value.chars().any(|c| {
-        matches!(c, '<' | '>' | '"' | '{' | '}' | '|' | '\\' | '^' | '`')
-            || c.is_whitespace()
-            || c <= '\u{20}'
-            || c == '\u{7F}'
-    }) {
+    if value.chars().any(excluded_from_iris) {
         return Err(format!(
             "Invalid graph IRI '{value}': contains whitespace, a control character, \
              or a character not allowed in an IRI \
