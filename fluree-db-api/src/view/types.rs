@@ -1143,6 +1143,41 @@ mod tests {
     }
 
     #[test]
+    fn result_cache_key_covers_each_view_input() {
+        fn key(view: &GraphDb) -> u128 {
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            view.hash_for_result_cache(&mut h).expect("keyable");
+            h.digest128()
+        }
+        let novelty = Arc::new(Novelty::new(0));
+        let overlay = novelty.clone() as Arc<dyn OverlayProvider>;
+        let base = GraphDb::new(
+            Arc::new(make_test_snapshot()),
+            overlay,
+            Some(novelty),
+            5,
+            "test:main",
+        );
+        assert_eq!(key(&base), key(&base.clone()));
+        let variants = [
+            ("t", base.clone().as_of(4)),
+            ("graph", base.clone().with_graph_id(3)),
+            (
+                "default context",
+                base.clone()
+                    .with_default_context(Some(serde_json::json!({"ex": "http://ex/"}))),
+            ),
+            ("union switch", base.clone().with_union_default_graph(true)),
+        ];
+        let unkeyed: Vec<&str> = variants
+            .iter()
+            .filter(|(_, view)| key(view) == key(&base))
+            .map(|(input, _)| *input)
+            .collect();
+        assert!(unkeyed.is_empty(), "not keyed: {unkeyed:?}");
+    }
+
+    #[test]
     fn test_view_new() {
         let snapshot = make_test_snapshot();
         let novelty = Arc::new(Novelty::new(0));
