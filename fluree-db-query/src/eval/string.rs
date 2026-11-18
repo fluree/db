@@ -718,8 +718,20 @@ pub fn eval_str_dt<R: RowAccess>(
                 }
                 return Ok(None);
             };
+            // A JSON value is stored canonical, so the literal is built in its
+            // canonical form, the term a write of it stores:
+            // `STRDT("[1, 2]", rdf:JSON)` is the stored `[1,2]`, compared or
+            // bound. Text that is not JSON stays a string.
+            let val = if dt_iri.as_ref() == fluree_vocab::rdf::JSON {
+                fluree_db_core::coerce::coerce_string_value(&s, &dt_iri)
+                    .ok()
+                    .filter(|v| matches!(v, FlakeValue::Json(_)))
+                    .unwrap_or_else(|| FlakeValue::String(s.to_string()))
+            } else {
+                FlakeValue::String(s.to_string())
+            };
             Ok(Some(ComparableValue::TypedLiteral {
-                val: FlakeValue::String(s.to_string()),
+                val,
                 dtc: Some(UnresolvedDatatypeConstraint::Explicit(dt_iri)),
             }))
         }
