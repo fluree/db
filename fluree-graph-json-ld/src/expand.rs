@@ -506,7 +506,7 @@ fn parse_value_object(
             _ => None,
         }),
     };
-    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref()) {
+    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref(), val) {
         return Err(JsonLdError::InvalidKeywordValue {
             keyword: "@value",
             reason: "a value object whose @value is an array or a map needs \"@type\": \
@@ -545,15 +545,16 @@ fn parse_value_object(
     Ok(vec![JsonValue::Object(obj)])
 }
 
-/// Whether a value object typed `type_iri` may hold an array or a map: a JSON
-/// literal, or a vector (an array only, which the vector parser checks).
-fn holds_structured_value(type_iri: Option<&str>) -> bool {
-    matches!(
-        type_iri,
-        Some(
-            "@json" | "@vector" | fluree_vocab::rdf::JSON | fluree_vocab::fluree::EMBEDDING_VECTOR
-        )
-    )
+/// Whether a value object typed `type_iri` may hold `val`, an array or a map:
+/// a JSON literal holds either, a vector only an array. Refused here, a map
+/// under a vector type fails every reader alike; a bulk import reaches no
+/// vector parser to refuse it.
+fn holds_structured_value(type_iri: Option<&str>, val: &JsonValue) -> bool {
+    match type_iri {
+        Some("@json" | fluree_vocab::rdf::JSON) => true,
+        Some("@vector" | fluree_vocab::fluree::EMBEDDING_VECTOR) => val.is_array(),
+        _ => false,
+    }
 }
 
 /// Parse @type values and return expanded types with potentially updated context
@@ -1976,6 +1977,16 @@ mod tests {
             (
                 json!({"@id": p, "@type": XSD_INTEGER}),
                 json!({"@value": [0.5]}),
+            ),
+            // A vector holds an array only.
+            (json!(p), json!({"@value": {"a": 1}, "@type": "@vector"})),
+            (
+                json!(p),
+                json!({"@value": {"a": 1}, "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}),
+            ),
+            (
+                json!({"@id": p, "@type": "@vector"}),
+                json!({"@value": {"a": 1}}),
             ),
         ] {
             let ctx = json!({"p": term});
