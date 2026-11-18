@@ -127,8 +127,7 @@ impl QueryExecutionOptions {
             None => 0u8.hash(h),
             Some(params) => {
                 1u8.hash(h);
-                let bytes = serde_json::to_vec(params.as_ref()).map_err(|_| "parameters")?;
-                bytes.hash(h);
+                result_cache::hash_json(params.as_ref(), h).map_err(|_| "parameters")?;
             }
         }
         Ok(())

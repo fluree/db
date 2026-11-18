@@ -225,8 +225,8 @@ where
             message: w.message.clone(),
             class_policy: w.class_policy,
             for_classes,
-            // `class_check_needed` is recomputed by `build_policy_set`
-            // from the (for_classes, property, stats) triple.
+            // Class checks are decided per index entry by
+            // `build_policy_set`.
             class_check_needed: false,
         });
     }

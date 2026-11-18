@@ -446,3 +446,65 @@ async fn lineage_export_rejects_a_base_off_the_line() {
         .expect_err("a diverged base should be refused");
     assert!(error.to_string().contains("diverged"), "{error}");
 }
+
+/// A push that retracts a value the receiver holds in its index: the
+/// receiver checks the retracted fact exists, through a range match that
+/// carries the value's datatype. A language-tagged or custom-datatype string
+/// must be found under its own datatype, like a plain one.
+#[tokio::test]
+async fn push_retracts_indexed_typed_strings() {
+    let prefixes = "PREFIX ex: <http://example.org/ns/> PREFIX dt: <http://example.org/dt/>";
+    for (label, value) in [
+        ("a plain string", "\"x\""),
+        ("a language-tagged string", "\"chat\"@fr"),
+        ("a custom-datatype string", "\"A1\"^^dt:Code"),
+    ] {
+        let fluree = FlureeBuilder::memory().build_memory();
+        let src = "push-typed/src:main";
+        let tgt = "push-typed/tgt:main";
+        fluree.create_ledger(src).await.unwrap();
+        let handle = fluree.ledger_cached(src).await.unwrap();
+        fluree
+            .stage(&handle)
+            .sparql_update(&format!("{prefixes} INSERT DATA {{ ex:a ex:v {value} }}"))
+            .execute()
+            .await
+            .unwrap();
+        let first = build_bundle_from(&fluree, src, None).await;
+        fluree.create_ledger(tgt).await.unwrap();
+        let pushed = fluree
+            .push_commits(tgt, first, &GovernanceOptions::default(), &index_config())
+            .await
+            .unwrap_or_else(|e| panic!("{label}: first push: {e}"));
+        support::rebuild_and_publish_index(&fluree, tgt).await;
+        fluree.disconnect_ledger(tgt).await;
+
+        fluree
+            .stage(&handle)
+            .sparql_update(&format!("{prefixes} DELETE DATA {{ ex:a ex:v {value} }}"))
+            .execute()
+            .await
+            .unwrap();
+        let second = build_bundle_from(&fluree, src, Some(&pushed.head.commit_id)).await;
+        fluree
+            .push_commits(tgt, second, &GovernanceOptions::default(), &index_config())
+            .await
+            .unwrap_or_else(|e| panic!("{label}: the retracting push: {e}"));
+
+        let ledger = fluree.ledger(tgt).await.unwrap();
+        let rows = support::query_sparql(
+            &fluree,
+            &ledger,
+            &format!("{prefixes} SELECT ?o WHERE {{ ex:a ex:v ?o }}"),
+        )
+        .await
+        .unwrap()
+        .to_sparql_json(&ledger.snapshot)
+        .unwrap();
+        let bindings = rows["results"]["bindings"].as_array().unwrap();
+        assert!(
+            bindings.is_empty(),
+            "{label}: the value is retracted on the receiver: {rows}"
+        );
+    }
+}

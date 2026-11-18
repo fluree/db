@@ -20,9 +20,14 @@ async-trait = { workspace = true }
 bytes = { workspace = true }
 futures = { workspace = true }
 http = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 urlencoding = { workspace = true }
+# The live-query change gate hashes formatted result bytes (xxh3 — fast,
+# non-cryptographic, stable across targets). Features are additive on top
+# of the workspace's xxh64.
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 # Channels and the fetch-width semaphore only; no runtime. tokio's sync
 # primitives are executor-agnostic and build for wasm32.
 tokio = { version = "1", default-features = false, features = ["sync"] }

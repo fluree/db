@@ -12,8 +12,53 @@ use async_trait::async_trait;
 use fluree_db_nameservice_sync::{
     HttpTransport, TransportError, TransportRequest, TransportResponse,
 };
+use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
+
+/// Shared, hot-swappable bearer token.
+///
+/// Long-lived subscribed sessions outlive their tokens: the shell's auth
+/// flow refreshes the bearer mid-session, and every I/O surface holding a
+/// clone of this cell — the fetch transports, the SSE source — picks the
+/// new value up on its next request or connect, with no teardown and no
+/// loss of warm per-store state. [`crate::BrowserPeer::set_token`] is the
+/// public entry.
+///
+/// Per-request cost is one read-lock acquisition plus the header-string
+/// allocation the request needed anyway. `Debug` redacts the token.
+#[derive(Clone)]
+pub struct TokenCell {
+    inner: Arc<RwLock<String>>,
+}
+
+impl TokenCell {
+    pub fn new(token: impl Into<String>) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(token.into())),
+        }
+    }
+
+    /// Replace the token. Requests already in flight keep the header they
+    /// were stamped with; everything issued afterwards carries the new one.
+    pub fn set(&self, token: impl Into<String>) {
+        *self.inner.write().unwrap_or_else(PoisonError::into_inner) = token.into();
+    }
+
+    /// The current `authorization` header value (`Bearer {token}`).
+    pub fn bearer_header(&self) -> String {
+        format!(
+            "Bearer {}",
+            self.inner.read().unwrap_or_else(PoisonError::into_inner)
+        )
+    }
+}
+
+impl std::fmt::Debug for TokenCell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TokenCell(<redacted>)")
+    }
+}
 
 /// Receiving end of the job channel, consumed by a driver.
 pub type IoReceiver = mpsc::UnboundedReceiver<IoJob>;
@@ -65,13 +110,30 @@ impl IoHandle {
 pub struct WasmFetchTransport {
     io: IoHandle,
     timeout: Duration,
+    token: Option<TokenCell>,
 }
 
 impl WasmFetchTransport {
     /// A transport whose requests are executed by the driver behind `io`
     /// and abandoned (aborted) after `timeout`.
     pub fn new(io: IoHandle, timeout: Duration) -> Self {
-        Self { io, timeout }
+        Self {
+            io,
+            timeout,
+            token: None,
+        }
+    }
+
+    /// Source the `authorization` header from `cell` on every request,
+    /// REPLACING any authorization header the caller baked into the
+    /// request. This is the hot-refresh seam: the proxy clients construct
+    /// requests with the token they were built with, and a transport
+    /// carrying a cell overrides it with the current one, so
+    /// [`TokenCell::set`] takes effect mid-session without rebuilding the
+    /// peer.
+    pub fn with_token(mut self, cell: TokenCell) -> Self {
+        self.token = Some(cell);
+        self
     }
 
     /// The per-request deadline this transport stamps on its jobs.
@@ -83,6 +145,13 @@ impl WasmFetchTransport {
 #[async_trait]
 impl HttpTransport for WasmFetchTransport {
     async fn execute(&self, req: TransportRequest) -> Result<TransportResponse, TransportError> {
+        let mut req = req;
+        if let Some(cell) = &self.token {
+            req.headers
+                .retain(|(name, _)| !name.eq_ignore_ascii_case("authorization"));
+            req.headers.push(("authorization", cell.bearer_header()));
+        }
+        let url = req.url.clone();
         let (reply, rx) = oneshot::channel();
         self.io
             .send(IoJob::Fetch {
@@ -91,10 +160,81 @@ impl HttpTransport for WasmFetchTransport {
                 reply,
             })
             .map_err(|e| TransportError::Request(e.to_string()))?;
-        rx.await.map_err(|_| {
-            TransportError::Request("browser I/O driver dropped the request".to_string())
-        })?
+        self.await_reply(rx, &url).await
     }
+}
+
+impl WasmFetchTransport {
+    /// Await the driver's reply under a deadline that does not depend on the
+    /// driver.
+    ///
+    /// `self.timeout` is enforced INSIDE the driver, by `fetch::execute`'s
+    /// `AbortController` — which only runs once the job has been dispatched.
+    /// Anything that stops dispatch therefore has no deadline at all: this
+    /// await blocks forever, the job holds the reply sender so the
+    /// "driver dropped the request" arm never fires either, and the peer
+    /// connects, reports healthy, and answers nothing — with no HTTP request
+    /// and no error to show for it. That shape is expensive to diagnose
+    /// precisely because it is silent, so it gets its own deadline here.
+    ///
+    /// [`dispatch_deadline`] is deliberately slack, so in every normal case
+    /// the driver's own timeout fires first and produces exactly the errors
+    /// it always did; this one fires only when the job never ran.
+    async fn await_reply(
+        &self,
+        rx: oneshot::Receiver<Result<TransportResponse, TransportError>>,
+        url: &str,
+    ) -> Result<TransportResponse, TransportError> {
+        let dropped =
+            || TransportError::Request("browser I/O driver dropped the request".to_string());
+
+        #[cfg(target_arch = "wasm32")]
+        {
+            let deadline = dispatch_deadline(self.timeout);
+            // The timer itself is a JS handle and so `!Send`, while this
+            // future must stay `Send` (the storage traits box Send futures on
+            // every target — the reason this bridge exists at all). Run the
+            // timer in its own `spawn_local` task and observe it over a
+            // channel, which is Send: the same trick the driver uses, and it
+            // deliberately does NOT route through the driver, since a
+            // deadline that needs the driver to dispatch it could never
+            // detect the driver failing to dispatch.
+            let (fired, elapsed) = oneshot::channel::<()>();
+            let millis = crate::config::timer_millis(deadline);
+            wasm_bindgen_futures::spawn_local(async move {
+                gloo_timers::future::TimeoutFuture::new(millis).await;
+                let _ = fired.send(());
+            });
+            match futures::future::select(Box::pin(rx), Box::pin(elapsed)).await {
+                futures::future::Either::Left((reply, _)) => reply.map_err(|_| dropped())?,
+                futures::future::Either::Right((_, _)) => Err(TransportError::Timeout(format!(
+                    "browser I/O driver did not dispatch a fetch of {url} within {deadline:?}; \
+                     the driver is not servicing jobs, so the request was never started and its \
+                     own {:?} timeout never applied",
+                    self.timeout
+                ))),
+            }
+        }
+        // Native keeps the original await exactly: there is no driver task to
+        // wedge, and the reqwest transport owns its own timeouts.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let _ = url;
+            rx.await.map_err(|_| dropped())?
+        }
+    }
+}
+
+/// How long to wait for the driver to dispatch a job before declaring it
+/// wedged: twice the request's own timeout, never less than a second.
+///
+/// Slack is the point. The driver's `AbortController` should always be what
+/// times a real request out, so this only fires when dispatch never
+/// happened; the floor keeps very short per-request timeouts (tests) from
+/// making the two indistinguishable.
+#[cfg(target_arch = "wasm32")]
+fn dispatch_deadline(timeout: Duration) -> Duration {
+    timeout.saturating_mul(2).max(Duration::from_secs(1))
 }
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
@@ -139,6 +279,60 @@ mod tests {
         assert_eq!(resp.headers.get("etag").unwrap(), "\"abc\"");
         assert_eq!(&resp.body[..], b"nope");
         driver.await.unwrap();
+    }
+
+    /// A transport carrying a token cell REPLACES any baked authorization
+    /// header with the cell's current value — the hot-refresh contract —
+    /// and never duplicates it. `Debug` on the cell redacts the token.
+    #[tokio::test]
+    async fn token_cell_stamps_and_replaces_the_authorization_header() {
+        let (io, mut rx) = IoHandle::channel();
+        let cell = TokenCell::new("first");
+        let transport =
+            WasmFetchTransport::new(io, Duration::from_secs(1)).with_token(cell.clone());
+
+        // Echo every authorization header value back as the body.
+        let driver = tokio::spawn(async move {
+            for _ in 0..2 {
+                match rx.recv().await.expect("job") {
+                    IoJob::Fetch { req, reply, .. } => {
+                        let auth: Vec<String> = req
+                            .headers
+                            .iter()
+                            .filter(|(name, _)| *name == "authorization")
+                            .map(|(_, value)| value.clone())
+                            .collect();
+                        let _ = reply.send(Ok(TransportResponse {
+                            status: StatusCode::OK,
+                            headers: HeaderMap::new(),
+                            body: Bytes::from(auth.join("|")),
+                        }));
+                    }
+                    other => panic!("unexpected job {other:?}"),
+                }
+            }
+        });
+
+        // The proxy clients bake the token they were built with; the
+        // transport overrides it with the cell's current value.
+        let stale = TransportRequest::get("http://origin.example/x")
+            .header("authorization", "Bearer stale".to_string());
+        let resp = transport.execute(stale).await.expect("reply");
+        assert_eq!(&resp.body[..], b"Bearer first");
+
+        cell.set("second");
+        let resp = transport
+            .execute(TransportRequest::get("http://origin.example/x"))
+            .await
+            .expect("reply");
+        assert_eq!(&resp.body[..], b"Bearer second");
+        driver.await.unwrap();
+
+        let debugged = format!("{cell:?} / {transport:?}");
+        assert!(
+            !debugged.contains("second") && !debugged.contains("first"),
+            "Debug must redact the token: {debugged}"
+        );
     }
 
     #[tokio::test]
