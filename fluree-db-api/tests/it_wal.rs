@@ -536,6 +536,47 @@ async fn a_read_only_client_leaves_the_writers_log_to_the_writer() {
     );
 }
 
+/// A `read_only` client that misses a file the writer's log still holds
+/// does not apply that log to read it: on a root with an owned log, a miss
+/// is where recovery would otherwise run, writing the writer's file.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_only_client_does_not_apply_the_writers_log_on_a_miss() {
+    use fluree_db_core::StorageWrite;
+
+    let dir = tempfile::tempdir().unwrap();
+    let previous = FileStorage::new(dir.path())
+        .with_durability(Durability::Wal)
+        .with_wal_owner("node-1");
+    previous.recover_wal().expect("attach");
+    previous.hold_wal_segments_for_test().unwrap();
+    previous
+        .write_bytes("fluree:file://payload", b"recover me")
+        .await
+        .unwrap();
+    previous.sync().await.unwrap();
+    previous.simulate_crash_for_test();
+    std::fs::remove_file(dir.path().join("payload")).unwrap();
+
+    let reader = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .read_only()
+        .build_client()
+        .await
+        .unwrap();
+    let read = reader
+        .admin_storage()
+        .expect("file storage")
+        .read_bytes("fluree:file://payload")
+        .await;
+    assert!(
+        read.is_err(),
+        "the reader applied the writer's log on a miss"
+    );
+    assert!(
+        !dir.path().join("payload").exists(),
+        "the reader wrote the writer's file"
+    );
+}
+
 /// Only `build_client` honors `read_only`. The builds that open the root as
 /// its writer refuse it, rather than recover, sweep and index a root another
 /// process writes.
