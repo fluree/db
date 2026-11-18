@@ -192,6 +192,18 @@ impl PeerEventSink {
     }
 }
 
+/// Whether the nameservice has no ledger `ledger_id`, or has it retracted.
+async fn ledger_is_gone(fluree: &Fluree, ledger_id: &LedgerId) -> bool {
+    matches!(
+        fluree.nameservice().lookup(ledger_id.as_str()).await,
+        Ok(None
+            | Some(NsRecord {
+                retracted: true,
+                ..
+            }))
+    )
+}
+
 /// A ledger's worker: applies its waiting updates until none is left.
 async fn apply_ledger_updates(
     updates: Arc<LedgerUpdates>,
@@ -218,6 +230,13 @@ async fn apply_ledger_updates(
                 let evict = fluree.disconnect_ledger(&ledger_id);
                 if peer_state.retract_ledger_in(epoch, &ledger_id, evict).await {
                     tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
+                } else if ledger_is_gone(&fluree, &ledger_id).await {
+                    // From an earlier connection, whose records the new one's
+                    // replace. Those cannot say a ledger is gone, so the
+                    // nameservice does; a ledger it still has (re-created
+                    // since, or loading) stays.
+                    fluree.disconnect_ledger(&ledger_id).await;
+                    tracing::info!(ledger_id = %ledger_id, "Ledger retracted before a reconnect");
                 }
                 continue;
             }
@@ -496,6 +515,111 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(watermark.commit_t, next.commit_t);
+    }
+
+    /// Every file under `dir`, with its length and modification time.
+    fn files_under(
+        dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path().strip_prefix(dir).unwrap().to_path_buf();
+                    files.insert(path, (meta.len(), meta.modified().unwrap()));
+                }
+            }
+        }
+        files
+    }
+
+    /// Wait until the writer's commit-index line for `t` is on disk: the
+    /// nameservice appends it after the publish returns, without the
+    /// committer waiting on it.
+    async fn commit_index_lists(dir: &std::path::Path, t: i64) {
+        let index = dir.join("ns@v2/peer/main.commits.jsonl");
+        let line = format!("\"t\":{t},");
+        for _ in 0..500 {
+            if std::fs::read_to_string(&index).is_ok_and(|s| s.contains(&line)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the writer never listed t {t} in its commit index");
+    }
+
+    /// A shared-storage peer writes nothing under the root: not as it opens
+    /// it, loads a ledger, or applies a new commit to the cached ledger.
+    /// Each snapshot is taken once the writer's own commit has settled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_peer_writes_nothing_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let writer = FlureeBuilder::file(path.clone())
+            .without_indexing()
+            .build()
+            .unwrap();
+        let commit = |n: usize| {
+            let writer = &writer;
+            async move {
+                let ledger = match writer.ledger("peer:main").await {
+                    Ok(ledger) => ledger,
+                    Err(_) => writer.create_ledger("peer:main").await.unwrap(),
+                };
+                writer
+                    .insert(
+                        ledger,
+                        &json!({"@context": {"ex": "http://example.org/"},
+                                "@id": format!("ex:s{n}"), "ex:p": n}),
+                    )
+                    .await
+                    .unwrap();
+                writer
+                    .nameservice()
+                    .lookup("peer:main")
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        let first = commit(1).await;
+        commit_index_lists(dir.path(), first.commit_t).await;
+
+        let before = files_under(dir.path());
+        let peer = Arc::new(
+            FlureeBuilder::file(path)
+                .read_only()
+                .build_client()
+                .await
+                .unwrap(),
+        );
+        let sink = PeerEventSink::new(
+            ServerConfig::default(),
+            Arc::new(PeerState::new()),
+            Arc::clone(&peer),
+        );
+        sink.on_event(RemoteEvent::Connected).await;
+        peer.ledger_cached("peer:main").await.unwrap();
+        assert_eq!(files_under(dir.path()), before, "opening and loading");
+
+        let next = commit(2).await;
+        commit_index_lists(dir.path(), next.commit_t).await;
+        let before = files_under(dir.path());
+        sink.on_event(RemoteEvent::LedgerUpdated(next.clone()))
+            .await;
+        settled(&sink).await;
+        let cached_t = peer
+            .ledger_manager()
+            .unwrap()
+            .current_t(&LedgerId::parse("peer:main").unwrap())
+            .await;
+        assert_eq!(cached_t, Some(next.commit_t), "the commit was applied");
+        assert_eq!(files_under(dir.path()), before, "applying a commit");
     }
 
     /// A shared-storage peer opens the root as a reader.
@@ -819,6 +943,30 @@ mod tests {
         load.await.unwrap();
         settled(&root.sink).await;
         assert_eq!(watermark_t(&root.sink, "a:main").await, None);
+    }
+
+    /// A retraction from before a reconnect, of a ledger the transaction
+    /// server did drop, still evicts it: the new connection's records cannot
+    /// say the ledger is gone, so the nameservice does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retraction_from_before_a_reconnect_evicts_a_dropped_ledger() {
+        let root = TwoLedgers::new().await;
+        root.peer.ledger_cached("a:main").await.unwrap();
+        assert!(root.cached_t("a:main").await.is_some());
+
+        let before = root.sink.peer_state.epoch();
+        root.sink.on_event(RemoteEvent::Connected).await;
+        root.writer
+            .drop_ledger("a", fluree_db_api::DropMode::Soft)
+            .await
+            .unwrap();
+        root.sink.queue(
+            LedgerId::parse("a:main").unwrap(),
+            LedgerUpdate::Retracted { epoch: before },
+        );
+
+        settled(&root.sink).await;
+        assert_eq!(root.cached_t("a:main").await, None, "evicted");
     }
 
     /// A retraction from before a reconnect is not applied after it: the new

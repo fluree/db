@@ -674,7 +674,40 @@ fn binary_range_eq_v3(
                             )
                         }
                     };
-                filter.o_type = Some(OType::XSD_STRING.as_u16());
+                // The string's datatype picks its o_type: `xsd:string` when
+                // none is given, the datatype's own for a custom one, and its
+                // tag's for `rdf:langString` (one o_type per tag; any tag's
+                // when the match names none). Rows are kept by their decoded
+                // datatype below and their tag by the caller.
+                let lang_string = |dt: &Sid| {
+                    dt.namespace_code == fluree_vocab::namespaces::RDF
+                        && dt.name.as_ref() == fluree_vocab::rdf_names::LANG_STRING
+                };
+                filter.o_type = match match_val.dt.as_ref() {
+                    None => Some(OType::XSD_STRING.as_u16()),
+                    Some(dt) if *dt == Sid::xsd_string() => Some(OType::XSD_STRING.as_u16()),
+                    Some(dt) if lang_string(dt) && match_val.lang.is_none() => None,
+                    // A datatype or tag the index does not hold: only novelty
+                    // can.
+                    Some(dt) => match encode_bound_object_prefilter(
+                        o_val,
+                        Some(dt),
+                        match_val
+                            .lang
+                            .as_deref()
+                            .map(|tag| fluree_db_core::normalize_lang_tag(tag))
+                            .as_deref(),
+                        store,
+                        Some(dict_novelty),
+                    ) {
+                        Ok((o_type, _)) => Some(o_type.as_u16()),
+                        Err(_) => {
+                            return overlay_only_flakes(
+                                store, g_id, index, match_val, opts, overlay,
+                            )
+                        }
+                    },
+                };
                 filter.o_key = Some(str_id as u64);
             }
             fluree_db_core::FlakeValue::Json(s) => {
@@ -929,6 +962,9 @@ fn binary_range_eq_v3(
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));
+            if match_val.dt.as_ref().is_some_and(|want| *want != dt) {
+                continue;
+            }
             // Language tag.
             let lang = store
                 .resolve_lang_tag(o_type)
@@ -969,7 +1005,7 @@ fn binary_range_eq_v3(
 
             // Fast path filters/limits.
             if let Some(bounds) = &opts.object_bounds {
-                if !bounds.matches(&flake.o) {
+                if !bounds.matches(&flake.o, &flake.dt) {
                     continue;
                 }
             }
@@ -995,7 +1031,8 @@ fn binary_range_eq_v3(
     resolved.retain(|f| flake_matches_range_eq(f, match_val));
 
     if let Some(bounds) = &opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
+        let bounds = bounds.prepare();
+        resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
@@ -1577,7 +1614,7 @@ fn binary_range_bounded_v3(
             }
 
             if let Some(bounds) = &opts.object_bounds {
-                if !bounds.matches(&flake.o) {
+                if !bounds.matches(&flake.o, &flake.dt) {
                     continue;
                 }
             }
@@ -1606,7 +1643,8 @@ fn binary_range_bounded_v3(
     resolved.retain(|f| f.s >= start_bound.s && f.s < end_bound.s);
 
     if let Some(bounds) = &opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
+        let bounds = bounds.prepare();
+        resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
@@ -1659,7 +1697,8 @@ fn overlay_only_flakes_bounded(
 
     // Apply options after lifecycle resolution.
     if let Some(ref bounds) = opts.object_bounds {
-        resolved.retain(|f| bounds.matches(&f.o));
+        let bounds = bounds.prepare();
+        resolved.retain(|f| bounds.matches(&f.o, &f.dt));
     }
     if offset > 0 && !resolved.is_empty() {
         let n = offset.min(resolved.len());
@@ -1766,11 +1805,11 @@ fn overlay_only_flakes(
                 }
             }
 
-            // Object bounds are a pure function of `o`, which a fact and its
-            // retraction share, so this prunes whole facts rather than
-            // splitting one — see the note above.
+            // Object bounds are a pure function of the object term (`o` and
+            // `dt`), which a fact and its retraction share, so this prunes
+            // whole facts rather than splitting one — see the note above.
             if let Some(ref bounds) = opts.object_bounds {
-                if !bounds.matches(&flake.o) {
+                if !bounds.matches(&flake.o, &flake.dt) {
                     return;
                 }
             }

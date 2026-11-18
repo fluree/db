@@ -16,8 +16,9 @@
 //! Snapshot filters results to the principal's authorized scope.
 //!
 //! # Server Role
-//! These endpoints are only available on transaction servers (file-backed mode).
-//! Peer-mode instances return 404 since write operations require a read-write nameservice.
+//! These endpoints run on the transaction server, whose nameservice they read
+//! and advance. A query peer forwards them there (see the router), as it does
+//! transactions. Any other server with a read-only nameservice returns 404.
 
 use axum::{
     extract::{Path, State},
@@ -75,8 +76,9 @@ pub struct SnapshotResponse {
 // Guards
 // ============================================================================
 
-/// Ensure we are running in file-backed (transaction server) mode.
-/// Returns 404 in proxy/peer mode since write operations require a read-write nameservice.
+/// Ensure the nameservice is this server's to advance. Returns 404 where it
+/// is read-only; a query peer never reaches this, as it forwards these routes
+/// to the transaction server.
 fn require_read_write_mode(state: &AppState) -> Result<(), ServerError> {
     if state.fluree.nameservice_mode().is_read_only() {
         return Err(ServerError::not_found(

@@ -4,8 +4,8 @@
 
 use crate::support::{genesis_ledger, graphdb_from_ledger, MemoryFluree, MemoryLedger};
 use fluree_db_api::{
-    DropMode, FlureeBuilder, FormatterConfig, GovernanceOptions, GraphDb, ResultCacheOutcome,
-    ResultCacheStatus,
+    DropMode, FlureeBuilder, FormatterConfig, GovernanceOptions, GraphDb, ReindexOptions,
+    ResultCacheOutcome, ResultCacheStatus,
 };
 use serde_json::{json, Value as JsonValue};
 
@@ -39,18 +39,45 @@ async fn seeded(fluree: &MemoryFluree, id: &str, data: &JsonValue) -> MemoryLedg
 }
 
 async fn uncached(fluree: &MemoryFluree, db: &GraphDb, sparql: &str) -> String {
-    db.query(fluree)
-        .sparql(&format!("{PREFIX}{sparql}"))
+    uncached_as(fluree, db, sparql, None).await
+}
+
+async fn cached(fluree: &MemoryFluree, db: &GraphDb, sparql: &str) -> (String, ResultCacheStatus) {
+    cached_as(fluree, db, sparql, None).await
+}
+
+async fn uncached_as(
+    fluree: &MemoryFluree,
+    db: &GraphDb,
+    sparql: &str,
+    format: Option<FormatterConfig>,
+) -> String {
+    let request = format!("{PREFIX}{sparql}");
+    let query = db.query(fluree).sparql(&request);
+    let query = match format {
+        Some(format) => query.format(format),
+        None => query,
+    };
+    query
         .execute_formatted_string()
         .await
         .unwrap_or_else(|e| panic!("{sparql}: {e}"))
 }
 
-async fn cached(fluree: &MemoryFluree, db: &GraphDb, sparql: &str) -> (String, ResultCacheStatus) {
+async fn cached_as(
+    fluree: &MemoryFluree,
+    db: &GraphDb,
+    sparql: &str,
+    format: Option<FormatterConfig>,
+) -> (String, ResultCacheStatus) {
     let outcome = ResultCacheOutcome::new();
-    let text = db
-        .query(fluree)
-        .sparql(&format!("{PREFIX}{sparql}"))
+    let request = format!("{PREFIX}{sparql}");
+    let query = db.query(fluree).sparql(&request);
+    let query = match format {
+        Some(format) => query.format(format),
+        None => query,
+    };
+    let text = query
         .result_cache(&outcome)
         .execute_formatted_string()
         .await
@@ -224,6 +251,248 @@ async fn a_recreated_ledger_at_the_same_t_misses() {
         cached(&fluree, &second_db, sparql).await,
         (want, ResultCacheStatus::Miss)
     );
+}
+
+/// Indexed, reloaded and with no novelty, a dropped ledger and the one
+/// created again under its id agree on `t`, the index `t` and the overlay's
+/// content version: only the index root tells their states apart.
+#[tokio::test]
+async fn a_reloaded_ledger_is_told_apart_by_its_index_root() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "cache/reload:main";
+    let sparql = "SELECT ?name WHERE { ?s schema:name ?name }";
+
+    async fn indexed_view(fluree: &MemoryFluree, id: &str, data: &JsonValue) -> GraphDb {
+        seeded(fluree, id, data).await;
+        fluree
+            .reindex(id, ReindexOptions::default())
+            .await
+            .expect("reindex");
+        fluree.disconnect_ledger(id).await;
+        fluree.db(id).await.expect("reload")
+    }
+
+    let first = indexed_view(&fluree, id, &people(&[("alice", "Alice", 30)])).await;
+    assert_eq!(
+        cached(&fluree, &first, sparql).await.1,
+        ResultCacheStatus::Miss
+    );
+    assert_eq!(
+        cached(&fluree, &first, sparql).await.1,
+        ResultCacheStatus::Hit
+    );
+
+    fluree
+        .drop_ledger("cache/reload", DropMode::Hard)
+        .await
+        .expect("drop");
+    let second = indexed_view(&fluree, id, &people(&[("zed", "Zed", 52)])).await;
+    assert_eq!((first.t, first.snapshot.t), (second.t, second.snapshot.t));
+    assert_eq!(
+        first.overlay.content_version(),
+        second.overlay.content_version()
+    );
+    assert_ne!(
+        first.snapshot.index_root_id(),
+        second.snapshot.index_root_id()
+    );
+
+    let want = uncached(&fluree, &second, sparql).await;
+    assert!(want.contains("Zed") && !want.contains("Alice"), "{want}");
+    assert_eq!(
+        cached(&fluree, &second, sparql).await,
+        (want, ResultCacheStatus::Miss)
+    );
+}
+
+#[tokio::test]
+async fn one_query_in_two_formats_keeps_two_answers() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seeded(
+        &fluree,
+        "cache/formats:main",
+        &people(&[("alice", "Alice", 30)]),
+    )
+    .await;
+    let db = graphdb_from_ledger(&ledger);
+    let sparql = "SELECT ?name WHERE { ?s schema:name ?name }";
+
+    let as_json = Some(FormatterConfig::sparql_json());
+    assert_eq!(
+        cached_as(&fluree, &db, sparql, as_json.clone()).await.1,
+        ResultCacheStatus::Miss
+    );
+    assert_eq!(
+        cached_as(&fluree, &db, sparql, as_json).await.1,
+        ResultCacheStatus::Hit
+    );
+
+    let as_jsonld = Some(FormatterConfig::jsonld());
+    let want = uncached_as(&fluree, &db, sparql, as_jsonld.clone()).await;
+    assert_eq!(
+        cached_as(&fluree, &db, sparql, as_jsonld).await,
+        (want, ResultCacheStatus::Miss)
+    );
+}
+
+/// Every staged view of a ledger reads at the same `t`, and so does the
+/// commit that follows: only their overlays tell them apart.
+#[tokio::test]
+async fn staged_views_at_one_t_do_not_share_answers() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seeded(
+        &fluree,
+        "cache/staged:main",
+        &people(&[("alice", "Alice", 30)]),
+    )
+    .await;
+    let sparql = "SELECT ?name WHERE { ?s schema:name ?name }";
+
+    let stage = |name: &'static str| {
+        let ledger = ledger.clone();
+        let fluree = &fluree;
+        async move {
+            fluree
+                .stage_owned(ledger)
+                .insert(&people(&[(name, name, 40)]))
+                .stage()
+                .await
+                .expect("stage")
+        }
+    };
+    let bob = stage("Bob").await;
+    let carol = stage("Carol").await;
+    let bob_db = GraphDb::from_staged(&bob).expect("bob view");
+    let carol_db = GraphDb::from_staged(&carol).expect("carol view");
+    assert_eq!(bob_db.t, carol_db.t);
+
+    let bob_answer = uncached(&fluree, &bob_db, sparql).await;
+    assert!(bob_answer.contains("Bob"), "{bob_answer}");
+    assert_eq!(
+        cached(&fluree, &bob_db, sparql).await,
+        (bob_answer, ResultCacheStatus::Miss)
+    );
+    let carol_answer = uncached(&fluree, &carol_db, sparql).await;
+    assert!(
+        carol_answer.contains("Carol") && !carol_answer.contains("Bob"),
+        "{carol_answer}"
+    );
+    assert_eq!(
+        cached(&fluree, &carol_db, sparql).await,
+        (carol_answer, ResultCacheStatus::Miss)
+    );
+
+    // Carol's insert committed: the ledger is at the staged views' `t`.
+    let committed = fluree
+        .insert(ledger, &people(&[("Carol", "Carol", 40)]))
+        .await
+        .expect("commit")
+        .ledger;
+    let committed_db = graphdb_from_ledger(&committed);
+    assert_eq!(committed_db.t, bob_db.t);
+    let want = uncached(&fluree, &committed_db, sparql).await;
+    assert!(!want.contains("Bob"), "{want}");
+    assert_eq!(
+        cached(&fluree, &committed_db, sparql).await,
+        (want, ResultCacheStatus::Miss)
+    );
+}
+
+#[tokio::test]
+async fn a_different_default_context_misses() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = seeded(
+        &fluree,
+        "cache/context:main",
+        &people(&[("alice", "Alice", 30)]),
+    )
+    .await;
+    // No @context: the view's default context compacts the answer.
+    let query = json!({
+        "select": ["?s"],
+        "where": {"@id": "?s", "@type": "http://example.org/ns/Person"}
+    });
+    let with_prefix = |prefix: &str| {
+        graphdb_from_ledger(&ledger)
+            .with_default_context(Some(json!({ prefix: "http://example.org/ns/" })))
+    };
+    let run = |db: GraphDb| {
+        let fluree = &fluree;
+        let query = &query;
+        async move {
+            let outcome = ResultCacheOutcome::new();
+            let answer = db
+                .query(fluree)
+                .jsonld(query)
+                .result_cache(&outcome)
+                .execute_formatted()
+                .await
+                .expect("query");
+            (answer, outcome.status().expect("status"))
+        }
+    };
+
+    assert_eq!(
+        run(with_prefix("ex")).await,
+        (json!([["ex:alice"]]), ResultCacheStatus::Miss)
+    );
+    assert_eq!(
+        run(with_prefix("pfx")).await,
+        (json!([["pfx:alice"]]), ResultCacheStatus::Miss)
+    );
+}
+
+/// A hit from `execute_formatted` parses the stored text back into a JSON
+/// value, so the miss's doubles must survive it bit for bit. That holds only
+/// while serde_json parses with `float_roundtrip`: without it, about one in
+/// eight of these doubles reads back as a neighbour.
+#[tokio::test]
+async fn a_json_value_hit_returns_the_miss_doubles_exactly() {
+    fn numbers(value: &JsonValue, out: &mut Vec<f64>) {
+        match value {
+            JsonValue::Number(n) => out.extend(n.as_f64()),
+            JsonValue::Array(items) => items.iter().for_each(|v| numbers(v, out)),
+            JsonValue::Object(map) => map.values().for_each(|v| numbers(v, out)),
+            _ => {}
+        }
+    }
+    async fn run(
+        fluree: &MemoryFluree,
+        db: &GraphDb,
+        sparql: &str,
+    ) -> (JsonValue, ResultCacheStatus) {
+        let outcome = ResultCacheOutcome::new();
+        let value = db
+            .query(fluree)
+            .sparql(sparql)
+            .format(FormatterConfig::jsonld())
+            .result_cache(&outcome)
+            .execute_formatted()
+            .await
+            .expect("query");
+        (value, outcome.status().expect("status"))
+    }
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let graph: Vec<JsonValue> = (1..=200)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:v": i}))
+        .collect();
+    let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph});
+    let ledger = seeded(&fluree, "cache/doubles:main", &data).await;
+    let db = graphdb_from_ledger(&ledger);
+    let sparql = format!(
+        "{PREFIX}SELECT ?x WHERE {{ ?s ex:v ?v BIND(?v / 7.0e0 * 1.1e0 AS ?x) }} ORDER BY ?x"
+    );
+
+    let (miss, status) = run(&fluree, &db, &sparql).await;
+    assert_eq!(status, ResultCacheStatus::Miss);
+    let mut doubles = Vec::new();
+    numbers(&miss, &mut doubles);
+    assert_eq!(doubles.len(), 200, "{miss}");
+
+    let (hit, status) = run(&fluree, &db, &sparql).await;
+    assert_eq!(status, ResultCacheStatus::Hit);
+    assert!(hit == miss, "a hit changed the miss's doubles");
 }
 
 #[tokio::test]

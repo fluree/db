@@ -7,7 +7,7 @@
 //! real driver; [`build_peer`] takes any [`IoHandle`] and is what native
 //! tests use.
 
-use crate::bridge::{IoHandle, WasmFetchTransport};
+use crate::bridge::{IoHandle, TokenCell, WasmFetchTransport};
 use crate::cas::BrowserCasStorage;
 use crate::config::BrowserIoConfig;
 use crate::heads::{
@@ -28,7 +28,7 @@ pub struct BrowserPeer {
     cas: BrowserCasStorage,
     io: IoHandle,
     api_base: String,
-    token: String,
+    token: TokenCell,
     config: BrowserIoConfig,
     heads: Arc<HeadRegistry>,
 }
@@ -69,6 +69,37 @@ impl BrowserPeer {
     /// as long as the storage inside the engine holds its handle).
     pub fn into_fluree(self) -> Fluree {
         self.fluree
+    }
+
+    /// Hot-refresh the bearer token for ALL of the peer's I/O — block
+    /// fetches, nameservice lookups, and SSE reconnects — with no teardown:
+    /// residency, IndexedDB cache, and loaded-ledger state all survive.
+    ///
+    /// The expiry story, end to end: when the token expires mid-session, a
+    /// block fetch surfaces `401` as a storage error from the query that
+    /// needed the bytes (`403` reads as not-found — the proxy's
+    /// no-existence-leak parity), and an SSE connect attempt surfaces
+    /// `401`/`403` as a fatal head-stream event (the pump stops rather than
+    /// hammer an unauthorized endpoint). The shell refreshes credentials
+    /// through its own auth flow, calls `set_token`, and retries: queries
+    /// simply re-run (the storage layer re-fetches what the failed query
+    /// could not pin), and head tracking is restarted via
+    /// [`head_stream`](Self::head_stream) /
+    /// [`start_head_tracking`](Self::start_head_tracking). Requests already
+    /// in flight keep the header they were stamped with; everything issued
+    /// after `set_token` carries the new bearer — fetch transports stamp it
+    /// per request, the SSE source resolves it per connect (matching the
+    /// native peer's per-connect token provider).
+    ///
+    /// Refreshing proactively (before expiry) needs no restart at all.
+    pub fn set_token(&self, token: impl Into<String>) {
+        self.token.set(token);
+    }
+
+    /// The shared token cell, for wiring additional I/O surfaces to the
+    /// same hot-refreshed bearer.
+    pub fn token_cell(&self) -> &TokenCell {
+        &self.token
     }
 
     /// Register a callback for ledger head changes seen by head tracking.
@@ -135,12 +166,20 @@ pub fn build_peer(
 ) -> BrowserPeer {
     let api_base = api_base.into();
     let token = token.into();
+    // One shared cell feeds every I/O surface, so BrowserPeer::set_token
+    // refreshes the bearer everywhere at once. The proxies still receive
+    // the initial token (their request-building contract), but the
+    // transports override the authorization header with the cell's current
+    // value on every request.
+    let token_cell = TokenCell::new(token.clone());
 
-    let block_transport = Arc::new(WasmFetchTransport::new(io.clone(), config.fetch_timeout));
-    let ns_transport = Arc::new(WasmFetchTransport::new(
-        io.clone(),
-        config.nameservice_timeout,
-    ));
+    let block_transport = Arc::new(
+        WasmFetchTransport::new(io.clone(), config.fetch_timeout).with_token(token_cell.clone()),
+    );
+    let ns_transport = Arc::new(
+        WasmFetchTransport::new(io.clone(), config.nameservice_timeout)
+            .with_token(token_cell.clone()),
+    );
 
     let proxy = ProxyStorage::from_api_base_with_transport(
         api_base.clone(),
@@ -148,11 +187,8 @@ pub fn build_peer(
         ProxyReadMode::Raw,
         block_transport,
     );
-    let nameservice = ProxyNameService::from_api_base_with_transport(
-        api_base.clone(),
-        token.clone(),
-        ns_transport,
-    );
+    let nameservice =
+        ProxyNameService::from_api_base_with_transport(api_base.clone(), token, ns_transport);
     let cas = BrowserCasStorage::new(proxy, io.clone(), config);
 
     let fluree = FlureeBuilder::memory().build_with(
@@ -165,7 +201,7 @@ pub fn build_peer(
         cas,
         io,
         api_base: api_base.trim_end_matches('/').to_string(),
-        token,
+        token: token_cell,
         config: config.clone(),
         heads: Arc::new(HeadRegistry::default()),
     }
@@ -229,6 +265,48 @@ mod tests {
             let (url, headers) = ns_calls[0];
             assert_eq!(url, &format!("{API_BASE}/storage/ns/mydb%3Amain"));
             assert_eq!(headers, &vec![("authorization", "Bearer tok".to_string())]);
+        }
+
+        peer.shutdown();
+        driver.await.unwrap();
+    }
+
+    /// Mid-session token refresh, end to end: after `set_token`, the SAME
+    /// peer's next nameservice lookup carries the new bearer — no teardown,
+    /// no rebuilt transports (the proxies still hold the original token;
+    /// the transport override is what refreshes).
+    #[tokio::test]
+    async fn set_token_refreshes_the_bearer_without_teardown() {
+        let state = Arc::new(Mutex::new(MockState::default()));
+        let (io, rx) = IoHandle::channel();
+        let driver = spawn_mock_driver(rx, Arc::clone(&state));
+        let config = BrowserIoConfig {
+            nameservice_timeout: Duration::from_secs(1),
+            ..Default::default()
+        };
+        let peer = build_peer(io, API_BASE, "tok", &config);
+
+        let _ = peer.fluree().db("mydb:main").await;
+        peer.set_token("tok2");
+        let _ = peer.fluree().db("mydb:main").await;
+
+        {
+            let s = state.lock().unwrap();
+            let bearers: Vec<&str> = s
+                .url_log
+                .iter()
+                .filter(|(url, _)| url.contains("/storage/ns/"))
+                .map(|(_, headers)| {
+                    headers
+                        .iter()
+                        .find(|(name, _)| *name == "authorization")
+                        .map(|(_, value)| value.as_str())
+                        .expect("every proxy request carries a bearer")
+                })
+                .collect();
+            assert!(bearers.len() >= 2, "two lookups expected: {bearers:?}");
+            assert_eq!(*bearers.first().unwrap(), "Bearer tok");
+            assert_eq!(*bearers.last().unwrap(), "Bearer tok2");
         }
 
         peer.shutdown();

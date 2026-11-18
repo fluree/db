@@ -1738,6 +1738,45 @@ async fn a_rebase_outlasts_an_index_install_refresh_started() {
     a_rebase_outlasts_an_index_install_in_flight(true).await;
 }
 
+/// On the writer, an index install planned on the branch's old line, which
+/// arrives after the writer's own rebase, is not made: the rebase starts a
+/// new line, so the cache stays on the rebased commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_writers_rebase_outlasts_an_index_install_planned_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+    assert_eq!(
+        query_cached_names(&writer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    let handle = writer.ledger_cached("rb:dev").await.unwrap();
+    let planned_on = handle.line();
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let old_index = dev_record(&writer).await.index_head_id.unwrap();
+    let store = writer.branched_content_store("rb:dev").await.unwrap();
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let cache_dir = tempfile::tempdir().unwrap();
+    let installed = handle
+        .apply_index_v2(&old_index, store, cache_dir.path(), None, planned_on)
+        .await
+        .unwrap();
+
+    assert!(
+        !installed,
+        "the old line's index landed on the rebased state"
+    );
+    assert_eq!(
+        query_cached_names(&writer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
 /// A refresh that read the branch's record before a rebase, and goes on
 /// after the rebase was followed, does not install that record's index of
 /// the old line.

@@ -10,7 +10,7 @@
 //!   to bare values — opt-in scalar output.
 
 use super::config::FormatterConfig;
-use super::datatype::is_inferable_datatype;
+use super::datatype::{ill_typed_json_literal, json_document, may_print_bare};
 use super::iri::IriCompactor;
 use super::json_write::{push_bool, push_f64, push_i64, push_json_string, push_value};
 use super::{materialize, FormatError, Result};
@@ -297,15 +297,14 @@ fn write_lit(
     let dt_full = compactor.decode_sid(dt)?;
     let dt_compact = compactor.compact_sid(dt)?;
 
-    // @json: emit the parsed value directly (accept Json or String, matching DOM).
+    // @json: emit the parsed value directly (accept Json or String, matching
+    // DOM); text that is not JSON as the typed literal it is.
     if dt_full == rdf::JSON || dt_compact == "@json" {
         return match val {
-            FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                let parsed: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                    FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                })?;
-                push_value(out, &parsed)
-            }
+            FlakeValue::Json(json_str) | FlakeValue::String(json_str) => push_value(
+                out,
+                &json_document(json_str).unwrap_or_else(|| ill_typed_json_literal(json_str)),
+            ),
             _ => Err(FormatError::InvalidBinding(
                 "@json datatype must have FlakeValue::Json".to_string(),
             )),
@@ -337,7 +336,7 @@ fn write_lit(
     }
 
     // Inferable datatypes emit a bare value (no @type wrapper).
-    if is_inferable_datatype(&dt_full) {
+    if may_print_bare(&dt_full, val) {
         return write_scalar(out, val, false);
     }
 
@@ -436,12 +435,12 @@ fn format_binding(
             // Accept both FlakeValue::Json and FlakeValue::String because serde's
             // untagged enum deserialization (used when loading commit JSON) cannot
             // distinguish the two variants — String always wins in enum order.
+            // Text that is not JSON is written as the typed literal it is.
             if dt_full == rdf::JSON || dt_compact == "@json" {
                 return match val {
                     FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                        serde_json::from_str(json_str).map_err(|e| {
-                            FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                        })
+                        Ok(json_document(json_str)
+                            .unwrap_or_else(|| ill_typed_json_literal(json_str)))
                     }
                     _ => Err(FormatError::InvalidBinding(
                         "@json datatype must have FlakeValue::Json".to_string(),
@@ -467,7 +466,7 @@ fn format_binding(
             }
 
             // Inferable datatypes can omit @type annotation.
-            if is_inferable_datatype(&dt_full) {
+            if may_print_bare(&dt_full, val) {
                 return match val {
                     FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
                     FlakeValue::Long(n) => Ok(json!(n)),

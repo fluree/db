@@ -3951,6 +3951,76 @@ async fn test_proxy_peer_forwards_a_write() {
     server_handle.abort();
 }
 
+/// A peer forwards the nameservice sync routes to the transaction server,
+/// whose nameservice they read and advance, as it does transactions. They
+/// used to return 404 on a peer, or, on a shared-storage peer, write the
+/// transaction server's nameservice from the peer's process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_peer_forwards_nameservice_sync() {
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer = build_router(peer);
+    let send = |method: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let resp = peer
+        .clone()
+        .oneshot(send("POST", "/v1/fluree/nameservice/refs/nsfw:main/init"))
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], true, "{body}");
+    assert!(
+        state
+            .fluree
+            .nameservice()
+            .lookup("nsfw:main")
+            .await
+            .unwrap()
+            .is_some(),
+        "the transaction server's nameservice holds the ledger"
+    );
+
+    let resp = peer
+        .oneshot(send("GET", "/v1/fluree/nameservice/snapshot"))
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["ledgers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["ledger_id"] == "nsfw:main" || r["ledgerId"] == "nsfw:main"),
+        "{body}"
+    );
+    server_handle.abort();
+}
+
 /// A proxy peer answers in every format the transaction server does, for
 /// SPARQL and JSON-LD alike, with the same bytes. It used to refuse every
 /// format but JSON with 406.
