@@ -11,6 +11,7 @@
 use std::collections::VecDeque;
 use std::num::NonZero;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use delta_kernel::actions::deletion_vector::split_vector;
@@ -24,7 +25,7 @@ use delta_kernel::scan::state::{transform_to_logical, ScanFile};
 use delta_kernel::scan::Scan;
 use delta_kernel::schema::{StructField, StructType};
 use delta_kernel::snapshot::SnapshotRef;
-use delta_kernel::{Engine as _, EngineData, FileMeta, Predicate, PredicateRef, Snapshot};
+use delta_kernel::{Engine as _, EngineData, FileMeta, LogPath, Predicate, PredicateRef, Snapshot};
 use delta_kernel_default_engine::executor::tokio::TokioMultiThreadExecutor;
 use delta_kernel_default_engine::executor::TaskExecutor as _;
 use delta_kernel_default_engine::{DefaultEngine, DefaultEngineBuilder};
@@ -38,7 +39,7 @@ use crate::error::{DeltaError, Result};
 use crate::filter::{ColumnFilter, RowFilter};
 use crate::listing::Listing;
 use crate::store::Credentials;
-use crate::unity::UnityClient;
+use crate::unity::{Ratified, UnityClient, UnityTable};
 
 type Engine = DefaultEngine<TokioMultiThreadExecutor>;
 
@@ -110,6 +111,17 @@ pub struct DeltaTable {
     /// Held across a first resolution, so concurrent first queries replay the
     /// log once between them.
     cold: Arc<Mutex<()>>,
+    /// The catalog that coordinates commits, for a table opened through Unity.
+    unity: Option<Arc<UnityRoute>>,
+}
+
+/// A Unity table, and whether it was last found to be catalog-managed: one
+/// whose commits Unity ratifies, so that a snapshot is built to the version
+/// Unity vouches for and from the commits it has not yet published.
+struct UnityRoute {
+    client: Arc<UnityClient>,
+    table: UnityTable,
+    managed: AtomicBool,
 }
 
 #[derive(Default)]
@@ -194,10 +206,23 @@ impl DeltaTable {
         let client = Arc::new(UnityClient::new(unity)?);
         let table = client.table(full_name).await?;
         let location = table.location.clone();
-        Self::over(
-            name,
-            crate::store::open(&location, io, Credentials::Unity(client, table))?,
-        )
+        let opened = crate::store::open(
+            &location,
+            io,
+            Credentials::Unity(client.clone(), table.clone()),
+        )?;
+        Ok(Self::over(name, opened)?.coordinated_by(client, table))
+    }
+
+    /// This table as Unity places it: a catalog-managed one is read to the
+    /// version Unity has ratified.
+    pub(crate) fn coordinated_by(mut self, client: Arc<UnityClient>, table: UnityTable) -> Self {
+        self.unity = Some(Arc::new(UnityRoute {
+            client,
+            table,
+            managed: AtomicBool::new(false),
+        }));
+        self
     }
 
     pub(crate) fn over(name: &str, (url, store): (Url, Arc<dyn ObjectStore>)) -> Result<Self> {
@@ -215,6 +240,7 @@ impl DeltaTable {
             executor,
             known: Arc::default(),
             cold: Arc::default(),
+            unity: None,
         })
     }
 
@@ -275,14 +301,107 @@ impl DeltaTable {
     }
 
     fn replay(&self, version: Option<u64>) -> Result<Resolved> {
-        let builder = Snapshot::builder_for(self.url.clone());
-        let snapshot = match version {
-            Some(v) => builder.at_version(v),
-            None => builder,
-        }
-        .build(self.engine.as_ref())
-        .map_err(|e| self.kernel(e))?;
+        let build = |managed: bool| -> Result<SnapshotRef> {
+            let builder = Snapshot::builder_for(self.url.clone());
+            let builder = match version {
+                Some(v) => builder.at_version(v),
+                None => builder,
+            };
+            let builder = if managed {
+                let (max, tail) = self.ratified()?;
+                builder.with_max_catalog_version(max).with_log_tail(tail)
+            } else {
+                builder
+            };
+            builder
+                .build(self.engine.as_ref())
+                .map_err(|e| self.kernel(e))
+        };
+        // Whether a table is catalog-managed is in its protocol, which only
+        // the build reads: build as last found, and on Kernel's refusal of
+        // that, once the other way. Only Unity can say what it ratified, so a
+        // path table is always built plainly.
+        let snapshot = match &self.unity {
+            None => build(false)?,
+            Some(unity) => {
+                let managed = unity.managed.load(Ordering::Relaxed);
+                match build(managed) {
+                    Err(e) if e.is_max_catalog_version() => {
+                        tracing::debug!(
+                            table = %self.name,
+                            catalog_managed = !managed,
+                            "Delta table's catalog management is not as last found; rebuilding"
+                        );
+                        let snapshot = build(!managed)?;
+                        unity.managed.store(!managed, Ordering::Relaxed);
+                        snapshot
+                    }
+                    built => built?,
+                }
+            }
+        };
         Ok(Resolved::new(snapshot, Files::Unlisted(None)))
+    }
+
+    /// The version Unity has ratified and the log tail that reaches it: its
+    /// commits not yet published, which a log listing does not see.
+    fn ratified(&self) -> Result<(u64, Vec<LogPath>)> {
+        let unity = self.unity.as_ref().ok_or_else(|| {
+            DeltaError::Internal("a catalog-managed read without a catalog".to_string())
+        })?;
+        let ratified = {
+            let unity = unity.clone();
+            self.executor
+                .block_on(async move { unity.client.ratified(&unity.table).await })?
+        };
+        let tail = self.log_tail(&ratified)?;
+        Ok((ratified.version, tail))
+    }
+
+    fn log_tail(&self, ratified: &Ratified) -> Result<Vec<LogPath>> {
+        let bad = |name: &str, why: String| DeltaError::Catalog {
+            table: self.name.to_string(),
+            message: format!("Unity Catalog listed commit '{name}', which {why}"),
+            denied: false,
+        };
+        ratified
+            .unpublished
+            .iter()
+            .map(|commit| {
+                let name = commit.file_name.as_str();
+                let named_version = name
+                    .get(..20)
+                    .filter(|_| name.as_bytes().get(20) == Some(&b'.'))
+                    .and_then(|digits| digits.parse::<u64>().ok());
+                if named_version != Some(commit.version) {
+                    return Err(bad(
+                        name,
+                        format!("is not a commit file for version {}", commit.version),
+                    ));
+                }
+                let path = if name.len() == 25 && name.ends_with(".json") {
+                    // Already published.
+                    let location = self
+                        .url
+                        .join("_delta_log/")
+                        .and_then(|log| log.join(name))
+                        .map_err(|e| bad(name, e.to_string()))?;
+                    LogPath::try_new(FileMeta {
+                        location,
+                        last_modified: commit.modified_ms,
+                        size: commit.file_size,
+                    })
+                } else {
+                    LogPath::staged_commit(
+                        self.url.clone(),
+                        name,
+                        commit.modified_ms,
+                        commit.file_size,
+                    )
+                };
+                path.map_err(|e| bad(name, e.to_string()))
+            })
+            .collect()
     }
 
     /// The table's current version, always checked against storage.
@@ -322,6 +441,9 @@ impl DeltaTable {
     /// past it. `None` when the log is no longer the one `known` was read from
     /// (a table dropped and rewritten in place) or cannot be extended.
     fn advance(&self, known: &Resolved) -> Option<Resolved> {
+        if known.snapshot.table_configuration().is_catalog_managed() {
+            return self.advance_ratified(known);
+        }
         let engine = self.engine.as_ref();
         // Kernel extends a snapshot without re-reading what it already holds,
         // so check that for it: the commit it ends on must be unchanged.
@@ -354,6 +476,35 @@ impl DeltaTable {
         };
         Some(if snapshot.version() == known.version() {
             // Possibly a newer checkpoint under the same version: same files.
+            Resolved {
+                snapshot,
+                files: known.files.clone(),
+            }
+        } else {
+            Resolved::new(snapshot, known.successor_files())
+        })
+    }
+
+    /// `known`, catalog-managed, brought up to the version Unity has ratified
+    /// since. Unity is the authority on what the log holds, so the commit
+    /// `known` ends on is not checked against storage: once published, its
+    /// staged file may be gone.
+    fn advance_ratified(&self, known: &Resolved) -> Option<Resolved> {
+        let advanced = self.ratified().and_then(|(max, tail)| {
+            Snapshot::builder_from(known.snapshot.clone())
+                .with_max_catalog_version(max)
+                .with_log_tail(tail)
+                .build(self.engine.as_ref())
+                .map_err(|e| self.kernel(e))
+        });
+        let snapshot = match advanced {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::debug!(table = %self.name, error = %e, "Delta table not extendable to its ratified version; replaying");
+                return None;
+            }
+        };
+        Some(if snapshot.version() == known.version() {
             Resolved {
                 snapshot,
                 files: known.files.clone(),
@@ -866,4 +1017,325 @@ where
     tokio::task::spawn_blocking(f)
         .await
         .map_err(|e| DeltaError::Internal(format!("Delta reader task failed: {e}")))?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UUID: &str = "3a0d65cd-4056-49b8-937b-95f9e3ee90e5";
+
+    fn fixture(name: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures")
+            .join(name)
+    }
+
+    pub(crate) fn allow_roots() {
+        let roots = [
+            fixture("").display().to_string(),
+            std::env::temp_dir().display().to_string(),
+        ];
+        std::env::set_var("FLUREE_ICEBERG_LOCAL_ROOTS", roots.join(":"));
+    }
+
+    /// The `flags` fixture's data file (6 rows), as one commit's `add`.
+    fn add(path: &str, ict: i64) -> String {
+        [
+            serde_json::json!({"commitInfo": {"timestamp": ict, "inCommitTimestamp": ict}}),
+            serde_json::json!({"add": {
+                "path": path, "partitionValues": {}, "size": 728,
+                "modificationTime": ict, "dataChange": true,
+                "stats": "{\"numRecords\":6}",
+            }}),
+        ]
+        .map(|v| v.to_string())
+        .join("\n")
+    }
+
+    pub(crate) const PARQUET: &str =
+        "part-00000-08a2e446-d8a5-4db0-b623-7c290b433f29-c000.snappy.parquet";
+
+    /// A catalog-managed table (6 rows a commit): versions 0 and 1 published
+    /// to `_delta_log/`, version 2 ratified but only staged. With
+    /// `catalog_managed` false, the same log under a plain protocol.
+    pub(crate) fn coordinated_table(dir: &std::path::Path, catalog_managed: bool) -> String {
+        let log = dir.join("_delta_log");
+        std::fs::create_dir_all(log.join("_staged_commits")).unwrap();
+        for n in 0..3 {
+            std::fs::copy(
+                fixture("flags").join(PARQUET),
+                dir.join(format!("part-{n}.parquet")),
+            )
+            .unwrap();
+        }
+        let protocol = if catalog_managed {
+            serde_json::json!({"protocol": {
+                "minReaderVersion": 3, "minWriterVersion": 7,
+                "readerFeatures": ["catalogManaged"],
+                "writerFeatures": ["catalogManaged", "inCommitTimestamp"],
+            }})
+        } else {
+            serde_json::json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}})
+        };
+        let metadata = serde_json::json!({"metaData": {
+            "id": "7316167a-770c-47a8-a5a4-165c3e0d1c62",
+            "format": {"provider": "parquet", "options": {}},
+            "schemaString": "{\"type\":\"struct\",\"fields\":[{\"name\":\"id\",\"type\":\"long\",\"nullable\":true,\"metadata\":{}},{\"name\":\"shipped\",\"type\":\"boolean\",\"nullable\":true,\"metadata\":{}}]}",
+            "partitionColumns": [],
+            "createdTime": 1_700_000_000_000_i64,
+            "configuration": if catalog_managed {
+                serde_json::json!({"delta.enableInCommitTimestamps": "true"})
+            } else {
+                serde_json::json!({})
+            },
+        }});
+        let v0 = format!(
+            "{}\n{protocol}\n{metadata}",
+            add("part-0.parquet", 1_700_000_000_000)
+        );
+        std::fs::write(log.join(format!("{:020}.json", 0)), v0).unwrap();
+        std::fs::write(
+            log.join(format!("{:020}.json", 1)),
+            add("part-1.parquet", 1_700_000_060_000),
+        )
+        .unwrap();
+        let staged = format!("{:020}.{UUID}.json", 2);
+        std::fs::write(
+            log.join("_staged_commits").join(&staged),
+            add("part-2.parquet", 1_700_000_120_000),
+        )
+        .unwrap();
+        staged
+    }
+
+    async fn rows(snapshot: &DeltaSnapshot) -> usize {
+        let mut stream = snapshot.scan(&[], &[]).unwrap();
+        let mut n = 0;
+        while let Some(batch) = stream.next().await {
+            n += batch.unwrap().num_rows;
+        }
+        n
+    }
+
+    /// With no catalog to ask, a catalog-managed table cannot be read: Kernel
+    /// will not guess which commits the catalog ratified.
+    #[tokio::test]
+    async fn a_catalog_managed_table_read_by_path_alone_is_refused() {
+        allow_roots();
+        let dir = tempfile::tempdir().unwrap();
+        coordinated_table(dir.path(), true);
+        let table =
+            DeltaTable::open("t", dir.path().to_str().unwrap(), &DeltaIoConfig::default()).unwrap();
+        let err = table
+            .snapshot(VersionSelector::Latest)
+            .await
+            .err()
+            .expect("refused");
+        assert!(err.to_string().contains("Max catalog version"), "{err}");
+    }
+
+    mod unity {
+        use super::*;
+        use crate::config::UnityConfig;
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::ConfigValue;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const LOAD_TABLE: &str =
+            "/api/2.1/unity-catalog/delta/v1/catalogs/main/schemas/sales/tables/orders";
+        const LEGACY_COMMITS: &str = "/api/2.1/unity-catalog/delta/preview/commits";
+
+        /// `dir` opened as Unity's `main.sales.orders`, on local disk: Unity
+        /// itself may not place a table there, so the store is opened plainly.
+        fn opened_in_unity(server: &MockServer, dir: &std::path::Path) -> DeltaTable {
+            allow_roots();
+            let config = UnityConfig {
+                uri: server.uri(),
+                auth: AuthConfig::Bearer {
+                    token: ConfigValue::literal("catalog-token"),
+                },
+                catalog: None,
+                schema: None,
+            };
+            let client = Arc::new(UnityClient::with_http(&config, reqwest::Client::new()).unwrap());
+            let location = dir.to_str().unwrap();
+            let table = UnityTable {
+                full_name: "main.sales.orders".to_string(),
+                id: "t-1".to_string(),
+                location: location.to_string(),
+                governed: None,
+            };
+            DeltaTable::open("orders", location, &DeltaIoConfig::default())
+                .unwrap()
+                .coordinated_by(client, table)
+        }
+
+        /// A commit as Unity lists it, in the Delta-Tables API's spelling.
+        fn listed(dir: &std::path::Path, version: u64, staged: &str) -> serde_json::Value {
+            let size = std::fs::metadata(dir.join("_delta_log/_staged_commits").join(staged))
+                .unwrap()
+                .len();
+            serde_json::json!({
+                "version": version, "timestamp": 1_700_000_000_000_i64,
+                "file-name": staged, "file-size": size,
+                "file-modification-timestamp": 1_700_000_000_000_i64,
+            })
+        }
+
+        async fn ratify(server: &MockServer, latest: u64, commits: Vec<serde_json::Value>) {
+            server.reset().await;
+            Mock::given(method("GET"))
+                .and(path(LOAD_TABLE))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "metadata": {"table-type": "MANAGED", "location": "s3://elsewhere"},
+                    // Newest first, as the Delta-Tables API lists them.
+                    "commits": commits.into_iter().rev().collect::<Vec<_>>(),
+                    "latest-table-version": latest,
+                })))
+                .mount(server)
+                .await;
+        }
+
+        /// The defect: a Databricks managed table, whose commits Unity
+        /// ratifies, was built without the version Unity vouches for and
+        /// Kernel refused it. It is read to that version, the newest commit
+        /// coming from the staged file only Unity lists.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_catalog_managed_table_is_read_to_the_version_unity_ratified() {
+            let dir = tempfile::tempdir().unwrap();
+            let staged = coordinated_table(dir.path(), true);
+            let server = MockServer::start().await;
+            ratify(&server, 2, vec![listed(dir.path(), 2, &staged)]).await;
+            let table = opened_in_unity(&server, dir.path());
+
+            let latest = table.snapshot(VersionSelector::Latest).await.unwrap();
+            assert_eq!(latest.version(), 2);
+            assert_eq!(rows(&latest).await, 18);
+
+            // Time travel is bounded by the ratified version, and reaches below it.
+            let older = table.snapshot(VersionSelector::Version(1)).await.unwrap();
+            assert_eq!(rows(&older).await, 12);
+
+            // Unity ratifies version 3; a staged version 4 it has not
+            // ratified is on disk too, and is not read.
+            std::fs::copy(
+                fixture("flags").join(PARQUET),
+                dir.path().join("part-3.parquet"),
+            )
+            .unwrap();
+            let staged_dir = dir.path().join("_delta_log/_staged_commits");
+            let three = format!("{:020}.{UUID}.json", 3);
+            std::fs::write(
+                staged_dir.join(&three),
+                add("part-3.parquet", 1_700_000_180_000),
+            )
+            .unwrap();
+            let four = format!("{:020}.{UUID}.json", 4);
+            std::fs::write(
+                staged_dir.join(&four),
+                add("part-0.parquet", 1_700_000_240_000),
+            )
+            .unwrap();
+            ratify(
+                &server,
+                3,
+                vec![
+                    listed(dir.path(), 2, &staged),
+                    listed(dir.path(), 3, &three),
+                ],
+            )
+            .await;
+            let advanced = table.snapshot(VersionSelector::Latest).await.unwrap();
+            assert_eq!(advanced.version(), 3);
+            assert_eq!(rows(&advanced).await, 24);
+        }
+
+        /// Where the Delta-Tables endpoint is absent, the older Delta-Commits
+        /// API it replaced is asked instead.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn without_the_delta_tables_api_the_commits_api_is_asked() {
+            let dir = tempfile::tempdir().unwrap();
+            let staged = coordinated_table(dir.path(), true);
+            let server = MockServer::start().await;
+            let size =
+                std::fs::metadata(dir.path().join("_delta_log/_staged_commits").join(&staged))
+                    .unwrap()
+                    .len();
+            Mock::given(method("GET"))
+                .and(path(LEGACY_COMMITS))
+                .and(body_json(serde_json::json!({
+                    "table_id": "t-1", "table_uri": dir.path().to_str().unwrap(),
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "commits": [{
+                        "version": 2, "timestamp": 1, "file_name": staged,
+                        "file_size": size, "file_modification_timestamp": 1,
+                    }],
+                    "latest_table_version": 2,
+                })))
+                .mount(&server)
+                .await;
+            let table = opened_in_unity(&server, dir.path());
+            let latest = table.snapshot(VersionSelector::Latest).await.unwrap();
+            assert_eq!(latest.version(), 2);
+            assert_eq!(rows(&latest).await, 18);
+        }
+
+        /// A Unity table that is not catalog-managed is read from its log as
+        /// before, without asking Unity for commits.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_unity_table_not_catalog_managed_reads_its_log() {
+            let dir = tempfile::tempdir().unwrap();
+            coordinated_table(dir.path(), false);
+            let server = MockServer::start().await;
+            let table = opened_in_unity(&server, dir.path());
+            for _ in 0..2 {
+                let latest = table.snapshot(VersionSelector::Latest).await.unwrap();
+                assert_eq!(latest.version(), 1);
+                assert_eq!(rows(&latest).await, 12);
+            }
+            assert!(server.received_requests().await.unwrap().is_empty());
+        }
+
+        /// Unity's refusal to list commits is the query's, as Unity's.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_refusal_to_list_commits_is_reported_as_unitys() {
+            let dir = tempfile::tempdir().unwrap();
+            coordinated_table(dir.path(), true);
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(LOAD_TABLE))
+                .respond_with(ResponseTemplate::new(403).set_body_json(serde_json::json!({
+                    "message": "User does not have SELECT on Table 'main.sales.orders'.",
+                })))
+                .mount(&server)
+                .await;
+            let table = opened_in_unity(&server, dir.path());
+            let err = table
+                .snapshot(VersionSelector::Latest)
+                .await
+                .err()
+                .expect("refused");
+            assert!(
+                matches!(&err, DeltaError::Catalog { denied: true, message, .. }
+                    if message.contains("does not have SELECT")),
+                "{err:?}"
+            );
+        }
+    }
+
+    /// A path-only table is read as before.
+    #[tokio::test]
+    async fn a_path_table_reads_its_published_log() {
+        allow_roots();
+        let dir = tempfile::tempdir().unwrap();
+        coordinated_table(dir.path(), false);
+        let table =
+            DeltaTable::open("t", dir.path().to_str().unwrap(), &DeltaIoConfig::default()).unwrap();
+        let snapshot = table.snapshot(VersionSelector::Latest).await.unwrap();
+        assert_eq!(snapshot.version(), 1, "staged commits are not the log");
+        assert_eq!(rows(&snapshot).await, 12);
+    }
 }
