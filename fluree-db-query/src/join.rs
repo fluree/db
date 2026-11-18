@@ -331,22 +331,27 @@ pub(crate) fn prepare_leaf_for_scan(
 
 /// The row range of `p_id` in a PSOT leaflet; the whole leaflet when it holds
 /// one predicate.
+///
+/// `p_const` is taken over the live rows. A history replay can restore rows
+/// of another predicate (indexes built before v4.1.6 filed a fully retracted
+/// predicate's history under the next predicate's leaflet), so a replayed
+/// leaflet is walked.
 fn psot_predicate_run(
     batch: &fluree_db_binary_index::ColumnBatch,
     entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
     p_id: u32,
+    replays_history: bool,
 ) -> (usize, usize) {
     let row_count = batch.row_count;
-    if entry.p_const == Some(p_id) {
+    if entry.p_const == Some(p_id) && !replays_history {
         return (0, row_count);
     }
     let p_start = (0..row_count)
         .position(|i| batch.p_id.get_or(i, 0) >= p_id)
         .unwrap_or(row_count);
     let p_end = (p_start..row_count)
-        .position(|i| batch.p_id.get_or(p_start + i, 0) > p_id)
-        .map(|offset| p_start + offset)
-        .unwrap_or(row_count);
+        .position(|i| batch.p_id.get_or(i, 0) > p_id)
+        .map_or(row_count, |offset| p_start + offset);
     (p_start, p_end)
 }
 
@@ -3266,7 +3271,6 @@ impl NestedLoopJoinOperator {
 
             for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
                 ctx.check_cancelled()?;
-                leaflets_scanned += 1;
                 // An empty-after-retract leaflet (`row_count == 0`) is preserved
                 // by the indexer for time-travel replay. Skip only when there is
                 // also no history past `to_t` to reconstruct.
@@ -3290,6 +3294,7 @@ impl NestedLoopJoinOperator {
                     continue;
                 }
 
+                leaflets_scanned += 1;
                 let batch =
                     leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
                 // Rows restored by replay keep their own types, which the
@@ -3297,7 +3302,8 @@ impl NestedLoopJoinOperator {
                 let o_type_const = entry.o_type_const_for(needs_history_replay);
                 ctx.check_cancelled()?;
 
-                let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
+                let (p_start, p_end) =
+                    psot_predicate_run(&batch, entry, p_id, needs_history_replay);
                 if p_start == p_end {
                     continue;
                 }
@@ -5610,7 +5616,7 @@ fn batched_subject_probe_binary_uncharged(
             let o_type_const = entry.o_type_const_for(needs_history_replay);
             ctx.check_cancelled()?;
 
-            let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
+            let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id, needs_history_replay);
             if p_start == p_end {
                 continue;
             }
@@ -5826,7 +5832,8 @@ fn batched_pair_probe_binary(
                     leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
                 probe.leaflets_loaded += 1;
                 ctx.check_cancelled()?;
-                let (p_start, p_end) = psot_predicate_run(&batch, entry, p_id);
+                let (p_start, p_end) =
+                    psot_predicate_run(&batch, entry, p_id, needs_history_replay);
                 if p_start == p_end {
                     continue;
                 }
@@ -6191,6 +6198,8 @@ fn batched_subject_star_spot_uncharged(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fluree_db_binary_index::format::leaf::LeafletDirEntryV3;
+    use fluree_db_binary_index::{ColumnBatch, ColumnData};
     use fluree_db_core::Sid;
 
     fn subject_batch(s_ids: Vec<u64>) -> fluree_db_binary_index::ColumnBatch {
@@ -6233,6 +6242,58 @@ mod tests {
         }
     }
 
+    /// A PSOT leaflet directory entry keyed from `first` to `last`, each a
+    /// `(p_id, s_id)`.
+    fn psot_leaflet(
+        p_const: Option<u32>,
+        first: (u32, u64),
+        last: (u32, u64),
+    ) -> LeafletDirEntryV3 {
+        use fluree_db_binary_index::format::run_record_v2::{
+            write_ordered_key_v2, RunRecordV2, ORDERED_KEY_V2_SIZE,
+        };
+        use fluree_db_binary_index::RunSortOrder;
+
+        let key = |(p_id, s_id): (u32, u64)| {
+            let mut buf = [0u8; ORDERED_KEY_V2_SIZE];
+            let rec = RunRecordV2 {
+                s_id: SubjectId::from_u64(s_id),
+                o_key: 0,
+                p_id,
+                t: 0,
+                o_i: 0,
+                o_type: 0,
+                g_id: 0,
+            };
+            write_ordered_key_v2(RunSortOrder::Psot, &rec, &mut buf);
+            buf
+        };
+        LeafletDirEntryV3 {
+            row_count: 1,
+            lead_group_count: 1,
+            first_key: key(first),
+            last_key: key(last),
+            p_const,
+            o_type_const: None,
+            flags: 0,
+            payload_offset: 0,
+            payload_len: 0,
+            column_refs: Vec::new(),
+            history_offset: 0,
+            history_len: 0,
+            history_min_t: 0,
+            history_max_t: 0,
+        }
+    }
+
+    fn batch_of_predicates(p_ids: &[u32]) -> ColumnBatch {
+        ColumnBatch {
+            row_count: p_ids.len(),
+            p_id: ColumnData::Block(Arc::from(p_ids)),
+            ..ColumnBatch::empty()
+        }
+    }
+
     #[test]
     fn subject_runs_on_const_column() {
         let mut batch = fluree_db_binary_index::ColumnBatch::empty();
@@ -6242,6 +6303,28 @@ mod tests {
         assert!(runs.next_run(41).is_empty());
         assert_eq!(runs.next_run(42), 0..6);
         assert!(runs.next_run(43).is_empty());
+    }
+
+    #[test]
+    fn p_run_walks_mixed_and_replayed_leaflets() {
+        let mixed = psot_leaflet(None, (5, 0), (9, 0));
+        let rows = batch_of_predicates(&[5, 5, 7, 7, 7, 9]);
+        assert_eq!(psot_predicate_run(&rows, &mixed, 7, false), (2, 5));
+        assert_eq!(psot_predicate_run(&rows, &mixed, 9, false), (5, 6));
+        assert_eq!(psot_predicate_run(&rows, &mixed, 6, false), (2, 2));
+
+        let homogeneous = psot_leaflet(Some(7), (7, 0), (7, 9));
+        let live = ColumnBatch {
+            row_count: 4,
+            p_id: ColumnData::Const(7),
+            ..ColumnBatch::empty()
+        };
+        assert_eq!(psot_predicate_run(&live, &homogeneous, 7, false), (0, 4));
+
+        // Replay restored rows of predicate 5 into the leaflet whose live rows
+        // are all 7, so `p_const` no longer describes the batch.
+        let replayed = batch_of_predicates(&[5, 5, 7, 7]);
+        assert_eq!(psot_predicate_run(&replayed, &homogeneous, 7, true), (2, 4));
     }
 
     fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
