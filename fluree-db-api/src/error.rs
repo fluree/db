@@ -694,6 +694,9 @@ impl ApiError {
             | ApiError::CommitNotFound(_)
             | ApiError::Ledger(fluree_db_ledger::LedgerError::NotFound(_)) => 404,
 
+            // A residency fetch failure surfaces while formatting, but it is
+            // an upstream read the same request can retry, not a bad request.
+            ApiError::Format(crate::format::FormatError::ResidencyFetch(_)) => 503,
             ApiError::Parse(_)
             | ApiError::Batch(_)
             | ApiError::Config(_)
@@ -1014,6 +1017,7 @@ impl ApiError {
             ApiError::NameService(_) => errors::NAMESERVICE,
             ApiError::Bm25Builder(_) | ApiError::Bm25Serialize(_) => errors::BM25,
             ApiError::Config(_) | ApiError::LedgerConfig(_) => errors::CONFIG,
+            ApiError::Format(crate::format::FormatError::ResidencyFetch(_)) => errors::STORAGE_READ,
             ApiError::Format(_) => errors::FORMAT,
             // The specific failure stays in the message; this is the umbrella.
             ApiError::CrossLedger(_) => errors::CROSS_LEDGER,
@@ -1305,6 +1309,11 @@ mod tests {
                 ApiError::Format(FormatError::InvalidBinding("x".into())),
                 400,
                 FORMAT,
+            ),
+            (
+                ApiError::Format(FormatError::ResidencyFetch("x".into())),
+                503,
+                STORAGE_READ,
             ),
             (ApiError::InvalidBranch("x".into()), 400, BAD_REQUEST),
             (

@@ -36,7 +36,7 @@
 use crate::config::FlureeRaftConfig;
 use crate::node::{ClusterNode, NodeId};
 use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::Router;
@@ -61,6 +61,11 @@ const PATH_APPEND_ENTRIES: &str = "/append-entries";
 /// both ways — unlike the Raft RPCs, application responses may carry
 /// `serde_json::Value` state, which postcard cannot decode.
 const PATH_PROPOSE: &str = "/propose";
+
+/// The JSON `LogId` a relayed command committed at, on a `/propose`
+/// success. A header rather than part of the body, so a peer on either
+/// side of an upgrade still reads the other's response.
+pub(crate) const PROPOSE_LOG_ID_HEADER: &str = "x-fluree-raft-log-id";
 
 /// Only this explicit rejection proves that a relayed command cannot
 /// commit. A generic 503 from an intermediary does not carry that promise.
@@ -520,7 +525,8 @@ pub fn router<C: FlureeRaftConfig>(raft: Arc<Raft<C>>, config: &RaftTransportCon
 }
 
 /// The receiving half of [`crate::forward::propose_via_leader`]: decode
-/// the JSON command, `client_write` it locally, answer the JSON response.
+/// the JSON command, `client_write` it locally, answer the JSON response
+/// with its log id in [`PROPOSE_LOG_ID_HEADER`].
 /// Leadership can move between the caller's lookup and this apply. A
 /// `ForwardToLeader` answers 503 with an explicit `not_leader` rejection
 /// so the caller can safely re-resolve and retry. Other failures may follow
@@ -540,10 +546,16 @@ async fn handle_propose<C: FlureeRaftConfig>(
         }
     };
     match raft.client_write(cmd).await {
-        Ok(resp) => match serde_json::to_vec(&resp.data) {
-            Ok(bytes) => (
+        Ok(resp) => match encode_proposed(&resp.log_id, &resp.data) {
+            Ok((log_id, bytes)) => (
                 StatusCode::OK,
-                [(reqwest::header::CONTENT_TYPE, "application/json")],
+                [
+                    (
+                        header::CONTENT_TYPE,
+                        HeaderValue::from_static("application/json"),
+                    ),
+                    (HeaderName::from_static(PROPOSE_LOG_ID_HEADER), log_id),
+                ],
                 bytes,
             )
                 .into_response(),
@@ -566,6 +578,16 @@ async fn handle_propose<C: FlureeRaftConfig>(
         )
             .into_response(),
     }
+}
+
+fn encode_proposed<R: Serialize>(
+    log_id: &openraft::LogId<NodeId>,
+    response: &R,
+) -> Result<(HeaderValue, Vec<u8>), String> {
+    let body = serde_json::to_vec(response).map_err(|e| e.to_string())?;
+    let log_id = serde_json::to_string(log_id).map_err(|e| e.to_string())?;
+    let log_id = HeaderValue::try_from(log_id).map_err(|e| e.to_string())?;
+    Ok((log_id, body))
 }
 
 /// Decode a postcard-encoded request body. Failure → 400.

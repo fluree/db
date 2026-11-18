@@ -36,12 +36,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// subject set in-memory.
 ///
 /// For sparse subject ranges, chunks the scan to avoid scanning large gaps.
+///
+/// Each leaflet read is charged to `tracker` (a no-op when it is disabled).
 pub fn batched_lookup_predicate_refs(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     p_id: u32,
     subjects: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> io::Result<HashMap<u64, Vec<u64>>> {
     if subjects.is_empty() {
         return Ok(HashMap::new());
@@ -212,6 +215,7 @@ pub fn batched_lookup_predicate_refs(
             projection,
         );
         cursor.set_to_t(to_t);
+        let mut cursor = cursor.with_tracker(tracker.clone());
 
         // The cursor's p_id filter pins PSOT's leading key, so s_id is
         // non-decreasing across the returned rows — gallop the chunk's
@@ -272,11 +276,14 @@ pub type SubjectPropertyFlakes = HashMap<u64, Vec<(u32, u16, u64)>>;
 /// add/remove a type, or delete) from the classes it left onto the classes it
 /// joined (issue #1266). Mirrors [`batched_lookup_predicate_refs`] but scans
 /// SPOT (subject-major) across all predicates instead of one PSOT predicate.
+///
+/// Each leaflet read is charged to `tracker` (a no-op when it is disabled).
 pub fn batched_lookup_subject_properties(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     subjects: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> io::Result<SubjectPropertyFlakes> {
     let mut out: HashMap<u64, Vec<(u32, u16, u64)>> = HashMap::new();
     if subjects.is_empty() {
@@ -370,6 +377,7 @@ pub fn batched_lookup_subject_properties(
             projection,
         );
         cursor.set_to_t(to_t);
+        let mut cursor = cursor.with_tracker(tracker.clone());
 
         // Batches are leaflet-granular and spill far past the wanted
         // subjects, so testing every row is the dominant cost for small
@@ -480,11 +488,14 @@ fn o_type_run(batch: &super::column_types::ColumnBatch, ot: u16) -> (usize, usiz
 /// o_type check is required. Used by the incremental class-stat merge to move a
 /// re-typed object's inbound ref-class edges from its old class bucket to its
 /// new one (issue #1266).
+///
+/// Each leaflet read is charged to `tracker` (a no-op when it is disabled).
 pub fn batched_lookup_inbound_refs(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     objects: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> io::Result<HashMap<u64, Vec<(u32, u64)>>> {
     let mut out: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
     if objects.is_empty() {
@@ -582,6 +593,7 @@ pub fn batched_lookup_inbound_refs(
             projection,
         );
         cursor.set_to_t(to_t);
+        let mut cursor = cursor.with_tracker(tracker.clone());
 
         // OPST sorts by (o_type, o_key, ...): binary-search the IRI_REF
         // o_type run (boundary leaflets can carry neighboring o_types),

@@ -610,26 +610,45 @@ async fn jsonld_construct_writes_the_lists_it_reads() {
 }
 
 /// The list is the one the query's default graph holds: a FROM picks the
-/// graph, and a default graph holding a list on the owner in two of its
-/// graphs writes values.
+/// graph, a default graph of several graphs where one holds the list writes
+/// it, and one holding a list on the owner in two of its graphs writes
+/// values. From novelty and from an index, where the rows of a default graph
+/// of several graphs reach the template encoded.
 #[tokio::test]
 async fn construct_reads_the_list_its_default_graph_holds() {
     let fluree = FlureeBuilder::memory().build_memory();
     let id = create(
         &fluree,
         "construct-from",
-        "ex:s ex:nums (1 2) . GRAPH ex:g1 { ex:s ex:nums (3 4) . } GRAPH ex:g2 { ex:s ex:nums (5 6) . }",
+        "ex:s ex:nums (1 2) . GRAPH ex:g1 { ex:s ex:nums (3 4) . } \
+         GRAPH ex:g2 { ex:s ex:nums (5 6) . } GRAPH ex:g3 { ex:t ex:name \"t\" . }",
     )
     .await;
-    let ledger = load(&fluree, &id).await;
     let from =
         |graphs: &str| format!("{PREFIX}CONSTRUCT {{ ?s ?p ?o }} {graphs} WHERE {{ ?s ?p ?o }}");
-    let ttl = turtle(&fluree, &ledger, &from("")).await;
-    assert!(ttl.contains("ex:s ex:nums ( 1 2 ) ."), "{ttl}");
-    let ttl = turtle(&fluree, &ledger, &from("FROM ex:g1")).await;
-    assert!(ttl.contains("ex:s ex:nums ( 3 4 ) ."), "{ttl}");
-    let ttl = turtle(&fluree, &ledger, &from("FROM ex:g1 FROM ex:g2")).await;
-    assert!(!ttl.contains('('), "{ttl}");
+    for indexed in [false, true] {
+        if indexed {
+            support::rebuild_and_publish_index(&fluree, &id).await;
+        }
+        let ledger = load(&fluree, &id).await;
+        let ttl = turtle(&fluree, &ledger, &from("")).await;
+        assert!(
+            ttl.contains("ex:s ex:nums ( 1 2 ) ."),
+            "indexed {indexed}: {ttl}"
+        );
+        let ttl = turtle(&fluree, &ledger, &from("FROM ex:g1")).await;
+        assert!(
+            ttl.contains("ex:s ex:nums ( 3 4 ) ."),
+            "indexed {indexed}: {ttl}"
+        );
+        let ttl = turtle(&fluree, &ledger, &from("FROM ex:g1 FROM ex:g3")).await;
+        assert!(
+            ttl.contains("ex:s ex:nums ( 3 4 ) ."),
+            "indexed {indexed}: {ttl}"
+        );
+        let ttl = turtle(&fluree, &ledger, &from("FROM ex:g1 FROM ex:g2")).await;
+        assert!(!ttl.contains('('), "indexed {indexed}: {ttl}");
+    }
 }
 
 /// Each value's entries are bound once, on the first solution naming it: a

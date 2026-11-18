@@ -612,7 +612,7 @@ impl RangeSemiJoinOperator {
             numeric => Ok(interval.numeric
                 && numeric
                     .numeric()
-                    .is_some_and(|v| interval.exact.matches(&v))),
+                    .is_some_and(|v| interval.exact.matches_number(&v))),
         }
     }
 
@@ -665,6 +665,7 @@ impl RangeSemiJoinOperator {
         let bounds = ObjectBounds {
             lower: envelope.lower.clone().map(|v| (v, true)),
             upper: envelope.upper.clone().map(|v| (v, true)),
+            ..ObjectBounds::new()
         };
         let narrow = ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OKey));
         let mixed = narrow
@@ -710,7 +711,7 @@ impl RangeSemiJoinOperator {
                     output: if key_range.is_some() { narrow } else { mixed },
                     internal: ColumnSet::EMPTY,
                 };
-                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None, &ctx.tracker)?;
 
                 let keyed = match key_range {
                     Some((ot, lo, hi)) => {
@@ -793,7 +794,7 @@ impl RangeSemiJoinOperator {
                         let val = store.decode_value_v3(ot, o_key, p_id, g_id).map_err(|e| {
                             QueryError::Internal(format!("decode_value_v3 (range walk): {e}"))
                         })?;
-                        if !bounds.matches(&val) {
+                        if !bounds.matches_encoded(&val, OType::from_u16(ot)) {
                             continue;
                         }
                         let value = match val {
@@ -1255,7 +1256,7 @@ impl Operator for RangeSemiJoinOperator {
                         }
                         Some(Binding::Poisoned) => false,
                         Some(subject) => {
-                            let key = binding_to_group_key_normalized(subject, dicts, gv);
+                            let key = binding_to_group_key_normalized(subject, dicts, gv)?;
                             let mut any = false;
                             for value in index.values.values_of(&key) {
                                 if self.value_passes(c, interval, &batch, row, value, ctx)? {
