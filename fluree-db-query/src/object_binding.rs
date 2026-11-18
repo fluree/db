@@ -924,6 +924,36 @@ impl ScopeCrossing {
             .map_err(|e| crate::error::QueryError::Internal(e.to_string()))
     }
 
+    /// Whether bindings leave the scope as they are: the outer context reads
+    /// the scope's store, so there is nothing to decode on the way out.
+    #[inline]
+    pub(crate) fn leaves_unchanged(&self) -> bool {
+        self.leave.is_none()
+    }
+
+    /// [`Self::leave`] for a column, or for `rows` of it. A column that
+    /// leaves unchanged is cloned without visiting each binding through
+    /// `leave`, as [`Self::enter_batch`] does on the way in.
+    pub(crate) fn leave_column(
+        &self,
+        column: &[Binding],
+        rows: Option<&[usize]>,
+    ) -> crate::error::Result<Vec<Binding>> {
+        use crate::group_aggregate::TryCollectVec;
+        match (rows, self.leaves_unchanged()) {
+            (None, true) => Ok(column.to_vec()),
+            (Some(rows), true) => Ok(rows.iter().map(|&row| column[row].clone()).collect()),
+            (None, false) => column
+                .iter()
+                .map(|b| self.leave(b.clone()))
+                .try_collect_vec(),
+            (Some(rows), false) => rows
+                .iter()
+                .map(|&row| self.leave(column[row].clone()))
+                .try_collect_vec(),
+        }
+    }
+
     /// `binding`, bound inside the scope, decoded when the outer context
     /// cannot decode it.
     pub(crate) fn leave(&self, binding: Binding) -> crate::error::Result<Binding> {

@@ -636,7 +636,7 @@ impl GraphOperator {
                         .enumerate()
                         .map(|(i, var)| match batch.column(*var) {
                             Some(col) if i < parent_len => Ok(col.to_vec()),
-                            Some(col) => col.iter().map(|b| crossing.leave(b.clone())).collect(),
+                            Some(col) => crossing.leave_column(col, None),
                             None => Ok(vec![Binding::Unbound; rows]),
                         })
                         .collect::<Result<Vec<Vec<Binding>>>>()?;
@@ -698,10 +698,7 @@ impl GraphOperator {
                                 vec![Binding::iri(st.graph_iri.clone()); kept.len()]
                             } else {
                                 match batch.column(*var) {
-                                    Some(col) => kept
-                                        .iter()
-                                        .map(|&row| crossing.leave(col[row].clone()))
-                                        .collect::<Result<Vec<Binding>>>()?,
+                                    Some(col) => crossing.leave_column(col, Some(&kept))?,
                                     None => vec![Binding::Unbound; kept.len()],
                                 }
                             })
