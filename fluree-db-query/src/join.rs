@@ -2896,11 +2896,18 @@ impl NestedLoopJoinOperator {
         let need_replay = ctx.to_t < store.max_t();
         let replay_to = need_replay.then_some(ctx.to_t);
         let proj = fluree_db_binary_index::ColumnProjection::all();
+        // Leaves are checked only while the probe set is under twice the
+        // leaf range. Past that, scattered subjects leave few leaves empty,
+        // and the check in this loop measurably slows a dense probe even
+        // when it skips nothing; such a probe opens every leaf in range.
+        let check_leaves = unique_s_ids.len() < 2 * leaf_range.len();
 
         for leaf_idx in leaf_range {
             ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
-            if !psot_leaf_may_hold_subjects(leaf_entry, p_id, unique_s_ids, need_replay) {
+            if check_leaves
+                && !psot_leaf_may_hold_subjects(leaf_entry, p_id, unique_s_ids, need_replay)
+            {
                 continue;
             }
             leaves_opened += 1;
