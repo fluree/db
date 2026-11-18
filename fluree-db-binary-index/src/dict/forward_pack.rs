@@ -232,13 +232,38 @@ impl FsstTable {
     }
 
     /// Append the value `codes` stand for to `out`.
+    ///
+    /// The decoder needs eight bytes of room per code. When `out` lacks it, the
+    /// value is decoded into a per-thread scratch buffer and copied, so `out`
+    /// grows by the value's own length.
     pub(crate) fn decode_value_into(&self, codes: &[u8], out: &mut Vec<u8>) {
         let decompressor = fsst::Decompressor::new(&self.symbols, &self.lengths);
-        out.reserve(decompressor.max_decompression_capacity(codes));
-        let written = decompressor.decompress_into(codes, out.spare_capacity_mut());
-        // SAFETY: the decompressor initialized `written` bytes past the length.
-        unsafe { out.set_len(out.len() + written) };
+        let room = decompressor.max_decompression_capacity(codes);
+        if out.capacity() - out.len() >= room || room > MAX_DECODE_SCRATCH {
+            out.reserve(room);
+            let written = decompressor.decompress_into(codes, out.spare_capacity_mut());
+            // SAFETY: the decompressor initialized `written` bytes past the length.
+            unsafe { out.set_len(out.len() + written) };
+            return;
+        }
+        DECODE_SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            scratch.clear();
+            scratch.reserve(room);
+            let written = decompressor.decompress_into(codes, scratch.spare_capacity_mut());
+            // SAFETY: the decompressor initialized the first `written` bytes.
+            unsafe { scratch.set_len(written) };
+            out.extend_from_slice(&scratch);
+        });
     }
+}
+
+/// The largest decoder room a value is decoded through [`DECODE_SCRATCH`]
+/// with; a larger value decodes straight into its output.
+const MAX_DECODE_SCRATCH: usize = 1 << 20;
+
+thread_local! {
+    static DECODE_SCRATCH: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 /// How each page of a pack stores its values: runs of pages keyed by their
@@ -1646,6 +1671,26 @@ mod tests {
                 .unwrap(),
             Some(String::from_utf8(entries[2].1.clone()).unwrap())
         );
+    }
+
+    /// A value decoded into a new buffer allocates about its own length, not
+    /// the decoder's eight bytes per code of slack.
+    #[test]
+    fn a_decoded_value_allocates_its_own_length() {
+        let entries = text_entries(0, 2_000);
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        let meta = parse_pack_meta(&bytes).unwrap();
+        for (id, value) in entries.iter().filter(|(_, v)| v.len() > 200) {
+            let mut out = Vec::new();
+            assert!(lookup_in_pack_into(&bytes, &meta, *id, &mut out));
+            assert_eq!(out, *value);
+            assert!(
+                out.capacity() < value.len() + 64,
+                "{} for {}",
+                out.capacity(),
+                value.len()
+            );
+        }
     }
 
     #[test]
