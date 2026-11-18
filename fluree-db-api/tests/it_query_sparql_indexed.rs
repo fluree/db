@@ -8549,6 +8549,39 @@ async fn indexed_long_strings_resolve_by_value_and_prefix() {
             check(2, text("alps"), "ex:e", format!("{shared}al"), 2).await;
             check(2, text("gamma"), "ex:f", "A ".into(), 6).await;
             check(2, text("beta"), "ex:b", shared.to_string(), 4).await;
+
+            // The group sharing the first 48 bytes passes the string tree's
+            // cap of 32 hashed values: it is then keyed by value, keeping
+            // the four hashed values it holds, and both kinds resolve.
+            let group = &shared.as_bytes()[..48];
+            let mut ledger = ledger;
+            for (t, range) in [(3, 0..30), (4, 30..35)] {
+                let graph: Vec<_> = range
+                    .map(|i| json!({"@id": format!("ex:crowd{i}"), "ex:text": text(&format!("crowd{i:02}"))}))
+                    .collect();
+                ledger = fluree
+                    .insert_with_opts(
+                        ledger,
+                        &json!({"@context": { "ex": "http://example.org/ns/" }, "@graph": graph}),
+                        TxnOpts::default(),
+                        CommitOpts::default(),
+                        &index_cfg,
+                    )
+                    .await
+                    .expect("crowd insert")
+                    .ledger;
+                trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+                let view = fluree.db_at_t(ledger_id, t).await.expect("indexed view");
+                let store = view.binary_store().expect("indexed view has a store");
+                let rules = store.string_key_rules().expect("a string tree");
+                let listed = rules.raw.get(group).expect("the group is keyed by value");
+                assert!(listed.hashed, "t={t}: the group keeps its hashed values");
+            }
+            let crowd = |i: usize| text(&format!("crowd{i:02}"));
+            check(4, crowd(0), "ex:crowd0", format!("{shared}crowd"), 35).await;
+            check(4, crowd(34), "ex:crowd34", format!("{shared}crowd3"), 5).await;
+            check(4, text("alps"), "ex:e", format!("{shared}al"), 2).await;
+            check(4, text("gamma"), "ex:f", shared.to_string(), 39).await;
         })
         .await;
 }

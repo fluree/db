@@ -107,6 +107,7 @@ pub fn build_reverse_tree_as(
     let branch = DictBranch {
         leaves: branch_entries,
         key_scheme,
+        ..Default::default()
     };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
@@ -124,6 +125,7 @@ fn empty_tree_result(key_scheme: KeyScheme) -> TreeBuildResult {
     let branch = DictBranch {
         leaves: vec![],
         key_scheme,
+        ..Default::default()
     };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);

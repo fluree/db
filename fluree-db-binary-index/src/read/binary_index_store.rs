@@ -1198,8 +1198,7 @@ impl BinaryIndexStore {
             }
         }
         if let Some(tree) = self.dicts.string_reverse_tree.as_ref() {
-            // String reverse keys are the raw UTF-8 value bytes (see
-            // `find_string_id`).
+            // The tree keys the values by its own scheme.
             let keys: Vec<&[u8]> = strings.map(str::as_bytes).collect();
             for address in tree.touched_leaf_addresses(keys.iter().copied()) {
                 if let Some(cid) = tree.leaf_cid(address) {
@@ -3270,18 +3269,29 @@ impl BinaryIndexStore {
         }
     }
 
+    /// How the string reverse tree keys values, if there is one.
+    pub fn string_key_rules(&self) -> Option<crate::dict::key_scheme::KeyRules<'_>> {
+        self.dicts
+            .string_reverse_tree
+            .as_ref()
+            .map(|tree| tree.key_rules())
+    }
+
     /// Find all string IDs whose value starts with `prefix`, in no
     /// particular order.
     ///
     /// Range-scans the reverse string tree over the key ranges its scheme
     /// gives for the prefix; a hashed key matching only the first part of a
-    /// long prefix is checked against its value.
+    /// long prefix is checked against its value, of which a group holds at
+    /// most a few (see [`KeyScheme`]).
+    ///
+    /// [`KeyScheme`]: crate::dict::key_scheme::KeyScheme
     pub fn find_strings_by_prefix(&self, prefix: &str) -> io::Result<Vec<u32>> {
         let Some(tree) = &self.dicts.string_reverse_tree else {
             return Ok(Vec::new());
         };
         let mut ids = Vec::new();
-        for range in tree.key_scheme().prefix_ranges(prefix.as_bytes()) {
+        for range in tree.key_rules().prefix_ranges(prefix.as_bytes()) {
             // An open range ends just past the tree's last key.
             let end = range.end.unwrap_or_else(|| {
                 let mut end = tree

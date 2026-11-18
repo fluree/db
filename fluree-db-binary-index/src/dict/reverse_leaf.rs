@@ -1153,7 +1153,10 @@ mod tests {
 
     #[test]
     fn subject_and_hashed_string_trees_are_front_coded() {
-        let hashed = KeyScheme::PrefixHash { prefix_len: 48 };
+        let hashed = KeyScheme::PrefixHash {
+            prefix_len: 48,
+            cap: 32,
+        };
         assert_eq!(
             LeafFormat::for_tree(DictKind::SubjectReverse, KeyScheme::Raw),
             LeafFormat::FrontCoded {

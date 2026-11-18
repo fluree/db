@@ -538,24 +538,35 @@ where
     Ok(pack_refs)
 }
 
-/// Build the string reverse tree by draining `next_entry`. Entries must arrive
-/// in value order (lexicographic by string). Keys follow a new string tree's
-/// [`KeyScheme`], which hashes long values, and leaves are front-coded, cut
-/// where a `DLR1` leaf of the same keys would reach the target size.
+/// The bytes of a string entry in the `.fwd` file.
+fn string_at<'f>(fwd: &'f [u8], entry: &StringEntry) -> &'f [u8] {
+    let off = entry.off as usize;
+    &fwd[off..off + entry.len as usize]
+}
+
+/// Build the string reverse tree. `entries` opens a pass over the strings in
+/// value order (lexicographic by string), and is called twice: a first pass
+/// finds the groups holding more long values than a new string tree's
+/// [`KeyScheme`] lets a group hash, and the second keys those groups' long
+/// values by value and hashes every other long value. Leaves are
+/// front-coded, cut where a `DLR1` leaf of the same keys would reach the
+/// target size.
 ///
 /// [`KeyScheme`]: fluree_db_binary_index::dict::key_scheme::KeyScheme
-async fn build_string_reverse_tree<F>(
+async fn build_string_reverse_tree<O, F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
-    spill_dir: &std::path::Path,
-    mut next_entry: F,
+    mut entries: O,
 ) -> Result<DictTreeRefs>
 where
+    O: FnMut() -> Result<F>,
     F: FnMut() -> Result<Option<StringEntry>>,
 {
     use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
     use fluree_db_binary_index::dict::builder;
-    use fluree_db_binary_index::dict::key_scheme::{KeyOrder, KeyScheme};
+    use fluree_db_binary_index::dict::key_scheme::{
+        GroupCounter, KeyOrder, KeyScheme, RawGroup, RawGroups,
+    };
     use fluree_db_binary_index::dict::reverse_leaf::FrontCodedLeafWriter;
     use fluree_db_core::{ContentKind, DictKind};
 
@@ -563,32 +574,50 @@ where
         dict: DictKind::StringReverse,
     };
     let scheme = KeyScheme::for_new_tree(DictKind::StringReverse);
+    let invalid =
+        |e: std::io::Error| IndexerError::StorageWrite(format!("string reverse keys: {e}"));
+
+    let mut counter = GroupCounter::new(scheme);
+    let mut next_entry = entries()?;
+    while let Some(entry) = next_entry()? {
+        counter.push(string_at(fwd, &entry));
+    }
+    let raw_groups = RawGroups::from_sorted(
+        counter
+            .finish()
+            .into_iter()
+            .map(|prefix| RawGroup {
+                prefix,
+                hashed: false,
+            })
+            .collect(),
+    )
+    .map_err(invalid)?;
+    if !raw_groups.is_empty() {
+        tracing::debug!(groups = raw_groups.len(), "string groups keyed by value");
+    }
+
     let mut leaf_cids: Vec<ContentId> = Vec::new();
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
-
-    let mut order = KeyOrder::spilling(scheme, spill_dir);
-    let spill_error =
-        |e: std::io::Error| IndexerError::StorageWrite(format!("string key order: {e}"));
+    let mut order = KeyOrder::new(scheme, raw_groups.clone());
     let mut writer = FrontCodedLeafWriter::new(false);
     let mut chunk_bytes: usize = 0;
     let mut first_key: Option<Vec<u8>> = None;
     let mut last_key: Vec<u8> = Vec::new();
+    let mut next_entry = entries()?;
     let mut drained = false;
 
     while !drained {
         match next_entry()? {
-            Some(entry) => {
-                let off = entry.off as usize;
-                order
-                    .push(&fwd[off..off + entry.len as usize], entry.id)
-                    .map_err(spill_error)?;
-            }
+            Some(entry) => order
+                .push(string_at(fwd, &entry), entry.id)
+                .map_err(invalid)?,
             None => {
-                order.finish().map_err(spill_error)?;
+                order.finish();
                 drained = true;
             }
         }
-        while let Some((key, id)) = order.pop().map_err(spill_error)? {
+        while let Some((key, id)) = order.pop() {
             if (!writer.is_empty() || !branch_entries.is_empty()) && key <= last_key {
                 return Err(IndexerError::StorageWrite(
                     "string reverse keys out of order, or two strings share a key".into(),
@@ -631,6 +660,7 @@ where
     let branch = DictBranch {
         leaves: branch_entries,
         key_scheme: scheme,
+        raw_groups,
     };
     let branch_bytes = branch.encode();
     let branch_result = content_store
@@ -994,20 +1024,21 @@ pub async fn upload_dicts_from_disk(
                     };
 
                     let reverse = {
-                        let mut idx_reader = ForwardIndexReader::open(&str_idx_path)?;
-                        let mut id = 0u64;
-                        let next = || -> Result<Option<StringEntry>> {
-                            match idx_reader.next()? {
-                                Some((off, len)) => {
-                                    let entry = StringEntry { id, off, len };
-                                    id += 1;
-                                    Ok(Some(entry))
+                        let entries = || -> Result<_> {
+                            let mut idx_reader = ForwardIndexReader::open(&str_idx_path)?;
+                            let mut id = 0u64;
+                            Ok(move || -> Result<Option<StringEntry>> {
+                                match idx_reader.next()? {
+                                    Some((off, len)) => {
+                                        let entry = StringEntry { id, off, len };
+                                        id += 1;
+                                        Ok(Some(entry))
+                                    }
+                                    None => Ok(None),
                                 }
-                                None => Ok(None),
-                            }
+                            })
                         };
-                        build_string_reverse_tree(content_store, &str_fwd_data, run_dir, next)
-                            .await?
+                        build_string_reverse_tree(content_store, &str_fwd_data, entries).await?
                     };
 
                     tracing::info!("string dict artifacts uploaded");
@@ -1077,32 +1108,35 @@ pub async fn upload_dicts_from_disk(
                         Some(v)
                     };
                     let reverse = {
-                        let mut pos = 0usize;
-                        let next = || -> Result<Option<StringEntry>> {
-                            let i = match &rev_order {
-                                None => {
-                                    if pos >= count {
-                                        None
-                                    } else {
-                                        Some(pos)
+                        let (rev_order, str_offsets, str_lens) =
+                            (&rev_order, &str_offsets, &str_lens);
+                        let entries = || -> Result<_> {
+                            let mut pos = 0usize;
+                            Ok(move || -> Result<Option<StringEntry>> {
+                                let i = match rev_order {
+                                    None => {
+                                        if pos >= count {
+                                            None
+                                        } else {
+                                            Some(pos)
+                                        }
                                     }
+                                    Some(order) => order.get(pos).copied(),
+                                };
+                                match i {
+                                    Some(i) => {
+                                        pos += 1;
+                                        Ok(Some(StringEntry {
+                                            id: i as u64,
+                                            off: str_offsets[i],
+                                            len: str_lens[i],
+                                        }))
+                                    }
+                                    None => Ok(None),
                                 }
-                                Some(order) => order.get(pos).copied(),
-                            };
-                            match i {
-                                Some(i) => {
-                                    pos += 1;
-                                    Ok(Some(StringEntry {
-                                        id: i as u64,
-                                        off: str_offsets[i],
-                                        len: str_lens[i],
-                                    }))
-                                }
-                                None => Ok(None),
-                            }
+                            })
                         };
-                        build_string_reverse_tree(content_store, &str_fwd_data, run_dir, next)
-                            .await?
+                        build_string_reverse_tree(content_store, &str_fwd_data, entries).await?
                     };
 
                     tracing::info!("string dict artifacts uploaded");
@@ -1118,6 +1152,7 @@ pub async fn upload_dicts_from_disk(
                     key_scheme: fluree_db_binary_index::dict::key_scheme::KeyScheme::for_new_tree(
                         DictKind::StringReverse,
                     ),
+                    ..Default::default()
                 };
                 let empty_bytes = empty_branch.encode();
                 let wr_rev = content_store
@@ -1578,15 +1613,18 @@ mod tests {
     }
 
     /// Long strings are keyed by prefix and hash and sorted among the short
-    /// ones around them, a run sharing its prefix included, and every string
-    /// resolves through the tree to its own id.
+    /// ones around them, except in a group of more long strings than the
+    /// cap, which is keyed by value; every string resolves through the tree
+    /// to its own id, and a prefix past the hashed one finds exactly its
+    /// strings.
     #[tokio::test]
     async fn long_strings_are_keyed_by_prefix_and_hash() {
-        use fluree_db_binary_index::dict::key_scheme::KeyScheme;
+        use fluree_db_binary_index::dict::key_scheme::{KeyScheme, RawGroup};
         use fluree_db_binary_index::dict::reader::DictTreeReader;
         use std::sync::Arc;
 
         let shared = "p".repeat(50);
+        let crowded = format!("{}-crowded-", "c".repeat(48));
         let mut values: Vec<String> = vec![
             "a".into(),
             "p".repeat(10),
@@ -1595,8 +1633,12 @@ mod tests {
             format!("{shared}9"),
             "q".into(),
         ];
-        values.extend((0..300).map(|i| format!("{shared}{i:03}-{}", "t".repeat(i % 40))));
+        // Long values sharing their first 48 bytes, up to the cap of 32.
+        values.extend((0..32).map(|i| format!("{shared}{i:03}-{}", "t".repeat(40 + i % 7))));
+        // Short ones sharing them: at most 81 bytes.
+        values.extend((0..300).map(|i| format!("{shared}{i:03}-{}", "t".repeat(i % 27))));
         values.extend((0..300).map(|i| format!("{i:04}-{}", "z".repeat(80 + i % 50))));
+        values.extend((0..200).map(|i| format!("{crowded}{i:03}-{}", "y".repeat(40))));
         values.sort();
         values.dedup();
 
@@ -1611,19 +1653,29 @@ mod tests {
             fwd.extend_from_slice(v.as_bytes());
         }
         let cs = MemoryContentStore::new();
-        let mut next = entries.into_iter();
-        let dir = tempfile::tempdir().unwrap();
-        let refs = build_string_reverse_tree(&cs, &fwd, dir.path(), || Ok(next.next()))
-            .await
-            .unwrap();
+        let refs = build_string_reverse_tree(&cs, &fwd, || -> Result<_> {
+            let mut next = entries.clone().into_iter();
+            Ok(move || Ok(next.next()))
+        })
+        .await
+        .unwrap();
 
         let cs: Arc<dyn ContentStore> = Arc::new(cs);
         let reader = DictTreeReader::from_refs(&cs, &refs, None).await.unwrap();
-        let scheme = reader.key_scheme();
-        assert!(matches!(scheme, KeyScheme::PrefixHash { .. }));
-        assert!(values
+        let rules = reader.key_rules();
+        assert!(matches!(rules.scheme, KeyScheme::PrefixHash { .. }));
+        assert_eq!(
+            rules.raw.iter().collect::<Vec<_>>(),
+            vec![&RawGroup {
+                prefix: crowded.as_bytes()[..48].to_vec(),
+                hashed: false,
+            }]
+        );
+        let hashed = values
             .iter()
-            .any(|v| scheme.key(v.as_bytes()).len() < v.len()));
+            .filter(|v| rules.key(v.as_bytes()).len() < v.len())
+            .count();
+        assert_eq!(hashed, 32 + 300);
         for (id, v) in values.iter().enumerate() {
             assert_eq!(
                 reader.reverse_lookup(v.as_bytes()).unwrap(),
@@ -1631,8 +1683,12 @@ mod tests {
                 "{v}"
             );
         }
-        let absent = format!("{shared}000-{}", "t".repeat(77));
-        assert_eq!(reader.reverse_lookup(absent.as_bytes()).unwrap(), None);
+        for absent in [
+            format!("{shared}000-{}", "t".repeat(77)),
+            format!("{crowded}000-{}", "y".repeat(41)),
+        ] {
+            assert_eq!(reader.reverse_lookup(absent.as_bytes()).unwrap(), None);
+        }
         let found = reader
             .reverse_lookup_many(values.iter().map(String::as_bytes))
             .unwrap();
@@ -1640,6 +1696,32 @@ mod tests {
             .iter()
             .enumerate()
             .all(|(id, f)| *f == Some(id as u64)));
+
+        for prefix in [format!("{shared}01"), format!("{crowded}01")] {
+            let mut got: Vec<u64> = Vec::new();
+            let mut checked = 0;
+            for range in rules.prefix_ranges(prefix.as_bytes()) {
+                let end = range.end.clone().unwrap();
+                for (_, id) in reader.reverse_range_scan(&range.start, &end).unwrap() {
+                    if range.check {
+                        checked += 1;
+                        if !values[id as usize].starts_with(&prefix) {
+                            continue;
+                        }
+                    }
+                    got.push(id);
+                }
+            }
+            got.sort();
+            let want: Vec<u64> = (0..values.len() as u64)
+                .filter(|&id| values[id as usize].starts_with(&prefix))
+                .collect();
+            assert_eq!(got, want, "{prefix}");
+            // A group past the cap leaves nothing to check; one within it,
+            // no more than the cap.
+            let limit = if prefix.starts_with('c') { 0 } else { 32 };
+            assert!(checked <= limit, "{prefix}: {checked}");
+        }
     }
 
     /// Same oracle with no strings persisted (empty-strings branch).

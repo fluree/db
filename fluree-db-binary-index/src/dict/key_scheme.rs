@@ -1,8 +1,8 @@
 //! How a reverse tree turns a value into its key.
 //!
 //! A [`KeyScheme::Raw`] tree keys a value by its bytes. A
-//! [`KeyScheme::PrefixHash`] tree does too, except for a value longer than
-//! `prefix_len + 1 + KEY_HASH_LEN` bytes, which it keys by its first
+//! [`KeyScheme::PrefixHash`] tree does too, except that it may key a *long*
+//! value, one longer than `prefix_len + 1 + KEY_HASH_LEN` bytes, by its first
 //! `prefix_len` bytes, a [`HASHED_KEY_MARKER`] byte and the value's SHA-256.
 //! Long values then cost a fixed-size key instead of a second copy of
 //! themselves.
@@ -10,21 +10,32 @@
 //! Values are UTF-8, which never contains `0xFF`, so a key with the marker
 //! at `prefix_len` can only be a hashed one, and a key keeps its value's
 //! first `prefix_len` bytes either way: every value starting with a prefix
-//! of at most `prefix_len` bytes lies in that prefix's key range. A longer
-//! prefix's hashed candidates share only the first `prefix_len` bytes and
-//! must be checked against their values.
+//! of at most `prefix_len` bytes lies in that prefix's key range.
+//!
+//! The long values sharing their first `prefix_len` bytes are a *group*. A
+//! longer prefix's hashed candidates are its group's hashed values, each of
+//! which must be checked against its value, so a group hashes at most `cap`
+//! values. Past that the tree lists the group in its [`RawGroups`] and keys
+//! the group's new values by value, where a prefix finds them exactly:
+//!
+//! - a full build counts each group first, so a group it lists holds no
+//!   hashed value;
+//! - an incremental write counts the hashed values a group already holds,
+//!   and lists the group before it would pass the cap;
+//! - an import into an existing tree sees a group's existing hashed values
+//!   only as it merges past them, so it can add up to `cap` before listing
+//!   it.
+//!
+//! A group listed after it began hashing keeps those values, and says so,
+//! so a lookup there tries the value key and then the hashed one.
 //!
 //! Equal keys for different values would take a SHA-256 collision, the
 //! same assumption content addresses make; the tree writers refuse equal
 //! keys rather than replace one value with another.
 
 use std::borrow::Cow;
-use std::cmp::Reverse;
-use std::collections::{BinaryHeap, VecDeque};
-use std::fs::File;
-use std::io::{self, BufReader, BufWriter, Read, Write};
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::VecDeque;
+use std::io;
 
 use fluree_db_core::DictKind;
 use sha2::{Digest, Sha256};
@@ -38,17 +49,17 @@ pub const HASHED_KEY_MARKER: u8 = 0xFF;
 /// Prefix a new string tree keeps before the hash.
 pub const DEFAULT_STRING_KEY_PREFIX: u8 = 48;
 
-/// Hashed values a spilling [`KeyOrder`] holds before writing a sorted
-/// chunk to disk: 40 bytes each, so about 40 MiB.
-pub const KEY_ORDER_SPILL_ENTRIES: usize = 1 << 20;
+/// Hashed values a new string tree lets a group hold.
+pub const DEFAULT_GROUP_HASH_CAP: u16 = 32;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KeyScheme {
     /// The key is the value.
     #[default]
     Raw,
-    /// Long values are keyed by a prefix and a hash.
-    PrefixHash { prefix_len: u8 },
+    /// Long values are keyed by a prefix and a hash, at most `cap` to a
+    /// group.
+    PrefixHash { prefix_len: u8, cap: u16 },
 }
 
 /// A key range `[start, end)` (`end: None` runs to the last key) and
@@ -77,47 +88,184 @@ fn digest(value: &[u8]) -> [u8; KEY_HASH_LEN] {
     Sha256::digest(value).into()
 }
 
+fn hashed_key(group: &[u8], hash: &[u8; KEY_HASH_LEN]) -> Vec<u8> {
+    let mut key = Vec::with_capacity(group.len() + 1 + KEY_HASH_LEN);
+    key.extend_from_slice(group);
+    key.push(HASHED_KEY_MARKER);
+    key.extend_from_slice(hash);
+    key
+}
+
 impl KeyScheme {
     /// The scheme a new tree of `dict` is written in.
     pub fn for_new_tree(dict: DictKind) -> Self {
         match dict {
             DictKind::StringReverse => Self::PrefixHash {
                 prefix_len: DEFAULT_STRING_KEY_PREFIX,
+                cap: DEFAULT_GROUP_HASH_CAP,
             },
             _ => Self::Raw,
         }
     }
 
-    /// The prefix a hashed key keeps, if this scheme hashes.
     fn prefix_len(self) -> Option<usize> {
         match self {
             Self::Raw => None,
-            Self::PrefixHash { prefix_len } => Some(prefix_len as usize),
+            Self::PrefixHash { prefix_len, .. } => Some(prefix_len as usize),
         }
     }
 
-    /// The tree key for `value`.
-    pub fn key(self, value: &[u8]) -> Cow<'_, [u8]> {
-        let Some(k) = self.prefix_len() else {
-            return Cow::Borrowed(value);
-        };
-        if value.len() <= k + 1 + KEY_HASH_LEN {
-            return Cow::Borrowed(value);
+    /// Hashed values a group may hold.
+    pub fn cap(self) -> usize {
+        match self {
+            Self::Raw => 0,
+            Self::PrefixHash { cap, .. } => cap as usize,
         }
+    }
+
+    /// A long value's group: its first `prefix_len` bytes.
+    pub fn group(self, value: &[u8]) -> Option<&[u8]> {
+        let k = self.prefix_len()?;
+        (value.len() > k + 1 + KEY_HASH_LEN).then(|| &value[..k])
+    }
+
+    /// The group of a hashed key; `None` for a value key.
+    pub fn hashed_key_group(self, key: &[u8]) -> Option<&[u8]> {
+        let k = self.prefix_len()?;
+        (key.len() == k + 1 + KEY_HASH_LEN && key[k] == HASHED_KEY_MARKER).then(|| &key[..k])
+    }
+
+    /// A long value's hashed key.
+    pub fn hashed_key(self, value: &[u8]) -> Vec<u8> {
+        let group = self.group(value).expect("only a long value hashes");
         debug_assert!(
-            !value[..k].contains(&HASHED_KEY_MARKER),
+            !group.contains(&HASHED_KEY_MARKER),
             "reverse-tree values are UTF-8"
         );
-        let mut key = Vec::with_capacity(k + 1 + KEY_HASH_LEN);
-        key.extend_from_slice(&value[..k]);
-        key.push(HASHED_KEY_MARKER);
-        key.extend_from_slice(&digest(value));
-        Cow::Owned(key)
+        hashed_key(group, &digest(value))
+    }
+
+    /// The key range `[start, end)` of a group's hashed values.
+    pub fn hashed_range(self, group: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+        let mut start = group.to_vec();
+        start.push(HASHED_KEY_MARKER);
+        let end = prefix_end(&start);
+        (start, end)
+    }
+
+    /// Whether this scheme may order keys differently from their values.
+    pub fn reorders(self) -> bool {
+        self != Self::Raw
+    }
+}
+
+/// A group whose long values the tree keys by value.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RawGroup {
+    pub prefix: Vec<u8>,
+    /// Whether it also holds hashed values, from before it filled.
+    pub hashed: bool,
+}
+
+/// The groups a tree keys by value, sorted by prefix.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RawGroups(Vec<RawGroup>);
+
+impl RawGroups {
+    /// From groups sorted by prefix, each listed once.
+    pub fn from_sorted(groups: Vec<RawGroup>) -> io::Result<Self> {
+        if groups.windows(2).any(|w| w[0].prefix >= w[1].prefix) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "raw key groups are not sorted",
+            ));
+        }
+        Ok(Self(groups))
+    }
+
+    pub fn get(&self, prefix: &[u8]) -> Option<&RawGroup> {
+        self.0
+            .binary_search_by(|g| g.prefix.as_slice().cmp(prefix))
+            .ok()
+            .map(|i| &self.0[i])
+    }
+
+    /// List `prefix`; `hashed` if it may already hold hashed values.
+    pub fn insert(&mut self, prefix: &[u8], hashed: bool) {
+        match self.0.binary_search_by(|g| g.prefix.as_slice().cmp(prefix)) {
+            Ok(i) => self.0[i].hashed |= hashed,
+            Err(i) => self.0.insert(
+                i,
+                RawGroup {
+                    prefix: prefix.to_vec(),
+                    hashed,
+                },
+            ),
+        }
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, RawGroup> {
+        self.0.iter()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// How one tree keys values: its scheme and the groups it keys by value.
+#[derive(Clone, Copy, Debug)]
+pub struct KeyRules<'a> {
+    pub scheme: KeyScheme,
+    pub raw: &'a RawGroups,
+}
+
+/// The keys a value may be held under, in the order to try them.
+#[derive(Debug, PartialEq, Eq)]
+pub struct LookupKeys<'v> {
+    pub first: Cow<'v, [u8]>,
+    /// The hashed key of a value whose group filled after it began hashing.
+    pub then: Option<Vec<u8>>,
+}
+
+impl KeyRules<'_> {
+    /// The key a new `value` is written under.
+    pub fn key<'v>(&self, value: &'v [u8]) -> Cow<'v, [u8]> {
+        match self.scheme.group(value) {
+            Some(group) if self.raw.get(group).is_none() => {
+                Cow::Owned(self.scheme.hashed_key(value))
+            }
+            _ => Cow::Borrowed(value),
+        }
+    }
+
+    /// The keys `value` may be held under.
+    pub fn lookup_keys<'v>(&self, value: &'v [u8]) -> LookupKeys<'v> {
+        let Some(group) = self.scheme.group(value) else {
+            return LookupKeys {
+                first: Cow::Borrowed(value),
+                then: None,
+            };
+        };
+        match self.raw.get(group) {
+            None => LookupKeys {
+                first: Cow::Owned(self.scheme.hashed_key(value)),
+                then: None,
+            },
+            Some(raw) => LookupKeys {
+                first: Cow::Borrowed(value),
+                then: raw.hashed.then(|| self.scheme.hashed_key(value)),
+            },
+        }
     }
 
     /// The key ranges that hold every value starting with `prefix`.
-    pub fn prefix_ranges(self, prefix: &[u8]) -> Vec<PrefixRange> {
-        let Some(k) = self.prefix_len() else {
+    pub fn prefix_ranges(&self, prefix: &[u8]) -> Vec<PrefixRange> {
+        let Some(k) = self.scheme.prefix_len() else {
             // A raw tree's values are its keys, and UTF-8 never holds 0xFF.
             let mut end = prefix.to_vec();
             end.push(0xFF);
@@ -135,97 +283,108 @@ impl KeyScheme {
         if prefix.len() <= k {
             return vec![exact];
         }
-        let mut hashed = prefix[..k].to_vec();
-        hashed.push(HASHED_KEY_MARKER);
+        let group = &prefix[..k];
+        if self.raw.get(group).is_some_and(|g| !g.hashed) {
+            return vec![exact];
+        }
+        let (start, end) = self.scheme.hashed_range(group);
         vec![
             exact,
             PrefixRange {
-                end: prefix_end(&hashed),
-                start: hashed,
+                start,
+                end,
                 check: true,
             },
         ]
     }
+}
 
-    /// Whether this scheme may order keys differently from their values.
-    pub fn reorders(self) -> bool {
-        self != Self::Raw
+/// The groups holding more long values than the cap, from values arriving
+/// in byte order.
+pub struct GroupCounter {
+    scheme: KeyScheme,
+    group: Vec<u8>,
+    count: usize,
+    over: Vec<Vec<u8>>,
+}
+
+impl GroupCounter {
+    pub fn new(scheme: KeyScheme) -> Self {
+        Self {
+            scheme,
+            group: Vec::new(),
+            count: 0,
+            over: Vec::new(),
+        }
+    }
+
+    pub fn push(&mut self, value: &[u8]) {
+        let Some(group) = self.scheme.group(value) else {
+            return;
+        };
+        if self.count > 0 && group == self.group.as_slice() {
+            self.count += 1;
+            return;
+        }
+        self.close();
+        self.group.clear();
+        self.group.extend_from_slice(group);
+        self.count = 1;
+    }
+
+    fn close(&mut self) {
+        if self.count > self.scheme.cap() {
+            self.over.push(std::mem::take(&mut self.group));
+        }
+        self.count = 0;
+    }
+
+    /// The groups over the cap, in byte order.
+    pub fn finish(mut self) -> Vec<Vec<u8>> {
+        self.close();
+        self.over
     }
 }
 
 /// A hashed value as a run holds it: its hash and id.
 type Hashed = ([u8; KEY_HASH_LEN], u64);
 
-const RECORD_LEN: usize = KEY_HASH_LEN + 8;
-
-static SPILL_SEQ: AtomicU64 = AtomicU64::new(0);
-
 /// Settled entries, in key order.
 enum Segment {
     Key(Vec<u8>, u64),
-    /// A closed run's hashed values, sorted; `prefix` ends in the marker.
+    /// A closed run's hashed values, sorted.
     Held {
-        prefix: Vec<u8>,
+        group: Vec<u8>,
         entries: std::vec::IntoIter<Hashed>,
     },
-    /// A closed run too large to hold, merged from its sorted chunks.
-    Spilled {
-        prefix: Vec<u8>,
-        merge: SpillMerge,
-    },
-}
-
-fn hashed_key(prefix: &[u8], hash: &[u8; KEY_HASH_LEN]) -> Vec<u8> {
-    let mut key = Vec::with_capacity(prefix.len() + KEY_HASH_LEN);
-    key.extend_from_slice(prefix);
-    key.extend_from_slice(hash);
-    key
 }
 
 /// Puts `(value, id)` pairs arriving in value order into key order.
 ///
 /// Only values sharing their first `prefix_len` bytes can change order, and
-/// those arrive together as a run. A run's whole-keyed values sort before
-/// its hashed ones and keep their order, so they pass straight through;
-/// its hashed values are held, as hash and id, until the run ends, then
-/// released sorted by hash. A spilling order writes a sorted chunk to disk
-/// whenever it holds [`KEY_ORDER_SPILL_ENTRIES`], and merges the chunks as
-/// the run is read out, so a run of any size stays within that memory.
+/// those arrive together as a run. A run's value-keyed values sort before
+/// its hashed ones and keep their order, so they pass straight through; its
+/// hashed values are held, as hash and id, until the run ends, then
+/// released sorted by hash. A group not in `raw` may hold at most the cap,
+/// so a run holds no more.
 pub struct KeyOrder {
     scheme: KeyScheme,
-    spill_dir: Option<PathBuf>,
-    spill_entries: usize,
+    raw: RawGroups,
     run_prefix: Option<Vec<u8>>,
     held: Vec<Hashed>,
-    chunks: Vec<PathBuf>,
     settled: VecDeque<Segment>,
 }
 
 impl KeyOrder {
-    /// An order that holds each run in memory, however large.
-    pub fn new(scheme: KeyScheme) -> Self {
+    /// An order keying the groups in `raw` by value and hashing the rest.
+    pub fn new(scheme: KeyScheme, raw: RawGroups) -> Self {
         Self {
             scheme,
-            spill_dir: None,
-            spill_entries: KEY_ORDER_SPILL_ENTRIES,
+            raw,
             run_prefix: None,
             held: Vec::new(),
-            chunks: Vec::new(),
             settled: VecDeque::new(),
         }
-    }
-
-    /// An order that spills large runs to sorted chunks in `dir`.
-    pub fn spilling(scheme: KeyScheme, dir: impl Into<PathBuf>) -> Self {
-        let mut order = Self::new(scheme);
-        order.spill_dir = Some(dir.into());
-        order
-    }
-
-    #[cfg(test)]
-    fn with_spill_entries(mut self, entries: usize) -> Self {
-        self.spill_entries = entries;
-        self
     }
 
     /// Add the next value; values must arrive in ascending byte order.
@@ -235,48 +394,48 @@ impl KeyOrder {
             return Ok(());
         };
         if value.len() <= k {
-            self.close_run()?;
+            self.close_run();
             self.settled.push_back(Segment::Key(value.to_vec(), id));
             return Ok(());
         }
         if self.run_prefix.as_deref() != Some(&value[..k]) {
-            self.close_run()?;
+            self.close_run();
             self.run_prefix = Some(value[..k].to_vec());
         }
-        if value.len() <= k + 1 + KEY_HASH_LEN {
-            self.settled.push_back(Segment::Key(value.to_vec(), id));
-        } else {
-            self.held.push((digest(value), id));
-            if self.spill_dir.is_some() && self.held.len() >= self.spill_entries {
-                self.spill()?;
+        match self.scheme.group(value) {
+            Some(group) if self.raw.get(group).is_none() => {
+                if self.held.len() >= self.scheme.cap() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "a hashed key group holds more values than its cap",
+                    ));
+                }
+                self.held.push((digest(value), id));
             }
+            _ => self.settled.push_back(Segment::Key(value.to_vec(), id)),
         }
         Ok(())
     }
 
     /// No more values: settle whatever is held.
-    pub fn finish(&mut self) -> io::Result<()> {
-        self.close_run()
+    pub fn finish(&mut self) {
+        self.close_run();
     }
 
     /// The next `(key, id)` in key order, once it is settled.
-    pub fn pop(&mut self) -> io::Result<Option<(Vec<u8>, u64)>> {
+    pub fn pop(&mut self) -> Option<(Vec<u8>, u64)> {
         loop {
-            let next = match self.settled.front_mut() {
-                None => return Ok(None),
-                Some(Segment::Key(..)) => match self.settled.pop_front() {
-                    Some(Segment::Key(key, id)) => return Ok(Some((key, id))),
+            let next = match self.settled.front_mut()? {
+                Segment::Key(..) => match self.settled.pop_front() {
+                    Some(Segment::Key(key, id)) => return Some((key, id)),
                     _ => unreachable!("the front is a key"),
                 },
-                Some(Segment::Held { prefix, entries }) => entries
+                Segment::Held { group, entries } => entries
                     .next()
-                    .map(|(hash, id)| (hashed_key(prefix, &hash), id)),
-                Some(Segment::Spilled { prefix, merge }) => merge
-                    .next()?
-                    .map(|(hash, id)| (hashed_key(prefix, &hash), id)),
+                    .map(|(hash, id)| (hashed_key(group, &hash), id)),
             };
             match next {
-                Some(entry) => return Ok(Some(entry)),
+                Some(entry) => return Some(entry),
                 None => {
                     self.settled.pop_front();
                 }
@@ -284,109 +443,13 @@ impl KeyOrder {
         }
     }
 
-    fn close_run(&mut self) -> io::Result<()> {
-        let Some(mut prefix) = self.run_prefix.take() else {
-            return Ok(());
+    fn close_run(&mut self) {
+        let Some(group) = self.run_prefix.take() else {
+            return;
         };
-        prefix.push(HASHED_KEY_MARKER);
-        if self.chunks.is_empty() {
-            self.held.sort_unstable();
-            let entries = std::mem::take(&mut self.held).into_iter();
-            self.settled.push_back(Segment::Held { prefix, entries });
-            return Ok(());
-        }
-        if !self.held.is_empty() {
-            self.spill()?;
-        }
-        let merge = SpillMerge::open(std::mem::take(&mut self.chunks))?;
-        self.settled.push_back(Segment::Spilled { prefix, merge });
-        Ok(())
-    }
-
-    fn spill(&mut self) -> io::Result<()> {
-        let dir = self
-            .spill_dir
-            .as_ref()
-            .expect("only a spilling order spills");
-        let path = dir.join(format!(
-            ".key-order-{}-{}.chunk",
-            std::process::id(),
-            SPILL_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
         self.held.sort_unstable();
-        // Recorded before writing, so a failed write is still cleaned up.
-        self.chunks.push(path.clone());
-        let mut out = BufWriter::new(File::create(&path)?);
-        for (hash, id) in self.held.drain(..) {
-            out.write_all(&hash)?;
-            out.write_all(&id.to_le_bytes())?;
-        }
-        out.flush()
-    }
-}
-
-impl Drop for KeyOrder {
-    fn drop(&mut self) {
-        for path in &self.chunks {
-            let _ = std::fs::remove_file(path);
-        }
-    }
-}
-
-/// Merges a run's sorted chunk files, removing them when dropped.
-struct SpillMerge {
-    readers: Vec<BufReader<File>>,
-    heap: BinaryHeap<Reverse<(Hashed, usize)>>,
-    paths: Vec<PathBuf>,
-}
-
-impl SpillMerge {
-    fn open(paths: Vec<PathBuf>) -> io::Result<Self> {
-        let mut merge = Self {
-            readers: Vec::with_capacity(paths.len()),
-            heap: BinaryHeap::with_capacity(paths.len()),
-            paths,
-        };
-        for i in 0..merge.paths.len() {
-            merge
-                .readers
-                .push(BufReader::new(File::open(&merge.paths[i])?));
-            if let Some(entry) = Self::read(&mut merge.readers[i])? {
-                merge.heap.push(Reverse((entry, i)));
-            }
-        }
-        Ok(merge)
-    }
-
-    fn read(reader: &mut BufReader<File>) -> io::Result<Option<Hashed>> {
-        let mut record = [0u8; RECORD_LEN];
-        match reader.read_exact(&mut record) {
-            Ok(()) => {}
-            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
-            Err(e) => return Err(e),
-        }
-        let mut hash = [0u8; KEY_HASH_LEN];
-        hash.copy_from_slice(&record[..KEY_HASH_LEN]);
-        let id = u64::from_le_bytes(record[KEY_HASH_LEN..].try_into().expect("eight bytes"));
-        Ok(Some((hash, id)))
-    }
-
-    fn next(&mut self) -> io::Result<Option<Hashed>> {
-        let Some(Reverse((entry, i))) = self.heap.pop() else {
-            return Ok(None);
-        };
-        if let Some(next) = Self::read(&mut self.readers[i])? {
-            self.heap.push(Reverse((next, i)));
-        }
-        Ok(Some(entry))
-    }
-}
-
-impl Drop for SpillMerge {
-    fn drop(&mut self) {
-        for path in &self.paths {
-            let _ = std::fs::remove_file(path);
-        }
+        let entries = std::mem::take(&mut self.held).into_iter();
+        self.settled.push_back(Segment::Held { group, entries });
     }
 }
 
@@ -394,7 +457,10 @@ impl Drop for SpillMerge {
 mod tests {
     use super::*;
 
-    const SCHEME: KeyScheme = KeyScheme::PrefixHash { prefix_len: 8 };
+    const SCHEME: KeyScheme = KeyScheme::PrefixHash {
+        prefix_len: 8,
+        cap: 4,
+    };
 
     /// Values near and across the hashing threshold, sharing prefixes of
     /// every length, and some that are prefixes of others.
@@ -415,38 +481,98 @@ mod tests {
         values
     }
 
+    fn over_cap(values: &[Vec<u8>]) -> RawGroups {
+        let mut counter = GroupCounter::new(SCHEME);
+        for v in values {
+            counter.push(v);
+        }
+        let groups = counter
+            .finish()
+            .into_iter()
+            .map(|prefix| RawGroup {
+                prefix,
+                hashed: false,
+            })
+            .collect();
+        RawGroups::from_sorted(groups).unwrap()
+    }
+
     fn drain(order: &mut KeyOrder, out: &mut Vec<(Vec<u8>, u64)>) {
-        while let Some(e) = order.pop().unwrap() {
+        while let Some(e) = order.pop() {
             out.push(e);
         }
     }
 
-    fn sorted_keys(scheme: KeyScheme, values: &[Vec<u8>]) -> Vec<(Vec<u8>, u64)> {
-        let mut want: Vec<(Vec<u8>, u64)> = values
-            .iter()
-            .enumerate()
-            .map(|(id, v)| (scheme.key(v).into_owned(), id as u64))
-            .collect();
-        want.sort();
-        want
-    }
-
     #[test]
     fn long_values_are_keyed_by_prefix_marker_and_hash() {
+        let none = RawGroups::default();
+        let rules = KeyRules {
+            scheme: SCHEME,
+            raw: &none,
+        };
         let limit = 8 + 1 + KEY_HASH_LEN;
         let short = vec![b'x'; limit];
-        assert!(matches!(SCHEME.key(&short), Cow::Borrowed(k) if k == short));
+        assert!(matches!(rules.key(&short), Cow::Borrowed(k) if k == short));
         let long = vec![b'x'; limit + 1];
-        let key = SCHEME.key(&long);
+        let key = rules.key(&long);
         assert_eq!(key.len(), limit);
         assert_eq!(&key[..8], &long[..8]);
         assert_eq!(key[8], HASHED_KEY_MARKER);
         assert_eq!(&key[9..], Sha256::digest(&long).as_slice());
-        assert_eq!(KeyScheme::Raw.key(&long), Cow::Borrowed(long.as_slice()));
+        assert_eq!(SCHEME.hashed_key_group(&key), Some(&long[..8]));
+        assert_eq!(SCHEME.hashed_key_group(&long), None);
+        let raw = KeyRules {
+            scheme: KeyScheme::Raw,
+            raw: &none,
+        };
+        assert_eq!(raw.key(&long), Cow::Borrowed(long.as_slice()));
+    }
+
+    /// A listed group's values are keyed by value; a lookup tries the value
+    /// key, then the hashed key only where the group began hashing.
+    #[test]
+    fn a_listed_group_is_keyed_and_looked_up_by_value() {
+        let long = |c: u8| -> Vec<u8> {
+            let mut v = vec![c; 8];
+            v.extend_from_slice(&[b'z'; 40]);
+            v
+        };
+        let (pure, mixed, hashed) = (long(b'p'), long(b'm'), long(b'h'));
+        let mut raw = RawGroups::default();
+        raw.insert(&mixed[..8], true);
+        raw.insert(&pure[..8], false);
+        raw.insert(&pure[..8], false);
+        assert_eq!(raw.len(), 2);
+        let rules = KeyRules {
+            scheme: SCHEME,
+            raw: &raw,
+        };
+
+        assert_eq!(rules.key(&pure), Cow::Borrowed(pure.as_slice()));
+        assert_eq!(rules.key(&mixed), Cow::Borrowed(mixed.as_slice()));
+        assert_eq!(rules.key(&hashed).into_owned(), SCHEME.hashed_key(&hashed));
+
+        let probe = |v: &[u8]| {
+            let keys = rules.lookup_keys(v);
+            (keys.first.into_owned(), keys.then)
+        };
+        assert_eq!(probe(&pure), (pure.clone(), None));
+        assert_eq!(
+            probe(&mixed),
+            (mixed.clone(), Some(SCHEME.hashed_key(&mixed)))
+        );
+        assert_eq!(probe(&hashed), (SCHEME.hashed_key(&hashed), None));
+
+        // A group listed as holding no hashed value has no range to check.
+        assert_eq!(rules.prefix_ranges(&pure[..9]).len(), 1);
+        assert_eq!(rules.prefix_ranges(&mixed[..9]).len(), 2);
+        assert_eq!(rules.prefix_ranges(&hashed[..9]).len(), 2);
     }
 
     /// Every prefix's ranges hold exactly the keys of the values starting
-    /// with it, once the checked ranges' values are checked.
+    /// with it, once the checked ranges' values are checked: with every
+    /// group hashed, with full groups keyed by value, and with full groups
+    /// whose earliest values kept their hashed keys.
     #[test]
     fn prefix_ranges_cover_exactly_the_matching_values() {
         let values = values();
@@ -458,14 +584,42 @@ mod tests {
                 }
             }
         }
-        for scheme in [SCHEME, KeyScheme::Raw] {
+        let full = over_cap(&values);
+        assert!(!full.is_empty());
+        let mut mixed = RawGroups::default();
+        for g in full.iter() {
+            mixed.insert(&g.prefix, true);
+        }
+        let none = RawGroups::default();
+        let trees: [(KeyScheme, &RawGroups); 4] = [
+            (SCHEME, &none),
+            (SCHEME, &full),
+            (SCHEME, &mixed),
+            (KeyScheme::Raw, &none),
+        ];
+        for (scheme, raw) in trees {
+            let rules = KeyRules { scheme, raw };
+            let mut seen_in_group = std::collections::HashMap::<Vec<u8>, usize>::new();
             let keyed: Vec<(Vec<u8>, &Vec<u8>)> = values
                 .iter()
-                .map(|v| (scheme.key(v).into_owned(), v))
+                .map(|v| {
+                    // A mixed group's first two values kept their hashed keys.
+                    let mixed_group = scheme
+                        .group(v)
+                        .filter(|g| raw.get(g).is_some_and(|r| r.hashed));
+                    if let Some(g) = mixed_group {
+                        let seen = seen_in_group.entry(g.to_vec()).or_default();
+                        *seen += 1;
+                        if *seen <= 2 {
+                            return (scheme.hashed_key(v), v);
+                        }
+                    }
+                    (rules.key(v).into_owned(), v)
+                })
                 .collect();
             for prefix in &prefixes {
                 let mut found: Vec<&Vec<u8>> = Vec::new();
-                for range in scheme.prefix_ranges(prefix) {
+                for range in rules.prefix_ranges(prefix) {
                     for (key, value) in &keyed {
                         let inside = key.as_slice() >= range.start.as_slice()
                             && range.end.as_ref().is_none_or(|end| key < end);
@@ -476,58 +630,69 @@ mod tests {
                 }
                 found.sort();
                 let want: Vec<&Vec<u8>> = values.iter().filter(|v| v.starts_with(prefix)).collect();
-                assert_eq!(found, want, "{scheme:?} {prefix:?}");
+                assert_eq!(found, want, "{scheme:?} {raw:?} {prefix:?}");
             }
         }
     }
 
-    /// Values pushed in byte order come out in key order, each once.
+    /// Values pushed in byte order come out in key order, each once, with
+    /// the over-cap groups keyed by value and no run holding past the cap.
     #[test]
     fn key_order_turns_value_order_into_key_order() {
         let values = values();
-        for scheme in [SCHEME, KeyScheme::Raw] {
-            let mut order = KeyOrder::new(scheme);
+        for (scheme, raw) in [
+            (SCHEME, over_cap(&values)),
+            (KeyScheme::Raw, RawGroups::default()),
+        ] {
+            let rules = KeyRules { scheme, raw: &raw };
+            let mut want: Vec<(Vec<u8>, u64)> = values
+                .iter()
+                .enumerate()
+                .map(|(id, v)| (rules.key(v).into_owned(), id as u64))
+                .collect();
+            want.sort();
+
+            let mut order = KeyOrder::new(scheme, raw.clone());
             let mut out = Vec::new();
             for (id, v) in values.iter().enumerate() {
                 order.push(v, id as u64).unwrap();
+                assert!(order.held.len() <= scheme.cap());
                 drain(&mut order, &mut out);
             }
-            order.finish().unwrap();
+            order.finish();
             drain(&mut order, &mut out);
-            assert_eq!(out, sorted_keys(scheme, &values), "{scheme:?}");
+            assert_eq!(out, want, "{scheme:?}");
         }
     }
 
-    /// A run larger than the spill limit holds no more than the limit,
-    /// spills sorted chunks, comes out in the same order as a held run,
-    /// and leaves no chunk files behind.
+    /// A group past the cap that is not listed is refused rather than held.
     #[test]
-    fn a_large_run_spills_and_merges_in_key_order() {
-        let dir = std::env::temp_dir().join(format!("key-order-spill-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let mut values = values();
-        let shared = "abcdefgh-shared-by-every-value-in-the-run-";
-        values.extend((0..2_000).map(|i| format!("{shared}{i:05}").into_bytes()));
-        values.extend((0..50).map(|i| format!("{shared}{i:05}é").into_bytes()));
-        values.sort();
-        values.dedup();
-
-        let mut order = KeyOrder::spilling(SCHEME, &dir).with_spill_entries(64);
-        let mut out = Vec::new();
-        let mut spilled = 0;
-        for (id, v) in values.iter().enumerate() {
-            order.push(v, id as u64).unwrap();
-            assert!(order.held.len() < 64);
-            spilled = spilled.max(order.chunks.len());
-            drain(&mut order, &mut out);
+    fn an_unlisted_group_past_the_cap_is_refused() {
+        let mut order = KeyOrder::new(SCHEME, RawGroups::default());
+        let values: Vec<String> = (0..5).map(|i| format!("abcdefgh{i:040}")).collect();
+        for (id, v) in values.iter().enumerate().take(4) {
+            order.push(v.as_bytes(), id as u64).unwrap();
         }
-        order.finish().unwrap();
-        drain(&mut order, &mut out);
-        assert!(spilled > 20, "{spilled}");
-        assert_eq!(out, sorted_keys(SCHEME, &values));
-        drop(order);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
-        std::fs::remove_dir(&dir).unwrap();
+        assert!(order.push(values[4].as_bytes(), 4).is_err());
+    }
+
+    #[test]
+    fn the_counter_finds_the_groups_over_the_cap() {
+        let mut values: Vec<String> = Vec::new();
+        values.extend((0..5).map(|i| format!("aaaaaaaa{i:040}")));
+        values.extend((0..4).map(|i| format!("bbbbbbbb{i:040}")));
+        // Short values between a group's long ones neither count nor split it.
+        values.extend((0..9).map(|i| format!("cccccccc{i}")));
+        values.extend((0..5).map(|i| format!("cccccccc{i}{}", "x".repeat(40))));
+        values.sort();
+        let mut counter = GroupCounter::new(SCHEME);
+        for v in &values {
+            counter.push(v.as_bytes());
+        }
+        assert_eq!(
+            counter.finish(),
+            vec![b"aaaaaaaa".to_vec(), b"cccccccc".to_vec()]
+        );
     }
 
     #[test]
@@ -535,7 +700,8 @@ mod tests {
         assert_eq!(
             KeyScheme::for_new_tree(DictKind::StringReverse),
             KeyScheme::PrefixHash {
-                prefix_len: DEFAULT_STRING_KEY_PREFIX
+                prefix_len: DEFAULT_STRING_KEY_PREFIX,
+                cap: DEFAULT_GROUP_HASH_CAP,
             }
         );
         assert_eq!(

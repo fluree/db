@@ -483,12 +483,27 @@ impl DictTreeReader {
         self.branch.key_scheme
     }
 
-    /// Reverse lookup: find the ID of `value`, keyed by the tree's scheme.
+    /// How this tree keys values, down to the groups it keys by value.
+    pub fn key_rules(&self) -> super::key_scheme::KeyRules<'_> {
+        self.branch.keys()
+    }
+
+    /// Reverse lookup: find the ID of `value`, under each key the tree may
+    /// hold it by.
     pub fn reverse_lookup(&self, value: &[u8]) -> io::Result<Option<u64>> {
+        let keys = self.branch.keys().lookup_keys(value);
+        if let Some(id) = self.lookup_key(&keys.first)? {
+            return Ok(Some(id));
+        }
+        match keys.then {
+            Some(key) => self.lookup_key(&key),
+            None => Ok(None),
+        }
+    }
+
+    fn lookup_key(&self, key: &[u8]) -> io::Result<Option<u64>> {
         const SLOW_LOOKUP_WARN_MS: u64 = 250;
 
-        let key = self.branch.key_scheme.key(value);
-        let key = key.as_ref();
         let mut clock = DebugClock::start();
         let leaf_idx = match self.branch.find_leaf(key) {
             Some(idx) => idx,
@@ -549,12 +564,15 @@ impl DictTreeReader {
     {
         let mut seen = vec![false; self.branch.leaves.len()];
         let mut addresses = Vec::new();
+        let rules = self.branch.keys();
         for value in values {
-            let key = self.branch.key_scheme.key(value);
-            if let Some(leaf_idx) = self.branch.find_leaf(&key) {
-                if !seen[leaf_idx] {
-                    seen[leaf_idx] = true;
-                    addresses.push(self.branch.leaves[leaf_idx].address.as_str());
+            let keys = rules.lookup_keys(value);
+            for key in std::iter::once(keys.first.as_ref()).chain(keys.then.as_deref()) {
+                if let Some(leaf_idx) = self.branch.find_leaf(key) {
+                    if !seen[leaf_idx] {
+                        seen[leaf_idx] = true;
+                        addresses.push(self.branch.leaves[leaf_idx].address.as_str());
+                    }
                 }
             }
         }
@@ -572,17 +590,39 @@ impl DictTreeReader {
     }
 
     /// Batched reverse lookup: find the IDs of `values` while loading each
-    /// touched leaf at most once for the batch.
+    /// touched leaf at most once for each of the (at most two) keys a value
+    /// may be held under.
     pub fn reverse_lookup_many<'a, I>(&self, values: I) -> io::Result<Vec<Option<u64>>>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        let rules = self.branch.keys();
+        let keys: Vec<_> = values
+            .into_iter()
+            .map(|value| rules.lookup_keys(value))
+            .collect();
+        let firsts: Vec<&[u8]> = keys.iter().map(|k| k.first.as_ref()).collect();
+        let mut results = self.lookup_keys_batched(&firsts)?;
+
+        let retry: Vec<usize> = (0..keys.len())
+            .filter(|&i| results[i].is_none() && keys[i].then.is_some())
+            .collect();
+        if !retry.is_empty() {
+            let thens: Vec<&[u8]> = retry
+                .iter()
+                .map(|&i| keys[i].then.as_deref().expect("filtered"))
+                .collect();
+            for (i, found) in retry.into_iter().zip(self.lookup_keys_batched(&thens)?) {
+                results[i] = found;
+            }
+        }
+        Ok(results)
+    }
+
+    fn lookup_keys_batched(&self, key_refs: &[&[u8]]) -> io::Result<Vec<Option<u64>>> {
         const SLOW_BATCH_WARN_MS: u64 = 250;
 
         let mut clock = DebugClock::start();
-        let scheme = self.branch.key_scheme;
-        let key_refs: Vec<std::borrow::Cow<'a, [u8]>> =
-            values.into_iter().map(|value| scheme.key(value)).collect();
         if key_refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -608,7 +648,7 @@ impl DictTreeReader {
             let leaf_data = self.load_leaf(address)?;
             let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
             for &key_idx in key_indices {
-                results[key_idx] = leaf.lookup(&key_refs[key_idx]);
+                results[key_idx] = leaf.lookup(key_refs[key_idx]);
             }
         }
         let load_and_decode = clock.lap();

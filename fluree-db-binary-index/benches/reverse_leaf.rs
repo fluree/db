@@ -16,7 +16,9 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES;
-use fluree_db_binary_index::dict::key_scheme::{KeyScheme, DEFAULT_STRING_KEY_PREFIX};
+use fluree_db_binary_index::dict::key_scheme::{
+    KeyRules, KeyScheme, RawGroups, DEFAULT_GROUP_HASH_CAP, DEFAULT_STRING_KEY_PREFIX,
+};
 use fluree_db_binary_index::dict::reverse_leaf::{
     subject_reverse_key, LeafFormat, ReverseEntry, ReverseLeaf,
 };
@@ -188,14 +190,14 @@ fn string_values() -> Vec<Vec<u8>> {
     values
 }
 
-/// One leaf of `values` keyed by `scheme`, cut where a `DLR1` leaf of those
+/// One leaf of `values` keyed by `rules`, cut where a `DLR1` leaf of those
 /// keys reaches the target, as the tree writers cut it.
-fn string_leaf(values: &[Vec<u8>], scheme: KeyScheme) -> Vec<ReverseEntry> {
+fn string_leaf(values: &[Vec<u8>], rules: KeyRules<'_>) -> Vec<ReverseEntry> {
     let mut entries: Vec<ReverseEntry> = values
         .iter()
         .enumerate()
         .map(|(id, v)| ReverseEntry {
-            key: scheme.key(v).into_owned(),
+            key: rules.key(v).into_owned(),
             id: id as u64,
         })
         .collect();
@@ -213,25 +215,54 @@ fn string_leaf(values: &[Vec<u8>], scheme: KeyScheme) -> Vec<ReverseEntry> {
 }
 
 /// A string probe as a lookup pays it: key the value, parse the cached
-/// leaf, look the key up. Raw keys in plain leaves against hashed keys in
-/// front-coded ones; half the probes miss.
+/// leaf, look the key up, and look up the hashed key too when a group that
+/// filled late misses. Raw keys in plain leaves, hashed keys in front-coded
+/// ones, and long values keyed by value in groups that also hold hashed
+/// ones; half the probes miss.
 fn bench_string_lookup(c: &mut Criterion) {
     let values = string_values();
     let hashed = KeyScheme::PrefixHash {
         prefix_len: DEFAULT_STRING_KEY_PREFIX,
+        cap: DEFAULT_GROUP_HASH_CAP,
+    };
+    let none = RawGroups::default();
+    let mut every_group = RawGroups::default();
+    for v in &values {
+        if let Some(group) = hashed.group(v) {
+            every_group.insert(group, true);
+        }
+    }
+    let front_coded = LeafFormat::FrontCoded {
+        ns_relative_ids: false,
     };
     let mut group = c.benchmark_group("string_leaf_lookup");
-    for (name, scheme, format) in [
-        ("raw_plain", KeyScheme::Raw, LeafFormat::Plain),
+    for (name, rules, format) in [
+        (
+            "raw_plain",
+            KeyRules {
+                scheme: KeyScheme::Raw,
+                raw: &none,
+            },
+            LeafFormat::Plain,
+        ),
         (
             "hashed_front_coded",
-            hashed,
-            LeafFormat::FrontCoded {
-                ns_relative_ids: false,
+            KeyRules {
+                scheme: hashed,
+                raw: &none,
             },
+            front_coded,
+        ),
+        (
+            "filled_groups_front_coded",
+            KeyRules {
+                scheme: hashed,
+                raw: &every_group,
+            },
+            front_coded,
         ),
     ] {
-        let entries = string_leaf(&values, scheme);
+        let entries = string_leaf(&values, rules);
         let blob = format.encode(&entries);
         let ids: std::collections::HashSet<u64> = entries.iter().map(|e| e.id).collect();
         let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
@@ -259,9 +290,12 @@ fn bench_string_lookup(c: &mut Criterion) {
             b.iter(|| {
                 let mut hits = 0usize;
                 for probe in &probes {
-                    let key = scheme.key(black_box(probe));
+                    let keys = rules.lookup_keys(black_box(probe));
                     let leaf = ReverseLeaf::from_bytes(black_box(&blob)).unwrap();
-                    hits += usize::from(leaf.lookup(&key).is_some());
+                    let found = leaf
+                        .lookup(&keys.first)
+                        .or_else(|| keys.then.as_deref().and_then(|key| leaf.lookup(key)));
+                    hits += usize::from(found.is_some());
                 }
                 black_box(hits)
             });
