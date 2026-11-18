@@ -657,6 +657,56 @@ async fn a_derived_class_deny_reaches_every_row_shape() {
     }
 }
 
+/// A derived class grants as well as denies. Under `default-allow: false`, an
+/// `f:onClass` allow reaches `ex:alice`, a `HighEarner` only by rule, on her
+/// asserted salary in a query that reasons to that membership. A plain query
+/// is judged on stored classes, where she is no `HighEarner`; `ex:bob` is
+/// none under either.
+#[tokio::test]
+async fn a_derived_class_allow_grants_in_a_reasoning_query_only() {
+    let mut observed = Vec::new();
+    for storage in STORAGE {
+        let ledger_id = format!("reasoning-policy/class-grant-{storage:?}:main");
+        let fluree = seeded_reader(&ledger_id, &family_with_rules(), storage).await;
+        let salary = |who: &str, reasoning: &str| {
+            let mut q = query(
+                &ledger_id,
+                json!(["?v"]),
+                json!({"@id": who, "ex:salary": "?v"}),
+                reasoning,
+            );
+            q["opts"] = json!({
+                "policy": [{
+                    "@id": "ex:allowClass",
+                    "f:onClass": [{"@id": HIGH_EARNER}],
+                    "f:action": "f:view",
+                    "f:allow": true
+                }],
+                "default-allow": false
+            });
+            q
+        };
+        let cases = [
+            (
+                "alice, reasoning",
+                salary("ex:alice", "datalog"),
+                vec![json!([250_000])],
+            ),
+            ("alice, plain", salary("ex:alice", "none"), Vec::new()),
+            ("bob, reasoning", salary("ex:bob", "datalog"), Vec::new()),
+        ];
+        for (what, q, expected) in cases {
+            let got = rows(&fluree, &q).await;
+            if got != expected {
+                observed.push(format!(
+                    "{storage:?}, {what}: got {got:?}, expected {expected:?}"
+                ));
+            }
+        }
+    }
+    assert!(observed.is_empty(), "{observed:#?}");
+}
+
 /// Documents typed `ex:Private` are readable only by an owner. Under OWL 2 RL,
 /// `ex:body rdfs:subPropertyOf ex:text` gives each document an `ex:text` the
 /// class statistics never list for `ex:Private`; the class policy covers it.
