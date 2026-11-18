@@ -22,6 +22,7 @@ use fluree_db_core::wasm_cache::Cache;
 use fluree_db_query::ir::result_cache::result_cache_bypass;
 #[cfg(not(target_arch = "wasm32"))]
 use moka::sync::Cache;
+use serde::ser::{Serialize, SerializeMap, Serializer};
 use serde_json::Value as JsonValue;
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -169,7 +170,10 @@ pub(crate) enum ViewAnswer {
     },
 }
 
-/// The query text, without the opts that only control the cache or tracking.
+/// Opts that control the cache or tracking, not the answer.
+const UNKEYED_OPTS: [&str; 5] = ["cache", "meta", "max-fuel", "maxFuel", "max_fuel"];
+
+/// The query text, without its [`UNKEYED_OPTS`].
 fn hash_input<H: Hasher>(
     input: &QueryInput<'_>,
     h: &mut H,
@@ -181,16 +185,64 @@ fn hash_input<H: Hasher>(
         }
         QueryInput::JsonLd(json) => {
             1u8.hash(h);
-            let mut json = (*json).clone();
-            if let Some(opts) = json.get_mut("opts").and_then(JsonValue::as_object_mut) {
-                for key in ["cache", "meta", "max-fuel", "maxFuel", "max_fuel"] {
-                    opts.remove(key);
-                }
-            }
-            serde_json::to_vec(&json).map_err(|_| "query")?.hash(h);
+            hash_json(&KeyedQuery(json), h).map_err(|_| "query")?;
         }
     }
     Ok(())
+}
+
+/// Hash `value`'s JSON text, written straight into `h`.
+pub(crate) fn hash_json<H: Hasher>(value: &impl Serialize, h: &mut H) -> serde_json::Result<()> {
+    struct Writer<'a, H>(&'a mut H);
+    impl<H: Hasher> std::io::Write for Writer<'_, H> {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    serde_json::to_writer(Writer(h), value)
+}
+
+/// A JSON-LD query as the key reads it: skips the [`UNKEYED_OPTS`] in
+/// place, so the remaining opts keep their order, and drops `opts` when
+/// nothing else is in it. A request opted in by its body or by the
+/// `Fluree-Cache` header shares one entry.
+struct KeyedQuery<'a>(&'a JsonValue);
+
+impl Serialize for KeyedQuery<'_> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let JsonValue::Object(query) = self.0 else {
+            return self.0.serialize(s);
+        };
+        let keyed = |(key, _): &(&String, &JsonValue)| !UNKEYED_OPTS.contains(&key.as_str());
+        let mut map = s.serialize_map(None)?;
+        for (key, value) in query {
+            match value {
+                JsonValue::Object(opts) if key == "opts" => {
+                    if opts.iter().any(|entry| keyed(&entry)) {
+                        map.serialize_entry(key, &KeyedOpts(opts, keyed))?;
+                    }
+                }
+                _ => map.serialize_entry(key, value)?,
+            }
+        }
+        map.end()
+    }
+}
+
+struct KeyedOpts<'a, F>(&'a serde_json::Map<String, JsonValue>, F);
+
+impl<F: Fn(&(&String, &JsonValue)) -> bool> Serialize for KeyedOpts<'_, F> {
+    fn serialize<S: Serializer>(&self, s: S) -> std::result::Result<S::Ok, S::Error> {
+        let mut map = s.serialize_map(None)?;
+        for (key, value) in self.0.iter().filter(|entry| (self.1)(entry)) {
+            map.serialize_entry(key, value)?;
+        }
+        map.end()
+    }
 }
 
 impl Fluree {
@@ -214,11 +266,14 @@ impl Fluree {
         let mut h = Xxh3::new();
         KEY_VERSION.hash(&mut h);
         std::mem::discriminant(&rendering).hash(&mut h);
+        // The query text last: a request that bypasses is refused before
+        // its largest input is hashed.
         let keyed = if self.result_cache.enabled() {
-            hash_input(&input, &mut h)
+            format
+                .hash_for_result_cache(&mut h)
                 .and_then(|()| options.hash_for_result_cache(&mut h))
-                .and_then(|()| format.hash_for_result_cache(&mut h))
                 .and_then(|()| db.hash_for_result_cache(&mut h))
+                .and_then(|()| hash_input(&input, &mut h))
         } else {
             Err("result cache disabled")
         };
@@ -294,5 +349,36 @@ impl Fluree {
             .pool()
             .insert(pending.key, Arc::from(bytes));
         true
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn key(query: &JsonValue) -> u128 {
+        let mut h = Xxh3::new();
+        hash_input(&QueryInput::JsonLd(query), &mut h).unwrap();
+        h.digest128()
+    }
+
+    #[test]
+    fn unkeyed_opts_are_skipped_wherever_they_sit() {
+        let base = json!({"select": ["?s"], "where": {"@id": "?s"}});
+        let mut in_body = base.clone();
+        in_body["opts"] = json!({"cache": true, "format": "x", "ledger": "y"});
+        // The `Fluree-Cache` header appends `cache` after the body's opts.
+        let mut from_header = base.clone();
+        from_header["opts"] = json!({"format": "x", "ledger": "y", "cache": true});
+        assert_eq!(key(&in_body), key(&from_header));
+
+        let mut only_cache = base.clone();
+        only_cache["opts"] = json!({"cache": true, "meta": true, "max-fuel": 5});
+        assert_eq!(key(&base), key(&only_cache));
+
+        let mut other = base.clone();
+        other["opts"] = json!({"cache": true, "format": "z", "ledger": "y"});
+        assert_ne!(key(&in_body), key(&other));
     }
 }

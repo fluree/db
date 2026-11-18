@@ -1117,9 +1117,7 @@ impl GraphDb {
             None => 0u8.hash(h),
             Some(ctx) => {
                 1u8.hash(h);
-                serde_json::to_vec(ctx)
-                    .map_err(|_| "default context")?
-                    .hash(h);
+                crate::query::result_cache::hash_json(ctx, h).map_err(|_| "default context")?;
             }
         }
         match policy {
