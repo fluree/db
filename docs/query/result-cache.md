@@ -68,6 +68,9 @@ These requests execute without consulting the cache and get no `x-fdb-cache` hea
   identity-keyed entries above are reachable only from the Rust API for now.
 - Over HTTP, SPARQL `FROM` / `FROM NAMED` and queries against a graph-source alias.
 
+A query peer in proxy-storage mode does not report the cache yet: a JSON-LD request that asks is
+served from the cache with no `x-fdb-cache` header, and a SPARQL request is not cached.
+
 ## Memory
 
 Cached answers have a budget of their own, `query_result_cache_max_mb`. It is separate from the
