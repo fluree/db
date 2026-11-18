@@ -6,6 +6,7 @@ use super::QueryPolicyExecutor;
 use crate::error::Result;
 use fluree_db_core::{Flake, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker};
 use fluree_db_policy::{is_schema_flake, ClassState, PolicyContext};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Plan-time-style verdict for a single statically-known scanned predicate under
@@ -126,8 +127,8 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
-        let state = ClassState::new(g_id, overlay, to_t);
-        self.cache_subject_classes(state, snapshot, g_id, overlay, to_t, &flakes)
+        let classes = self
+            .subject_classes(snapshot, g_id, overlay, to_t, &flakes)
             .await?;
 
         let mut result = Vec::with_capacity(flakes.len());
@@ -139,11 +140,7 @@ impl QueryPolicyEnforcer {
                 continue;
             }
 
-            // Get subject classes from cache
-            let subject_classes = self
-                .policy
-                .get_cached_subject_classes(state, &flake.s)
-                .unwrap_or_default();
+            let subject_classes = classes.of(&self.policy, &flake.s);
 
             // Async policy check with f:query support
             match self
@@ -196,22 +193,10 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
-        let state = ClassState::new(g_id, overlay, to_t);
-        self.cache_subject_classes(
-            state,
-            snapshot,
-            g_id,
-            overlay,
-            to_t,
-            std::slice::from_ref(flake),
-        )
-        .await?;
-
-        // Get subject classes from cache
         let subject_classes = self
-            .policy
-            .get_cached_subject_classes(state, &flake.s)
-            .unwrap_or_default();
+            .subject_classes(snapshot, g_id, overlay, to_t, std::slice::from_ref(flake))
+            .await?
+            .of(&self.policy, &flake.s);
 
         // Async policy check
         self.policy
@@ -227,20 +212,23 @@ impl QueryPolicyEnforcer {
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
     }
 
-    /// Cache, under `state`, the classes of every subject the checks of
-    /// `flakes` read. Callers need no prefetch: a miss reads as no classes,
-    /// so the check resolves its own, under the state it reads with.
-    async fn cache_subject_classes(
+    /// Resolve the classes of every subject the checks of `flakes` read,
+    /// under the state they read with. Callers need no prefetch: a miss reads
+    /// as no classes, so the check resolves its own.
+    ///
+    /// An overlay with no content version shares its lookups with nothing, so
+    /// they stay in a map of this call's own: in the context's cache they
+    /// would be entries no later check reads, kept for the context's life.
+    async fn subject_classes(
         &self,
-        state: ClassState,
         snapshot: &LedgerSnapshot,
         g_id: GraphId,
         overlay: &dyn OverlayProvider,
         to_t: i64,
         flakes: &[Flake],
-    ) -> Result<()> {
+    ) -> Result<SubjectClasses> {
         if !self.policy.wrapper().has_class_policies() {
-            return Ok(());
+            return Ok(SubjectClasses::Local(HashMap::new()));
         }
         let mut subjects: Vec<Sid> = flakes
             .iter()
@@ -250,9 +238,18 @@ impl QueryPolicyEnforcer {
         subjects.sort();
         subjects.dedup();
         let db = fluree_db_core::GraphDbRef::new(snapshot, g_id, overlay, to_t);
-        fluree_db_policy::populate_class_cache_in(state, &subjects, db, &self.policy)
-            .await
-            .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
+        let state = ClassState::new(g_id, overlay, to_t);
+        if state.is_shared() {
+            fluree_db_policy::populate_class_cache_in(state, &subjects, db, &self.policy)
+                .await
+                .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
+            Ok(SubjectClasses::Shared(state))
+        } else {
+            fluree_db_policy::lookup_subject_classes(&subjects, db)
+                .await
+                .map(SubjectClasses::Local)
+                .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
+        }
     }
 
     /// Prefetch the classes of `subjects` for a run of
@@ -270,6 +267,25 @@ impl QueryPolicyEnforcer {
             .await
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// Where a check finds its subjects' classes.
+enum SubjectClasses {
+    /// The context's cache, under a state other lookups can share.
+    Shared(ClassState),
+    /// This call's own lookups.
+    Local(HashMap<Sid, Vec<Sid>>),
+}
+
+impl SubjectClasses {
+    fn of(&self, policy: &PolicyContext, subject: &Sid) -> Vec<Sid> {
+        match self {
+            Self::Shared(state) => policy
+                .get_cached_subject_classes(*state, subject)
+                .unwrap_or_default(),
+            Self::Local(classes) => classes.get(subject).cloned().unwrap_or_default(),
+        }
     }
 }
 
@@ -356,8 +372,8 @@ mod tests {
     }
 
     /// A class deny reaches a subject read through an overlay with no content
-    /// version, whose classes a caller's prefetch cached under a state of its
-    /// own.
+    /// version, which shares its class lookups with nothing: not a caller's
+    /// prefetch, nor the context's cache.
     #[tokio::test]
     async fn a_class_policy_applies_over_an_overlay_with_no_content_version() {
         let mut snapshot = LedgerSnapshot::genesis("test:main");

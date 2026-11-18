@@ -95,6 +95,8 @@ pub async fn lookup_subject_classes(
 ///
 /// A prefetch for checks that then resolve one subject at a time: without the
 /// empty entry, each check of an untyped subject reads its `rdf:type` again.
+/// Does nothing for an overlay with no content version: no check can take
+/// the state its entries would be cached under.
 ///
 /// # Arguments
 ///
@@ -106,14 +108,11 @@ pub async fn populate_class_cache(
     db: GraphDbRef<'_>,
     policy_ctx: &crate::evaluate::PolicyContext,
 ) -> Result<()> {
-    populate(
-        crate::evaluate::ClassState::of(db),
-        subjects,
-        db,
-        policy_ctx,
-        true,
-    )
-    .await
+    let state = crate::evaluate::ClassState::of(db);
+    if !state.is_shared() {
+        return Ok(());
+    }
+    populate(state, subjects, db, policy_ctx, true).await
 }
 
 /// Populate the class cache under `state`, the state the caller then reads

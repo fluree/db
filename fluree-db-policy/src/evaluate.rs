@@ -96,6 +96,12 @@ impl ClassState {
     pub fn of(db: GraphDbRef<'_>) -> Self {
         Self::new(db.g_id, db.overlay, db.t)
     }
+
+    /// Whether another lookup can take this state: false for an overlay with
+    /// no content version, whose state matches only itself.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.overlay, OverlayState::Version(_))
+    }
 }
 
 /// Shared (state, subject) -> classes cache for runtime class-membership
