@@ -192,6 +192,18 @@ impl PeerEventSink {
     }
 }
 
+/// Whether the nameservice has no ledger `ledger_id`, or has it retracted.
+async fn ledger_is_gone(fluree: &Fluree, ledger_id: &LedgerId) -> bool {
+    matches!(
+        fluree.nameservice().lookup(ledger_id.as_str()).await,
+        Ok(None
+            | Some(NsRecord {
+                retracted: true,
+                ..
+            }))
+    )
+}
+
 /// A ledger's worker: applies its waiting updates until none is left.
 async fn apply_ledger_updates(
     updates: Arc<LedgerUpdates>,
@@ -218,6 +230,13 @@ async fn apply_ledger_updates(
                 let evict = fluree.disconnect_ledger(&ledger_id);
                 if peer_state.retract_ledger_in(epoch, &ledger_id, evict).await {
                     tracing::info!(ledger_id = %ledger_id, "Ledger retracted from remote");
+                } else if ledger_is_gone(&fluree, &ledger_id).await {
+                    // From an earlier connection, whose records the new one's
+                    // replace. Those cannot say a ledger is gone, so the
+                    // nameservice does; a ledger it still has (re-created
+                    // since, or loading) stays.
+                    fluree.disconnect_ledger(&ledger_id).await;
+                    tracing::info!(ledger_id = %ledger_id, "Ledger retracted before a reconnect");
                 }
                 continue;
             }
@@ -819,6 +838,30 @@ mod tests {
         load.await.unwrap();
         settled(&root.sink).await;
         assert_eq!(watermark_t(&root.sink, "a:main").await, None);
+    }
+
+    /// A retraction from before a reconnect, of a ledger the transaction
+    /// server did drop, still evicts it: the new connection's records cannot
+    /// say the ledger is gone, so the nameservice does.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_retraction_from_before_a_reconnect_evicts_a_dropped_ledger() {
+        let root = TwoLedgers::new().await;
+        root.peer.ledger_cached("a:main").await.unwrap();
+        assert!(root.cached_t("a:main").await.is_some());
+
+        let before = root.sink.peer_state.epoch();
+        root.sink.on_event(RemoteEvent::Connected).await;
+        root.writer
+            .drop_ledger("a", fluree_db_api::DropMode::Soft)
+            .await
+            .unwrap();
+        root.sink.queue(
+            LedgerId::parse("a:main").unwrap(),
+            LedgerUpdate::Retracted { epoch: before },
+        );
+
+        settled(&root.sink).await;
+        assert_eq!(root.cached_t("a:main").await, None, "evicted");
     }
 
     /// A retraction from before a reconnect is not applied after it: the new
