@@ -82,6 +82,16 @@ impl LedgerWriteGuard {
         &self.ledger
     }
 
+    /// Start a new line for the state this guard is about to install, which
+    /// is not a commit on the cached line (a rebase's result): an index
+    /// install planned on the old line is then not made on it.
+    pub(crate) fn start_line(&mut self) {
+        self.ledger
+            .inner
+            .line
+            .store(Line::fresh(), Ordering::Release);
+    }
+
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
         &self.guard
@@ -327,8 +337,9 @@ struct LedgerHandleInner {
     committed_t: std::sync::atomic::AtomicI64,
     /// Bumped each time a reload swaps in a state it loaded from the
     /// nameservice, which may be another line than the one it replaces (a
-    /// rebase). An index install planned before the swap is not made after
-    /// it; commits on the line leave it alone.
+    /// rebase), and when this process's own rebase installs its result. An
+    /// index install planned before either is not made after it; commits on
+    /// the line leave it alone.
     line: AtomicU64,
     write_paths: WritePathCounters,
     /// Test hook: the next optimistic stage on this handle parks here after
