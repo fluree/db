@@ -442,6 +442,59 @@ async fn a_different_default_context_misses() {
     );
 }
 
+/// A hit from `execute_formatted` parses the stored text back into a JSON
+/// value, so the miss's doubles must survive it bit for bit. That holds only
+/// while serde_json parses with `float_roundtrip`: without it, about one in
+/// eight of these doubles reads back as a neighbour.
+#[tokio::test]
+async fn a_json_value_hit_returns_the_miss_doubles_exactly() {
+    fn numbers(value: &JsonValue, out: &mut Vec<f64>) {
+        match value {
+            JsonValue::Number(n) => out.extend(n.as_f64()),
+            JsonValue::Array(items) => items.iter().for_each(|v| numbers(v, out)),
+            JsonValue::Object(map) => map.values().for_each(|v| numbers(v, out)),
+            _ => {}
+        }
+    }
+    async fn run(
+        fluree: &MemoryFluree,
+        db: &GraphDb,
+        sparql: &str,
+    ) -> (JsonValue, ResultCacheStatus) {
+        let outcome = ResultCacheOutcome::new();
+        let value = db
+            .query(fluree)
+            .sparql(sparql)
+            .format(FormatterConfig::jsonld())
+            .result_cache(&outcome)
+            .execute_formatted()
+            .await
+            .expect("query");
+        (value, outcome.status().expect("status"))
+    }
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let graph: Vec<JsonValue> = (1..=200)
+        .map(|i| json!({"@id": format!("ex:n{i}"), "ex:v": i}))
+        .collect();
+    let data = json!({"@context": {"ex": "http://example.org/ns/"}, "@graph": graph});
+    let ledger = seeded(&fluree, "cache/doubles:main", &data).await;
+    let db = graphdb_from_ledger(&ledger);
+    let sparql = format!(
+        "{PREFIX}SELECT ?x WHERE {{ ?s ex:v ?v BIND(?v / 7.0e0 * 1.1e0 AS ?x) }} ORDER BY ?x"
+    );
+
+    let (miss, status) = run(&fluree, &db, &sparql).await;
+    assert_eq!(status, ResultCacheStatus::Miss);
+    let mut doubles = Vec::new();
+    numbers(&miss, &mut doubles);
+    assert_eq!(doubles.len(), 200, "{miss}");
+
+    let (hit, status) = run(&fluree, &db, &sparql).await;
+    assert_eq!(status, ResultCacheStatus::Hit);
+    assert!(hit == miss, "a hit changed the miss's doubles");
+}
+
 #[tokio::test]
 async fn identities_with_different_policies_do_not_share_answers() {
     let fluree = FlureeBuilder::memory().build_memory();
