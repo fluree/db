@@ -128,7 +128,7 @@ pub(crate) async fn remove_strings(
         keys.extend(
             mine.iter()
                 .filter_map(|id| pack.lookup(*id))
-                .map(<[u8]>::to_vec),
+                .map(std::borrow::Cow::into_owned),
         );
         let blanked =
             blank_forward_entries(&bytes, &mine, DEFAULT_TARGET_PAGE_BYTES).map_err(read_err)?;

@@ -11,9 +11,16 @@
 //!
 //! ```text
 //! Header (40 bytes):
-//!   [magic: 4B "FPK1"] [version: u8=1] [kind: u8] [ns_code: u16 LE]
+//!   [magic: 4B "FPK1"] [version: u8] [kind: u8] [ns_code: u16 LE]
 //!   [first_id: u64 LE] [last_id: u64 LE]
-//!   [page_count: u32 LE] [page_dir_offset: u64 LE] [reserved: u32=0]
+//!   [page_count: u32 LE] [page_dir_offset: u64 LE] [codecs_len: u32 LE]
+//!
+//! Codec section (version 2 only; `codecs_len` bytes, 0 in version 1):
+//!   [run_count: u32 LE] then per run, ascending, the first at page 0:
+//!   [first_page: u32 LE] [codec: u8 (0 raw, 1 FSST)]
+//!   FSST: [symbol_count: u8] [lengths: u8 × n] [symbols: u64 LE × n]
+//!   A run's pages store each value as FSST codes over its symbol table,
+//!   or as the value itself.
 //!
 //! Pages (concatenated):
 //!   page_0 ... page_N
@@ -31,7 +38,8 @@
 //! [data: concatenated value bytes]
 //! ```
 //!
-//! Lookup: `local = id - page_first_id; value = data[offsets[local]..offsets[local+1]]`
+//! Lookup: `local = id - page_first_id; stored = data[offsets[local]..offsets[local+1]]`,
+//! decoded by the page's run.
 
 use std::io;
 
@@ -42,8 +50,11 @@ use std::io;
 /// Magic bytes identifying a forward pack file.
 pub const PACK_MAGIC: [u8; 4] = *b"FPK1";
 
-/// Current wire format version.
+/// Wire format version of a pack that stores every value as it is.
 pub const PACK_VERSION: u8 = 1;
+
+/// Wire format version of a pack with a codec section.
+pub const PACK_VERSION_CODED: u8 = 2;
 
 /// Fixed header size in bytes.
 pub const PACK_HEADER_SIZE: usize = 40;
@@ -75,6 +86,8 @@ pub struct PackHeader {
     pub last_id: u64,
     pub page_count: u32,
     pub page_dir_offset: u64,
+    /// Length of the codec section after the header; 0 in version 1.
+    pub codecs_len: u32,
 }
 
 impl PackHeader {
@@ -96,10 +109,21 @@ impl PackHeader {
             ));
         }
         let version = data[4];
-        if version != PACK_VERSION {
+        let codecs_len = u32::from_le_bytes(data[36..40].try_into().unwrap());
+        let codecs_fit = match version {
+            PACK_VERSION => codecs_len == 0,
+            PACK_VERSION_CODED => codecs_len > 0,
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("pack header: unsupported version {version}"),
+                ))
+            }
+        };
+        if !codecs_fit {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("pack header: unsupported version {version}"),
+                format!("pack header: version {version} with a codec section of {codecs_len}"),
             ));
         }
         Ok(Self {
@@ -110,7 +134,13 @@ impl PackHeader {
             last_id: u64::from_le_bytes(data[16..24].try_into().unwrap()),
             page_count: u32::from_le_bytes(data[24..28].try_into().unwrap()),
             page_dir_offset: u64::from_le_bytes(data[28..36].try_into().unwrap()),
+            codecs_len,
         })
+    }
+
+    /// Where the pages may start: after the header and the codec section.
+    fn pages_start(&self) -> u64 {
+        PACK_HEADER_SIZE as u64 + u64::from(self.codecs_len)
     }
 
     fn encode(&self, buf: &mut Vec<u8>) {
@@ -122,8 +152,220 @@ impl PackHeader {
         buf.extend_from_slice(&self.last_id.to_le_bytes());
         buf.extend_from_slice(&self.page_count.to_le_bytes());
         buf.extend_from_slice(&self.page_dir_offset.to_le_bytes());
-        buf.extend_from_slice(&0u32.to_le_bytes()); // reserved
+        buf.extend_from_slice(&self.codecs_len.to_le_bytes());
     }
+}
+
+// ============================================================================
+// Value codecs
+// ============================================================================
+
+/// An FSST symbol table. A coded value is a string of one-byte codes, each
+/// standing for a symbol of one to eight bytes, with code 255 escaping the
+/// literal byte after it.
+#[derive(Clone)]
+pub(crate) struct FsstTable {
+    symbols: Box<[fsst::Symbol; 255]>,
+    lengths: [u8; 255],
+    len: u8,
+}
+
+impl std::fmt::Debug for FsstTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FsstTable({} symbols)", self.len)
+    }
+}
+
+impl FsstTable {
+    fn from_compressor(compressor: fsst::Compressor) -> Self {
+        let parts = compressor.into_parts();
+        Self {
+            symbols: Box::new(parts.symbols),
+            lengths: parts.lengths,
+            len: parts.n_symbols,
+        }
+    }
+
+    fn encoded_len(&self) -> usize {
+        1 + 9 * self.len as usize
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        let n = self.len as usize;
+        buf.push(self.len);
+        buf.extend_from_slice(&self.lengths[..n]);
+        for symbol in &self.symbols[..n] {
+            buf.extend_from_slice(&symbol.to_u64().to_le_bytes());
+        }
+    }
+
+    /// Decode a table from the front of `bytes`, returning it and its length.
+    fn decode(bytes: &[u8]) -> io::Result<(Self, usize)> {
+        let invalid = |what: &str| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("pack codecs: FSST table {what}"),
+            )
+        };
+        let n = *bytes.first().ok_or_else(|| invalid("is empty"))? as usize;
+        if n == 255 {
+            return Err(invalid("has 255 symbols; code 255 is the escape"));
+        }
+        let end = 1 + 9 * n;
+        if bytes.len() < end {
+            return Err(invalid("is truncated"));
+        }
+        let mut lengths = [0u8; 255];
+        lengths[..n].copy_from_slice(&bytes[1..=n]);
+        if lengths[..n].iter().any(|len| !(1..=8).contains(len)) {
+            return Err(invalid("has a symbol length outside 1..=8"));
+        }
+        let mut symbols = Box::new([fsst::Symbol::ZERO; 255]);
+        for (i, chunk) in bytes[1 + n..end].chunks_exact(8).enumerate() {
+            symbols[i] = fsst::Symbol::from_slice(chunk.try_into().expect("eight bytes"));
+        }
+        Ok((
+            Self {
+                symbols,
+                lengths,
+                len: n as u8,
+            },
+            end,
+        ))
+    }
+
+    /// Append the value `codes` stand for to `out`.
+    pub(crate) fn decode_value_into(&self, codes: &[u8], out: &mut Vec<u8>) {
+        let decompressor = fsst::Decompressor::new(&self.symbols, &self.lengths);
+        out.reserve(decompressor.max_decompression_capacity(codes));
+        let written = decompressor.decompress_into(codes, out.spare_capacity_mut());
+        // SAFETY: the decompressor initialized `written` bytes past the length.
+        unsafe { out.set_len(out.len() + written) };
+    }
+}
+
+/// How each page of a pack stores its values: runs of pages keyed by their
+/// first page, each raw or FSST-coded over one table. A pack with no codec
+/// section is raw throughout.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PackCodecs {
+    runs: Vec<(u32, Option<FsstTable>)>,
+}
+
+impl PackCodecs {
+    fn coded(table: FsstTable) -> Self {
+        Self {
+            runs: vec![(0, Some(table))],
+        }
+    }
+
+    fn is_raw(&self) -> bool {
+        self.runs.iter().all(|(_, table)| table.is_none())
+    }
+
+    /// The table page `page`'s values are coded over, if they are.
+    pub(crate) fn table(&self, page: usize) -> Option<&FsstTable> {
+        let run = self
+            .runs
+            .partition_point(|(first, _)| *first as usize <= page);
+        run.checked_sub(1).and_then(|i| self.runs[i].1.as_ref())
+    }
+
+    /// Append a run starting at `first_page`, merging raw runs.
+    fn push(&mut self, first_page: u32, table: Option<FsstTable>) {
+        if table.is_none() && matches!(self.runs.last(), Some((_, None))) {
+            return;
+        }
+        self.runs.push((first_page, table));
+    }
+
+    fn encoded_len(&self) -> usize {
+        if self.is_raw() {
+            return 0;
+        }
+        4 + self
+            .runs
+            .iter()
+            .map(|(_, table)| 5 + table.as_ref().map_or(0, FsstTable::encoded_len))
+            .sum::<usize>()
+    }
+
+    fn encode(&self, buf: &mut Vec<u8>) {
+        if self.is_raw() {
+            return;
+        }
+        buf.extend_from_slice(&(self.runs.len() as u32).to_le_bytes());
+        for (first_page, table) in &self.runs {
+            buf.extend_from_slice(&first_page.to_le_bytes());
+            match table {
+                None => buf.push(0),
+                Some(table) => {
+                    buf.push(1);
+                    table.encode(buf);
+                }
+            }
+        }
+    }
+
+    fn decode(bytes: &[u8], page_count: u32) -> io::Result<Self> {
+        let invalid = |what: String| io::Error::new(io::ErrorKind::InvalidData, what);
+        if bytes.len() < 4 {
+            return Err(invalid("pack codecs: truncated run count".into()));
+        }
+        let count = u32::from_le_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let mut runs: Vec<(u32, Option<FsstTable>)> =
+            Vec::with_capacity(count.min(page_count as usize));
+        let mut at = 4;
+        for i in 0..count {
+            if bytes.len() < at + 5 {
+                return Err(invalid(format!("pack codecs: run {i} is truncated")));
+            }
+            let first_page = u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+            let in_order = match runs.last() {
+                None => first_page == 0,
+                Some((prev, _)) => first_page > *prev,
+            };
+            if !in_order || first_page >= page_count {
+                return Err(invalid(format!(
+                    "pack codecs: run {i} starts at page {first_page}, out of order or past {page_count} pages"
+                )));
+            }
+            let codec = bytes[at + 4];
+            at += 5;
+            let table = match codec {
+                0 => None,
+                1 => {
+                    let (table, len) = FsstTable::decode(&bytes[at..])?;
+                    at += len;
+                    Some(table)
+                }
+                other => return Err(invalid(format!("pack codecs: unknown codec {other}"))),
+            };
+            runs.push((first_page, table));
+        }
+        if at != bytes.len() {
+            return Err(invalid(format!(
+                "pack codecs: {} bytes past the last run",
+                bytes.len() - at
+            )));
+        }
+        Ok(Self { runs })
+    }
+}
+
+/// Where a pack's codec section lies, checked against the pack's length.
+pub(crate) fn codec_range(header: &PackHeader, pack_len: u64) -> io::Result<std::ops::Range<u64>> {
+    let range = PACK_HEADER_SIZE as u64..header.pages_start();
+    if range.end > pack_len {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "pack: codec section of {} bytes exceeds pack length {pack_len}",
+                header.codecs_len
+            ),
+        ));
+    }
+    Ok(range)
 }
 
 // ============================================================================
@@ -269,7 +511,8 @@ impl<'a> ForwardPage<'a> {
         u32::from_le_bytes(self.data[pos..pos + 4].try_into().unwrap())
     }
 
-    /// Look up a value by ID. Returns the raw value bytes, or `None` if out of range.
+    /// Look up a value by ID. Returns its stored bytes (FSST codes on a coded
+    /// page), or `None` if out of range.
     #[inline]
     pub fn lookup(&self, id: u64) -> Option<&'a [u8]> {
         if id < self.first_id {
@@ -312,6 +555,18 @@ pub(crate) struct ParsedPackMeta {
     pub kind: u8,
     pub ns_code: u16,
     pub directory: Vec<PageDirEntry>,
+    pub codecs: PackCodecs,
+}
+
+impl ParsedPackMeta {
+    /// Append page `page_idx`'s `stored` value, decoded, to `out`.
+    #[inline]
+    pub(crate) fn decode_into(&self, page_idx: usize, stored: &[u8], out: &mut Vec<u8>) {
+        match self.codecs.table(page_idx) {
+            Some(table) => table.decode_value_into(stored, out),
+            None => out.extend_from_slice(stored),
+        }
+    }
 }
 
 /// Parse and validate a pack's header + page directory from raw bytes.
@@ -325,9 +580,11 @@ pub(crate) struct ParsedPackMeta {
 /// - Non-ascending / overlapping page ID ranges
 pub(crate) fn parse_pack_meta(data: &[u8]) -> io::Result<ParsedPackMeta> {
     let header = PackHeader::decode(data)?;
+    let codecs = codec_range(&header, data.len() as u64)?;
     let dir = page_dir_range(&header, data.len() as u64)?;
     parse_pack_meta_parts(
         &header,
+        &data[codecs.start as usize..codecs.end as usize],
         &data[dir.start as usize..dir.end as usize],
         data.len() as u64,
     )
@@ -355,13 +612,20 @@ pub(crate) fn page_dir_range(
     Ok(dir_offset..dir_end)
 }
 
-/// [`parse_pack_meta`] from the header, the directory's bytes (see
-/// [`page_dir_range`]) and the pack's length, for a pack read by range.
+/// [`parse_pack_meta`] from the header, the codec section's and the
+/// directory's bytes (see [`codec_range`] and [`page_dir_range`]) and the
+/// pack's length, for a pack read by range.
 pub(crate) fn parse_pack_meta_parts(
     header: &PackHeader,
+    codec_bytes: &[u8],
     dir_bytes: &[u8],
     pack_len: u64,
 ) -> io::Result<ParsedPackMeta> {
+    let codecs = if header.codecs_len == 0 {
+        PackCodecs::default()
+    } else {
+        PackCodecs::decode(codec_bytes, header.page_count)?
+    };
     if dir_bytes.len() != header.page_count as usize * PAGE_DIR_ENTRY_SIZE {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -396,6 +660,15 @@ pub(crate) fn parse_pack_meta_parts(
 
         // Validate page bounds.
         let page_end = u64::from(entry.page_offset) + u64::from(entry.page_len);
+        if u64::from(entry.page_offset) < header.pages_start() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "pack: page {i} at offset {} overlaps the header",
+                    entry.page_offset
+                ),
+            ));
+        }
         if page_end > pack_len {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -434,27 +707,36 @@ pub(crate) fn parse_pack_meta_parts(
         kind: header.kind,
         ns_code: header.ns_code,
         directory,
+        codecs,
     })
 }
 
-/// Zero-alloc lookup using pre-parsed metadata. Returns raw value bytes.
+/// Append `id`'s value to `out` using pre-parsed metadata; `false` when the
+/// pack lacks it.
 ///
 /// Binary-searches the cached directory, then does O(1) offset indexing
-/// within the matching page.
-pub(crate) fn lookup_in_pack<'a>(
-    data: &'a [u8],
+/// within the matching page and decodes the value by the page's codec.
+pub(crate) fn lookup_in_pack_into(
+    data: &[u8],
     meta: &ParsedPackMeta,
     id: u64,
-) -> Option<&'a [u8]> {
+    out: &mut Vec<u8>,
+) -> bool {
     if id < meta.first_id || id > meta.last_id {
-        return None;
+        return false;
     }
-    let page_idx = find_page_in_dir(&meta.directory, id)?;
+    let Some(page_idx) = find_page_in_dir(&meta.directory, id) else {
+        return false;
+    };
     let dir = &meta.directory[page_idx];
     let page_data =
         &data[dir.page_offset as usize..dir.page_offset as usize + dir.page_len as usize];
     let page = ForwardPage::from_bytes_unchecked(page_data, dir.page_first_id);
-    page.lookup(id)
+    let Some(stored) = page.lookup(id) else {
+        return false;
+    };
+    meta.decode_into(page_idx, stored, out);
+    true
 }
 
 /// Binary search a page directory for the page containing `id`.
@@ -482,8 +764,7 @@ pub(crate) fn find_page_in_dir(directory: &[PageDirEntry], id: u64) -> Option<us
 pub struct ForwardPack<'a> {
     data: &'a [u8],
     header: PackHeader,
-    /// Cached decoded directory entries.
-    directory: Vec<PageDirEntry>,
+    meta: ParsedPackMeta,
 }
 
 impl<'a> ForwardPack<'a> {
@@ -491,11 +772,7 @@ impl<'a> ForwardPack<'a> {
     pub fn from_bytes(data: &'a [u8]) -> io::Result<Self> {
         let header = PackHeader::decode(data)?;
         let meta = parse_pack_meta(data)?;
-        Ok(Self {
-            data,
-            header,
-            directory: meta.directory,
-        })
+        Ok(Self { data, header, meta })
     }
 
     /// The decoded pack header.
@@ -510,41 +787,50 @@ impl<'a> ForwardPack<'a> {
 
     /// Total entries across all pages.
     pub fn total_entries(&self) -> u64 {
-        self.directory.iter().map(|d| d.entry_count as u64).sum()
+        self.meta
+            .directory
+            .iter()
+            .map(|d| d.entry_count as u64)
+            .sum()
     }
 
-    /// Look up a value by ID. Returns raw value bytes, or `None` if not found.
-    pub fn lookup(&self, id: u64) -> Option<&'a [u8]> {
+    /// Whether any page stores its values coded.
+    pub fn is_coded(&self) -> bool {
+        !self.meta.codecs.is_raw()
+    }
+
+    /// Look up a value by ID: borrowed from a raw page, decoded from a coded
+    /// one. `None` if not found.
+    pub fn lookup(&self, id: u64) -> Option<std::borrow::Cow<'a, [u8]>> {
         if id < self.header.first_id || id > self.header.last_id {
             return None;
         }
-        let page_idx = find_page_in_dir(&self.directory, id)?;
-        let dir = &self.directory[page_idx];
+        let page_idx = find_page_in_dir(&self.meta.directory, id)?;
+        let dir = &self.meta.directory[page_idx];
         let page_data =
             &self.data[dir.page_offset as usize..dir.page_offset as usize + dir.page_len as usize];
-        let page = ForwardPage::from_bytes_unchecked(page_data, dir.page_first_id);
-        page.lookup(id)
+        let stored = ForwardPage::from_bytes_unchecked(page_data, dir.page_first_id).lookup(id)?;
+        Some(match self.meta.codecs.table(page_idx) {
+            None => std::borrow::Cow::Borrowed(stored),
+            Some(table) => {
+                let mut value = Vec::new();
+                table.decode_value_into(stored, &mut value);
+                std::borrow::Cow::Owned(value)
+            }
+        })
     }
 
     /// Append value bytes to `out`. Returns `true` if found.
     pub fn lookup_into(&self, id: u64, out: &mut Vec<u8>) -> bool {
-        match self.lookup(id) {
-            Some(bytes) => {
-                out.extend_from_slice(bytes);
-                true
-            }
-            None => false,
-        }
+        lookup_in_pack_into(self.data, &self.meta, id, out)
     }
 
     /// Look up and return as a UTF-8 string.
     pub fn lookup_str(&self, id: u64) -> io::Result<Option<String>> {
         match self.lookup(id) {
-            Some(bytes) => {
-                let s = std::str::from_utf8(bytes)
-                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-                Ok(Some(s.to_string()))
-            }
+            Some(bytes) => String::from_utf8(bytes.into_owned())
+                .map(Some)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
             None => Ok(None),
         }
     }
@@ -576,14 +862,85 @@ impl<'a> ForwardPage<'a> {
 /// `entries` must be sorted by ID in ascending order and IDs must be contiguous
 /// (no gaps). Returns the complete pack bytes.
 ///
-/// Uses a two-pass approach: first determines page boundaries, then encodes
-/// directly into the output buffer with no intermediate per-page allocations.
+/// A string pack stores its values as FSST codes over one symbol table trained
+/// on them, unless that would not make it smaller; other kinds store values as
+/// they are.
 pub fn encode_forward_pack(
     entries: &[(u64, &[u8])],
     kind: u8,
     ns_code: u16,
     target_page_bytes: usize,
 ) -> io::Result<Vec<u8>> {
+    if kind == KIND_STRING_FWD && !entries.is_empty() {
+        let values: Vec<&[u8]> = entries.iter().map(|(_, value)| *value).collect();
+        let compressor = fsst::Compressor::train(&values);
+        let coded: Vec<Vec<u8>> = values
+            .iter()
+            .map(|value| compressor.compress(value))
+            .collect();
+        let table = FsstTable::from_compressor(compressor);
+        let raw_len: usize = values.iter().map(|value| value.len()).sum();
+        let coded_len = coded.iter().map(Vec::len).sum::<usize>() + table.encoded_len();
+        if coded_len < raw_len {
+            let coded_entries: Vec<(u64, &[u8])> = entries
+                .iter()
+                .zip(&coded)
+                .map(|((id, _), codes)| (*id, codes.as_slice()))
+                .collect();
+            return encode_pack_with(
+                &coded_entries,
+                kind,
+                ns_code,
+                target_page_bytes,
+                &PackCodecs::coded(table),
+            );
+        }
+    }
+    encode_pack_with(
+        entries,
+        kind,
+        ns_code,
+        target_page_bytes,
+        &PackCodecs::default(),
+    )
+}
+
+/// [`encode_forward_pack`] storing every value as it is, whatever the kind:
+/// for tests of the page layout.
+#[cfg(test)]
+pub(crate) fn encode_forward_pack_raw(
+    entries: &[(u64, &[u8])],
+    kind: u8,
+    ns_code: u16,
+    target_page_bytes: usize,
+) -> io::Result<Vec<u8>> {
+    encode_pack_with(
+        entries,
+        kind,
+        ns_code,
+        target_page_bytes,
+        &PackCodecs::default(),
+    )
+}
+
+/// Encode a pack of entries already in their stored form, with `codecs`
+/// describing every page. Determines page boundaries first, then encodes
+/// directly into the output buffer with no intermediate per-page allocations.
+fn encode_pack_with(
+    entries: &[(u64, &[u8])],
+    kind: u8,
+    ns_code: u16,
+    target_page_bytes: usize,
+    codecs: &PackCodecs,
+) -> io::Result<Vec<u8>> {
+    let codecs_len = u32::try_from(codecs.encoded_len())
+        .map_err(|_| io::Error::other("pack encode: codec section exceeds u32"))?;
+    let version = if codecs_len == 0 {
+        PACK_VERSION
+    } else {
+        PACK_VERSION_CODED
+    };
+    let pages_start = PACK_HEADER_SIZE + codecs_len as usize;
     if entries.is_empty() {
         // Empty pack: header + empty directory.
         let mut buf = Vec::with_capacity(PACK_HEADER_SIZE);
@@ -595,6 +952,7 @@ pub fn encode_forward_pack(
             last_id: 0,
             page_count: 0,
             page_dir_offset: PACK_HEADER_SIZE as u64,
+            codecs_len: 0,
         };
         header.encode(&mut buf);
         return Ok(buf);
@@ -632,25 +990,27 @@ pub fn encode_forward_pack(
         .len()
         .checked_mul(PAGE_DIR_ENTRY_SIZE)
         .ok_or_else(|| io::Error::other("pack encode: directory size overflow"))?;
-    let total = PACK_HEADER_SIZE
+    let total = pages_start
         .checked_add(total_page_bytes)
         .and_then(|s| s.checked_add(dir_size))
         .ok_or_else(|| io::Error::other("pack encode: total size overflow"))?;
 
     let mut buf = Vec::with_capacity(total);
 
-    // Write header.
-    let page_dir_offset = (PACK_HEADER_SIZE + total_page_bytes) as u64;
+    // Write header and codec section.
+    let page_dir_offset = (pages_start + total_page_bytes) as u64;
     let header = PackHeader {
-        version: PACK_VERSION,
+        version,
         kind,
         ns_code,
         first_id,
         last_id,
         page_count: page_plan.len() as u32,
         page_dir_offset,
+        codecs_len,
     };
     header.encode(&mut buf);
+    codecs.encode(&mut buf);
 
     // Pass 2: encode pages directly into buf, recording directory entries.
     let mut dir_entries: Vec<PageDirEntry> = Vec::with_capacity(page_plan.len());
@@ -777,16 +1137,24 @@ pub fn blank_forward_entries(
 ) -> io::Result<Vec<u8>> {
     let pack = ForwardPack::from_bytes(pack_bytes)?;
     let header = *pack.header();
-    let mut entries: Vec<(u64, &[u8])> = Vec::new();
+    let mut values: Vec<(u64, std::borrow::Cow<'_, [u8]>)> = Vec::new();
     if header.page_count > 0 {
-        entries.reserve((header.last_id - header.first_id + 1) as usize);
+        values.reserve((header.last_id - header.first_id + 1) as usize);
         for id in header.first_id..=header.last_id {
             let value = pack.lookup(id).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("pack has no id {id}"))
             })?;
-            entries.push((id, if ids.contains(&id) { &[] } else { value }));
+            values.push((
+                id,
+                if ids.contains(&id) {
+                    Default::default()
+                } else {
+                    value
+                },
+            ));
         }
     }
+    let entries: Vec<(u64, &[u8])> = values.iter().map(|(id, v)| (*id, v.as_ref())).collect();
     encode_forward_pack(&entries, header.kind, header.ns_code, target_page_bytes)
 }
 
@@ -871,8 +1239,25 @@ pub fn concat_forward_packs(packs: &[&[u8]]) -> io::Result<Vec<u8>> {
         total_pages += meta.directory.len();
     }
 
+    // Pages are copied verbatim, so each keeps the codec it was written with.
+    let mut codecs = PackCodecs::default();
+    let mut first_page = 0u32;
+    for meta in &metas {
+        if meta.codecs.is_raw() {
+            codecs.push(first_page, None);
+        } else {
+            for (run_first, table) in &meta.codecs.runs {
+                codecs.push(first_page + run_first, table.clone());
+            }
+        }
+        first_page += meta.directory.len() as u32;
+    }
+    let codecs_len = u32::try_from(codecs.encoded_len())
+        .map_err(|_| io::Error::other("pack concat: codec section exceeds u32"))?;
+
     let page_dir_offset = PACK_HEADER_SIZE
-        .checked_add(total_page_bytes)
+        .checked_add(codecs_len as usize)
+        .and_then(|s| s.checked_add(total_page_bytes))
         .ok_or_else(|| io::Error::other("pack concat: page directory offset overflow"))?;
     let dir_size = total_pages
         .checked_mul(PAGE_DIR_ENTRY_SIZE)
@@ -883,7 +1268,11 @@ pub fn concat_forward_packs(packs: &[&[u8]]) -> io::Result<Vec<u8>> {
 
     let mut buf = Vec::with_capacity(total);
     let header = PackHeader {
-        version: PACK_VERSION,
+        version: if codecs_len == 0 {
+            PACK_VERSION
+        } else {
+            PACK_VERSION_CODED
+        },
         kind,
         ns_code,
         first_id: metas[0].first_id,
@@ -891,8 +1280,10 @@ pub fn concat_forward_packs(packs: &[&[u8]]) -> io::Result<Vec<u8>> {
         page_count: u32::try_from(total_pages)
             .map_err(|_| io::Error::other("pack concat: page count exceeds u32"))?,
         page_dir_offset: page_dir_offset as u64,
+        codecs_len,
     };
     header.encode(&mut buf);
+    codecs.encode(&mut buf);
 
     // Copy page payloads, recording each page's new offset.
     let mut dir_entries: Vec<PageDirEntry> = Vec::with_capacity(total_pages);
@@ -953,7 +1344,7 @@ mod tests {
         let pack = ForwardPack::from_bytes(&blanked).unwrap();
         for (id, value) in &entries {
             let expected: &[u8] = if [42, 77].contains(id) { &[] } else { value };
-            assert_eq!(pack.lookup(*id), Some(expected), "{id}");
+            assert_eq!(pack.lookup(*id).as_deref(), Some(expected), "{id}");
         }
         assert!(!blanked.windows(b"value_42".len()).any(|w| w == b"value_42"));
     }
@@ -1136,8 +1527,8 @@ mod tests {
         assert_eq!(pack.header().last_id, 1049);
 
         assert!(pack.lookup(999).is_none());
-        assert_eq!(pack.lookup(1000).unwrap(), b"value_1000");
-        assert_eq!(pack.lookup(1049).unwrap(), b"value_1049");
+        assert_eq!(&*pack.lookup(1000).unwrap(), b"value_1000");
+        assert_eq!(&*pack.lookup(1049).unwrap(), b"value_1049");
         assert!(pack.lookup(1050).is_none());
     }
 
@@ -1148,10 +1539,10 @@ mod tests {
         let pack_bytes = encode_forward_pack(&entries, KIND_STRING_FWD, 0, 1024 * 1024).unwrap();
         let pack = ForwardPack::from_bytes(&pack_bytes).unwrap();
 
-        assert_eq!(pack.lookup(0).unwrap(), b"");
-        assert_eq!(pack.lookup(1).unwrap(), b"hello");
-        assert_eq!(pack.lookup(2).unwrap(), b"");
-        assert_eq!(pack.lookup(3).unwrap(), b"world");
+        assert_eq!(&*pack.lookup(0).unwrap(), b"");
+        assert_eq!(&*pack.lookup(1).unwrap(), b"hello");
+        assert_eq!(&*pack.lookup(2).unwrap(), b"");
+        assert_eq!(&*pack.lookup(3).unwrap(), b"world");
     }
 
     #[test]
@@ -1186,14 +1577,197 @@ mod tests {
         assert_eq!(meta.ns_code, 0);
         assert!(!meta.directory.is_empty());
 
-        // Verify lookup_in_pack works with pre-parsed meta.
+        // Verify lookup_in_pack_into works with pre-parsed meta.
+        let mut found = Vec::new();
         for &(id, ref value) in &entries {
-            let found = lookup_in_pack(&pack_bytes, &meta, id).unwrap();
+            found.clear();
+            assert!(lookup_in_pack_into(&pack_bytes, &meta, id, &mut found));
             assert_eq!(found, value.as_slice(), "mismatch at id={id}");
         }
 
-        assert!(lookup_in_pack(&pack_bytes, &meta, 99).is_none());
-        assert!(lookup_in_pack(&pack_bytes, &meta, 600).is_none());
+        assert!(!lookup_in_pack_into(&pack_bytes, &meta, 99, &mut found));
+        assert!(!lookup_in_pack_into(&pack_bytes, &meta, 600, &mut found));
+    }
+
+    // ---- Coded string packs ----
+
+    /// Text-like values of varied shape: repeated words, empty, multi-byte,
+    /// and long.
+    fn text_entries(first: u64, count: usize) -> Vec<(u64, Vec<u8>)> {
+        (0..count)
+            .map(|i| {
+                let id = first + i as u64;
+                let value = match i % 5 {
+                    0 => String::new(),
+                    1 => format!("product review {i}: the battery lasts all day"),
+                    2 => format!("Größe {i} — naïve café ☕"),
+                    3 => "lorem ipsum dolor sit amet ".repeat(1 + i % 40),
+                    _ => format!("http://example.org/catalog/item/{i}"),
+                };
+                (id, value.into_bytes())
+            })
+            .collect()
+    }
+
+    fn read_back(bytes: &[u8], entries: &[(u64, Vec<u8>)]) {
+        let pack = ForwardPack::from_bytes(bytes).unwrap();
+        let meta = parse_pack_meta(bytes).unwrap();
+        let mut out = Vec::new();
+        for (id, value) in entries {
+            assert_eq!(pack.lookup(*id).as_deref(), Some(value.as_slice()), "{id}");
+            out.clear();
+            assert!(lookup_in_pack_into(bytes, &meta, *id, &mut out), "{id}");
+            assert_eq!(out, *value, "{id}");
+        }
+        let last = entries.last().unwrap().0;
+        assert!(pack.lookup(last + 1).is_none());
+    }
+
+    #[test]
+    fn string_packs_store_fsst_codes_and_read_back_every_value() {
+        let entries = text_entries(7, 3_000);
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        let header = PackHeader::decode(&bytes).unwrap();
+        assert_eq!(header.version, PACK_VERSION_CODED);
+        assert!(header.page_count > 1);
+        assert!(ForwardPack::from_bytes(&bytes).unwrap().is_coded());
+        let raw = encode_forward_pack_raw(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        assert!(
+            bytes.len() * 2 < raw.len(),
+            "{} vs {}",
+            bytes.len(),
+            raw.len()
+        );
+        assert!(!bytes
+            .windows(b"battery lasts".len())
+            .any(|w| w == b"battery lasts"));
+        read_back(&bytes, &entries);
+        assert_eq!(
+            ForwardPack::from_bytes(&bytes)
+                .unwrap()
+                .lookup_str(9)
+                .unwrap(),
+            Some(String::from_utf8(entries[2].1.clone()).unwrap())
+        );
+    }
+
+    #[test]
+    fn only_string_packs_are_coded() {
+        let entries = text_entries(0, 500);
+        for kind in [KIND_SUBJECT_FWD, KIND_TERM_FWD] {
+            let bytes = encode_forward_pack(&as_refs(&entries), kind, 3, 4096).unwrap();
+            assert_eq!(
+                bytes,
+                encode_forward_pack_raw(&as_refs(&entries), kind, 3, 4096).unwrap()
+            );
+            assert_eq!(PackHeader::decode(&bytes).unwrap().version, PACK_VERSION);
+            read_back(&bytes, &entries);
+        }
+    }
+
+    /// Values FSST cannot shrink are stored as they are.
+    #[test]
+    fn a_string_pack_codes_shrink_nothing_stays_raw() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let entries: Vec<(u64, Vec<u8>)> = (0..400u64)
+            .map(|id| {
+                let value = (0..24)
+                    .map(|_| {
+                        state ^= state << 13;
+                        state ^= state >> 7;
+                        state ^= state << 17;
+                        state as u8
+                    })
+                    .collect();
+                (id, value)
+            })
+            .collect();
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        assert_eq!(PackHeader::decode(&bytes).unwrap().version, PACK_VERSION);
+        read_back(&bytes, &entries);
+    }
+
+    /// Compaction copies pages verbatim, so each keeps its own pack's table,
+    /// and pages of a raw pack stay raw.
+    #[test]
+    fn merging_coded_and_raw_packs_keeps_each_pages_codec() {
+        let a = text_entries(0, 800);
+        let b = text_entries(800, 300);
+        let c = text_entries(1_100, 900);
+        let packs = vec![
+            encode_forward_pack(&as_refs(&a), KIND_STRING_FWD, 0, 2048).unwrap(),
+            encode_forward_pack_raw(&as_refs(&b), KIND_STRING_FWD, 0, 2048).unwrap(),
+            encode_forward_pack(&as_refs(&c), KIND_STRING_FWD, 0, 2048).unwrap(),
+        ];
+        let merged = concat(&packs).unwrap();
+        let meta = parse_pack_meta(&merged).unwrap();
+        let pages: Vec<usize> = packs
+            .iter()
+            .map(|p| parse_pack_meta(p).unwrap().directory.len())
+            .collect();
+        assert_eq!(meta.directory.len(), pages.iter().sum::<usize>());
+        assert_eq!(meta.codecs.runs.len(), 3);
+        assert!(meta.codecs.table(0).is_some());
+        assert!(meta.codecs.table(pages[0]).is_none());
+        assert!(meta.codecs.table(pages[0] + pages[1]).is_some());
+        let all: Vec<(u64, Vec<u8>)> = a.into_iter().chain(b).chain(c).collect();
+        read_back(&merged, &all);
+
+        let raw = vec![packs[1].clone(), {
+            let d = text_entries(1_100, 10);
+            encode_forward_pack_raw(&as_refs(&d), KIND_STRING_FWD, 0, 2048).unwrap()
+        }];
+        let merged_raw = concat(&raw).unwrap();
+        assert_eq!(
+            PackHeader::decode(&merged_raw).unwrap().version,
+            PACK_VERSION
+        );
+    }
+
+    #[test]
+    fn blanking_a_coded_pack_keeps_every_other_value() {
+        let entries = text_entries(0, 1_000);
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        let blanked = blank_forward_entries(&bytes, &[1, 6], 4096).unwrap();
+        let pack = ForwardPack::from_bytes(&blanked).unwrap();
+        assert!(pack.is_coded());
+        for (id, value) in &entries {
+            let expected: &[u8] = if [1, 6].contains(id) { &[] } else { value };
+            assert_eq!(pack.lookup(*id).as_deref(), Some(expected), "{id}");
+        }
+    }
+
+    #[test]
+    fn a_bad_codec_section_is_refused() {
+        let entries = text_entries(0, 1_000);
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        let codecs = PACK_HEADER_SIZE;
+        let table = codecs + 4 + 5;
+        let symbols = bytes[table] as usize;
+        let corruptions: [(&str, usize, u8); 5] = [
+            ("first run past page 0", codecs + 4, 1),
+            ("unknown codec", codecs + 8, 7),
+            ("255 symbols", table, 255),
+            ("symbol length 0", table + 1, 0),
+            ("symbol length 9", table + symbols, 9),
+        ];
+        for (what, at, byte) in corruptions {
+            let mut bad = bytes.clone();
+            bad[at] = byte;
+            assert!(parse_pack_meta(&bad).is_err(), "{what}");
+        }
+        let mut version_one = bytes.clone();
+        version_one[4] = PACK_VERSION;
+        assert!(
+            PackHeader::decode(&version_one).is_err(),
+            "version 1 with codecs"
+        );
+        let mut no_codecs = bytes;
+        no_codecs[36..40].copy_from_slice(&0u32.to_le_bytes());
+        assert!(
+            PackHeader::decode(&no_codecs).is_err(),
+            "version 2 without codecs"
+        );
     }
 
     // ---- Compaction ----

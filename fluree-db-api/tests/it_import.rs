@@ -4065,3 +4065,122 @@ async fn import_keeps_two_lists_on_one_property_apart() {
         [[1, 2], [3, 4]]
     );
 }
+
+// ============================================================================
+// FSST-coded string packs
+// ============================================================================
+
+/// String forward packs under `dir`, counted as `(raw, coded)` by version.
+fn string_pack_versions(dir: &std::path::Path) -> (usize, usize) {
+    let (mut raw, mut coded) = (0, 0);
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        if path.is_dir() {
+            stack.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+            continue;
+        }
+        let mut head = [0u8; 6];
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        if std::io::Read::read_exact(&mut file, &mut head).is_err() || &head[..4] != b"FPK1" {
+            continue;
+        }
+        match (head[4], head[5]) {
+            (1, 0) => raw += 1,
+            (2, 0) => coded += 1,
+            _ => {}
+        }
+    }
+    (raw, coded)
+}
+
+fn review(i: usize) -> String {
+    format!(
+        "review {i}: the battery lasts all day and the screen is bright{}",
+        " — great value".repeat(i % 5)
+    )
+}
+
+async fn assert_reviews(fluree: &fluree_db_api::Fluree, ledger_id: &str, count: usize) {
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let mut expected: Vec<String> = (0..count).map(review).collect();
+    expected.sort();
+    let all = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?t"],
+        "where": {"ex:text": "?t"}
+    });
+    let qr = support::query_jsonld(fluree, &ledger, &all)
+        .await
+        .expect("query all reviews");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    assert_eq!(extract_sorted_strings(&json), expected);
+
+    let prefixed = json!({
+        "@context": {"ex": "http://example.org/ns/"},
+        "select": ["?t"],
+        "where": [{"ex:text": "?t"}, ["filter", "(strStarts ?t \"review 12\")"]]
+    });
+    let qr = support::query_jsonld(fluree, &ledger, &prefixed)
+        .await
+        .expect("query prefixed reviews");
+    let json = qr.to_jsonld(&ledger.snapshot).expect("format jsonld");
+    let want: Vec<String> = expected
+        .iter()
+        .filter(|t| t.starts_with("review 12"))
+        .cloned()
+        .collect();
+    assert!(want.len() > 100);
+    assert_eq!(extract_sorted_strings(&json), want);
+}
+
+/// String forward packs are stored as FSST codes; every value reads back
+/// after an import, an incremental index and a full rebuild.
+#[tokio::test]
+async fn imported_strings_read_back_from_fsst_coded_packs() {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let mut ttl = String::from("@prefix ex: <http://example.org/ns/> .\n");
+    for i in 0..3_000 {
+        ttl.push_str(&format!("ex:r{i} ex:text \"{}\" .\n", review(i)));
+    }
+    let ttl_path = write_ttl(data_dir.path(), "reviews.ttl", &ttl);
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .expect("build file-backed Fluree");
+    let ledger_id = "test/fsst-packs:main";
+    fluree
+        .create(ledger_id)
+        .import(&ttl_path)
+        .threads(2)
+        .memory_budget_mb(256)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect("import");
+    let (raw, coded) = string_pack_versions(db_dir.path());
+    assert!(coded > 0, "the import writes coded string packs: {raw} raw");
+    assert_reviews(&fluree, ledger_id, 3_000).await;
+
+    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
+    let mut more = String::from("@prefix ex: <http://example.org/ns/> .\n");
+    for i in 3_000..3_600 {
+        more.push_str(&format!("ex:r{i} ex:text \"{}\" .\n", review(i)));
+    }
+    fluree
+        .insert_turtle(ledger, &more)
+        .await
+        .expect("insert more reviews");
+    support::build_incrementally_and_publish_index(&fluree, ledger_id).await;
+    let (_, coded_after) = string_pack_versions(db_dir.path());
+    assert!(
+        coded_after > coded,
+        "the incremental build codes its new pack"
+    );
+    assert_reviews(&fluree, ledger_id, 3_600).await;
+
+    support::rebuild_and_publish_index(&fluree, ledger_id).await;
+    assert_reviews(&fluree, ledger_id, 3_600).await;
+}

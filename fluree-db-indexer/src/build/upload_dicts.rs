@@ -489,50 +489,59 @@ where
     // large enough that a fixed target would run the routing table into its
     // u16 cap.
     let target_pack_bytes = pack_target_bytes(fwd.len() as u64);
+    // Coding a string pack trains its FSST table, so a batch of packs is
+    // encoded in parallel and uploaded in order.
+    let batch_len = rayon::current_num_threads().max(1);
     let mut pack_refs = Vec::new();
+    let mut batch: Vec<Vec<(u64, &[u8])>> = Vec::new();
     let mut entries: Vec<(u64, &[u8])> = Vec::new();
     let mut pack_est = 0usize;
 
-    while let Some(entry) = next_entry()? {
-        let bytes = &fwd[entry.off as usize..(entry.off as usize + entry.len as usize)];
-        pack_est += bytes.len() + 4;
-        entries.push((entry.id, bytes));
-
-        if pack_est >= target_pack_bytes {
-            let (bytes, first_id, last_id) = build_forward_pack_artifact(
-                &entries,
-                KIND_STRING_FWD,
-                0,
-                DEFAULT_TARGET_PAGE_BYTES,
-            )
-            .map_err(|e| IndexerError::StorageWrite(format!("string pack build: {e}")))?;
-            let cas_result = content_store
-                .put(kind, &bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            pack_refs.push(PackBranchEntry {
-                first_id,
-                last_id,
-                pack_cid: cas_result,
-            });
-            entries.clear();
+    loop {
+        let next = next_entry()?;
+        let done = next.is_none();
+        if let Some(entry) = next {
+            let bytes = &fwd[entry.off as usize..(entry.off as usize + entry.len as usize)];
+            pack_est += bytes.len() + 4;
+            entries.push((entry.id, bytes));
+        }
+        if pack_est >= target_pack_bytes || (done && !entries.is_empty()) {
+            batch.push(std::mem::take(&mut entries));
             pack_est = 0;
         }
-    }
-
-    if !entries.is_empty() {
-        let (bytes, first_id, last_id) =
-            build_forward_pack_artifact(&entries, KIND_STRING_FWD, 0, DEFAULT_TARGET_PAGE_BYTES)
-                .map_err(|e| IndexerError::StorageWrite(format!("string pack build: {e}")))?;
-        let cas_result = content_store
-            .put(kind, &bytes)
-            .await
-            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-        pack_refs.push(PackBranchEntry {
-            first_id,
-            last_id,
-            pack_cid: cas_result,
-        });
+        if batch.len() >= batch_len || (done && !batch.is_empty()) {
+            let built: Vec<std::io::Result<(Vec<u8>, u64, u64)>> = {
+                use rayon::prelude::*;
+                batch
+                    .par_iter()
+                    .map(|pack| {
+                        build_forward_pack_artifact(
+                            pack,
+                            KIND_STRING_FWD,
+                            0,
+                            DEFAULT_TARGET_PAGE_BYTES,
+                        )
+                    })
+                    .collect()
+            };
+            batch.clear();
+            for pack in built {
+                let (bytes, first_id, last_id) = pack
+                    .map_err(|e| IndexerError::StorageWrite(format!("string pack build: {e}")))?;
+                let cas_result = content_store
+                    .put(kind, &bytes)
+                    .await
+                    .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+                pack_refs.push(PackBranchEntry {
+                    first_id,
+                    last_id,
+                    pack_cid: cas_result,
+                });
+            }
+        }
+        if done {
+            break;
+        }
     }
 
     Ok(pack_refs)
