@@ -387,10 +387,35 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
                 Ordering::Equal
             }
         }
+        // A plain string the sort keeps encoded (lex-sorted string ids) against
+        // a decoded literal of another type: their types decide, as they would
+        // decoded. A triple term or JSON sorts after it, a number before.
+        (Binding::Lit { val, .. }, kept)
+            if is_kept_plain_string(kept) && !matches!(val, FlakeValue::String(_)) =>
+        {
+            compare_flake_values(val, &FlakeValue::String(String::new()))
+        }
+        (kept, Binding::Lit { val, .. })
+            if is_kept_plain_string(kept) && !matches!(val, FlakeValue::String(_)) =>
+        {
+            compare_flake_values(&FlakeValue::String(String::new()), val)
+        }
         // Cross-Lit type: Lit sorts before EncodedLit when mixed
         (Binding::Lit { .. }, Binding::EncodedLit { .. }) => Ordering::Less,
         (Binding::EncodedLit { .. }, Binding::Lit { .. }) => Ordering::Greater,
     }
+}
+
+/// The literal [`materialize_encoded_for_sort`] leaves encoded when string ids
+/// are lex-sorted: a plain `xsd:string`.
+fn is_kept_plain_string(b: &Binding) -> bool {
+    matches!(
+        b,
+        Binding::EncodedLit { o_kind, dt_id, lang_id, .. }
+            if *o_kind == ObjKind::LEX_ID.as_u8()
+                && *dt_id == DatatypeDictId::STRING.as_u16()
+                && *lang_id == 0
+    )
 }
 
 /// Compare two Sids for sorting
@@ -865,6 +890,54 @@ impl Operator for SortOperator {
     fn estimated_rows(&self) -> Option<usize> {
         // Sort doesn't change row count
         self.child.estimated_rows()
+    }
+}
+
+#[cfg(test)]
+mod kept_string_tests {
+    use super::*;
+
+    /// A plain string the sort leaves encoded (lex-sorted string ids) against
+    /// decoded literals of other types: SPARQL 1.2 orders literals by type
+    /// as `FlakeValue` does, a triple term after every other literal.
+    #[test]
+    fn a_kept_string_orders_by_type_against_decoded_literals() {
+        let kept = Binding::EncodedLit {
+            o_kind: ObjKind::LEX_ID.as_u8(),
+            o_key: 7,
+            p_id: 1,
+            dt_id: DatatypeDictId::STRING.as_u16(),
+            lang_id: 0,
+            i_val: fluree_db_core::list_index::NONE,
+            t: 1,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
+        };
+        let lit = |val: FlakeValue| Binding::Lit {
+            val,
+            dtc: DatatypeConstraint::Explicit(Sid::new(2, "x")),
+            t: None,
+            op: None,
+            p_id: None,
+        };
+        let triple = FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+            s: Sid::new(9, "s"),
+            p: Sid::new(9, "p"),
+            o: FlakeValue::Ref(Sid::new(9, "o")),
+            dt: Sid::new(0, ""),
+            lang: None,
+        }));
+        for (decoded, want) in [
+            (lit(triple), Ordering::Greater),
+            (lit(FlakeValue::Json("{}".into())), Ordering::Greater),
+            (lit(FlakeValue::Long(5)), Ordering::Less),
+        ] {
+            assert_eq!(compare_bindings(&decoded, &kept), want, "{decoded:?}");
+            assert_eq!(
+                compare_bindings(&kept, &decoded),
+                want.reverse(),
+                "{decoded:?}"
+            );
+        }
     }
 }
 
