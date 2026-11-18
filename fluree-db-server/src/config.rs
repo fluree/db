@@ -546,6 +546,12 @@ pub struct ServerConfig {
     #[arg(long, env = "FLUREE_DISK_CACHE_MAX_MB")]
     pub disk_cache_max_mb: Option<usize>,
 
+    /// Query-result cache ceiling in MB, in addition to `cache_max_mb`
+    /// (default: 10% of `cache_max_mb`; `0` disables). Allocated only once a
+    /// request opts in with `Fluree-Cache: true` or `opts.cache`.
+    #[arg(long, env = "FLUREE_QUERY_RESULT_CACHE_MAX_MB")]
+    pub query_result_cache_max_mb: Option<usize>,
+
     /// Directories under which catalog-less Iceberg tables may be read from the
     /// local filesystem (colon-separated, absolute).
     ///
@@ -963,6 +969,7 @@ impl Default for ServerConfig {
             indexer_catchup_interval_secs: server_defaults::DEFAULT_INDEXER_CATCHUP_INTERVAL_SECS,
             cache_max_mb: None,
             disk_cache_max_mb: None,
+            query_result_cache_max_mb: None,
             body_limit: server_defaults::DEFAULT_BODY_LIMIT,
             query_timeout_ms: server_defaults::DEFAULT_QUERY_TIMEOUT_MS,
             graphql_max_depth: server_defaults::DEFAULT_GRAPHQL_MAX_DEPTH,

@@ -680,7 +680,7 @@ pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutc
         ValueOrder::Incomparable => {}
     }
     // Same term (reflexivity): equal even for ill-typed / unrecognized literals.
-    if a == b {
+    if a == b || super::value::same_json_term(a, b) {
         return EqOutcome::Eq;
     }
     match (eq_kind(a), eq_kind(b)) {

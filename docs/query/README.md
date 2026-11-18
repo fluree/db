@@ -100,6 +100,12 @@ Monitor and control query execution:
 - Fuel limits for resource control
 - Performance monitoring
 
+### [Query Result Cache](result-cache.md)
+
+Answer a repeated query from its stored answer, per request:
+- `Fluree-Cache: true` or `"opts": {"cache": true}`
+- Keyed on the ledger state, so a hit is never stale
+
 ### Nameservice Queries
 
 Query metadata about all ledgers and graph sources in the system. The nameservice stores information about every database including commit state, index state, and configuration.

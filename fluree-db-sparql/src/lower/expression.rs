@@ -235,7 +235,8 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
                         | FlakeValue::Boolean(_)
                         | FlakeValue::String(_)
                         | FlakeValue::Vector(_)
-                        | FlakeValue::GeoPoint(_),
+                        | FlakeValue::GeoPoint(_)
+                        | FlakeValue::Json(_),
                 ) || fv.is_temporal()
                     || fv.is_duration()
                 {

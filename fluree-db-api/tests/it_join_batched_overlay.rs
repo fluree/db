@@ -1324,3 +1324,117 @@ fn decimal_values(rows: &[serde_json::Value]) -> Vec<String> {
     out.sort();
     out
 }
+
+/// Three subjects probed across a predicate partition of many leaflets: the
+/// batched subject lane loads only the leaflets that can hold them, where it
+/// used to load every leaflet between the lowest and highest probed subject.
+/// Pinned on the indexed lane and under novelty, with a time-travel read whose
+/// replay must still restore a changed value.
+#[tokio::test]
+async fn batched_subject_join_loads_only_leaflets_holding_probed_subjects() {
+    const LANE: &str = "join batched binary scan complete";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-leaflet-skip:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id);
+    let small_leaflets = || {
+        ReindexOptions::default().with_indexer_config(IndexerConfig::default().with_leaflet_rows(4))
+    };
+
+    // The hub lands in its own commit: refs minted with it would take
+    // adjacent subject ids and share one leaflet.
+    let graph: Vec<serde_json::Value> = (0..120)
+        .map(|i| json!({"@id": format!("ex:s{i:03}"), "ex:val": i}))
+        .collect();
+    let receipt = fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("base insert");
+    let hub = json!({"@context": ctx(), "@id": "ex:hub", "ex:ref": [
+        {"@id": "ex:s005"}, {"@id": "ex:s060"}, {"@id": "ex:s115"}
+    ]});
+    let receipt = fluree.insert(receipt.ledger, &hub).await.expect("hub");
+    let base_t = receipt.ledger.t();
+    fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:s060", "ex:val": 60},
+                "insert": {"@id": "ex:s060", "ex:val": 600}
+            }),
+        )
+        .await
+        .expect("change s060");
+    fluree
+        .reindex(ledger_id, small_leaflets())
+        .await
+        .expect("reindex");
+
+    let query = r"PREFIX ex: <http://example.org/ns/>
+        SELECT ?s ?v WHERE { ex:hub ex:ref ?s . ?s ex:val ?v }";
+    let (spans, guard) = span_capture::init_test_tracing();
+    // Sibling tests share the lane's callsite and can pin its interest to
+    // "never" while the subscriber installs: run once, then recompute.
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    run_query(&fluree, &view, query).await;
+    tracing::callsite::rebuild_interest_cache();
+    let leaflets_loaded = |from: usize| -> Vec<u64> {
+        spans.find_events(LANE)[from..]
+            .iter()
+            .map(|e| e.fields["leaflets_scanned"].parse().expect("count"))
+            .collect()
+    };
+    let vals = |rows: &[serde_json::Value]| -> Vec<i64> {
+        let mut v: Vec<i64> = rows.iter().map(|r| r[1].as_i64().expect("int")).collect();
+        v.sort_unstable();
+        v
+    };
+
+    let before = spans.find_events(LANE).len();
+    let rows = run_query(&fluree, &view, query).await;
+    assert_eq!(vals(&rows), [5, 115, 600], "indexed: {rows:?}");
+    assert_eq!(
+        leaflets_loaded(before),
+        [3],
+        "indexed: one leaflet per subject"
+    );
+
+    let view = fluree.db_at_t(ledger_id, base_t).await.expect("base view");
+    let rows = run_query(&fluree, &view, query).await;
+    assert_eq!(
+        vals(&rows),
+        [5, 60, 115],
+        "replayed to the base t: {rows:?}"
+    );
+
+    let ledger = fluree.ledger(ledger_id).await.expect("indexed ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": {"@id": "ex:s005", "ex:val": 5},
+                "insert": {"@id": "ex:s115", "ex:val": 1150}
+            }),
+        )
+        .await
+        .expect("novelty update");
+    let view = fluree.db(ledger_id).await.expect("novelty view");
+    let before = spans.find_events(LANE).len();
+    let rows = run_query(&fluree, &view, query).await;
+    assert_eq!(vals(&rows), [115, 600, 1150], "novelty: {rows:?}");
+    assert_eq!(
+        leaflets_loaded(before),
+        [3],
+        "novelty: one leaflet per subject"
+    );
+    drop(guard);
+
+    fluree
+        .reindex(ledger_id, small_leaflets())
+        .await
+        .expect("reindex ground truth");
+    let view = fluree.db(ledger_id).await.expect("reindexed view");
+    let rows = run_query(&fluree, &view, query).await;
+    assert_eq!(vals(&rows), [115, 600, 1150], "reindexed: {rows:?}");
+}

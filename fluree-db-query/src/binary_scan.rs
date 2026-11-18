@@ -1168,18 +1168,8 @@ impl BinaryScanOperator {
             return Ok(flakes);
         }
 
-        // Populate class cache for all subjects in this batch (deduped).
-        let mut subjects: Vec<Sid> = flakes.iter().map(|f| f.s.clone()).collect();
-        subjects.sort();
-        subjects.dedup();
-        let db = fluree_db_core::GraphDbRef::new(snapshot, g_id, overlay, to_t);
         enforcer
-            .populate_class_cache_for_graph(db, &subjects)
-            .await
-            .map_err(|e| QueryError::Policy(e.to_string()))?;
-
-        enforcer
-            .filter_flakes_for_graph(snapshot, db.g_id, overlay, to_t, &ctx.tracker, flakes)
+            .filter_flakes_for_graph(snapshot, g_id, overlay, to_t, &ctx.tracker, flakes)
             .await
             .map_err(|e| QueryError::Policy(e.to_string()))
     }

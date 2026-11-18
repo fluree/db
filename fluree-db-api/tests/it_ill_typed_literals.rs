@@ -290,6 +290,21 @@ async fn bulk_import_keeps_an_ill_typed_literal() {
     }
 }
 
+/// A JSON-LD query counting the `ex:p` values in every graph that `op`
+/// (`sameTerm` or `=`) relates to `(str-dt "<lexical>" rdf:JSON)`, as the
+/// SPARQL query in [`a_valid_typed_literal_is_one_term_on_every_write_path`]
+/// counts them.
+fn json_twin(op: &str, lexical: &str) -> Value {
+    json!({
+        "@context": {"ex": EX, "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"},
+        "select": ["(as (count ?s) ?n)", "(as (count-distinct ?v) ?terms)"],
+        "where": [["union",
+                    {"@id": "?s", "ex:p": "?v"},
+                    [["graph", "?g", {"@id": "?s", "ex:p": "?v"}]]],
+                  ["filter", format!(r#"({op} ?v (str-dt "{lexical}" rdf:JSON))"#)]]
+    })
+}
+
 /// A valid lexical form is stored as its value on every path, one term
 /// whichever path wrote it.
 #[tokio::test]
@@ -316,6 +331,47 @@ async fn a_valid_typed_literal_is_one_term_on_every_write_path() {
         .await
         .unwrap();
         assert_eq!(rows, json!([[paths, 1]]), "{name}: every path, one term");
+        if dt != CASES[2].0 {
+            continue;
+        }
+        // `rdf:JSON` in another spelling too, and the JSON-LD twin, whose
+        // filter writes the constant with `str-dt`: each is canonicalized
+        // as the writes were, so each is the stored term under `sameTerm`
+        // and `=`.
+        for spelling in [good, "[1, 2]"] {
+            for (op, sparql_filter) in [
+                (
+                    "sameTerm",
+                    format!(r#"sameTerm(?v, "{spelling}"^^rdf:JSON)"#),
+                ),
+                ("=", format!(r#"?v = "{spelling}"^^rdf:JSON"#)),
+            ] {
+                let sparql = query_sparql_formatted(
+                    &fluree,
+                    &ledger,
+                    &format!(
+                        "{PREFIXES} SELECT (COUNT(?s) AS ?n) (COUNT(DISTINCT ?v) AS ?terms)
+                           WHERE {{ {{ ?s ex:p ?v }} UNION {{ GRAPH ?g {{ ?s ex:p ?v }} }}
+                                   FILTER({sparql_filter}) }}"
+                    ),
+                )
+                .await
+                .unwrap();
+                assert_eq!(
+                    sparql,
+                    json!([[paths, 1]]),
+                    "{name}: SPARQL {op} {spelling:?}"
+                );
+                let jsonld = query_jsonld_formatted(&fluree, &ledger, &json_twin(op, spelling))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    jsonld,
+                    json!([[paths, 1]]),
+                    "{name}: JSON-LD {op} {spelling:?}"
+                );
+            }
+        }
     }
 }
 

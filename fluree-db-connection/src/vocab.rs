@@ -104,6 +104,9 @@ pub const FIELD_PARALLELISM: &str = "https://ns.flur.ee/system#parallelism";
 /// Maximum cache size in megabytes
 pub const FIELD_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#cacheMaxMb";
 
+/// Query-result cache ceiling in megabytes, in addition to `cacheMaxMb`
+pub const FIELD_QUERY_RESULT_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#queryResultCacheMaxMb";
+
 /// Index storage reference
 pub const FIELD_INDEX_STORAGE: &str = "https://ns.flur.ee/system#indexStorage";
 
