@@ -255,7 +255,7 @@ mod tests {
             )),
         ];
 
-        let block = collect_inner_join_block(&patterns, 0);
+        let block = collect_inner_join_block(&patterns, 0, false);
         assert_eq!(
             block.end_index,
             patterns.len(),
@@ -354,13 +354,15 @@ mod tests {
         let a = ObjectBounds {
             lower: Some((FlakeValue::Long(10), false)),
             upper: Some((FlakeValue::Long(100), true)),
+            ..ObjectBounds::new()
         };
         let b = ObjectBounds {
             lower: Some((FlakeValue::Long(20), true)),
             upper: Some((FlakeValue::Long(80), false)),
+            ..ObjectBounds::new()
         };
 
-        let merged = merge_object_bounds(&a, &b);
+        let merged = merge_object_bounds(&a, &b).expect("numeric bounds merge");
 
         let (lower_val, _) = merged.lower.as_ref().unwrap();
         assert_eq!(*lower_val, FlakeValue::Long(20));

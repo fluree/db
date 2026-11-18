@@ -69,6 +69,7 @@ Notes:
 Supported:
 - `parallelism` (default 4)
 - `cacheMaxMb` (supports `ConfigurationValue`)
+- `queryResultCacheMaxMb` (supports `ConfigurationValue`): ceiling for [cached query answers](../query/result-cache.md), in addition to `cacheMaxMb`. Default 10% of `cacheMaxMb`; `0` disables. Nothing is allocated until a query opts in
 - `indexStorage` (required): reference to a `Storage` node
 - `commitStorage` (optional): reference to a `Storage` node
 - `primaryPublisher` (optional): reference to a `Publisher` node
