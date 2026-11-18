@@ -538,9 +538,24 @@ mod tests {
         files
     }
 
+    /// Wait until the writer's commit-index line for `t` is on disk: the
+    /// nameservice appends it after the publish returns, without the
+    /// committer waiting on it.
+    async fn commit_index_lists(dir: &std::path::Path, t: i64) {
+        let index = dir.join("ns@v2/peer/main.commits.jsonl");
+        let line = format!("\"t\":{t},");
+        for _ in 0..500 {
+            if std::fs::read_to_string(&index).is_ok_and(|s| s.contains(&line)) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        panic!("the writer never listed t {t} in its commit index");
+    }
+
     /// A shared-storage peer writes nothing under the root: not as it opens
     /// it, loads a ledger, or applies a new commit to the cached ledger.
-    /// Each snapshot is taken after the writer's own commits.
+    /// Each snapshot is taken once the writer's own commit has settled.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_peer_writes_nothing_under_the_root() {
         let dir = tempfile::tempdir().unwrap();
@@ -572,7 +587,8 @@ mod tests {
                     .unwrap()
             }
         };
-        commit(1).await;
+        let first = commit(1).await;
+        commit_index_lists(dir.path(), first.commit_t).await;
 
         let before = files_under(dir.path());
         let peer = Arc::new(
@@ -592,6 +608,7 @@ mod tests {
         assert_eq!(files_under(dir.path()), before, "opening and loading");
 
         let next = commit(2).await;
+        commit_index_lists(dir.path(), next.commit_t).await;
         let before = files_under(dir.path());
         sink.on_event(RemoteEvent::LedgerUpdated(next.clone()))
             .await;
