@@ -313,12 +313,15 @@ pub(super) async fn resolve_block(
     };
     let mapping = provider.compiled_mapping(iri, as_of_t).await?;
     let graph_ctx = ctx.with_active_graph(Arc::clone(iri));
-    let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri)? {
+    let verdicts = match R2rmlPolicyGate::build(&graph_ctx, &mapping, iri).await? {
         None => None,
         Some(mut gate) => match gate
             .static_verdicts(&graph_ctx, &mapping, caps.keyset_max_rows)
-            .await?
-        {
+            .await
+            .inspect_err(|e| {
+                // The lane decided the block, and the decision is a refusal.
+                tracing::debug!(graph = %iri, error = %e, "sql pushdown refused: policy");
+            })? {
             Some(v) => Some(v),
             None => {
                 tracing::debug!(graph = %iri, "sql pushdown declined: policy is not static");
