@@ -472,7 +472,7 @@ No stored format changes. These kinds of earlier data behave differently after t
 
 #### A JSON-LD array or map `@value` needs a `@json` or `@vector` type
 
-A value object whose `@value` is an array or a map is refused unless it, or the term it sits under, types it `@json` or `@vector`: `{"@value": [0.5, 0.25]}` under an untyped term has no literal to stand for. A transaction refused it already, with a message that named no fix, and a bulk import and inline shapes dropped the value without an error. Each now refuses it with a message that names the `@type` to add.
+A value object whose `@value` is an array or a map is refused unless it, or the term it sits under, types it `@json` (or `@vector`, for an array): `{"@value": [0.5, 0.25]}` under an untyped term has no literal to stand for. A transaction refused it already, with a message that named no fix, and a bulk import and inline shapes dropped the value without an error, as a bulk import did a map typed `@vector`. Each now refuses it with a message that names the `@type` to add. A ledger built by an earlier bulk import holds nothing for such a value, and nothing records that it was dropped: to restore one, write it again with the `@type` it needs.
 
 #### Graph-source requests are checked strictly (breaking)
 
