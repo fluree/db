@@ -535,3 +535,31 @@ async fn a_read_only_client_leaves_the_writers_log_to_the_writer() {
         b"recover me"
     );
 }
+
+/// Only `build_client` honors `read_only`. The builds that open the root as
+/// its writer refuse it, rather than recover, sweep and index a root another
+/// process writes.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_writer_builds_refuse_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+
+    let refused = |result: fluree_db_api::Result<Fluree>| match result {
+        Ok(_) => panic!("a read_only builder built a writer"),
+        Err(err) => assert!(err.to_string().contains("build_client"), "{err}"),
+    };
+    refused(FlureeBuilder::file(path.clone()).read_only().build());
+    refused(
+        FlureeBuilder::file(path.clone())
+            .read_only()
+            .build_async()
+            .await,
+    );
+
+    let reader = FlureeBuilder::file(path)
+        .read_only()
+        .build_client()
+        .await
+        .unwrap();
+    assert!(reader.nameservice_mode().is_read_only());
+}
