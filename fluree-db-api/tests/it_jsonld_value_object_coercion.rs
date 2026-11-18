@@ -116,3 +116,61 @@ async fn a_value_object_typed_id_with_a_non_string_value_is_refused() {
         );
     }
 }
+
+/// An array or map `@value` with no `@json` or `@vector` type has no literal
+/// to stand for, and neither has a map typed as a vector, which only an array
+/// can be. A transaction and a bulk import both refuse each: the import used
+/// to drop the value with no error.
+#[tokio::test]
+async fn an_untyped_structured_value_object_is_refused() {
+    for (i, value) in [
+        json!({"@value": [0.5, 0.25]}),
+        json!({"@value": {"a": 1}}),
+        json!({"@value": {"a": 1}, "@type": "@vector"}),
+        json!({"@value": {"a": 1}, "@type": "f:embeddingVector"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+            "@id": "ex:s",
+            "ex:v": value
+        });
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree
+            .create_ledger(&format!("tx/value-object-structured-{i}:main"))
+            .await
+            .expect("genesis");
+        let err = fluree
+            .insert(ledger, &doc)
+            .await
+            .expect_err("an untyped structured @value");
+        assert_eq!(err.status_code(), 400, "{value}: {err}");
+        assert!(
+            err.to_string().contains(r#""@type": "@json""#),
+            "{value}: {err}"
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let file = data.path().join("doc.jsonld");
+        std::fs::write(&file, doc.to_string()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = FlureeBuilder::file(root.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+            .create(&format!("import/value-object-structured-{i}:main"))
+            .import(&file)
+            .threads(1)
+            .memory_budget_mb(256)
+            .execute()
+            .await
+            .expect_err("a bulk import of an untyped structured @value");
+        assert!(
+            err.to_string().contains(r#""@type": "@json""#),
+            "{value}: {err}"
+        );
+    }
+}
