@@ -506,7 +506,12 @@ fn parse_value_object(
             _ => None,
         }),
     };
-    if (val.is_array() || val.is_object()) && !holds_structured_value(type_iri.as_deref(), val) {
+    // A value object typed `@id` gets its own message below, which names
+    // its fix: a string IRI.
+    if (val.is_array() || val.is_object())
+        && type_iri.as_deref() != Some("@id")
+        && !holds_structured_value(type_iri.as_deref(), val)
+    {
         return Err(JsonLdError::InvalidKeywordValue {
             keyword: "@value",
             reason: "a value object whose @value is an array or a map needs \"@type\": \
@@ -2006,6 +2011,13 @@ mod tests {
             let expanded =
                 values_of_p(json!({"@context": ctx, "p": {"@value": value, "@type": ty}}));
             assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
+
+        // Typed `@id`, an array or a map is told the IRI must be a string.
+        for value in [json!(["ex:a"]), json!({"@id": "ex:a"})] {
+            let doc = json!({"@context": {"p": p}, "p": {"@value": value, "@type": "@id"}});
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "{value}: {err}");
         }
 
         let vector = json!({"p": {"@id": p, "@type": "@vector"}});
