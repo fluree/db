@@ -9,7 +9,8 @@
 //! A named graph's IRI and a datatype's take the same encoding: before it, a
 //! write into an overflow-IRI graph was refused as naming an unknown graph.
 //! The planner and the schema catalogs find an overflow predicate's and
-//! class's stats under that Sid too.
+//! class's stats under that Sid too, and a policy identity's IRI is found
+//! under it, so its policies apply.
 
 use crate::support;
 use fluree_db_api::{Batch, Fluree, FlureeBuilder, LedgerState};
@@ -33,6 +34,14 @@ const CLASS_P: &str = "http://old.example/q";
 
 fn row_count(result: &fluree_db_api::QueryResult) -> usize {
     result.batches.iter().map(Batch::len).sum()
+}
+
+/// One subject per namespace, enough to take every user code: an IRI with
+/// a new prefix written after these is stored whole, under `OVERFLOW`.
+fn table_fillers() -> Vec<Value> {
+    (0..namespaces::OVERFLOW as usize)
+        .map(|i| json!({"@id": format!("http://ns{i}.example/s"), LABEL: "filler"}))
+        .collect()
 }
 
 async fn sparql_update(fluree: &Fluree, ledger: LedgerState, body: &str) -> LedgerState {
@@ -64,9 +73,7 @@ async fn constant_overflow_iris_match_in_novelty_and_the_index() {
     let id = "it/overflow-iri-bound:main";
     let ledger = fluree.create_ledger(id).await.expect("create");
 
-    let mut graph: Vec<_> = (0..namespaces::OVERFLOW as usize)
-        .map(|i| json!({"@id": format!("http://ns{i}.example/s"), LABEL: "filler"}))
-        .collect();
+    let mut graph = table_fillers();
     graph.push(json!({
         "@id": OLD, LABEL: "old", OLD_P: 1, LINK: {"@id": OLD_O},
         CODE: {"@value": "x", "@type": DT}
@@ -303,4 +310,84 @@ async fn constant_overflow_iris_match_in_novelty_and_the_index() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// An identity whose IRI is stored under `OVERFLOW` has its `f:policyClass`
+/// policies applied to its queries, while it is only in novelty and once it
+/// is indexed. Its IRI must encode as the write stored it for the identity
+/// to be found at all.
+#[tokio::test]
+async fn an_overflow_identity_has_its_policies_applied() {
+    const SECRET: &str = "http://example.org/secret";
+    const USER: &str = "http://example.org/user";
+    const IDENTITY: &str = "http://identities.example/alice";
+    const POLICY_CLASS: &str = "http://identities.example/EmployeePolicy";
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .expect("file fluree");
+    let id = "it/overflow-iri-identity:main";
+    let ledger = fluree.create_ledger(id).await.expect("create");
+    let mut graph = table_fillers();
+    graph.push(json!({"@id": OLD, SECRET: "old's"}));
+    graph.push(json!({"@id": OLD_O, SECRET: "someone else's"}));
+    let ledger = fluree
+        .insert(ledger, &json!({"@graph": graph}))
+        .await
+        .expect("seed")
+        .ledger;
+
+    // Only the identity's own user's secret is visible to it.
+    let only_its_user = serde_json::to_string(&json!({
+        "where": {"@id": "?$identity", USER: {"@id": "?$this"}}
+    }))
+    .unwrap();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {
+                        "@id": IDENTITY,
+                        "f:policyClass": {"@id": POLICY_CLASS},
+                        USER: {"@id": OLD}
+                    },
+                    {
+                        "@id": "http://identities.example/secretPolicy",
+                        "@type": ["f:AccessPolicy", POLICY_CLASS],
+                        "f:required": true,
+                        "f:onProperty": [{"@id": SECRET}],
+                        "f:action": {"@id": "f:view"},
+                        "f:query": {"@value": only_its_user, "@type": "http://www.w3.org/2001/XMLSchema#string"}
+                    }
+                ]
+            }),
+        )
+        .await
+        .expect("identity and policy")
+        .ledger;
+    assert!(
+        ledger
+            .snapshot
+            .encode_iri(IDENTITY)
+            .is_some_and(|sid| sid.namespace_code == namespaces::OVERFLOW),
+        "the fixture must store the identity under OVERFLOW"
+    );
+
+    let secrets_seen = || async {
+        let query = json!({
+            "from": id,
+            "opts": {"identity": IDENTITY, "default-allow": true},
+            "select": "?secret",
+            "where": {"@id": "?s", SECRET: "?secret"}
+        });
+        row_count(&fluree.query_connection(&query).await.expect("query"))
+    };
+    assert_eq!(secrets_seen().await, 1, "identity only in novelty");
+    support::rebuild_and_publish_index(&fluree, id).await;
+    fluree.disconnect_ledger(id).await;
+    assert_eq!(secrets_seen().await, 1, "identity indexed");
 }
