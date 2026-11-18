@@ -323,16 +323,18 @@ pub struct PropertyPolicyEntry {
 
 /// Indexed policy set
 ///
-/// View-set class policies are indexed INTO by_property (pre-expanded via
-/// class→property stats); modify-set class policies are indexed by class in
-/// `by_class`. This is designed for efficient lookup.
+/// A view set's class policies are indexed INTO by_property (pre-expanded via
+/// class→property stats); a modify set's, and those of the view set a
+/// reasoning query reads ([`Self::selecting_classes_by_subject`]), are indexed
+/// by class in `by_class`. This is designed for efficient lookup.
 #[derive(Debug, Default, Clone)]
 pub struct PolicySet {
     /// All restrictions in parse order (insertion order preserved)
     pub restrictions: Vec<PolicyRestriction>,
     /// Index: subject SID -> restriction indices
     pub by_subject: HashMap<Sid, Vec<usize>>,
-    /// Index: property SID -> property policy entries (includes view-set class policies!)
+    /// Index: property SID -> property policy entries (includes stats-expanded
+    /// view-set class policies!)
     /// Each entry includes whether class check is needed for that specific property
     pub by_property: HashMap<Sid, Vec<PropertyPolicyEntry>>,
     /// Index: class SID -> restriction indices.
@@ -403,8 +405,9 @@ impl PolicySet {
     }
 
     /// Collect the deduplicated class-bucket restriction indices for a
-    /// subject's classes, in insertion order. Empty unless this is a modify
-    /// set with `f:onClass` policies.
+    /// subject's classes, in insertion order. Empty unless this set selects
+    /// `f:onClass` policies by class: a modify set, or a view set for a
+    /// reasoning query.
     fn class_bucket_indices(&self, subject_classes: &[Sid]) -> Vec<usize> {
         if self.by_class.is_empty() {
             return Vec::new();
@@ -434,14 +437,14 @@ impl PolicySet {
     ) -> Vec<&PolicyRestriction> {
         let mut candidates = Vec::new();
 
-        // 1. Property-specific (includes view-set class policies mapped here)
+        // 1. Property-specific (includes stats-expanded view-set class policies)
         if let Some(entries) = self.by_property.get(property) {
             for entry in entries {
                 candidates.push(&self.restrictions[entry.idx]);
             }
         }
 
-        // 2. Class-specific (modify sets)
+        // 2. Class-specific (modify sets, and a reasoning query's view set)
         for idx in self.class_bucket_indices(subject_classes) {
             candidates.push(&self.restrictions[idx]);
         }
@@ -482,7 +485,7 @@ impl PolicySet {
     ) -> Vec<FlakePolicyEntry> {
         let mut candidates = Vec::new();
 
-        // 1. Property-specific (includes view-set class policies mapped here)
+        // 1. Property-specific (includes stats-expanded view-set class policies)
         // Uses per-property class_check_needed
         if let Some(entries) = self.by_property.get(property) {
             for entry in entries {
@@ -493,7 +496,8 @@ impl PolicySet {
             }
         }
 
-        // 2. Class-specific (modify sets): selection by class IS the check
+        // 2. Class-specific (modify sets, and a reasoning query's view set):
+        //    selection by class IS the check
         for idx in self.class_bucket_indices(subject_classes) {
             candidates.push(FlakePolicyEntry {
                 idx,
