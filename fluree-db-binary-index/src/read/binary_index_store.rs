@@ -699,7 +699,7 @@ impl BinaryIndexStore {
         }
 
         let mut pool_deltas = HashMap::new();
-        let deltas_started = std::time::Instant::now();
+        let deltas_started = Instant::now();
         // Orders whose runs need fetching: (order, run cids, runs already
         // decoded, their events).
         let mut pending: Vec<(
