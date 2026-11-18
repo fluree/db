@@ -5449,6 +5449,24 @@ mod tests {
         assert_eq!(psot_p_run(&homogeneous, &replayed, 7, true), (2, 4));
     }
 
+    #[test]
+    fn leaflet_keys_decline_only_at_head_and_only_when_homogeneous() {
+        let probed = [10, 20, 30];
+        let may_hold = |p_const, first, last, replays| {
+            psot_leaflet_may_hold_subjects(&psot_leaflet(p_const, first, last), 7, &probed, replays)
+        };
+        // Both key endpoints are inclusive.
+        assert!(may_hold(Some(7), (7, 11), (7, 20), false));
+        assert!(may_hold(Some(7), (7, 30), (7, 40), false));
+        assert!(!may_hold(Some(7), (7, 11), (7, 19), false));
+        assert!(!may_hold(Some(7), (7, 31), (7, 99), false));
+        // A mixed leaflet's keys are no subject interval.
+        assert!(may_hold(None, (5, 11), (7, 19), false));
+        // A replay can restore subjects the live keys leave out.
+        assert!(may_hold(Some(7), (7, 11), (7, 19), true));
+        assert!(may_hold(Some(7), (7, 31), (7, 99), true));
+    }
+
     fn count_join(inline_ops: Vec<InlineOperator>, batches: Vec<Batch>) -> NestedLoopJoinOperator {
         let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
         NestedLoopJoinOperator::new(
