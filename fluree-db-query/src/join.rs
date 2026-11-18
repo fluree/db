@@ -329,6 +329,59 @@ pub(crate) fn prepare_leaf_for_scan(
     Ok(LeafScan { handle, leaf_id })
 }
 
+/// Whether a PSOT leaf can hold any of the sorted `s_ids` under `p_id`,
+/// judged from its branch keys before the leaf is opened. The keys bound
+/// `p_id`'s subjects, open-ended where the leaf starts or ends inside another
+/// predicate. A history replay is never declined: the writers widen keys over
+/// the history they keep (#1624), but the probe does not lean on that to
+/// reach a subject that exists only at an earlier `t`.
+fn psot_leaf_may_hold_subjects(
+    leaf: &fluree_db_binary_index::format::branch::LeafEntry,
+    p_id: u32,
+    s_ids: &[u64],
+    replays_history: bool,
+) -> bool {
+    if replays_history {
+        return true;
+    }
+    let (first, last) = (&leaf.first_key, &leaf.last_key);
+    if first.p_id > p_id || last.p_id < p_id {
+        return false;
+    }
+    let lo = if first.p_id == p_id {
+        first.s_id.as_u64()
+    } else {
+        0
+    };
+    let hi = if last.p_id == p_id {
+        last.s_id.as_u64()
+    } else {
+        u64::MAX
+    };
+    holds_any_subject(s_ids, lo, hi)
+}
+
+/// [`psot_leaf_may_hold_subjects`] for a SPOT leaf, whose keys bound its
+/// subjects directly.
+fn spot_leaf_may_hold_subjects(
+    leaf: &fluree_db_binary_index::format::branch::LeafEntry,
+    s_ids: &[u64],
+    replays_history: bool,
+) -> bool {
+    replays_history
+        || holds_any_subject(
+            s_ids,
+            leaf.first_key.s_id.as_u64(),
+            leaf.last_key.s_id.as_u64(),
+        )
+}
+
+/// Whether any of the sorted `s_ids` lies in `[lo, hi]`.
+fn holds_any_subject(s_ids: &[u64], lo: u64, hi: u64) -> bool {
+    let next = s_ids.partition_point(|&s| s < lo);
+    s_ids.get(next).is_some_and(|&s| s <= hi)
+}
+
 /// The row range of `p_id` in a PSOT leaflet; the whole leaflet when it holds
 /// one predicate.
 ///
@@ -3242,11 +3295,17 @@ impl NestedLoopJoinOperator {
     ) -> Result<()> {
         let scan_start = Instant::now();
 
+        let mut leaves_opened: u64 = 0;
         let mut leaflets_scanned: u64 = 0;
         let mut matched_rows: u64 = 0;
         let need_replay = ctx.to_t < store.max_t();
         let replay_to = need_replay.then_some(ctx.to_t);
         let proj = fluree_db_binary_index::ColumnProjection::all();
+        // Leaves are checked only while the probe set is under twice the
+        // leaf range. Past that, scattered subjects leave few leaves empty,
+        // and the check in this loop measurably slows a dense probe even
+        // when it skips nothing; such a probe opens every leaf in range.
+        let check_leaves = unique_s_ids.len() < 2 * leaf_range.len();
 
         if let Some(g_id) = pooled_graph {
             debug_assert!(probe_ops.is_none(), "pooled subject lane runs overlay-free");
@@ -3267,6 +3326,12 @@ impl NestedLoopJoinOperator {
         for leaf_idx in leaf_range {
             ctx.check_cancelled()?;
             let leaf_entry = &branch.leaves[leaf_idx];
+            if check_leaves
+                && !psot_leaf_may_hold_subjects(leaf_entry, p_id, unique_s_ids, need_replay)
+            {
+                continue;
+            }
+            leaves_opened += 1;
             let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
             for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
@@ -3423,6 +3488,7 @@ impl NestedLoopJoinOperator {
 
         tracing::debug!(
             scan_ms = (scan_start.elapsed().as_secs_f64() * 1000.0) as u64,
+            leaves_opened,
             leaflets_scanned,
             matched_rows,
             "join batched binary scan complete"
@@ -5590,10 +5656,15 @@ fn batched_subject_probe_binary_uncharged(
     let replay_to = need_replay.then_some(ctx.to_t);
     let proj = ColumnProjection::all();
     let mut out = Vec::new();
+    let mut leaves_opened = 0u64;
 
     for leaf_idx in leaf_range {
         ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
+        if !psot_leaf_may_hold_subjects(leaf_entry, p_id, &unique_s_ids, need_replay) {
+            continue;
+        }
+        leaves_opened += 1;
         let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
@@ -5715,6 +5786,12 @@ fn batched_subject_probe_binary_uncharged(
         }
     }
 
+    tracing::debug!(
+        subjects = unique_s_ids.len(),
+        leaves_opened,
+        matches = out.len(),
+        "batched subject probe complete"
+    );
     Ok(out)
 }
 
@@ -6021,10 +6098,15 @@ fn batched_subject_star_spot_uncharged(
     let proj = ColumnProjection::all();
     let mut out = Vec::new();
     let (mut leaflets_read, mut leaflets_replayed, mut leaflets_skipped) = (0u64, 0u64, 0u64);
+    let mut leaves_opened = 0u64;
 
     for leaf_idx in leaf_range {
         ctx.check_cancelled()?;
         let leaf_entry = &branch.leaves[leaf_idx];
+        if !spot_leaf_may_hold_subjects(leaf_entry, &unique_s_ids, need_replay) {
+            continue;
+        }
+        leaves_opened += 1;
         let leaf = prepare_leaf_for_scan(store, leaf_entry, need_replay)?;
 
         for (leaflet_idx, entry) in leaf.dir().entries.iter().enumerate() {
@@ -6134,6 +6216,7 @@ fn batched_subject_star_spot_uncharged(
 
     tracing::debug!(
         subjects = unique_s_ids.len(),
+        leaves_opened,
         leaflets_read,
         leaflets_replayed,
         leaflets_skipped,
@@ -6239,6 +6322,70 @@ mod tests {
                     assert_eq!(got, expect_lo..expect_hi, "stride {stride} target {target}");
                 }
             }
+        }
+    }
+
+    fn leaf_spanning(
+        first: (u32, u64),
+        last: (u32, u64),
+    ) -> fluree_db_binary_index::format::branch::LeafEntry {
+        let key =
+            |(p_id, s_id): (u32, u64)| fluree_db_binary_index::format::run_record_v2::RunRecordV2 {
+                s_id: SubjectId::from_u64(s_id),
+                o_key: 0,
+                p_id,
+                t: 0,
+                o_i: 0,
+                o_type: 0,
+                g_id: 0,
+            };
+        fluree_db_binary_index::format::branch::LeafEntry {
+            first_key: key(first),
+            last_key: key(last),
+            row_count: 1,
+            leaf_cid: fluree_db_core::ContentId::new(
+                fluree_db_core::ContentKind::IndexLeaf,
+                b"leaf",
+            ),
+            sidecar_cid: None,
+        }
+    }
+
+    #[test]
+    fn leaf_keys_decline_only_leaves_without_a_probed_subject() {
+        let probed = [10, 20, 30];
+        let psot = |first, last| {
+            psot_leaf_may_hold_subjects(&leaf_spanning(first, last), 7, &probed, false)
+        };
+        // Within the predicate, both endpoints are inclusive.
+        assert!(psot((7, 11), (7, 20)));
+        assert!(psot((7, 30), (7, 40)));
+        assert!(!psot((7, 11), (7, 19)));
+        // Open-ended where the leaf starts or ends inside another predicate.
+        assert!(psot((6, 99), (7, 10)));
+        assert!(!psot((6, 5), (7, 9)));
+        assert!(psot((7, 30), (8, 0)));
+        assert!(!psot((7, 31), (8, 0)));
+        assert!(psot((6, 50), (8, 0)));
+        // Wholly before or after the predicate.
+        assert!(!psot((5, 0), (6, 50)));
+        assert!(!psot((8, 0), (9, 0)));
+
+        let spot =
+            |first, last| spot_leaf_may_hold_subjects(&leaf_spanning(first, last), &probed, false);
+        assert!(spot((99, 15), (0, 20)));
+        assert!(!spot((0, 21), (99, 29)));
+        assert!(!spot_leaf_may_hold_subjects(
+            &leaf_spanning((0, 0), (0, u64::MAX)),
+            &[],
+            false
+        ));
+
+        // A history replay opens every leaf, whatever its keys.
+        for (first, last) in [((7, 11), (7, 19)), ((8, 0), (9, 0)), ((0, 21), (99, 29))] {
+            let leaf = leaf_spanning(first, last);
+            assert!(psot_leaf_may_hold_subjects(&leaf, 7, &probed, true));
+            assert!(spot_leaf_may_hold_subjects(&leaf, &probed, true));
         }
     }
 

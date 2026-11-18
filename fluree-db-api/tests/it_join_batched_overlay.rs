@@ -1445,3 +1445,132 @@ async fn batched_subject_join_loads_only_leaflets_holding_probed_subjects() {
     let rows = run_query(&fluree, &view, query).await;
     assert_eq!(vals(&rows), [115, 600, 1150], "reindexed: {rows:?}");
 }
+
+/// Four subjects probed over leaves of two small leaflets: the nested-loop
+/// join, the OPTIONAL probe and the property join's SPOT walk each open only
+/// the leaves that can hold a probed subject, where they opened every leaf
+/// between the lowest and highest one. The partition's first subject sits in
+/// a leaf that starts inside another predicate, where the PSOT bound is
+/// open-ended. A time-travel read, which opens them all, still restores a
+/// changed value and a subject whose only value was retracted.
+#[tokio::test]
+async fn subject_probes_open_only_leaves_holding_probed_subjects() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/join-batched-leaf-skip:main";
+    let ledger = genesis_ledger_for_fluree(&fluree, ledger_id).await;
+    let probed = [0, 5, 60, 115];
+    let graph: Vec<serde_json::Value> = (0..120)
+        .map(|i| {
+            let mut s = json!({
+                "@id": format!("ex:s{i:03}"),
+                "ex:val": i, "ex:tag": format!("t{i}"), "ex:num": i * 2
+            });
+            if probed.contains(&i) {
+                s["ex:group"] = json!("g");
+            }
+            s
+        })
+        .collect();
+    let receipt = fluree
+        .insert(ledger, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("base insert");
+    // Refs minted with the hub would take adjacent subject ids.
+    let hub = json!({"@context": ctx(), "@id": "ex:hub", "ex:ref": [
+        {"@id": "ex:s000"}, {"@id": "ex:s005"}, {"@id": "ex:s060"},
+        {"@id": "ex:s115"}
+    ]});
+    let receipt = fluree.insert(receipt.ledger, &hub).await.expect("hub");
+    let base_t = receipt.ledger.t();
+    fluree
+        .update(
+            receipt.ledger,
+            &json!({
+                "@context": ctx(),
+                "delete": [
+                    {"@id": "ex:s060", "ex:val": 60},
+                    {"@id": "ex:s115", "ex:val": 115}
+                ],
+                "insert": {"@id": "ex:s060", "ex:val": 600}
+            }),
+        )
+        .await
+        .expect("change s060, retract s115");
+    fluree
+        .reindex(
+            ledger_id,
+            ReindexOptions::default().with_indexer_config(
+                IndexerConfig::default()
+                    .with_leaflet_rows(4)
+                    .with_leaf_rows(8),
+            ),
+        )
+        .await
+        .expect("reindex");
+
+    // (lane, its event, query with ?v second, most leaves it may open). A
+    // subject's SPOT rows can straddle two leaves.
+    let lanes = [
+        (
+            "nested loop",
+            "join batched binary scan complete",
+            r"PREFIX ex: <http://example.org/ns/>
+            SELECT ?s ?v WHERE { ex:hub ex:ref ?s . ?s ex:val ?v }",
+            4,
+        ),
+        (
+            "optional",
+            "batched subject probe complete",
+            r"PREFIX ex: <http://example.org/ns/>
+            SELECT ?s ?v WHERE { ex:hub ex:ref ?s . OPTIONAL { ?s ex:val ?v } }",
+            4,
+        ),
+        (
+            "spot star",
+            "spot star walk",
+            r#"PREFIX ex: <http://example.org/ns/>
+            SELECT ?s ?v ?t ?n
+            WHERE { ?s ex:group "g" . ?s ex:val ?v . ?s ex:tag ?t . ?s ex:num ?n }"#,
+            8,
+        ),
+    ];
+    // The OPTIONAL lane keeps s115 with ?v unbound; only bound values count.
+    let vals = |rows: &[serde_json::Value]| -> Vec<i64> {
+        let mut v: Vec<i64> = rows.iter().filter_map(|r| r[1].as_i64()).collect();
+        v.sort_unstable();
+        v
+    };
+
+    let view = fluree.db(ledger_id).await.expect("indexed view");
+    let (spans, guard) = span_capture::init_test_tracing();
+    // Sibling tests share these callsites and can pin their interest to
+    // "never" while the subscriber installs: run once, then recompute.
+    for (_, _, query, _) in &lanes {
+        run_query(&fluree, &view, query).await;
+    }
+    tracing::callsite::rebuild_interest_cache();
+    for (lane, event, query, max_leaves) in &lanes {
+        let before = spans.find_events(event).len();
+        let rows = run_query(&fluree, &view, query).await;
+        assert_eq!(vals(&rows), [0, 5, 600], "{lane}: {rows:?}");
+        let opened: Vec<u64> = spans.find_events(event)[before..]
+            .iter()
+            .map(|e| e.fields["leaves_opened"].parse().expect("count"))
+            .collect();
+        assert!(
+            !opened.is_empty() && opened.iter().all(|n| n <= max_leaves),
+            "{lane}: leaves opened per probe {opened:?}, at most {max_leaves}"
+        );
+    }
+    drop(guard);
+
+    let view = fluree.db_at_t(ledger_id, base_t).await.expect("base view");
+    for (lane, _, query, _) in &lanes {
+        let rows = run_query(&fluree, &view, query).await;
+        assert_eq!(
+            vals(&rows),
+            [0, 5, 60, 115],
+            "{lane} at the base t: {rows:?}"
+        );
+    }
+}
