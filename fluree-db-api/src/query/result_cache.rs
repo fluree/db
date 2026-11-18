@@ -169,60 +169,6 @@ pub(crate) enum ViewAnswer {
     },
 }
 
-/// Everything about `db` that decides what a query sees. `Err` names what
-/// the cache cannot key.
-fn hash_view<H: Hasher>(db: &GraphDb, h: &mut H) -> std::result::Result<(), &'static str> {
-    if db.graph_source_id.is_some() || db.over_graph_source {
-        return Err("graph source");
-    }
-    if !db.cross_ledger_resolved_heads.is_empty() {
-        return Err("cross-ledger governance");
-    }
-    view_state(db)?.hash(h);
-    db.graph_id.hash(h);
-    db.union_default_graph.hash(h);
-    match &db.default_context {
-        None => 0u8.hash(h),
-        Some(ctx) => {
-            1u8.hash(h);
-            serde_json::to_vec(ctx)
-                .map_err(|_| "default context")?
-                .hash(h);
-        }
-    }
-    match db.policy() {
-        None => 0u8.hash(h),
-        Some(policy) => {
-            1u8.hash(h);
-            if !policy.hash_view_policy(h) {
-                return Err("f:query policy");
-            }
-        }
-    }
-    Ok(())
-}
-
-/// The ledger state `db` reads. A new commit or index build changes it: the
-/// overlay's content version is unique to its contents, and the index root
-/// is content-addressed.
-fn view_state(db: &GraphDb) -> std::result::Result<u128, &'static str> {
-    let content_version = db
-        .overlay
-        .content_version()
-        .ok_or("overlay without a content version")?;
-    let index_root = db.snapshot.index_root_id();
-    if db.snapshot.t > 0 && index_root.is_none() {
-        return Err("index root unknown");
-    }
-    let mut h = Xxh3::new();
-    db.ledger_id.hash(&mut h);
-    db.t.hash(&mut h);
-    db.snapshot.t.hash(&mut h);
-    index_root.map(ToString::to_string).hash(&mut h);
-    content_version.hash(&mut h);
-    Ok(h.digest128())
-}
-
 /// The query text, without the opts that only control the cache or tracking.
 fn hash_input<H: Hasher>(
     input: &QueryInput<'_>,
@@ -272,7 +218,7 @@ impl Fluree {
             hash_input(&input, &mut h)
                 .and_then(|()| options.hash_for_result_cache(&mut h))
                 .and_then(|()| format.hash_for_result_cache(&mut h))
-                .and_then(|()| hash_view(db, &mut h))
+                .and_then(|()| db.hash_for_result_cache(&mut h))
         } else {
             Err("result cache disabled")
         };

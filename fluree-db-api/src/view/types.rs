@@ -1044,6 +1044,97 @@ impl std::fmt::Debug for DerivedFactsHandle {
     }
 }
 
+// ============================================================================
+// Query-result cache
+// ============================================================================
+
+impl GraphDb {
+    /// Hash everything about this view that decides a query's answer, for
+    /// the query-result cache. `Err` names what the cache cannot key.
+    ///
+    /// The ledger state is the overlay's content version, unique to its
+    /// contents, and the content-addressed index root: a commit, an index
+    /// build or a recreated ledger changes one of them.
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            snapshot,
+            overlay,
+            t,
+            ledger_id,
+            graph_id,
+            policy,
+            default_context,
+            union_default_graph,
+            cross_ledger_resolved_heads,
+            graph_source_id,
+            graph_source_time,
+            over_graph_source,
+            // Derived from the ledger state hashed below.
+            novelty: _,
+            binary_store: _,
+            dict_novelty: _,
+            runtime_small_dicts: _,
+            ledger_config: _,
+            resolved_config: _,
+            config_absent: _,
+            // Read only when reasoning or rules run, which the caller
+            // bypasses once the plan shows them.
+            reasoning: _,
+            reasoning_precedence: _,
+            config_reasoning_budget: _,
+            datalog_enabled: _,
+            query_time_rules_allowed: _,
+            datalog_override_allowed: _,
+            rules_source_g_id: _,
+            // Serves `f:query` restrictions, which the policy hash refuses.
+            policy_enforcer: _,
+        } = self;
+        if graph_source_id.is_some() || graph_source_time.is_some() || *over_graph_source {
+            return Err("graph source");
+        }
+        if !cross_ledger_resolved_heads.is_empty() {
+            return Err("cross-ledger governance");
+        }
+        let content_version = overlay
+            .content_version()
+            .ok_or("overlay without a content version")?;
+        let index_root = snapshot.index_root_id();
+        if snapshot.t > 0 && index_root.is_none() {
+            return Err("index root unknown");
+        }
+        ledger_id.hash(h);
+        t.hash(h);
+        snapshot.t.hash(h);
+        index_root.hash(h);
+        content_version.hash(h);
+        graph_id.hash(h);
+        union_default_graph.hash(h);
+        match default_context {
+            None => 0u8.hash(h),
+            Some(ctx) => {
+                1u8.hash(h);
+                serde_json::to_vec(ctx)
+                    .map_err(|_| "default context")?
+                    .hash(h);
+            }
+        }
+        match policy {
+            None => 0u8.hash(h),
+            Some(policy) => {
+                1u8.hash(h);
+                if !policy.hash_view_policy(h) {
+                    return Err("f:query policy");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
