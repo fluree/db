@@ -42,6 +42,9 @@ const ENTRY_OVERHEAD_BYTES: u64 = 128;
 /// The pool of opted-in answers.
 pub(crate) struct ResultCache {
     max_bytes: u64,
+    /// Seeds every key, so a request cannot be built offline to collide
+    /// with another's key and be served its answer.
+    seed: u64,
     pool: OnceLock<Cache<u128, Arc<[u8]>>>,
 }
 
@@ -50,6 +53,7 @@ impl ResultCache {
     pub(crate) fn with_max_mb(mb: usize) -> Self {
         Self {
             max_bytes: (mb as u64).saturating_mul(1024 * 1024),
+            seed: uuid::Uuid::new_v4().as_u64_pair().0,
             pool: OnceLock::new(),
         }
     }
@@ -263,7 +267,7 @@ impl Fluree {
             result: Box::new(result),
             insert: None,
         };
-        let mut h = Xxh3::new();
+        let mut h = Xxh3::with_seed(self.result_cache.seed);
         KEY_VERSION.hash(&mut h);
         std::mem::discriminant(&rendering).hash(&mut h);
         // The query text last: a request that bypasses is refused before
