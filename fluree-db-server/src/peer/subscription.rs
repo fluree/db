@@ -517,6 +517,94 @@ mod tests {
         assert_eq!(watermark.commit_t, next.commit_t);
     }
 
+    /// Every file under `dir`, with its length and modification time.
+    fn files_under(
+        dir: &std::path::Path,
+    ) -> std::collections::BTreeMap<std::path::PathBuf, (u64, std::time::SystemTime)> {
+        let mut files = std::collections::BTreeMap::new();
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(next) = pending.pop() {
+            for entry in std::fs::read_dir(&next).unwrap() {
+                let entry = entry.unwrap();
+                let meta = entry.metadata().unwrap();
+                if meta.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    let path = entry.path().strip_prefix(dir).unwrap().to_path_buf();
+                    files.insert(path, (meta.len(), meta.modified().unwrap()));
+                }
+            }
+        }
+        files
+    }
+
+    /// A shared-storage peer writes nothing under the root: not as it opens
+    /// it, loads a ledger, or applies a new commit to the cached ledger.
+    /// Each snapshot is taken after the writer's own commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_peer_writes_nothing_under_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().to_string_lossy().to_string();
+        let writer = FlureeBuilder::file(path.clone())
+            .without_indexing()
+            .build()
+            .unwrap();
+        let commit = |n: usize| {
+            let writer = &writer;
+            async move {
+                let ledger = match writer.ledger("peer:main").await {
+                    Ok(ledger) => ledger,
+                    Err(_) => writer.create_ledger("peer:main").await.unwrap(),
+                };
+                writer
+                    .insert(
+                        ledger,
+                        &json!({"@context": {"ex": "http://example.org/"},
+                                "@id": format!("ex:s{n}"), "ex:p": n}),
+                    )
+                    .await
+                    .unwrap();
+                writer
+                    .nameservice()
+                    .lookup("peer:main")
+                    .await
+                    .unwrap()
+                    .unwrap()
+            }
+        };
+        commit(1).await;
+
+        let before = files_under(dir.path());
+        let peer = Arc::new(
+            FlureeBuilder::file(path)
+                .read_only()
+                .build_client()
+                .await
+                .unwrap(),
+        );
+        let sink = PeerEventSink::new(
+            ServerConfig::default(),
+            Arc::new(PeerState::new()),
+            Arc::clone(&peer),
+        );
+        sink.on_event(RemoteEvent::Connected).await;
+        peer.ledger_cached("peer:main").await.unwrap();
+        assert_eq!(files_under(dir.path()), before, "opening and loading");
+
+        let next = commit(2).await;
+        let before = files_under(dir.path());
+        sink.on_event(RemoteEvent::LedgerUpdated(next.clone()))
+            .await;
+        settled(&sink).await;
+        let cached_t = peer
+            .ledger_manager()
+            .unwrap()
+            .current_t(&LedgerId::parse("peer:main").unwrap())
+            .await;
+        assert_eq!(cached_t, Some(next.commit_t), "the commit was applied");
+        assert_eq!(files_under(dir.path()), before, "applying a commit");
+    }
+
     /// A shared-storage peer opens the root as a reader.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_peer_cannot_write_the_nameservice() {
