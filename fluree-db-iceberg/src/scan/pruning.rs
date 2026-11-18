@@ -13,7 +13,7 @@
 use crate::manifest::value_codec::TypedValue;
 use crate::manifest::{decode_by_type_string, DataFile, PartitionFieldSummary};
 use crate::metadata::Schema;
-use crate::scan::predicate::{ComparisonOp, Expression, LiteralValue};
+use crate::scan::predicate::{ComparisonOp, Expression, InSet, LiteralValue};
 use parquet::file::metadata::{ColumnChunkMetaData, RowGroupMetaData};
 use parquet::file::statistics::Statistics;
 use std::collections::HashMap;
@@ -124,10 +124,8 @@ pub fn can_contain_file(expr: &Expression, data_file: &DataFile, schema: &Schema
         Expression::In {
             field_id, values, ..
         } => {
-            // Any value in the list might be in range
-            values
-                .iter()
-                .any(|v| can_contain_comparison(*field_id, ComparisonOp::Eq, v, data_file, schema))
+            // Any value in the list might be in range.
+            can_contain_in(*field_id, values, data_file, schema)
         }
         Expression::NotIn { .. } => {
             // NOT IN is hard to prune with just min/max bounds
@@ -135,6 +133,121 @@ pub fn can_contain_file(expr: &Expression, data_file: &DataFile, schema: &Schema
             true
         }
     }
+}
+
+/// The members of an `IN`, arranged once so a file or row group is decided by
+/// a binary search per kind of member rather than a check per member.
+///
+/// Each member is the typed value pruning compares ([`LiteralValue::to_typed_value`]).
+/// A member of a kind whose comparisons are total (booleans, integers, dates,
+/// timestamps, strings, bytes, non-NaN floats) joins the sorted, deduplicated
+/// run of its kind. Every other member (decimals, whose comparison across
+/// scales can come back unknown; NaN floats; UUIDs) is checked one by one, as
+/// before. A file or row group may hold a member iff some member's equality
+/// check ([`eq_bounds_can_contain`]) says so; [`Self::can_contain`] answers
+/// that exactly.
+#[derive(Debug, Default)]
+pub struct OrderedMembers {
+    runs: Vec<Vec<TypedValue>>,
+    rest: Vec<TypedValue>,
+}
+
+impl OrderedMembers {
+    pub(crate) fn of(values: &[LiteralValue]) -> Self {
+        let mut out = Self::default();
+        for value in values {
+            let typed = value.to_typed_value();
+            if !orderable(&typed) {
+                out.rest.push(typed);
+                continue;
+            }
+            let kind = std::mem::discriminant(&typed);
+            match out
+                .runs
+                .iter_mut()
+                .find(|run| std::mem::discriminant(&run[0]) == kind)
+            {
+                Some(run) => run.push(typed),
+                None => out.runs.push(vec![typed]),
+            }
+        }
+        for run in &mut out.runs {
+            // Total within a run: one kind, no NaN.
+            run.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            run.dedup_by(|a, b| (*a).partial_cmp(&*b) == Some(std::cmp::Ordering::Equal));
+        }
+        out
+    }
+
+    /// Whether some member could equal a value within `[lower, upper]` (a
+    /// missing bound cannot prune): exactly `any(eq_bounds_can_contain)` over
+    /// the members, with one binary search per run.
+    fn can_contain(&self, lower: Option<&TypedValue>, upper: Option<&TypedValue>) -> bool {
+        self.rest
+            .iter()
+            .any(|m| eq_bounds_can_contain(m, lower, upper))
+            || self
+                .runs
+                .iter()
+                .any(|run| run_can_contain(run, lower, upper))
+    }
+}
+
+/// Whether a member's comparisons are total, so it can sit in a sorted run.
+fn orderable(value: &TypedValue) -> bool {
+    match value {
+        TypedValue::Boolean(_)
+        | TypedValue::Int32(_)
+        | TypedValue::Int64(_)
+        | TypedValue::Date(_)
+        | TypedValue::Timestamp(_)
+        | TypedValue::TimestampTz(_)
+        | TypedValue::String(_)
+        | TypedValue::Bytes(_) => true,
+        TypedValue::Float32(f) => !f.is_nan(),
+        TypedValue::Float64(f) => !f.is_nan(),
+        TypedValue::Uuid(_) | TypedValue::Decimal { .. } => false,
+    }
+}
+
+/// [`OrderedMembers::can_contain`] for one sorted run of one kind. A bound
+/// the kind cannot be compared with (another kind, or NaN) leaves every
+/// member's check on that side unknown, which keeps, so it constrains
+/// nothing: drop it. With the bounds left, every comparison is known and
+/// monotone along the run, so some member lies in `[lower, upper]` iff the
+/// first member at or above `lower` is at or below `upper`.
+fn run_can_contain(
+    run: &[TypedValue],
+    lower: Option<&TypedValue>,
+    upper: Option<&TypedValue>,
+) -> bool {
+    let Some(first) = run.first() else {
+        return false;
+    };
+    let comparable = |bound: &&TypedValue| first.le(bound).is_some();
+    let lower = lower.filter(comparable);
+    let upper = upper.filter(comparable);
+    let start = lower.map_or(0, |l| run.partition_point(|m| m.lt(l) == Some(true)));
+    run.get(start)
+        .is_some_and(|m| upper.is_none_or(|u| m.le(u) == Some(true)))
+}
+
+/// Whether a file whose `field_id` bounds are `data_file`'s might hold a value
+/// equal to a member of `values`: the per-member equality check, with the
+/// file's bounds decoded once for the set and the members searched in order
+/// ([`OrderedMembers`]).
+fn can_contain_in(field_id: i32, values: &InSet, data_file: &DataFile, schema: &Schema) -> bool {
+    let Some(field) = schema.field(field_id) else {
+        return true; // Unknown field, be conservative
+    };
+    let lower = data_file.lower_bound(field_id);
+    let upper = data_file.upper_bound(field_id);
+    if lower.is_none() && upper.is_none() {
+        return true;
+    }
+    let lower = lower.and_then(|b| decode_by_type_string(b, field.type_string()).ok());
+    let upper = upper.and_then(|b| decode_by_type_string(b, field.type_string()).ok());
+    values.ordered().can_contain(lower.as_ref(), upper.as_ref())
 }
 
 /// Check if a comparison predicate might be satisfied by a file.
@@ -183,12 +296,7 @@ fn bounds_can_contain(
 ) -> bool {
     match op {
         // value ∈ [lower, upper]
-        ComparisonOp::Eq => match (&lower, &upper) {
-            (Some(l), Some(u)) => lit.ge(l).unwrap_or(true) && lit.le(u).unwrap_or(true),
-            (Some(l), None) => lit.ge(l).unwrap_or(true),
-            (None, Some(u)) => lit.le(u).unwrap_or(true),
-            (None, None) => true,
-        },
+        ComparisonOp::Eq => eq_bounds_can_contain(lit, lower.as_ref(), upper.as_ref()),
         // Prunable only when every value equals the excluded one (lower==upper==value).
         ComparisonOp::NotEq => match (&lower, &upper) {
             (Some(l), Some(u)) if l == u => l != lit,
@@ -200,6 +308,21 @@ fn bounds_can_contain(
         // column > value can occur iff upper > value.
         ComparisonOp::Gt => upper.as_ref().is_none_or(|u| lit.lt(u).unwrap_or(true)),
         ComparisonOp::GtEq => upper.as_ref().is_none_or(|u| lit.le(u).unwrap_or(true)),
+    }
+}
+
+/// Whether a value equal to `lit` could lie within `[lower, upper]` (a missing
+/// bound cannot prune).
+fn eq_bounds_can_contain(
+    lit: &TypedValue,
+    lower: Option<&TypedValue>,
+    upper: Option<&TypedValue>,
+) -> bool {
+    match (lower, upper) {
+        (Some(l), Some(u)) => lit.ge(l).unwrap_or(true) && lit.le(u).unwrap_or(true),
+        (Some(l), None) => lit.ge(l).unwrap_or(true),
+        (None, Some(u)) => lit.le(u).unwrap_or(true),
+        (None, None) => true,
     }
 }
 
@@ -250,10 +373,15 @@ pub fn row_group_can_contain(
                 return true;
             };
             let decimal = column_decimal(col);
-            values.iter().any(|v| {
-                let lit = v.to_typed_value();
-                let (lower, upper) = stat_bounds(stats, &lit, decimal);
-                bounds_can_contain(ComparisonOp::Eq, &lit, lower, upper)
+            // `stat_bounds` reads the statistics by the member's kind only, so
+            // a run reads them once.
+            let ordered = values.ordered();
+            ordered.rest.iter().any(|lit| {
+                let (lower, upper) = stat_bounds(stats, lit, decimal);
+                bounds_can_contain(ComparisonOp::Eq, lit, lower, upper)
+            }) || ordered.runs.iter().any(|run| {
+                let (lower, upper) = stat_bounds(stats, &run[0], decimal);
+                run_can_contain(run, lower.as_ref(), upper.as_ref())
             })
         }
         // Null predicates and negations keep the row group (conservative).
@@ -450,7 +578,7 @@ pub fn evaluate_batch(expr: &Expression, batch: &crate::io::ColumnBatch) -> Vec<
             field_id, values, ..
         } => {
             let mut result_set = std::collections::HashSet::new();
-            for value in values {
+            for value in values.iter() {
                 let matching = evaluate_comparison(*field_id, ComparisonOp::Eq, value, batch);
                 result_set.extend(matching);
             }
@@ -737,6 +865,136 @@ mod tests {
         assert!(!can_contain_file(&expr, &data_file, &schema));
     }
 
+    /// An `IN` keeps a file iff some member's equality would: decoding the
+    /// file's bounds once per set changes nothing. Members below, inside, at
+    /// and above the bounds, of the column's type and of another (which
+    /// compares as unknown, so keeps).
+    #[test]
+    fn an_in_keeps_a_file_iff_a_member_equality_would() {
+        let schema = create_test_schema();
+        let data_file = create_test_data_file(10, 100);
+        let per_member = |values: &[LiteralValue]| {
+            values
+                .iter()
+                .any(|v| can_contain_comparison(1, ComparisonOp::Eq, v, &data_file, &schema))
+        };
+        let sets: Vec<Vec<LiteralValue>> = vec![
+            (1_000..2_000).map(LiteralValue::Int64).collect(),
+            vec![LiteralValue::Int64(9), LiteralValue::Int64(101)],
+            vec![LiteralValue::Int64(9), LiteralValue::Int64(10)],
+            vec![LiteralValue::Int64(100)],
+            vec![LiteralValue::Int64(50), LiteralValue::Int64(5_000)],
+            vec![LiteralValue::Int32(5)],
+            vec![LiteralValue::String("x".to_string())],
+            vec![],
+        ];
+        for values in sets {
+            let expr = Expression::in_list(1, "id", values.clone());
+            assert_eq!(
+                can_contain_file(&expr, &data_file, &schema),
+                per_member(&values),
+                "{values:?}"
+            );
+        }
+        let expr = Expression::in_list(1, "id", (1_000..2_000).map(LiteralValue::Int64).collect());
+        assert!(!can_contain_file(&expr, &data_file, &schema));
+    }
+
+    /// A scan plan clones its filter into every file's task: cloning a set
+    /// shares its members and its ordered view instead of copying them.
+    #[test]
+    fn a_cloned_in_set_shares_its_members() {
+        let set = InSet::new((0..1024).map(LiteralValue::Int64).collect());
+        let copy = set.clone();
+        assert!(std::ptr::eq(set.values().as_ptr(), copy.values().as_ptr()));
+        assert!(std::ptr::eq(set.ordered(), copy.ordered()));
+        assert_eq!(copy.len(), 1024);
+    }
+
+    /// Binary-search pruning decides exactly as the per-member equality check,
+    /// for random sets and bounds of every kind: integers of both widths,
+    /// dates, booleans, strings drawn from prefixes and incremented prefixes
+    /// (the shapes of truncated string bounds), floats with NaN and both
+    /// zeros, decimals of several scales, mixed kinds, and missing bounds.
+    #[test]
+    fn ordered_in_pruning_equals_the_per_member_check() {
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        const STRINGS: [&str; 12] = [
+            "",
+            "a",
+            "ab",
+            "abc",
+            "abd",
+            "ab\u{7f}",
+            "abz",
+            "b",
+            "ac",
+            "\u{e9}",
+            "a\u{10ffff}",
+            "zz",
+        ];
+        const FLOATS: [f64; 7] = [f64::NAN, -0.0, 0.0, 1.5, -3.0, f64::INFINITY, 1e300];
+        let literal = |kind: u64, r: u64| -> LiteralValue {
+            match kind {
+                0 => LiteralValue::Int32((r % 60) as i32 - 10),
+                1 => LiteralValue::Int64((r % 60) as i64 - 10),
+                2 => LiteralValue::String(STRINGS[(r % 12) as usize].to_string()),
+                3 => LiteralValue::Float64(FLOATS[(r % 7) as usize]),
+                4 => LiteralValue::Decimal {
+                    unscaled: (r % 2_000) as i128 - 1_000,
+                    scale: ((r >> 16) % 3) as i8,
+                },
+                5 => LiteralValue::Date((r % 40) as i32),
+                _ => LiteralValue::Boolean(r & 1 == 1),
+            }
+        };
+        let mut decided = [0usize; 2];
+        for _ in 0..20_000 {
+            let kind = next() % 7;
+            let pick = |r: u64| {
+                if r.is_multiple_of(5) {
+                    (r >> 3) % 7
+                } else {
+                    kind
+                }
+            };
+            let n = next() % 12;
+            let values: Vec<LiteralValue> = (0..n)
+                .map(|_| {
+                    let r = next();
+                    literal(pick(r), r >> 8)
+                })
+                .collect();
+            let ordered = OrderedMembers::of(&values);
+            for _ in 0..8 {
+                let mut bound = || {
+                    let r = next();
+                    (!r.is_multiple_of(7)).then(|| literal(pick(r >> 4), r >> 12).to_typed_value())
+                };
+                let (lower, upper) = (bound(), bound());
+                let want = values.iter().any(|v| {
+                    eq_bounds_can_contain(&v.to_typed_value(), lower.as_ref(), upper.as_ref())
+                });
+                decided[usize::from(want)] += 1;
+                assert_eq!(
+                    ordered.can_contain(lower.as_ref(), upper.as_ref()),
+                    want,
+                    "{values:?} within [{lower:?}, {upper:?}]"
+                );
+            }
+        }
+        assert!(
+            decided[0] > 10_000 && decided[1] > 10_000,
+            "both outcomes are exercised: {decided:?}"
+        );
+    }
+
     #[test]
     fn test_can_contain_file_and() {
         let schema = create_test_schema();
@@ -887,10 +1145,8 @@ mod tests {
         let reader = SerializedFileReader::new(two_row_group_parquet()).unwrap();
         let meta = reader.metadata();
         let field_to_col = HashMap::from([(1i32, 0usize)]);
-        let in_set = |vs: &[i64]| Expression::In {
-            field_id: 1,
-            column: "v".to_string(),
-            values: vs.iter().map(|v| LiteralValue::Int64(*v)).collect(),
+        let in_set = |vs: &[i64]| {
+            Expression::in_list(1, "v", vs.iter().map(|v| LiteralValue::Int64(*v)).collect())
         };
 
         // {2, 200}: 2 ∈ rg0 → keep rg0; neither ∈ [100,104] → prune rg1.

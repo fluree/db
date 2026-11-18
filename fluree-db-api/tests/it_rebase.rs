@@ -33,14 +33,25 @@ fn extract_names(rows: &serde_json::Value) -> Vec<String> {
 /// Query all ex:name values on a branch.
 async fn query_all_names(fluree: &support::MemoryFluree, ledger_id: &str) -> Vec<String> {
     let ledger = fluree.ledger(ledger_id).await.unwrap();
+    query_names(fluree, &ledger).await
+}
+
+/// Query all ex:name values on a branch as its cached handle holds it.
+async fn query_cached_names(fluree: &support::MemoryFluree, ledger_id: &str) -> Vec<String> {
+    let handle = fluree.ledger_cached(ledger_id).await.unwrap();
+    query_names(fluree, &handle.snapshot().await.to_ledger_state()).await
+}
+
+async fn query_names(
+    fluree: &support::MemoryFluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> Vec<String> {
     let query = json!({
         "@context": {"ex": "http://example.org/ns/"},
         "select": ["?name"],
         "where": {"@id": "?s", "ex:name": "?name"}
     });
-    let result = support::query_jsonld(fluree, &ledger, &query)
-        .await
-        .unwrap();
+    let result = support::query_jsonld(fluree, ledger, &query).await.unwrap();
     let rows = result.to_jsonld(&ledger.snapshot).unwrap();
     extract_names(&rows)
 }
@@ -962,4 +973,322 @@ async fn rebase_replays_commit_that_creates_named_graph() {
         .to_jsonld(&dev.snapshot)
         .unwrap();
     assert_eq!(rows, json!(["Dave"]));
+}
+
+/// A branch with its own commits, `bob` and `carol` after the fork at
+/// `alice`, and a source that moved on to `dave`.
+async fn diverged(fluree: &fluree_db_api::Fluree) {
+    let name = |n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{n}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree.insert(main, &name("alice")).await.unwrap().ledger;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    for n in ["bob", "carol"] {
+        let dev = fluree.ledger("rb:dev").await.unwrap();
+        fluree.insert(dev, &name(n)).await.unwrap();
+    }
+    fluree.insert(main, &name("dave")).await.unwrap();
+}
+
+fn file_fluree(dir: &tempfile::TempDir) -> fluree_db_api::Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .without_indexing()
+        .build()
+        .unwrap()
+}
+
+const EVERY_NAME: [&str; 4] = ["alice", "bob", "carol", "dave"];
+
+/// A rebase that replays the branch's commits takes the branch's index of
+/// the line it replaced away, even where the source's index is older or
+/// absent: a fresh load of the branch reads its new line, not that index
+/// with the new line's later commits on top.
+#[tokio::test]
+async fn a_rebase_takes_away_the_index_of_the_line_it_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    support::rebuild_and_publish_index(&fluree, "rb:dev").await;
+
+    let report = fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert_eq!(report.replayed, 2);
+    drop(fluree);
+
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+}
+
+/// An index of a branch's line built before a rebase and published after it
+/// is not extended over the new line: the incremental build refuses it, and
+/// the build falls back to a full rebuild of the new line. An index on the
+/// head's line is extended as before.
+#[tokio::test]
+async fn an_index_of_a_replaced_line_is_not_extended() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    let before = fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let store = fluree.branched_content_store("rb:dev").await.unwrap();
+    let stale = fluree_db_indexer::rebuild_index_from_commits(
+        store,
+        "rb:dev",
+        &before,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    support::publish_built_index(&fluree, "rb:dev", stale.index_t, &stale.root_id).await;
+
+    let record = fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let refused = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.branched_content_store("rb:dev").await.unwrap(),
+        &record,
+        fluree_db_indexer::IndexerConfig::default(),
+    )
+    .await;
+    assert!(refused.is_err(), "the replaced line's index was extended");
+    support::build_and_publish_index(&fluree, "rb:dev").await;
+    drop(fluree);
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+
+    // On the head's line, the index is extended.
+    let dev = fresh.ledger("rb:dev").await.unwrap();
+    fresh
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/ns/"},
+                    "@id": "ex:erin", "ex:name": "erin"}),
+        )
+        .await
+        .unwrap();
+    support::build_incrementally_and_publish_index(&fresh, "rb:dev").await;
+}
+
+/// The nameservice's commit-CID index keeps the entries of the line a rebase
+/// replaced below the new head, so a build handed that index for its walk
+/// sees every `t` covered while the entries are not the head's line. The
+/// build checks the entries link and walks the line itself when they do not.
+#[tokio::test]
+async fn a_build_from_the_commit_index_reads_the_rebased_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    let name = |n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{n}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree.insert(main, &name("alice")).await.unwrap().ledger;
+    support::rebuild_and_publish_index(&fluree, "rb:main").await;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    for n in ["bob", "carol"] {
+        let dev = fluree.ledger("rb:dev").await.unwrap();
+        fluree.insert(dev, &name(n)).await.unwrap();
+    }
+    fluree.insert(main, &name("dave")).await.unwrap();
+    fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+
+    let record = fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap();
+    let pending = fluree
+        .branch_admin()
+        .unwrap()
+        .pending_commit_cids("rb:dev", record.index_t)
+        .await
+        .unwrap();
+    let covered: Vec<i64> = pending.iter().flatten().map(|(t, _)| *t).collect();
+    assert_eq!(
+        covered,
+        (record.index_t + 1..=record.commit_t).collect::<Vec<_>>(),
+        "the commit index no longer covers the range, so the build would not use it"
+    );
+    let config = fluree_db_indexer::IndexerConfig {
+        pending_commit_cids: pending,
+        ..Default::default()
+    };
+    let built = fluree_db_indexer::build_incremental_index_for_record(
+        fluree.branched_content_store("rb:dev").await.unwrap(),
+        &record,
+        config,
+    )
+    .await
+    .unwrap();
+    support::publish_built_index(&fluree, "rb:dev", built.index_t, &built.root_id).await;
+    drop(fluree);
+
+    let fresh = file_fluree(&dir);
+    assert_eq!(query_all_names(&fresh, "rb:dev").await, EVERY_NAME);
+}
+
+/// A `Skip` rebase that skips every commit makes the branch the source: its
+/// head and index move to the source's together, so it reads the source's
+/// line and writes on top of the source's head.
+#[tokio::test]
+async fn a_rebase_that_skips_every_commit_makes_the_branch_the_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    let name = |s: &str, n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{s}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree
+        .insert(main, &name("alice", "alice"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    let dev = fluree.ledger("rb:dev").await.unwrap();
+    fluree
+        .insert(dev, &name("alice", "alice-dev"))
+        .await
+        .unwrap();
+    let main = fluree
+        .insert(main, &name("alice", "alice-main"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree.insert(main, &name("dave", "dave")).await.unwrap();
+    support::rebuild_and_publish_index(&fluree, "rb:main").await;
+
+    let report = fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    assert_eq!((report.replayed, report.skipped), (0, 1));
+
+    let lookup = |id: &'static str| fluree.nameservice().lookup(id);
+    let (source, branch) = (
+        lookup("rb:main").await.unwrap().unwrap(),
+        lookup("rb:dev").await.unwrap().unwrap(),
+    );
+    assert_eq!(
+        (branch.commit_head_id, branch.commit_t, branch.index_t),
+        (source.commit_head_id, source.commit_t, source.index_t)
+    );
+    let source_line = ["alice", "alice-main", "dave"];
+    assert_eq!(query_all_names(&fluree, "rb:dev").await, source_line);
+    let dev = fluree.ledger("rb:dev").await.unwrap();
+    fluree
+        .insert(dev, &name("erin", "erin"))
+        .await
+        .expect("the branch writes on the source's head");
+    drop(fluree);
+
+    let fresh = file_fluree(&dir);
+    assert_eq!(
+        query_all_names(&fresh, "rb:dev").await,
+        ["alice", "alice-main", "dave", "erin"]
+    );
+}
+
+/// An instance holding the branch warm across another instance's rebase
+/// does not apply the new line's commits onto the line they replaced: the
+/// commits sit on another commit at its `t`, so it reloads.
+#[tokio::test]
+async fn a_warm_cache_reloads_across_another_instances_rebase() {
+    let dir = tempfile::tempdir().unwrap();
+    let rebaser = file_fluree(&dir);
+    diverged(&rebaser).await;
+    let warm = file_fluree(&dir);
+    assert_eq!(
+        query_cached_names(&warm, "rb:dev").await,
+        ["alice", "bob", "carol"]
+    );
+
+    rebaser
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    let refreshed = warm
+        .refresh("rb:dev", Default::default())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(refreshed.action, fluree_db_api::NotifyResult::Reloaded),
+        "{:?}",
+        refreshed.action
+    );
+    assert_eq!(query_cached_names(&warm, "rb:dev").await, EVERY_NAME);
+}
+
+async fn dev_record(fluree: &fluree_db_api::Fluree) -> fluree_db_nameservice::NsRecord {
+    fluree
+        .nameservice()
+        .lookup("rb:dev")
+        .await
+        .unwrap()
+        .unwrap()
+}
+
+/// Whether the indexer refuses to publish a build of `built` on `rb:dev`.
+async fn refused(fluree: &fluree_db_api::Fluree, built: &fluree_db_nameservice::NsRecord) -> bool {
+    let store = fluree.branched_content_store("rb:dev").await.unwrap();
+    fluree_db_indexer::refuse_build_off_the_line(fluree.nameservice(), store.as_ref(), built)
+        .await
+        .is_err()
+}
+
+/// A build from the branch's record before a rebase is not published after
+/// it: its head is no longer on the branch's line. A build of the head's
+/// line is published, including one that commits have since moved past.
+#[tokio::test]
+async fn a_build_of_the_replaced_line_is_not_published() {
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = file_fluree(&dir);
+    diverged(&fluree).await;
+    let before = dev_record(&fluree).await;
+    assert!(!refused(&fluree, &before).await, "a build of the head");
+
+    fluree
+        .rebase_branch("rb", "dev", ConflictStrategy::default())
+        .await
+        .unwrap();
+    assert!(
+        refused(&fluree, &before).await,
+        "a build of the replaced line"
+    );
+
+    let rebased = dev_record(&fluree).await;
+    let dev = fluree.ledger("rb:dev").await.unwrap();
+    fluree
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/ns/"},
+                    "@id": "ex:erin", "ex:name": "erin"}),
+        )
+        .await
+        .unwrap();
+    assert!(
+        !refused(&fluree, &rebased).await,
+        "a build of the head's line, behind the head"
+    );
 }

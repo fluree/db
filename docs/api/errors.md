@@ -577,6 +577,10 @@ unchanged fails the same way.
 **How to Fix:**
 - Narrow the query with more selective patterns or filters
 - Aggregate over fewer groups, or page through the results
+- Over an R2RML graph source (Iceberg, Delta, SQL), declare the keys of
+  the tables whose rows never repeat a subject: a map no key proves
+  subject-unique holds the solutions it has seen against this budget (see
+  [R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade))
 
 ## Error Handling Best Practices
 

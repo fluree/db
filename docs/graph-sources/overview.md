@@ -252,13 +252,14 @@ Iceberg graph sources use R2RML mappings to define how table rows become RDF tri
 
 ### Query Patterns a Graph Source Cannot Evaluate
 
-A graph source has no native RDF index. Its triples are materialized per query from the backing table or index, which is enough for triple patterns but not for the constructs that need an index to walk. Three of them are refused rather than answered:
+A graph source has no native RDF index. Its triples are materialized per query from the backing table or index, which is enough for triple patterns but not for the constructs that need an index to walk. Two of them are refused rather than answered:
 
 - **Property-path quantifiers** — `p+`, `p*`, `p?`, and any quantified combination such as `^p+`, `(a|b)+`, or `(a/b)+`
 - **`shortestPath` / `allShortestPaths`**
-- **Subqueries** — a nested SPARQL `SELECT`, or a JSON-LD sub-`select`
 
 A query using one against a graph source returns **HTTP 400 `err:db/InvalidQuery`**, naming the pattern kind. The refusal is deliberate: these patterns would otherwise read the graph source's empty native index and return a wrong answer as a success — nothing at all for `p+`, and the starting node alone for `p*` and `p?`. Unquantified alternation (`a|b`) and inverse (`^p`) are unaffected; they lower to ordinary triple patterns and run normally.
+
+Sub-selects are evaluated, with one exception and one cost to know about: see [Sub-selects over a Graph Source](#sub-selects-over-a-graph-source). So is an `EXISTS` in the `WHERE` clause; one in `HAVING` or `ORDER BY` is refused (see [EXISTS over a Graph Source](#exists-over-a-graph-source)).
 
 **Workaround: bounded fixed-length paths.** Sequence paths do lower to table scans, so a traversal whose maximum depth you know can be written as a union of explicit hops:
 
@@ -305,7 +306,72 @@ SELECT ?total ?item FROM <warehouse-orders:main> WHERE {
 
 Either move the pattern inside a `GRAPH` block naming the source it belongs to, or drop the explicit `GRAPH` block so the whole query is scoped automatically.
 
-One gap remains here: a top-level pattern inside `OPTIONAL`, `MINUS`, `UNION`, or `EXISTS` is **not** refused, because refusing it would reject queries that do return rows today. Such a block is evaluated against an empty index, so it matches nothing — a top-level `OPTIONAL` never binds, and a top-level `MINUS` excludes nothing. Scope those blocks with `GRAPH` as well.
+One gap remains here: a top-level pattern inside `OPTIONAL`, `MINUS`, `UNION`, or `EXISTS` is **not** refused, because refusing it would reject queries that do return rows today. Such a block is evaluated against an empty index, so it matches nothing — a top-level `OPTIONAL` never binds, and a top-level `MINUS` excludes nothing. Scope those blocks with `GRAPH` as well. A sub-select outside every `GRAPH` block is the exception: one whose body reads the default view is refused (see [below](#a-sub-select-outside-every-graph-block)).
+
+### Sub-selects over a Graph Source
+
+A sub-select — a nested SPARQL `SELECT`, or a JSON-LD `["query", …]` — inside a graph source's scope is evaluated. The scope is a query addressed to the source (`FROM <source>`, `"from"`, or the source's own query endpoint) or the source's `GRAPH` block. The sub-select's body lowers to table scans like the patterns around it, and the answer is the one a native ledger holding the mapping's triples would give. Grouping and aggregates, `DISTINCT`, `ORDER BY` with `LIMIT` / `OFFSET`, and nested sub-selects all run. A pattern in the body that the source cannot evaluate (a quantified path, [above](#query-patterns-a-graph-source-cannot-evaluate)) refuses the whole query.
+
+The two query languages correlate a sub-select differently, on a graph source as on a native ledger:
+
+- **SPARQL** evaluates a sub-select once, on its own, and then joins its rows to the rest of the query (SPARQL 1.1 §18.2). An `ORDER BY ?amount LIMIT 5` inside it keeps five rows of the whole sub-select.
+- **JSON-LD** correlates a sub-select with the patterns written before it. When the sub-select has a `limit` or `offset`, and selects a variable those patterns bind and its own body binds in every row, it runs once per outer row, seeded with that row's value. A `limit` inside it is then a top-k per outer row: the two largest orders of each customer, say. Without a `limit` or `offset` it is evaluated once and joined on the shared variable (under an outer result known to hold fewer than eight rows it may run once per row instead). A sub-select that shares no variable it binds in every row is evaluated once, with or without a slice.
+
+#### Cost: a sliced JSON-LD sub-select reads per outer row
+
+Each per-row run of a sliced, correlated JSON-LD sub-select reads the tables its body scans, and reads each one whole. The outer row's value is not yet pushed into the scan to skip files ([#2310](https://github.com/fluree/db/issues/2310)). A `limit` sub-select over an `orders` table under 50 outer rows reads `orders` 50 times; under 10,000 outer rows, 10,000 times. Before running one over a large outer result:
+
+- If you want the top rows of the whole sub-select rather than per outer row, write it in SPARQL, or leave the shared variable out of the JSON-LD sub-select's `select`. Either way it is evaluated once.
+- If you do want a top-k per outer row, narrow the outer rows first, or query a [native twin](iceberg.md#materializing-a-native-twin), where each seeded run is an index lookup.
+
+#### Annotation and list patterns
+
+An R2RML mapping produces no edge annotations: it has no term map for one. An annotation pattern (SPARQL `{| … |}` or `rdf:reifies`, JSON-LD `@annotation` or `@reifies`) therefore matches nothing over a graph source, in a sub-select or not. A native ledger holding the same triples gives the same answer. Nor does a mapping produce RDF lists stored as list values; `rdf:first` / `rdf:rest` triples a mapping does produce are ordinary triples and query as such.
+
+#### A sub-select outside every GRAPH block
+
+A query addressed to a graph source that has a `GRAPH` block of its own is not wrapped in the source's scope (see [Patterns Must Be Inside the GRAPH Block](#patterns-must-be-inside-the-graph-block)). A sub-select outside every `GRAPH` block in such a query is still evaluated when its body reads the source through a `GRAPH` block of its own, or reads no index at all (only `VALUES` or `BIND`). One whose body reads the default view directly — a triple pattern outside any `GRAPH` block — is refused with **HTTP 400 `err:db/InvalidQuery`**, because that body would read the source's empty native index (an ungrouped `COUNT` would answer 0):
+
+> A sub-select reads a graph source only from inside that source's graph block; move it there, or drop the explicit graph block so the whole query is scoped to the graph source.
+
+```sparql
+# Refused: the sub-select's body reads the default view
+SELECT ?name ?orders WHERE {
+  GRAPH <warehouse-orders:main> { ?c ex:name ?name }
+  { SELECT ?c (COUNT(?o) AS ?orders) WHERE { ?o ex:customer ?c } GROUP BY ?c }
+}
+
+# Correct: the body reads the source through its own GRAPH block
+SELECT ?name ?orders WHERE {
+  GRAPH <warehouse-orders:main> { ?c ex:name ?name }
+  { SELECT ?c (COUNT(?o) AS ?orders) WHERE {
+      GRAPH <warehouse-orders:main> { ?o ex:customer ?c }
+    } GROUP BY ?c }
+}
+```
+
+Dropping the explicit `GRAPH` block works as well: the whole query, sub-select included, is then scoped to the source.
+
+### EXISTS over a Graph Source
+
+An `EXISTS` or `NOT EXISTS` in the `WHERE` clause reads the graph source wherever it sits: as a pattern (`FILTER EXISTS { … }`, JSON-LD `["exists", …]`), inside an expression (`BIND(EXISTS { … } AS ?b)`, `FILTER(EXISTS { … } || …)`, a JSON-LD compound `filter` such as `["or", ["exists", …], …]`), or in a sub-select's `HAVING` or `ORDER BY`. Its body lowers to table scans like the rest of the scope.
+
+A query's own `HAVING` and `ORDER BY` run after the `WHERE` clause, outside the graph source's scope. So do the expressions a query evaluates after a trailing `VALUES` block: its `GROUP BY` expressions, aggregate inputs and `SELECT` expressions. An `EXISTS` there would read the source's empty native index, where every `EXISTS` is false. A query with one is refused with **HTTP 400 `err:db/InvalidQuery`** naming `EXISTS outside the WHERE clause`, with or without a `GRAPH` block of its own. Move the condition into the `WHERE` clause:
+
+```sparql
+# Refused: the EXISTS is in HAVING
+SELECT ?c (COUNT(?o) AS ?orders) FROM <warehouse-orders:main> WHERE {
+  ?o ex:customer ?c
+} GROUP BY ?c HAVING (EXISTS { ?c ex:name ?name })
+
+# Correct: the same condition as a FILTER in WHERE
+SELECT ?c (COUNT(?o) AS ?orders) FROM <warehouse-orders:main> WHERE {
+  ?o ex:customer ?c
+  FILTER EXISTS { ?c ex:name ?name }
+} GROUP BY ?c
+```
+
+To order by an `EXISTS`, `BIND` it to a variable in the `WHERE` clause and order by that variable.
 
 ### Search Indexes (BM25, Vector)
 

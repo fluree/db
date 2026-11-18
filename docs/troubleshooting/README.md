@@ -148,6 +148,10 @@ curl http://localhost:8090/v1/fluree/stats
 - High latency
 - Timeouts
 
+Queries over an R2RML graph source (Iceberg, Delta, SQL) that got slower
+after an upgrade usually read a map with no key: see
+[R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade).
+
 **Quick Checks:**
 ```bash
 # Check indexing lag

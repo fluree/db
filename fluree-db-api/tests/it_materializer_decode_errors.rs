@@ -51,6 +51,7 @@ async fn undecodable_encoded_bindings_are_errors() {
         lang_id: 0,
         i_val: 0,
         t: 1,
+        arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
     };
 
     for mode in [JoinKeyMode::SingleLedger, JoinKeyMode::MultiLedger] {

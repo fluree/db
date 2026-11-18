@@ -43,6 +43,7 @@ use crate::fast_whole_graph_agg::{
 use crate::group_aggregate::{GroupAggregateOperator, StreamingAggSpec};
 use crate::groupby::GroupByOperator;
 use crate::having::HavingOperator;
+use crate::index_scope::ScopeKind;
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{
     AggregateFn, AggregateSpec, Aggregation, Expression, Grouping, InputSemantics, PathModifier,
@@ -56,7 +57,10 @@ use crate::project::ProjectOperator;
 use crate::sort::SortDirection;
 use crate::sort::SortOperator;
 use crate::sort::SortSpec;
-use crate::stats_query::stats_count_by_predicate_operator;
+use crate::stats_query::{
+    count_by_predicate_union_operator, stats_count_by_predicate_operator,
+    STATS_COUNT_BY_PREDICATE_UNION_SITE,
+};
 use crate::temporal_mode::PlanningContext;
 use crate::var_registry::VarId;
 use fluree_db_core::StatsView;
@@ -2292,9 +2296,23 @@ pub fn build_operator_tree(
         crate::planner::estimate_projected_distinct_rows(&query.patterns, &vars, stats)
             .is_none_or(|rows| rows >= goal as f64)
     });
+    // A graph-source scan may emit rows in any order (as its file reads finish)
+    // only when nothing in the query takes a prefix of an answer: a page cut
+    // from an unordered answer must hold the same rows on every execution.
+    // Decided once, here at the root, and fail closed: a prefix taken at any
+    // depth, or any path that plans without passing through here, keeps every
+    // scan deterministic. A prefix taken by the caller after the query (the
+    // browse crawl's subject pages, a byte-budgeted response a client resumes
+    // with OFFSET) sets `ExecutionContext::deterministic_scans` instead.
+    let scan_order = if query_takes_prefix(query) {
+        crate::r2rml::ScanOrder::Deterministic
+    } else {
+        crate::r2rml::ScanOrder::Any
+    };
     let planning = &planning
         .with_unmatched_optional(query.unmatched_optional)
-        .with_row_goal(row_goal);
+        .with_row_goal(row_goal)
+        .with_scan_order(scan_order);
     // Convert single-triple OPTIONALs whose fresh var is error-rejected by a
     // same-group filter into required triples (well-formed left-join
     // simplification), so equality/range pushdown and selectivity estimation
@@ -2308,6 +2326,76 @@ pub fn build_operator_tree(
         return build_operator_tree_folds(&simplified, stats, planning);
     }
     build_operator_tree_folds(query, stats, planning)
+}
+
+/// Whether `query` answers with a prefix of some unordered answer, so the
+/// order its scans emit rows in decides which rows it answers: a LIMIT or
+/// OFFSET anywhere ([`query_has_slice`]), or a `selectOne`, which keeps the
+/// first row when the result is formatted.
+pub(crate) fn query_takes_prefix(query: &Query) -> bool {
+    query_has_slice(query) || query.output.is_select_one()
+}
+
+/// Whether a LIMIT or OFFSET appears anywhere in `query`: on the query itself,
+/// or on a sub-SELECT at any depth, including inside an `EXISTS` in a filter,
+/// bind or modifier expression.
+pub(crate) fn query_has_slice(query: &Query) -> bool {
+    query.limit.is_some()
+        || query.offset.is_some()
+        || patterns_have_slice(&query.patterns)
+        || modifiers_have_slice(&query.grouping, &query.order_binds)
+}
+
+fn modifiers_have_slice(grouping: &Option<Grouping>, order_binds: &[(VarId, Expression)]) -> bool {
+    order_binds.iter().any(|(_, e)| expression_has_slice(e))
+        || grouping.as_ref().is_some_and(|g| {
+            g.having().is_some_and(expression_has_slice)
+                || g.binds().any(|(_, e)| expression_has_slice(e))
+        })
+}
+
+fn expression_has_slice(expr: &Expression) -> bool {
+    let mut found = false;
+    expr.for_each_embedded_patterns(&mut |patterns| found |= patterns_have_slice(patterns));
+    found
+}
+
+/// Exhaustive over `Pattern`, so a new container variant must decide here
+/// whether it can hold a slice.
+fn patterns_have_slice(patterns: &[Pattern]) -> bool {
+    patterns.iter().any(|p| match p {
+        Pattern::Subquery(sq) => {
+            sq.limit.is_some()
+                || sq.offset.is_some()
+                || patterns_have_slice(&sq.patterns)
+                || modifiers_have_slice(&sq.grouping, &sq.order_binds)
+        }
+        Pattern::Filter(expr) | Pattern::Bind { expr, .. } | Pattern::Unwind { list: expr, .. } => {
+            expression_has_slice(expr)
+        }
+        Pattern::Optional(inner)
+        | Pattern::Minus(inner)
+        | Pattern::Exists(inner)
+        | Pattern::NotExists(inner) => patterns_have_slice(inner),
+        Pattern::Union(branches) => branches.iter().any(|b| patterns_have_slice(b)),
+        Pattern::Graph { patterns, .. } | Pattern::DefaultGraphSource { patterns } => {
+            patterns_have_slice(patterns)
+        }
+        Pattern::Service(sp) => patterns_have_slice(&sp.patterns),
+        Pattern::EdgeAnnotation { body, .. } | Pattern::AnnotationTarget { body, .. } => {
+            patterns_have_slice(body)
+        }
+        Pattern::Triple(_)
+        | Pattern::ListView(_)
+        | Pattern::PropertyPath(_)
+        | Pattern::ShortestPath(_)
+        | Pattern::Values { .. }
+        | Pattern::IndexSearch(_)
+        | Pattern::VectorSearch(_)
+        | Pattern::R2rml(_)
+        | Pattern::GeoSearch(_)
+        | Pattern::S2Search(_) => false,
+    })
 }
 
 fn build_operator_tree_folds(
@@ -2440,7 +2528,14 @@ fn build_operator_tree_inner(
     // (and some build count-only scans with a pruned emit mask), so they would
     // over-count a triple shared across members. Decline them and let the
     // general pipeline run over the deduplicating `DatasetOperator`.
-    let enable_fused_fast_paths = enable_fused_fast_paths && !planning.multi_default_graph;
+    //
+    // The fused paths also read one graph's index (`binary_g_id`'s), so they
+    // are planned only for a default graph of exactly one graph
+    // (`ScopeKind::One`, which implies `!multi_default_graph`): their runtime
+    // gates check the same definition, and a default graph of none (`FROM
+    // NAMED` alone) has no index to read either.
+    let enable_fused_fast_paths =
+        enable_fused_fast_paths && planning.index_scope_kind == ScopeKind::One;
 
     // Expression-based ORDER BY (`query.order_binds`) is materialized only by the
     // generic pipeline's dedicated post-grouping bind stage. No fast path runs
@@ -2698,9 +2793,10 @@ fn build_operator_tree_inner(
             let generic =
                 build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
             let fallback: BoxedOperator = match crate::r2rml::detect_fused_r2rml_aggregate(query) {
-                Some(fused) => Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
-                    fused, generic,
-                )),
+                Some(fused) => Box::new(
+                    crate::r2rml::FusedR2rmlAggregateOperator::new(fused, generic)
+                        .with_scan_order(planning.scan_order),
+                ),
                 None => generic,
             };
             let mut op: BoxedOperator = Box::new(
@@ -2743,9 +2839,10 @@ fn build_operator_tree_inner(
             fallback_query.offset = None;
             let fallback =
                 build_operator_tree_inner(&fallback_query, stats.clone(), false, planning)?;
-            let mut op: BoxedOperator = Box::new(crate::r2rml::FusedR2rmlAggregateOperator::new(
-                plan, fallback,
-            ));
+            let mut op: BoxedOperator = Box::new(
+                crate::r2rml::FusedR2rmlAggregateOperator::new(plan, fallback)
+                    .with_scan_order(planning.scan_order),
+            );
             // PR-6: HAVING filters the grouped rows before ORDER BY (SPARQL order:
             // WHERE → GROUP → HAVING → ORDER → LIMIT). The fused op emits exactly
             // the projected group + aggregate vars (detect's projection check
@@ -3041,11 +3138,64 @@ fn build_operator_tree_inner(
         }
     }
 
+    // The two count lanes below read stored rows, so neither answers a
+    // pattern the request reads as RDF lists (`crate::list_view`, the Graph
+    // Store `GET`), and neither detector accepts one. Over a default graph of several
+    // graphs (or of none) the union site says why it stood down where the
+    // query is its shape apart from the view; the kill switch, where it is on,
+    // is the reason given. The one-graph sites stay silent, as main's do.
+    if list_view
+        && !planning.is_history()
+        && !trailing_values
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+    {
+        let stored = query.with_patterns(crate::list_view::without_list_view(&query.patterns));
+        let reason = if fast_paths_globally_disabled {
+            FastPathFallback::KillSwitch
+        } else {
+            FastPathFallback::ListView
+        };
+        if detect_predicate_group_by_object_count_topk(&stored).is_some() {
+            stamp_fast_path(
+                crate::fast_group_count_firsts::GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+        }
+        if detect_predicate_object_count(&stored).is_some() {
+            stamp_fast_path(
+                crate::fast_group_count_firsts::PREDICATE_OBJECT_COUNT_UNION_SITE,
+                FastPathOutcome::Fallback(reason),
+            );
+        }
+    }
+
     // Fast-path: `?s <p> ?o GROUP BY ?o COUNT(?s)` top-k using leaflet FIRST headers.
     //
     // This avoids decoding leaflets for long (p,o) runs that span leaflet boundaries.
     // Skipped in `History` mode for the same reason as the fused fast paths above:
     // the path emits current-state counts and ignores retracts.
+    //
+    // Over a default graph of several graphs (or of none) the operator groups
+    // the union, which answers to the kill switch: under it, the union site
+    // says so here, since no operator is built to say it at open.
+    if fast_paths_globally_disabled
+        && !planning.is_history()
+        && !trailing_values
+        && !list_view
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+        && detect_predicate_group_by_object_count_topk(query).is_some()
+    {
+        stamp_fast_path(
+            crate::fast_group_count_firsts::GROUP_BY_OBJECT_COUNT_TOPK_UNION_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+        );
+    }
     if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values && !list_view {
         if let Some((pred, s_var, o_var, count_var, limit)) =
             detect_predicate_group_by_object_count_topk(query)
@@ -3084,6 +3234,25 @@ fn build_operator_tree_inner(
 
     // Fast-path: `SELECT (COUNT(?s) AS ?c) WHERE { ?s <p> <o> }` using leaflet FIRST headers.
     // Skipped in `History` mode (current-state count semantics).
+    //
+    // Over a default graph of several graphs (or of none) the operator counts
+    // the union, which answers to the kill switch: under it, the union site
+    // says so here, since no operator is built to say it at open.
+    if fast_paths_globally_disabled
+        && !planning.is_history()
+        && !trailing_values
+        && !list_view
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+        && detect_predicate_object_count(query).is_some()
+    {
+        stamp_fast_path(
+            crate::fast_group_count_firsts::PREDICATE_OBJECT_COUNT_UNION_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+        );
+    }
     if !planning.is_history() && !fast_paths_globally_disabled && !trailing_values && !list_view {
         if let Some((pred, s_var, obj, count_var)) = detect_predicate_object_count(query) {
             stamp_fast_path("predicate_object_count", FastPathOutcome::Proceed);
@@ -3135,20 +3304,56 @@ fn build_operator_tree_inner(
     // both keeps the probe to plausibly-indexed ledgers AND is the re-entry
     // guard — the fallback below recurses with `stats = None`, so a false here on
     // that recursion stops this fast path re-wrapping itself. The operator's
-    // open()-time gate (`fast_path_store`) is the real guard, declining to the
-    // generic fallback under overlay novelty, time-travel, a non-root policy, or
-    // multi-ledger.
+    // open()-time gate (a scope of one graph whose index is current) is the
+    // real guard, declining to the generic fallback under overlay novelty,
+    // time-travel, a non-root policy, or multi-ledger.
+    //
+    // Over a default graph of several graphs, or of none, the count reads the
+    // union of the members (`count_by_predicate_union_operator`), which stamps
+    // only its own site and only at open(), so a site that proceeded is one
+    // that answered. It answers to the kill switch by stamping that site; the
+    // one-graph operator keeps its plan-time switch unchanged.
+    let union_scope = matches!(
+        planning.index_scope_kind,
+        ScopeKind::Union | ScopeKind::Empty
+    );
+    if fast_paths_globally_disabled
+        && union_scope
+        && !planning.is_history()
+        && !trailing_values
+        && stats.is_some()
+        && detect_stats_count_by_predicate(query).is_some()
+    {
+        stamp_fast_path(
+            STATS_COUNT_BY_PREDICATE_UNION_SITE,
+            FastPathOutcome::Fallback(FastPathFallback::KillSwitch),
+        );
+    }
     if !planning.is_history()
         && !fast_paths_globally_disabled
         && !trailing_values
         && stats.is_some()
     {
-        if let Some((pred_var, count_var, lists)) =
-            detect_stats_count_by_predicate(query).filter(|(_, _, lists)| *lists || !list_view)
-        {
+        // The count over several graphs reads stored rows, and does not
+        // answer for the view of RDF lists: it stands down for the
+        // general plan, saying so. Over one graph, the list census corrects
+        // the stored counts where the view answers the query's one pattern.
+        let detected = match detect_stats_count_by_predicate(query) {
+            Some(_) if union_scope && list_view => {
+                stamp_fast_path(
+                    STATS_COUNT_BY_PREDICATE_UNION_SITE,
+                    FastPathOutcome::Fallback(FastPathFallback::ListView),
+                );
+                None
+            }
+            detected => detected.filter(|(_, _, lists)| *lists || !list_view),
+        };
+        if let Some((pred_var, count_var, lists)) = detected {
             // EXPLAIN seed (PR-1): planned here; the FastPathOperator below
             // stamps the runtime Proceed/Fallback(GateDeclined) at open().
-            stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            if !union_scope {
+                stamp_fast_path("stats_count_by_predicate", FastPathOutcome::Proceed);
+            }
             // Build the fallback: the same query as a generic GROUP BY,
             // producing the operator's internal `[pred, count]` schema (output
             // forced to those two vars; ORDER BY / LIMIT / OFFSET stripped,
@@ -3170,12 +3375,20 @@ fn build_operator_tree_inner(
                 planning,
             )?;
 
-            let mut operator: BoxedOperator = Box::new(stats_count_by_predicate_operator(
-                pred_var,
-                count_var,
-                lists,
-                Some(fallback),
-            ));
+            let mut operator: BoxedOperator = if union_scope {
+                Box::new(count_by_predicate_union_operator(
+                    pred_var,
+                    count_var,
+                    Some(fallback),
+                ))
+            } else {
+                Box::new(stats_count_by_predicate_operator(
+                    pred_var,
+                    count_var,
+                    lists,
+                    Some(fallback),
+                ))
+            };
 
             // ORDER BY (on predicate or count)
             if !query.ordering.is_empty() {
@@ -3343,6 +3556,17 @@ fn build_operator_tree_inner(
         &query.patterns,
         query.post_values.as_ref(),
     );
+    // The grouped count over several graphs (or none) never sees a list-view
+    // triple's rows, which its scan does not carry alone; say so where the
+    // query is the lane's shape.
+    if list_view
+        && matches!(
+            planning.index_scope_kind,
+            ScopeKind::Union | ScopeKind::Empty
+        )
+    {
+        crate::union_group_count::stamp_list_view_decline(query);
+    }
     apply_solution_modifiers(
         operator,
         query.grouping.as_ref(),
@@ -3465,7 +3689,15 @@ pub(crate) fn apply_solution_modifiers(
     // (e.g. `GROUP BY ?s COUNT(*)` splitting every subject into per-source
     // groups of 1). Demote here, next to the consumer, so no caller can
     // reintroduce the unsound combination.
-    let partitioned = partitioned && !planning.is_history();
+    //
+    // A default graph of several graphs breaks the promise too: each member's
+    // scan arrives sorted by the key, but `DatasetOperator` drains the members
+    // one after another, so one key's rows come in one run per member. The
+    // operator also checks its scope at open, by the same definition
+    // (`planning.index_scope_kind` here, `ExecutionContext::scope_kind`
+    // there).
+    let partitioned =
+        partitioned && !planning.is_history() && planning.index_scope_kind == ScopeKind::One;
     // Flatten the grouping phase's data for consumption below. The variant
     // distinction has already done its structural work at the IR boundary; the
     // tail treats both variants uniformly. Cloning is cheap — both vectors are

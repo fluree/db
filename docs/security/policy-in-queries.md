@@ -88,7 +88,7 @@ Filtering happens wherever the plan reads flakes, so every query operation enfor
 - **Triple patterns / BGPs** — the common case shown above; each matched flake is checked.
 - **OPTIONAL, joins, aggregates, `COUNT`** — these operate over already-filtered flakes, so a hidden flake is absent from joins and excluded from counts. `SELECT (COUNT(?o) ...) WHERE { ?s ex:salary ?o }` counts only the salary flakes the identity may view.
 - **Property paths** (`?x :knows+ ?y`, `:reportsTo*`, sequence/alternation) — traversal only follows edges the identity can view. A hidden `:knows` flake is not walked, so nodes reachable *only* through hidden edges do not appear in the result. You traverse exactly the graph you can see.
-- **Full-text and vector search** (embedded indexes) — a search hit is returned only if the identity can view the indexed content that produced the match. If the policy hides the indexed property's flake for a subject, that subject is dropped from the search results — even when selecting only the hit id/score with no constraining pattern. (This applies to Fluree's embedded search indexes; an external/dedicated search service enforces its own access controls.)
+- **Full-text and vector search** (embedded indexes) — a search hit is returned only if the identity can view the indexed content that produced the match. If the policy hides the indexed property's flake for a subject, that subject is dropped from the search results — even when selecting only the hit id/score with no constraining pattern. (This applies to Fluree's embedded search indexes; an external/dedicated search service enforces its own access controls.) Full-text **scores**, though, come from BM25 statistics over every document of the property, including documents the identity cannot see: a reader gets the same score for a visible document as an unrestricted request does. A consequence is that a reader can tell from their scores when hidden documents containing a term are added or removed.
 
 In every case the rule is the same: the engine never emits — or traverses, or counts, or returns as a search hit — a flake the identity is not allowed to see.
 
@@ -106,6 +106,8 @@ The two approaches can therefore disagree under the same policy. With `ex:ssn rd
 **So when you enable reasoning under a non-root policy, your policy must cover the derived properties and classes.** Either deny them explicitly, or run with `default-allow: false` so any predicate you did not explicitly allow — including reasoning-introduced ones — is hidden by default. Inline per-query ontologies (`f:schemaSource`) are subject to the same rule: any class/property they entail must be covered by your policy.
 
 Query-time rule injection (the query's `rules` field) is **admin-only**: under a non-root view policy, caller-supplied datalog rules are stripped before execution, because a rule with a viewable head could launder hidden data the policy author never anticipated. Database-stored rules (`f:rule`) and OWL/RDFS reasoning are administrator-controlled and continue to apply. A policy selection that yields no rules under `default-allow: true` is root — nothing is hidden, so there is nothing to launder and query-supplied rules are not stripped.
+
+Class membership and `f:query` conditions read the state the query reads: derived facts in a reasoning query, stored facts in a plain one. A derived fact can therefore grant access as well as deny it, and a deny on a derived class does not reach a caller's plain queries; to make reasoning unavoidable, set the ledger's reasoning defaults with `f:overrideControl` `f:OverrideNone` ([Reasoning under access policy](../query/reasoning.md#reasoning-under-access-policy)).
 
 ### Performance under a policy
 
@@ -286,6 +288,7 @@ request header — and the response gains two siblings:
 | `policy_enforcement.enforced` | The request executed under a non-root policy context. The field is **absent entirely** when it did not, so its presence alone answers "was this request enforced?" A selection that yields no rules under `default-allow: true` is root, so the field is absent for it too. |
 | `policy_enforcement.denies_all_data` | The effective view-policy set is empty and `default-allow` is false: under this request's policy configuration, **no data flake could have been returned**. |
 | `policy_enforcement.unevaluable_policies` | Ids of `f:query` policies a virtual graph source (Iceberg / SQL) could not evaluate and therefore denied. Omitted when empty; never set on a native ledger. |
+| `policy_enforcement.undecidable_class_maps` | Triples maps of a virtual graph source whose rows a class-targeted policy hid because their subjects could also hold classes another map declares (see [Iceberg → Class policies over subjects several rows mint](../graph-sources/iceberg.md#class-policies-over-subjects-several-rows-mint)). Omitted when empty; never set on a native ledger. |
 
 The same values ride the `x-fdb-policy` (base64 JSON) and
 `x-fdb-policy-enforcement` (plain JSON) response headers, which is how you read

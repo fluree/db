@@ -7,6 +7,7 @@ mod graph_source;
 pub(crate) mod helpers;
 pub mod multi;
 pub mod nameservice_builder;
+pub mod result_cache;
 
 use fluree_db_core::VerifiedIdentity;
 use serde_json::Value as JsonValue;
@@ -40,6 +41,12 @@ pub struct QueryExecutionOptions {
     /// stringified child value never equals the parent key — is treated as
     /// dangling, so the templated IRI may not resolve to a real parent subject.
     pub trust_fk_refs: bool,
+    /// Make every graph-source table scan emit a fixed row order, even when the
+    /// query has no LIMIT or OFFSET, for a caller that pages the answer itself.
+    /// Without it, a query with no slice may stream a table's rows as its file
+    /// reads finish. Set by the graph-source crawl, which applies its subject
+    /// OFFSET after the query.
+    pub deterministic_scans: bool,
     /// Read lists as RDF does: a list is its owner's edge to a head cell and
     /// a chain of `rdf:first`/`rdf:rest` cells (`fluree_db_query::list_view`),
     /// so a CONSTRUCT writes it back as the list. Set only by the Graph Store
@@ -76,6 +83,7 @@ impl fmt::Debug for QueryExecutionOptions {
         f.debug_struct("QueryExecutionOptions")
             .field("cancellation", &self.cancellation)
             .field("trust_fk_refs", &self.trust_fk_refs)
+            .field("deterministic_scans", &self.deterministic_scans)
             .field("rdf_list_view", &self.rdf_list_view)
             .field("server_identity", &self.server_identity)
             .field("params", &self.params)
@@ -86,6 +94,45 @@ impl fmt::Debug for QueryExecutionOptions {
 }
 
 impl QueryExecutionOptions {
+    /// Hash the options that can change a query's answer, for the
+    /// query-result cache. `Err` names one it cannot key.
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            cancellation: _,
+            trust_fk_refs,
+            deterministic_scans,
+            rdf_list_view,
+            server_identity,
+            params,
+            lifecycle_guard: _,
+            view_is_the_dataset,
+            ledger_times,
+        } = self;
+        if ledger_times.is_some() {
+            return Err("pinned ledger times");
+        }
+        trust_fk_refs.hash(h);
+        deterministic_scans.hash(h);
+        rdf_list_view.hash(h);
+        view_is_the_dataset.hash(h);
+        server_identity
+            .as_ref()
+            .map(VerifiedIdentity::as_str)
+            .hash(h);
+        match params {
+            None => 0u8.hash(h),
+            Some(params) => {
+                1u8.hash(h);
+                result_cache::hash_json(params.as_ref(), h).map_err(|_| "parameters")?;
+            }
+        }
+        Ok(())
+    }
+
     /// Create empty execution options.
     pub fn new() -> Self {
         Self::default()
@@ -102,6 +149,13 @@ impl QueryExecutionOptions {
     /// crawl/browse path.
     pub fn with_trust_fk_refs(mut self, trust: bool) -> Self {
         self.trust_fk_refs = trust;
+        self
+    }
+
+    /// Make graph-source scans emit a fixed row order whatever the query's
+    /// shape. See [`QueryExecutionOptions::deterministic_scans`].
+    pub fn with_deterministic_scans(mut self, deterministic: bool) -> Self {
+        self.deterministic_scans = deterministic;
         self
     }
 

@@ -9,6 +9,7 @@ mod ref_object_map;
 mod sql_subset;
 mod term_map;
 mod triples_map;
+mod uniqueness;
 
 pub use compiled::CompiledR2rmlMapping;
 pub use ref_object_map::{JoinCondition, RefObjectMap};
@@ -17,4 +18,8 @@ pub use term_map::{ConstantValue, ObjectMap, PredicateMap, PredicateObjectMap, T
 pub use triples_map::{
     extract_template_columns, GraphMap, LogicalTable, SubjectMap, TriplesMap,
     SQL_QUERY_ALIAS_PREFIX,
+};
+pub use uniqueness::{
+    constant_prefix, templates_provably_disjoint, usable_in_key, KeyColumn, SubjectKeyProof,
+    TableKeys,
 };

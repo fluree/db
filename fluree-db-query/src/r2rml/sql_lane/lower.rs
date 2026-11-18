@@ -9,16 +9,30 @@
 //! the plan cannot express exactly is either kept in the engine (a residual
 //! `FILTER` over the returned rows) or declines the whole block, in which case
 //! the per-scan lane runs. There is no approximate translation.
+//!
+//! The graph is a *set* of triples while its tables are bags, so a row-level
+//! translation is exact only where no row repeats a solution another row
+//! gave. That holds when every table access mints at most one row per subject
+//! the solution binds (a key of its table within the subject's columns, see
+//! [`TriplesMap::subject_unique_under`]) and no two resolutions of an entity
+//! can mint one subject; the statement is then what it would be without set
+//! semantics. Elsewhere it is a `SELECT DISTINCT` over every block variable's
+//! columns ([`Lowered::dedupes`]), or the block declines where a `DISTINCT`
+//! cannot answer exactly: two patterns read from one row of a map that may
+//! hold several rows per subject (a star, whose graph answer is the
+//! per-subject cross product), a template that is not injective, a string
+//! `DISTINCT` that folds case, a repeated `VALUES` row.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use fluree_db_core::{DatatypeConstraint, FlakeValue, LedgerSnapshot};
 use fluree_db_r2rml::mapping::{
-    CompiledR2rmlMapping, ConstantValue, ObjectMap, PredicateMap, TermType, TriplesMap,
+    extract_template_columns, CompiledR2rmlMapping, ConstantValue, ObjectMap, PredicateMap,
+    TermType, TriplesMap,
 };
-use fluree_db_r2rml::materialize::reverse_subject_template;
-use fluree_db_r2rml::RdfTerm;
+use fluree_db_r2rml::materialize::{reverse_subject_template, template_is_injective};
+use fluree_db_r2rml::{RdfTerm, TableKeys};
 use fluree_db_tabular::plan::{
     like_escape, ArithOp, CmpOp, ColRef, Expr, KeySet, Literal, OrderKey, OutputCol, OutputExpr,
     Pred, PushdownCapabilities, RelNode, RelPlan, RelSource,
@@ -239,8 +253,28 @@ pub(crate) struct Lowered {
     pub limit_is_exact: bool,
     /// The statement is `SELECT DISTINCT` over the columns of the variables
     /// a `DISTINCT` above reads (plus what the join and residuals need);
-    /// the other block variables come back unbound.
+    /// the other block variables come back unbound. Or, when
+    /// [`Self::dedupes`], over every block variable's columns.
     pub distinct: bool,
+    /// No two rows of the statement are one solution. A graph source is a
+    /// set of triples while its tables are bags, so a row can repeat a
+    /// solution another row already gave; this holds when every table
+    /// access mints at most one row per subject the solution binds
+    /// ([`TriplesMap::subject_unique_under`]) and no two resolutions of a
+    /// union entity can mint one solution. Where it fails and no `DISTINCT`
+    /// above reads a projection, the statement removes the duplicates
+    /// ([`Self::dedupes`]) or the lane declines.
+    pub rows_unique: bool,
+    /// A `SELECT DISTINCT` over every block variable's columns keeps exactly
+    /// one row per solution: the database's equality on each column is the
+    /// equality of the terms it renders (no collation folds strings, no
+    /// rendering keeps apart what the database merges or merges what it
+    /// keeps apart, every template is injective), and no row the block joins
+    /// may legitimately repeat (a sub-select's projection, a `VALUES` row).
+    pub dedupe_exact: bool,
+    /// `distinct` removes repeated solutions over every block variable, not
+    /// a projection a `DISTINCT` above reads.
+    pub dedupes: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -289,6 +323,9 @@ pub(crate) struct LowerInput<'a> {
     /// The variables a `DISTINCT` directly above the block reads, when there
     /// is one: the statement may then be `SELECT DISTINCT` over their columns.
     pub projection: Option<&'a [VarId]>,
+    /// Each reachable table's keys ([`crate::r2rml::effective_table_keys`]),
+    /// by table name: what proves a map's rows cannot repeat a subject.
+    pub keys: &'a HashMap<String, TableKeys>,
 }
 
 /// The most `UNION` branch combinations one block expands into.
@@ -335,6 +372,11 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>
             unions: HashMap::new(),
             forced: None,
             derived_types: HashMap::new(),
+            keys: input.keys,
+            constraints: HashMap::new(),
+            class_policy: HashSet::new(),
+            set_derived: HashSet::new(),
+            values_distinct: true,
         };
         let lowered = lw.lower(
             block,
@@ -344,7 +386,22 @@ pub(crate) fn lower_block(input: LowerInput<'_>) -> Result<Lowering<Vec<Lowered>
         )?;
         policy = lw.policy.take();
         match lowered {
-            Ok(Some(l)) => out.push(l),
+            Ok(Some(mut l)) => {
+                // Each UNION branch is a set of solutions on its own; the
+                // branches together stay a bag. A DISTINCT above already
+                // removes every repeat, so only a block it does not read
+                // removes its own.
+                if !l.rows_unique && input.projection.is_none() {
+                    if !l.dedupe_exact {
+                        return Ok(Err(Decline(
+                            "repeated solutions the statement cannot remove exactly",
+                        )));
+                    }
+                    l.distinct = true;
+                    l.dedupes = true;
+                }
+                out.push(l);
+            }
             Ok(None) => {}
             Err(d) => return Ok(Err(d)),
         }
@@ -418,6 +475,21 @@ struct Lowerer<'a> {
     forced: Option<Vec<Part<'a>>>,
     /// Column types of derived and union outputs, by alias then column.
     derived_types: HashMap<String, HashMap<String, FieldType>>,
+    /// Each reachable table's keys, by table name.
+    keys: &'a HashMap<String, TableKeys>,
+    /// Row-level constraints per table access: how many triple patterns
+    /// read its row (a member's columns, a class column, a join on columns
+    /// other than its subject's). Two on an access whose map may hold several
+    /// rows per subject pair values row by row, where the graph pairs every
+    /// value the subject has for one with every value it has for the other.
+    constraints: HashMap<String, usize>,
+    /// Table accesses a row-dependent class policy filters.
+    class_policy: HashSet<String>,
+    /// Derived tables whose rows are a set: a `DISTINCT` sub-select, or a
+    /// grouped one projecting every key.
+    set_derived: HashSet<String>,
+    /// No two rows of a `VALUES` the block joins are alike.
+    values_distinct: bool,
 }
 
 /// A union entity's derived table: one plan per resolution, each output
@@ -429,6 +501,13 @@ struct UnionInfo {
     /// columns as `(column, slot)` — present only when every branch reads
     /// the parent's row.
     parent_cols: HashMap<String, Vec<(String, String)>>,
+    /// See [`Lowered::rows_unique`]: every resolution's rows are, and no two
+    /// resolutions can mint one subject.
+    rows_unique: bool,
+    /// See [`Lowered::dedupe_exact`], for every resolution; and the tag
+    /// names a decoding, not a resolution, wherever two resolutions can mint
+    /// one subject, so a repeated solution repeats its tag too.
+    dedupe_exact: bool,
 }
 
 /// A foreign key another entity may point at an entity: the parent map and
@@ -559,7 +638,12 @@ impl<'a> Lowerer<'a> {
                         Some(Verdict::Allow) => {}
                         Some(Verdict::Deny) => return Ok(Ok(None)),
                         Some(verdict) => match self.verdict_pred(&alias, tm, &verdict) {
-                            Ok(Ok(Some(pred))) => self.place_pred(pred),
+                            Ok(Ok(Some(pred))) => {
+                                if matches!(verdict, Verdict::ByClass { .. }) {
+                                    self.class_policy.insert(alias.clone());
+                                }
+                                self.place_pred(pred);
+                            }
                             Ok(Ok(None)) => {}
                             Ok(Err(Empty)) => return Ok(Ok(None)),
                             Err(d) => return Ok(Err(d)),
@@ -576,6 +660,7 @@ impl<'a> Lowerer<'a> {
                         if static_classes(tm).iter().any(|c| c == class) {
                             continue;
                         }
+                        self.constrain(&alias);
                         match self.class_value(&alias, tm, class) {
                             Ok(Some((col, value))) => self.place_pred(Pred::Cmp {
                                 col,
@@ -587,6 +672,7 @@ impl<'a> Lowerer<'a> {
                         }
                         continue;
                     }
+                    self.constrain(&alias);
                     match self.bind_member(&alias, tm, pred, obj, &required_subjects, false) {
                         Ok(Ok(Some(edge))) => pending_refs.push(edge),
                         Ok(Ok(None)) => {}
@@ -658,6 +744,9 @@ impl<'a> Lowerer<'a> {
                     )))
                 }
             };
+            if !joins_on_subject(parent, conds.iter().map(|(_, p)| p.as_str())) {
+                self.constrain(&parent_alias);
+            }
             for (child_col, parent_col) in conds {
                 self.edges.push((
                     child_alias.clone(),
@@ -899,6 +988,56 @@ impl<'a> Lowerer<'a> {
         }
 
         let limit_is_exact = self.residuals.is_empty() && all_shared_seeded;
+
+        // Set semantics. Two triple patterns read from one row of a map that
+        // may hold several rows per subject pair that row's values, where the
+        // graph pairs every value the subject has for one with every value
+        // it has for the other: the statement would lose solutions, which no
+        // DISTINCT restores. A class a policy reads from a column is likewise
+        // one row's, where the subject has every row's classes.
+        let mut constrained: Vec<(&String, &usize)> = self.constraints.iter().collect();
+        constrained.sort();
+        for (alias, n) in constrained {
+            if *n >= 2 && !self.access_unique(alias) {
+                return Ok(Err(Decline(
+                    "star over a subject its map does not prove unique",
+                )));
+            }
+        }
+        if self.class_policy.iter().any(|a| !self.access_unique(a)) {
+            return Ok(Err(Decline(
+                "class policy over a subject its map does not prove unique",
+            )));
+        }
+        // A derived table's rows carry the multiplicity its own lowering
+        // gave them; a union's are unique when its resolutions are.
+        let rows_unique = self.accesses.iter().all(|a| {
+            if self.derived.contains_key(&a.alias) {
+                true
+            } else if let Some(u) = self.unions.get(&a.alias) {
+                u.rows_unique
+            } else {
+                self.access_unique(&a.alias)
+            }
+        });
+        let strings_apart = self.caps.string_distinct_is_binary
+            || outputs.iter().all(|o| {
+                o.expr
+                    .col()
+                    .is_some_and(|c| !matches!(self.field_type(c), None | Some(FieldType::String)))
+            });
+        let terms_apart = projected.iter().all(|v| {
+            let src = &self.vars[v];
+            let eq_exact = !matches!(&src.key,
+                Some(KeyShape::Column { class, .. }) if !class.database_eq_is_exact());
+            eq_exact && self.term_renders_apart(&src.term)
+        });
+        let dedupe_exact = strings_apart
+            && terms_apart
+            && self.unions.values().all(|u| u.dedupe_exact)
+            && self.derived.keys().all(|a| self.set_derived.contains(a))
+            && self.values_distinct;
+
         Ok(Ok(Some(Lowered {
             root,
             outputs,
@@ -914,6 +1053,9 @@ impl<'a> Lowerer<'a> {
             order_exprs,
             limit_is_exact,
             distinct: distinct && distinct_vars.is_some() && distinct_exact,
+            rows_unique,
+            dedupe_exact,
+            dedupes: false,
         })))
     }
 
@@ -967,7 +1109,13 @@ impl<'a> Lowerer<'a> {
             alternatives = kept;
         }
         let mut branches: Vec<(Lowered, HashSet<(String, String)>)> = Vec::new();
+        // The map minting each branch's subject (every part of a resolution
+        // mints the same one).
+        let mut subjects: Vec<&'a TriplesMap> = Vec::new();
         for alt in alternatives {
+            let Some(&(subject_tm, _)) = alt.first() else {
+                return Ok(Err(Decline("union resolution without a part")));
+            };
             let mut inner = self.nested();
             inner.forced = Some(alt);
             let block = Block {
@@ -982,7 +1130,10 @@ impl<'a> Lowerer<'a> {
             let required = std::mem::take(&mut inner.required_columns);
             self.rejoin(inner);
             match lowered {
-                Ok(Some(l)) => branches.push((l, required)),
+                Ok(Some(l)) => {
+                    branches.push((l, required));
+                    subjects.push(subject_tm);
+                }
                 // A branch no row can satisfy contributes nothing.
                 Ok(None) => {}
                 Err(d) => return Ok(Err(d)),
@@ -1011,6 +1162,10 @@ impl<'a> Lowerer<'a> {
         // column of the first branch (a column two variables share takes
         // one), the other branches' columns alongside.
         let mut slots: Vec<Vec<ColRef>> = Vec::new();
+        // Each variable's columns' slots, in its column order: a column two
+        // variables read sits in one slot, so a slot found by column alone
+        // could be the other variable's.
+        let mut var_slots: HashMap<VarId, Vec<usize>> = HashMap::new();
         for v in &vars {
             let n = first.var_columns.get(v).map_or(0, Vec::len);
             for j in 0..n {
@@ -1023,13 +1178,17 @@ impl<'a> Lowerer<'a> {
                         "union branches bind a variable on different column counts",
                     )));
                 };
-                match slots.iter().position(|s| s[0] == per_branch[0]) {
+                let k = match slots.iter().position(|s| s[0] == per_branch[0]) {
                     Some(k) if slots[k] != per_branch => {
                         return Ok(Err(Decline("union branches disagree on a shared column")));
                     }
-                    Some(_) => {}
-                    None => slots.push(per_branch),
-                }
+                    Some(k) => k,
+                    None => {
+                        slots.push(per_branch);
+                        slots.len() - 1
+                    }
+                };
+                var_slots.entry(*v).or_default().push(k);
             }
         }
         // The parents' join columns, as slots, where every branch reads
@@ -1077,6 +1236,72 @@ impl<'a> Lowerer<'a> {
         let slot_name = |k: usize| format!("c{k}");
         let slot_of = |col: &ColRef, branch: usize| slots.iter().position(|s| &s[branch] == col);
 
+        // Set semantics across resolutions. Two resolutions that can mint one
+        // subject can give one solution twice, which the statement removes
+        // with a DISTINCT over its columns: the tag then names a decoding,
+        // shared by every resolution rendering the same terms from the same
+        // slots, so a repeated solution repeats its tag too. Resolutions that
+        // decode apart must mint subjects provably apart.
+        let n = branches.len();
+        let apart = |i: usize, j: usize| subjects[i].subjects_provably_disjoint(subjects[j]);
+        let rows_unique = branches.iter().all(|(l, _)| l.rows_unique)
+            && (0..n).all(|i| (i + 1..n).all(|j| apart(i, j)));
+        let mut class_of: Vec<usize> = (0..n).collect();
+        let mut representatives: Vec<usize> = (0..n).collect();
+        if !rows_unique {
+            let signatures: Vec<Option<Vec<String>>> = branches
+                .iter()
+                .map(|(l, _)| {
+                    vars.iter()
+                        .map(|v| {
+                            let cols = l.var_columns.get(v);
+                            let at = var_slots.get(v);
+                            let slot = |c: &ColRef| {
+                                let j = cols?.iter().position(|x| x == c)?;
+                                at?.get(j).copied()
+                            };
+                            self.decoding(l, &l.vars[v].term, slot)
+                        })
+                        .collect()
+                })
+                .collect();
+            representatives.clear();
+            for i in 0..n {
+                let shared = representatives
+                    .iter()
+                    .position(|r| signatures[*r].is_some() && signatures[*r] == signatures[i]);
+                class_of[i] = match shared {
+                    Some(c) => c,
+                    None => {
+                        representatives.push(i);
+                        representatives.len() - 1
+                    }
+                };
+            }
+            for i in 0..n {
+                for j in i + 1..n {
+                    if class_of[i] != class_of[j] && !apart(i, j) {
+                        return Ok(Err(Decline(
+                            "union resolutions that can mint one subject decode it apart",
+                        )));
+                    }
+                }
+            }
+            // A reference joining on columns other than the subject's reads
+            // one row of a resolution that may hold several per subject.
+            for inc in incoming {
+                let on_subject = self
+                    .mapping
+                    .get(&inc.parent)
+                    .is_some_and(|p| joins_on_subject(p, inc.cols.iter().map(String::as_str)));
+                if !on_subject {
+                    return Ok(Err(Decline(
+                        "reference into a union entity on columns its subject does not fix",
+                    )));
+                }
+            }
+        }
+
         let plans: Vec<RelPlan> = branches
             .iter()
             .enumerate()
@@ -1087,7 +1312,7 @@ impl<'a> Lowerer<'a> {
                     .enumerate()
                     .map(|(k, s)| OutputCol::column(s[i].clone(), slot_name(k)))
                     .chain(std::iter::once(OutputCol {
-                        expr: OutputExpr::Tag(i as i64),
+                        expr: OutputExpr::Tag(class_of[i] as i64),
                         name: tag.clone(),
                     }))
                     .collect(),
@@ -1175,7 +1400,10 @@ impl<'a> Lowerer<'a> {
             let term = TermSource::Union {
                 alias: alias.clone(),
                 tag: tag.clone(),
-                branches: sources.iter().map(|s| retarget(&s.term)).collect(),
+                branches: representatives
+                    .iter()
+                    .map(|r| retarget(&sources[*r].term))
+                    .collect(),
             };
             // The key's shape survives when every branch has the same one,
             // column for column over the slots.
@@ -1238,12 +1466,15 @@ impl<'a> Lowerer<'a> {
                 )
             })
             .collect();
+        let dedupe_exact = branches.iter().all(|(l, _)| l.dedupe_exact);
         self.unions.insert(
             alias.clone(),
             UnionInfo {
                 branches: plans,
                 tag,
                 parent_cols,
+                rows_unique,
+                dedupe_exact,
             },
         );
         Ok(Ok(Ok(alias)))
@@ -1293,6 +1524,32 @@ impl<'a> Lowerer<'a> {
             }
         };
         self.rejoin(inner);
+        // Over rows that can repeat a solution, a sub-select answers over
+        // the set of the block's solutions: a DISTINCT one does already; any
+        // other reads every block variable's columns, made distinct, and
+        // groups or projects those.
+        let dedupe = !lowered.rows_unique && !sq.distinct;
+        let lowered = if dedupe {
+            let block = match parse_block(&sq.patterns, self.snapshot) {
+                Ok(b) => b,
+                Err(d) => return Ok(Err(d)),
+            };
+            let mut inner = self.nested();
+            let full = inner.lower(block, &[], None, false)?;
+            self.rejoin(inner);
+            match full {
+                Ok(Some(l)) if l.dedupe_exact => l,
+                Ok(Some(_)) => {
+                    return Ok(Err(Decline(
+                        "repeated solutions a subquery cannot remove exactly",
+                    )))
+                }
+                Ok(None) => return Ok(Ok(Err(Empty))),
+                Err(d) => return Ok(Err(d)),
+            }
+        } else {
+            lowered
+        };
         if !lowered.residual_filters.is_empty() {
             return Ok(Err(Decline("subquery with a residual filter")));
         }
@@ -1412,18 +1669,22 @@ impl<'a> Lowerer<'a> {
                         })
                         .collect();
                     match keys {
-                        Some(keys) => {
+                        // A DISTINCT orders only by what it selects.
+                        Some(keys)
+                            if !(dedupe
+                                && keys.iter().any(|(k, _)| matches!(k, OrderKey::Expr(_)))) =>
+                        {
                             order_by = keys;
                             limit = Some(*k as u64);
                         }
-                        None => return Ok(Err(Decline("subquery ORDER BY not pushable"))),
+                        _ => return Ok(Err(Decline("subquery ORDER BY not pushable"))),
                     }
                 }
                 let plan = RelPlan {
                     root: lowered.root.clone(),
                     output: lowered.outputs.clone(),
                     group_by: Vec::new(),
-                    distinct: lowered.distinct,
+                    distinct: lowered.distinct || dedupe,
                     order_by,
                     limit,
                     having: None,
@@ -1557,6 +1818,30 @@ impl<'a> Lowerer<'a> {
             })
             .collect();
         self.derived_types.insert(alias.clone(), types);
+        // A grouped statement reads the block's distinct solutions instead
+        // of its rows, so its groups and aggregates count solutions.
+        let plan = match (&sq.grouping, dedupe) {
+            (Some(_), true) => match super::aggregate::over_distinct_solutions(&plan, &lowered) {
+                Some(p) => p,
+                None => {
+                    return Ok(Err(Decline(
+                        "subquery aggregate over columns outside the solutions",
+                    )))
+                }
+            },
+            _ => plan,
+        };
+        // Its rows are a set when distinct, or grouped with every key
+        // projected: the outer statement may then remove its own repeats
+        // without losing one of these.
+        let is_set = sq.distinct
+            || sq
+                .grouping
+                .as_ref()
+                .is_some_and(|g| g.group_by_vars().all(|v| sq.select.contains(&v)));
+        if is_set {
+            self.set_derived.insert(alias.clone());
+        }
         self.derived.insert(alias, plan);
         for (v, src) in binds {
             if let Err(d) = self.bind_var(v, src) {
@@ -1564,6 +1849,77 @@ impl<'a> Lowerer<'a> {
             }
         }
         Ok(Ok(Ok(())))
+    }
+
+    /// How union branch `l` renders `term`, stated so that two branches
+    /// state it alike exactly when they render the same term from the same
+    /// slot values: the term map's shape, its columns replaced by the slots
+    /// `slot` puts them in. `None` when it cannot be stated, which shares a
+    /// decoding with no other branch.
+    fn decoding(
+        &self,
+        l: &Lowered,
+        term: &TermSource,
+        slot: impl Fn(&ColRef) -> Option<usize>,
+    ) -> Option<String> {
+        let slots = |alias: &str, cols: &[String]| -> Option<Vec<usize>> {
+            cols.iter().map(|c| slot(&ColRef::new(alias, c))).collect()
+        };
+        Some(match term {
+            TermSource::Subject { alias } => {
+                let sm = &self.mapping.get(&access_tm(l, alias)?)?.subject_map;
+                if let Some(c) = &sm.constant {
+                    format!("subject constant {c}")
+                } else if let Some(c) = &sm.column {
+                    let at = slots(alias, std::slice::from_ref(c))?;
+                    format!("subject column {:?} {at:?}", sm.term_type)
+                } else {
+                    let t = sm.template.as_deref()?;
+                    let at = slots(alias, &sm.template_columns)?;
+                    format!(
+                        "subject template {} {:?} {at:?}",
+                        template_skeleton(t),
+                        sm.term_type
+                    )
+                }
+            }
+            TermSource::Object { alias, tm_iri, pom } => {
+                let om = &self
+                    .mapping
+                    .get(tm_iri)?
+                    .predicate_object_maps
+                    .get(*pom)?
+                    .object_map;
+                match om {
+                    ObjectMap::Column {
+                        column,
+                        datatype,
+                        language,
+                        term_type,
+                    } => {
+                        let at = slots(alias, std::slice::from_ref(column))?;
+                        format!("column {datatype:?} {language:?} {term_type:?} {at:?}")
+                    }
+                    ObjectMap::Template {
+                        template,
+                        columns,
+                        term_type,
+                        datatype,
+                        language,
+                    } => {
+                        let at = slots(alias, columns)?;
+                        format!(
+                            "template {} {datatype:?} {language:?} {term_type:?} {at:?}",
+                            template_skeleton(template)
+                        )
+                    }
+                    ObjectMap::Constant { value } => format!("constant {value:?}"),
+                    ObjectMap::RefObjectMap(_) => return None,
+                }
+            }
+            TermSource::Constant(t) => format!("constant {t:?}"),
+            TermSource::Aggregate { .. } | TermSource::Union { .. } => return None,
+        })
     }
 
     fn allowed(&mut self, tm: &TriplesMap, pred: &str) -> Result<Option<Verdict>> {
@@ -1803,12 +2159,76 @@ impl<'a> Lowerer<'a> {
             unions: HashMap::new(),
             forced: None,
             derived_types: HashMap::new(),
+            keys: self.keys,
+            constraints: HashMap::new(),
+            class_policy: HashSet::new(),
+            set_derived: HashSet::new(),
+            values_distinct: true,
         }
     }
 
     fn rejoin(&mut self, mut inner: Lowerer<'a>) {
         self.policy = inner.policy.take();
         self.next_alias = inner.next_alias;
+    }
+
+    /// One more triple pattern reads table access `alias`'s row (see
+    /// [`Self::constraints`]).
+    fn constrain(&mut self, alias: &str) {
+        *self.constraints.entry(alias.to_string()).or_default() += 1;
+    }
+
+    /// Whether `tm`'s logical table holds at most one row per subject the
+    /// map mints, given the table's keys.
+    fn subject_unique(&self, tm: &TriplesMap) -> bool {
+        tm.table_name()
+            .and_then(|t| self.keys.get(t))
+            .is_some_and(|keys| tm.subject_unique_under(keys))
+    }
+
+    /// Whether table access `alias` reads at most one row per subject.
+    fn access_unique(&self, alias: &str) -> bool {
+        self.tm_of(alias).is_some_and(|tm| self.subject_unique(tm))
+    }
+
+    /// The triples map a term alias decodes through: a table access, or a
+    /// derived table's view of one.
+    fn term_tm(&self, alias: &str) -> Option<&'a TriplesMap> {
+        match self.derived_terms.get(alias) {
+            Some(dc) => self.mapping.get(&dc.tm_iri),
+            None => self.tm_of(alias),
+        }
+    }
+
+    /// Whether rows the database keeps apart on `term`'s columns always
+    /// render different terms: a template term must be injective. An
+    /// undecidable term is not.
+    fn term_renders_apart(&self, term: &TermSource) -> bool {
+        match term {
+            TermSource::Subject { alias } => self.term_tm(alias).is_some_and(|tm| {
+                let sm = &tm.subject_map;
+                sm.template.as_deref().is_none_or(|t| {
+                    template_renders_apart(t, sm.term_type, extract_template_columns(t).len())
+                })
+            }),
+            TermSource::Object { tm_iri, pom, .. } => self
+                .mapping
+                .get(tm_iri)
+                .and_then(|tm| tm.predicate_object_maps.get(*pom))
+                .is_some_and(|p| match &p.object_map {
+                    ObjectMap::Template {
+                        template,
+                        columns,
+                        term_type,
+                        ..
+                    } => template_renders_apart(template, *term_type, columns.len()),
+                    _ => true,
+                }),
+            // A union's terms are vetted per resolution.
+            TermSource::Constant(_) | TermSource::Aggregate { .. } | TermSource::Union { .. } => {
+                true
+            }
+        }
     }
 
     fn new_access(&mut self, tm: &TriplesMap) -> String {
@@ -2457,6 +2877,9 @@ impl<'a> Lowerer<'a> {
                         // The parent is not an entity of the block: access it
                         // for its subject, joined on the FK.
                         let palias = self.new_access(parent);
+                        if !joins_on_subject(parent, conds.iter().map(|(_, p)| p.as_str())) {
+                            self.constrain(&palias);
+                        }
                         let on: Vec<Pred> = conds
                             .iter()
                             .map(|(c, p)| Pred::ColEq {
@@ -2476,6 +2899,9 @@ impl<'a> Lowerer<'a> {
                     }
                     Obj::Iri(iri) => {
                         let palias = self.new_access(parent);
+                        if !joins_on_subject(parent, conds.iter().map(|(_, p)| p.as_str())) {
+                            self.constrain(&palias);
+                        }
                         for (c, p) in &conds {
                             self.edges.push((
                                 alias.to_string(),
@@ -2576,6 +3002,7 @@ impl<'a> Lowerer<'a> {
                         return decline("policy not static")
                     }
                 }
+                self.constrain(&alias);
                 match self.bind_member(&alias, tm, pred, obj, required_subjects, true) {
                     Ok(Ok(None)) => {}
                     Ok(Ok(Some(_))) => return decline("optional ref to a required entity"),
@@ -2596,6 +3023,7 @@ impl<'a> Lowerer<'a> {
         // predicates name the access this entity is about to get.
         let alias = self.next_alias_name();
         let mut policy_on: Vec<Pred> = Vec::new();
+        let mut class_policy = false;
         for (pred, _) in members {
             match self
                 .allowed(tm, pred)
@@ -2604,7 +3032,10 @@ impl<'a> Lowerer<'a> {
                 Some(Verdict::Allow) => {}
                 Some(Verdict::Deny) => return Ok(()),
                 Some(verdict) => match self.verdict_pred(&alias, tm, &verdict)? {
-                    Ok(Some(p)) => policy_on.push(p),
+                    Ok(Some(p)) => {
+                        class_policy |= matches!(verdict, Verdict::ByClass { .. });
+                        policy_on.push(p);
+                    }
                     Ok(None) => {}
                     Err(Empty) => return Ok(()),
                 },
@@ -2613,6 +3044,9 @@ impl<'a> Lowerer<'a> {
         }
         debug_assert_eq!(alias, self.next_alias_name());
         let alias = self.new_access(tm);
+        if class_policy {
+            self.class_policy.insert(alias.clone());
+        }
         let mut on: Vec<Pred> = policy_on;
         for c in tm.subject_columns() {
             on.push(Pred::IsNotNull(ColRef::new(&alias, c)));
@@ -2627,6 +3061,7 @@ impl<'a> Lowerer<'a> {
             if pred == rdf::TYPE {
                 continue;
             }
+            self.constrain(&alias);
             match self.bind_member(&alias, tm, pred, obj, required_subjects, true) {
                 Ok(Ok(None)) => {}
                 Ok(Ok(Some((child_alias, conds, parent_tm, var)))) => {
@@ -2649,6 +3084,12 @@ impl<'a> Lowerer<'a> {
                         .unwrap_or_default();
                     if target_tm != parent_tm {
                         return decline("optional FK target has another triples map");
+                    }
+                    let joins_subject = self.mapping.get(&parent_tm).is_some_and(|p| {
+                        joins_on_subject(p, conds.iter().map(|(_, p)| p.as_str()))
+                    });
+                    if !joins_subject {
+                        self.constrain(&parent_alias);
                     }
                     for (c, p) in conds {
                         fk_edges.push(Pred::ColEq {
@@ -2756,6 +3197,15 @@ impl<'a> Lowerer<'a> {
         }
         if out_rows.is_empty() {
             return decline("empty VALUES");
+        }
+        // Two alike rows each join the block's solutions: a multiplicity
+        // removing repeated solutions would lose.
+        let mut seen: HashSet<super::SeedKey> = HashSet::with_capacity(out_rows.len());
+        if !out_rows
+            .iter()
+            .all(|r| seen.insert(super::SeedKey(r.clone())))
+        {
+            self.values_distinct = false;
         }
         // A key set the provider would not take in one statement stays with
         // the engine: the block's VALUES is not chunked the way outer
@@ -3561,6 +4011,30 @@ fn subjects_disjoint(a: &TriplesMap, b: &TriplesMap) -> bool {
     let prefix = |t: &str| t.split('{').next().unwrap_or("").to_string();
     let (pa, pb) = (prefix(ta), prefix(tb));
     !pa.starts_with(&pb) && !pb.starts_with(&pa)
+}
+
+/// Whether a reference joins `parent` on its subject's columns alone, so
+/// every row of one subject agrees on them and the join picks subjects, not
+/// rows: a column subject, or an injective template.
+fn joins_on_subject<'c>(parent: &TriplesMap, cols: impl IntoIterator<Item = &'c str>) -> bool {
+    let sm = &parent.subject_map;
+    let injective = sm.column.is_some()
+        || sm.template.as_deref().is_some_and(|t| {
+            template_renders_apart(t, sm.term_type, extract_template_columns(t).len())
+        });
+    let subject = parent.subject_columns();
+    injective && cols.into_iter().all(|c| subject.contains(&c))
+}
+
+/// Whether distinct values of a template's columns always render distinct
+/// terms. An IRI template escapes its values, so a separator the escape
+/// always encodes delimits them ([`template_is_injective`]); a literal or
+/// blank-node template does not escape, so only one over a single column is.
+fn template_renders_apart(template: &str, term_type: TermType, columns: usize) -> bool {
+    match term_type {
+        TermType::Iri => template_is_injective(template),
+        _ => columns <= 1,
+    }
 }
 
 /// Whether two triples maps read the same row: one relation, one subject

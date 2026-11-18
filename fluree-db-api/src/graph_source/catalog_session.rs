@@ -144,9 +144,33 @@ pub(crate) struct IcebergCatalogSession {
     /// table versions this query reads.
     #[cfg(feature = "delta")]
     delta_dispatch: Mutex<HashMap<String, Option<Arc<super::delta::DeltaSource>>>>,
+    /// Per-query memo of each source's compiled mapping. Every caller needing
+    /// it (each schema probe, each table's key lookup, the scans) would
+    /// otherwise repeat the nameservice lookup behind it, two object reads on
+    /// a storage-backed nameservice; the mapping is fixed for the query as the
+    /// source's family already is.
+    mappings: Mutex<HashMap<String, Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>>>,
 }
 
 impl IcebergCatalogSession {
+    pub(crate) fn mapping(
+        &self,
+        graph_source_id: &str,
+    ) -> Option<Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>> {
+        self.mappings.lock().unwrap().get(graph_source_id).cloned()
+    }
+
+    pub(crate) fn memo_mapping(
+        &self,
+        graph_source_id: &str,
+        mapping: Arc<fluree_db_r2rml::mapping::CompiledR2rmlMapping>,
+    ) {
+        self.mappings
+            .lock()
+            .unwrap()
+            .insert(graph_source_id.to_string(), mapping);
+    }
+
     #[cfg(feature = "sql")]
     pub(crate) fn mark_sql_source(&self, graph_source_id: &str) {
         self.sql_sources

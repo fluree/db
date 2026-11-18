@@ -76,11 +76,15 @@ fluree iceberg map orders \
 
 Once mapped, graph sources appear in `fluree list`, can be inspected with `fluree info`, and removed with `fluree drop`. See [CLI iceberg reference](../cli/iceberg.md) for all options.
 
-For a catalog-backed source, `info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. The count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`, and its class and property counts are `null`. A count that metadata cannot give exactly but can bound is `null`, with a `count-upper-bound` beside it: the true count is at most that. A triples map narrowed by a [row filter](#row-filters-rrsqlquery) keeps only some of its table's rows, so each class and property it contributes to reports the sum of the contributing tables' row counts as the bound (absent when one of them is unknown), and its per-datatype counts are `null`.
+`info` (and the server's `/info`) reports each table's row count from Iceberg metadata, never from a data scan. For a catalog-backed source the count is the snapshot summary's `total-records`. Some writers leave the summary's totals out (BigQuery writes only `operation`); for those, the count is the live-row total of the snapshot's manifest list, which is read once per snapshot and then cached. A Direct (`--table-location`) source reads each table's metadata file and reports its summary's `total-records`, or no count when the writer left it out. A table whose snapshot carries merge-on-read delete files is listed under `mor-approximate-tables`, because its count is an upper bound. A table whose count cannot be read has no entry in `table-row-counts`.
+
+A class or property `count` for a graph source means one thing: the exact number, as a native ledger loaded with the mapping's triples would report it. Where the metadata cannot prove the number, `count` is `null`, and `count-upper-bound` beside it gives the most it can be when that is provable. A class count is exact when every triples map minting the class reads its whole table (no [row filter](#row-filters-rrsqlquery)) under a row count that is not a merge-on-read bound, mints one distinct subject per row (its subject is built from a [key](r2rml.md#declaring-a-tables-keys-fkey) of the table, and no subject column can be null), and the maps provably mint different subjects (of any two subject templates, neither one's text before its first placeholder begins the other's). A property count is exact under the same conditions, when also no row mints one value of the property twice and the object column can never be null. "Can never be null" means the column is `required` in the table's schema, for format version 2 or older tables (from version 3 a required column can be added with a default that older files do not store). Otherwise the bound is the sum of the contributing tables' row counts, absent when one of them is unknown. A reference (`rr:parentTriplesMap`) is never counted exactly, because a child key may match no parent row: it is bounded by the child's rows when one join key value can match at most one parent subject (the parent's subject is built from the join columns, or they hold a key of the parent's table), and has no bound when one value can match several parents. Its `ref-classes` entries are `null`, with the bound under `ref-classes-upper-bound`. Per-datatype counts are the exact count or `null`.
+
+**Reading a virtual count.** Earlier releases reported the contributing tables' row counts as `count`. Now most classes and properties of a mapping that declares no key have `count: null`, since a count is exact only for maps whose subjects a key proves unique. A client that displays a count shows `count` when it is a number, else `count-upper-bound` as "at most N", else "not counted"; it never reads a `null` as 0. A `ref-classes` entry reads the same way, with its bound under `ref-classes-upper-bound`. Fluree's own MCP data-model summary does this. Declaring the tables' keys ([`f:key`](r2rml.md#declaring-a-tables-keys-fkey)) makes the counts of maps over unfiltered tables exact again.
 
 #### Warehouse-root `--table-location` (multi-table, catalog-less)
 
-`--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name (the namespace prefix stripped). Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
+`--table-location` normally points at a single table's root directory. It may instead point at a **database / namespace root** — e.g. `s3://bucket/warehouse/dw` — for a catalog-less copy whose table directories carry random suffixes (a Snowflake-managed Iceberg database writes `fact_order.UIHGsQex/`, not `fact_order/`). With an `--r2rml` mapping, each `rr:tableName` (e.g. `DW.FACT_ORDER`) is resolved to its own directory under the root via a single S3 `LIST`, matching `<name>.<suffix>/` or bare `<name>/`, case-insensitively on the name. When the root holds a directory for the table's namespace (`<root>/<namespace>/<table>` or the Hive/Glue spelling `<root>/<namespace>.db/<table>`, one directory per namespace level), the table is looked up there and only there, so the same table name in two namespaces resolves to two different tables and a table missing from its namespace directory is an error naming that directory; a root with no such directory is matched flat, with the namespace prefix ignored. Warehouse-root mode is **auto-detected** when the location's leaf directory does not name the requested table; a bare single-table location resolves exactly as before. (A table named identically to its own parent directory reads as single-table.) No catalog or OAuth flags are needed — direct mode reads with ambient IAM credentials.
 
 ### HTTP API
 
@@ -419,7 +423,7 @@ whose manifests reference files *outside* its own root is not remapped.)
 **Direct mode requirements:**
 
 - `catalog.table_location` must be an S3 URI (`s3://` or `s3a://`), a `file://` URI, or an absolute local path, pointing to the table root directory. Local paths additionally require `FLUREE_ICEBERG_LOCAL_ROOTS` to name a directory containing them (see [Enabling local tables](#enabling-local-tables)).
-- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file, and (for S3 locations) `version-hint.text` — the current metadata filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
+- The table must contain a `metadata/` subdirectory with the current `.metadata.json` file. A `version-hint.text` there is optional; when present it names the current metadata — a filename (e.g., `00001-abc-def.metadata.json`), a full `s3://`/`gs://` path, or a bare integer version `N` (resolving to `vN.metadata.json`)
 - Direct mode uses ambient AWS credentials (IAM roles, env vars, `~/.aws/credentials`) for S3 locations. It does **not** support vended credentials. Local locations use no credentials at all.
 
 **How Direct metadata resolution works:**
@@ -428,7 +432,7 @@ whose manifests reference files *outside* its own root is not remapped.)
   - `"{table_location}/metadata/version-hint.text"` to get the current metadata filename
   - `"{table_location}/metadata/{filename}"` as the table’s current metadata
 - `version-hint.text` may contain a bare filename (e.g., `00001-abc.metadata.json`), a full absolute path (`s3://...` / `gs://...`), or a bare integer version `N` — the Iceberg Hadoop file-based catalog convention — which resolves to `vN.metadata.json`.
-- **Local tables don't need `version-hint.text`** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3, where listing is not performed, a missing or empty `version-hint.text` fails with an error mentioning `version-hint.text`.
+- **`version-hint.text` is optional** (pyiceberg and most non-Hadoop writers never produce it): when the hint is absent or empty, the `metadata/` directory is listed and the highest-versioned `*.metadata.json` is used. On S3 this needs `s3:ListBucket` on the bucket; if the listing is denied or finds no metadata file, the error mentions `version-hint.text`.
 
 **Iceberg table setup must already exist:**
 
@@ -481,7 +485,7 @@ export AWS_SECRET_ACCESS_KEY=<gcs-hmac-secret>
 
 A signing region is required and must match the bucket location — SigV4 scopes the signature to a region, and GCS interop rejects a mismatched or unsigned region. Set it via `s3_region` in the config (recommended, and what the examples use) or via the ambient `AWS_REGION` in the server environment. `s3_endpoint` must be the interop host, and `s3_path_style` must be `true`. HMAC keys do not expire. In `rest` mode with vended credentials, the catalog's credentials for the table are used instead (S3 interoperability keys through this path, a GCS token through the native reader), and are renewed by asking the catalog again before they expire.
 
-GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory and a current `version-hint.text`) must already exist in the bucket.
+GCS-backed Iceberg tables are typically read via `direct` mode — point `table_location` at the table root. GCS-native conventions are handled automatically: `gs://` paths in metadata/manifests, a Hadoop-style integer `version-hint.text` (resolved to `vN.metadata.json`), and Snappy/GZIP-compressed Parquet. As with any direct-mode table, the Iceberg layout (the `metadata/` directory with a current metadata file) must already exist in the bucket.
 
 **BigLake REST catalog (catalog auth, distinct from the storage identity above; see also [Google BigLake](#google-biglake)).** For tables discovered through Google's BigLake Iceberg REST catalog, the catalog `loadTable` call authenticates with a **Google OAuth token**, separately from whatever reads the `gs://` data files (the catalog's own identity with `storage_auth: catalog`, another Google identity, vended credentials, or HMAC keys). A **static `auth_bearer`** (e.g. `gcloud auth print-access-token`) works for a one-shot map/query but **expires after ~1h and cannot renew**, so a long-running tracking worker starts returning 401s. For a workload running as a GCP service account (GKE **Workload Identity**), set **`auth_google_metadata: true`** instead: it mints and auto-refreshes tokens from the instance metadata server, so tracked jobs keep authenticating. Off GCP, a structured `{"type": "google", "credentials": …}` catalog auth refreshes too: a service-account key held in an environment variable, Workload Identity Federation from AWS, or (locally) application-default credentials; see [Iceberg connection](../api/endpoints.md#iceberg-connection). Storage HMAC keys, if the files are read with them, are unaffected: they don't expire.
 
@@ -583,7 +587,7 @@ What else changes for a filtered map:
 
 - A `COUNT` over it scans the data files, because the manifest row-count shortcut cannot know which rows a filter keeps.
 - A reference into it (`rr:parentTriplesMap`) joins the rows the filter keeps. A child row whose key names an excluded row has no reference, in the browse crawl too.
-- In `info` / `/info`, its class and property counts are `null`, with `count-upper-bound` reporting the most they can be.
+- In `info` / `/info`, its class and property counts are `null`, with `count-upper-bound` reporting the most they can be, even when the map declares a key: no metadata knows how many rows the filter keeps.
 - [Tracking materialization](#tracking-keep-the-target-fresh-automatically) (`/iceberg/materialize`, `/iceberg/track`) refuses a mapping with any `rr:sqlQuery` logical table. A row that stops matching the `WHERE` (say, `is_current` going from 1 to 0) is never read again, so the subject it produced would never be retracted. Build a [native twin](#materializing-a-native-twin) with `fluree materialize` instead, and rebuild it to refresh.
 - Delta sources refuse `rr:sqlQuery`; [SQL sources](sql.md#rrsqlquery) hand any query to their engine.
 
@@ -644,6 +648,30 @@ WHERE {
 ORDER BY DESC(?date)
 LIMIT 100
 ```
+
+### Row order and paging
+
+A query with no `ORDER BY` has no defined row order; SPARQL leaves it open. Over
+an Iceberg graph source:
+
+- A query with a `LIMIT` or `OFFSET` anywhere in it, sub-queries included, reads
+  the table's data files in a fixed order: smallest file first, ties in commit
+  order. Run again over the same snapshot, it returns the same rows in the same
+  order, so pages fetched with `LIMIT n OFFSET k×n` partition the answer: no row
+  is skipped or repeated. Subgraph crawls (`"select": {"?s": ["*"]}`) page their
+  subjects the same way.
+- A query with no `LIMIT` or `OFFSET` streams rows as the data files are read, so
+  its row order can differ from one run to the next. The rows are the same.
+- The fixed order has a cost where the data files differ widely in size: the
+  reads still overlap, but rows are taken in file order, not as each read
+  finishes. It shows most on a query that must read the whole table before its
+  `LIMIT` applies, such as a grouped one: over a table with uneven files, a
+  grouped query with a `LIMIT` measured about 13% slower than reading in
+  completion order. Any `LIMIT` or `OFFSET` takes the fixed order, with or
+  without an `ORDER BY`.
+- Pages hold together only while the table does: an append or compaction between
+  two page requests changes the snapshot, and with it the order. For paging that
+  must survive table changes, order by a unique key (`ORDER BY ?id`).
 
 ## Materialization (into a native ledger)
 
@@ -1074,10 +1102,21 @@ Pushed to Iceberg:
   SELECT order_id FROM sales.orders WHERE order_date > '2024-01-01'
   ↓
 Iceberg optimizations:
-  - Partition pruning (only scan 2024 partitions)
-  - File skipping (skip files outside date range)
+  - File skipping (skip files whose order_date bounds lie outside the range)
+  - Row-group skipping and row filtering inside the files read
   - Column pruning (only read order_id, order_date)
 ```
+
+Files are skipped by the column bounds and null counts each manifest records
+per file. Partition values and manifest-list partition summaries are not used
+yet, so every manifest of the snapshot is read; a partitioned table still
+benefits, because its files' bounds on the partition column are narrow.
+
+A snapshot's data-file list never changes, so it is read from the manifests
+once (up to 16 manifests at a time) and kept, in memory
+(`FLUREE_ICEBERG_SCAN_FILES_CACHE_MB`) and in the on-disk catalog cache. Every
+later query against that snapshot selects its files from the kept list in
+memory, whatever its filter: a repeated filtered query reads no manifest.
 
 ### Same-subject stars over several triples maps
 
@@ -1096,17 +1135,19 @@ the type (`?s a ?t`), both are kept unless their class sets are equal.
 
 ### Best Practices
 
-1. **Partition by Common Filters:**
+1. **Partition or Sort by Common Filters:**
    ```sql
    -- Partition Iceberg table by date
    PARTITIONED BY (YEAR(order_date), MONTH(order_date))
    ```
+   Files then hold narrow ranges of the filtered column, so their bounds let
+   a filter skip most of them.
 
 2. **Use Filters:**
    ```json
    {
      "where": [...],
-     "filter": "?date >= '2024-01-01'"  // Enables partition pruning
+     "filter": "?date >= '2024-01-01'"  // Enables file skipping
    }
    ```
 
@@ -1246,13 +1287,22 @@ per-flake filter a native scan pays.
 Supported, with native parity (the test suite checks each shape against a
 native twin of the same data):
 
-- `f:onProperty`, `f:onClass`, `f:onSubject`, and untargeted policies with a
-  static `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onProperty`, `f:onSubject`, and untargeted policies with a static
+  `f:allow`, including `f:required` gates and `default-allow`.
+- `f:onClass` (alone or with `f:onProperty`), with parity wherever each row
+  shows every class its subject holds: the subject is minted by one triples
+  map, or by maps that declare the same classes, and a map deriving
+  `rdf:type` from its row (a column, template or reference) declares a key
+  that makes each subject one row's. Otherwise see
+  [Class policies over subjects several rows mint](#class-policies-over-subjects-several-rows-mint).
 - `f:onClass` / `f:onProperty` expansion through `rdfs:subClassOf` /
   `rdfs:subPropertyOf`, when the source references a model ledger (below).
 - Every pattern shape the scan produces: fixed predicates, same-subject stars,
   constant objects, class scans, projected `rdf:type`, wildcards (`?s ?p ?o`),
-  aggregates, and `GRAPH` blocks in a dataset query.
+  aggregates, and `GRAPH` blocks in a dataset query. A type triple is
+  decided on the class it states, so a schema class (`owl:Class`,
+  `rdfs:Class`) declared beside a data class is viewable while the data
+  class's triples follow the policy.
 
 A source read through a graph scope is filtered by its own policy (the
 request's and the source's model), whatever governs the graph the query
@@ -1270,6 +1320,48 @@ policy query against, so a targeted `f:query` evaluates as "no rows" and
 denies its targets — it never falls open. Relationship gates that join the
 requesting identity to the row (`fluree model access … --connected`) fall in
 this category. Write verbs do not apply; the source is read-only.
+
+### Class policies over subjects several rows mint
+
+A row shows its own map's classes and the classes it derives. A subject can
+hold more: another triples map minting the same subjects can declare other
+classes, and where a map's subjects are not proven one row's (no key covers
+the subject's columns), other rows can derive other classes. Two maps' subjects
+count as overlapping unless their templates provably mint apart (see
+[R2RML → keys](r2rml.md#declaring-a-tables-keys-fkey)); an `rr:column`
+subject overlaps every other map's.
+
+Under a class-targeted view policy, a row is shown only when the policy allows
+it for every class set its subject could hold. Only classes a class-targeted
+restriction on the read predicate selects are considered, and a derived class
+only when the deriving template could mint it.
+
+- **Classes another map declares** (known from the mapping): a row whose
+  decision depends on them is hidden, so rows a native ledger would show can
+  be missing (a customer only one map mints, denied because the other map's
+  class is denied). The tracked response's `policy_enforcement` lists such maps
+  as `undecidable_class_maps`, the server logs it once per map, and
+  registering a source with a model reports each overlapping, differently
+  classed pair in `model_warnings`.
+- **Classes other rows derive** (depending on rows the scan does not read):
+  the query is refused with `400` `err:db/InvalidQuery`, naming the map, when
+  the decision depends on them. Where the other map's classes alone deny the
+  row whatever classes other rows derive, it is hidden as above instead.
+  Declare the table's key (`f:key`) if no two rows mint one subject; for a
+  history table, map its current rows with an `rr:sqlQuery`
+  (`SELECT * FROM t WHERE <current-row condition>`) and declare the key
+  there; or target the policy by property or subject.
+- Some decisions evaluate every class set the subject could hold: one on a
+  predicate an `f:required` or `f:query` restriction can apply to (one
+  targeted by property applies to its properties, any other to every
+  predicate), and the check before a refusal. Such a decision over more than 8 extra classes
+  (declared by other maps or derived by other rows) is refused with `400`
+  `err:db/InvalidQuery`. Other decisions take two evaluations however many
+  classes other maps declare.
+
+A declared key (or an Iceberg table's identifier fields) is trusted here, as
+it is for [set semantics](r2rml.md#declaring-a-tables-keys-fkey): a table that
+breaks it is decided as if each subject were one row's.
 
 ### Where policies live: the model ledger
 
@@ -1334,7 +1426,9 @@ a native ledger's `f:defaultAllow` config: it fills a request that left
 With `"meta": {"policy": true}` (or the `fluree-meta` header) the tracked
 response's `policy_enforcement` carries `unevaluable_policies`: the ids of
 `f:query` policies the source could not evaluate and therefore denied. That is
-how to tell a fail-closed policy from an empty table. The server also logs a
+how to tell a fail-closed policy from an empty table. It also carries
+`undecidable_class_maps`: the triples maps whose rows a class policy hid
+because their subjects could hold classes another map declares (above). The server also logs a
 warning the first time each such policy is met, and a debug line for every
 triples map a scan skipped because its predicates were hidden.
 
@@ -1354,17 +1448,38 @@ triples map a scan skipped because its predicates were hidden.
    deletion vectors, or Snowflake v2 once `ENABLE_ICEBERG_MERGE_ON_READ` is on).
    See the switch below to override.
 5. **No transitive traversal (fail-closed):** Property-path quantifiers (`p+`,
-   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`),
-   `shortestPath`, and subqueries need a native index to walk and cannot be
-   evaluated over an Iceberg source. A query using one is **refused** with HTTP
-   400 `err:db/InvalidQuery` naming the pattern, rather than returning the empty
+   `p*`, `p?`, and quantified combinations like `^p+` or `(a|b)+`) and
+   `shortestPath` need a native index to walk and cannot be evaluated over an
+   Iceberg source. A query using one is **refused** with HTTP 400
+   `err:db/InvalidQuery` naming the pattern, rather than returning the empty
    result it would otherwise produce as a success. Fixed-length patterns (`p`,
    `p/p`, …) and unquantified `a|b` / `^p` scan the tables normally. Bound the
    traversal to a known depth (see [Graph Sources Overview → Query Patterns a
    Graph Source Cannot
    Evaluate](overview.md#query-patterns-a-graph-source-cannot-evaluate)) or
    [materialize a native twin](#materializing-a-native-twin), which evaluates
-   all of them.
+   all of them. Sub-selects scan the tables like any other pattern; see
+   [Sub-selects over a Graph
+   Source](overview.md#sub-selects-over-a-graph-source).
+6. **A sliced JSON-LD sub-select reads its tables once per outer row:** a
+   JSON-LD sub-select with a `limit` or `offset` that shares a variable with
+   the patterns before it runs once per outer row (a top-k per row, as on a
+   native ledger), and each run reads the tables its body scans in full. Under
+   10,000 outer rows that is 10,000 reads of each table. Pushing the outer
+   row's key into those reads is [#2310](https://github.com/fluree/db/issues/2310).
+   A SPARQL sub-select is evaluated once.
+   See [Cost: a sliced JSON-LD sub-select reads per outer
+   row](overview.md#cost-a-sliced-json-ld-sub-select-reads-per-outer-row).
+   A sub-select outside every `GRAPH` block whose body reads the default view
+   is refused; see [A sub-select outside every GRAPH
+   block](overview.md#a-sub-select-outside-every-graph-block).
+7. **An `EXISTS` after the `WHERE` clause is refused:** an `EXISTS` in the
+   query's own `HAVING` or `ORDER BY`, or in an expression evaluated after a
+   trailing `VALUES`, runs outside the source's scope and is refused with HTTP
+   400 `err:db/InvalidQuery`. Move the condition into the `WHERE` clause as a
+   `FILTER` or `BIND`; see [EXISTS over a Graph
+   Source](overview.md#exists-over-a-graph-source). An `EXISTS` inside the
+   `WHERE` clause, in a pattern or an expression, scans the tables normally.
 
 ### Environment switches
 
@@ -1373,6 +1488,7 @@ triples map a scan skipped because its predicates were hidden.
 | `FLUREE_ICEBERG_ALLOW_MOR_DELETES` | off | When truthy (`1`/`true`/`yes`/`on`), **disables** the fail-closed merge-on-read guard: delete files are ignored and the read proceeds. **Results may include deleted rows and row counts may be over-counted.** A one-time warning is logged per table. |
 | `FLUREE_ICEBERG_PREDICATE_PUSHDOWN` | on | When falsy (`0`/`false`/`off`), disables row-group / row-level predicate pushdown during Parquet reads. |
 | `FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS` | `10000` | Wall-clock budget for the virtual `/info` row-count fetch. A table whose count is not read by then has none; the others keep theirs. `0` returns structure only. |
+| `FLUREE_ICEBERG_SCAN_FILES_CACHE_MB` | `512` | Memory for snapshots' data-file lists kept between queries (see [Query Planning](#query-planning)). A list larger than the whole budget is held in one oversize slot beside it (the latest such list; a second replaces the first). `0` keeps none in memory. |
 
 ## Troubleshooting
 
@@ -1408,6 +1524,10 @@ Mapping a source compiles the R2RML mapping (a mapping that does not parse or co
 | `casingMismatch` | `warning` | `Column 'ORDER_DATE' does not match the live schema's casing; the schema spells it 'order_date'. Iceberg field names are case-sensitive — fix the casing to match.` |
 | `joinTypeMismatch` | `error` | `Join key type mismatch: child column '…' is … but parent column '…' is …; the join will never match.` |
 | `noSafeSubjectKey` | `warning` | `Subject-key column '…' is nullable (…); rows with a NULL value here produce no subject and are silently dropped. …` |
+| `columnNotFound` | `error` | `f:key on 'sales.orders' names column 'order_key', which the table does not have.` A declared key's column, checked as a query checks it (see [R2RML → Declaring a Table's Keys](r2rml.md#declaring-a-tables-keys-fkey)). |
+| `casingMismatch` | `error` | `f:key on 'sales.orders' names column 'ORDER_ID', which the schema spells 'order_id'; a key column must match exactly.` |
+| `nonKeyTypeSkipped` | `error` | `f:key on 'sales.orders' names column 'score' of type Float64; a floating-point value cannot identify a row (NaN is unequal to itself).` Also for a nested column. |
+| `keylessMap` | `advisory` | `TriplesMap <…>: no key of its logical table 'sales.orders' lies within its subject's columns (order_id), and it has no known key, so queries over it remove repeated solutions as they run. …` One per map that neither an `f:key` nor the table's identifier fields prove subject-unique; it names the `f:key` that would. Informational: queries answer correctly, but more slowly (see [R2RML → Slow Queries](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)). Registration (`POST /iceberg/map`, `fluree iceberg map`) reports the same advisories in its `diagnostics`. |
 
 Fix the names in the mapping to match the table (Iceberg column names are case-sensitive), or the table identifier and catalog when the table itself is not found.
 
@@ -1418,6 +1538,15 @@ At query time a column the table does not have is read like a NULL: the triples 
 Every query that names a source answers `409` with `err:db/GraphSourceUnmapped` when the source has no R2RML mapping, or one that defines no `rr:TriplesMap`. Registration refuses both, so such a source was registered before it did. Map it again under the same name, with a mapping that defines one, to replace it. See [409 Conflict](../api/errors.md#409-conflict).
 
 ### Slow Queries
+
+**After an upgrade, a `COUNT`, a same-subject star or an `ORDER BY … LIMIT`
+got slower, or a query now fails with `MemoryBudgetExceeded`.** The most
+likely cause is a map with no key: neither an `f:key` nor the table's
+identifier fields prove its subjects unique, so its queries remove repeated
+solutions as they read. Registration and `POST /iceberg/r2rml/validate` name
+each such map (`keylessMap`). See
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade)
+for how to confirm it per query and how to declare the key.
 
 **Causes:**
 - Large result sets
