@@ -36,11 +36,13 @@ A hit's body is byte-identical to the uncached response.
 - The ledger state read: ledger, branch, `t`, index, and uncommitted novelty.
 - The ledger's default context.
 - The effective policy: identity, policy classes, `default-allow`, policy values and the policy
-  rules themselves. Two identities share an entry only when the same policy applies to both.
+  rules themselves. Each identity has entries of its own; requests without an identity share
+  entries when the same policy applies to them.
 
 ## What bypasses the cache
 
-These queries always execute and report `bypass`:
+These queries always execute, and report `bypass` where the request reaches the cache (see
+[below](#not-served-from-the-cache) for HTTP requests that do not):
 
 - Queries that call `NOW()`, `RAND()`, `UUID()`, `STRUUID()` or `BNODE()`, anywhere in the query.
 - `SERVICE` to a remote endpoint or a variable endpoint.
@@ -54,9 +56,17 @@ These queries always execute and report `bypass`:
   [result-cache budget](#memory).
 - Any request, when the result cache is disabled (`query_result_cache_max_mb = 0`).
 
-Tracked requests (`fluree-track-*`, `opts.meta`) and CSV/TSV output are not served from the cache.
-Neither are connection-scoped queries (`/v1/fluree/query` without a ledger in the path),
-multi-query, GraphQL or Cypher. Those requests get no `x-fdb-cache` header.
+## Not served from the cache
+
+These requests execute without consulting the cache and get no `x-fdb-cache` header:
+
+- Tracked requests (`fluree-track-*`, `opts.meta`) and CSV/TSV output.
+- Connection-scoped queries (`/v1/fluree/query` without a ledger in the path), multi-query, GraphQL
+  and Cypher.
+- Over HTTP, requests that carry an identity or policy inputs (a verified identity,
+  `fluree-identity`, `fluree-policy*` headers, or `opts.identity` / `opts.policy*`). The
+  identity-keyed entries above are reachable only from the Rust API for now.
+- Over HTTP, SPARQL `FROM` / `FROM NAMED` and queries against a graph-source alias.
 
 ## Memory
 
