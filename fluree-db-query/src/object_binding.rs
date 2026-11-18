@@ -1007,6 +1007,52 @@ pub(crate) fn materialized_object_binding(
 mod tests {
     use super::*;
 
+    /// A column leaves a scope as it is when the crossing has nothing to
+    /// decode, whole or by rows. With a decoder, every encoded binding goes
+    /// through it, which over an empty store fails rather than passing a
+    /// store's id out to a context that can't read it; a decoded binding
+    /// passes either way.
+    #[test]
+    fn a_column_leaves_unchanged_only_when_nothing_decodes() {
+        let encoded = Binding::EncodedSid {
+            s_id: 7,
+            t: None,
+            op: None,
+        };
+        let decoded = Binding::lit(
+            fluree_db_core::FlakeValue::Long(1),
+            fluree_db_core::Sid::new(2, "long"),
+        );
+        let column = vec![encoded.clone(), decoded.clone(), encoded.clone()];
+
+        let same_store = ScopeCrossing {
+            enter: None,
+            leave: None,
+        };
+        assert!(same_store.leaves_unchanged());
+        assert_eq!(same_store.leave_column(&column, None).unwrap(), column);
+        assert_eq!(
+            same_store.leave_column(&column, Some(&[2, 1])).unwrap(),
+            vec![encoded.clone(), decoded.clone()]
+        );
+
+        let dir = std::env::temp_dir().join(format!("scope-leave-{}", std::process::id()));
+        let decoding = ScopeCrossing {
+            enter: None,
+            leave: Some(fluree_db_binary_index::TermView::new(
+                std::sync::Arc::new(fluree_db_binary_index::BinaryIndexStore::empty(dir)),
+                None,
+            )),
+        };
+        assert!(!decoding.leaves_unchanged());
+        assert!(decoding.leave_column(&column, None).is_err());
+        assert!(decoding.leave_column(&column, Some(&[0])).is_err());
+        assert_eq!(
+            decoding.leave_column(&column, Some(&[1])).unwrap(),
+            vec![decoded]
+        );
+    }
+
     #[test]
     fn late_materialized_object_binding_keeps_dates_encoded() {
         let binding = late_materialized_object_binding(
