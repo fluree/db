@@ -2838,6 +2838,7 @@ impl FlureeBuilder {
     /// storage as its writer: only [`build_client`](Self::build_client)
     /// honors it, and a reader that came back a writer would recover,
     /// sweep and index another process's root.
+    #[cfg(any(feature = "native", feature = "aws", feature = "ipfs"))]
     fn refuse_read_only(&self, build_path: &'static str) -> Result<()> {
         if self.read_only {
             return Err(ApiError::config(format!(
