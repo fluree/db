@@ -8,6 +8,7 @@
 use crate::tracking::{RemoteName, RemoteTrackingStore, TrackingRecord};
 use crate::{NameServiceError, Result};
 use async_trait::async_trait;
+use fluree_db_core::LedgerId;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
 
@@ -93,7 +94,7 @@ impl RemoteTrackingStore for FileTrackingStore {
     async fn get_tracking(
         &self,
         remote: &RemoteName,
-        ledger_id: &str,
+        ledger_id: &LedgerId,
     ) -> Result<Option<TrackingRecord>> {
         let path = self.record_path(remote, ledger_id);
         let path_clone = path.clone();
@@ -217,7 +218,7 @@ impl RemoteTrackingStore for FileTrackingStore {
         .map_err(|e| NameServiceError::storage(format!("Task join error: {e}")))?
     }
 
-    async fn remove_tracking(&self, remote: &RemoteName, ledger_id: &str) -> Result<()> {
+    async fn remove_tracking(&self, remote: &RemoteName, ledger_id: &LedgerId) -> Result<()> {
         let path = self.record_path(remote, ledger_id);
         let parent_span = tracing::Span::current();
 
@@ -270,7 +271,10 @@ mod tests {
     async fn test_file_tracking_get_empty() {
         let tmp = TempDir::new().unwrap();
         let store = FileTrackingStore::new(tmp.path());
-        let result = store.get_tracking(&origin(), "mydb:main").await.unwrap();
+        let result = store
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
         assert!(result.is_none());
     }
 
@@ -285,7 +289,7 @@ mod tests {
         store.set_tracking(&record).await.unwrap();
 
         let fetched = store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .unwrap();
@@ -351,14 +355,17 @@ mod tests {
             .await
             .unwrap();
         assert!(store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .is_some());
 
-        store.remove_tracking(&origin(), "mydb:main").await.unwrap();
+        store
+            .remove_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
+            .await
+            .unwrap();
         assert!(store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .is_none());
@@ -370,7 +377,7 @@ mod tests {
         let store = FileTrackingStore::new(tmp.path());
         // Should not error
         store
-            .remove_tracking(&origin(), "nonexistent:main")
+            .remove_tracking(&origin(), &LedgerId::parse("nonexistent:main").unwrap())
             .await
             .unwrap();
     }
@@ -396,7 +403,7 @@ mod tests {
         store.set_tracking(&record).await.unwrap();
 
         let fetched = store
-            .get_tracking(&origin(), "mydb:main")
+            .get_tracking(&origin(), &LedgerId::parse("mydb:main").unwrap())
             .await
             .unwrap()
             .unwrap();

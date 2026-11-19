@@ -12,7 +12,7 @@ fluree show <COMMIT> [OPTIONS]
 
 | Argument | Description |
 |----------|-------------|
-| `<COMMIT>` | Commit identifier: `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex-digest prefix (min 6 chars), or a full CID — the same forms `branch create --at` accepts |
+| `<COMMIT>` | Commit identifier: `t:<N>` or a bare transaction number, `commit:<prefix>` or a bare hex-digest prefix (min 6 chars), or a full CID — the commit spellings `branch create --at` also accepts |
 
 ## Options
 

@@ -19,7 +19,8 @@
 //!
 //! Policy evaluation follows the expected semantics:
 //!
-//! 1. **Schema bypass**: Schema flakes (rdfs:subClassOf, etc.) always allowed
+//! 1. **Schema bypass**: view lets schema flakes (rdfs:subClassOf, etc.)
+//!    through; modify judges them like any other
 //! 2. **Candidate collection**: Policies gathered in order (property → subject → default)
 //! 3. **Class filtering**: Class policies filtered by subject membership
 //! 4. **Required subset**: if any `f:required` policy applies, only required
@@ -53,12 +54,13 @@ mod schema;
 mod types;
 mod wire;
 
-pub use class_lookup::{lookup_subject_classes, populate_class_cache};
+pub use class_lookup::{lookup_subject_classes, populate_class_cache, populate_class_cache_in};
 pub use error::{PolicyError, Result};
 pub use evaluate::{
-    build_policy_values_clause, filter_by_required, PolicyContext, UNBOUND_IDENTITY_PREFIX,
+    build_policy_values_clause, filter_by_required, ClassState, PolicyContext,
+    UNBOUND_IDENTITY_PREFIX,
 };
-pub use index::{build_policy_set, compute_class_check_needed, get_all_classes_for_property};
+pub use index::build_policy_set;
 pub use query_eval::{NoOpQueryExecutor, PolicyQueryExecutor, PolicyQueryFut};
 pub use schema::{is_schema_flake, is_schema_predicate};
 pub use types::{

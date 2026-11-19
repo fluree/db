@@ -40,6 +40,9 @@ Configuration is organized into independent **setting groups**, each governing a
 | [`f:reasoningDefaults`](setting-groups.md#reasoning-defaults) | OWL/RDFS reasoning | `f:reasoningModes`, `f:schemaSource` |
 | [`f:datalogDefaults`](setting-groups.md#datalog-defaults) | Datalog rules | `f:datalogEnabled`, `f:rulesSource` |
 | [`f:transactDefaults`](setting-groups.md#transact-defaults) | Transaction constraints | `f:uniqueEnabled`, `f:constraintsSource` |
+| [`f:fullTextDefaults`](setting-groups.md#full-text-defaults) | Full-text indexing | `f:property`, `f:defaultLanguage` |
+| [`f:queryDefaults`](setting-groups.md#fquerydefaults--query-defaults) | Query defaults (ledger-scoped) | `f:unionDefaultGraph` |
+| [`f:servingDefaults`](setting-groups.md#fservingdefaults--serving-posture) | Serving posture (ledger-scoped) | `f:serveQuery`, `f:serveBlocks`, `f:publicVisibility` |
 
 Each group is resolved independently — locking down policy does not affect whether reasoning can be overridden.
 
@@ -204,9 +207,8 @@ User queries against the config graph go through **policy enforcement**. If `f:d
 The config graph is written and queried through normal CLI transaction and query commands:
 
 ```bash
-# Write config via SPARQL UPDATE.
-# `fluree insert` takes Turtle or JSON-LD, not TriG, so it cannot target a
-# named graph; see "Writing from the CLI" in writing-config.md.
+# Write config via SPARQL UPDATE. TriG through `fluree insert` or
+# `fluree upsert` works too; see "Writing from the CLI" in writing-config.md.
 fluree update --ledger mydb:main --format sparql -e '
 PREFIX f: <https://ns.flur.ee/db#>
 INSERT DATA {
@@ -230,10 +232,13 @@ fluree query --ledger mydb:main#config 'SELECT ?s ?p ?o WHERE { ?s ?p ?o }'
 
 No special CLI commands are needed — config is data, written and queried like any other named graph.
 
-A reserved graph has to be named in full. `FROM <config>` and `FROM <#config>`
-are not the config graph's IRI and are rejected, and `GRAPH ?g` never
-enumerates the reserved graphs — naming one is always something the query
-author did on purpose.
+Where a query targets one ledger (the ledger route `/query/<ledger>`, the CLI
+with a ledger, an embedded view), `FROM <config>` and `FROM <txn-meta>` name
+that ledger's reserved graphs by keyword. The connection route `/query` has no
+target ledger, so there a reserved graph is named in full (`<ledger>#config`
+or its `urn:fluree:` IRI). `FROM <#config>` is a relative IRI, not a graph
+name, and is refused. `GRAPH ?g` never enumerates the reserved graphs, so
+naming one is always something the query author did on purpose.
 
 Reachability is not access. Adding `f:policyDefaults [ f:defaultAllow false ]`
 to the config above makes the `FROM` query return zero rows instead of three,

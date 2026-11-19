@@ -21,8 +21,8 @@
 
 use crate::raft::staged_receipt::AppliedReceipt;
 use crate::raft::state_machine::{
-    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, NameServiceState, PoisonRecord,
-    QueueSubmission, RefKey, Response as SmResponse,
+    ApplyOutcome, ApplyRecord, BodyKind, Command as SmCommand, NameServiceState, PoisonReason,
+    PoisonRecord, QueueSubmission, RefKey, Response as SmResponse,
 };
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::waiter::{AbortReason, WaitError, WaiterMap, WaiterOutcome};
@@ -152,28 +152,18 @@ impl QueuedTransactor {
     /// an idempotency key: without one, re-proposing would create a
     /// duplicate queue entry rather than hitting the cache.
     ///
-    /// Envelope release rules:
-    ///
-    /// - State-machine rejections (`BodyHashMismatch`, `QueueFull`,
-    ///   `LedgerNotFound`, `LedgerRetracted`, unexpected variants):
-    ///   the propose was applied to a deterministic rejection, so
-    ///   the envelope is genuinely orphaned and released here.
-    /// - Raft-layer pre-commit errors (`ForwardToLeader`,
-    ///   `ChangeMembershipError`): the propose never entered the
-    ///   replicated log; release.
-    /// - Raft-layer `Fatal`: ambiguous — the entry may have committed
-    ///   to a majority before this node's loop crashed. Don't
-    ///   release: a worker on the new leader may still need to read
-    ///   the envelope. The idempotency-key eviction path sweeps it
-    ///   later if the entry never actually committed.
-    /// - `Enqueued`/`InFlight`: the envelope is owned by the queue;
-    ///   eviction / admin clear releases it via the state-machine
-    ///   adapter's release channel.
-    /// - `IdempotencyHit`/`IdempotencyFailed`: the cached record
-    ///   points at a *prior* submission's envelope (unique
-    ///   timestamps per attempt mean retries hash to distinct
-    ///   `request_cid`s). The freshly-written envelope for this
-    ///   retry is unreferenced and released here.
+    /// The envelope is released here when nothing will read it: when
+    /// every propose of this submission was turned away (a state-machine
+    /// rejection or idempotency answer, or a Raft error before the log)
+    /// or it only joined another submission's in-flight entry under the
+    /// same key, which reads its own envelope. Every submission stamps
+    /// its envelope, so none shares an address with another's. Once this
+    /// submission's own entry is queued the queue owns the envelope, and
+    /// releases it at apply (no key) or at idempotency eviction; a later
+    /// propose that fails must not release it from under that entry. A
+    /// Raft `Fatal` leaves it too: the entry may have committed before
+    /// this node's loop crashed, and a worker on the new leader would
+    /// read it.
     async fn submit_and_await(
         &self,
         args: QueueSubmission,
@@ -182,6 +172,24 @@ impl QueuedTransactor {
     ) -> Result<SubmissionOutcome, SubmissionError> {
         let request_cid = args.request_cid.clone();
         let full_ledger_id = format!("{}:{}", args.ledger_id, args.branch);
+        let mut envelope = EnvelopeFate::Unanswered;
+        let result = self
+            .propose_and_park(args, ref_key, retry_eligible, &mut envelope)
+            .await;
+        if envelope.is_unread() {
+            self.release_envelope(&full_ledger_id, &request_cid).await;
+        }
+        result
+    }
+
+    async fn propose_and_park(
+        &self,
+        args: QueueSubmission,
+        ref_key: RefKey,
+        retry_eligible: bool,
+        envelope: &mut EnvelopeFate,
+    ) -> Result<SubmissionOutcome, SubmissionError> {
+        let request_cid = args.request_cid.clone();
         let cmd = SmCommand::EnqueueCommand(args);
         let attempts_allowed = if retry_eligible { self.max_retries } else { 1 };
         // Arm interest *before* proposing. The queue_id does not exist
@@ -195,18 +203,11 @@ impl QueuedTransactor {
             let response = match self.raft.client_write(cmd.clone()).await {
                 Ok(response) => response,
                 // `ForwardToLeader` and `ChangeMembershipError` reject
-                // the propose before it enters the replicated log, so
-                // the envelope is genuinely orphaned and safe to
-                // release. `Fatal` is ambiguous: the entry may have
-                // committed to a majority before this node's local
-                // raft loop crashed, in which case some other node's
-                // worker is going to read the envelope. Leaving it in
-                // CAS is correct — the idempotency-key eviction path
-                // sweeps it later if the entry never actually
-                // committed, but releasing here would race against a
-                // worker on the new leader trying to read it.
+                // the propose before it enters the replicated log.
+                // `Fatal` is ambiguous: the entry may have committed to
+                // a majority before this node's local raft loop crashed.
                 Err(RaftError::APIError(ClientWriteError::ForwardToLeader(_))) => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    envelope.turned_away();
                     return Err(SubmissionError::Execution {
                         status: 503,
                         message: "raft node is not the leader; retry against the current leader"
@@ -214,13 +215,14 @@ impl QueuedTransactor {
                     });
                 }
                 Err(RaftError::APIError(ClientWriteError::ChangeMembershipError(e))) => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
+                    envelope.turned_away();
                     return Err(SubmissionError::Execution {
                         status: 500,
                         message: format!("unexpected ChangeMembershipError on EnqueueCommand: {e}"),
                     });
                 }
                 Err(RaftError::Fatal(f)) => {
+                    *envelope = EnvelopeFate::Unknown;
                     return Err(SubmissionError::Execution {
                         status: 503,
                         message: format!(
@@ -230,6 +232,7 @@ impl QueuedTransactor {
                     });
                 }
             };
+            envelope.answered(&response.data);
             match response.data {
                 SmResponse::Enqueued { .. } | SmResponse::InFlight { .. } => {
                     // The adapter bound the ticket while applying this
@@ -278,35 +281,18 @@ impl QueuedTransactor {
                     }
                 }
                 SmResponse::IdempotencyHit { record } => {
-                    // The cached record points at the *original*
-                    // submission's request_cid; the envelope we just
-                    // wrote to CAS for this retry is unreferenced —
-                    // its timestamps differ from the cached one's,
-                    // so its content id won't dedup against the
-                    // existing blob. Release it before returning so
-                    // every idempotent retry doesn't leak one CAS
-                    // object per attempt.
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Ok(SubmissionOutcome::Cached(record));
                 }
                 SmResponse::IdempotencyFailed { record } => {
-                    // Same as `IdempotencyHit`: the cached failure
-                    // record references the original envelope; the
-                    // retry's envelope is orphaned and must be
-                    // released.
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Ok(SubmissionOutcome::CachedFailure(record));
                 }
                 SmResponse::BodyHashMismatch => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::KeyCollision);
                 }
                 SmResponse::QueueFull { .. } => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Overloaded);
                 }
                 SmResponse::LedgerNotFound { ledger_id } => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 404,
                         message: format!("ledger not found: {ledger_id}"),
@@ -318,14 +304,12 @@ impl QueuedTransactor {
                     // purge + re-create. 410 Gone matches the
                     // semantics — the resource existed, the client
                     // shouldn't retry with the same alias.
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 410,
                         message: format!("ledger retracted: {ledger_id}"),
                     });
                 }
                 other => {
-                    self.release_envelope(&full_ledger_id, &request_cid).await;
                     return Err(SubmissionError::Execution {
                         status: 500,
                         message: format!(
@@ -384,9 +368,9 @@ impl QueuedTransactor {
 
     /// Hash the envelope's canonical body bytes into a comparison-only
     /// `ContentId`. Distinct from the `request_cid` returned by the
-    /// CAS put: the envelope as-stored includes per-request transient
-    /// fields (timestamps, tracking) whereas the body CID covers only
-    /// what defines the request semantically.
+    /// CAS put: the envelope as-stored includes its submission and
+    /// per-request transient fields (timestamps, tracking) whereas the
+    /// body CID covers only what defines the request semantically.
     fn canonical_body_cid(envelope: &QueuedRequest) -> Result<ContentId, SubmissionError> {
         let bytes = envelope
             .canonical_body_bytes()
@@ -441,7 +425,7 @@ impl QueuedTransactor {
         &self,
         ledger_name: String,
         branch: String,
-        envelope: QueuedRequest,
+        mut envelope: QueuedRequest,
         body_kind: BodyKind,
         idempotency_key: Option<&IdempotencyKey>,
     ) -> Result<SubmissionOutcome, SubmissionError> {
@@ -450,6 +434,7 @@ impl QueuedTransactor {
         let idempotency_cache_key =
             idempotency_key.map(|k| IdempotencyCacheKey::new(full_ledger_id.clone(), k.clone()));
 
+        envelope.stamp_submission(ulid::Ulid::new().to_string());
         let bytes = envelope
             .to_bytes()
             .map_err(|e| SubmissionError::Execution {
@@ -479,6 +464,45 @@ impl QueuedTransactor {
         };
 
         self.submit_and_await(args, ref_key, retry_eligible).await
+    }
+}
+
+/// What became of a submission's envelope over its proposes, which decides
+/// whether [`QueuedTransactor::submit_and_await`] releases it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum EnvelopeFate {
+    Unanswered,
+    /// Every propose was turned away, before the log or by the state
+    /// machine.
+    TurnedAway,
+    /// It joined another submission's in-flight entry under the same key.
+    Joined,
+    /// Its own entry was queued, which owns the envelope from then on.
+    Queued,
+    /// A Raft `Fatal` left the last propose's fate unknown.
+    Unknown,
+}
+
+impl EnvelopeFate {
+    fn answered(&mut self, response: &SmResponse) {
+        if *self == Self::Queued {
+            return;
+        }
+        *self = match response {
+            SmResponse::Enqueued { .. } => Self::Queued,
+            SmResponse::InFlight { .. } => Self::Joined,
+            _ => Self::TurnedAway,
+        };
+    }
+
+    fn turned_away(&mut self) {
+        if *self != Self::Queued {
+            *self = Self::TurnedAway;
+        }
+    }
+
+    fn is_unread(self) -> bool {
+        matches!(self, Self::TurnedAway | Self::Joined)
     }
 }
 
@@ -559,6 +583,7 @@ impl Committer for QueuedTransactor {
             commit_opts: commit_opts_request,
             tracking,
             governance,
+            submission: None,
         }));
         let outcome = self
             .enqueue_and_await(
@@ -572,7 +597,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                transaction_receipt_from(idempotency_key, receipt)
+                transaction_receipt_from(idempotency_key, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -609,6 +634,7 @@ impl Committer for QueuedTransactor {
         let envelope = QueuedRequest::Revert(QueuedRevert {
             selection,
             strategy,
+            submission: None,
         });
         let outcome = self
             .enqueue_and_await(
@@ -622,7 +648,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                revert_receipt_from(idempotency_key, branch, strategy, receipt)
+                revert_receipt_from(idempotency_key, branch, strategy, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -678,6 +704,7 @@ impl Committer for QueuedTransactor {
             source_branch: source_branch.clone(),
             target_branch,
             strategy,
+            submission: None,
         });
         let outcome = self
             .enqueue_and_await(
@@ -695,7 +722,7 @@ impl Committer for QueuedTransactor {
                 source_branch,
                 target_for_queue,
                 strategy,
-                receipt,
+                *receipt,
             ),
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -723,7 +750,10 @@ impl Committer for QueuedTransactor {
             strategy,
         } = request;
 
-        let envelope = QueuedRequest::Rebase(QueuedRebase { strategy });
+        let envelope = QueuedRequest::Rebase(QueuedRebase {
+            strategy,
+            submission: None,
+        });
         let outcome = self
             .enqueue_and_await(
                 ledger_name,
@@ -736,7 +766,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                rebase_receipt_from(idempotency_key, branch, strategy, receipt)
+                rebase_receipt_from(idempotency_key, branch, strategy, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -764,6 +794,7 @@ impl Committer for QueuedTransactor {
             ledger_id,
             commits,
             blobs,
+            merged_commits,
             governance,
         } = request;
 
@@ -785,23 +816,35 @@ impl Committer for QueuedTransactor {
         // and record its CID. The envelope carries only the CIDs;
         // the worker reads the bytes back when staging.
         let content_store = self.fluree.content_store(&ledger_id);
-        let mut commit_cids = Vec::with_capacity(commits.len());
-        for commit_bytes in &commits {
-            let cid = content_store
-                .put(ContentKind::Commit, commit_bytes)
-                .await
-                .map_err(|e| SubmissionError::Execution {
-                    status: 500,
-                    message: format!("push commit CAS write failed: {e}"),
-                })?;
-            commit_cids.push(cid);
-        }
+        let upload = |blobs: Vec<Vec<u8>>| {
+            let content_store = content_store.clone();
+            async move {
+                let mut cids = Vec::with_capacity(blobs.len());
+                for bytes in &blobs {
+                    let cid = content_store
+                        .put(ContentKind::Commit, bytes)
+                        .await
+                        .map_err(|e| SubmissionError::Execution {
+                            status: 500,
+                            message: format!("push commit CAS write failed: {e}"),
+                        })?;
+                    cids.push(cid);
+                }
+                Ok::<_, SubmissionError>(cids)
+            }
+        };
+        let commit_cids = upload(commits).await?;
+        let merged_commit_cids = upload(merged_commits).await?;
 
-        let envelope = QueuedRequest::Push(Box::new(QueuedPush {
-            commit_cids,
-            blobs,
-            governance,
-        }));
+        let envelope = QueuedRequest::for_push(
+            QueuedPush {
+                commit_cids,
+                blobs,
+                governance,
+                submission: None,
+            },
+            merged_commit_cids,
+        );
         let outcome = self
             .enqueue_and_await(
                 ledger_name,
@@ -814,7 +857,7 @@ impl Committer for QueuedTransactor {
 
         match outcome {
             SubmissionOutcome::Waiter(WaiterOutcome::Applied(receipt)) => {
-                push_receipt_from(idempotency_key, ledger_id, receipt)
+                push_receipt_from(idempotency_key, ledger_id, *receipt)
             }
             SubmissionOutcome::Waiter(WaiterOutcome::Aborted(reason)) => {
                 Err(submission_error_from_abort(reason))
@@ -899,8 +942,15 @@ fn failure_from_poison(record: &PoisonRecord) -> SubmissionError {
     // that need richer typing can use the body via the commit log;
     // the status route only promises pass/fail + identity.
     SubmissionError::Execution {
-        status: 422,
+        status: poison_status(&record.reason),
         message: format!("submission poisoned: {:?}", record.reason),
+    }
+}
+
+fn poison_status(reason: &PoisonReason) -> u16 {
+    match reason {
+        PoisonReason::PolicyViolation { .. } => 403,
+        _ => 422,
     }
 }
 
@@ -1193,7 +1243,7 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
                 .into(),
         },
         AbortReason::Poisoned(reason) => SubmissionError::Execution {
-            status: 422,
+            status: poison_status(&reason),
             message: format!("submission poisoned: {reason:?}"),
         },
     }
@@ -1203,6 +1253,45 @@ fn submission_error_from_abort(reason: AbortReason) -> SubmissionError {
 mod tests {
     use super::*;
     use crate::raft::state_machine::{PoisonReason, QueueEntry};
+
+    /// A submission's own queued entry owns its envelope through any later
+    /// propose; one that never queued an entry leaves its envelope unread.
+    #[test]
+    fn an_envelope_is_released_only_when_no_entry_of_its_own_was_queued() {
+        let enqueued = SmResponse::Enqueued {
+            ledger_id: "db:main".into(),
+            queue_id: 1,
+        };
+        let in_flight = SmResponse::InFlight {
+            ledger_id: "db:main".into(),
+            queue_id: 1,
+        };
+        let not_found = SmResponse::LedgerNotFound {
+            ledger_id: "db:main".into(),
+        };
+
+        let mut queued = EnvelopeFate::Unanswered;
+        queued.answered(&enqueued);
+        queued.answered(&in_flight);
+        queued.turned_away();
+        queued.answered(&not_found);
+        assert!(!queued.is_unread());
+
+        let mut joined = EnvelopeFate::Unanswered;
+        joined.answered(&in_flight);
+        assert!(joined.is_unread());
+        joined.answered(&enqueued);
+        assert!(!joined.is_unread(), "a later propose queued its own entry");
+
+        let mut refused = EnvelopeFate::Unanswered;
+        refused.turned_away();
+        assert!(refused.is_unread());
+        refused.answered(&not_found);
+        assert!(refused.is_unread());
+
+        assert!(!EnvelopeFate::Unknown.is_unread());
+        assert!(!EnvelopeFate::Unanswered.is_unread());
+    }
 
     #[test]
     fn a_probe_timeout_on_a_live_entry_keeps_waiting() {
@@ -1348,6 +1437,27 @@ mod tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    #[test]
+    fn policy_poison_maps_to_403_for_fresh_and_replayed_submissions() {
+        use crate::raft::state_machine::PoisonRecord;
+        use fluree_db_core::ContentKind;
+
+        let reason = PoisonReason::PolicyViolation {
+            error: "write refused".into(),
+        };
+        let fresh = submission_error_from_abort(AbortReason::Poisoned(reason.clone()));
+        let replayed = failure_from_poison(&PoisonRecord {
+            request_cid: ContentId::new(ContentKind::Commit, &[1]),
+            body_cid: ContentId::new(ContentKind::Commit, &[2]),
+            reason,
+            recorded_index: 1,
+            recorded_at_millis: 0,
+        });
+        assert_eq!(status(&fresh), 403);
+        assert_eq!(status(&replayed), 403);
+        assert_eq!(fresh.to_string(), replayed.to_string());
     }
 
     /// A poison replayed from the replicated idempotency map must

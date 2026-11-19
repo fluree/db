@@ -1,6 +1,6 @@
 //! The deep reader: crops the engine could not read, sent to a vision model.
 //!
-//! The engine decides *what* to read (`fluree_doc_pdf::escalate::crops_for`)
+//! The engine decides *what* to read (`fluree_doc_pdf::escalate::plan`)
 //! and how to arbitrate what comes back; this module only carries pixels to
 //! an OpenAI-compatible endpoint and readings back. Two wire shapes: chat
 //! completions with `image_url` parts (OpenAI, Ollama, vLLM, LM Studio) and
@@ -22,8 +22,7 @@ use crate::config::ModelEndpoint;
 use crate::llm::{LlmClient, Part, Request};
 use crate::payload_fit::{fit_under_cap, MAX_CROP_BYTES};
 use crate::{DocError, Result};
-use fluree_doc_pdf::document::Analysis;
-use fluree_doc_pdf::escalate::{self, Crop, Readings};
+use fluree_doc_pdf::escalate::{self, Crop, CropJobs, Readings};
 use fluree_doc_pdf::Document;
 use hayro_syntax::Pdf;
 use std::collections::HashMap;
@@ -72,10 +71,9 @@ impl VlmReader {
         self.max_crops
     }
 
-    /// Read every crop `analysis` asks for. Empty when the document asks for
+    /// Read every crop the engine planned. Empty when the document asks for
     /// nothing, which is the common case and must stay silent.
-    pub fn read_pdf(&self, pdf: &Pdf, doc: &Document, analysis: &Analysis) -> Result<Readings> {
-        let jobs = escalate::crops_for(doc, analysis, false);
+    pub fn read_pdf(&self, pdf: &Pdf, doc: &Document, jobs: CropJobs) -> Result<Readings> {
         if jobs.is_empty() {
             return Ok(Readings::from_map(HashMap::new()));
         }

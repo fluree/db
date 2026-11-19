@@ -74,11 +74,15 @@ fluree query 'SELECT ?name WHERE { ?s <http://example.org/name> ?name }'
 | [`index`](index.md) | Build or update the binary index (incremental) |
 | [`reindex`](reindex.md) | Full reindex from commit history |
 | [`sweep`](sweep.md) | Reclaim index artifacts no index chain references |
+| [`encryption`](encryption.md) | Held encryption keys and key rotation (status, rotate, resume, pause, cancel, verify, generate-key) |
 | [`iceberg`](iceberg.md) | Map and manage Iceberg tables as graph sources (map, list, info, drop) |
+| [`delta`](delta.md) | Map and manage Delta Lake tables as graph sources (map, list, info, drop) |
 | [`sql`](sql.md) | Map and manage SQL tables as graph sources through a Trino-protocol endpoint (map, check, list, info, drop) |
 | [`materialize`](materialize.md) | Build a native ledger twin from a virtual (Iceberg/R2RML) graph source |
 | [`bm25`](bm25.md) | Manage BM25 full-text search indexes (create, list, sync, drop) |
 | [`doc`](doc.md) | Ingest a folder of documents into a searchable graph (structure, chunks, embeddings, indexes) and search it |
+| [`ontology`](ontology.md) | Ontology tools for document extraction: check what an extraction model reads of an ontology; make one from tables (CSV, workbooks, SQL DDL) a semantic layer (Snowflake, Genie, dbt, Apache Ossie) or a Neo4j schema, or rewrite and slice one |
+| [`catalog`](catalog.md) | Catalog tools for document extraction: SKOS records from rows (CSV, workbooks) for an extraction model to link names to |
 
 ### Remote Sync
 
@@ -115,8 +119,10 @@ If you're building a custom server that must support the CLI end-to-end (for exa
 
 | Command | Description |
 |---------|-------------|
+| [`login`](login.md) | Sign this machine in to a fluree.ai account |
+| [`logout`](logout.md) | Sign this machine out of its fluree.ai account |
 | [`token`](token.md) | Create, inspect, and manage JWS tokens |
-| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token) |
+| [`auth`](auth.md) | Manage bearer tokens stored on remotes (login/logout/status/token), and show the account sign-in |
 
 ### Configuration
 

@@ -14,7 +14,7 @@
 //! does the same. A future variant could surface these as a warn
 //! when authors mistype the rule literal.
 
-use super::types::{RulesArtifactWire, WireOrigin};
+use super::types::{ModelHead, RulesArtifactWire, WireOrigin};
 use super::CrossLedgerError;
 use super::ResolveCtx;
 use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest};
@@ -27,17 +27,18 @@ use fluree_vocab::fluree::RULE;
     fields(
         model_ledger = canonical_model_ledger_id,
         graph_iri = graph_iri,
-        resolved_t = resolved_t,
+        resolved_t = head.t,
     ),
 )]
 pub(super) async fn materialize_rules(
     canonical_model_ledger_id: &str,
     graph_iri: &str,
-    resolved_t: i64,
+    head: &ModelHead,
     ctx: &ResolveCtx<'_>,
 ) -> Result<RulesArtifactWire, CrossLedgerError> {
+    let resolved_t = head.t;
     let m_db = ctx
-        .open_model_db(canonical_model_ledger_id, resolved_t)
+        .open_model_db(canonical_model_ledger_id, head)
         .await
         .map_err(|e| CrossLedgerError::TranslationFailed {
             ledger_id: canonical_model_ledger_id.to_string(),
@@ -45,13 +46,14 @@ pub(super) async fn materialize_rules(
             detail: format!("failed to open model ledger snapshot at t={resolved_t}: {e}"),
         })?;
 
-    let g_id = super::resolve_selector_g_id(&m_db.snapshot, graph_iri)?.ok_or_else(|| {
-        CrossLedgerError::GraphMissingAtT {
-            ledger_id: canonical_model_ledger_id.to_string(),
-            graph_iri: graph_iri.to_string(),
-            resolved_t,
-        }
-    })?;
+    let g_id =
+        super::resolve_selector_g_id(&m_db.snapshot, graph_iri, m_db.t)?.ok_or_else(|| {
+            CrossLedgerError::GraphMissingAtT {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                resolved_t,
+            }
+        })?;
 
     // No `f:rule` predicate in M's namespace map → M never authored
     // rules. Treat the same as an empty rule set so the caller's
@@ -62,6 +64,7 @@ pub(super) async fn materialize_rules(
                 model_ledger_id: canonical_model_ledger_id.to_string(),
                 graph_iri: graph_iri.to_string(),
                 resolved_t,
+                commit_id: head.commit_id.clone(),
             },
             rules: Vec::new(),
         });
@@ -99,6 +102,7 @@ pub(super) async fn materialize_rules(
             model_ledger_id: canonical_model_ledger_id.to_string(),
             graph_iri: graph_iri.to_string(),
             resolved_t,
+            commit_id: head.commit_id.clone(),
         },
         rules,
     })

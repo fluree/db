@@ -12,6 +12,10 @@ description = "Runtime-agnostic core library for Fluree DB queries"
 default = []
 native = ["tokio", "moka", "dashmap", "fs2", "dep:rand"]
 credential = ["dep:fluree-db-credential"]
+# Test-only hooks into the WAL's background thread. Never a default: other
+# crates enable it from their dev-dependencies only, so a production build
+# does not compile them.
+test-hooks = []
 
 [dependencies]
 fluree-vocab = { path = "../fluree-vocab" }
@@ -31,7 +35,7 @@ cid = { workspace = true }
 multihash = { workspace = true }
 tokio = { workspace = true, features = ["fs", "sync"], optional = true }
 fs2 = { version = "0.4", optional = true }
-xxhash-rust = { workspace = true }
+xxhash-rust = { workspace = true, features = ["xxh3"] }
 # Per-process token in `FileStorage` staging-file names. The pid alone
 # is unique per host, not across hosts sharing a mount.
 rand = { workspace = true, optional = true }

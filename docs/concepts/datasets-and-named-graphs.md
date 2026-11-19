@@ -34,19 +34,44 @@ In Fluree, named graphs are used in several ways:
 
 Fluree exposes two query styles over HTTP:
 
-- **Connection-scoped** (`POST /query`): the ledger(s) and graphs are identified by `from` / `fromNamed` (JSON-LD) or `FROM` / `FROM NAMED` (SPARQL). This is the dataset path and supports multi-ledger datasets.
+- **Connection-scoped** (`POST /query`): the ledger(s) and graphs are identified by `from` / `fromNamed` (JSON-LD) or `FROM` / `FROM NAMED` (SPARQL). This is the dataset path and supports multi-ledger datasets. There is no target ledger, so a graph is named together with its ledger (`<mydb:main#http://example.org/ns/archive>`). A keyword, or an IRI that cannot be a ledger address (`http://example.org/g`), names no ledger and is refused with a 400; an IRI that could be one (`urn:g1`, read as ledger `urn`, branch `g1`) is looked up as a ledger.
 - **Ledger-scoped** (`POST /query/{ledger}`): the ledger is fixed by the URL. The request may still select a **named graph inside that ledger**:
-  - JSON-LD: `"from": "default"`, `"from": "txn-meta"`, or `"from": "<graph IRI>"`
-  - SPARQL: `FROM <default>`, `FROM <txn-meta>`, `FROM <graph IRI>`, and `FROM NAMED <graph IRI>`
+  - JSON-LD: `"from": "default"`, `"from": "txn-meta"`, `"from": "config"`, or `"from": "<graph IRI>"`
+  - SPARQL: `FROM <default>`, `FROM <txn-meta>`, `FROM <config>`, `FROM <graph IRI>`, and `FROM NAMED <graph IRI>`
+  - `urn:default`, the name [`/info`](../api/endpoints.md#get-infoledger-id) lists the default graph under, is accepted wherever `default` is, and `GRAPH <urn:default> { ... }` reads the default graph as `GRAPH <ledger:main>` does, even on a ledger where an earlier version registered a graph literally as `urn:default`. A write cannot name a graph `urn:default` (see [SPARQL UPDATE](../query/sparql.md))
+  - The ledger's own address, in any spelling (`mydb`, `mydb:main`, `urn:fluree:mydb:main`), names its default graph, and with a graph (`mydb:main#config`, `mydb:main#<graph IRI>`) that graph. A graph the ledger does not have is a 404 (`err:db/GraphNotFound`).
   - `GRAPH <iri> { ... }` and `GRAPH ?g { ... }` resolve the ledger's registered user named graphs **without** an explicit `FROM NAMED` (the reserved `#txn-meta` / `#config` graphs stay private). Supplying `FROM NAMED` still narrows resolution to exactly the graphs listed.
 
-If the request body tries to target a different ledger than the one in the URL, the server rejects it with a "Ledger mismatch" error.
+A `from` string or object, or a SPARQL `FROM`, that names a different ledger than the one in the URL, in any spelling, is rejected with a "Ledger mismatch" error (see [`POST /query/{ledger}`](../api/endpoints.md#post-queryledger)). A JSON-LD array `from`, or a `fromNamed`, may name other ledgers, as on `POST /query`; each is read under the caller's access rights.
+
+On a ledger-scoped request, `Fluree-Min-T` (or `opts.min-t`) waits for the URL's ledger, and the wait comes before the request's dataset is resolved in that ledger, so a graph registered by the awaited commit is found.
+
+SPARQL dataset IRIs are expanded against the query's prologue first: prefixed names, and relative IRIs against `BASE`. A ledger address that names its branch or a time (`my_db:main`, `mydb@t:3`) is no relative IRI, so `BASE` leaves it as written. A bare name (`mydb`) is a relative IRI, as `data.ttl` is, and `BASE` resolves it, so a query that declares a `BASE` names a ledger with its branch (`mydb:main`).
+
+### The ledger's own address in a graph position
+
+Wherever a query or an update names a graph of the ledger it reads or writes, one table decides which graph the name is. That covers `GRAPH <iri>` in a query or in an update's `WHERE`, an update template's `GRAPH <iri>`, an `INSERT DATA` / `DELETE DATA` quad, a TriG block (in a transaction or a bulk import), `WITH`, and the JSON-LD forms (top-level `graph`, a node's `@graph`, `["graph", …]`). A dataset clause on a ledger-scoped surface (`FROM`, `FROM NAMED`, `USING`, `USING NAMED`, JSON-LD `from` / `fromNamed`) reads the ledger's own address and `mydb:main#<graph IRI>` the same way, and differs only as the list above says: another ledger's address is refused there, and a query's `FROM` may carry a time.
+
+| The name | reads | writes |
+|---|---|---|
+| the ledger's own address, in any spelling: `mydb`, `mydb:main`, `urn:fluree:mydb:main` | the default graph | the default graph |
+| `urn:default` | the default graph | refused with a `400`, except `WITH <urn:default>` and a top-level `"graph": "urn:default"`, which write the default graph |
+| the address with a reserved keyword: `mydb:main#config`, `mydb#txn-meta` | that reserved graph, as `urn:fluree:mydb:main#config` reads it | the config graph; a `#txn-meta` write is refused |
+| the address with a graph IRI: `mydb:main#http://example.org/g` | the graph `http://example.org/g` | the graph `http://example.org/g` |
+| a registered graph IRI | that graph | that graph |
+| any other IRI | nothing | a new graph by that IRI |
+
+- No write registers a graph under the ledger's own address, and the graph-management verbs (`CREATE`, `COPY`, `MOVE`, `ADD`) do not create one there. The address with a time (`mydb:main@t:5`) names no graph in these positions.
+- A `GRAPH ?g` template writes the graph its binding names in this table, which is the graph the `WHERE` read: `DELETE { GRAPH ?g { ?s ?p ?o } } USING NAMED <mydb:main> WHERE { GRAPH ?g { ?s ?p ?o } }` deletes from the default graph.
+- The reserved graphs keep their own IRIs, such as `urn:fluree:mydb:main#config`, and the address with a reserved keyword is the same graph in every position. `CLEAR`, `DROP`, `ADD`, `COPY` and `MOVE` refuse both reserved graphs, by either name. A branch made from an indexed ledger keeps its source's reserved IRIs (`urn:fluree:mydb:main#config` on `mydb:feature`), and `mydb:feature#config` names the graph at that place in reads and writes alike.
+
+An earlier version could register a graph under the ledger's address; how to reach and move one is in [Behavior changes](../reference/compatibility.md#a-ledgers-own-address-names-its-default-graph-in-every-graph-position).
 
 #### Named graphs with no default graph (changed in 4.1.4)
 
 A dataset clause defines the query's dataset exhaustively (SPARQL 1.1 §13.2): the default graph is the union of the `FROM` clauses, so `FROM NAMED` alone leaves it **empty** and patterns written outside `GRAPH { ... }` match nothing. The embedded Rust API has always behaved this way; before 4.1.4 the HTTP endpoints instead substituted a ledger's default graph, so the same query returned different answers depending on which surface you used. The HTTP endpoints now follow §13.2 as well.
 
-This applies equally to the JSON-LD form: `fromNamed` with no `from` leaves the default graph empty, and patterns outside `["graph", ...]` match nothing. The two spellings below are equivalent, and now return the same result on every endpoint:
+This applies equally to the JSON-LD form: `fromNamed` with no `from` leaves the default graph empty, and patterns outside `["graph", ...]` match nothing. The two spellings below are equivalent, and return the same result on every ledger-scoped endpoint (on the connection endpoint, name the graph with its ledger: `FROM NAMED <mydb:main#http://example.org/ns/archive>`):
 
 ```sparql
 SELECT ?name
@@ -77,6 +102,8 @@ WHERE {
 A query with **no** dataset clause at all is unaffected — it reads the endpoint's ledger default graph as before. When a request does combine named-graph-only with a pattern outside `GRAPH { ... }` / `["graph", ...]`, the response carries an `x-fdb-warning` header explaining why those patterns matched nothing; the status is still `200` and the body is the (correct, possibly empty) result. This holds on the ledger-scoped and connection-scoped `/query` routes and on both streaming routes.
 
 On the **connection-scoped** route this also removes a sharper edge: previously a `fromNamed`-only body had one of its entries chosen as the default graph, so a pattern outside `["graph", ...]` silently read one arbitrarily-selected graph's triples and returned them with a `200`.
+
+A JSON-LD `from` that names just the ledger (no graph, no time, no `fromNamed`) is not a dataset clause: the query runs on that ledger as if it named none, so `["graph", "?g", ...]` ranges over the ledger's graphs and `["graph", "urn:default", ...]` reads its default graph. Its SPARQL twin, on the ledger's own endpoint, has no `FROM`. A SPARQL `FROM`, by contrast, is a dataset clause, so `GRAPH` addresses only the named graphs the query lists: under `FROM <mydb:main>`, `GRAPH <urn:default>` and `GRAPH ?g` match nothing. To read the default graph by name under a dataset clause, list it: `FROM NAMED <urn:default>` on the ledger's own endpoint, or `FROM NAMED <mydb:main#urn:default>` anywhere. How a `FROM` naming a whole ledger should expose its graphs is tracked in [#1975](https://github.com/fluree/db/issues/1975).
 
 ### Txn metadata named graph (`#txn-meta`)
 
@@ -136,6 +163,8 @@ curl -X POST "http://localhost:8090/v1/fluree/upsert?ledger=mydb:main" \
   --data-binary '@data.trig'
 ```
 
+To replace a named graph's contents wholesale, for example when reloading an export, use [sync](../transactions/sync.md) instead: it takes the graph's new contents as JSON-LD, Turtle, N-Triples or TriG and commits only what changed. The [Graph Store Protocol](../api/graph-store.md) offers the same replace as a standard `PUT`, plus `GET`, `POST` and `DELETE` on one graph.
+
 **Querying user-defined named graphs (JSON-LD):**
 
 Use the structured `from` object with a `graph` field:
@@ -169,6 +198,8 @@ Use the structured `from` object with a `graph` field:
 
 ### Querying Named Graphs
 
+A graph IRI on its own names a graph of the ledger the query targets: a ledger-scoped endpoint, the CLI with a ledger, or an embedded view. On the connection endpoint, write it with its ledger (`FROM NAMED <mydb:main#http://example.org/ns/graph1>`, and the same IRI in `GRAPH`).
+
 ```sparql
 # Query specific named graphs
 SELECT ?name
@@ -201,24 +232,52 @@ FROM <ledger:main>
 WHERE {
   ?person ex:name ?name
   # This matches triples in the default graph only
+  # (unless the ledger reads a union default graph, below)
 }
 ```
 
 ### Union Default Graph
 
-Some SPARQL implementations create a "union default graph" containing triples from all graphs. Fluree keeps them separate by default, but you can achieve union semantics:
+A ledger can instead read its default graph as the **union** of the default graph and all of its named graphs, the SPARQL service feature `sd:UnionDefaultGraph`. Switch it on for the ledger in its config graph:
 
-```sparql
-# Manual union across graphs
-SELECT ?name
-FROM NAMED <ledger:main>
-FROM NAMED <ledger:archive>
-WHERE {
-  { GRAPH <ledger:main> { ?person ex:name ?name } }
-  UNION
-  { GRAPH <ledger:archive> { ?person ex:name ?name } }
+```trig
+@prefix f: <https://ns.flur.ee/db#> .
+
+GRAPH <urn:fluree:ledger:main#config> {
+    <urn:cfg:main>  a f:LedgerConfig ;
+                    f:queryDefaults <urn:cfg:query> .
+    <urn:cfg:query> f:unionDefaultGraph true .
 }
 ```
+
+or for one query, whatever the ledger says:
+
+```sparql
+# PRAGMA union-default-graph: true
+SELECT ?name WHERE { ?person ex:name ?name }
+```
+
+```json
+{
+  "select": ["?name"],
+  "where": { "@id": "?person", "ex:name": "?name" },
+  "opts": { "unionDefaultGraph": true }
+}
+```
+
+`# PRAGMA union-default-graph: false` (or `"unionDefaultGraph": false`) reads the default graph alone on a ledger that unions.
+
+The union is a set: a triple stored in several graphs matches once, and a property path follows edges across graphs, so `ex:alice ex:knows+ ?x` reaches a node through an edge in the default graph and the next edge in a named graph. It applies whenever the query does not choose a default graph of its own, which includes naming just the ledger itself in `FROM`. Everything else stays as it was:
+
+- `GRAPH <iri>` and `GRAPH ?g` address the named graphs exactly as without the union, and `GRAPH <ledger:main>` still names the default graph alone.
+- `FROM <graph>` reads just that graph; `FROM NAMED` names exactly the graphs it lists. A `FROM` list that names the ledger and any of its graphs reads just the graphs it names, not the union.
+- The union's named graphs are the ones `GRAPH ?g` lists, a graph registered under the ledger's address by an earlier version included (see [above](#the-ledgers-own-address-in-a-graph-position)). The reserved `#txn-meta` and `#config` graphs are never part of the union.
+- Policy applies to each graph as it would to a `GRAPH` pattern reading it.
+- Transactions are unaffected: they write to the graphs they name, and an update's `WHERE` matches the default graph alone. History queries (`FROM … TO …`) read the default graph alone too.
+
+The ledger's SPARQL endpoint advertises `sd:feature sd:UnionDefaultGraph` in its [service description](../api/endpoints.md#service-description) while the setting is on.
+
+A union reads every graph for every default-graph pattern, so a query costs more than the same query over the default graph alone, and the single-graph shortcuts for counts and aggregates do not apply. On a ledger without named graphs the setting changes nothing.
 
 ## Multi-Ledger Datasets
 
@@ -294,14 +353,16 @@ WHERE {
 
 There is no "create graph" operation. The first transaction that targets a new graph IRI — via TriG, JSON-LD with `@graph`, or SPARQL `INSERT … GRAPH <iri> …` — registers it and assigns a stable `g_id` (3+ for user graphs). Subsequent inserts into the same IRI land in the same registered slot.
 
+To load a large new graph into an existing ledger, bulk-import it instead: [`fluree graph import <iri> --from <path>`](../cli/graph.md#fluree-graph-import) (Rust: `Fluree::import_into_graph`, Python: `Ledger.import_graph`) runs the bulk-import pipeline into a graph the ledger does not have yet, or one it dropped. Its commits continue the ledger's history and its terms are shared with the rest of the ledger.
+
 ### Listing and dropping graphs
 
 Two CLI commands cover the rest of the lifecycle:
 
 - **[`fluree graph list`](../cli/graph.md#fluree-graph-list)** — lists user graphs registered on a branch (with `--include-system` to also show the default and system graphs). Reads the `named-graphs` section of the standard `/info` response.
-- **[`fluree graph drop`](../cli/graph.md#fluree-graph-drop)** — transactionally retracts every triple currently asserted under a named graph. Produces one new commit at `t + 1` whose flakes are all retractions; history at older `t` values is preserved, and the graph IRI keeps its `g_id` so future inserts land in the same slot. Drops are per-branch.
+- **[`fluree graph drop`](../cli/graph.md#fluree-graph-drop)** — SPARQL `DROP GRAPH`: one new commit at `t + 1`, which retracts nothing, takes the graph and its history out of the ledger. Nothing it held is queryable at the head, and a query naming it as of an earlier `t` is refused. Writing to the IRI again starts the graph afresh. The commits keep what the drop took, so a branch created before the drop still has it. Drops are per-branch. To empty a graph and keep its history, use SPARQL `CLEAR GRAPH`.
 
-The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped. The Rust API entry point is `Fluree::drop_named_graph(ledger_id, graph_iri)`; over HTTP it is `POST /v1/fluree/drop-graph` (admin-protected). See the [server-integration contract](../cli/server-integration.md#drop-named-graph-contract) for the wire details.
+The default graph, `urn:fluree:{ledger_id}#txn-meta`, and `urn:fluree:{ledger_id}#config` cannot be dropped. The Rust API entry point is `Fluree::drop_named_graph(ledger_id, graph_iri)`, whose report carries the drop commit's `commit_id` when it committed; over HTTP it is `POST /v1/fluree/drop-graph` (admin-protected). See the [server-integration contract](../cli/server-integration.md#drop-named-graph-contract) for the wire details.
 
 ### Graph Metadata
 
@@ -314,11 +375,10 @@ For transaction-scoped metadata, Fluree uses the **`txn-meta`** named graph (see
 Separate different types of data:
 
 ```sparql
+SELECT ?customer ?product
 FROM NAMED <urn:customers>
 FROM NAMED <urn:products>
 FROM NAMED <urn:orders>
-
-SELECT ?customer ?product
 WHERE {
   GRAPH <urn:customers> { ?customer foaf:name ?name }
   GRAPH <urn:orders> {
@@ -327,6 +387,8 @@ WHERE {
   }
 }
 ```
+
+SHACL checks a record against the graph it is written to. When its shapes need data kept in another graph, such as a shared catalog, see [SHACL across named graphs](../guides/cookbook-shacl-across-graphs.md).
 
 ### Access Control
 
@@ -341,10 +403,9 @@ Different graphs can have different permissions:
 Track data sources and quality:
 
 ```sparql
+SELECT ?sensor ?reading ?quality
 FROM NAMED <urn:sensor1>
 FROM NAMED <urn:sensor2>
-
-SELECT ?sensor ?reading ?quality
 WHERE {
   GRAPH ?sensor {
     ?obs ex:reading ?reading ;
@@ -359,10 +420,9 @@ WHERE {
 Maintain different versions of data:
 
 ```sparql
+SELECT ?feature ?version
 FROM NAMED <urn:v1.0>
 FROM NAMED <urn:v2.0>
-
-SELECT ?feature ?version
 WHERE {
   GRAPH ?version {
     ?feature ex:status "active"
@@ -402,6 +462,6 @@ Fluree's dataset implementation follows:
 - **SPARQL 1.1 Query**: FROM and FROM NAMED clauses
 - **SPARQL 1.1 Update**: GRAPH clauses in updates
 - **RDF 1.1 Datasets**: Named graph semantics
-- **JSON-LD 1.1**: @graph syntax for named graphs
+- **JSON-LD 1.1**: named graph objects (an object whose `@id` names the graph and whose `@graph` holds its nodes), plus a Fluree extension: a node's own `"@graph": "<graph IRI>"` places the node, and every node nested in it, in that graph
 
 This enables seamless integration with other RDF tools and SPARQL endpoints while providing Fluree's unique temporal and ledger capabilities.

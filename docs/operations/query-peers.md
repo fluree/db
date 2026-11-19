@@ -1,6 +1,6 @@
 # Query peers and replication
 
-This document describes how to run `fluree-server` in **transaction** mode (event source + transactions) and **peer** mode (read replica). It also documents the **events stream** (`/v1/fluree/events`) and **storage proxy** endpoints (`/v1/fluree/storage/*`) used to keep peers up to date and/or to proxy storage reads.
+This document describes how to run the Fluree server (`fluree server run`) in **transaction** mode (event source + transactions) and **peer** mode (read replica). It also documents the **events stream** (`/v1/fluree/events`) and **storage proxy** endpoints (`/v1/fluree/storage/*`) used to keep peers up to date and/or to proxy storage reads.
 
 This guide is written from an **operator / end-user** standpoint: what to deploy, how to configure it, and what to expect from each mode.
 
@@ -10,7 +10,7 @@ availability, and cross-cloud recovery, see
 
 ## Server roles
 
-`fluree-server` supports two roles:
+The server supports two roles:
 
 - **Transaction server** (`--server-role transaction`)
   - Write-enabled.
@@ -19,7 +19,7 @@ availability, and cross-cloud recovery, see
 - **Query peer** (`--server-role peer`)
   - Read-only API surface for clients (queries, history, etc.).
   - Subscribes to `GET /v1/fluree/events` from a transaction server to learn about nameservice updates.
-  - Reads ledger data from storage (shared-storage deployments), and refreshes on staleness based on the events stream.
+  - Reads ledger data from storage (shared-storage deployments), and applies each event to the ledgers it has cached.
   - Forwards write/admin operations to the configured transaction server.
 
 ## Events stream (SSE): `GET /v1/fluree/events`
@@ -52,6 +52,8 @@ In peer mode:
 
 - **Write forwarding**: write and admin endpoints are forwarded to the transaction server configured by `--tx-server-url`.
 - **Read serving**: query endpoints are served locally, using ledger/index data obtained either from shared storage or via storage proxy reads (see below). History queries are executed via the standard `/query` endpoint with time range specifiers.
+- **Staying current**: each event names a ledger's commit head and index. A peer applies it to the ledger it has cached, in place: new commits are added and a new index is installed, while queries go on against the cached state. A ledger the peer has not cached loads on its first query. Each ledger's events are applied in order, one at a time, and apart from other ledgers', so one waiting on slow storage holds up no other; events that arrive faster than a ledger applies them collapse to the latest. An event can arrive after the peer has already read a newer state from storage; one for a commit the peer has passed changes nothing. An event that replaces the ledger's history (a [rebase](../cli/branch.md#fluree-branch-rebase) can move a branch's head back, or lower its index) reloads the ledger, and the cached state serves queries until the reload lands.
+- **Index retention**: a peer query reads an index version the transaction server's indexer published, and keeps reading it after a newer one arrives. That indexer's garbage collector decides how long a superseded version stays in storage, so a peer query that outlasts its age guard (15 minutes by default) or its version ceiling (10 old versions by default) can lose the version it is reading. A peer does not collect garbage itself, so set retention on the transaction server; see [Index Retention](../indexing-and-search/background-indexing.md#index-retention).
 
 ### Peer configuration (SSE subscription)
 
@@ -70,6 +72,8 @@ Peer servers support two storage access modes:
 - **Shared storage** (`--storage-access-mode shared`, default)
   - The peer reads the same storage backend as the transaction server (shared filesystem, shared bucket credentials, etc.).
   - Requires `--storage-path`.
+  - The peer only reads: the nameservice, write-ahead log, staging files and indexes on that storage are the transaction server's. A peer runs no indexer, whatever `--indexing-enabled` says.
+  - **Upgrading from v4.2.7:** a v4.2.7 shared-storage peer writes the transaction server's nameservice record and can move its head back, losing acknowledged commits. Upgrade (or stop) every shared-storage peer before, or together with, the transaction server.
 - **Proxy storage** (`--storage-access-mode proxy`)
   - The peer does **not** need direct storage credentials.
   - The peer fetches all storage reads through the transaction server’s `/v1/fluree/storage/objects/{cid}` endpoint (raw CAS bytes, verified against the CID client-side), including index leaves and dictionary blobs — so queries execute locally on the peer against remotely served index content.
@@ -207,10 +211,11 @@ When a flakes format is requested and the block is a ledger leaf:
 ### Transaction server (events + storage proxy)
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8090 \
-  --server-role transaction \
   --storage-path /var/lib/fluree \
+  -- \
+  --server-role transaction \
   --events-auth-mode required \
   --events-auth-trusted-issuer did:key:z6Mk... \
   --storage-proxy-enabled
@@ -219,11 +224,12 @@ fluree-server \
 ### Query peer (shared storage)
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8091 \
+  --storage-path /var/lib/fluree \
+  -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
-  --storage-path /var/lib/fluree \
   --peer-subscribe-all \
   --peer-events-token @/etc/fluree/peer-events.jwt
 ```
@@ -233,8 +239,9 @@ fluree-server \
 In proxy storage mode, the peer does not need `--storage-path` and instead needs a storage proxy token:
 
 ```bash
-fluree-server \
+fluree server run \
   --listen-addr 0.0.0.0:8091 \
+  -- \
   --server-role peer \
   --tx-server-url http://tx.internal:8090 \
   --storage-access-mode proxy \

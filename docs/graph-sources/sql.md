@@ -48,11 +48,15 @@ curl -X POST http://localhost:8090/v1/fluree/sql/map \
   "endpoint": "https://trino.example.com:8443",
   "catalog": "hive",
   "schema": "sales",
-  "auth_bearer": "…",
+  "auth_bearer_env": "TRINO_TOKEN",
   "r2rml": "@prefix rr: <http://www.w3.org/ns/r2rml#> . …"
 }
 JSON
 ```
+
+`auth_bearer_env` names a server environment variable that the operator lists in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`; `auth_bearer` is the token itself, stored with the source. The auth may instead be given as a structured `auth`, the stored shape, which is also how a Google identity is given. A body that gives auth two ways, or only partly, is refused with `400`.
+
+A Google identity's token goes to the SQL endpoint, but a **host** identity's token (the metadata server's, the host's application-default credentials, WIF signed with the host's own AWS identity) is sent only to Google's APIs (`https` on `googleapis.com`) and the hosts the operator lists in `FLUREE_GOOGLE_TOKEN_HOSTS`. Against an ordinary Trino endpoint, then, only a service-account key (`--auth-google-service-account-env`, or `{"source": "service_account"}`) works unless the operator lists the endpoint's host; a host identity is refused with `403` (`err:auth/HostIdentityRefused`) before a token is minted.
 
 === Rust
 
@@ -80,7 +84,7 @@ be fixed later; the first query surfaces the real error.
 | `protocol` | `trino` | Header family: `trino` (`X-Trino-*`) or `presto` (`X-Presto-*`) |
 | `catalog`, `schema` | — | Defaults for unqualified `rr:tableName`s |
 | `user` | `fluree` | The protocol's user header; required even with a bearer token |
-| `auth` | none | `bearer` (static token) or `oauth2_client_credentials`; values accept the same `env_var` / `secret_ref` indirection as Iceberg catalog auth |
+| `auth` | none | `bearer` (static token), `oauth2_client_credentials`, or `google` (a Google identity), in the shape of an Iceberg REST catalog's auth (see [Iceberg connection](../api/endpoints.md#iceberg-connection)). A secret may be `{"env_var": "NAME"}` (`--auth-bearer-env`, `auth_bearer_env`), which over HTTP the server must list in `FLUREE_GRAPH_SOURCE_SECRET_ENV_VARS`; a `{"secret_ref": …}` resolves only in an embedded `Fluree` with a secret resolver |
 | `session` | `{}` | Session properties, e.g. `{"query_max_run_time": "5m"}` |
 | `request_timeout_secs` | `120` | Per page fetch |
 | `model` | — | Model ledger (`name:branch`) whose default graph supplies view policies and the class/property hierarchy; must exist. See [Access policy](iceberg.md#access-policy) |
@@ -92,9 +96,10 @@ set, an unqualified name resolves inside it.
 
 ### `rr:sqlQuery`
 
-Unlike Iceberg sources, a SQL source accepts the R2RML `rr:sqlQuery` logical
-table. The query is scanned as a derived table, with Fluree's projection and
-pushed filters applied on top of it:
+A SQL source accepts any R2RML `rr:sqlQuery` logical table (an Iceberg source
+accepts only a single-table [row filter](iceberg.md#row-filters-rrsqlquery)).
+The query is scanned as a derived table, with Fluree's projection and pushed
+filters applied on top of it:
 
 ```turtle
 <#OpenOrders> a rr:TriplesMap ;
@@ -233,10 +238,11 @@ pushable. In that statement:
   pattern binding it too is declined as it would be inside one block. A
   sub-select with another `HAVING`, an `OFFSET`, a `BIND`, a nested
   sub-select, a filter the statement cannot evaluate exactly, or one that
-  hides an inner variable the enclosing block also uses is not admitted. There is
-  no other lane for a sub-select over a graph source (the engine's
-  subquery operator has no native index to run against), so one the lane
-  does not take still refuses the query, as it did before;
+  hides an inner variable the enclosing block also uses is not admitted. One
+  the lane does not take runs on the per-scan lane below, which evaluates
+  the sub-select's body over its own table reads (see [Sub-selects over a
+  Graph Source](overview.md#sub-selects-over-a-graph-source), including the
+  cost of a sliced JSON-LD sub-select there);
 - an entity whose members come from **several triples maps sharing its
   subject** (a vertically partitioned mapping: one map per column group, or
   per table, over the same `rr:template`) is one access per distinct table,
@@ -397,6 +403,23 @@ points, instants) and declines rather than approximate:
   DECIMAL columns at the scale it was started with (`--decimal-scale`,
   default 6), and SQLite's `NUMERIC` is a double.
 
+**An un-annotated column the database does not hold as text** — a `bigint`,
+`double`, `decimal`, `date`, `timestamp` or `varbinary` mapped with no
+`rr:datatype` — reads as the `xsd:string` of its rendered value (`10`, `-0`,
+`0.050000000`, `2024-01-01T00:00:00Z`, hex bytes), so it sorts as text (`"10"`
+before `"9"`) where the database sorts the column by value. The lane pushes no
+`ORDER BY … LIMIT`, `MIN`/`MAX` or comparison of such a column, and pushes a
+`GROUP BY`, `SELECT DISTINCT`, `COUNT(DISTINCT …)` or join on it only where the
+database's `=` is the strings' equality: integers, decimals of one scale,
+booleans, dates, bytes, and timestamps the endpoint declares to at most
+microseconds (`timestamp(6)`, Trino's default `timestamp(3)`). A float renders
+`-0.0` and `0.0` apart where the database groups them, and a `timestamp(9)`
+holds instants a nanosecond apart that decode to one microsecond, so those
+group in the engine. A language-tagged map over such a column follows the same
+rules. Conversely, a mapping that declares a numeric, date or boolean
+`rr:datatype` over a text column orders as text in the database ("9" after
+"100"), so its `ORDER BY … LIMIT` and `MIN`/`MAX` stay in the engine.
+
 CI replays every lane case against SQLite, Postgres 16 and MySQL 8 behind
 the bridge, the two servers deliberately running five hours off UTC, and
 pins both the rows and which of these forms each statement took.
@@ -415,20 +438,74 @@ true`) returns every statement the lane ran under `sql` as
 `[{"source", "sql"}]` — see [Tracking and
 Fuel](../query/tracking-and-fuel.md#tracked-information).
 
-### Subject keys must be unique
+### Repeated rows and subject keys
 
-Both lanes assume the columns of a subject template identify one row: a
-star over a subject reads its columns from one row. R2RML itself does not
-require that — the output graph is a set — so a subject minted from a
-non-key column, a joined `rr:sqlQuery` view or a denormalized fact table
-would return duplicate rows. Registration therefore probes every table
-(`SELECT 1 … GROUP BY <subject key columns> HAVING COUNT(*) > 1 LIMIT 1`,
-also over the parent columns of every foreign key pointing at the map) and
-reports repeats as `mapping_warnings`; the finding is stored on the source.
-The pushdown lane **refuses** a statement over a flagged table with an
-error naming it. Register with `allow_duplicate_subjects` to accept the
-duplicate rows instead, and run `fluree sql check <source>` to re-probe
-live tables. An unreachable endpoint skips the probe with a warning.
+A graph source answers over the set of triples its mapping defines (R2RML
+§11): two rows that mint the same triple add it once. A table is a bag of
+rows, and a subject minted from a non-key column, a joined `rr:sqlQuery`
+view, a history table or a denormalized fact table mints the same triple
+from several rows. The lane therefore needs to know where rows can repeat a
+solution:
+
+- A map whose subject columns hold a key of its table mints at most one row
+  per subject. Its statements are the ones shown above.
+- Elsewhere the statement removes repeated solutions: a `SELECT DISTINCT`
+  over every block variable's columns. A `GROUP BY` or aggregate reads that
+  distinct set as a derived table, so `COUNT`, `SUM` and `AVG` count
+  triples, not rows. Two maps that can mint the same subject (one entity
+  over several tables) are deduplicated together. A `DISTINCT` above the
+  block stays the only one, and each branch of a `UNION` is a set on its own
+  (the branches together keep SPARQL's multiplicity, as does a projection).
+- Shapes a `DISTINCT` cannot answer exactly decline to the per-scan lane: a
+  star over such a subject (two patterns read from one row would pair that
+  row's values, where the graph pairs every value of the subject with every
+  other), an `OPTIONAL` member folded onto such a row, a reference joining
+  on columns other than the parent's subject, a template that is not
+  injective (`{a}-{b}`: `-` can occur inside a value), string columns where
+  the dialect's `DISTINCT` folds case (MySQL), and a `VALUES` repeating a
+  row.
+
+Keys come from two places:
+
+- **The registration probe.** Registration probes every table (`SELECT 1 …
+  GROUP BY <key columns> HAVING COUNT(*) > 1 LIMIT 1`, over the subject
+  columns of every map over the table plus the parent columns of every
+  foreign key pointing at one, as one composite key) and stores what it
+  found on the source: repeats are reported as `mapping_warnings`, and the
+  lane **refuses** a statement over a flagged table with an error naming it;
+  a table the probe found unique has its key recorded and trusted until the
+  next `fluree sql check <source>`, which re-probes the live tables. An
+  endpoint unreachable at registration verifies nothing, so every table
+  answers with set semantics until a `check` succeeds. Because the probe
+  checks one composite per table, a map whose subject uses only some of its
+  columns is not proven unique by it. The probe sees the table as it was
+  when it ran, and queries do not repeat it: a row written since that
+  repeats a key is not noticed, and queries over the table return the
+  repeated solutions the key ruled out (and counts as if it held) until the
+  next `fluree sql check` flags the table.
+- **A declared key.** `f:key` on the logical table (see [Declaring a
+  table's keys](r2rml.md#declaring-a-tables-keys-fkey)) declares a key the
+  data is trusted to hold. The lane checks that its columns exist and can
+  identify a row and refuses the query otherwise: a floating-point column
+  cannot, nor can a timestamp finer than the microsecond its values are read
+  to (or one whose precision the endpoint does not report), since two of its
+  values can render one term. A probed key over such a column is not
+  trusted either.
+
+Register with `allow_duplicate_subjects` to skip the probe: no table is
+refused, and every map without a declared key answers with set semantics.
+A source registered before the probe recorded the keys it verified keeps
+trusting every table it did not flag; run `fluree sql check` to record them.
+
+Registration and `fluree sql check` name each map no key proves
+subject-unique: the response's `diagnostics` holds a `keylessMap` advisory
+per map (`fluree sql map` and `check` print them), with the `f:key` that
+would prove it. Statements over such a map carry `DISTINCT`, or decline to
+the per-scan lane, so a `COUNT` or a star over it costs more than over a
+keyed map. If an upgrade made such queries slower, see
+[R2RML → A map with no key](r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade).
+An endpoint unreachable at registration gets no advisories; `check` reports
+them once it succeeds.
 
 **Not pushed** in the per-scan lane: `ORDER BY … LIMIT` (a NULL in a key or
 required column would consume `LIMIT` slots for rows the mapping drops) and
@@ -464,7 +541,7 @@ A SQL source has no snapshot: every query reads the tables as they are at that
 moment. Consequently
 
 - `as-of` time travel is not available on a SQL source;
-- [materialization](iceberg.md#materialization) into a twin ledger and
+- [materialization](iceberg.md#materialization-into-a-native-ledger) into a twin ledger and
   `fluree iceberg track` are **not yet supported** for SQL sources — both are
   built on Iceberg snapshot windows, and a mutable table has no delta between
   two reads. Attempting either returns a clear error naming the source. A
@@ -524,7 +601,12 @@ moment. Consequently
   subject policy beside a class policy over a column-derived type, a map
   deriving classes from several columns or maps, and a policy on an
   `OPTIONAL` member of the entity it hides still leave the block to the
-  per-scan lane.
+  per-scan lane. A class-targeted policy over a subject several maps or rows
+  mint is decided over every class set the subject could hold, in both
+  lanes, as for an Iceberg source: see
+  [Class policies over subjects several rows mint](iceberg.md#class-policies-over-subjects-several-rows-mint).
+  The registration probe's keys count as keys there, trusted until the next
+  `fluree sql check`.
 
 ## Running the bridge
 
@@ -574,7 +656,7 @@ class it found. Declare the column `NUMERIC` to read mixed storage as a
 | `COUNT` | manifest stats, when provably exact | exact `COUNT(*)` |
 | `ORDER BY … LIMIT` | top-k file ordering | pushed by the pushdown lane on typed required columns |
 | Snapshots / time travel | pinned per query, incremental twins | none; full rebuilds |
-| `rr:sqlQuery` | refused | supported |
+| `rr:sqlQuery` | a single-table `WHERE` conjunction, applied exactly | supported |
 | View policy | static targeting in the scan, `--model` ledger | same |
 | Extra infrastructure | none | Trino, or a bridge sidecar |
 

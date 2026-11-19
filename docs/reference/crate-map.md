@@ -301,7 +301,7 @@ fluree-db/
 - File and DynamoDB backends
 
 **Key Types:**
-- `NameService` trait (includes `list_branches`, `create_branch`, `drop_branch`)
+- `NameService` trait (includes `branch_records`, `create_branch`, `drop_branch`)
 - `Publisher` trait (commit/index publishing)
 - `NsRecord` - Nameservice record (includes `source_branch` for ancestry and `branches` child count for reference counting)
 - `FileNameService`
@@ -439,9 +439,10 @@ Behind the `ipfs` feature on `fluree-db-api`.
 **Purpose:** Storage encryption
 
 **Responsibilities:**
-- AES-256-GCM encryption/decryption
-- Key management
-- Encrypted storage layer
+- AES-256-GCM encryption/decryption and the `FLU\0` envelope
+- Key management: single keys and rotation key sets (`MultiKeyProvider`)
+- Encrypted storage layer (`EncryptedStorage`), including the `EncryptionAdmin`
+  surface key rotation drives (`key_id_at`, `reencrypt`)
 
 **Dependencies:**
 - fluree-db-core
@@ -967,7 +968,7 @@ cargo build --release
 ### Build Server Only
 
 ```bash
-cargo build --release --bin fluree-db-server
+cargo build --release --bin fluree-server
 ```
 
 ### Run Tests

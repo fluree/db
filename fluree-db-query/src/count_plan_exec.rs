@@ -23,11 +23,11 @@ use crate::fast_path_common::{
     collect_subjects_for_predicate_set, collect_subjects_for_predicate_sorted,
     collect_subjects_with_object_in_set, count_rows_for_predicate_psot,
     cursor_projection_otype_okey, cursor_projection_sid_only, cursor_projection_sid_otype_okey,
-    intersect_many_sorted, leaf_entries_for_predicate, normalize_pred_sid,
-    projection_sid_otype_okey, slice_overlay_ops_by_subject, sum_post_object_counts_filtered,
-    CursorSubjectCountStream, FastPathOperator, ObjectFilterMode, PostObjectGroupCountIter,
-    PsotObjectFilterCountIter, PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter,
-    SharedOverlayOps,
+    driver_subject_boundaries, intersect_many_sorted, leaf_entries_for_predicate,
+    normalize_pred_sid, projection_sid_otype_okey, slice_overlay_ops_by_subject,
+    sum_post_object_counts_filtered, CursorSubjectCountStream, FastPathOperator, GroupStream,
+    InnerMergeHeads, ObjectFilterMode, PostObjectGroupCountIter, PsotObjectFilterCountIter,
+    PsotSubjectCountIter, PsotSubjectSeek, PsotSubjectWeightedSumIter, SharedOverlayOps,
 };
 use crate::ir::triple::Ref;
 use crate::operator::BoxedOperator;
@@ -41,7 +41,7 @@ use std::sync::Arc;
 /// Per-execution bundle threaded through the plan evaluator.
 ///
 /// Carries the store + graph plus whether an **overlay lane** is required:
-/// novelty is present (`overlay.epoch() != 0`) or the query is time-travel
+/// novelty is present or the query is time-travel
 /// (`to_t < max_t`). When `overlay` is false the metadata (base-leaflet)
 /// primitives are exact and used as before; when true the subject-keyed nodes
 /// route through the overlay-merging PSOT cursor instead. Nodes not yet
@@ -84,12 +84,8 @@ pub(crate) fn count_plan_operator(
             // Overlay lane needed when novelty is present or the query is
             // time-travel (`to_t < max_t`) — in both cases the base-leaflet
             // metadata primitives are not exact.
-            let overlay = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0
-                || ctx.to_t != store.max_t();
+            let overlay =
+                crate::fast_path_common::overlay_has_novelty(ctx) || ctx.to_t != store.max_t();
 
             // Only some node types have an overlay lane so far; any other node
             // under overlay must bail to the (correct, slower) generic fallback
@@ -147,7 +143,13 @@ fn execute_plan(root: &CountPlanRoot, ec: &ExecCtx<'_, '_>) -> Result<Option<u64
             if ec.overlay {
                 execute_chain_overlay(chain, ec)
             } else {
-                execute_chain(chain, ec.store, ec.g_id, &ec.ctx.cancellation)
+                execute_chain(
+                    chain,
+                    ec.store,
+                    ec.g_id,
+                    &ec.ctx.cancellation,
+                    &ec.ctx.tracker,
+                )
             }
         }
         CountPlanRoot::OptionalChainHead { p1, p2, p3 } => {
@@ -235,7 +237,7 @@ enum SubjectGroups<'a> {
     Cursor(CursorSubjectCountStream),
 }
 
-impl SubjectGroups<'_> {
+impl GroupStream for SubjectGroups<'_> {
     fn next_group(&mut self) -> Result<Option<(u64, u64)>> {
         match self {
             SubjectGroups::Empty => Ok(None),
@@ -281,7 +283,8 @@ fn subject_groups<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<Subject
     } else {
         Ok(Some(SubjectGroups::Meta(
             PsotSubjectCountIter::new(store, ec.g_id, p_id)?
-                .with_cancellation(&ec.ctx.cancellation),
+                .with_cancellation(&ec.ctx.cancellation)
+                .with_tracker(&ec.ctx.tracker),
         )))
     }
 }
@@ -307,7 +310,10 @@ fn subject_keys_sorted(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<Vec<u6
             return Ok(Some(Vec::new()));
         };
         Ok(Some(collect_subjects_for_predicate_sorted(
-            ec.store, ec.g_id, p_id,
+            ec.store,
+            ec.g_id,
+            p_id,
+            &ec.ctx.tracker,
         )?))
     }
 }
@@ -334,7 +340,7 @@ fn total_row_count(ec: &ExecCtx<'_, '_>, pred: &Ref) -> Result<Option<u64>> {
         let mut total: u64 = 0;
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+            .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
         {
             ec.ctx.check_cancelled()?;
             total = total
@@ -366,7 +372,13 @@ fn post_object_filtered_sum(
         return Ok(if ec.overlay { None } else { Some(0) });
     };
     if !ec.overlay {
-        return sum_post_object_counts_filtered(ec.store, ec.g_id, p_id, allowed_sorted);
+        return sum_post_object_counts_filtered(
+            ec.store,
+            ec.g_id,
+            p_id,
+            allowed_sorted,
+            &ec.ctx.tracker,
+        );
     }
 
     let Some(mut cursor) = build_post_cursor_for_predicate(
@@ -387,7 +399,7 @@ fn post_object_filtered_sum(
     let mut total: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         ec.ctx.check_cancelled()?;
         for row in 0..batch.row_count {
@@ -420,7 +432,13 @@ fn subjects_with_object_in(
         return Ok(if ec.overlay { None } else { Some(Vec::new()) });
     };
     if !ec.overlay {
-        return collect_subjects_with_object_in_set(ec.store, ec.g_id, p_id, object_set);
+        return collect_subjects_with_object_in_set(
+            ec.store,
+            ec.g_id,
+            p_id,
+            object_set,
+            &ec.ctx.tracker,
+        );
     }
 
     let Some(mut cursor) = build_psot_cursor_for_predicate(
@@ -440,7 +458,7 @@ fn subjects_with_object_in(
     let mut cur_ok = false;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         ec.ctx.check_cancelled()?;
         for row in 0..batch.row_count {
@@ -691,8 +709,9 @@ fn try_modifier_seek(
         let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
             return Ok(None);
         };
-        let mut b_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_b).with_cancellation(&ec.ctx.cancellation);
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut acc: u128 = 0;
         while let Some((s, count_a)) = a_groups.next_group()? {
             let present = b_seek.subject_present(s)?;
@@ -708,8 +727,9 @@ fn try_modifier_seek(
         let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
             return Ok(None);
         };
-        let mut a_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_a).with_cancellation(&ec.ctx.cancellation);
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut matched: u128 = 0;
         while let Some((s, _)) = b_groups.next_group()? {
             if let Some(count_a) = a_seek.count_for_subject(s)? {
@@ -838,6 +858,7 @@ fn merge_count_range(
     g_id: fluree_db_core::GraphId,
     p_ids: &[u32],
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -845,33 +866,20 @@ fn merge_count_range(
     for &p_id in p_ids {
         iters.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p_id, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
-    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
-    for it in &mut iters {
-        curr.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut iters)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if curr.iter().any(std::option::Option::is_none) {
-            break;
+        if heads.aligned() {
+            total = total.saturating_add(heads.count_product());
         }
-        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
-            let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
-            total = total.saturating_add(product);
-            for (i, it) in iters.iter_mut().enumerate() {
-                curr[i] = it.next_group()?;
-            }
-        } else {
-            for (i, it) in iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = curr[i] {
-                    if s_id < max_s {
-                        curr[i] = it.next_group()?;
-                    }
-                }
-            }
+        if !heads.advance(&mut iters)? {
+            break;
         }
     }
     Ok(total)
@@ -883,12 +891,14 @@ fn merge_count_range(
 /// `opt_groups` lists each optional group's present predicate ids; an empty group
 /// is `always_one` (multiplier 1 — an absent optional predicate). BASE index only
 /// (no overlay), no exclude/include (the caller gates that).
+#[allow(clippy::too_many_arguments)]
 fn merge_optional_count_range(
     store: &BinaryIndexStore,
     g_id: fluree_db_core::GraphId,
     req_pids: &[u32],
     opt_groups: &[Vec<u32>],
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -896,7 +906,8 @@ fn merge_optional_count_range(
     for &p in req_pids {
         req_iters.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
 
@@ -919,7 +930,8 @@ fn merge_optional_count_range(
         for &p in grp {
             iters.push(
                 PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                    .with_cancellation(cancellation),
+                    .with_cancellation(cancellation)
+                    .with_tracker(tracker),
             );
         }
         let mut cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
@@ -933,23 +945,15 @@ fn merge_optional_count_range(
         });
     }
 
-    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_iters.len());
-    for it in &mut req_iters {
-        req_cur.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut req_iters)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if req_cur.iter().any(std::option::Option::is_none) {
-            break;
-        }
-        let max_s = req_cur
-            .iter()
-            .filter_map(|c| c.map(|(s, _)| s))
-            .max()
-            .unwrap();
-        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+        if heads.aligned() {
+            let max_s = heads.key();
             // Required inner-join product at this subject.
-            let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+            let mut product: u128 = heads.count_product();
             // Multiply each optional group's max(1, Π count) factor (streaming;
             // cursors lazily catch up to max_s).
             for g in &mut opt {
@@ -982,55 +986,12 @@ fn merge_optional_count_range(
                 product = product.saturating_mul(mult);
             }
             total = total.saturating_add(product);
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                req_cur[i] = it.next_group()?;
-            }
-        } else {
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = req_cur[i] {
-                    if s_id < max_s {
-                        req_cur[i] = it.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut req_iters)? {
+            break;
         }
     }
     Ok(total)
-}
-
-/// Ascending candidate subject boundaries for partitioning a predicate's scan.
-///
-/// When the predicate has at least `k` leaves, returns each leaf's first subject
-/// straight from the in-memory manifest (no leaf opens) — the huge-predicate case
-/// (e.g. `rdf:type`, thousands of leaves). Otherwise opens the few leaves and
-/// returns each matching leaflet's first subject, giving finer boundaries for a
-/// predicate that fits in one/few leaves but many leaflets. The returned values
-/// are non-decreasing (leaves and leaflets are subject-sorted).
-fn driver_subject_boundaries(
-    store: &BinaryIndexStore,
-    g_id: fluree_db_core::GraphId,
-    p_id: u32,
-    k: usize,
-) -> Result<Vec<u64>> {
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
-    if leaves.len() >= k {
-        return Ok(leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect());
-    }
-    use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-    let mut bounds: Vec<u64> = Vec::new();
-    for leaf in leaves {
-        let handle = store
-            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
-            if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                continue;
-            }
-            let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
-            bounds.push(first.s_id.as_u64());
-        }
-    }
-    Ok(bounds)
 }
 
 /// Parallel partitioned variant of the inner-star count merge.
@@ -1150,7 +1111,17 @@ fn sum_star_join_parallel(children: &[StreamNode], ec: &ExecCtx<'_, '_>) -> Resu
         driver_p,
         total_rows,
         &ec.ctx.cancellation,
-        |lo, hi| merge_count_range(ec.store, ec.g_id, &p_ids, &ec.ctx.cancellation, lo, hi),
+        |lo, hi| {
+            merge_count_range(
+                ec.store,
+                ec.g_id,
+                &p_ids,
+                &ec.ctx.cancellation,
+                &ec.ctx.tracker,
+                lo,
+                hi,
+            )
+        },
     )
 }
 
@@ -1168,8 +1139,8 @@ fn merge_count_range_overlay(
     p_ids: &[u32],
     ops_per_pred: &[SharedOverlayOps],
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1185,39 +1156,26 @@ fn merge_count_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
+            tracker,
         ) else {
             return Ok(0); // PSOT branch absent => empty intersection
         };
         streams.push(CursorSubjectCountStream::new(cursor).with_cancellation(cancellation));
     }
 
-    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(streams.len());
-    for s in &mut streams {
-        curr.push(s.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut streams)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if curr.iter().any(std::option::Option::is_none) {
-            break;
+        if heads.aligned() {
+            let s = heads.key();
+            if s >= lo && s < hi {
+                total = total.saturating_add(heads.count_product());
+            }
         }
-        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
-            if max_s >= lo && max_s < hi {
-                let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
-                total = total.saturating_add(product);
-            }
-            for (i, s) in streams.iter_mut().enumerate() {
-                curr[i] = s.next_group()?;
-            }
-        } else {
-            for (i, s) in streams.iter_mut().enumerate() {
-                if let Some((s_id, _)) = curr[i] {
-                    if s_id < max_s {
-                        curr[i] = s.next_group()?;
-                    }
-                }
-            }
+        if !heads.advance(&mut streams)? {
+            break;
         }
     }
     Ok(total)
@@ -1269,7 +1227,6 @@ fn sum_star_join_overlay_parallel(
         }
     }
     let to_t = ec.ctx.to_t;
-    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
 
     let driver_p = *p_ids
         .iter()
@@ -1295,8 +1252,8 @@ fn sum_star_join_overlay_parallel(
                 p_ids_ref,
                 ops_ref,
                 to_t,
-                epoch,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1384,6 +1341,7 @@ fn sum_optional_join_parallel(
                 &req_pids,
                 &opt_groups,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1407,8 +1365,8 @@ fn merge_optional_count_range_overlay(
     opt_groups: &[Vec<u32>],
     opt_ops: &[Vec<SharedOverlayOps>],
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1423,7 +1381,7 @@ fn merge_optional_count_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
+            tracker,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -1456,23 +1414,15 @@ fn merge_optional_count_range_overlay(
         opt.push(OptG { streams, cur });
     }
 
-    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_streams.len());
-    for s in &mut req_streams {
-        req_cur.push(s.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut req_streams)? else {
+        return Ok(0);
+    };
     let mut total: u128 = 0;
     loop {
-        if req_cur.iter().any(std::option::Option::is_none) {
-            break;
-        }
-        let max_s = req_cur
-            .iter()
-            .filter_map(|c| c.map(|(s, _)| s))
-            .max()
-            .unwrap();
-        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+        if heads.aligned() {
+            let max_s = heads.key();
             if max_s >= lo && max_s < hi {
-                let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+                let mut product: u128 = heads.count_product();
                 for g in &mut opt {
                     let mut g_prod: u128 = 1;
                     for i in 0..g.streams.len() {
@@ -1501,17 +1451,9 @@ fn merge_optional_count_range_overlay(
                 }
                 total = total.saturating_add(product);
             }
-            for (i, s) in req_streams.iter_mut().enumerate() {
-                req_cur[i] = s.next_group()?;
-            }
-        } else {
-            for (i, s) in req_streams.iter_mut().enumerate() {
-                if let Some((s_id, _)) = req_cur[i] {
-                    if s_id < max_s {
-                        req_cur[i] = s.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut req_streams)? {
+            break;
         }
     }
     Ok(total)
@@ -1600,7 +1542,6 @@ fn sum_optional_join_overlay_parallel(
     }
 
     let to_t = ec.ctx.to_t;
-    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let driver_p = *req_pids
         .iter()
         .max_by_key(|&&p| {
@@ -1626,8 +1567,8 @@ fn sum_optional_join_overlay_parallel(
                 opt_groups,
                 opt_ops,
                 to_t,
-                epoch,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1659,16 +1600,19 @@ fn merge_modifier_intersect_range(
     inner_pids: &[u32],
     is_anti: bool,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
     let mut outer = PsotSubjectCountIter::new_bounded(store, g_id, outer_pid, lo, hi)?
-        .with_cancellation(cancellation);
+        .with_cancellation(cancellation)
+        .with_tracker(tracker);
     let mut inner: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(inner_pids.len());
     for &p in inner_pids {
         inner.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
     let mut i_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(inner.len());
@@ -1790,6 +1734,7 @@ fn try_modifier_intersect_parallel(
                 &inner_pids,
                 is_anti,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -1848,8 +1793,8 @@ fn merge_modifier_intersect_range_overlay(
     inner_ops: &[SharedOverlayOps],
     is_anti: bool,
     to_t: i64,
-    epoch: u64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -1864,7 +1809,7 @@ fn merge_modifier_intersect_range_overlay(
             hi,
             sliced,
             to_t,
-            epoch,
+            tracker,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -1964,7 +1909,6 @@ fn try_modifier_intersect_overlay_parallel(
     }
 
     let to_t = ec.ctx.to_t;
-    let epoch = ec.ctx.overlay.as_ref().map(|o| o.epoch()).unwrap_or(0);
     let driver_p = std::iter::once(outer_pid)
         .chain(inner_pids.iter().copied())
         .max_by_key(|&p| leaf_entries_for_predicate(ec.store, ec.g_id, RunSortOrder::Psot, p).len())
@@ -1989,8 +1933,8 @@ fn try_modifier_intersect_overlay_parallel(
                 inner_ops,
                 is_anti,
                 to_t,
-                epoch,
                 &ec.ctx.cancellation,
+                &ec.ctx.tracker,
                 lo,
                 hi,
             )
@@ -2127,42 +2071,25 @@ fn sum_star_join(
         iters.push(groups);
     }
 
-    let mut curr: Vec<Option<(u64, u64)>> = Vec::with_capacity(iters.len());
-    for it in &mut iters {
-        curr.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut iters)? else {
+        return Ok(Some(0));
+    };
 
     let mut excl_idx: usize = 0;
     let mut incl_idx: usize = 0;
     let mut total: u128 = 0;
 
     loop {
-        if curr.iter().any(std::option::Option::is_none) {
-            break;
-        }
-
-        let max_s = curr.iter().filter_map(|c| c.map(|(s, _)| s)).max().unwrap();
-
-        if curr.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
-            let skip = is_excluded(max_s, exclude_sorted, &mut excl_idx)
-                || !is_included(max_s, include_sorted, &mut incl_idx);
-
+        if heads.aligned() {
+            let s = heads.key();
+            let skip = is_excluded(s, exclude_sorted, &mut excl_idx)
+                || !is_included(s, include_sorted, &mut incl_idx);
             if !skip {
-                let product: u128 = curr.iter().map(|c| c.unwrap().1 as u128).product();
-                total = total.saturating_add(product);
+                total = total.saturating_add(heads.count_product());
             }
-
-            for (i, it) in iters.iter_mut().enumerate() {
-                curr[i] = it.next_group()?;
-            }
-        } else {
-            for (i, it) in iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = curr[i] {
-                    if s_id < max_s {
-                        curr[i] = it.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut iters)? {
+            break;
         }
     }
 
@@ -2245,7 +2172,9 @@ fn try_sum_star_join_seek(
         .enumerate()
         .filter(|(i, _)| *i != driver_idx)
         .map(|(_, &p_id)| {
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_id).with_cancellation(&ec.ctx.cancellation)
+            PsotSubjectSeek::new(ec.store, ec.g_id, p_id)
+                .with_cancellation(&ec.ctx.cancellation)
+                .with_tracker(&ec.ctx.tracker)
         })
         .collect();
 
@@ -2324,8 +2253,9 @@ fn try_optional_seek(
         let Some(mut a_groups) = subject_groups(ec, pred_a)? else {
             return Ok(None);
         };
-        let mut b_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_b).with_cancellation(&ec.ctx.cancellation);
+        let mut b_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_b)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut acc: u128 = 0;
         while let Some((s, count_a)) = a_groups.next_group()? {
             let mult = b_seek.count_for_subject(s)?.unwrap_or(0).max(1);
@@ -2337,8 +2267,9 @@ fn try_optional_seek(
         let Some(mut b_groups) = subject_groups(ec, pred_b)? else {
             return Ok(None);
         };
-        let mut a_seek =
-            PsotSubjectSeek::new(ec.store, ec.g_id, p_a).with_cancellation(&ec.ctx.cancellation);
+        let mut a_seek = PsotSubjectSeek::new(ec.store, ec.g_id, p_a)
+            .with_cancellation(&ec.ctx.cancellation)
+            .with_tracker(&ec.ctx.tracker);
         let mut bonus: u128 = 0;
         while let Some((s, count_b)) = b_groups.next_group()? {
             // count_B == 1 yields no bonus; skip the seek (targets stay ascending).
@@ -2458,34 +2389,23 @@ fn sum_optional_join(
         });
     }
 
-    // Prime required cursors.
-    let mut req_cur: Vec<Option<(u64, u64)>> = Vec::with_capacity(req_iters.len());
-    for it in &mut req_iters {
-        req_cur.push(it.next_group()?);
-    }
+    let Some(mut heads) = InnerMergeHeads::prime(&mut req_iters)? else {
+        return Ok(Some(0));
+    };
 
     let mut excl_idx: usize = 0;
     let mut incl_idx: usize = 0;
     let mut total: u128 = 0;
 
     loop {
-        if req_cur.iter().any(std::option::Option::is_none) {
-            break;
-        }
-
-        let max_s = req_cur
-            .iter()
-            .filter_map(|c| c.map(|(s, _)| s))
-            .max()
-            .unwrap();
-
-        if req_cur.iter().all(|c| c.map(|(s, _)| s) == Some(max_s)) {
+        if heads.aligned() {
+            let max_s = heads.key();
             let skip = is_excluded(max_s, exclude_sorted, &mut excl_idx)
                 || !is_included(max_s, include_sorted, &mut incl_idx);
 
             if !skip {
                 // Required product at this subject.
-                let mut product: u128 = req_cur.iter().map(|c| c.unwrap().1 as u128).product();
+                let mut product: u128 = heads.count_product();
 
                 // Multiply OPTIONAL group factors for this subject (streaming).
                 for g in &mut opt_groups {
@@ -2543,20 +2463,9 @@ fn sum_optional_join(
                     }
                 }
             }
-
-            // Advance required iterators.
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                req_cur[i] = it.next_group()?;
-            }
-        } else {
-            // Advance smaller required subjects up to the current max.
-            for (i, it) in req_iters.iter_mut().enumerate() {
-                if let Some((s_id, _)) = req_cur[i] {
-                    if s_id < max_s {
-                        req_cur[i] = it.next_group()?;
-                    }
-                }
-            }
+        }
+        if !heads.advance(&mut req_iters)? {
+            break;
         }
     }
 
@@ -2622,7 +2531,10 @@ fn execute_keyset_as_hash_set(
                 return Ok(Some(FxHashSet::default()));
             };
             Ok(Some(collect_subjects_for_predicate_set(
-                ec.store, ec.g_id, p_id,
+                ec.store,
+                ec.g_id,
+                p_id,
+                &ec.ctx.tracker,
             )?))
         }
         _ => {
@@ -2661,6 +2573,7 @@ fn execute_chain(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     // Matches the overlay twin `execute_chain_overlay`: a malformed chain is a
     // planner bug, not a runtime condition — never panic a release query path.
@@ -2790,6 +2703,8 @@ fn execute_chain(
         /// every row gets the `non_iri_weight` without checking `o_key`.
         all_non_iri: bool,
         mode: P2WeightMode<'m>,
+        /// Charged one index touch per leaflet read.
+        tracker: fluree_db_core::Tracker,
     }
 
     impl<'a, 'm> PsotSeekSumCursor<'a, 'm> {
@@ -2798,6 +2713,7 @@ fn execute_chain(
             g_id: GraphId,
             p_id: u32,
             mode: P2WeightMode<'m>,
+            tracker: &fluree_db_core::Tracker,
         ) -> Self {
             let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
             Self {
@@ -2812,9 +2728,12 @@ fn execute_chain(
                 mixed: false,
                 all_non_iri: false,
                 mode,
+                tracker: tracker.clone(),
             }
         }
 
+        // Left inline, unlike the count iterators' refills: out of line it
+        // measured slower on the chain fold this cursor serves.
         fn load_next_batch(&mut self, target_b: u64) -> Result<Option<()>> {
             use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
             loop {
@@ -2870,27 +2789,14 @@ fn execute_chain(
                         crate::fast_path_common::projection_sid_okey()
                     };
 
-                    let batch = if let Some(cache) = self.store.leaflet_cache() {
-                        use fluree_db_binary_index::read::column_loader::load_columns_cached_via_handle;
-                        let idx_u32: u32 = idx.try_into().map_err(|_| {
-                            QueryError::Internal("leaflet idx exceeds u32".to_string())
-                        })?;
-                        load_columns_cached_via_handle(
-                            handle.as_ref(),
-                            cache,
-                            fluree_db_binary_index::read::column_loader::LeafletDecodeSpec {
-                                leaf_id: handle.leaf_id(),
-                                leaflet_idx: idx_u32,
-                                order: RunSortOrder::Psot,
-                                decode_set: fluree_db_binary_index::ColumnSet::ALL,
-                            },
-                        )
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    } else {
-                        handle
-                            .load_columns(idx, &projection, RunSortOrder::Psot)
-                            .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?
-                    };
+                    let batch = crate::fast_path_common::load_leaflet_projection(
+                        self.store,
+                        handle.as_ref(),
+                        idx,
+                        &projection,
+                        RunSortOrder::Psot,
+                        &self.tracker,
+                    )?;
 
                     self.row = 0;
                     self.batch = Some(batch);
@@ -2982,7 +2888,8 @@ fn execute_chain(
         match &chain.tail_weight {
             TailWeight::None => {
                 let mut iter = PsotSubjectCountIter::new(store, g_id, p_ids[n - 1])?
-                    .with_cancellation(cancellation);
+                    .with_cancellation(cancellation)
+                    .with_tracker(tracker);
                 while let Some((s, count)) = iter.next_group()? {
                     if count > 0 {
                         v2_weights.insert(s, count);
@@ -2994,13 +2901,14 @@ fn execute_chain(
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
                     let mut mult_map: FxHashMap<u64, u64> = FxHashMap::default();
                     let mut iter = PsotSubjectCountIter::new(store, g_id, tail_p_id)?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((c, count)) = iter.next_group()? {
                         mult_map.insert(c, count.max(1));
                     }
                     let Some(mut ws_iter) =
                         PsotSubjectWeightedSumIter::new(store, g_id, p_ids[n - 1], &mult_map, 1)?
-                            .map(|it| it.with_cancellation(cancellation))
+                            .map(|it| it.with_cancellation(cancellation).with_tracker(tracker))
                     else {
                         return Ok(None);
                     };
@@ -3011,7 +2919,8 @@ fn execute_chain(
                     }
                 } else {
                     let mut iter = PsotSubjectCountIter::new(store, g_id, p_ids[n - 1])?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((s, count)) = iter.next_group()? {
                         if count > 0 {
                             v2_weights.insert(s, count);
@@ -3022,13 +2931,15 @@ fn execute_chain(
             TailWeight::Minus { tail_pred } => {
                 let tail_sid = normalize_pred_sid(store, tail_pred)?;
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
-                    let excluded = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                    let excluded =
+                        collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                     let Some(mut iter) = PsotObjectFilterCountIter::new(
                         store,
                         g_id,
                         p_ids[n - 1],
                         &excluded,
                         ObjectFilterMode::NotInSet,
+                        tracker,
                     )?
                     else {
                         return Ok(None);
@@ -3040,7 +2951,8 @@ fn execute_chain(
                     }
                 } else {
                     let mut iter = PsotSubjectCountIter::new(store, g_id, p_ids[n - 1])?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((s, count)) = iter.next_group()? {
                         if count > 0 {
                             v2_weights.insert(s, count);
@@ -3053,7 +2965,7 @@ fn execute_chain(
                 let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) else {
                     return Ok(Some(0));
                 };
-                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                 if included.is_empty() {
                     return Ok(Some(0));
                 }
@@ -3063,6 +2975,7 @@ fn execute_chain(
                     p_ids[n - 1],
                     &included,
                     ObjectFilterMode::InSet,
+                    tracker,
                 )?
                 else {
                     return Ok(None);
@@ -3084,7 +2997,7 @@ fn execute_chain(
         for i in (2..n - 1).rev() {
             let Some(mut iter) =
                 PsotSubjectWeightedSumIter::new(store, g_id, p_ids[i], &v2_weights, 0)?
-                    .map(|it| it.with_cancellation(cancellation))
+                    .map(|it| it.with_cancellation(cancellation).with_tracker(tracker))
             else {
                 return Ok(None);
             };
@@ -3102,7 +3015,7 @@ fn execute_chain(
     }
 
     // 2) Stream POST(p1) grouped by object `b`, and for each `b` seek PSOT(p2) to compute w(b).
-    let Some(mut it1) = PostObjectGroupCountIter::new(store, g_id, p_ids[0])? else {
+    let Some(mut it1) = PostObjectGroupCountIter::new(store, g_id, p_ids[0], tracker)? else {
         return Ok(None);
     };
 
@@ -3115,7 +3028,8 @@ fn execute_chain(
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
                     let mut mult_map: FxHashMap<u64, u64> = FxHashMap::default();
                     let mut iter = PsotSubjectCountIter::new(store, g_id, tail_p_id)?
-                        .with_cancellation(cancellation);
+                        .with_cancellation(cancellation)
+                        .with_tracker(tracker);
                     while let Some((c, count)) = iter.next_group()? {
                         mult_map.insert(c, count.max(1));
                     }
@@ -3131,7 +3045,8 @@ fn execute_chain(
             TailWeight::Minus { tail_pred } => {
                 let tail_sid = normalize_pred_sid(store, tail_pred)?;
                 if let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) {
-                    let excluded = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                    let excluded =
+                        collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                     P2WeightMode::NotInSetOwned {
                         set: excluded,
                         non_iri_weight: 1,
@@ -3145,7 +3060,7 @@ fn execute_chain(
                 let Some(tail_p_id) = store.sid_to_p_id(&tail_sid) else {
                     return Ok(Some(0));
                 };
-                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id)?;
+                let included = collect_subjects_for_predicate_set(store, g_id, tail_p_id, tracker)?;
                 if included.is_empty() {
                     return Ok(Some(0));
                 }
@@ -3163,7 +3078,7 @@ fn execute_chain(
         }
     };
 
-    let mut p2_cursor = PsotSeekSumCursor::new(store, g_id, p_ids[1], p2_mode);
+    let mut p2_cursor = PsotSeekSumCursor::new(store, g_id, p_ids[1], p2_mode, tracker);
 
     let mut total: u64 = 0;
     while let Some((b, n1)) = it1.next_group()? {
@@ -3275,7 +3190,7 @@ fn psot_weighted_subject_sums(
     let overflow = || QueryError::execution("COUNT(*) overflow in chain join");
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         for row in 0..batch.row_count {
             let s = batch.s_id.get(row);
@@ -3323,7 +3238,7 @@ fn psot_weighted_total(
     let mut total: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?
     {
         for row in 0..batch.row_count {
             let w = weight.weight(batch.o_type.get(row), batch.o_key.get(row));
@@ -3465,10 +3380,10 @@ fn execute_chain_overlay(chain: &ChainFold, ec: &ExecCtx<'_, '_>) -> Result<Opti
 fn predicate_objects_all_iri(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<bool> {
     let iri_ref = OType::IRI_REF.as_u16();
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
-        let handle = store
-            .open_leaf_handle(&leaf_entry.leaf_cid, leaf_entry.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
+        let dir = store
+            .open_leaf_dir(&leaf_entry.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
@@ -3518,7 +3433,7 @@ fn execute_optional_chain_head(
     // If either inner predicate is absent, the OPTIONAL chain can never match,
     // so every `?a p1 ?b` row contributes exactly 1 (multiplier 1 for all b).
     let (Some(p2_id), Some(p3_id)) = (p2_id, p3_id) else {
-        let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+        let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id, &ec.ctx.tracker)?.ok_or(
             QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
         )?;
         let mut total = 0u64;
@@ -3530,18 +3445,22 @@ fn execute_optional_chain_head(
 
     // Precompute n3(c) = count_{p3}(c).
     let mut n3: FxHashMap<u64, u64> = FxHashMap::default();
-    let mut it3 =
-        PsotSubjectCountIter::new(store, g_id, p3_id)?.with_cancellation(&ec.ctx.cancellation);
+    let mut it3 = PsotSubjectCountIter::new(store, g_id, p3_id)?
+        .with_cancellation(&ec.ctx.cancellation)
+        .with_tracker(&ec.ctx.tracker);
     while let Some((c, n)) = it3.next_group()? {
         n3.insert(c, n);
     }
 
-    let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id)?.ok_or(
+    let mut it1 = PostObjectGroupCountIter::new(store, g_id, p1_id, &ec.ctx.tracker)?.ok_or(
         QueryError::Internal("optional chain-head: POST iterator unavailable".into()),
     )?;
     // default_weight=0: objects not in n3 contribute nothing to the sum
     let mut it2 = PsotSubjectWeightedSumIter::new(store, g_id, p2_id, &n3, 0)?
-        .map(|it| it.with_cancellation(&ec.ctx.cancellation))
+        .map(|it| {
+            it.with_cancellation(&ec.ctx.cancellation)
+                .with_tracker(&ec.ctx.tracker)
+        })
         .ok_or(QueryError::Internal(
             "optional chain-head: PSOT iterator unavailable".into(),
         ))?;
@@ -3649,10 +3568,17 @@ struct PsotSoIter<'a> {
     handle: Option<Box<dyn fluree_db_binary_index::read::leaf_access::LeafHandle>>,
     batch: Option<fluree_db_binary_index::ColumnBatch>,
     projection: fluree_db_binary_index::ColumnProjection,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSoIter<'a> {
-    fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Self {
+    fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        tracker: &fluree_db_core::Tracker,
+    ) -> Self {
         let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
         Self {
             store,
@@ -3664,9 +3590,14 @@ impl<'a> PsotSoIter<'a> {
             handle: None,
             batch: None,
             projection: projection_sid_otype_okey(),
+            tracker: tracker.clone(),
         }
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         loop {
             if self.handle.is_none() {
@@ -3698,9 +3629,13 @@ impl<'a> PsotSoIter<'a> {
                 if entry.row_count == 0 || entry.p_const != Some(self.p_id) {
                     continue;
                 }
-                let batch = handle
-                    .load_columns(idx, &self.projection, RunSortOrder::Psot)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    handle.as_ref(),
+                    idx,
+                    &self.projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 return Ok(Some(()));
@@ -3766,7 +3701,7 @@ impl CursorSoIter {
                 self.current = self
                     .cursor
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("count-plan cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("count-plan cursor batch", e))?;
                 self.row = 0;
                 if self.current.is_none() {
                     return Ok(None);
@@ -3848,7 +3783,10 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
         Ok(Some(SoRows::Cursor(Box::new(CursorSoIter::new(cursor)))))
     } else {
         Ok(Some(SoRows::Meta(Box::new(PsotSoIter::new(
-            store, ec.g_id, p_id,
+            store,
+            ec.g_id,
+            p_id,
+            &ec.ctx.tracker,
         )))))
     }
 }
@@ -3863,20 +3801,25 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
 /// - overlay present but a predicate is absent from the base index, or an
 ///   overlay flake failed to translate;
 /// - either predicate fails
-///   [`predicate_unsafe_for_cross_predicate_o_key_join`] (#1652): a
-///   `NUM_BIG_OVERFLOW` object's `o_key` is a per-predicate arena handle, so
-///   cross-predicate `o_key` equality is not value equality — equal big
-///   decimals under the two predicates would never match; list rows join by
-///   rules `SoKey` cannot express. Directory-metadata gate; ledgers without
-///   decimals/overflow-integers/lists under these predicates keep the fast
-///   path;
+///   [`predicate_unsafe_for_cross_predicate_o_key_join`] (#1652): an
+///   arena-backed object's `o_key` (`NUM_BIG_OVERFLOW`, `VECTOR`) is a
+///   per-predicate arena handle, so cross-predicate `o_key` equality is not
+///   value equality — equal values under the two predicates would never
+///   match, and equal handles naming different values would; list rows join
+///   by rules `SoKey` cannot express. Directory-metadata gate; ledgers
+///   without decimals/overflow-integers/vectors/lists under these predicates
+///   keep the fast path;
 /// - a novelty list row surfaced in the overlay lane (`SoRows::declined`).
 fn count_composite_join_pairs(ec: &ExecCtx<'_, '_>, p1: &Ref, p2: &Ref) -> Result<Option<u64>> {
     for pred in [p1, p2] {
         let sid = normalize_pred_sid(ec.store, pred)?;
         if let Some(p_id) = ec.store.sid_to_p_id(&sid) {
             if crate::fast_path_common::predicate_unsafe_for_cross_predicate_o_key_join(
-                ec.store, ec.g_id, p_id,
+                ec.store,
+                ec.g_id,
+                p_id,
+                (ec.ctx.to_t < ec.store.max_t()).then_some(ec.ctx.to_t),
+                &ec.ctx.tracker,
             )? {
                 return Ok(None);
             }

@@ -6,10 +6,11 @@
 //! so they are defined once here to ensure consistency.
 
 use crate::{
-    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads, RefValue,
-    StatusPayload, StatusValue,
+    is_zero, parse_default_context_value, ConfigPayload, ConfigValue, LedgerHeads,
+    NameServiceError, RefValue, Result, StatusPayload, StatusValue,
 };
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 /// ns@v2 format version path segment.
@@ -176,6 +177,18 @@ impl NsFileV2 {
     }
 }
 
+/// The index-only file holding `snapshot`'s index, which a reset writes
+/// over any newer one.
+pub(crate) fn snapshot_index_file(snapshot: &crate::NsRecordSnapshot) -> NsIndexFileV2 {
+    NsIndexFileV2 {
+        context: ns_context(),
+        index: IndexRef {
+            cid: snapshot.index_head_id.as_ref().map(ToString::to_string),
+            t: snapshot.index_t,
+        },
+    }
+}
+
 /// Head pointers from a main ns@v2 file plus its optional index-only file,
 /// using the read-time merge rule shared by `load_record`: the separate
 /// index file wins when its `t` is equal or higher.
@@ -240,6 +253,44 @@ pub(crate) struct BranchPointRef {
 
     #[serde(rename = "f:t")]
     pub t: i64,
+}
+
+/// Parse the ns record read from `address`, naming it if it cannot be
+/// parsed. A listing fails on one bad record, and the error is how an
+/// operator finds which.
+pub(crate) fn parse_record<T: DeserializeOwned>(bytes: &[u8], address: &str) -> Result<T> {
+    serde_json::from_slice(bytes).map_err(|e| {
+        NameServiceError::storage(format!("Cannot parse nameservice record {address}: {e}"))
+    })
+}
+
+/// Whether `bytes` hold a ledger's main ns record (as opposed to an index or
+/// snapshots sidecar, or a graph-source record): only main records carry
+/// `f:ledger`.
+pub(crate) fn is_ledger_main_record(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(bytes).is_ok_and(|v| v.get("f:ledger").is_some())
+}
+
+/// Keys that may be sidecars rather than main records.
+pub(crate) fn has_sidecar_suffix(key: &str) -> bool {
+    key.ends_with(".index.json") || key.ends_with(".snapshots.json")
+}
+
+/// A stored ledger record's identity, or `None` (logged) when even
+/// [`LedgerId::from_persisted_parts`] refuses it. Such a name (`/x`, `x/`,
+/// `a/../b`) has a storage path that can alias another ledger's: listing it
+/// would let GC or key rotation act on that ledger's files, and failing
+/// would take down every listing on the node.
+pub(crate) fn persisted_ledger_id(name: &str, branch: &str, record: &str) -> Option<LedgerId> {
+    LedgerId::from_persisted_parts(name, branch)
+        .inspect_err(|e| {
+            tracing::warn!(
+                record,
+                error = %e,
+                "Skipping nameservice record whose id is invalid; rename or remove it"
+            );
+        })
+        .ok()
 }
 
 #[cfg(test)]

@@ -1,5 +1,6 @@
 //! Transaction error types
 
+use serde_json::Value as JsonValue;
 use thiserror::Error;
 
 /// Transaction errors
@@ -36,6 +37,18 @@ pub enum TransactError {
     /// Transaction parsing error
     #[error("Parse error: {0}")]
     Parse(String),
+
+    /// RDF text (Turtle, TriG) that does not parse. Positions are byte
+    /// offsets into the document as the caller sent it.
+    #[error("Turtle parse error: {0}")]
+    Turtle(#[from] fluree_graph_turtle::TurtleError),
+
+    /// A graph-scoped write (graph sync, graph insert) whose RDF body puts
+    /// statements outside the one graph the request names: a block for
+    /// another graph, or the target's statements both in blocks and as
+    /// default-graph statements. The message names the graphs.
+    #[error("{0}")]
+    PayloadGraphMismatch(String),
 
     /// A syntactically valid transaction feature is not yet implemented.
     ///
@@ -112,6 +125,34 @@ pub enum TransactError {
         max_bytes: usize,
     },
 
+    /// The write would bring the ledger past the number of datatypes its
+    /// index can store. Not retryable: datatype IDs are never released.
+    #[error(
+        "datatype limit exceeded: the ledger holds {used} of at most {max} non-reserved \
+         datatypes, and this write would add {adding} more"
+    )]
+    DatatypeLimitExceeded {
+        used: usize,
+        adding: usize,
+        max: usize,
+    },
+
+    /// An `f:embeddingVector` value the ledger cannot store: empty, longer
+    /// than 65,535 elements, holding a non-finite element, or of a length
+    /// other than the property's other vectors in the same graph
+    /// ([`fluree_db_core::vector`]).
+    #[error("Invalid vector: {0}")]
+    InvalidVector(String),
+
+    /// This process has not loaded the ledger's index, so it cannot stage a
+    /// write against it: no index is attached, or the one attached is older
+    /// than the index the ledger's novelty starts from. Decided before any
+    /// read and before any commit, so nothing is committed, and the same
+    /// write can succeed once the index loads
+    /// ([`crate::check_index_loaded`]).
+    #[error("Index not loaded: {0}")]
+    IndexNotLoaded(String),
+
     /// Whole-graph scan larger than the memory backstop
     #[error(
         "whole-graph operation would materialize more than {limit} currently-asserted flakes; \
@@ -144,7 +185,7 @@ pub enum TransactError {
     /// SHACL validation violation (only available with `shacl` feature)
     #[cfg(feature = "shacl")]
     #[error("{0}")]
-    ShaclViolation(String),
+    ShaclViolation(ShaclViolations),
 
     /// Transaction exceeded the configured max-fuel limit
     #[error("{0}")]
@@ -162,6 +203,30 @@ pub enum TransactError {
     /// `f:enforceUnique`).
     #[error("Transaction invariant violation: {0}")]
     InvariantViolation(String),
+
+    /// The commit being built would retract and assert one fact at one `t`.
+    /// Staging cancels the two by fact identity, so this is an internal
+    /// error, not a property of the request: the commit is refused rather
+    /// than written with a pair (see `fluree_db_core::same_t`).
+    #[error(
+        "internal error: the commit would retract and assert one fact at one t: \
+         {fact}, retracting {retracted} and asserting {asserted}"
+    )]
+    SameTPair {
+        /// Graph, subject and predicate.
+        fact: String,
+        /// The retracted term.
+        retracted: String,
+        /// The asserted term.
+        asserted: String,
+    },
+
+    /// The ledger config, which decides what checks a write gets, could not
+    /// be read (a storage or read failure, not anything in the request). The
+    /// write is refused rather than admitted unchecked; it can succeed on
+    /// retry.
+    #[error("Ledger config unavailable: {0}")]
+    ConfigUnavailable(String),
 
     /// A transaction named a reserved system graph as a write target:
     /// `urn:fluree:{ledger}#config` (g_id 2) or `#txn-meta` (g_id 1). These
@@ -187,6 +252,51 @@ pub enum TransactError {
     ReservedGraphTarget {
         /// The reserved graph IRI the operation attempted to target.
         graph_iri: String,
+    },
+
+    /// A write named `urn:default` as a named graph: a `GRAPH` template or
+    /// data quad, a TriG block, a bulk-import block, a graph-management
+    /// operand or a sync target. The name stands for the default graph
+    /// wherever a graph is read, so a named graph by that name would hold data
+    /// no read of `urn:default` reaches.
+    #[error(
+        "<urn:default> names the default graph, not a named graph: write default-graph \
+         triples without GRAPH, or name it DEFAULT in graph management"
+    )]
+    DefaultGraphNameAsGraph,
+
+    /// A write named the config graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own config graph, which a
+    /// write names by the branch's own config graph IRI or `config`. The graph
+    /// registry reads any ledger's config graph IRI as this ledger's config
+    /// graph only so that history written under another name (a branch's
+    /// source, a copy) replays into it.
+    #[error(
+        "<{graph_iri}> is the config graph of '{named}', not of this ledger; \
+         write this ledger's config to <{own}> or the `config` graph"
+    )]
+    OtherLedgersConfigGraph {
+        /// The config graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
+        /// This ledger's own config graph IRI.
+        own: String,
+    },
+
+    /// A write named the txn-meta graph IRI of another ledger, or of another
+    /// branch of this one. Each branch has its own txn-meta graph, which no
+    /// write names: a transaction adds metadata to its own commit in a
+    /// `#txn-meta` block.
+    #[error(
+        "<{graph_iri}> is the txn-meta graph of '{named}', not of this ledger; a \
+         transaction adds metadata to its own commit in a `#txn-meta` block"
+    )]
+    OtherLedgersTxnMetaGraph {
+        /// The txn-meta graph IRI the write named.
+        graph_iri: String,
+        /// The ledger, or branch, that IRI names.
+        named: String,
     },
 
     /// A bulk RDF import (`fluree create --from`, the server's source-import
@@ -223,6 +333,33 @@ pub enum TransactError {
         graph_iri: String,
     },
 
+    /// A `DROP GRAPH` named a graph that does not exist: never registered, or
+    /// dropped already and not written since. An error unless `SILENT`, per
+    /// SPARQL 1.1 Update §3.2.2.
+    #[error("graph <{graph_iri}> does not exist; use DROP SILENT to ignore")]
+    GraphNotFound {
+        /// The graph IRI the drop named.
+        graph_iri: String,
+    },
+
+    /// A request-time setting that the ledger config's `f:overrideControl`
+    /// does not permit for this request, where applying less than the caller
+    /// asked for would be unsafe: inline SHACL shapes (`opts.shapes`) the
+    /// caller expects its data to be checked against. Refused rather than
+    /// dropped, so nothing commits unvalidated.
+    #[error(
+        "{setting} refused by this ledger's override control (f:overrideControl {control}) \
+         for {graph}"
+    )]
+    RequestOverrideRefused {
+        /// The request setting, as the caller wrote it.
+        setting: String,
+        /// The graph whose effective control refused it.
+        graph: String,
+        /// The effective `f:overrideControl` value.
+        control: String,
+    },
+
     /// Unique constraint violation (`f:enforceUnique`).
     ///
     /// A property annotated with `f:enforceUnique true` has duplicate values
@@ -244,6 +381,85 @@ pub enum TransactError {
         /// The new subject trying to assert this value.
         new_subject: String,
     },
+}
+
+/// One validation result with all identifiers resolved to IRIs.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ReportResult {
+    /// The node that failed validation (`sh:focusNode`): a JSON string for
+    /// IRIs / blank-node labels, or a JSON-LD value object (or native
+    /// scalar) for literal `sh:targetNode` targets.
+    pub focus_node: JsonValue,
+    /// The property path, when it is a single predicate (`sh:resultPath`).
+    /// Complex paths are omitted rather than misrepresented.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_path: Option<String>,
+    /// The node shape that produced this result.
+    pub source_shape: String,
+    /// The property shape that produced this result, when applicable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_constraint: Option<String>,
+    /// The constraint component IRI (`sh:sourceConstraintComponent`).
+    pub constraint_component: String,
+    /// Severity IRI: `sh:Violation`, `sh:Warning`, or `sh:Info`.
+    pub severity: String,
+    /// Human-readable message (`sh:resultMessage`).
+    pub message: String,
+    /// The offending value, when applicable (`sh:value`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<JsonValue>,
+}
+
+/// The violations that rejected a write: the readable report the error
+/// displays, and each violation resolved to IRIs, as
+/// `fluree_db_api::validate` reports them. Reads as the report text, so it
+/// can be matched and searched as a string.
+#[derive(Debug, Clone)]
+pub struct ShaclViolations {
+    message: String,
+    results: Vec<ReportResult>,
+}
+
+impl ShaclViolations {
+    pub fn new(message: String, results: Vec<ReportResult>) -> Self {
+        Self { message, results }
+    }
+
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    /// The violations, resolved; empty where only the text was kept.
+    pub fn results(&self) -> &[ReportResult] {
+        &self.results
+    }
+}
+
+/// Violations known only by their text.
+impl From<String> for ShaclViolations {
+    fn from(message: String) -> Self {
+        Self::new(message, Vec::new())
+    }
+}
+
+impl From<&str> for ShaclViolations {
+    fn from(message: &str) -> Self {
+        Self::from(message.to_string())
+    }
+}
+
+impl std::fmt::Display for ShaclViolations {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::ops::Deref for ShaclViolations {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.message
+    }
 }
 
 /// Result type for transaction operations

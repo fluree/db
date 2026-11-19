@@ -41,7 +41,7 @@
 //! that cell rather than dropping the entire row.
 
 use super::config::{FormatterConfig, OutputFormat};
-use super::datatype::is_inferable_datatype;
+use super::datatype::{ill_typed_json_literal, json_document, may_print_bare};
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
@@ -50,13 +50,13 @@ use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid, Tracker};
-use fluree_db_policy::{is_schema_flake, PolicyContext};
+use fluree_db_policy::PolicyContext;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
 };
 use fluree_db_query::QueryPolicyEnforcer;
-use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD};
+use fluree_vocab::namespaces::{BLANK_NODE, FLUREE_DB, JSON_LD, RDF};
 use fluree_vocab::rdf::{self, TYPE as RDF_TYPE_IRI};
 use futures::future::BoxFuture;
 use futures::stream::{self, StreamExt, TryStreamExt};
@@ -885,6 +885,7 @@ impl<'a> DatasetCtx<'a> {
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(view.db.snapshot, arena_reader.is_some());
         HydrationFormatter {
             db: view.db,
             compactor: &view.compactor,
@@ -893,9 +894,11 @@ impl<'a> DatasetCtx<'a> {
             policy: view.policy.as_ref(),
             tracker: self.tracker,
             arena_reader,
+            arena_dropped_graphs,
             novelty,
             dataset: Some(self),
             active_idx: idx,
+            holds_cells: std::sync::OnceLock::new(),
         }
     }
 }
@@ -1130,6 +1133,10 @@ struct HydrationFormatter<'a> {
             dyn fluree_db_core::storage::ContentStore,
         >,
     >,
+    /// The graphs a drop took after the index, as edges name them: the
+    /// arena predates those drops, so an edge of theirs is read from novelty
+    /// alone. Empty without an arena reader or a drop since the index.
+    arena_dropped_graphs: Vec<Option<Sid>>,
     /// Cached downcast of `db.overlay` to the concrete
     /// `fluree_db_novelty::Novelty` type. Computed once on `new()`
     /// and reused across every annotation-hydration call site —
@@ -1156,6 +1163,20 @@ struct HydrationFormatter<'a> {
     /// identifies the view within a hydration's shared cache, so one ledger's
     /// rendering is never served for another's (issue #1259).
     active_idx: usize,
+    /// Whether `db` holds an `rdf:first` triple, so a blank-node value may
+    /// head a list stored as its triples; read when the crawl first meets a
+    /// blank-node value ([`Self::holds_cells`]).
+    holds_cells: std::sync::OnceLock<bool>,
+}
+
+/// [`HydrationFormatter::arena_dropped_graphs`] for `snapshot`, when an
+/// arena reader is in use.
+fn arena_dropped_graphs(snapshot: &LedgerSnapshot, has_arena: bool) -> Vec<Option<Sid>> {
+    if has_arena {
+        snapshot.edge_graphs_dropped_since_index()
+    } else {
+        Vec::new()
+    }
 }
 
 impl<'a> HydrationFormatter<'a> {
@@ -1191,6 +1212,7 @@ impl<'a> HydrationFormatter<'a> {
             .overlay
             .as_any()
             .downcast_ref::<fluree_db_novelty::Novelty>();
+        let arena_dropped_graphs = arena_dropped_graphs(db.snapshot, arena_reader.is_some());
         Self {
             db,
             compactor,
@@ -1199,9 +1221,11 @@ impl<'a> HydrationFormatter<'a> {
             policy,
             tracker,
             arena_reader,
+            arena_dropped_graphs,
             novelty,
             dataset: None,
             active_idx: 0,
+            holds_cells: std::sync::OnceLock::new(),
         }
     }
 
@@ -1351,8 +1375,13 @@ impl<'a> HydrationFormatter<'a> {
                 _ => Arc::new(self.fetch_subject_properties(sid, predicate_filter).await?),
             };
 
-            // Group flakes by predicate
-            let mut by_pred: HashMap<Sid, Vec<&Flake>> = HashMap::new();
+            // Group flakes by predicate, in predicate order. The order the
+            // predicates are formatted in decides which path reaches a shared
+            // node first, and so what its cached rendering holds (the cycle
+            // cut at `visited` depends on the path): a std map, seeded at
+            // random per instance, rendered the same subject differently from
+            // run to run.
+            let mut by_pred: BTreeMap<Sid, Vec<&Flake>> = BTreeMap::new();
             for flake in flakes.iter() {
                 by_pred.entry(flake.p.clone()).or_default().push(flake);
             }
@@ -1400,6 +1429,22 @@ impl<'a> HydrationFormatter<'a> {
                     pred_flakes.sort_by_key(|f| f.m.as_ref().and_then(|m| m.i).unwrap_or(i32::MAX));
                 }
 
+                // A list stored as an `rdf:first`/`rdf:rest` chain, not
+                // compactly, reads as its members, as a compact list does.
+                let chains = self.stored_list_members(&pred_flakes).await?;
+                let pred_flakes: Vec<&Flake> = if chains.is_empty() {
+                    pred_flakes
+                } else {
+                    pred_flakes
+                        .into_iter()
+                        .enumerate()
+                        .flat_map(|(k, f)| match chains.iter().find(|(at, _)| *at == k) {
+                            Some((_, members)) => members.iter().collect(),
+                            None => vec![f],
+                        })
+                        .collect()
+                };
+
                 let pred_ctx = PredicateContext {
                     pred: &pred,
                     flakes: &pred_flakes,
@@ -1431,8 +1476,10 @@ impl<'a> HydrationFormatter<'a> {
                 }
             }
 
-            // Format reverse properties
-            for (rev_pred, rev_nested_opt) in level.reverse() {
+            // Format reverse properties, in predicate order (as `by_pred`).
+            let mut reverse: Vec<_> = level.reverse().iter().collect();
+            reverse.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            for (rev_pred, rev_nested_opt) in reverse {
                 let rev_flakes = self.fetch_reverse_properties(sid, rev_pred).await?;
                 if !rev_flakes.is_empty() {
                     let values = self
@@ -2039,7 +2086,7 @@ impl<'a> HydrationFormatter<'a> {
         }
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
-        if !is_inferable_datatype(&dt_full) {
+        if !may_print_bare(&dt_full, &flake.o) {
             wrapper.insert("@type".to_string(), json!(dt_compact));
         }
         Ok(JsonValue::Object(wrapper))
@@ -2142,6 +2189,16 @@ impl<'a> HydrationFormatter<'a> {
             let Some(novelty) = self.novelty else {
                 return Ok(None);
             };
+            if self.arena_dropped_graphs.contains(&edge_key.g) {
+                // The arena predates the drop of this edge's graph, which
+                // took all it holds of the edge.
+                let live: Vec<Sid> = novelty
+                    .attachments
+                    .current_annotations_for_at(edge_key, self.db.t)
+                    .collect();
+                tracing::Span::current().record("live_count", live.len());
+                return Ok(Some(live));
+            }
             let novelty_events = novelty.attachments.collect_forward_events(edge_key);
             let live = reader
                 .current_annotations_merged(edge_key, &novelty_events, self.db.t)
@@ -2193,12 +2250,11 @@ impl<'a> HydrationFormatter<'a> {
 
         // Special handling for @json datatype: deserialize the JSON string.
         // Accept both Json and String variants (see jsonld.rs for rationale).
+        // Text that is not JSON is written as the typed literal it is.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })
+                    Ok(json_document(json_str).unwrap_or_else(|| ill_typed_json_literal(json_str)))
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2223,7 +2279,7 @@ impl<'a> HydrationFormatter<'a> {
         }
 
         // Inferable datatypes can omit @type
-        if is_inferable_datatype(&dt_full) {
+        if may_print_bare(&dt_full, &flake.o) {
             return match &flake.o {
                 FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
                 FlakeValue::Long(n) => Ok(json!(n)),
@@ -2329,17 +2385,18 @@ impl<'a> HydrationFormatter<'a> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
 
-        // @json datatype: deserialize and wrap with @type
+        // @json datatype: deserialize and wrap with @type; text that is not
+        // JSON as the typed literal it is.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    let json_val: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })?;
-                    Ok(json!({
-                        "@value": json_val,
-                        "@type": "@json"
-                    }))
+                    Ok(match json_document(json_str) {
+                        Some(json_val) => json!({
+                            "@value": json_val,
+                            "@type": "@json"
+                        }),
+                        None => ill_typed_json_literal(json_str),
+                    })
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2484,12 +2541,13 @@ impl<'a> HydrationFormatter<'a> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
 
+        // The document, or text that is not JSON as that text; `@type`
+        // beside it names the datatype.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })
+                    Ok(json_document(json_str)
+                        .unwrap_or_else(|| JsonValue::String(json_str.clone())))
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2584,6 +2642,64 @@ impl<'a> HydrationFormatter<'a> {
         Ok(flakes)
     }
 
+    /// The members of each of `flakes` that names a list stored as an
+    /// `rdf:first`/`rdf:rest` chain, with the flake's position. A list any of
+    /// whose members the view policy hides is left as its head.
+    async fn stored_list_members(&self, flakes: &[&Flake]) -> Result<Vec<(usize, Vec<Flake>)>> {
+        let mut out = Vec::new();
+        for (k, flake) in flakes.iter().enumerate() {
+            let FlakeValue::Ref(head) = &flake.o else {
+                continue;
+            };
+            if head.namespace_code != BLANK_NODE || !self.holds_cells().await? {
+                continue;
+            }
+            let members = fluree_db_core::rdf_list::chain_members(self.db, head)
+                .await
+                .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+            let Some(members) = members else {
+                continue;
+            };
+            let members = match self.policy {
+                Some(policy_ctx) if !policy_ctx.wrapper().is_root() => {
+                    let count = members.len();
+                    let visible = self.filter_flakes_by_policy(members, policy_ctx).await?;
+                    if visible.len() != count {
+                        continue;
+                    }
+                    visible
+                }
+                _ => members,
+            };
+            out.push((k, members));
+        }
+        Ok(out)
+    }
+
+    /// Whether `db` holds any `rdf:first` triple, read once per response:
+    /// without one, no blank node heads a list stored as its triples.
+    async fn holds_cells(&self) -> Result<bool> {
+        if let Some(&held) = self.holds_cells.get() {
+            return Ok(held);
+        }
+        let first = self
+            .db
+            .range_with_opts(
+                IndexType::Psot,
+                RangeTest::Eq,
+                RangeMatch {
+                    p: Some(Sid::new(RDF, fluree_vocab::predicates::RDF_FIRST)),
+                    ..Default::default()
+                },
+                RangeOptions::default().with_flake_limit(1),
+            )
+            .await
+            .map_err(|e| FormatError::InvalidBinding(format!("Failed to read a list: {e}")))?;
+        let held = !first.is_empty();
+        let _ = self.holds_cells.set(held);
+        Ok(held)
+    }
+
     /// Fetch one `(subject, predicate)` pair via the SPOT index.
     ///
     /// Caller invariant: the projection's level is Explicit with exactly
@@ -2651,12 +2767,8 @@ impl<'a> HydrationFormatter<'a> {
     ///
     /// Schema flakes are always allowed. Other flakes are checked against the
     /// policy context's view set via the **async** evaluator, so `f:query`
-    /// policies run (the sync evaluator silently skips them). The subject class
-    /// cache is populated first: hydration-only-fetched subjects (direct-id
-    /// selects, nested-ref expansion) are never scanned, so the cache would
-    /// otherwise be empty and every `f:onClass` restriction would silently drop
-    /// to `default_allow`. Class membership is resolved at this view's `t` via
-    /// the GraphDbRef.
+    /// policies run (the sync evaluator silently skips them). Class membership
+    /// is resolved at this view's `t` via the GraphDbRef.
     async fn filter_flakes_by_policy(
         &self,
         flakes: Vec<Flake>,
@@ -2665,18 +2777,6 @@ impl<'a> HydrationFormatter<'a> {
         // Share the existing class cache (Arc-backed) so populated lookups carry
         // across fetches and the original policy context sees them too.
         let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
-
-        let mut subjects: Vec<Sid> = flakes
-            .iter()
-            .filter(|f| !is_schema_flake(&f.p, &f.o))
-            .map(|f| f.s.clone())
-            .collect();
-        subjects.sort();
-        subjects.dedup();
-        enforcer
-            .populate_class_cache_for_graph(self.db, &subjects)
-            .await
-            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
 
         let disabled = Tracker::disabled();
         let tracker = self.tracker.unwrap_or(&disabled);

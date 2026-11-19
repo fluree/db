@@ -18,6 +18,12 @@
 # stack sizing is controlled separately via tokio's runtime builder.
 RUST_MIN_STACK = "8388608"  # 8 MB
 
+# Oldest macOS the Apple silicon builds run on; rustc and the cc/cmake build
+# scripts of C and C++ dependencies read it (rustc's own default is 11.0).
+# maturin sets its own value over this table, so fluree-db-python/pyproject.toml
+# carries the same one for the wheel.
+MACOSX_DEPLOYMENT_TARGET = "14.0"
+
 # wasm32 C toolchain (zstd-sys): route through in-repo shims that pick a
 # wasm32-capable clang per platform (Homebrew LLVM on macOS — Apple clang has
 # no WebAssembly backend — plain clang on Linux/CI). Scoped to the wasm target.

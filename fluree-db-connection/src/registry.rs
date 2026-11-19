@@ -62,8 +62,6 @@ impl StorageRegistry {
         sdk_config: &aws_config::SdkConfig,
         config: &StorageConfig,
     ) -> Result<Arc<S3Storage>> {
-        use fluree_db_storage_aws::S3Config as RawS3Config;
-
         // Extract S3 config
         let s3_config = match &config.storage_type {
             StorageType::S3(s3) => s3,
@@ -81,33 +79,7 @@ impl StorageRegistry {
             }
         }
 
-        // Create new storage instance
-        let timeout_ms = s3_config
-            .read_timeout_ms
-            .into_iter()
-            .chain(s3_config.write_timeout_ms)
-            .chain(s3_config.list_timeout_ms)
-            .max();
-
-        let raw_config = RawS3Config {
-            bucket: s3_config.bucket.to_string(),
-            prefix: s3_config
-                .prefix
-                .as_ref()
-                .map(std::string::ToString::to_string),
-            endpoint: s3_config
-                .endpoint
-                .as_ref()
-                .map(std::string::ToString::to_string),
-            force_path_style: s3_config.force_path_style,
-            timeout_ms,
-            max_retries: s3_config.max_retries.map(|n| n as u32),
-            retry_base_delay_ms: s3_config.retry_base_delay_ms,
-            retry_max_delay_ms: s3_config.retry_max_delay_ms,
-            max_concurrent_requests: s3_config.max_concurrent_requests,
-        };
-
-        let storage = S3Storage::new(sdk_config, raw_config)
+        let storage = S3Storage::new(sdk_config, crate::aws::s3_config_from(s3_config))
             .await
             .map_err(|e| ConnectionError::storage(format!("Failed to create S3 storage: {e}")))?;
 

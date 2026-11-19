@@ -121,7 +121,13 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
         Ok(records) => {
             let indexes = indexes_to_auto_sync(&records);
             for gs in &indexes {
-                handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies);
+                // A persisted dependency that no longer parses cannot name a
+                // ledger any commit event will carry; skip it, loudly.
+                if let Err(e) =
+                    handle.register_graph_source_with_deps(&gs.graph_source_id, &gs.dependencies)
+                {
+                    tracing::warn!(graph_source = %gs.graph_source_id, error = %e, "Skipping BM25 index with unparseable dependencies");
+                }
             }
             info!(registered = indexes.len(), "BM25 auto-sync starting");
         }
@@ -131,6 +137,30 @@ async fn build_bm25_worker(fluree: Arc<Fluree>) -> (Bm25MaintenanceWorker, Bm25W
     }
 
     (worker, handle)
+}
+
+/// Leader-scope key rotation task: resume a pending sweep, then hold. The
+/// guard releases the sweep when the task is aborted on leadership loss.
+#[cfg(feature = "raft")]
+async fn run_key_rotation_on_leader(fluree: Arc<fluree_db_api::Fluree>, holder: String) {
+    struct ReleaseOnDrop(Arc<fluree_db_api::Fluree>);
+    impl Drop for ReleaseOnDrop {
+        fn drop(&mut self) {
+            self.0.release_key_rotation();
+        }
+    }
+    let _release = ReleaseOnDrop(Arc::clone(&fluree));
+    match fluree.resume_pending_key_rotation(&holder).await {
+        Ok(Some(progress)) => tracing::info!(
+            retire_key_id = progress.retire_key_id,
+            units_done = progress.units_done,
+            units_total = progress.units_total,
+            "resumed a pending key rotation on the leader"
+        ),
+        Ok(None) => {}
+        Err(e) => tracing::warn!(%e, "could not resume a pending key rotation on the leader"),
+    }
+    std::future::pending::<()>().await;
 }
 
 /// Drive a BM25 maintenance worker to completion, logging an unexpected exit.
@@ -350,27 +380,14 @@ impl FlureeServer {
                 .clone()
                 .expect("peer_state should exist in peer mode");
 
-            if !self.state.fluree.nameservice_mode().is_read_only() {
-                // Shared storage: PeerSyncTask persists refs into local FileNameService
-                let events_url = peer::build_peer_events_url(&self.state.config);
-                let auth_token = self.state.config.load_peer_events_token().ok().flatten();
-                let watch = fluree_db_nameservice_sync::SseRemoteWatch::new(events_url, auth_token);
-                let task = peer::PeerSyncTask::new(
-                    Arc::clone(&self.state.fluree),
-                    peer_state,
-                    watch,
-                    self.state.config.clone(),
-                );
-                Some(task.spawn())
-            } else {
-                // Proxy storage: existing PeerSubscriptionTask (in-memory watermarks only)
-                let task = peer::PeerSubscriptionTask::new(
-                    self.state.config.clone(),
-                    peer_state,
-                    Arc::clone(&self.state.fluree),
-                );
-                Some(task.spawn())
-            }
+            // Either storage access mode: the task applies the transaction
+            // server's records to the cached ledgers and writes nothing.
+            let task = peer::PeerSubscriptionTask::new(
+                self.state.config.clone(),
+                peer_state,
+                Arc::clone(&self.state.fluree),
+            );
+            Some(task.spawn())
         } else {
             None
         };
@@ -429,6 +446,19 @@ impl FlureeServer {
             ),
             None => None,
         };
+        if self.state.config.events_open_under_data_auth() {
+            tracing::warn!(
+                "data auth is required but events auth is off: /v1/fluree/events lists every \
+                 ledger and its nameservice record to anyone; set --events-auth-mode to require \
+                 tokens there too"
+            );
+        }
+        if let Some(displaced) = &self.state.config.memory_displaced {
+            tracing::warn!(
+                "memory storage replaces the configured {displaced}; everything written \
+                 is lost when the server stops"
+            );
+        }
         #[cfg(not(feature = "bolt"))]
         if self.state.config.bolt_listen_addr.is_some() {
             tracing::warn!(
@@ -593,7 +623,8 @@ pub struct FlureeServerBuilder {
 }
 
 impl FlureeServerBuilder {
-    /// Create a new builder with default config (memory storage)
+    /// Create a new builder with default config (file storage in
+    /// `.fluree/storage`)
     pub fn new() -> Self {
         Self::for_config(ServerConfig::default())
     }
@@ -612,7 +643,9 @@ impl FlureeServerBuilder {
 
     /// Create a builder configured for memory storage
     pub fn memory() -> Self {
-        Self::new()
+        let mut builder = Self::new();
+        builder.config.memory = true;
+        builder
     }
 
     /// Create a builder configured for file storage
@@ -650,6 +683,12 @@ impl FlureeServerBuilder {
     /// Set the global on-disk cache budget in MB (Fluree object storage + Iceberg)
     pub fn disk_cache_max_mb(mut self, max_mb: usize) -> Self {
         self.config.disk_cache_max_mb = Some(max_mb);
+        self
+    }
+
+    /// Set the query-result cache ceiling in MB, in addition to the cache budget
+    pub fn query_result_cache_max_mb(mut self, max_mb: usize) -> Self {
+        self.config.query_result_cache_max_mb = Some(max_mb);
         self
     }
 
@@ -795,6 +834,8 @@ impl FlureeServerBuilder {
                         state_inner.config.indexer_catchup_interval_secs,
                     ));
                 let event_bus = Arc::clone(&integration.event_bus);
+                let rotation_fluree = Arc::clone(&state_inner.fluree);
+                let rotation_holder = routes::rotation_holder(&state_inner);
                 let leader_tasks = move || {
                     let nameservice: std::sync::Arc<
                         dyn fluree_db_nameservice::IndexingNameService,
@@ -830,6 +871,14 @@ impl FlureeServerBuilder {
                     if bm25_auto_sync {
                         tasks.push(tokio::spawn(run_bm25_worker(Arc::clone(&bm25_fluree))));
                     }
+                    // A key rotation in progress continues on the new leader
+                    // and is handed off when leadership is lost: the guard's
+                    // drop, run by the abort, releases the record so the next
+                    // leader takes it over without waiting for staleness.
+                    tasks.push(tokio::spawn(run_key_rotation_on_leader(
+                        Arc::clone(&rotation_fluree),
+                        rotation_holder.clone(),
+                    )));
                     tasks
                 };
                 let config = fluree_db_consensus::raft::embedded::EmbeddedRaftConfig {
@@ -869,6 +918,30 @@ impl FlureeServerBuilder {
         drop(raft_nameservice);
 
         let state = Arc::new(state_inner);
+
+        // Without Raft this process is the only holder: a rotation that a
+        // previous run left `Running` continues here. Under Raft the
+        // leader tasks above own it.
+        #[cfg(feature = "raft")]
+        let standalone = raft_listener_parts.is_none();
+        #[cfg(not(feature = "raft"))]
+        let standalone = true;
+        if standalone {
+            let fluree = Arc::clone(&state.fluree);
+            let holder = routes::rotation_holder(&state);
+            tokio::spawn(async move {
+                match fluree.resume_pending_key_rotation(&holder).await {
+                    Ok(Some(progress)) => tracing::info!(
+                        retire_key_id = progress.retire_key_id,
+                        units_done = progress.units_done,
+                        units_total = progress.units_total,
+                        "resumed a pending key rotation"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(%e, "could not resume a pending key rotation"),
+                }
+            });
+        }
 
         // Assemble the private-listener router now that `state` is an
         // `Arc<AppState>` — `require_admin_token` needs that shape. The
@@ -948,6 +1021,13 @@ impl Default for FlureeServerBuilder {
 mod tests {
     use super::*;
     use fluree_db_nameservice::GraphSourceType;
+
+    #[test]
+    fn memory_builder_selects_memory_storage() {
+        let storage = |b: FlureeServerBuilder| b.config.storage_type_str();
+        assert_eq!(storage(FlureeServerBuilder::memory()), "memory");
+        assert_eq!(storage(FlureeServerBuilder::new()), "file");
+    }
 
     fn auto_sync_config(server_role: ServerRole) -> ServerConfig {
         ServerConfig {

@@ -50,17 +50,14 @@ pub(crate) fn binding_subject_sid(
 ) -> Result<Option<Sid>> {
     match binding {
         Binding::Sid { sid, .. } => Ok(Some(sid.clone())),
-        Binding::EncodedSid { s_id, .. } => {
-            let Some(gv) = ctx.graph_view() else {
-                return Ok(None);
-            };
-            Ok(gv.resolve_subject_sid(*s_id).ok())
-        }
+        Binding::EncodedSid { s_id, .. } => Ok(ctx
+            .with_term_view(|gv| gv.resolve_subject_sid(*s_id).ok())
+            .flatten()),
         Binding::IriMatch { iri, .. } | Binding::Iri(iri) => {
             if let Some(store) = ctx.binary_store.as_ref() {
                 if let Ok(Some(s_id)) = store.find_subject_id(iri) {
-                    if let Some(gv) = ctx.graph_view() {
-                        return Ok(gv.resolve_subject_sid(s_id).ok());
+                    if let Some(sid) = ctx.with_term_view(|gv| gv.resolve_subject_sid(s_id).ok()) {
+                        return Ok(sid);
                     }
                 }
             }
@@ -140,13 +137,10 @@ fn merge_latest_ref_objects(flakes: Vec<Flake>) -> Vec<Sid> {
             continue;
         };
         match latest.get(&obj) {
-            None => {
+            Some(&cur) if !fluree_db_core::same_t::supersedes((flake.t, flake.op), cur) => {}
+            _ => {
                 latest.insert(obj, (flake.t, flake.op));
             }
-            Some(&(t0, _)) if flake.t > t0 => {
-                latest.insert(obj, (flake.t, flake.op));
-            }
-            _ => {}
         }
     }
     let mut out: Vec<Sid> = latest
@@ -261,10 +255,11 @@ fn subject_ref_object_keys_merged(
     subject_s_id: u64,
 ) -> Result<Vec<u64>> {
     let g_id = ctx.binary_g_id;
-    let mut refs = batched_lookup_predicate_refs(store, g_id, p_id, &[subject_s_id], ctx.to_t)
-        .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?
-        .remove(&subject_s_id)
-        .unwrap_or_default();
+    let mut refs =
+        batched_lookup_predicate_refs(store, g_id, p_id, &[subject_s_id], ctx.to_t, &ctx.tracker)
+            .map_err(|e| QueryError::from_io("batched_lookup_predicate_refs", e))?
+            .remove(&subject_s_id)
+            .unwrap_or_default();
 
     if let Some(ops) = cached_overlay_ops(ctx, store, g_id, RunSortOrder::Psot, pred_sid)? {
         let iri_ref = OType::IRI_REF.as_u16();
@@ -302,7 +297,10 @@ fn lookup_ref_objects(
         );
         return Ok(Vec::new());
     }
-    if let Some(store) = ctx.binary_store.as_ref() {
+    // The batched read takes one graph's refs (`binary_g_id`), so it runs
+    // only where the scope reads exactly that graph through the index; a
+    // default graph of several graphs reads through the range path below.
+    if let Some(store) = ctx.binary_store.as_ref().filter(|_| ctx.has_binary_store()) {
         if let Some(subject_s_id) = binding_subject_s_id(
             &Binding::Sid {
                 sid: subject.clone(),
@@ -325,7 +323,7 @@ fn lookup_ref_objects(
                 subject_ref_object_keys_merged(ctx, store, predicate, p_id, subject_s_id)?;
             let mut out = Vec::with_capacity(ref_s_ids.len());
             for s_id in ref_s_ids {
-                if let Some(gv) = ctx.graph_view() {
+                if let Some(gv) = ctx.one_graph_view() {
                     if let Ok(sid) = gv.resolve_subject_sid(s_id) {
                         out.push(sid);
                     }
@@ -1032,22 +1030,53 @@ pub(crate) async fn eval_metadata_call_async<R: RowAccess>(
 }
 
 /// True for the metadata functions that read graph flakes and so must be
-/// policy-filtered (`labels`/`keys`/`properties`/`type`/`startNode`/`endNode`).
+/// policy-filtered (`labels`/`keys`/`properties`/`type`/`startNode`/`endNode`):
+/// the functions that read the dataset, less full-text scoring and the
+/// unknown function.
 pub(crate) fn is_metadata_function(func: &Function) -> bool {
-    matches!(
-        func,
-        Function::Labels
-            | Function::Keys
-            | Function::Properties
-            | Function::RelType
-            | Function::StartNode
-            | Function::EndNode
-    )
+    func.reads_dataset() && !matches!(func, Function::Fulltext | Function::Custom(_))
 }
 
 fn comparable_opt_to_binding(v: Option<ComparableValue>) -> Result<Binding> {
     match v {
         Some(cv) => cv.to_binding(None),
         None => Ok(Binding::Unbound),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn type_flake(class: &str, t: i64, op: bool) -> Flake {
+        Flake::new(
+            Sid::new(100, "s"),
+            Sid::new(1, "type"),
+            FlakeValue::Ref(Sid::new(100, class)),
+            Sid::new(1, "id"),
+            t,
+            op,
+            None,
+        )
+    }
+
+    /// A retraction and an assertion of one reference at one `t` leave it
+    /// held, in either order; a later retraction removes it.
+    #[test]
+    fn a_same_t_pair_of_a_reference_holds_it() {
+        for ops in [[false, true], [true, false]] {
+            let flakes = ops.iter().map(|&op| type_flake("A", 5, op)).collect();
+            assert_eq!(
+                merge_latest_ref_objects(flakes),
+                vec![Sid::new(100, "A")],
+                "{ops:?}"
+            );
+        }
+        let flakes = vec![
+            type_flake("A", 5, false),
+            type_flake("A", 5, true),
+            type_flake("A", 6, false),
+        ];
+        assert!(merge_latest_ref_objects(flakes).is_empty());
     }
 }

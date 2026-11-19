@@ -61,10 +61,9 @@ impl<S: IcebergStorage> DirectCatalogClient<S> {
     /// Returns the full path to the current metadata JSON file. The hint file,
     /// when present, contains the metadata filename
     /// (e.g., `00001-abc-def.metadata.json`) or a full path. Without one
-    /// (pyiceberg and most non-Hadoop writers never write it), the highest-
-    /// versioned `*.metadata.json` in `metadata/` is used — only on storage
-    /// backends that support listing (local filesystem); S3 keeps the original
-    /// hint error. SYNC: mirror any change in
+    /// (pyiceberg and most non-Hadoop writers never write it), or with an empty
+    /// one, the highest-versioned `*.metadata.json` in `metadata/` is used; if the listing
+    /// itself fails, the original hint error is reported. SYNC: mirror any change in
     /// `SendDirectCatalogClient::resolve_metadata_location` below.
     async fn resolve_metadata_location(&self) -> Result<String> {
         let hint_path = format!("{}/metadata/version-hint.text", self.table_location);
@@ -86,10 +85,16 @@ impl<S: IcebergStorage> DirectCatalogClient<S> {
             .map_err(|e| IcebergError::Metadata(format!("Invalid version-hint.text: {e}")))?
             .trim();
 
+        // An empty hint names nothing: it takes the fallback a missing one does.
         if hint.is_empty() {
-            return Err(IcebergError::Metadata(
-                "version-hint.text is empty".to_string(),
-            ));
+            return fallback_metadata_location(
+                self.storage
+                    .list_files(&format!("{}/metadata", self.table_location)),
+                &self.table_location,
+                &hint_path,
+                &IcebergError::Metadata("version-hint.text is empty".to_string()),
+            )
+            .await;
         }
 
         Ok(resolve_hint_to_metadata_path(hint, &self.table_location))
@@ -191,10 +196,16 @@ impl<S: SendIcebergStorage> SendDirectCatalogClient<S> {
             .map_err(|e| IcebergError::Metadata(format!("Invalid version-hint.text: {e}")))?
             .trim();
 
+        // An empty hint names nothing: it takes the fallback a missing one does.
         if hint.is_empty() {
-            return Err(IcebergError::Metadata(
-                "version-hint.text is empty".to_string(),
-            ));
+            return fallback_metadata_location(
+                self.storage
+                    .list_files(&format!("{}/metadata", self.table_location)),
+                &self.table_location,
+                &hint_path,
+                &IcebergError::Metadata("version-hint.text is empty".to_string()),
+            )
+            .await;
         }
 
         Ok(resolve_hint_to_metadata_path(hint, &self.table_location))
@@ -267,9 +278,9 @@ fn resolve_hint_to_metadata_path(hint: &str, table_location: &str) -> String {
 
 /// Shared hint-absent fallback: resolve the current metadata file by listing
 /// the `metadata/` directory. Takes the not-yet-awaited listing future so one
-/// helper serves both the Send and non-Send clients. A storage backend without
-/// listing support (S3) surfaces the ORIGINAL version-hint error, so S3
-/// Direct-mode behavior is unchanged.
+/// helper serves both the Send and non-Send clients. A listing that fails (a
+/// backend without listing, or a role without list permission) surfaces the
+/// ORIGINAL version-hint error.
 async fn fallback_metadata_location(
     list: impl std::future::Future<Output = Result<Vec<String>>>,
     table_location: &str,
@@ -332,12 +343,7 @@ pub fn warehouse_dir_name(dir: &str) -> &str {
 /// on the name part. Ambiguity (two dirs matching one name) or a miss is a
 /// fail-loud [`IcebergError::Catalog`] naming what WAS found.
 pub fn match_warehouse_table_dir(table_name: &str, dir_names: &[String]) -> Result<String> {
-    let want = table_name.trim();
-    let matches: Vec<&String> = dir_names
-        .iter()
-        .filter(|d| warehouse_dir_name(d).eq_ignore_ascii_case(want))
-        .collect();
-    match matches.as_slice() {
+    match warehouse_table_dir_candidates(table_name, dir_names).as_slice() {
         [one] => Ok((*one).trim_end_matches('/').to_string()),
         [] => Err(IcebergError::Catalog(format!(
             "no directory under the warehouse root matches table '{table_name}' \
@@ -351,6 +357,55 @@ pub fn match_warehouse_table_dir(table_name: &str, dir_names: &[String]) -> Resu
             many.iter().map(|d| d.as_str()).collect::<Vec<_>>().join(", ")
         ))),
     }
+}
+
+/// Every directory in `dir_names` whose name part matches `table_name` — the
+/// matching rule behind [`match_warehouse_table_dir`], for a caller that treats
+/// a miss differently from ambiguity.
+pub fn warehouse_table_dir_candidates<'a>(
+    table_name: &str,
+    dir_names: &'a [String],
+) -> Vec<&'a String> {
+    let want = table_name.trim();
+    dir_names
+        .iter()
+        .filter(|d| warehouse_dir_name(d).eq_ignore_ascii_case(want))
+        .collect()
+}
+
+/// Resolve one namespace level to its directory among `dir_names`, for a
+/// warehouse laid out `<root>/<namespace>/<table>`. Matches the WHOLE directory
+/// name, `<level>` or the Hive/Glue/Spark spelling `<level>.db` (a table
+/// directory's random `.suffix` never matches), preferring an exact-case match
+/// and otherwise accepting a unique case-insensitive one. `Ok(None)` when no
+/// directory carries the name — the flat `<root>/<table>` layout. Two
+/// directories differing only in case, neither exact, is a fail-loud error.
+pub fn match_warehouse_namespace_dir(level: &str, dir_names: &[String]) -> Result<Option<String>> {
+    let want = level.trim();
+    let name = |d: &'_ String| d.trim_end_matches('/').to_string();
+    for want in [want.to_string(), format!("{want}.db")] {
+        if let Some(exact) = dir_names.iter().map(name).find(|d| *d == want) {
+            return Ok(Some(exact));
+        }
+        let folded: Vec<String> = dir_names
+            .iter()
+            .map(name)
+            .filter(|d| d.eq_ignore_ascii_case(&want))
+            .collect();
+        match folded.as_slice() {
+            [] => continue,
+            [one] => return Ok(Some(one.clone())),
+            many => {
+                return Err(IcebergError::Catalog(format!(
+                    "namespace '{level}' is AMBIGUOUS under the warehouse root — {} directories \
+                     match: [{}]",
+                    many.len(),
+                    many.join(", ")
+                )))
+            }
+        }
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -419,6 +474,47 @@ mod warehouse_tests {
     }
 
     #[test]
+    fn namespace_dir_matches_whole_name_preferring_exact_case() {
+        let d = dirs(&["site1/", "Site2/", "site2/", "site3.AbC/"]);
+        assert_eq!(
+            match_warehouse_namespace_dir("SITE1", &d).unwrap(),
+            Some("site1".to_string())
+        );
+        // An exact-case directory wins over a case-folded sibling.
+        assert_eq!(
+            match_warehouse_namespace_dir("site2", &d).unwrap(),
+            Some("site2".to_string())
+        );
+        // Neither sibling is exact: refuse to guess.
+        let err = match_warehouse_namespace_dir("SITE2", &d)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AMBIGUOUS"), "flags ambiguity: {err}");
+        // A suffixed table directory is not a namespace directory.
+        assert_eq!(match_warehouse_namespace_dir("site3", &d).unwrap(), None);
+        assert_eq!(match_warehouse_namespace_dir("site9", &d).unwrap(), None);
+    }
+
+    #[test]
+    fn namespace_dir_matches_the_hive_db_spelling() {
+        let d = dirs(&["north.db/", "South.db/", "sales/", "sales.db/"]);
+        assert_eq!(
+            match_warehouse_namespace_dir("north", &d).unwrap(),
+            Some("north.db".to_string())
+        );
+        assert_eq!(
+            match_warehouse_namespace_dir("SOUTH", &d).unwrap(),
+            Some("South.db".to_string())
+        );
+        // The bare directory wins over its `.db` twin.
+        assert_eq!(
+            match_warehouse_namespace_dir("sales", &d).unwrap(),
+            Some("sales".to_string())
+        );
+        assert_eq!(match_warehouse_namespace_dir("west", &d).unwrap(), None);
+    }
+
+    #[test]
     fn warehouse_dir_name_strips_suffix_and_slash() {
         assert_eq!(warehouse_dir_name("fact_order.UIHGsQex/"), "fact_order");
         assert_eq!(warehouse_dir_name("dim_customer/"), "dim_customer");
@@ -475,6 +571,23 @@ mod tests {
         assert_eq!(
             resp.metadata_location,
             "file:///wh/t/metadata/00003-bbbb.metadata.json"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_version_hint_falls_back_to_metadata_listing() {
+        // An empty hint names no file: it resolves as a missing one does.
+        let mut storage = MemoryStorage::new();
+        storage.add_file("file:///wh/t/metadata/version-hint.text", "  \n");
+        storage.add_file("file:///wh/t/metadata/v1.metadata.json", "{}");
+        let client = DirectCatalogClient::new("file:///wh/t".to_string(), Arc::new(storage));
+        let resp = client
+            .load_table(&TableIdentifier::new("ns", "t"), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.metadata_location,
+            "file:///wh/t/metadata/v1.metadata.json"
         );
     }
 

@@ -102,11 +102,29 @@ impl fmt::Debug for GeoPointBits {
 }
 
 impl fmt::Display for GeoPointBits {
+    /// WKT, longitude first. Each coordinate is the shortest decimal that
+    /// encodes to this point, so `POINT(2.2945 48.8584)` reads back as
+    /// written rather than as the binary expansion of its decoded cell.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // WKT format: POINT(lng lat) - note: longitude first!
+        const LNG_BITS: u64 = (1 << 30) - 1;
         let (lat, lng) = ObjKey::from_u64(self.0).decode_geo_point();
-        write!(f, "POINT({lng} {lat})")
+        let lat_text = shortest_decimal(lat, |c| {
+            GeoPointBits::new(c, lng).map(|p| p.0 & !LNG_BITS) == Some(self.0 & !LNG_BITS)
+        });
+        let lng_text = shortest_decimal(lng, |c| {
+            GeoPointBits::new(lat, c).map(|p| p.0 & LNG_BITS) == Some(self.0 & LNG_BITS)
+        });
+        write!(f, "POINT({lng_text} {lat_text})")
     }
+}
+
+/// The shortest fixed-point rendering of `value` that `same` accepts.
+fn shortest_decimal(value: f64, same: impl Fn(f64) -> bool) -> String {
+    (0..=12)
+        .map(|digits| format!("{value:.digits$}"))
+        .map(|text| if text == "-0" { "0".to_string() } else { text })
+        .find(|text| text.parse().is_ok_and(&same))
+        .unwrap_or_else(|| value.to_string())
 }
 
 /// Polymorphic value type for flake objects
@@ -266,6 +284,71 @@ impl FlakeValue {
         }
     }
 
+    /// Whether two different terms whose values are of this kind can share a
+    /// persisted index key, so that storage, which merges ops by key, holds
+    /// them as one fact. A big integer is keyed by its value alone, whatever
+    /// XSD subtype it was written with, and every null shares one key. For
+    /// every other kind the key is a function of the term that no two terms
+    /// share: a `dateTime` or `time` is keyed to the microsecond, which is
+    /// all it holds.
+    ///
+    /// A double is listed although no two double terms share a key: its key
+    /// is its value under its datatype, with every NaN as one and -0.0 as
+    /// 0.0, which is how this type's equality compares doubles too. Listing
+    /// it keys doubles the way storage does without depending on that.
+    ///
+    /// Exhaustive on purpose: a new kind of value has to say which it is.
+    /// The key encoding is `value_to_otype_okey` in `fluree-db-query`.
+    pub fn index_key_may_merge_terms(&self) -> bool {
+        match self {
+            FlakeValue::Null | FlakeValue::Double(_) | FlakeValue::BigInt(_) => true,
+            FlakeValue::Ref(_)
+            | FlakeValue::DateTime(_)
+            | FlakeValue::Time(_)
+            | FlakeValue::Boolean(_)
+            | FlakeValue::Long(_)
+            | FlakeValue::Decimal(_)
+            | FlakeValue::Date(_)
+            | FlakeValue::GYear(_)
+            | FlakeValue::GYearMonth(_)
+            | FlakeValue::GMonth(_)
+            | FlakeValue::GDay(_)
+            | FlakeValue::GMonthDay(_)
+            | FlakeValue::YearMonthDuration(_)
+            | FlakeValue::DayTimeDuration(_)
+            | FlakeValue::Duration(_)
+            | FlakeValue::String(_)
+            | FlakeValue::Vector(_)
+            | FlakeValue::Json(_)
+            | FlakeValue::GeoPoint(_) => false,
+        }
+    }
+
+    /// Whether the index keys this value by the value alone, whatever XSD
+    /// datatype it is written with: an integer too large for 64 bits, which
+    /// its `(graph, predicate)` arena keys by value, so every subtype it is
+    /// written under is one stored fact. Decided without an index, unlike
+    /// the other kinds of [`Self::index_key_may_merge_terms`].
+    pub fn index_keys_by_value(&self) -> bool {
+        matches!(self, FlakeValue::BigInt(v) if v.to_i64().is_none())
+    }
+
+    /// Whether this value, written with datatype `dt`, keeps less in its
+    /// persisted index key than the term holds, so the key decodes to a
+    /// different term: an integer too large for 64 bits written with an XSD
+    /// subtype (the key keeps no subtype), or a null (every null shares one
+    /// key). A query that reads such a term through its key gets the other
+    /// term. No double does, `±INF` and NaN included: its key decodes to a
+    /// value equal to the one written.
+    /// See [`Self::index_key_may_merge_terms`] for the kinds.
+    pub fn index_key_loses_detail(&self, dt: &Sid) -> bool {
+        match self {
+            FlakeValue::BigInt(v) => v.to_i64().is_none() && *dt != Sid::xsd_integer(),
+            FlakeValue::Null => true,
+            _ => false,
+        }
+    }
+
     /// Check if this is any temporal type (DateTime, Date, Time, g-types)
     pub fn is_temporal(&self) -> bool {
         matches!(
@@ -387,22 +470,28 @@ impl FlakeValue {
         }
     }
 
-    /// Compare two numeric values mathematically.
+    /// Compare two numeric values mathematically: the value comparison of
+    /// XPath `op:numeric-less-than` / `op:numeric-equal` (F&O 3.1 §4.3).
     ///
-    /// Returns `None` if either value is not numeric.
+    /// Returns `None` if either value is not numeric, or either is NaN: NaN is
+    /// incomparable, so every `<`, `>`, `=` with it is false. `+INF` is above
+    /// and `-INF` below every other number, of any numeric type.
     ///
     /// This implements "number is a number" semantics:
     /// - `Long(3) < Double(3.5) < Long(4)`
     /// - Equal values compare as Equal regardless of type
+    ///
+    /// The storage order (`Ord`), which must be total, is [`Self::cmp`]: it
+    /// places NaN after `+INF`.
     pub fn numeric_cmp(&self, other: &Self) -> Option<Ordering> {
+        if let Some(ord) = Self::special_double_cmp(self, other) {
+            return ord;
+        }
         match (self, other) {
             // === Fast paths: same type ===
             (FlakeValue::Long(a), FlakeValue::Long(b)) => Some(a.cmp(b)),
-            (FlakeValue::Double(a), FlakeValue::Double(b)) => {
-                // Handle NaN: use bit comparison as fallback for total ordering
-                a.partial_cmp(b)
-                    .or_else(|| Some(a.to_bits().cmp(&b.to_bits())))
-            }
+            // Neither is NaN or infinite here (handled above).
+            (FlakeValue::Double(a), FlakeValue::Double(b)) => a.partial_cmp(b),
             (FlakeValue::BigInt(a), FlakeValue::BigInt(b)) => Some((**a).cmp(&**b)),
             (FlakeValue::Decimal(a), FlakeValue::Decimal(b)) => {
                 a.partial_cmp(b).or(Some(Ordering::Equal))
@@ -486,10 +575,60 @@ impl FlakeValue {
         }
     }
 
+    /// The cases of [`Self::numeric_cmp`] a non-finite double decides, so the
+    /// arms below only ever see finite doubles. `None` = no special double
+    /// involved; `Some(None)` = incomparable (NaN, or a non-numeric operand).
+    fn special_double_cmp(a: &Self, b: &Self) -> Option<Option<Ordering>> {
+        let special = |v: &Self| match v {
+            FlakeValue::Double(d) if !d.is_finite() => Some(*d),
+            _ => None,
+        };
+        let (sa, sb) = (special(a), special(b));
+        if sa.is_none() && sb.is_none() {
+            return None;
+        }
+        if !a.is_numeric() || !b.is_numeric() {
+            return Some(None);
+        }
+        // `+INF` > everything, `-INF` < everything; a double holds the value,
+        // so two infinities of one sign are equal.
+        let rank = |v: &Self, s: Option<f64>| -> Option<i8> {
+            match s {
+                Some(d) if d.is_nan() => None,
+                Some(d) if d > 0.0 => Some(1),
+                Some(_) => Some(-1),
+                None => {
+                    debug_assert!(v.is_numeric());
+                    Some(0)
+                }
+            }
+        };
+        Some(match (rank(a, sa), rank(b, sb)) {
+            (Some(x), Some(y)) => Some(x.cmp(&y)),
+            _ => None, // NaN on either side
+        })
+    }
+
+    /// The storage order of two numeric values: [`Self::numeric_cmp`], made
+    /// total by placing NaN after `+INF` (all NaNs equal). This is the order
+    /// of index keys ([`crate::value_id::total_cmp_f64`]) and of ORDER BY.
+    fn numeric_total_cmp(&self, other: &Self) -> Option<Ordering> {
+        if !self.is_numeric() || !other.is_numeric() {
+            return None;
+        }
+        let nan = |v: &Self| matches!(v, FlakeValue::Double(d) if d.is_nan());
+        Some(match (nan(self), nan(other)) {
+            (true, true) => Ordering::Equal,
+            (true, false) => Ordering::Greater,
+            (false, true) => Ordering::Less,
+            (false, false) => self.numeric_cmp(other)?,
+        })
+    }
+
     /// Check if i64 is exactly representable as f64 (within 2^53)
     fn i64_fits_f64(v: i64) -> bool {
-        const MAX_SAFE: i64 = 1 << 53;
-        v.abs() <= MAX_SAFE
+        const MAX_SAFE: u64 = 1 << 53;
+        v.unsigned_abs() <= MAX_SAFE
     }
 
     /// Compare values of the same type
@@ -499,9 +638,9 @@ impl FlakeValue {
             (FlakeValue::Ref(a), FlakeValue::Ref(b)) => a.cmp(b),
             (FlakeValue::Boolean(a), FlakeValue::Boolean(b)) => a.cmp(b),
             (FlakeValue::Long(a), FlakeValue::Long(b)) => a.cmp(b),
-            (FlakeValue::Double(a), FlakeValue::Double(b)) => a
-                .partial_cmp(b)
-                .unwrap_or_else(|| a.to_bits().cmp(&b.to_bits())),
+            (FlakeValue::Double(a), FlakeValue::Double(b)) => {
+                crate::value_id::total_cmp_f64(*a, *b)
+            }
             (FlakeValue::BigInt(a), FlakeValue::BigInt(b)) => a.cmp(b),
             (FlakeValue::Decimal(a), FlakeValue::Decimal(b)) => {
                 a.partial_cmp(b).unwrap_or(Ordering::Equal)
@@ -561,9 +700,6 @@ impl FlakeValue {
     pub fn canonical_hash(&self) -> u64 {
         use xxhash_rust::xxh64::xxh64;
 
-        // Canonical NaN bit pattern for deterministic hashing (quiet NaN)
-        const CANONICAL_NAN_BITS: u64 = 0x7ff8_0000_0000_0000;
-
         // Type tag prefixes prevent collisions (e.g., string "true" vs boolean true)
         match self {
             FlakeValue::Null => xxh64(b"\x00null", 0),
@@ -581,14 +717,9 @@ impl FlakeValue {
                 xxh64(&buf, 0)
             }
             FlakeValue::Double(f) => {
-                // CRITICAL: Canonicalize NaN and -0.0/+0.0 for determinism
-                let canonical_bits = if f.is_nan() {
-                    CANONICAL_NAN_BITS // Fixed bit pattern for ALL NaN values
-                } else if *f == 0.0 {
-                    0u64 // Normalize -0.0 to +0.0 (both compare equal)
-                } else {
-                    f.to_bits()
-                };
+                // CRITICAL: Canonicalize NaN and -0.0/+0.0 for determinism —
+                // the same bits the index key and the total order use.
+                let canonical_bits = crate::value_id::canonical_f64_bits(*f);
                 let mut buf = [0u8; 9];
                 buf[0] = 0x03; // type tag
                 buf[1..].copy_from_slice(&canonical_bits.to_le_bytes());
@@ -728,13 +859,7 @@ impl FlakeValue {
                 hasher.update(&[0x0C]); // type tag
                 hasher.update(&(v.len() as u64).to_le_bytes());
                 for f in v.iter() {
-                    let canonical_bits = if f.is_nan() {
-                        CANONICAL_NAN_BITS
-                    } else if *f == 0.0 {
-                        0u64
-                    } else {
-                        f.to_bits()
-                    };
+                    let canonical_bits = crate::value_id::canonical_f64_bits(*f);
                     hasher.update(&canonical_bits.to_le_bytes());
                 }
                 hasher.digest()
@@ -754,9 +879,11 @@ impl FlakeValue {
 
 impl PartialEq for FlakeValue {
     fn eq(&self, other: &Self) -> bool {
-        // For numeric types, use numeric_cmp for value equality
+        // For numeric types, equality by value across numeric types.
         if self.is_numeric() && other.is_numeric() {
-            return self.numeric_cmp(other) == Some(Ordering::Equal);
+            // Storage identity, not XPath `=`: a NaN equals itself here (so a
+            // stored NaN can be found and retracted), as in `Ord` and `Hash`.
+            return self.numeric_total_cmp(other) == Some(Ordering::Equal);
         }
 
         // For temporal types of the same kind, use temporal_cmp
@@ -785,10 +912,13 @@ impl PartialEq for FlakeValue {
                 (FlakeValue::String(a), FlakeValue::String(b)) => a == b,
                 (FlakeValue::Json(a), FlakeValue::Json(b)) => a == b,
                 (FlakeValue::Vector(a), FlakeValue::Vector(b)) => {
-                    a.len() == b.len()
-                        && a.iter()
-                            .zip(b.iter())
-                            .all(|(x, y)| x.to_bits() == y.to_bits())
+                    // A decode shares one allocation per distinct value
+                    // (`BinaryGraphView`), so most equal pairs are one `Arc`.
+                    Arc::ptr_eq(a, b)
+                        || a.len() == b.len()
+                            && a.iter()
+                                .zip(b.iter())
+                                .all(|(x, y)| x.to_bits() == y.to_bits())
                 }
                 (FlakeValue::GeoPoint(a), FlakeValue::GeoPoint(b)) => a == b,
                 // Numeric and temporal types already handled above
@@ -812,12 +942,10 @@ impl Ord for FlakeValue {
         // 2. Both numeric → compare by mathematical value
         // Equal numeric values return Equal so cmp_object can use dt as tie-breaker
         // "number is a number": equal values are equal regardless of numeric type
-        if self.is_numeric() && other.is_numeric() {
-            if let Some(ord) = self.numeric_cmp(other) {
-                return ord;
-            }
-            // numeric_cmp returned None - shouldn't happen for two numeric values
-            // Fall through to discriminant comparison as defensive measure
+        // Total over every numeric value, NaN included (after +INF), as `Ord`
+        // requires.
+        if let Some(ord) = self.numeric_total_cmp(other) {
+            return ord;
         }
 
         // 3. Both temporal → compare by instant (if same temporal type)
@@ -870,6 +998,100 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
     }
 }
 
+/// The hash of a vector's value, for in-memory hash keys. One function for
+/// every form a vector takes: [`vector_value_hash`] for decoded components
+/// and [`vector_value_hash_f32`] for an arena's `f32` slice give equal
+/// hashes for vectors [`vector_eq_f32_f64`] / bitwise equality call equal.
+///
+/// Vector equality is bitwise on the `f64` components, as `FlakeValue`'s is:
+/// `-0.0` and `0.0` differ, and a NaN equals a NaN of the same bits (writes
+/// and query literals reject non-finite components, so neither reaches a
+/// stored vector). Every stored vector is `f32`-quantized, so the canonical
+/// bytes are the components narrowed to `f32` whenever that round-trips
+/// exactly; a vector with a component that doesn't (a query literal such as
+/// `[0.1]`, which equals no stored vector) hashes its `f64` bytes under
+/// another seed.
+///
+/// It is `xxh3` over native-endian bytes, in memory only. A per-component
+/// multiply chain is latency-bound, and an add-and-multiply hasher such as
+/// `FxHasher` is weak here: a widened `f32` has its low 29 bits zero, which
+/// leaves such a hash's low bits independent of the data.
+pub fn vector_value_hash(components: &[f64]) -> u64 {
+    const CHUNK: usize = 256;
+    if !components.iter().all(|&x| narrows_exactly(x)) {
+        // SAFETY: `f64` has no padding and any byte is a valid `u8`; the byte
+        // slice covers exactly `components`' memory and borrows it.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                components.as_ptr().cast::<u8>(),
+                std::mem::size_of_val(components),
+            )
+        };
+        return xxhash_rust::xxh3::xxh3_64_with_seed(bytes, WIDE_VECTOR_SEED);
+    }
+    if components.len() <= CHUNK {
+        let mut narrow = [0f32; CHUNK];
+        for (n, &x) in narrow.iter_mut().zip(components) {
+            *n = x as f32;
+        }
+        return vector_value_hash_f32(&narrow[..components.len()]);
+    }
+    let mut hasher = xxhash_rust::xxh3::Xxh3::new();
+    let mut narrow = [0f32; CHUNK];
+    for chunk in components.chunks(CHUNK) {
+        for (n, &x) in narrow.iter_mut().zip(chunk) {
+            *n = x as f32;
+        }
+        hasher.update(f32_bytes(&narrow[..chunk.len()]));
+    }
+    hasher.digest()
+}
+
+/// [`vector_value_hash`] of a vector held as `f32`, as a vector arena holds
+/// it: `xxh3` over the slice's bytes in place.
+pub fn vector_value_hash_f32(components: &[f32]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(f32_bytes(components))
+}
+
+/// Whether two arenas' `f32` vectors are equal: bitwise-equal components,
+/// as [`FlakeValue`]'s vector equality is.
+pub fn vector_eq_f32(x: &[f32], y: &[f32]) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+}
+
+/// Whether an arena's `f32` vector equals a decoded one: every component of
+/// `wide` narrows to `f32` exactly, to the same bits. For every finite `f32`
+/// this is bitwise equality of `narrow` widened with `wide`, and it agrees
+/// with [`vector_value_hash`] on every input.
+pub fn vector_eq_f32_f64(narrow: &[f32], wide: &[f64]) -> bool {
+    narrow.len() == wide.len()
+        && narrow
+            .iter()
+            .zip(wide)
+            .all(|(&n, &w)| narrows_exactly(w) && (w as f32).to_bits() == n.to_bits())
+}
+
+/// Seed for vectors that don't narrow to `f32`, so they never collide with
+/// the narrowed form's hashes by construction.
+const WIDE_VECTOR_SEED: u64 = 0x5745_4944_4556_4543;
+
+#[inline]
+fn narrows_exactly(x: f64) -> bool {
+    f64::from(x as f32).to_bits() == x.to_bits()
+}
+
+#[inline]
+fn f32_bytes(components: &[f32]) -> &[u8] {
+    // SAFETY: `f32` has no padding and any byte is a valid `u8`; the byte
+    // slice covers exactly `components`' memory and borrows it.
+    unsafe {
+        std::slice::from_raw_parts(
+            components.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(components),
+        )
+    }
+}
+
 impl std::hash::Hash for FlakeValue {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         // IMPORTANT: Hash must be consistent with PartialEq.
@@ -892,8 +1114,12 @@ impl std::hash::Hash for FlakeValue {
                 } else if d.is_infinite() {
                     3u8.hash(state); // infinity tag
                     (*d > 0.0).hash(state); // sign
-                } else if d.fract() == 0.0 && *d >= i64::MIN as f64 && *d <= i64::MAX as f64 {
-                    // Integer-valued double in i64 range: hash as integer
+                } else if d.fract() == 0.0
+                    && *d >= i64::MIN as f64
+                    && *d < 9_223_372_036_854_775_808.0
+                {
+                    // Integer-valued double in i64 range (`i64::MAX as f64`
+                    // rounds up to 2^63, outside it): hash as integer
                     0u8.hash(state); // integer tag
                     BigInt::from(*d as i64).to_signed_bytes_le().hash(state);
                 } else {
@@ -985,9 +1211,7 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
+                vector_value_hash(v).hash(state);
             }
             FlakeValue::GeoPoint(bits) => {
                 self.type_discriminant().hash(state);
@@ -1244,10 +1468,9 @@ pub fn parse_double(value: &serde_json::Value) -> Result<FlakeValue, String> {
                 Err("Cannot convert to double".to_string())
             }
         }
-        serde_json::Value::String(s) => s
-            .parse::<f64>()
+        serde_json::Value::String(s) => fluree_graph_ir::parse_xsd_double(s)
             .map(FlakeValue::Double)
-            .map_err(|e| format!("Invalid double '{s}': {e}")),
+            .ok_or_else(|| format!("Invalid double '{s}': not an xsd:double lexical form")),
         _ => Err("Expected number or string for double".to_string()),
     }
 }
@@ -1263,6 +1486,75 @@ fn count_significant_digits(s: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point reads back as the WKT it was written as: each coordinate is
+    /// the shortest decimal that encodes to the stored point.
+    #[test]
+    fn geo_point_displays_as_written() {
+        for (lng, lat, wkt) in [
+            (2.2945, 48.8584, "POINT(2.2945 48.8584)"),
+            (-122.4194, 37.7749, "POINT(-122.4194 37.7749)"),
+            (0.0, 0.0, "POINT(0 0)"),
+            (180.0, -90.0, "POINT(180 -90)"),
+            (12.5, 41.9, "POINT(12.5 41.9)"),
+        ] {
+            let point = GeoPointBits::new(lat, lng).expect("in range");
+            let shown = point.to_string();
+            assert_eq!(shown, wkt);
+            // And it parses back to the same point.
+            let (lat, lng) = crate::geo::try_extract_point(&shown).expect("wkt");
+            assert_eq!(GeoPointBits::new(lat, lng), Some(point));
+        }
+    }
+
+    /// The terms whose index key keeps less than the term: a big integer
+    /// written with an XSD subtype. The same value written as `xsd:integer`
+    /// does not, and neither does a `dateTime` or `time` written past the
+    /// microsecond, which holds no more than its key from the moment it is
+    /// built.
+    #[test]
+    fn index_key_loses_detail_of_the_terms_its_key_keeps_less_of() {
+        let xsd = |name: &str| Sid::new(fluree_vocab::namespaces::XSD, name);
+        let big =
+            || FlakeValue::BigInt(Box::new("123456789012345678901234567890".parse().unwrap()));
+        let at = |v: &str| FlakeValue::DateTime(Box::new(DateTime::parse(v).unwrap()));
+        let time = |v: &str| FlakeValue::Time(Box::new(Time::parse(v).unwrap()));
+
+        assert!(big().index_key_loses_detail(&xsd("nonNegativeInteger")));
+        assert!(!big().index_key_loses_detail(&Sid::xsd_integer()));
+        assert!(!at("2020-01-01T00:00:00.123456789Z").index_key_loses_detail(&xsd("dateTime")));
+        assert!(!time("12:00:00.123456789").index_key_loses_detail(&xsd("time")));
+        assert!(!FlakeValue::Long(5).index_key_loses_detail(&xsd("nonNegativeInteger")));
+        assert!(!FlakeValue::String("x".into()).index_key_loses_detail(&xsd("string")));
+
+        // A term that loses detail is of a kind whose key can merge terms;
+        // a temporal's key is all it holds.
+        assert!(big().index_key_may_merge_terms());
+        assert!(!at("2020-01-01T00:00:00.1234567Z").index_key_may_merge_terms());
+        assert!(!time("12:00:00.1234567").index_key_may_merge_terms());
+    }
+
+    /// No double loses detail to its index key, `±INF` and NaN included:
+    /// every double's key decodes to a value equal to the one written. What
+    /// the key drops, a NaN's payload and a zero's sign, equality drops too.
+    #[test]
+    fn no_double_loses_detail_to_its_index_key() {
+        use crate::value_id::ObjKey;
+        let xsd = |name: &str| Sid::new(fluree_vocab::namespaces::XSD, name);
+        for bits in special_double_bits() {
+            let written = FlakeValue::Double(f64::from_bits(bits));
+            let decoded = FlakeValue::Double(ObjKey::encode_f64(f64::from_bits(bits)).decode_f64());
+            assert_eq!(decoded, written, "{bits:#018x}");
+            for dt in ["double", "float"] {
+                assert!(
+                    !written.index_key_loses_detail(&xsd(dt)),
+                    "{bits:#018x} {dt}"
+                );
+            }
+            // Listed all the same; see `index_key_may_merge_terms`.
+            assert!(written.index_key_may_merge_terms(), "{bits:#018x}");
+        }
+    }
 
     /// `FlakeValue::Vector` is `Arc<[f64]>` behind a `serde(with)` adapter
     /// inside a `serde(untagged)` enum — verify it still round-trips as a
@@ -1615,5 +1907,129 @@ mod tests {
                 "Hash collision detected in test values"
             );
         }
+    }
+
+    /// Double bit patterns whose identity differs from their bits: NaNs with
+    /// every sign and a spread of payloads (quiet and signalling), both zeros,
+    /// both infinities, and a few ordinary values to compare them against.
+    fn special_double_bits() -> Vec<u64> {
+        let mut bits = vec![
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            0x7FF0_0000_0000_0001,
+            0xFFF0_0000_0000_0001,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            1.5f64.to_bits(),
+            (-1.5f64).to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+        ];
+        for shift in 0..51 {
+            bits.push(0x7FF0_0000_0000_0000 | (1u64 << shift));
+            bits.push(0xFFF0_0000_0000_0000 | (1u64 << shift));
+        }
+        bits
+    }
+
+    /// `FlakeValue`'s equality treats every NaN as one value and -0.0 as 0.0;
+    /// its hash must agree, or hashed sets and maps split one value in two.
+    #[test]
+    fn equal_doubles_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        let hash = |v: &FlakeValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        let values: Vec<FlakeValue> = special_double_bits()
+            .into_iter()
+            .map(|b| FlakeValue::Double(f64::from_bits(b)))
+            .collect();
+        for a in &values {
+            for b in &values {
+                if a == b {
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+    }
+
+    /// `Long(i64::MIN)` compares with a double by value, like any other
+    /// integer beyond 2^53.
+    #[test]
+    fn long_min_compares_with_doubles() {
+        let min = FlakeValue::Long(i64::MIN);
+        let as_double = FlakeValue::Double(-9_223_372_036_854_775_808.0);
+        assert_eq!(min.numeric_cmp(&as_double), Some(Ordering::Equal));
+        assert_eq!(as_double.numeric_cmp(&min), Some(Ordering::Equal));
+        assert_eq!(
+            min.numeric_cmp(&FlakeValue::Double(0.0)),
+            Some(Ordering::Less)
+        );
+        assert_eq!(
+            FlakeValue::Double(-1e19).numeric_cmp(&min),
+            Some(Ordering::Less)
+        );
+        assert_eq!(min.cmp(&as_double), Ordering::Equal);
+    }
+
+    /// Equality is by value across numeric types (`Long(1) == Double(1.0)`,
+    /// `Double(2^63) == BigInt(2^63)`); equal values must hash equally across
+    /// those types too.
+    #[test]
+    fn equal_numbers_of_different_types_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        use std::str::FromStr;
+        let hash = |v: &FlakeValue| {
+            let mut h = DefaultHasher::new();
+            v.hash(&mut h);
+            h.finish()
+        };
+        let big = |s: &str| FlakeValue::BigInt(Box::new(BigInt::from_str(s).unwrap()));
+        let dec = |s: &str| FlakeValue::Decimal(Box::new(BigDecimal::from_str(s).unwrap()));
+        let two_63 = 9_223_372_036_854_775_808.0_f64;
+        let values = [
+            FlakeValue::Long(0),
+            FlakeValue::Double(0.0),
+            FlakeValue::Double(-0.0),
+            dec("0"),
+            FlakeValue::Long(1),
+            FlakeValue::Double(1.0),
+            dec("1.0"),
+            FlakeValue::Double(2.5),
+            dec("2.5"),
+            dec("2.50"),
+            FlakeValue::Long(1 << 53),
+            FlakeValue::Double((1u64 << 53) as f64),
+            FlakeValue::Long(i64::MAX),
+            FlakeValue::Long(i64::MIN),
+            FlakeValue::Double(-two_63),
+            FlakeValue::Double(two_63),
+            big("9223372036854775808"),
+            dec("9223372036854775808"),
+            FlakeValue::Double(1e19),
+            big("10000000000000000000"),
+            big("-9223372036854775809"),
+        ];
+        let mut equal_pairs = 0;
+        for a in &values {
+            for b in &values {
+                if a == b {
+                    equal_pairs += 1;
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+        assert!(
+            equal_pairs > values.len(),
+            "some cross-type pairs are equal"
+        );
     }
 }

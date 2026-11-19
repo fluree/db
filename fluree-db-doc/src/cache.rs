@@ -28,7 +28,7 @@
 
 use crate::extract::ChunkExtraction;
 use crate::parse::ParsedDocument;
-use crate::Result;
+use crate::{DocError, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -46,6 +46,8 @@ struct ParseMeta {
     escalated_crops: usize,
     #[serde(default)]
     escalation_skipped: Option<String>,
+    #[serde(default)]
+    notes: Vec<String>,
 }
 
 /// Bumped when the way an extraction is asked changes without the prompt
@@ -87,18 +89,27 @@ impl DocCache {
             elements: meta.elements,
             escalated_crops: meta.escalated_crops,
             escalation_skipped: meta.escalation_skipped,
+            notes: meta.notes,
             from_cache: true,
         })
     }
 
     pub fn store_parse(&self, sha256: &str, fingerprint: &str, doc: &ParsedDocument) -> Result<()> {
         let dir = self.parse_dir(sha256, fingerprint);
-        fs::create_dir_all(&dir)?;
+        // An unwritable cache names itself: a bare "Permission denied"
+        // doesn't say which directory to fix.
+        self.write_parse(&dir, doc)
+            .map_err(|e| DocError::Io(format!("parse cache {}: {e}", dir.display())))
+    }
+
+    fn write_parse(&self, dir: &Path, doc: &ParsedDocument) -> std::io::Result<()> {
+        fs::create_dir_all(dir)?;
         let meta = ParseMeta {
             pages: doc.pages,
             elements: doc.elements,
             escalated_crops: doc.escalated_crops,
             escalation_skipped: doc.escalation_skipped.clone(),
+            notes: doc.notes.clone(),
         };
         // Write into place last so a torn write never reads as a hit.
         fs::write(dir.join("text.txt"), &doc.text)?;
@@ -112,7 +123,6 @@ impl DocCache {
         Ok(())
     }
 
-    /// Key for one crop reading: the pixels, what was asked, and who was asked.
     pub fn reading_key(model: &str, prompt: &str, png: &[u8]) -> String {
         let mut h = Sha256::new();
         h.update(model.as_bytes());
@@ -191,6 +201,7 @@ mod tests {
             elements: 3,
             escalated_crops: 1,
             escalation_skipped: None,
+            notes: vec!["page 2 unread".into()],
             from_cache: false,
         };
         assert!(cache.load_parse("abc", "fp").is_none());
@@ -199,7 +210,33 @@ mod tests {
         assert!(hit.from_cache);
         assert_eq!(hit.text, "hello");
         assert_eq!(hit.pages, 2);
+        assert_eq!(hit.notes, doc.notes);
         assert!(cache.load_parse("abc", "other").is_none());
+        fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_cache_that_cant_be_written_names_itself() {
+        let dir = tempdir();
+        // A file where the cache directory should be.
+        let root = dir.join("cache");
+        fs::write(&root, "").unwrap();
+        let doc = ParsedDocument {
+            doco: "{}".into(),
+            text: "hello".into(),
+            pages: 0,
+            elements: 0,
+            escalated_crops: 0,
+            escalation_skipped: None,
+            notes: Vec::new(),
+            from_cache: false,
+        };
+        let err = DocCache::new(&root)
+            .store_parse("abc", "fp", &doc)
+            .unwrap_err()
+            .to_string();
+        assert!(err.starts_with("parse cache "), "{err}");
+        assert!(err.contains(&root.display().to_string()), "{err}");
         fs::remove_dir_all(dir).ok();
     }
 

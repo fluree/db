@@ -25,7 +25,7 @@ fluree export [LEDGER] [OPTIONS]
 | `--raw-reifies` | Emit edge annotations as raw `f:reifies*` system triples instead of RDF 1.2 annotation syntax (pre-4.2 output). |
 | `--context <JSON>` | JSON-LD context for prefix declarations. Overrides the ledger's default context. |
 | `--context-file <FILE>` | Read context from a JSON file. Overrides the ledger's default context. |
-| `--at <TIME>` | Export data as of a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `iso:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. If omitted, exports at the latest committed time (including data committed but not yet persisted to index). |
+| `--at <TIME>` | Export data as of a specific point in time. `t:<N>` (transaction number), `t:latest` or `latest`, `time:<ISO-8601>` (commit event time), `recorded:<ISO-8601>` (the wall-clock time the commit was recorded), or `commit:<hex-prefix>`. A bare transaction number, ISO-8601 timestamp or commit prefix also works; a commit prefix must be at least 6 characters in either spelling; a bare integer is read as a transaction number, so use `commit:<prefix>` to force an all-digit prefix. If omitted, exports at the latest committed time (including data committed but not yet persisted to index). |
 
 ## Formats
 
@@ -59,6 +59,24 @@ Every ledger has two system graphs, `urn:fluree:<ledger>:main#txn-meta` (commit 
 
 `--system-graphs` emits them anyway, for diagnostics. Use `--format ledger` to move a ledger — it carries commits rather than re-serializing triples, and round-trips losslessly.
 
+### Blank nodes
+
+Blank nodes are written by their stored labels (`_:fdb-…`), so inserting an export back into a ledger addresses the same nodes. Older data can hold labels that Turtle and N-Triples don't allow: labels earlier versions minted for a SPARQL UPDATE's `[ … ]`, `( … )` and annotations (such as `_:fdb-…-#bnpl0`), and labels from imports by Fluree 4.1.4 or earlier, which contain `/` and `:`. Export writes such a label as `_:x` followed by the label's hex, as query results do, so the file parses; a node written that way inserts as a new blank node with the same properties. JSON-LD export writes every label as stored. (`fluree create --from` gives every blank node a new id whatever its label.)
+
+### Lists
+
+A list — a JSON-LD `@list`, or a Turtle `( … )` in object position — is stored as ordered values of its predicate, and export writes it in that order:
+
+| Format | Output |
+|---|---|
+| `turtle`, `trig` | `ex:s ex:items ( "c" "a" "b" ) .` |
+| `jsonld` | `{"@id": "ex:s", "ex:items": {"@list": ["c", "a", "b"]}}` |
+| `ntriples`, `nquads` | `<ex:s> <ex:items> _:l0-0 .`, then `rdf:first`/`rdf:rest` triples ending in `rdf:nil` |
+
+Turtle, TriG and JSON-LD insert back as the same list. N-Triples and N-Quads have no list syntax, so they write the `rdf:first`/`rdf:rest` chain that a Turtle `( … )` stands for, which other RDF tools read as the same list. Inserted or upserted into Fluree, that chain is stored as a list again. A bulk import (`fluree create --from`) stores it as the blank nodes and triples it spells out, so use Turtle, TriG or JSON-LD to copy lists between ledgers that way.
+
+A second list on one subject and property is stored as its triples (see [Writing lists](../query/sparql.md#writing-lists)), and export writes those triples.
+
 ### Edge annotations (RDF 1.2)
 
 An edge annotation attaches a reifier to one specific triple: `ex:alice ex:knows ex:bob ~ ex:claim1 {| ex:confidence 0.8 |}`. Fluree stores that as seven reserved `f:reifies*` system facts plus the reifier's own properties. Export used to emit those system facts verbatim — output no other RDF 1.2 tool understands, and which Fluree's own insert and update surfaces reject as system-controlled predicates.
@@ -79,6 +97,8 @@ ex:alice
 ex:claim1
     ex:confidence "0.8"^^xsd:decimal .
 ```
+
+JSON-LD's `@type` holds IRIs only, so an annotated type, like a list of types, is written as an `rdf:type` property: `"rdf:type": {"@id": "ex:A", "@annotation": {"@id": "ex:claim1"}}`. Fluree's JSON-LD insert reads it back as the same type.
 
 `--raw-reifies` restores the pre-4.2 output. That output only re-imports through `fluree create --from`; the insert and update surfaces reject hand-written `f:reifies*` triples.
 

@@ -58,7 +58,7 @@ Every commit references an **original transaction blob** — the raw request (JS
 The CLI uses the **pack protocol** (`fluree-pack-v1`) as the primary transport for clone and pull. Pack transfers all missing CAS objects (commits + txn blobs, and by default index artifacts) in a single streaming HTTP request, avoiding per-object round-trips.
 
 If the remote server does not support the pack endpoint (returns 404, 405, 406, or 501), the CLI automatically falls back to:
-- **Named-remote mode**: paginated JSON export via `GET /commits/{ledger}` (500 commits per page)
+- **Named-remote mode**: paginated JSON export via `GET /commits/{ledger}` (500 commits per page). The export sends the first-parent line and, separately, the commits its merges brought in. A server too old to export that way can still serve a history without merges.
 - **Origin mode**: CID chain walk via `GET /storage/objects/{cid}` (one round-trip per commit)
 
 This fallback is transparent -- no user action is required.

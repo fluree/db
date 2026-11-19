@@ -4,9 +4,12 @@
 //! Both produce the same `Vec<TxnMetaEntry>` and are merged by
 //! [`extract_txn_meta`].
 //!
-//! # 1. Envelope form (`@graph` present)
+//! # 1. Envelope form (`@graph` holding node objects, no top-level `@id`)
 //!
-//! Top-level non-reserved keys are metadata; `@graph` contents are data.
+//! Top-level non-reserved keys are metadata; `@graph` contents are data. A
+//! single node with a graph selector (`"@graph": "<iri>"`) and a JSON-LD
+//! named graph (`{"@id": G, "@graph": [...]}`) are not envelopes: their other
+//! keys are data (see `fluree_graph_json_ld::doc_shape`).
 //!
 //! ```json
 //! {
@@ -44,29 +47,29 @@ use crate::namespace::NamespaceRegistry;
 use crate::parse::jsonld::expand_datatype_iri;
 use fluree_db_novelty::{TxnMetaEntry, TxnMetaValue, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES};
 use fluree_graph_json_ld::{details_with_policy, ParsedContext};
-use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB, FLUREE_URN};
 use serde_json::Value;
 
-/// Namespace codes that are reserved for Fluree-generated provenance and must
-/// never appear as a user-supplied txn-meta predicate. System provenance
-/// (commit address, t, time, identity, etc.) is emitted on the same commit
-/// subject as user metadata — allowing these namespaces would let a user
-/// clobber or shadow real provenance properties.
+/// Refuse a txn-meta predicate a transaction may not set.
 ///
-/// FLUREE_DB is handled separately via `FLUREE_DB_USER_ALLOWED` below:
-/// `f:message` and `f:author` are explicitly permitted as user claims.
+/// System provenance (commit address, t, time, identity, revert targets, …)
+/// lives on the same commit subject as user metadata, so a predicate in a
+/// Fluree namespace would clobber or shadow it. Only `f:message` and
+/// `f:author` are user claims ([`fluree_vocab::txn_meta::user_may_set`]).
+/// Every reader of user txn-meta calls this: the JSON-LD sidecar and envelope
+/// here, and the TriG `<#txn-meta>` block in a transaction and in bulk import.
 ///
-/// Why check by namespace code (not IRI string): the code is already resolved
-/// at the call site, comparison is O(1), and it's immune to IRI encoding
-/// tricks (percent-encoding, alternate prefixes, etc.).
-const RESERVED_PREDICATE_NAMESPACES: &[u16] = &[FLUREE_COMMIT, FLUREE_URN];
-
-/// Local names in the `FLUREE_DB` namespace that users *may* set as txn-meta.
-///
-/// `f:message` — commit message (free-form user claim).
-/// `f:author` — commit author (user claim; distinct from `f:identity` which is
-/// the authenticated subject and is system-controlled).
-const FLUREE_DB_USER_ALLOWED: &[&str] = &[fluree_vocab::db::MESSAGE, fluree_vocab::db::AUTHOR];
+/// The check is by namespace code, not IRI string: the code is already
+/// resolved at the call site, and it's immune to IRI encoding tricks
+/// (percent-encoding, alternate prefixes, etc.). `shown` names the predicate
+/// as the user wrote it.
+pub(crate) fn check_user_predicate(ns: u16, name: &str, shown: &str) -> Result<()> {
+    if fluree_vocab::txn_meta::user_may_set(ns, name) {
+        return Ok(());
+    }
+    Err(TransactError::Parse(format!(
+        "txn-meta predicate {shown} uses a Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable"
+    )))
+}
 
 /// The top-level body key for the txn-meta sidecar.
 ///
@@ -101,8 +104,9 @@ const RESERVED_KEYS: &[&str] = &[
 ///    metadata. Works for any transaction shape (insert/upsert/update). The
 ///    block may carry its own `@context`; otherwise it inherits the outer
 ///    context.
-/// 2. **Envelope form**: when `@graph` is present, top-level non-reserved
-///    keys are also treated as metadata.
+/// 2. **Envelope form**: when the document is an envelope (`@graph` holding
+///    node objects, no top-level `@id`), top-level non-reserved keys are also
+///    treated as metadata.
 ///
 /// Both forms run through the same predicate validation (Fluree-namespace
 /// allowlist — only `f:message` and `f:author` permitted in `f:`).
@@ -157,8 +161,11 @@ pub fn extract_txn_meta(
         }
     }
 
-    // Envelope form: top-level non-reserved keys when @graph is present.
-    if obj.contains_key("@graph") {
+    // Envelope form: top-level non-reserved keys, only when the document is
+    // an envelope (`@graph` node content, no `@id`). The keys beside a graph
+    // selector on a single node, or beside a JSON-LD named graph's content,
+    // are that node's data, not metadata.
+    if fluree_graph_json_ld::doc_shape(obj)? == fluree_graph_json_ld::DocShape::Envelope {
         for (key, value) in obj {
             if key.starts_with('@') || RESERVED_KEYS.contains(&key.as_str()) {
                 continue;
@@ -188,17 +195,11 @@ fn extract_one_entry(
     let predicate_ns = sid.namespace_code;
     let predicate_name = sid.name.to_string();
 
-    if RESERVED_PREDICATE_NAMESPACES.contains(&predicate_ns) {
-        return Err(TransactError::Parse(format!(
-            "txn-meta predicate '{key}' (expanded: '{expanded_iri}') uses Fluree-reserved namespace and would collide with system provenance; use a different namespace"
-        )));
-    }
-
-    if predicate_ns == FLUREE_DB && !FLUREE_DB_USER_ALLOWED.contains(&predicate_name.as_str()) {
-        return Err(TransactError::Parse(format!(
-            "txn-meta predicate '{key}' (expanded: '{expanded_iri}') uses Fluree-reserved namespace and would collide with system provenance; only f:message and f:author are user-settable"
-        )));
-    }
+    check_user_predicate(
+        predicate_ns,
+        &predicate_name,
+        &format!("'{key}' (expanded: '{expanded_iri}')"),
+    )?;
 
     let meta_values = json_to_txn_meta_values(value, context, ns_registry, strict)?;
     for mv in meta_values {
@@ -488,10 +489,12 @@ mod tests {
         let mut ns = test_registry();
         let ctx = empty_context();
 
+        // (An `@id` beside `@graph` content makes the document a JSON-LD
+        // named graph, not an envelope; see
+        // `named_graph_object_keys_are_data_not_txn_meta`.)
         let json = json!({
             "@context": {},
             "@graph": [],
-            "@id": "ignored",
             "@type": "ignored",
             "@base": "ignored",
             "@vocab": "ignored",
@@ -501,6 +504,88 @@ mod tests {
         let result = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].predicate_name, "keep");
+    }
+
+    /// P10e: a single node carrying a graph selector is not an envelope. Its
+    /// other keys are its data; they used to be written as data and ALSO as
+    /// transaction metadata.
+    #[test]
+    fn single_object_with_graph_selector_has_no_txn_meta() {
+        let mut ns = test_registry();
+        for selector in [
+            json!("http://example.org/g"),
+            json!({"@id": "http://example.org/g"}),
+        ] {
+            let json = json!({
+                "@id": "http://example.org/s",
+                "@graph": selector,
+                "http://example.org/p": 1
+            });
+            let result = extract_txn_meta(&json, &empty_context(), &mut ns, true).unwrap();
+            assert!(result.is_empty(), "{json}: {result:?}");
+        }
+    }
+
+    /// A JSON-LD 1.1 named graph's other keys are properties of the graph
+    /// node (data), not transaction metadata.
+    #[test]
+    fn named_graph_object_keys_are_data_not_txn_meta() {
+        let mut ns = test_registry();
+        let json = json!({
+            "@id": "http://example.org/G",
+            "@graph": [{"@id": "http://example.org/a", "http://example.org/p": 1}],
+            "http://example.org/label": "w"
+        });
+        let result = extract_txn_meta(&json, &empty_context(), &mut ns, true).unwrap();
+        assert!(result.is_empty(), "{result:?}");
+    }
+
+    /// solo's MCP write sends one property-bearing node as the `@graph` value
+    /// (an object, not an array) with the commit metadata beside it. That is
+    /// an envelope: the siblings stay transaction metadata.
+    #[test]
+    fn single_node_envelope_keeps_its_txn_meta() {
+        let mut ns = test_registry();
+        let ctx = fluree_graph_json_ld::parse_context(&json!({
+            "f": "https://ns.flur.ee/db#",
+            "ex": "http://example.org/"
+        }))
+        .unwrap();
+        let json = json!({
+            "@graph": {"@id": "ex:a", "ex:p": 1},
+            "f:message": "from the assistant",
+            "f:author": "did:example:agent",
+            "ex:batch": 7
+        });
+        let result = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap();
+        let mut names: Vec<&str> = result.iter().map(|e| e.predicate_name.as_str()).collect();
+        names.sort_unstable();
+        assert_eq!(names, ["author", "batch", "message"]);
+    }
+
+    /// The same single-object envelope holding a bare reference (solo's MCP
+    /// wrapper around a context-free `{"@id"}` document) is still an
+    /// envelope, exactly like its one-element array form: the siblings stay
+    /// transaction metadata rather than becoming data in a graph named by
+    /// the reference.
+    #[test]
+    fn single_bare_reference_envelope_keeps_its_txn_meta() {
+        let mut ns = test_registry();
+        let ctx = fluree_graph_json_ld::parse_context(&json!({
+            "f": "https://ns.flur.ee/db#",
+            "ex": "http://example.org/"
+        }))
+        .unwrap();
+        for graph in [
+            json!({"@id": "http://example.org/X"}),
+            json!([{"@id": "http://example.org/X"}]),
+        ] {
+            let json = json!({"@graph": graph, "f:message": "hello", "ex:batch": 7});
+            let result = extract_txn_meta(&json, &ctx, &mut ns, true).unwrap();
+            let mut names: Vec<&str> = result.iter().map(|e| e.predicate_name.as_str()).collect();
+            names.sort_unstable();
+            assert_eq!(names, ["batch", "message"], "{json}");
+        }
     }
 
     #[test]

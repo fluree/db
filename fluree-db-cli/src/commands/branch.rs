@@ -193,13 +193,8 @@ async fn run_create(
         }
         LedgerMode::Local { fluree, alias } => {
             let (ledger_name, _) = split_ledger_id(&alias)?;
-            let at_commit = match at {
-                Some(s) => Some(fluree_db_api::CommitRef::parse(s).map_err(CliError::from)?),
-                None => None,
-            };
-            let record = fluree
-                .create_branch(&ledger_name, name, from, at_commit)
-                .await?;
+            let at = at.map(super::query::parse_time_spec).transpose()?;
+            let record = fluree.create_branch(&ledger_name, name, from, at).await?;
 
             let source = record.source_branch.as_deref().unwrap_or("main");
             let t = record.commit_t;

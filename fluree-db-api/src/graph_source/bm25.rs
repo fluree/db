@@ -4,7 +4,7 @@
 //! BM25 full-text search indexes.
 
 use crate::graph_source::config::Bm25CreateConfig;
-use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map};
+use crate::graph_source::helpers::{expand_ids_in_results, extract_prefix_map, latest_drop_read};
 use crate::graph_source::result::{
     Bm25CreateResult, Bm25DropResult, Bm25StalenessCheck, Bm25SyncResult, SnapshotSelection,
 };
@@ -215,10 +215,11 @@ async fn delete_old_snapshots(storage: &dyn Storage, graph_source_id: &str, cids
     }
 }
 
-/// Default snapshot retention for BM25 manifests.
-/// Uses the same default as index GC (`gc_max_old_indexes` + 1 for current).
+/// Snapshots a BM25 manifest keeps, the current one included. A count alone:
+/// unlike index GC there is no age guard, so it keeps the retention index GC
+/// had before its age guard became the default.
 fn snapshot_retention() -> usize {
-    (crate::wasm_compat::DEFAULT_MAX_OLD_INDEXES as usize) + 1
+    6
 }
 
 // =============================================================================
@@ -668,6 +669,7 @@ impl crate::Fluree {
         graph_source_id: &str,
         as_of_t: i64,
     ) -> Result<Option<SnapshotSelection>> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let manifest = self.load_bm25_manifest(graph_source_id).await?;
 
         match manifest.select_snapshot(as_of_t) {
@@ -689,6 +691,7 @@ impl crate::Fluree {
         graph_source_id: &str,
         as_of_t: i64,
     ) -> Result<(Arc<fluree_db_query::bm25::Bm25Index>, i64)> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let selection = self
             .select_bm25_snapshot(graph_source_id, as_of_t)
             .await?
@@ -714,6 +717,7 @@ impl crate::Fluree {
         &self,
         graph_source_id: &str,
     ) -> Result<Arc<fluree_db_query::bm25::Bm25Index>> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         let manifest = self.load_bm25_manifest(graph_source_id).await?;
         let head = manifest.head().ok_or_else(|| {
             crate::ApiError::NotFound(format!("No snapshots in manifest for: {graph_source_id}"))
@@ -953,6 +957,7 @@ impl crate::Fluree {
     ///
     /// This is a lightweight check that only looks up nameservice records.
     pub async fn check_bm25_staleness(&self, graph_source_id: &str) -> Result<Bm25StalenessCheck> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         // Look up graph source record
         let record = self
             .nameservice()
@@ -1019,7 +1024,7 @@ impl crate::Fluree {
             })?;
 
         if record.retracted {
-            return Err(crate::ApiError::Drop(format!(
+            return Err(crate::ApiError::GraphSourceRetracted(format!(
                 "Cannot sync retracted graph source: {graph_source_id}"
             )));
         }
@@ -1035,6 +1040,7 @@ impl crate::Fluree {
         use fluree_db_core::trace_first_parent_commits_by_id;
         use fluree_db_query::bm25::{CompiledPropertyDeps, IncrementalUpdater};
         use futures::StreamExt;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting BM25 index sync");
 
@@ -1088,6 +1094,22 @@ impl crate::Fluree {
                 new_watermark: old_watermark,
                 was_full_resync: false,
             });
+        }
+
+        // A drop names graphs, not the facts it took, so the commit walk below
+        // cannot find the documents it took. A drop since the last sync of a
+        // graph the query reads takes the full rebuild, which also retires the
+        // snapshots from before it.
+        if let Some(floor) =
+            latest_drop_read(&ledger.snapshot, &query).filter(|floor| *floor > old_watermark)
+        {
+            info!(
+                graph_source_id = %graph_source_id,
+                old_watermark = old_watermark,
+                drop_t = floor,
+                "A graph the indexing query reads was dropped since the last sync; running a full resync"
+            );
+            return self.resync_bm25_index(graph_source_id).await;
         }
 
         // 4. Get head commit CID for tracing
@@ -1320,6 +1342,7 @@ impl crate::Fluree {
     /// and rebuilds the index from scratch.
     pub async fn resync_bm25_index(&self, graph_source_id: &str) -> Result<Bm25SyncResult> {
         use fluree_db_query::bm25::IncrementalUpdater;
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(graph_source_id = %graph_source_id, "Starting BM25 full resync");
 
@@ -1389,10 +1412,16 @@ impl crate::Fluree {
         // 6. Persist updated index blob
         let new_snapshot_id = self.write_bm25_snapshot(graph_source_id, &index).await?;
 
-        // 7. Update manifest, trim old snapshots, and publish
+        // 7. Update manifest, retire and trim old snapshots, and publish.
+        //    The snapshots from before a drop of a graph the query reads hold
+        //    what it took; this rebuild covers the drop, so they leave in the
+        //    same publish that adds it.
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(ledger_t, new_snapshot_id.clone()));
-        let removed = manifest.trim(snapshot_retention());
+        let mut removed = latest_drop_read(&ledger.snapshot, &query)
+            .map(|floor| manifest.retire_before(floor))
+            .unwrap_or_default();
+        removed.extend(manifest.trim(snapshot_retention()));
         self.publish_bm25_manifest(graph_source_id, &manifest, ledger_t)
             .await?;
 
@@ -1431,6 +1460,7 @@ impl crate::Fluree {
         Arc<fluree_db_query::bm25::Bm25Index>,
         Option<Bm25SyncResult>,
     )> {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         // Look up graph source record
         let record = self
             .nameservice()
@@ -1499,6 +1529,7 @@ impl crate::Fluree {
         timeout_ms: Option<u64>,
     ) -> Result<Bm25SyncResult> {
         use fluree_db_query::bm25::{Bm25IndexBuilder, IncrementalUpdater, PropertyDeps};
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
 
         info!(
             graph_source_id = %graph_source_id,
@@ -1589,10 +1620,16 @@ impl crate::Fluree {
         // 6. Persist versioned snapshot blob
         let snapshot_id = self.write_bm25_snapshot(graph_source_id, &index).await?;
 
-        // 7. Update manifest, trim old snapshots, and publish
+        // 7. Update manifest, retire and trim old snapshots, and publish. As
+        //    in a full resync, the snapshots from before a drop of a graph the
+        //    query reads leave; a drop after `target_t` took everything the
+        //    snapshots before this one hold of the graph.
         let mut manifest = manifest;
         manifest.append(Bm25SnapshotEntry::new(target_t, snapshot_id));
-        let removed = manifest.trim(snapshot_retention());
+        let mut removed = latest_drop_read(&view.snapshot, &query)
+            .map(|floor| manifest.retire_before(floor.min(target_t)))
+            .unwrap_or_default();
+        removed.extend(manifest.trim(snapshot_retention()));
         let effective_t = manifest.head().map(|h| h.index_t).unwrap_or(target_t);
         self.publish_bm25_manifest(graph_source_id, &manifest, effective_t)
             .await?;
@@ -1652,6 +1689,7 @@ impl crate::Fluree {
     /// 2. Deletes all snapshot files from storage
     pub async fn drop_full_text_index(&self, graph_source_id: &str) -> Result<Bm25DropResult>
 where {
+        let graph_source_id = &crate::LedgerId::parse(graph_source_id)?;
         info!(graph_source_id = %graph_source_id, "Dropping BM25 full-text index");
 
         // 1. Look up graph source record to verify it exists

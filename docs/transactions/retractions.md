@@ -304,13 +304,67 @@ Remove entities with specific property:
 
 ### Idempotent
 
-Retracting a non-existent triple is a no-op:
+Retracting a triple that is not stored is a no-op, and a transaction that
+retracts nothing else commits nothing:
 
 ```text
 t=1: No triple exists
-t=2: DELETE { ex:alice schema:age 30 }
-     Result: No change (triple didn't exist)
+t=2: DELETE DATA { ex:alice schema:age 30 }
+     Result: nothing is committed; the ledger stays at t=1
 ```
+
+The same holds in a named graph the ledger does not have: a DELETE that
+names one (`DELETE DATA { GRAPH <g> { … } }`, `WITH <g>`, a `GRAPH ?g` bound
+to it) retracts nothing there and does not create the graph. An INSERT into
+a new graph, a sync, or `CREATE GRAPH` creates it.
+
+A DELETE names RDF terms exactly. The datatype must match the stored one
+(`30` is `xsd:integer`, so it does not retract `"30"^^xsd:int`); a language
+tag matches case-insensitively (`"a"@EN` retracts a stored `"a"@en`). A
+`DELETE`/`INSERT` of a triple that is not stored therefore inserts it — the
+retraction names nothing, so it cannot cancel the insertion (SPARQL 1.1
+Update's `(DS − D) ∪ I`):
+
+```sparql
+DELETE { ex:alice schema:age 30 } INSERT { ex:alice schema:age 30 } WHERE {}
+```
+
+stores `ex:alice schema:age 30` if it was absent, and commits nothing if it
+was present.
+
+The same holds when the `WHERE` has several solutions and the templates are
+instantiated once for each: a triple that any solution inserts is kept,
+however many solutions delete it, and a stored triple that solutions both
+delete and insert is not committed at all.
+
+An integer too large for 64 bits is matched by its value, not by the XSD
+subtype it was written with, since the index keeps no such subtype. A DELETE
+naming the same big integer under another integer datatype retracts it,
+whether it is indexed yet or not. Storage holds such an integer as one
+fact per value, so when a transaction retracts one and
+inserts the same value, the two cancel whatever subtype the insert names:
+`DELETE { x } INSERT { x } WHERE {}` commits nothing for it, as for any value
+that is present, and neither does a write that retracts it and inserts it
+under another subtype.
+
+### Lists
+
+A delete reaches a list's members as values of the property that holds the
+list. Deleting a value deletes every entry of a list that holds it, and the
+value where it is also stored beside the list. With
+`{"@id": "ex:s", "ex:items": {"@list": [1, 2, 1, 3]}}` stored, this leaves
+`ex:items` as the list `(2 3)`:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "delete": { "@id": "ex:s", "ex:items": 1 }
+}
+```
+
+To remove one entry of a list that repeats a value, or to replace a list,
+upsert the list. SPARQL deletes behave the same way: see
+[Writing lists](../query/sparql.md#writing-lists).
 
 ### No Cascading by Default
 

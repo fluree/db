@@ -5,7 +5,8 @@
 
 use crate::export_annotations::AnnotationProbe;
 use fluree_db_binary_index::format::branch::BranchManifest;
-use fluree_db_binary_index::read::types::sort_overlay_ops;
+use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
+use fluree_db_binary_index::read::types::{resolve_overlay_ops, sort_overlay_ops};
 use fluree_db_binary_index::{
     BinaryCursor, BinaryFilter, BinaryIndexStore, ColumnBatch, ColumnProjection, RunSortOrder,
 };
@@ -16,7 +17,7 @@ use fluree_db_core::{DecodeKind, Flake, GraphId, OType, OverlayProvider, Sid};
 use fluree_db_query::binary_scan::{
     translate_overlay_flakes_with_untranslated, EphemeralPredicateMap,
 };
-use fluree_graph_ir::canonical_xsd_double;
+use fluree_graph_ir::{canonical_xsd_double, syntax};
 use fluree_vocab::{namespaces, xsd};
 use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
@@ -160,6 +161,11 @@ fn apply_time_travel(
         );
         if !ops.is_empty() {
             sort_overlay_ops(&mut ops, RunSortOrder::Spot);
+            // Novelty holds a fact's whole lifecycle — an assert and a later
+            // retract both — and the cursor merges one op per fact: the
+            // latest. Unresolved, a fact asserted and then deleted since the
+            // index was built was exported.
+            resolve_overlay_ops(&mut ops);
             cursor.set_overlay_ops(ops.into());
         }
         (ephemeral_preds, surviving_untranslated(untranslated))
@@ -171,14 +177,17 @@ fn apply_time_travel(
 /// Resolve assert/retract set-semantics among the untranslated overlay flakes.
 ///
 /// Untranslated flakes bypass the cursor's overlay merge, so we apply the same
-/// rule here: for each fact identity `(s, p, o, dt, m)` keep the highest-`t`
-/// flake and emit it only if it is an assertion. `Flake`'s `Eq`/`Hash` key on
-/// fact identity (ignoring `t`/`op`), so the map collapses each identity.
+/// rule here: for each fact identity `(s, p, o, dt, m)` keep the flake that
+/// holds (the highest `t`, and at one `t` the assertion:
+/// `fluree_db_core::same_t`) and emit it only if it is an assertion.
+/// `Flake`'s `Eq`/`Hash` key on fact identity (ignoring `t`/`op`), so the map
+/// collapses each identity.
 fn surviving_untranslated(flakes: Vec<Flake>) -> Vec<Flake> {
     let mut latest: HashMap<Flake, Flake> = HashMap::with_capacity(flakes.len());
     for f in flakes {
         match latest.get(&f) {
-            Some(existing) if existing.t >= f.t => {}
+            Some(existing)
+                if !fluree_db_core::same_t::supersedes((f.t, f.op), (existing.t, existing.op)) => {}
             _ => {
                 latest.insert(f.clone(), f);
             }
@@ -275,7 +284,7 @@ impl<'a> ExportResolver<'a> {
     /// Mirrors `BinaryGraphView::resolve_subject_sid_uncached`: a novel id
     /// (above its namespace's watermark) resolves straight from `DictNovelty`
     /// to `Sid(ns_code, suffix)`, which is the exact value the transaction
-    /// wrote; anything persisted round-trips through the subject dictionary.
+    /// wrote; anything persisted resolves through the subject dictionary.
     /// Exactness matters because the resulting `EdgeKey` is a seek key into
     /// arena leaves sorted by the derived `Ord` — a Sid that differs in any
     /// position lands on the wrong span and reports "no annotations" rather
@@ -290,6 +299,9 @@ impl<'a> ExportResolver<'a> {
                     }
                 }
             }
+        }
+        if let Ok((ns_code, suffix)) = self.store.resolve_subject_parts(s_id) {
+            return self.store.subject_sid_of_parts(ns_code, suffix);
         }
         let iri = self.resolve_subject_iri(s_id)?;
         Ok(self
@@ -455,6 +467,12 @@ async fn batch_reifiers(
         if ann.is_reifies_row(p_id) {
             continue; // the bundle itself is never an annotated edge
         }
+        // Nor is a list item: the list index is part of the edge
+        // (`EdgeKey::matches`), and the key below has none, so it would name
+        // the bundles of the plain `s p o` edge beside it.
+        if row_list_index(batch, row).is_some() {
+            continue;
+        }
         let o_type = batch.o_type.get_or(row, 0);
         let o_key = batch.o_key.get(row);
         let Some(p) = resolver.resolve_predicate_sid(p_id) else {
@@ -509,106 +527,74 @@ fn row_reifiers(reifiers: &[Vec<Sid>], row: usize) -> &[Sid] {
 }
 
 // ---------------------------------------------------------------------------
-// Prefix map — IRI → prefixed name compression for Turtle/TriG
+// Lists
 // ---------------------------------------------------------------------------
 
-/// A sorted prefix map for compressing IRIs into prefixed names.
+/// A subject's stored lists, gathered while its rows stream past.
 ///
-/// Prefixes are sorted by IRI length descending so that longest-prefix-first
-/// matching produces the most specific result.
-#[derive(Debug, Clone)]
-pub struct PrefixMap {
-    /// (prefix, namespace_iri) sorted by namespace IRI length descending.
-    entries: Vec<(String, String)>,
+/// A list item is a row with a list index: a JSON-LD `@list` member, or an
+/// item of a Turtle `( … )` in object position. SPOT order reaches a
+/// predicate's items in object order, not list order, and overlay rows that
+/// missed V3 translation join only when the subject closes, so a list is
+/// written once its subject's last row has been read. Memory is the
+/// subject's list items.
+struct SubjectLists<T> {
+    lists: Vec<(String, Vec<(i64, T)>)>,
 }
 
-impl PrefixMap {
-    /// Build a prefix map from a JSON-LD `@context` object.
-    ///
-    /// Expects `{"prefix": "iri", ...}` — ignores entries where the value
-    /// is not a string or the key starts with `@`.
-    pub fn from_context(ctx: &serde_json::Value) -> Self {
-        let mut entries = Vec::new();
-        if let Some(obj) = ctx.as_object() {
-            for (key, val) in obj {
-                if key.starts_with('@') {
-                    continue;
-                }
-                if let Some(iri) = val.as_str() {
-                    entries.push((key.clone(), iri.to_string()));
-                }
+impl<T> SubjectLists<T> {
+    fn new() -> Self {
+        Self { lists: Vec::new() }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.lists.is_empty()
+    }
+
+    fn push(&mut self, p_iri: &str, index: i64, item: T) {
+        match self.lists.iter_mut().find(|(p, _)| p == p_iri) {
+            Some((_, items)) => items.push((index, item)),
+            None => self.lists.push((p_iri.to_string(), vec![(index, item)])),
+        }
+    }
+
+    /// Add `other`'s items after this subject's own.
+    fn absorb(&mut self, other: SubjectLists<T>) {
+        for (p_iri, items) in other.lists {
+            for (index, item) in items {
+                self.push(&p_iri, index, item);
             }
         }
-        // Sort by IRI length descending for longest-prefix-first matching
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-        PrefixMap { entries }
     }
 
-    /// Build from an explicit map of prefix → IRI.
-    pub fn from_map(map: BTreeMap<String, String>) -> Self {
-        let mut entries: Vec<(String, String)> = map.into_iter().collect();
-        entries.sort_by_key(|b| std::cmp::Reverse(b.1.len()));
-        PrefixMap { entries }
-    }
-
-    /// Try to compress a full IRI into a prefixed name (e.g., `ex:alice`).
-    ///
-    /// Returns `None` if no prefix matches or the local name contains
-    /// characters that are invalid in a Turtle prefixed name.
-    pub fn compact(&self, iri: &str) -> Option<String> {
-        for (prefix, ns) in &self.entries {
-            if let Some(local) = iri.strip_prefix(ns.as_str()) {
-                if is_valid_pname_local(local) {
-                    return Some(format!("{prefix}:{local}"));
-                }
-            }
-        }
-        None
-    }
-
-    /// Returns `true` if the map has any entries.
-    pub fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-
-    /// Iterate `(prefix, namespace_iri)` pairs.
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.entries.iter().map(|(p, n)| (p.as_str(), n.as_str()))
+    /// Each list, in the order its predicate was first seen, with its items
+    /// in index order. One predicate holds one list: items that share an
+    /// index keep scan order.
+    fn take(&mut self) -> Vec<(String, Vec<T>)> {
+        std::mem::take(&mut self.lists)
+            .into_iter()
+            .map(|(p_iri, mut items)| {
+                items.sort_by_key(|(index, _)| *index);
+                (p_iri, items.into_iter().map(|(_, item)| item).collect())
+            })
+            .collect()
     }
 }
 
-/// Check if `local` is a valid Turtle PN_LOCAL (simplified).
-///
-/// We allow ASCII alphanumeric, `-`, `_`, and `.` (but not leading/trailing `.`).
-/// This is conservative — the full Turtle grammar allows more, but this covers
-/// the vast majority of real-world local names without risking invalid output.
-fn is_valid_pname_local(local: &str) -> bool {
-    if local.is_empty() {
-        return true; // bare prefix like `ex:` is valid
-    }
-    if local.starts_with('.') || local.ends_with('.') {
-        return false;
-    }
-    local
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+/// The list index of a scanned row, or `None` for an ordinary value.
+#[inline]
+fn row_list_index(batch: &ColumnBatch, row: usize) -> Option<i64> {
+    let index = batch.o_i.get_or(row, LIST_INDEX_NONE);
+    (index != LIST_INDEX_NONE).then_some(i64::from(index))
 }
 
-/// Write `@prefix` declarations to a Turtle/TriG writer.
-pub fn write_prefix_declarations<W: Write>(prefixes: &PrefixMap, writer: &mut W) -> io::Result<()> {
-    // Sort alphabetically for deterministic, readable output
-    let mut sorted: Vec<(&str, &str)> = prefixes.iter().collect();
-    sorted.sort_by_key(|(p, _)| *p);
-    for (prefix, ns) in sorted {
-        write!(writer, "@prefix {prefix}: <")?;
-        write_escaped_iri(writer, ns)?;
-        writeln!(writer, "> .")?;
-    }
-    if !prefixes.is_empty() {
-        writeln!(writer)?; // blank line after prefixes
-    }
-    Ok(())
+/// The list index of an untranslated overlay flake.
+fn flake_list_index(flake: &Flake) -> Option<i64> {
+    flake.m.as_ref().and_then(|m| m.i).map(i64::from)
 }
+
+/// IRI → prefixed name compression for Turtle/TriG (and JSON-LD compact IRIs).
+pub use fluree_graph_format::PrefixMap;
 
 // ---------------------------------------------------------------------------
 // Turtle streaming export
@@ -645,7 +631,7 @@ pub async fn export_graph_turtle<W: Write>(
     let ann = AnnotationContext::new(&resolver, config);
 
     let mut stats = ExportStats::default();
-    let mut prev_subject: Option<String> = None;
+    let mut block: Option<TurtleBlock> = None;
 
     // Untranslated overlay rows are folded into the subject block they belong
     // to rather than appended after the stream, so a subject never opens twice
@@ -664,7 +650,7 @@ pub async fn export_graph_turtle<W: Write>(
             &batch,
             config.g_id,
             prefixes,
-            &mut prev_subject,
+            &mut block,
             &mut untranslated,
             &mut stats,
             writer,
@@ -672,19 +658,20 @@ pub async fn export_graph_turtle<W: Write>(
     }
 
     // Close last subject if any, folding in its untranslated rows first.
-    if let Some(s_iri) = prev_subject.take() {
-        if let Some(flakes) = untranslated.take(&s_iri) {
-            write_untranslated_turtle_continuations(
+    if let Some(mut last) = block.take() {
+        if let Some(flakes) = untranslated.take(&last.subject) {
+            write_untranslated_turtle_rows(
                 &resolver,
                 ann.as_ref(),
                 &untranslated_reifiers,
+                &mut last,
                 &flakes,
                 prefixes,
                 &mut stats,
                 writer,
             )?;
         }
-        writeln!(writer, " .")?;
+        last.close(writer, prefixes)?;
     }
 
     // Subjects the base stream never reached get their own blocks.
@@ -761,6 +748,69 @@ fn untranslated_reifiers_for<'m>(map: &'m HashMap<EdgeKey, Vec<Sid>>, flake: &Fl
         .unwrap_or(&[])
 }
 
+/// The Turtle subject block being written.
+struct TurtleBlock {
+    subject: String,
+    /// `predicate object` pairs written so far, which decides the separator.
+    pairs: usize,
+    lists: SubjectLists<Vec<u8>>,
+}
+
+impl TurtleBlock {
+    /// Write the subject term and open its block.
+    fn open<W: Write>(writer: &mut W, subject: String, prefixes: &PrefixMap) -> io::Result<Self> {
+        write_turtle_iri_or_bnode(writer, &subject, prefixes)?;
+        writer.write_all(b"\n    ")?;
+        Ok(Self {
+            subject,
+            pairs: 0,
+            lists: SubjectLists::new(),
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pairs == 0 && self.lists.is_empty()
+    }
+
+    /// Start the next `predicate object` pair.
+    fn next_pair<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        if self.pairs > 0 {
+            writer.write_all(b" ;\n    ")?;
+        }
+        self.pairs += 1;
+        Ok(())
+    }
+
+    /// Write the block's lists as `p ( … )` and close it.
+    fn close<W: Write>(mut self, writer: &mut W, prefixes: &PrefixMap) -> io::Result<()> {
+        for (p_iri, items) in self.lists.take() {
+            self.next_pair(writer)?;
+            write_turtle_predicate(writer, &p_iri, prefixes)?;
+            writer.write_all(b" (")?;
+            for item in &items {
+                writer.write_all(b" ")?;
+                writer.write_all(item)?;
+            }
+            writer.write_all(b" )")?;
+        }
+        writer.write_all(b" .\n")
+    }
+}
+
+/// Write a predicate as Turtle: `a` for `rdf:type`, else as `PrefixMap`
+/// writes an IRI.
+fn write_turtle_predicate<W: Write>(
+    w: &mut W,
+    p_iri: &str,
+    prefixes: &PrefixMap,
+) -> io::Result<()> {
+    if p_iri == fluree_vocab::rdf::TYPE {
+        w.write_all(b"a")
+    } else {
+        prefixes.write_iri(w, p_iri)
+    }
+}
+
 /// Write a batch of rows as Turtle, grouping by subject.
 #[allow(clippy::too_many_arguments)]
 fn write_turtle_batch<W: Write>(
@@ -771,7 +821,7 @@ fn write_turtle_batch<W: Write>(
     batch: &ColumnBatch,
     g_id: GraphId,
     prefixes: &PrefixMap,
-    prev_subject: &mut Option<String>,
+    block: &mut Option<TurtleBlock>,
     untranslated: &mut UntranslatedBySubject,
     stats: &mut ExportStats,
     writer: &mut W,
@@ -807,40 +857,41 @@ fn write_turtle_batch<W: Write>(
             continue;
         }
 
-        let same_subject = prev_subject.as_deref() == Some(&s_iri);
-
-        if same_subject {
-            // Continue same subject — semicolon separator
-            write!(writer, " ;\n    ")?;
-        } else {
-            // New subject — close previous if any, folding in the untranslated
-            // rows that belong to it so the block is written once.
-            if let Some(prev) = prev_subject.take() {
-                if let Some(flakes) = untranslated.take(&prev) {
-                    write_untranslated_turtle_continuations(
-                        resolver,
-                        ann,
-                        untranslated_reifiers,
-                        &flakes,
-                        prefixes,
-                        stats,
-                        writer,
-                    )?;
+        let open = match block.take() {
+            Some(open) if open.subject == s_iri => open,
+            prev => {
+                // New subject — close the previous block, folding in the
+                // untranslated rows that belong to it so it is written once.
+                if let Some(mut prev) = prev {
+                    if let Some(flakes) = untranslated.take(&prev.subject) {
+                        write_untranslated_turtle_rows(
+                            resolver,
+                            ann,
+                            untranslated_reifiers,
+                            &mut prev,
+                            &flakes,
+                            prefixes,
+                            stats,
+                            writer,
+                        )?;
+                    }
+                    prev.close(writer, prefixes)?;
                 }
-                writeln!(writer, " .")?;
+                TurtleBlock::open(writer, s_iri, prefixes)?
             }
-            // Write subject
-            write_turtle_iri_or_bnode(writer, &s_iri, prefixes)?;
-            write!(writer, "\n    ")?;
-            *prev_subject = Some(s_iri);
+        };
+        let open = block.insert(open);
+
+        if let Some(index) = row_list_index(batch, row) {
+            let mut object = Vec::new();
+            write_turtle_object(&mut object, &value, resolver.store, o_type, prefixes)?;
+            open.lists.push(&p_iri, index, object);
+            stats.triples_written += 1;
+            continue;
         }
 
-        // Write predicate
-        if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
-            writer.write_all(b"a")?;
-        } else {
-            write_turtle_iri(writer, &p_iri, prefixes)?;
-        }
+        open.next_pair(writer)?;
+        write_turtle_predicate(writer, &p_iri, prefixes)?;
         writer.write_all(b" ")?;
 
         // Write object
@@ -867,39 +918,39 @@ fn write_turtle_batch<W: Write>(
     Ok(())
 }
 
-/// Write an IRI as a Turtle prefixed name or `<full-iri>`.
-pub fn write_turtle_iri<W: Write>(w: &mut W, iri: &str, prefixes: &PrefixMap) -> io::Result<()> {
-    if let Some(pname) = prefixes.compact(iri) {
-        w.write_all(pname.as_bytes())
-    } else {
-        w.write_all(b"<")?;
-        write_escaped_iri(w, iri)?;
-        w.write_all(b">")
-    }
-}
-
 /// Write a subject term as Turtle (prefixed name, `<iri>`, or `_:bnode`).
 ///
-/// Blank-node labels are written verbatim, deliberately: an export has to
-/// round-trip, and rewriting a label to fit the Turtle grammar would merge two
-/// distinct nodes onto one id (contrast `crate::validate`, whose report output
-/// sanitizes because it does not round-trip).
-///
-/// Current blank-node ids are all writable as-is: import mints `[0-9a-z-]`
-/// (see `fluree_db_core::skolem`), staged transactions mint hex, `BNODE()`
-/// mints a UUID. Ledgers imported by Fluree 4.1.4 or earlier hold ids that
-/// embedded the ledger id, so they contain `/` and `:` and an export of such a
-/// ledger emits Turtle that strict parsers reject — the identity is preserved,
-/// the syntax is not. Re-importing the source fixes it.
+/// A blank node is written by its stored label, so re-inserting the export
+/// addresses the same `_:fdb-…` node. Labels minted now are all valid Turtle:
+/// import mints `[0-9a-z-]` (see `fluree_db_core::skolem`), a transaction
+/// mints hex plus the label it was given or a `-`-prefixed one of its own,
+/// and `BNODE()` mints a UUID. Older data can hold labels the grammar
+/// rejects: SPARQL UPDATE used to mint labels such as `#bnpl0` and `[]0`,
+/// and imports by Fluree 4.1.4 or earlier embedded the ledger id (`/`, `:`).
+/// Those are escaped as every RDF text writer escapes them
+/// ([`syntax::escape_blank_label`]), so the export parses, and the node
+/// re-inserts as a new blank node.
 fn write_turtle_iri_or_bnode<W: Write>(
     w: &mut W,
     iri: &str,
     prefixes: &PrefixMap,
 ) -> io::Result<()> {
-    if iri.starts_with("_:") {
-        w.write_all(iri.as_bytes())
-    } else {
-        write_turtle_iri(w, iri, prefixes)
+    write_bnode_or(w, iri, |w| prefixes.write_iri(w, iri))
+}
+
+/// Write `iri` as a blank node when it is one (see
+/// [`write_turtle_iri_or_bnode`]), else as `write_iri` writes it.
+fn write_bnode_or<W: Write>(
+    w: &mut W,
+    iri: &str,
+    write_iri: impl FnOnce(&mut W) -> io::Result<()>,
+) -> io::Result<()> {
+    match iri.strip_prefix("_:") {
+        Some(label) => {
+            w.write_all(b"_:")?;
+            syntax::write_blank_label(w, label)
+        }
+        None => write_iri(w),
     }
 }
 
@@ -971,10 +1022,8 @@ pub async fn export_graph_jsonld<W: Write>(
 
     let mut stats = ExportStats::default();
 
-    // Accumulate properties for the current subject.
-    // Key = predicate IRI, Value = list of JSON-LD values.
     let mut current_subject: Option<String> = None;
-    let mut current_props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+    let mut current_node = JsonLdNode::new();
     let mut first_node = true;
     let (untranslated, untranslated_reifiers) =
         resolve_untranslated(ann.as_ref(), untranslated).await?;
@@ -1011,21 +1060,6 @@ pub async fn export_graph_jsonld<W: Write>(
 
             // Convert to JSON-LD value
             let jval = flake_to_jsonld(&value, store, o_type, prefixes);
-            // One value per reifier, each carrying `@annotation` — the JSON-LD
-            // shape `parse/edge_annotations.rs` ingests. Repeating the base
-            // value is how the keyword attaches to an edge: two reifiers on
-            // one edge are two annotated occurrences of the same triple, which
-            // re-ingest to one triple and two bundles.
-            let jvals = match ann.as_ref() {
-                Some(ann) => annotated_jsonld_values(
-                    &resolver,
-                    ann,
-                    &jval,
-                    row_reifiers(&reifiers, row),
-                    prefixes,
-                ),
-                None => vec![jval],
-            };
 
             // Check if we've moved to a new subject
             let same_subject = current_subject.as_deref() == Some(&s_iri);
@@ -1039,23 +1073,36 @@ pub async fn export_graph_jsonld<W: Write>(
                             &untranslated_reifiers,
                             &flakes,
                             prefixes,
-                            &mut current_props,
+                            &mut current_node,
                             &mut stats,
                         );
                     }
-                    write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
+                    let props = std::mem::replace(&mut current_node, JsonLdNode::new()).finish();
+                    write_jsonld_node(writer, &subj_iri, &props, prefixes, first_node)?;
                     first_node = false;
                 }
                 current_subject = Some(s_iri);
-                current_props.clear();
             }
 
-            // Append value to the right predicate bucket
             let compact_p = compact_iri(&p_iri, prefixes);
-            if let Some(entry) = current_props.iter_mut().find(|(k, _)| *k == compact_p) {
-                entry.1.extend(jvals);
-            } else {
-                current_props.push((compact_p, jvals));
+            match (row_list_index(&batch, row), ann.as_ref()) {
+                (Some(index), _) => current_node.lists.push(&compact_p, index, jval),
+                // One value per reifier, each carrying `@annotation` — the
+                // JSON-LD shape `parse/edge_annotations.rs` ingests. Repeating
+                // the base value is how the keyword attaches to an edge: two
+                // reifiers on one edge are two annotated occurrences of the
+                // same triple, which re-ingest to one triple and two bundles.
+                (None, Some(ann)) => current_node.push(
+                    compact_p,
+                    annotated_jsonld_values(
+                        &resolver,
+                        ann,
+                        &jval,
+                        row_reifiers(&reifiers, row),
+                        prefixes,
+                    ),
+                ),
+                (None, None) => current_node.push(compact_p, [jval]),
             }
 
             stats.triples_written += 1;
@@ -1071,11 +1118,17 @@ pub async fn export_graph_jsonld<W: Write>(
                 &untranslated_reifiers,
                 &flakes,
                 prefixes,
-                &mut current_props,
+                &mut current_node,
                 &mut stats,
             );
         }
-        write_jsonld_node(writer, &subj_iri, &current_props, prefixes, first_node)?;
+        write_jsonld_node(
+            writer,
+            &subj_iri,
+            &current_node.finish(),
+            prefixes,
+            first_node,
+        )?;
         first_node = false;
     }
 
@@ -1084,16 +1137,17 @@ pub async fn export_graph_jsonld<W: Write>(
     // skipped, matching every other writer.
     let (remaining, unresolved) = untranslated.into_remaining();
     for (subj_iri, flakes) in &remaining {
-        let mut props: Vec<(String, Vec<serde_json::Value>)> = Vec::new();
+        let mut node = JsonLdNode::new();
         merge_untranslated_jsonld(
             &resolver,
             ann.as_ref(),
             &untranslated_reifiers,
             flakes,
             prefixes,
-            &mut props,
+            &mut node,
             &mut stats,
         );
+        let props = node.finish();
         if props.is_empty() {
             continue;
         }
@@ -1118,7 +1172,7 @@ fn merge_untranslated_jsonld(
     reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
     flakes: &[Flake],
     prefixes: &PrefixMap,
-    props: &mut Vec<(String, Vec<serde_json::Value>)>,
+    node: &mut JsonLdNode,
     stats: &mut ExportStats,
 ) {
     let store = resolver.store;
@@ -1130,25 +1184,56 @@ fn merge_untranslated_jsonld(
             stats.rows_skipped += 1;
             continue;
         };
+        let compact_p = compact_iri(&p_iri, prefixes);
         // Same `@annotation` shape the translated path emits, via the same
         // helper — an untranslated row is no less annotated.
-        let values = match ann {
-            Some(ann) => annotated_jsonld_values(
-                resolver,
-                ann,
-                &jval,
-                untranslated_reifiers_for(reifier_map, flake),
-                prefixes,
+        match (flake_list_index(flake), ann) {
+            (Some(index), _) => node.lists.push(&compact_p, index, jval),
+            (None, Some(ann)) => node.push(
+                compact_p,
+                annotated_jsonld_values(
+                    resolver,
+                    ann,
+                    &jval,
+                    untranslated_reifiers_for(reifier_map, flake),
+                    prefixes,
+                ),
             ),
-            None => vec![jval],
-        };
-        let compact_p = compact_iri(&p_iri, prefixes);
-        if let Some(entry) = props.iter_mut().find(|(k, _)| *k == compact_p) {
-            entry.1.extend(values);
-        } else {
-            props.push((compact_p, values));
+            (None, None) => node.push(compact_p, [jval]),
         }
         stats.triples_written += 1;
+    }
+}
+
+/// One subject's JSON-LD properties, accumulated until the subject closes.
+struct JsonLdNode {
+    /// Compact predicate → its values, in the order predicates were first seen.
+    props: Vec<(String, Vec<serde_json::Value>)>,
+    lists: SubjectLists<serde_json::Value>,
+}
+
+impl JsonLdNode {
+    fn new() -> Self {
+        Self {
+            props: Vec::new(),
+            lists: SubjectLists::new(),
+        }
+    }
+
+    fn push(&mut self, compact_p: String, values: impl IntoIterator<Item = serde_json::Value>) {
+        match self.props.iter_mut().find(|(k, _)| *k == compact_p) {
+            Some((_, existing)) => existing.extend(values),
+            None => self.props.push((compact_p, values.into_iter().collect())),
+        }
+    }
+
+    /// The node's properties, each list a `{"@list": […]}` value of its
+    /// predicate.
+    fn finish(mut self) -> Vec<(String, Vec<serde_json::Value>)> {
+        for (compact_p, items) in self.lists.take() {
+            self.push(compact_p, [serde_json::json!({ "@list": items })]);
+        }
+        self.props
     }
 }
 
@@ -1322,52 +1407,66 @@ fn write_jsonld_node<W: Write>(
     for (pred, values) in props {
         // rdf:type gets special @type treatment
         if *pred == rdf_type_compact || *pred == rdf_type {
-            writer.write_all(b", \"@type\": ")?;
-            // Extract @id values for types
-            let type_iris: Vec<&str> = values
-                .iter()
-                .filter_map(|v| {
-                    v.as_object()
-                        .and_then(|o| o.get("@id"))
-                        .and_then(|id| id.as_str())
-                })
-                .collect();
-            if type_iris.len() == 1 {
-                write!(writer, "\"{}\"", escape_json_string(type_iris[0]))?;
-            } else {
-                writer.write_all(b"[")?;
-                for (i, t) in type_iris.iter().enumerate() {
-                    if i > 0 {
-                        writer.write_all(b", ")?;
+            let type_iris: Vec<&str> = values.iter().filter_map(bare_id).collect();
+            if !type_iris.is_empty() {
+                writer.write_all(b", \"@type\": ")?;
+                if type_iris.len() == 1 {
+                    write!(writer, "\"{}\"", escape_json_string(type_iris[0]))?;
+                } else {
+                    writer.write_all(b"[")?;
+                    for (i, t) in type_iris.iter().enumerate() {
+                        if i > 0 {
+                            writer.write_all(b", ")?;
+                        }
+                        write!(writer, "\"{}\"", escape_json_string(t))?;
                     }
-                    write!(writer, "\"{}\"", escape_json_string(t))?;
+                    writer.write_all(b"]")?;
                 }
-                writer.write_all(b"]")?;
+            }
+            // `@type` holds IRIs only: a list, or a type carrying an
+            // `@annotation`, stays an `rdf:type` property.
+            let rest: Vec<&serde_json::Value> =
+                values.iter().filter(|v| bare_id(v).is_none()).collect();
+            if !rest.is_empty() {
+                write_jsonld_property(writer, pred, rest.into_iter())?;
             }
             continue;
         }
 
-        write!(writer, ", \"{}\": ", escape_json_string(pred))?;
-
-        if values.len() == 1 {
-            // Single cardinality — unwrap
-            let json_str = serde_json::to_string(&values[0]).unwrap_or_default();
-            writer.write_all(json_str.as_bytes())?;
-        } else {
-            // Multi cardinality — array
-            writer.write_all(b"[")?;
-            for (i, v) in values.iter().enumerate() {
-                if i > 0 {
-                    writer.write_all(b", ")?;
-                }
-                let json_str = serde_json::to_string(v).unwrap_or_default();
-                writer.write_all(json_str.as_bytes())?;
-            }
-            writer.write_all(b"]")?;
-        }
+        write_jsonld_property(writer, pred, values.iter())?;
     }
 
     writer.write_all(b"}")
+}
+
+/// The IRI of a `{"@id": …}` value with nothing else in it.
+fn bare_id(value: &serde_json::Value) -> Option<&str> {
+    let obj = value.as_object().filter(|o| o.len() == 1)?;
+    obj.get("@id")?.as_str()
+}
+
+/// Write `, "pred": value`: a single value unwrapped, several as an array.
+fn write_jsonld_property<'v, W: Write>(
+    writer: &mut W,
+    pred: &str,
+    values: impl ExactSizeIterator<Item = &'v serde_json::Value>,
+) -> io::Result<()> {
+    write!(writer, ", \"{}\": ", escape_json_string(pred))?;
+    let single = values.len() == 1;
+    if !single {
+        writer.write_all(b"[")?;
+    }
+    for (i, v) in values.enumerate() {
+        if i > 0 {
+            writer.write_all(b", ")?;
+        }
+        let json_str = serde_json::to_string(v).unwrap_or_default();
+        writer.write_all(json_str.as_bytes())?;
+    }
+    if !single {
+        writer.write_all(b"]")?;
+    }
+    Ok(())
 }
 
 /// Convert a FlakeValue to a JSON-LD value representation.
@@ -1607,10 +1706,15 @@ pub async fn export_graph_ntriples<W: Write>(
     let graph_term = config.graph_iri.as_deref().map(|iri| {
         let mut buf = String::with_capacity(iri.len() + 2);
         buf.push('<');
-        escape_iri_into(&mut buf, iri);
+        syntax::push_iri(&mut buf, iri);
         buf.push('>');
         buf
     });
+
+    // Untranslated list items join their subject's lists; the other rows are
+    // written after the stream.
+    let mut lists = NtLists::new(config.g_id, graph_term.as_deref());
+    let untranslated = lists.take_untranslated_items(store, untranslated, &mut stats)?;
 
     while let Some(batch) = cursor.next_batch()? {
         let reifiers = batch_reifiers(&resolver, ann.as_ref(), &batch, config.g_id).await?;
@@ -1620,11 +1724,12 @@ pub async fn export_graph_ntriples<W: Write>(
             &reifiers,
             &batch,
             config.g_id,
-            graph_term.as_deref(),
+            &mut lists,
             &mut stats,
             writer,
         )?;
     }
+    lists.finish(writer)?;
 
     // Emit overlay flakes that could not be encoded into V3 ops (e.g.
     // novelty-only language tags) directly from their decoded form.
@@ -1655,10 +1760,11 @@ fn write_batch<W: Write>(
     reifiers: &[Vec<Sid>],
     batch: &ColumnBatch,
     g_id: GraphId,
-    graph_term: Option<&str>,
+    lists: &mut NtLists<'_>,
     stats: &mut ExportStats,
     writer: &mut W,
 ) -> io::Result<()> {
+    let graph_term = lists.graph_term;
     for row in 0..batch.row_count {
         let s_id = batch.s_id.get(row);
         let p_id = batch.p_id.get_or(row, 0);
@@ -1691,13 +1797,22 @@ fn write_batch<W: Write>(
             continue;
         }
 
+        lists.enter(s_id, writer)?;
+        if let Some(index) = row_list_index(batch, row) {
+            let mut object = Vec::new();
+            write_object(&mut object, &value, resolver.store, o_type)?;
+            lists.push(&s_iri, &p_iri, index, object);
+            stats.triples_written += 1;
+            continue;
+        }
+
         // Write subject
         write_iri_or_bnode(writer, &s_iri)?;
         writer.write_all(b" ")?;
 
         // Write predicate (always an IRI)
         writer.write_all(b"<")?;
-        write_escaped_iri(writer, &p_iri)?;
+        syntax::write_iri(writer, &p_iri)?;
         writer.write_all(b"> ")?;
 
         // Write object
@@ -1722,11 +1837,11 @@ fn write_batch<W: Write>(
                 };
                 write_iri_or_bnode(writer, &r_iri)?;
                 writer.write_all(b" <")?;
-                write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+                syntax::write_iri(writer, fluree_vocab::rdf::REIFIES)?;
                 writer.write_all(b"> <<( ")?;
                 write_iri_or_bnode(writer, &s_iri)?;
                 writer.write_all(b" <")?;
-                write_escaped_iri(writer, &p_iri)?;
+                syntax::write_iri(writer, &p_iri)?;
                 writer.write_all(b"> ")?;
                 write_object(writer, &value, resolver.store, o_type)?;
                 writer.write_all(b" )>>")?;
@@ -1742,23 +1857,197 @@ fn write_batch<W: Write>(
     Ok(())
 }
 
+/// Stored lists for N-Triples and N-Quads, which have no `( … )`. Each is
+/// written once its subject's rows are read, as the `rdf:first`/`rdf:rest`
+/// spine a Turtle collection denotes.
+struct NtLists<'a> {
+    graph_term: Option<&'a str>,
+    g_id: GraphId,
+    /// The subject the scan is on, and its IRI once it has a list item.
+    s_id: Option<u64>,
+    s_iri: Option<String>,
+    items: SubjectLists<Vec<u8>>,
+    /// Untranslated list items, by subject IRI.
+    untranslated: BTreeMap<String, SubjectLists<Vec<u8>>>,
+    cells: u64,
+}
+
+impl<'a> NtLists<'a> {
+    fn new(g_id: GraphId, graph_term: Option<&'a str>) -> Self {
+        Self {
+            graph_term,
+            g_id,
+            s_id: None,
+            s_iri: None,
+            items: SubjectLists::new(),
+            untranslated: BTreeMap::new(),
+            cells: 0,
+        }
+    }
+
+    /// Hold the list items among `flakes` for their subjects, and return the
+    /// rest.
+    fn take_untranslated_items(
+        &mut self,
+        store: &BinaryIndexStore,
+        flakes: Vec<Flake>,
+        stats: &mut ExportStats,
+    ) -> io::Result<Vec<Flake>> {
+        let mut rest = Vec::with_capacity(flakes.len());
+        for flake in flakes {
+            let Some(index) = flake_list_index(&flake) else {
+                rest.push(flake);
+                continue;
+            };
+            let (Some(s_iri), Some(p_iri)) =
+                (store.sid_to_iri(&flake.s), store.sid_to_iri(&flake.p))
+            else {
+                stats.rows_skipped += 1;
+                continue;
+            };
+            let mut object = Vec::new();
+            if !write_raw_object(&mut object, store, &flake, None)? {
+                stats.rows_skipped += 1;
+                continue;
+            }
+            self.untranslated
+                .entry(s_iri)
+                .or_insert_with(SubjectLists::new)
+                .push(&p_iri, index, object);
+            stats.triples_written += 1;
+        }
+        Ok(rest)
+    }
+
+    /// Note that the scan is on `s_id`, writing the previous subject's lists
+    /// if it has moved on.
+    fn enter<W: Write>(&mut self, s_id: u64, writer: &mut W) -> io::Result<()> {
+        if self.s_id != Some(s_id) {
+            self.flush(writer)?;
+            self.s_id = Some(s_id);
+        }
+        Ok(())
+    }
+
+    fn push(&mut self, s_iri: &str, p_iri: &str, index: i64, object: Vec<u8>) {
+        if self.s_iri.is_none() {
+            self.s_iri = Some(s_iri.to_string());
+        }
+        self.items.push(p_iri, index, object);
+    }
+
+    /// Write the current subject's lists, with its untranslated items.
+    fn flush<W: Write>(&mut self, writer: &mut W) -> io::Result<()> {
+        let Some(s_iri) = self.s_iri.take() else {
+            return Ok(());
+        };
+        if let Some(untranslated) = self.untranslated.remove(&s_iri) {
+            self.items.absorb(untranslated);
+        }
+        for (p_iri, items) in self.items.take() {
+            self.write_spine(writer, &s_iri, &p_iri, &items)?;
+        }
+        Ok(())
+    }
+
+    /// Write the last subject's lists, then those of the subjects only
+    /// untranslated rows reached.
+    fn finish<W: Write>(mut self, writer: &mut W) -> io::Result<()> {
+        self.flush(writer)?;
+        for (s_iri, mut lists) in std::mem::take(&mut self.untranslated) {
+            for (p_iri, items) in lists.take() {
+                self.write_spine(writer, &s_iri, &p_iri, &items)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// `s <p> _:c0`, then `_:cK rdf:first item` and `_:cK rdf:rest` the next
+    /// cell, the last one's `rdf:rest` being `rdf:nil`.
+    fn write_spine<W: Write>(
+        &mut self,
+        writer: &mut W,
+        s_iri: &str,
+        p_iri: &str,
+        items: &[Vec<u8>],
+    ) -> io::Result<()> {
+        let mut cell = self.mint();
+        write_ntriples_triple(writer, s_iri, p_iri, cell.as_bytes())?;
+        end_statement(writer, self.graph_term)?;
+        for (k, item) in items.iter().enumerate() {
+            write_ntriples_triple(writer, &cell, fluree_vocab::rdf::FIRST, item)?;
+            end_statement(writer, self.graph_term)?;
+            let rest = if k + 1 == items.len() {
+                format!("<{}>", fluree_vocab::rdf::NIL)
+            } else {
+                self.mint()
+            };
+            write_ntriples_triple(writer, &cell, fluree_vocab::rdf::REST, rest.as_bytes())?;
+            end_statement(writer, self.graph_term)?;
+            cell = rest;
+        }
+        Ok(())
+    }
+
+    /// A fresh spine cell, `_:l<graph id>-<n>`. A stored blank node is
+    /// written with the `fdb-…` label it was minted under or escaped as
+    /// `x…`, so no cell shares a label with one; the graph id keeps the
+    /// graphs of an N-Quads dataset, each written by its own call, from
+    /// sharing cells.
+    fn mint(&mut self) -> String {
+        let cell = format!("_:l{}-{}", self.g_id, self.cells);
+        self.cells += 1;
+        cell
+    }
+}
+
+/// `s <p> o`, with `o` already written as a term.
+fn write_ntriples_triple<W: Write>(
+    w: &mut W,
+    s_iri: &str,
+    p_iri: &str,
+    object: &[u8],
+) -> io::Result<()> {
+    write_iri_or_bnode(w, s_iri)?;
+    w.write_all(b" <")?;
+    syntax::write_iri(w, p_iri)?;
+    w.write_all(b"> ")?;
+    w.write_all(object)
+}
+
+/// End an N-Triples statement, or an N-Quads one in `graph_term`.
+fn end_statement<W: Write>(w: &mut W, graph_term: Option<&str>) -> io::Result<()> {
+    if let Some(g) = graph_term {
+        w.write_all(b" ")?;
+        w.write_all(g.as_bytes())?;
+    }
+    w.write_all(b" .\n")
+}
+
 // ---------------------------------------------------------------------------
 // Term formatting
 // ---------------------------------------------------------------------------
 
-/// Write a subject term: `<iri>` or `_:bnode`.
+/// Write a subject term: `<iri>` or `_:bnode` (see
+/// [`write_turtle_iri_or_bnode`] for blank-node labels).
 fn write_iri_or_bnode<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
-    if iri.starts_with("_:") {
-        // Blank node — emit as-is (no angle brackets)
-        w.write_all(iri.as_bytes())
-    } else {
-        w.write_all(b"<")?;
-        write_escaped_iri(w, iri)?;
-        w.write_all(b">")
-    }
+    write_bnode_or(w, iri, |w| syntax::write_iri_ref(w, iri))
 }
 
 /// Write an object value as an N-Triples term.
+/// `@tag` after a literal. A tag has no escape form, so an invalid one would
+/// end the literal and read back as more triples: refuse it instead.
+fn write_lang_tag<W: Write>(w: &mut W, lang: &str) -> io::Result<()> {
+    if !syntax::is_lang_tag(lang) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("language tag {lang:?} cannot be written as Turtle or N-Triples"),
+        ));
+    }
+    w.write_all(b"\"@")?;
+    w.write_all(lang.as_bytes())
+}
+
 fn write_object<W: Write>(
     w: &mut W,
     value: &FlakeValue,
@@ -1777,21 +2066,20 @@ fn write_object<W: Write>(
             // Check for language tag first (takes precedence over datatype)
             if let Some(lang) = store.resolve_lang_tag(o_type) {
                 w.write_all(b"\"")?;
-                write_escaped_ntriples_string(w, s)?;
-                w.write_all(b"\"@")?;
-                w.write_all(lang.as_bytes())?;
+                syntax::write_string(w, s)?;
+                write_lang_tag(w, lang)?;
                 return Ok(());
             }
 
             // Resolve datatype; omit ^^<xsd:string> (implicit)
             let dt_iri = resolve_datatype_iri(store, o_type);
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, s)?;
+            syntax::write_string(w, s)?;
             w.write_all(b"\"")?;
             if let Some(dt) = &dt_iri {
                 if *dt != xsd::STRING {
                     w.write_all(b"^^<")?;
-                    write_escaped_iri(w, dt)?;
+                    syntax::write_iri(w, dt)?;
                     w.write_all(b">")?;
                 }
             }
@@ -1912,9 +2200,9 @@ fn write_object<W: Write>(
             let dt = resolve_datatype_iri(store, o_type)
                 .unwrap_or_else(|| "http://www.w3.org/1999/02/22-rdf-syntax-ns#JSON".to_string());
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, s)?;
+            syntax::write_string(w, s)?;
             w.write_all(b"\"^^<")?;
-            write_escaped_iri(w, &dt)?;
+            syntax::write_iri(w, &dt)?;
             w.write_all(b">")
         }
         FlakeValue::Vector(v) => {
@@ -1923,9 +2211,9 @@ fn write_object<W: Write>(
             // Serialize as JSON array string
             let json = serde_json::to_string(v).unwrap_or_else(|_| "[]".to_string());
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, &json)?;
+            syntax::write_string(w, &json)?;
             w.write_all(b"\"^^<")?;
-            write_escaped_iri(w, &dt)?;
+            syntax::write_iri(w, &dt)?;
             w.write_all(b">")
         }
         FlakeValue::GeoPoint(bits) => {
@@ -1933,9 +2221,9 @@ fn write_object<W: Write>(
                 .unwrap_or_else(|| "http://www.opengis.net/ont/geosparql#wktLiteral".to_string());
             let wkt = bits.to_string(); // "POINT(lng lat)"
             w.write_all(b"\"")?;
-            write_escaped_ntriples_string(w, &wkt)?;
+            syntax::write_string(w, &wkt)?;
             w.write_all(b"\"^^<")?;
-            write_escaped_iri(w, &dt)?;
+            syntax::write_iri(w, &dt)?;
             w.write_all(b">")
         }
 
@@ -1979,17 +2267,16 @@ fn write_raw_object<W: Write>(
         FlakeValue::String(s) => {
             if let Some(lang) = lang {
                 w.write_all(b"\"")?;
-                write_escaped_ntriples_string(w, s)?;
-                w.write_all(b"\"@")?;
-                w.write_all(lang.as_bytes())?;
+                syntax::write_string(w, s)?;
+                write_lang_tag(w, lang)?;
             } else {
                 w.write_all(b"\"")?;
-                write_escaped_ntriples_string(w, s)?;
+                syntax::write_string(w, s)?;
                 w.write_all(b"\"")?;
                 if let Some(dt) = dt_iri() {
                     if dt != xsd::STRING {
                         w.write_all(b"^^<")?;
-                        write_escaped_iri(w, &dt)?;
+                        syntax::write_iri(w, &dt)?;
                         w.write_all(b">")?;
                     }
                 }
@@ -2069,7 +2356,7 @@ fn write_raw_flake_ntriples<W: Write>(
     let mut body: Vec<u8> = Vec::new();
     write_iri_or_bnode(&mut body, &s_iri)?;
     body.write_all(b" <")?;
-    write_escaped_iri(&mut body, &p_iri)?;
+    syntax::write_iri(&mut body, &p_iri)?;
     body.write_all(b"> ")?;
     if !write_raw_object(&mut body, resolver.store, flake, None)? {
         stats.rows_skipped += 1;
@@ -2093,7 +2380,7 @@ fn write_raw_flake_ntriples<W: Write>(
             };
             write_iri_or_bnode(writer, &r_iri)?;
             writer.write_all(b" <")?;
-            write_escaped_iri(writer, fluree_vocab::rdf::REIFIES)?;
+            syntax::write_iri(writer, fluree_vocab::rdf::REIFIES)?;
             writer.write_all(b"> <<( ")?;
             writer.write_all(&body)?;
             writer.write_all(b" )>>")?;
@@ -2179,11 +2466,7 @@ fn write_raw_po_turtle(
     let Some(p_iri) = resolver.store.sid_to_iri(&flake.p) else {
         return Ok(false);
     };
-    if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
-        out.write_all(b"a")?;
-    } else {
-        write_turtle_iri(out, &p_iri, prefixes)?;
-    }
+    write_turtle_predicate(out, &p_iri, prefixes)?;
     out.write_all(b" ")?;
     if !write_raw_object(out, resolver.store, flake, Some(prefixes))? {
         return Ok(false);
@@ -2203,25 +2486,40 @@ fn write_raw_po_turtle(
     Ok(true)
 }
 
-/// Append untranslated rows to the Turtle block that is currently open.
-fn write_untranslated_turtle_continuations<W: Write>(
+/// Add a subject's untranslated rows to its open Turtle block.
+#[allow(clippy::too_many_arguments)]
+fn write_untranslated_turtle_rows<W: Write>(
     resolver: &ExportResolver,
     ann: Option<&AnnotationContext<'_>>,
     reifier_map: &HashMap<EdgeKey, Vec<Sid>>,
+    block: &mut TurtleBlock,
     flakes: &[Flake],
     prefixes: &PrefixMap,
     stats: &mut ExportStats,
     writer: &mut W,
 ) -> io::Result<()> {
     for flake in flakes {
-        let mut body: Vec<u8> = Vec::new();
-        let reifiers = untranslated_reifiers_for(reifier_map, flake);
-        if !write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
-            stats.rows_skipped += 1;
-            continue;
+        if let Some(index) = flake_list_index(flake) {
+            let mut object: Vec<u8> = Vec::new();
+            let Some(p_iri) = resolver.store.sid_to_iri(&flake.p) else {
+                stats.rows_skipped += 1;
+                continue;
+            };
+            if !write_raw_object(&mut object, resolver.store, flake, Some(prefixes))? {
+                stats.rows_skipped += 1;
+                continue;
+            }
+            block.lists.push(&p_iri, index, object);
+        } else {
+            let mut body: Vec<u8> = Vec::new();
+            let reifiers = untranslated_reifiers_for(reifier_map, flake);
+            if !write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
+                stats.rows_skipped += 1;
+                continue;
+            }
+            block.next_pair(writer)?;
+            writer.write_all(&body)?;
         }
-        write!(writer, " ;\n    ")?;
-        writer.write_all(&body)?;
         stats.triples_written += 1;
     }
     Ok(())
@@ -2240,32 +2538,25 @@ fn write_untranslated_turtle_block<W: Write>(
     stats: &mut ExportStats,
     writer: &mut W,
 ) -> io::Result<()> {
-    // Render the rows first: a subject whose every row is unrepresentable must
-    // not leave a dangling subject term behind.
-    let mut bodies: Vec<Vec<u8>> = Vec::new();
-    for flake in flakes {
-        let mut body: Vec<u8> = Vec::new();
-        let reifiers = untranslated_reifiers_for(reifier_map, flake);
-        if write_raw_po_turtle(resolver, ann, reifiers, flake, prefixes, &mut body)? {
-            bodies.push(body);
-        } else {
-            stats.rows_skipped += 1;
-        }
-    }
-    let Some((first, rest)) = bodies.split_first() else {
+    // Render the block first: a subject whose every row is unrepresentable
+    // must not leave a dangling subject term behind.
+    let mut out: Vec<u8> = Vec::new();
+    let mut block = TurtleBlock::open(&mut out, s_iri.to_string(), prefixes)?;
+    write_untranslated_turtle_rows(
+        resolver,
+        ann,
+        reifier_map,
+        &mut block,
+        flakes,
+        prefixes,
+        stats,
+        &mut out,
+    )?;
+    if block.is_empty() {
         return Ok(());
-    };
-    write_turtle_iri_or_bnode(writer, s_iri, prefixes)?;
-    write!(writer, "\n    ")?;
-    writer.write_all(first)?;
-    stats.triples_written += 1;
-    for body in rest {
-        write!(writer, " ;\n    ")?;
-        writer.write_all(body)?;
-        stats.triples_written += 1;
     }
-    writeln!(writer, " .")?;
-    Ok(())
+    block.close(&mut out, prefixes)?;
+    writer.write_all(&out)
 }
 
 /// Emit a single untranslated overlay flake as a standalone Turtle statement.
@@ -2287,11 +2578,7 @@ fn write_raw_flake_turtle<W: Write>(
     let mut body: Vec<u8> = Vec::new();
     write_turtle_iri_or_bnode(&mut body, &s_iri, prefixes)?;
     body.write_all(b" ")?;
-    if p_iri == "http://www.w3.org/1999/02/22-rdf-syntax-ns#type" {
-        body.write_all(b"a")?;
-    } else {
-        write_turtle_iri(&mut body, &p_iri, prefixes)?;
-    }
+    write_turtle_predicate(&mut body, &p_iri, prefixes)?;
     body.write_all(b" ")?;
     if !write_raw_object(&mut body, resolver.store, flake, Some(prefixes))? {
         stats.rows_skipped += 1;
@@ -2317,9 +2604,9 @@ fn resolve_datatype_iri(store: &BinaryIndexStore, o_type: u16) -> Option<String>
 /// Write `"lexical"^^<datatype_iri>`.
 fn write_typed_literal<W: Write>(w: &mut W, lexical: &str, datatype_iri: &str) -> io::Result<()> {
     w.write_all(b"\"")?;
-    write_escaped_ntriples_string(w, lexical)?;
+    syntax::write_string(w, lexical)?;
     w.write_all(b"\"^^<")?;
-    write_escaped_iri(w, datatype_iri)?;
+    syntax::write_iri(w, datatype_iri)?;
     w.write_all(b">")
 }
 
@@ -2336,134 +2623,31 @@ fn write_typed_literal_display<W: Write, T: std::fmt::Display>(
     write_typed_literal(w, &lexical, &dt)
 }
 
-// ---------------------------------------------------------------------------
-// N-Triples escaping (W3C compliant)
-// ---------------------------------------------------------------------------
-
-/// Write an N-Triples-escaped string to `w`.
-///
-/// Escapes: `\` `"` `\n` `\r` `\t` and control chars (U+0000..U+001F, U+007F..U+009F)
-/// via `\uXXXX`.
-fn write_escaped_ntriples_string<W: Write>(w: &mut W, s: &str) -> io::Result<()> {
-    for ch in s.chars() {
-        match ch {
-            '\\' => w.write_all(b"\\\\")?,
-            '"' => w.write_all(b"\\\"")?,
-            '\n' => w.write_all(b"\\n")?,
-            '\r' => w.write_all(b"\\r")?,
-            '\t' => w.write_all(b"\\t")?,
-            c if c.is_control() => {
-                let cp = c as u32;
-                if cp <= 0xFFFF {
-                    write!(w, "\\u{cp:04X}")?;
-                } else {
-                    write!(w, "\\U{cp:08X}")?;
-                }
-            }
-            c => {
-                let mut buf = [0u8; 4];
-                let encoded = c.encode_utf8(&mut buf);
-                w.write_all(encoded.as_bytes())?;
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Write an IRI with escaping per N-Triples/Turtle `IRIREF` grammar.
-///
-/// Disallowed characters in `IRIREF`:
-/// - ASCII control and space: U+0000..=U+0020
-/// - DEL + C1 controls: U+007F..=U+009F
-/// - Punctuation: `<`, `>`, `"`, `{`, `}`, `|`, `^`, `` ` ``, `\`
-///
-/// We percent-encode the UTF-8 bytes of these characters to ensure the output
-/// remains syntactically valid RDF, even if the stored IRI contains invalid
-/// characters.
-pub fn write_escaped_iri<W: Write>(w: &mut W, iri: &str) -> io::Result<()> {
-    for ch in iri.chars() {
-        let cp = ch as u32;
-        let is_forbidden_range = cp <= 0x20 || (0x7F..=0x9F).contains(&cp);
-        let is_forbidden_punct = matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\');
-
-        if is_forbidden_range || is_forbidden_punct {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                write!(w, "%{b:02X}")?;
-            }
-        } else {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            w.write_all(encoded.as_bytes())?;
-        }
-    }
-    Ok(())
-}
-
-/// Escape an IRI into a pre-allocated String (for graph term caching).
-fn escape_iri_into(out: &mut String, iri: &str) {
-    for ch in iri.chars() {
-        let cp = ch as u32;
-        let is_forbidden_range = cp <= 0x20 || (0x7F..=0x9F).contains(&cp);
-        let is_forbidden_punct = matches!(ch, '<' | '>' | '"' | '{' | '}' | '|' | '^' | '`' | '\\');
-
-        if is_forbidden_range || is_forbidden_punct {
-            let mut buf = [0u8; 4];
-            let encoded = ch.encode_utf8(&mut buf);
-            for &b in encoded.as_bytes() {
-                out.push('%');
-                out.push_str(&format!("{b:02X}"));
-            }
-        } else {
-            out.push(ch);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A retraction and an assertion of one untranslated fact at one `t`
+    /// leave the fact, in either order; a later retraction removes it.
     #[test]
-    fn test_escape_ntriples_string() {
-        let mut buf = Vec::new();
-        write_escaped_ntriples_string(&mut buf, "hello \"world\"\nline2\\end").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "hello \\\"world\\\"\\nline2\\\\end"
-        );
-    }
-
-    #[test]
-    fn test_escape_ntriples_control_chars() {
-        let mut buf = Vec::new();
-        write_escaped_ntriples_string(&mut buf, "a\x00b\x1Fc").unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "a\\u0000b\\u001Fc");
-    }
-
-    #[test]
-    fn test_escape_iri() {
-        let mut buf = Vec::new();
-        write_escaped_iri(&mut buf, "http://example.org/foo>bar").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "http://example.org/foo%3Ebar"
-        );
-
-        let mut buf = Vec::new();
-        write_escaped_iri(&mut buf, "http://example.org/a\\b<c\"d").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "http://example.org/a%5Cb%3Cc%22d"
-        );
-
-        let mut buf = Vec::new();
-        write_escaped_iri(&mut buf, "http://example.org/a b\tc").unwrap();
-        assert_eq!(
-            String::from_utf8(buf).unwrap(),
-            "http://example.org/a%20b%09c"
-        );
+    fn surviving_untranslated_holds_a_same_t_pairs_assertion() {
+        let f = |t: i64, op: bool| {
+            Flake::new(
+                fluree_db_core::Sid::new(100, "s"),
+                fluree_db_core::Sid::new(100, "p"),
+                fluree_db_core::FlakeValue::String("v".to_string()),
+                fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "string"),
+                t,
+                op,
+                None,
+            )
+        };
+        for ops in [[false, true], [true, false]] {
+            let out = surviving_untranslated(ops.iter().map(|&op| f(5, op)).collect());
+            assert_eq!(out.len(), 1, "{ops:?}");
+            assert!(out[0].op);
+        }
+        assert!(surviving_untranslated(vec![f(5, false), f(5, true), f(6, false)]).is_empty());
     }
 
     #[test]
@@ -2480,82 +2664,24 @@ mod tests {
         assert_eq!(String::from_utf8(buf).unwrap(), "_:b123");
     }
 
+    /// A stored label the Turtle grammar rejects is escaped, in N-Triples and
+    /// Turtle alike; a valid one, the `-` mints included, is written as is.
     #[test]
-    fn test_prefix_map_from_context() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/",
-            "schema": "http://schema.org/",
-            "@base": "http://ignored.org/"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        assert_eq!(
-            pm.compact("http://example.org/alice"),
-            Some("ex:alice".to_string())
-        );
-        assert_eq!(
-            pm.compact("http://schema.org/name"),
-            Some("schema:name".to_string())
-        );
-        assert_eq!(pm.compact("http://other.org/foo"), None);
-    }
-
-    #[test]
-    fn test_prefix_map_longest_match() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/",
-            "exn": "http://example.org/ns/"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        // Should match the longer prefix
-        assert_eq!(
-            pm.compact("http://example.org/ns/thing"),
-            Some("exn:thing".to_string())
-        );
-        assert_eq!(
-            pm.compact("http://example.org/other"),
-            Some("ex:other".to_string())
-        );
-    }
-
-    #[test]
-    fn test_prefix_map_invalid_local_name() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        // Spaces and special chars → falls back to full IRI
-        assert_eq!(pm.compact("http://example.org/has space"), None);
-        assert_eq!(pm.compact("http://example.org/has:colon"), None);
-        // Leading/trailing dots invalid
-        assert_eq!(pm.compact("http://example.org/.hidden"), None);
-    }
-
-    #[test]
-    fn test_write_prefix_declarations() {
-        let ctx = serde_json::json!({
-            "ex": "http://example.org/",
-            "rdf": "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
-        });
-        let pm = PrefixMap::from_context(&ctx);
-        let mut buf = Vec::new();
-        write_prefix_declarations(&pm, &mut buf).unwrap();
-        let output = String::from_utf8(buf).unwrap();
-        assert!(output.contains("@prefix ex: <http://example.org/> ."));
-        assert!(output.contains("@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ."));
-    }
-
-    #[test]
-    fn test_write_turtle_iri() {
-        let ctx = serde_json::json!({"ex": "http://example.org/"});
-        let pm = PrefixMap::from_context(&ctx);
-
-        let mut buf = Vec::new();
-        write_turtle_iri(&mut buf, "http://example.org/alice", &pm).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "ex:alice");
-
-        let mut buf = Vec::new();
-        write_turtle_iri(&mut buf, "http://other.org/bob", &pm).unwrap();
-        assert_eq!(String::from_utf8(buf).unwrap(), "<http://other.org/bob>");
+    fn blank_labels_the_grammar_rejects_are_escaped() {
+        let pm = PrefixMap::from_context(&serde_json::json!({}));
+        for (stored, written) in [
+            ("_:fdb-1a-0--bnpl0", "_:fdb-1a-0--bnpl0"),
+            ("_:fdb-1a-0-#bnpl0", "_:x6664622d31612d302d23626e706c30"),
+            ("_:fdb-1a-0-[]0", "_:x6664622d31612d302d5b5d30"),
+            ("_:fdb-lubm:main-1", "_:x6664622d6c75626d3a6d61696e2d31"),
+        ] {
+            let mut nt = Vec::new();
+            write_iri_or_bnode(&mut nt, stored).unwrap();
+            assert_eq!(String::from_utf8(nt).unwrap(), written, "{stored}");
+            let mut ttl = Vec::new();
+            write_turtle_iri_or_bnode(&mut ttl, stored, &pm).unwrap();
+            assert_eq!(String::from_utf8(ttl).unwrap(), written, "{stored}");
+        }
     }
 
     #[test]

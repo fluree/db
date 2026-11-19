@@ -6,6 +6,7 @@
 pub mod edge_annotations;
 pub mod jsonld;
 pub mod nquads;
+pub mod rdf_text;
 pub mod trig_meta;
 pub mod txn_meta;
 
@@ -23,7 +24,7 @@ pub mod txn_meta;
 ///   It also rejects (rather than silently strips) a single-object document
 ///   whose own `@context` defines one of these names as a term — that name is
 ///   reserved, so the collision is an error, not a guess.
-/// - [`edge_annotations::is_envelope`] / [`edge_annotations::is_transaction_wrapper`]
+/// - `fluree_graph_json_ld::doc_shape` / [`edge_annotations::is_transaction_wrapper`]
 ///   tolerate them when classifying a document as an envelope / wrapper
 ///   rather than a data node-map, so annotation lowering still recurses into
 ///   `@graph` / clause values.
@@ -47,10 +48,16 @@ pub(crate) const RESERVED_TXN_KEYS: &[&str] = &[
 /// never stripped.
 pub(crate) const CLAUSE_KEYS: &[&str] = &["where", "delete", "insert", "upsert", "values"];
 
-pub use jsonld::{parse_sync_transaction, parse_transaction};
+pub use jsonld::{
+    is_empty_document, parse_graph_insert, parse_sync_transaction, parse_transaction,
+};
 pub use nquads::nquads_to_trig;
+pub use rdf_text::{
+    has_graph_blocks, parse_rdf_text, parse_rdf_text_txn, parse_trig_txn, ContentIdentity,
+    Placement, RdfText, RdfTextSummary,
+};
 pub use trig_meta::{
-    extract_trig_txn_meta, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject,
-    RawTerm, RawTrigMeta, RawTriple, TrigMetaResult, TrigPhase1Result, TXN_META_GRAPH_IRI,
+    might_contain_graph_block, parse_trig_phase1, resolve_trig_meta, NamedGraphBlock, RawObject,
+    RawTerm, RawTrigMeta, RawTriple, TrigPhase1Result, TXN_META_GRAPH_IRI,
 };
 pub use txn_meta::extract_txn_meta;

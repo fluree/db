@@ -196,8 +196,8 @@ async fn sparql_group_concat_iri_across_multi_ledger_dataset() {
     let _beta = seed_single_prefix(&fluree, "gcns-beta:main", "http://beta.example/", "b1").await;
 
     let spec = DatasetSpec::new()
-        .with_default(GraphSource::new("gcns-alpha:main"))
-        .with_default(GraphSource::new("gcns-beta:main"));
+        .with_default(GraphSource::parse("gcns-alpha:main").unwrap())
+        .with_default(GraphSource::parse("gcns-beta:main").unwrap());
     let dataset = fluree
         .build_dataset_view(&spec)
         .await

@@ -244,6 +244,7 @@ mod tests {
             has_annotations: annotation_index.is_some(),
             had_annotation_arena: annotation_index.is_some(),
             has_list_meta: None,
+            graph_drops: Vec::new(),
             annotation_index,
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
@@ -273,6 +274,7 @@ mod tests {
             txn_meta: Vec::new(),
             graph_delta: std::collections::HashMap::new(),
             ns_split_mode: None,
+            graph_drops: Vec::new(),
         };
 
         let result = write_commit(&commit, false, None).expect("write_commit");

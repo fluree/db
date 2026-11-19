@@ -20,6 +20,11 @@ Reference for frequently encountered errors:
 Historical reads that return empty for retracted properties or deleted
 entities, and the reindex that repairs them.
 
+### [Typed values wrong after indexing](typed-values-wrong-after-indexing.md)
+
+Dates, times and `xsd:long` values that read back as `1970-01-01` or similar
+once indexed, and the reindex that repairs them.
+
 ### [Debugging Queries](debugging-queries.md)
 
 Tools and techniques for query debugging:
@@ -85,7 +90,7 @@ tail -f /var/log/fluree/server.log | grep WARN
 **Quick Checks:**
 ```bash
 # Is server running?
-ps aux | grep fluree-db-server
+ps aux | grep 'fluree server'
 
 # Is port listening?
 netstat -an | grep 8090
@@ -143,6 +148,10 @@ curl http://localhost:8090/v1/fluree/stats
 - High latency
 - Timeouts
 
+Queries over an R2RML graph source (Iceberg, Delta, SQL) that got slower
+after an upgrade usually read a map with no key: see
+[R2RML → A map with no key](../graph-sources/r2rml.md#a-map-with-no-key-most-likely-after-an-upgrade).
+
 **Quick Checks:**
 ```bash
 # Check indexing lag
@@ -191,7 +200,7 @@ See [Common Errors](common-errors.md) for complete error code reference.
 ### Enable Debug Logging
 
 ```bash
-./fluree-db-server --log-level debug
+fluree server run --log-level debug
 ```
 
 Runtime log-level changes are not currently exposed through the standalone HTTP
@@ -239,7 +248,7 @@ When reporting issues, include:
 
 2. **Configuration:**
    ```bash
-   ./fluree-db-server --help
+   fluree server run -- --help
    # Include relevant config values
    ```
 
@@ -319,6 +328,7 @@ Retain logs for historical analysis:
 
 - [Common Errors](common-errors.md) - Error reference
 - [Missing results at a historical `t`](historical-results-missing.md) - Historical reads after an old index build
+- [Typed values wrong after indexing](typed-values-wrong-after-indexing.md) - Dates and numbers misread after an index build
 - [Debugging Queries](debugging-queries.md) - Query debugging
 - [API Errors](../api/errors.md) - HTTP error codes
 - [Operations](../operations/README.md) - Operational guides

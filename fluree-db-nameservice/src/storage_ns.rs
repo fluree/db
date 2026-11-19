@@ -18,8 +18,8 @@
 //! Under contention, operations will retry with exponential backoff.
 
 use crate::ns_format::{
-    merge_heads, ns_context, BranchPointRef, IndexRef, LedgerRef, NsFileV2, NsIndexFileV2,
-    NS_VERSION,
+    merge_heads, ns_context, parse_record, BranchPointRef, IndexRef, LedgerRef, NsFileV2,
+    NsIndexFileV2, NS_VERSION,
 };
 use crate::{
     deserialize_json, parse_default_context_value, serialize_json, AdminPublisher, BranchLifecycle,
@@ -30,13 +30,18 @@ use crate::{
     StatusPublisher, StatusValue,
 };
 use async_trait::async_trait;
-use fluree_db_core::ledger_id::{format_ledger_id, normalize_ledger_id, split_ledger_id};
+use fluree_db_core::ledger_id::{format_ledger_id, split_ledger_id, split_persisted_ledger_id};
 use fluree_db_core::{
-    CasAction, CasOutcome, ContentId, Error as CoreError, StorageCas, StorageList, StorageRead,
-    StorageWrite,
+    CasAction, CasOutcome, ContentId, Error as CoreError, LedgerId, StorageCas, StorageList,
+    StorageRead, StorageWrite,
 };
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use std::fmt::Debug;
+
+/// Record reads [`NameServiceLookup::branch_records`] keeps in flight. Each
+/// is a GET or two on an object store.
+const BRANCH_RECORD_READS_IN_FLIGHT: usize = 8;
 
 /// Storage-backed nameservice
 ///
@@ -290,9 +295,14 @@ where
             .map(|t| GraphSourceType::from_type_string(t))
             .unwrap_or(GraphSourceType::Unknown("unknown".to_string()));
 
-        // Convert to GraphSourceRecord
+        // Convert to GraphSourceRecord. The file is authoritative for
+        // identity; a different name/branch at this path is another source.
+        let graph_source_id = LedgerId::from_persisted_parts(&main.name, &main.branch)?;
+        if graph_source_id.name() != name || graph_source_id.branch() != branch {
+            return Ok(None);
+        }
         let mut record = GraphSourceRecord {
-            graph_source_id: format_ledger_id(name, branch),
+            graph_source_id,
             name: main.name,
             branch: main.branch,
             source_type,
@@ -316,10 +326,7 @@ where
     /// Read and parse a JSON file from storage
     async fn read_json<T: for<'de> Deserialize<'de>>(&self, key: &str) -> Result<Option<T>> {
         match self.storage.read_bytes(key).await {
-            Ok(bytes) => {
-                let parsed = serde_json::from_slice(&bytes)?;
-                Ok(Some(parsed))
-            }
+            Ok(bytes) => Ok(Some(parse_record(&bytes, key)?)),
             Err(CoreError::NotFound(_)) => Ok(None),
             Err(e) => Err(NameServiceError::storage(format!(
                 "Failed to read {key}: {e}"
@@ -343,7 +350,7 @@ where
         if Self::is_graph_source_from_bytes(&main_bytes) {
             return Ok(None);
         }
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        let main: NsFileV2 = parse_record(&main_bytes, &main_key)?;
         let index_file: Option<NsIndexFileV2> =
             self.read_json(&self.index_key(ledger_name, branch)).await?;
         Ok(Some(merge_heads(&main, index_file.as_ref())))
@@ -351,11 +358,44 @@ where
 
     /// Load and merge main record with index file
     async fn load_record(&self, ledger_name: &str, branch: &str) -> Result<Option<NsRecord>> {
-        let main_key = self.ns_key(ledger_name, branch);
-        let index_key = self.index_key(ledger_name, branch);
+        let record = self
+            .read_record_at(&self.ns_key(ledger_name, branch))
+            .await?;
+        // The file is authoritative for identity. A file whose name/branch
+        // differ from the requested ones belongs to another ledger that maps
+        // to the same path (`a:b/c` vs `a/b:c`), so this ledger does not exist.
+        Ok(record.filter(|r| r.name == ledger_name && r.branch == branch))
+    }
+
+    /// The `.json` keys under `ledger_name`'s prefix: its branches' records,
+    /// their sidecars, and any ledger nested under the name.
+    async fn ledger_record_keys(&self, ledger_name: &str) -> Result<Vec<String>> {
+        let prefix = if self.prefix.is_empty() {
+            format!("{NS_VERSION}/{ledger_name}/")
+        } else {
+            format!("{}/{}/{}/", self.prefix, NS_VERSION, ledger_name)
+        };
+
+        let mut keys = StorageList::list_prefix(&self.storage, &prefix)
+            .await
+            .map_err(|e| NameServiceError::storage(format!("Failed to list branches: {e}")))?;
+        keys.retain(|key| key.ends_with(".json"));
+        Ok(keys)
+    }
+
+    /// Read the ledger record stored at `main_key`, taking its identity from
+    /// the file rather than the path: a path does not determine `name:branch`
+    /// once names and branches may both contain `/`.
+    async fn read_record_at(&self, main_key: &str) -> Result<Option<NsRecord>> {
+        let index_key = main_key
+            .strip_suffix(".json")
+            .map(|stem| format!("{stem}.index.json"))
+            .ok_or_else(|| {
+                NameServiceError::storage(format!("not an ns record key: {main_key}"))
+            })?;
 
         // Read the main record bytes once.
-        let main_bytes = match self.storage.read_bytes(&main_key).await {
+        let main_bytes = match self.storage.read_bytes(main_key).await {
             Ok(bytes) => bytes,
             Err(CoreError::NotFound(_)) => return Ok(None),
             Err(e) => {
@@ -375,14 +415,28 @@ where
             return Ok(None);
         }
 
-        let main: NsFileV2 = serde_json::from_slice(&main_bytes)?;
+        // Enumeration hands us sidecar keys too (`{branch}.index.json`,
+        // `{gs}.snapshots.json`): a branch may legitimately be named
+        // `x.index`, so the suffix alone cannot say which file this is.
+        if crate::ns_format::has_sidecar_suffix(main_key)
+            && !crate::ns_format::is_ledger_main_record(&main_bytes)
+        {
+            return Ok(None);
+        }
+
+        let main: NsFileV2 = parse_record(&main_bytes, main_key)?;
+        let Some(ledger_id) =
+            crate::ns_format::persisted_ledger_id(&main.ledger.id, &main.branch, main_key)
+        else {
+            return Ok(None);
+        };
 
         // Read index file (if exists)
         let index_file: Option<NsIndexFileV2> = self.read_json(&index_key).await?;
 
         // Convert to NsRecord, parsing persisted CID strings
         let mut record = NsRecord {
-            ledger_id: format_ledger_id(ledger_name, branch),
+            ledger_id,
             name: main.ledger.id.clone(),
             branch: main.branch,
             commit_head_id: main
@@ -433,12 +487,12 @@ where
     /// no write is performed.
     async fn cas_update<T, F>(&self, key: &str, update_fn: F) -> Result<()>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        F: Fn(Option<T>) -> Option<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(Option<T>) -> Option<T> + Send + Sync + 'static,
     {
         let outcome = self
             .storage
-            .compare_and_swap(key, |current_bytes| {
+            .compare_and_swap(key, move |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
 
                 match update_fn(current) {
@@ -467,12 +521,12 @@ where
         update_fn: F,
     ) -> Result<CasUpdateOutcome>
     where
-        T: Serialize + for<'de> Deserialize<'de>,
-        F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync,
+        T: Serialize + for<'de> Deserialize<'de> + 'static,
+        F: Fn(Option<T>) -> CasUpdateDecision<T> + Send + Sync + 'static,
     {
         let outcome = self
             .storage
-            .compare_and_swap(key, |current_bytes| {
+            .compare_and_swap(key, move |current_bytes| {
                 let current: Option<T> = current_bytes.map(deserialize_json).transpose()?;
 
                 match update_fn(current) {
@@ -527,36 +581,22 @@ where
         self.load_heads(&ledger_name, &branch).await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        let prefix = if self.prefix.is_empty() {
-            format!("{NS_VERSION}/{ledger_name}/")
-        } else {
-            format!("{}/{}/{}/", self.prefix, NS_VERSION, ledger_name)
-        };
-
-        let keys = StorageList::list_prefix(&self.storage, &prefix)
-            .await
-            .map_err(|e| NameServiceError::storage(format!("Failed to list branches: {e}")))?;
-
-        let mut records = Vec::new();
-
-        for key in keys {
-            if key.ends_with(".index.json") || !key.ends_with(".json") {
-                continue;
-            }
-
-            // Extract branch name from the key suffix
-            let file_part = key.rsplit('/').next().unwrap_or("");
-            let branch = file_part.trim_end_matches(".json");
-
-            if let Ok(Some(record)) = self.load_record(ledger_name, branch).await {
-                if !record.retracted {
-                    records.push(record);
-                }
-            }
-        }
-
-        Ok(records)
+    /// One LIST under the ledger's prefix and a bounded number of record
+    /// reads in flight, so the cost follows this ledger's branches, not the
+    /// store's ledgers. Keys under the prefix include nested ledgers
+    /// (`{ledger_name}/sub/main.json`); the record says which it is.
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        let keys = self.ledger_record_keys(ledger_name).await?;
+        let records: Vec<Option<NsRecord>> = stream::iter(keys)
+            .map(|key| async move { self.read_record_at(&key).await })
+            .buffered(BRANCH_RECORD_READS_IN_FLIGHT)
+            .try_collect()
+            .await?;
+        Ok(records
+            .into_iter()
+            .flatten()
+            .filter(|r| r.name == ledger_name)
+            .collect())
     }
 
     async fn all_records(&self) -> Result<Vec<NsRecord>> {
@@ -574,38 +614,17 @@ where
         let mut records = Vec::new();
 
         for key in keys {
-            // Skip index files
-            if key.ends_with(".index.json") {
-                continue;
-            }
-
             if !key.ends_with(".json") {
                 continue;
             }
 
-            // Parse ledger name and branch from key
-            // Key format: {prefix}/ns@v2/{ledger-name}/{branch}.json
-            let path_part = if self.prefix.is_empty() {
-                key.strip_prefix(&format!("{NS_VERSION}/"))
-            } else {
-                key.strip_prefix(&format!("{}/{}/", self.prefix, NS_VERSION))
-            };
-
-            if let Some(path) = path_part {
-                // path is now "{ledger-name}/{branch}.json"
-                if let Some(slash_pos) = path.rfind('/') {
-                    let ledger_name = &path[..slash_pos];
-                    let branch = path[slash_pos + 1..].trim_end_matches(".json");
-
-                    // A read failure must not silently shrink the result:
-                    // callers that decide what to delete treat a missing
-                    // branch as one with nothing to protect. `Ok(None)` is a
-                    // legitimate skip (graph-source record, or a branch
-                    // dropped since the key listing).
-                    if let Some(record) = self.load_record(ledger_name, branch).await? {
-                        records.push(record);
-                    }
-                }
+            // A read failure must not silently shrink the result: callers
+            // that decide what to delete treat a missing branch as one with
+            // nothing to protect. `Ok(None)` is a legitimate skip
+            // (graph-source record, a branch dropped since the listing, or an
+            // id whose path could alias another ledger's).
+            if let Some(record) = self.read_record_at(&key).await? {
+                records.push(record);
             }
         }
 
@@ -691,7 +710,7 @@ where
     }
 
     async fn drop_branch(&self, ledger_id: &str) -> Result<Option<u32>> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
 
         // Read the record to find the parent before purging
         let record = self
@@ -741,10 +760,12 @@ where
     async fn reset_head(&self, ledger_id: &str, snapshot: crate::NsRecordSnapshot) -> Result<()> {
         let (ledger_name, branch) = split_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
+        let index_key = self.index_key(&ledger_name, &branch);
+        let index = crate::ns_format::snapshot_index_file(&snapshot);
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |bytes| {
+            .compare_and_swap(&key, move |bytes| {
                 let Some(data) = bytes else {
                     return Ok(CasAction::Abort(()));
                 };
@@ -759,7 +780,12 @@ where
             return Err(NameServiceError::not_found(ledger_id));
         }
 
-        Ok(())
+        // A separate index file wins at an equal or higher `t`, so it is
+        // reset too, or the index could not move back.
+        self.cas_update::<NsIndexFileV2, _>(&index_key, move |existing| {
+            existing.map(|_| index.clone())
+        })
+        .await
     }
 }
 
@@ -807,7 +833,7 @@ where
                 // Record exists — check if it's retracted (dropped) and allow re-creation
                 match self.storage.read_bytes(&key).await {
                     Ok(existing_bytes) => {
-                        let existing: NsFileV2 = serde_json::from_slice(&existing_bytes)?;
+                        let existing: NsFileV2 = parse_record(&existing_bytes, &key)?;
                         if existing.status == "retracted" {
                             // Overwrite the retracted record with a fresh one
                             self.storage.write_bytes(&key, &bytes).await.map_err(|e| {
@@ -832,7 +858,7 @@ where
     }
 
     async fn retract(&self, ledger_id: &str) -> Result<()> {
-        let (ledger_name, branch) = split_ledger_id(ledger_id)?;
+        let (ledger_name, branch) = split_persisted_ledger_id(ledger_id)?;
         let key = self.ns_key(&ledger_name, &branch);
 
         self.cas_update::<NsFileV2, _>(&key, |existing| {
@@ -896,7 +922,7 @@ where
 
     fn publishing_ledger_id(&self, ledger_id: &str) -> Option<String> {
         // Return normalized ledger ID for publishing
-        Some(normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string()))
+        LedgerId::parse(ledger_id).ok().map(String::from)
     }
 }
 
@@ -951,7 +977,7 @@ where
         let index_key = self.index_key(&ledger_name, &branch);
         let cid_str = index_id.to_string();
 
-        self.cas_update::<NsIndexFileV2, _>(&index_key, |existing| {
+        self.cas_update::<NsIndexFileV2, _>(&index_key, move |existing| {
             let should_update = match &existing {
                 Some(file) => index_t >= file.index.t, // Allow equal
                 None => true,
@@ -1497,7 +1523,7 @@ where
             }
         };
 
-        let file: NsFileV2 = serde_json::from_slice(&data)?;
+        let file: NsFileV2 = parse_record(&data, &key)?;
 
         Ok(Some(file.to_status_value()))
     }
@@ -1522,7 +1548,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |current_bytes| {
+            .compare_and_swap(&key, move |current_bytes| {
                 let Some(bytes) = current_bytes else {
                     return Ok(CasAction::Abort(StatusCasResult::Conflict { actual: None }));
                 };
@@ -1595,7 +1621,7 @@ where
             }
         };
 
-        let file: NsFileV2 = serde_json::from_slice(&data)?;
+        let file: NsFileV2 = parse_record(&data, &key)?;
 
         Ok(Some(file.to_config_value()))
     }
@@ -1620,7 +1646,7 @@ where
 
         let outcome = self
             .storage
-            .compare_and_swap(&key, |current_bytes| {
+            .compare_and_swap(&key, move |current_bytes| {
                 let Some(bytes) = current_bytes else {
                     return Ok(CasAction::Abort(ConfigCasResult::Conflict { actual: None }));
                 };
@@ -1767,6 +1793,18 @@ mod tests {
 
     #[async_trait]
     impl fluree_db_core::StorageRead for MemoryCasStorage {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            None
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             self.data
                 .read()
@@ -1876,8 +1914,9 @@ mod tests {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
             let mut data = self.data.write().unwrap();
             let current = data.get(address).map(std::vec::Vec::as_slice);
@@ -1916,6 +1955,18 @@ mod tests {
 
     #[async_trait]
     impl fluree_db_core::StorageRead for FlakyCasStorage {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
+        fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+            self.inner.encryption_admin()
+        }
+
         async fn read_bytes(&self, address: &str) -> fluree_db_core::Result<Vec<u8>> {
             fluree_db_core::StorageRead::read_bytes(&self.inner, address).await
         }
@@ -1992,8 +2043,9 @@ mod tests {
         where
             F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
                 + Send
-                + Sync,
-            T: Send,
+                + Sync
+                + 'static,
+            T: Send + 'static,
         {
             // On the first call, run the closure but then call it again to
             // simulate a concurrent modification that invalidated the first read.
@@ -2019,6 +2071,32 @@ mod tests {
     /// Create a dummy ContentId for tests (hashes the label as Commit kind).
     fn dummy_cid(label: &str) -> ContentId {
         ContentId::new(fluree_db_core::ContentKind::Commit, label.as_bytes())
+    }
+
+    /// A reset moves the index back, even below one in the separate index
+    /// file, which otherwise wins at an equal or higher `t`.
+    #[tokio::test]
+    async fn reset_head_moves_the_index_back() {
+        let ns = make_storage_ns();
+        publish_commit(&ns, "mydb:main", 3, &dummy_cid("commit-3")).await;
+        ns.publish_index("mydb:main", 3, &dummy_cid("index-3"))
+            .await
+            .unwrap();
+        for (index, t) in [(Some(dummy_cid("index-1")), 1), (None, 0)] {
+            ns.reset_head(
+                "mydb:main",
+                crate::NsRecordSnapshot {
+                    commit_head_id: Some(dummy_cid("commit-3")),
+                    commit_t: 3,
+                    index_head_id: index.clone(),
+                    index_t: t,
+                },
+            )
+            .await
+            .unwrap();
+            let record = ns.lookup("mydb:main").await.unwrap().unwrap();
+            assert_eq!((record.index_head_id, record.index_t), (index, t));
+        }
     }
 
     // =========================================================================
@@ -2082,6 +2160,147 @@ mod tests {
         let current = ns.get_config("mydb:main").await.unwrap().unwrap();
         assert_eq!(current.v, 1);
         assert_eq!(current.payload.unwrap().default_context, Some(ctx_cid));
+    }
+
+    /// Enumeration takes identity from each record, never from its path:
+    /// nested names, legacy `/` branches, and branches spelled like sidecar
+    /// files all round-trip (a record missing here reads as unprotected to GC).
+    #[tokio::test]
+    async fn test_storage_ns_enumeration_round_trips_ambiguous_layouts() {
+        let ns = make_storage_ns();
+        for id in [
+            "acme:main",
+            "acme/inventory:main",
+            "mydb:release/v1.0",
+            "mydb:feature.index",
+            "mydb:main.json",
+        ] {
+            publish_commit(&ns, id, 1, &dummy_cid(id)).await;
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| {
+                assert_eq!(r.ledger_id, format!("{}:{}", r.name, r.branch));
+                r.ledger_id.to_string()
+            })
+            .collect();
+        all.sort();
+        assert_eq!(
+            all,
+            [
+                "acme/inventory:main",
+                "acme:main",
+                "mydb:feature.index",
+                "mydb:main.json",
+                "mydb:release/v1.0"
+            ]
+        );
+
+        let acme: Vec<_> = ns.branch_records("acme").await.unwrap();
+        assert_eq!(acme.len(), 1, "nested ledger is not a branch: {acme:?}");
+        let mut mydb: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        mydb.sort();
+        assert_eq!(mydb, ["feature.index", "main.json", "release/v1.0"]);
+
+        // Same path, different identity: not this ledger.
+        assert!(ns.lookup("mydb/release:v1.0").await.unwrap().is_none());
+        assert!(ns.lookup("mydb:release/v1.0").await.unwrap().is_some());
+    }
+
+    /// `branch_records` lists one ledger's branches, retracted ones included,
+    /// and fails on a record it cannot read rather than leave it out: GC reads
+    /// a missing branch as one with nothing to protect. Another ledger's
+    /// records are never read.
+    #[tokio::test]
+    async fn branch_records_lists_one_ledger_strictly() {
+        let ns = make_storage_ns();
+        for id in ["mydb:main", "mydb:dev", "mydb/nested:main", "other:main"] {
+            publish_commit(&ns, id, 1, &dummy_cid(id)).await;
+        }
+        ns.retract("mydb:dev").await.unwrap();
+        ns.storage
+            .write_bytes(&ns.ns_key("other", "main"), b"not json")
+            .await
+            .unwrap();
+        assert!(ns.all_records().await.is_err());
+
+        let mut branches: Vec<String> = ns
+            .branch_records("mydb")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.branch)
+            .collect();
+        branches.sort();
+        assert_eq!(
+            branches,
+            ["dev", "main"],
+            "retracted kept, nested ledger left out"
+        );
+
+        ns.storage
+            .write_bytes(&ns.ns_key("mydb", "dev"), b"not json")
+            .await
+            .unwrap();
+        let err = ns.branch_records("mydb").await.unwrap_err();
+        assert!(
+            err.to_string().contains("mydb/dev.json"),
+            "an unreadable branch fails the listing, naming its record: {err}"
+        );
+    }
+
+    /// Ids an older release could store but the current grammar rejects
+    /// never fail the listing: `@`/`#` stay listed so GC and drop still see
+    /// them, and a name whose path can alias another ledger's is skipped.
+    #[tokio::test]
+    async fn legacy_ids_do_not_fail_the_listing() {
+        let ns = make_storage_ns();
+        for id in [
+            "plain:main",
+            "repQ2026:main",
+            "mydb:featureQ1",
+            "unsafeQ:main",
+        ] {
+            publish_commit(&ns, id, 1, &dummy_cid(id)).await;
+        }
+        for (from, to, (placeholder, legacy)) in [
+            ("repQ2026/main", "rep@2026/main", ("repQ2026", "rep@2026")),
+            (
+                "mydb/featureQ1",
+                "mydb/feature#1",
+                ("featureQ1", "feature#1"),
+            ),
+            ("unsafeQ/main", "unsafeQ/main", ("unsafeQ", "/unsafe")),
+        ] {
+            let from = format!("test/{NS_VERSION}/{from}.json");
+            let bytes = ns.storage.read_bytes(&from).await.unwrap();
+            let json = String::from_utf8(bytes)
+                .unwrap()
+                .replace(placeholder, legacy);
+            ns.storage.delete(&from).await.unwrap();
+            let to = format!("test/{NS_VERSION}/{to}.json");
+            ns.storage.write_bytes(&to, json.as_bytes()).await.unwrap();
+        }
+
+        let mut all: Vec<String> = ns
+            .all_records()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.ledger_id.to_string())
+            .collect();
+        all.sort();
+        assert_eq!(all, ["mydb:feature#1", "plain:main", "rep@2026:main"]);
     }
 
     #[tokio::test]

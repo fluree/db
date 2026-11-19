@@ -44,6 +44,16 @@ impl OverlayProvider for CompositeOverlay {
         self
     }
 
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        let mut all = std::collections::HashSet::new();
+        for overlay in &self.overlays {
+            all.extend(overlay.list_predicates()?.iter().cloned());
+        }
+        Some(std::sync::Arc::new(all))
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }
@@ -61,6 +71,23 @@ impl OverlayProvider for CompositeOverlay {
         self.overlays
             .iter()
             .try_fold(0usize, |acc, o| Some(acc + o.overlay_flake_count(g_id)?))
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        // A component's whole-graph count bounds its range count.
+        self.overlays.iter().try_fold(0usize, |acc, o| {
+            let n = o
+                .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
+                .or_else(|| o.overlay_flake_count(g_id))?;
+            Some(acc + n)
+        })
     }
 
     fn for_each_overlay_flake(

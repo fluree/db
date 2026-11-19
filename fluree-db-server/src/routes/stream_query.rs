@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
@@ -44,7 +44,7 @@ use crate::routes::query::{
     collect_sparql_min_t_requirements, enforce_bearer_dataset_scope, get_ledger_id,
     has_policy_opts, inject_default_context_if_requested, inject_headers_into_query,
     is_sparql_request, load_ledger_for_query, normalize_ledger_scoped_from,
-    requires_dataset_features, resolve_sparql_text, SparqlParams,
+    requires_dataset_features, resolve_sparql_text, PathLedger, SparqlParams,
 };
 use crate::state::AppState;
 
@@ -56,7 +56,7 @@ const STREAM_CHANNEL_DEPTH: usize = 64;
 pub async fn stream_query_ledger_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
-    Query(params): Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -74,7 +74,7 @@ pub async fn stream_query_ledger_tail(
 /// connection/dataset path — there is no single-ledger shortcut.
 pub async fn stream_query_connection(
     State(state): State<Arc<AppState>>,
-    Query(params): Query<SparqlParams>,
+    params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
     credential: MaybeCredential,
@@ -87,10 +87,10 @@ pub async fn stream_query_connection(
 
 async fn stream_query_connection_inner(
     state: Arc<AppState>,
-    params: SparqlParams,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -121,19 +121,17 @@ async fn stream_query_connection_inner(
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     // Both branches below set it, so there is no default to fall back on.
     let warn_headers;
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
 
         // Bearer scope over every FROM/FROM NAMED ledger.
         if let Some(p) = bearer.0.as_ref() {
             if !credential.is_signed() {
-                if let Ok(ledger_ids) = fluree_db_api::sparql_dataset_ledger_ids(&sparql) {
-                    for lid in &ledger_ids {
-                        if !p.can_read(lid) {
-                            return Err(ServerError::not_found("Ledger not found"));
-                        }
-                    }
-                }
+                crate::routes::query::authorize_sparql_dataset(p, &sparql)?;
             }
         }
 
@@ -197,7 +195,7 @@ async fn stream_query_connection_inner(
 
         inject_headers_into_query(&mut query_json, &headers);
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger_id) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger_id)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
@@ -237,10 +235,10 @@ async fn stream_query_connection_inner(
 async fn stream_query_inner(
     state: Arc<AppState>,
     ledger: String,
-    params: SparqlParams,
+    mut params: SparqlParams,
     headers: FlureeHeaders,
     bearer: MaybeDataBearer,
-    credential: MaybeCredential,
+    mut credential: MaybeCredential,
 ) -> Result<Response> {
     let headers = crate::routes::policy_auth::bind_authorization(
         &state,
@@ -267,6 +265,18 @@ async fn stream_query_inner(
         ));
     }
 
+    // The streaming dataset path does not enumerate a ledger's named graphs
+    // under `GRAPH ?g`, so a pinned read here would silently drop them.
+    let path = PathLedger::parse(&ledger)?;
+    if path.pin.is_some() {
+        return Err(ServerError::bad_request(
+            "A time pin in the ledger path is not supported on the streaming endpoint; \
+             use /v1/fluree/query/<ledger>@<pin>",
+        ));
+    }
+    // The typed id, not the path's spelling, drives loading and authorization.
+    let ledger = path.ledger.clone();
+
     // Resolve into one of two execution shapes, planned before the 200 stream
     // commits so parse errors / unsupported shapes return a clean 4xx:
     //  - Single: the lean single-ledger GraphDb path (common case).
@@ -276,10 +286,14 @@ async fn stream_query_inner(
     // Advisory headers attached to the 200 — empty unless the request names
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     let mut warn_headers = HeaderMap::new();
+    params.absorb_form_body(&mut credential)?;
+    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
+        // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
+        let headers = headers.clone().with_sparql_request_pragmas(&sparql)?;
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
@@ -307,8 +321,13 @@ async fn stream_query_inner(
             })
             .unwrap_or(false);
 
-        // Freshness barrier parity with /query (header / `@t:` min-t).
-        let min_t = collect_sparql_min_t_requirements(headers.min_t, &sparql, Some(&ledger))?;
+        // Freshness barrier parity with /query (header / `@t:` min-t): the
+        // path ledger's, before its registry resolves the dataset.
+        let min_t = crate::routes::query::path_ledger_min_t(
+            &path,
+            headers.min_t,
+            collect_sparql_min_t_requirements(None, &sparql, Some(&ledger))?,
+        );
         await_query_min_t_requirements(state.as_ref(), min_t).await?;
 
         if qc_opts.has_any_policy_inputs() || has_dataset {
@@ -327,19 +346,19 @@ async fn stream_query_inner(
                     dc,
                     parsed.ast.as_ref(),
                 );
-                crate::routes::query::ledger_scoped_sparql_dataset_spec(&ledger, dc)?
+                let clause = crate::routes::query::resolved_sparql_dataset(parsed.ast.as_ref())?
+                    .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
+                let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
+                crate::routes::query::ledger_scoped_sparql_dataset_spec(
+                    &path.id, &clause, None, &registry,
+                )?
             } else {
-                let mut spec = fluree_db_api::DatasetSpec::new();
-                spec.default_graphs.push(
-                    fluree_db_api::GraphSource::new(&ledger)
-                        .with_graph(fluree_db_api::dataset::GraphSelector::Default),
-                );
-                spec
+                fluree_db_api::DatasetSpec::new().with_default(fluree_db_api::GraphSource::ledger(
+                    fluree_db_api::LedgerRef::parse(&ledger)?,
+                ))
             };
-            // Ensure the head is fresh before view loading (shared storage).
-            if !state.config.is_proxy_storage_mode() {
-                let _ = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            }
+            // Ensure the head is fresh before view loading.
+            let _ = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
             let dataset = fluree
                 .build_stream_dataset_from_spec(&spec, &qc_opts)
                 .await
@@ -374,17 +393,28 @@ async fn stream_query_inner(
             ));
         }
 
-        // Mirror /query's ledger-scoped preprocessing: normalize `from` against
-        // the path ledger, fold header opts in, enforce bearer scope over the
-        // path ledger and every referenced graph, then apply auth-derived
-        // identity + default policy class.
-        normalize_ledger_scoped_from(&ledger, &mut query_json)?;
-        inject_headers_into_query(&mut query_json, &headers);
+        // Mirror /query's ledger-scoped preprocessing: enforce bearer scope
+        // over the path ledger before anything is read from it, normalize
+        // `from` against it, fold header opts in, enforce bearer scope over
+        // every referenced graph, then apply auth-derived identity + default
+        // policy class.
         if let Some(p) = bearer.0.as_ref() {
-            if !credential.is_signed() && !p.can_read(&ledger) {
+            if !credential.is_signed() && !p.can_read(&crate::error::scope_id(&ledger)?) {
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
+        if fluree_db_api::jsonld_names_dataset(&query_json) {
+            crate::routes::query::await_path_ledger_min_t_for_jsonld(
+                &state,
+                &path,
+                &headers,
+                &query_json,
+            )
+            .await?;
+            let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
+            normalize_ledger_scoped_from(&path.id, &registry, &mut query_json)?;
+        }
+        inject_headers_into_query(&mut query_json, &headers);
         enforce_bearer_dataset_scope(&query_json, &bearer, credential.is_signed(), &span)?;
         let plan_options =
             crate::query_control::options_for_identity(headers.server_identity.as_ref());

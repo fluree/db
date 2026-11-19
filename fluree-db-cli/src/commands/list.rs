@@ -18,7 +18,7 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
         }
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let active = config::read_active_ledger(dirs.data_dir());
     let records = fluree.nameservice().all_records().await?;
     let gs_records = fluree.nameservice().all_graph_source_records().await?;
@@ -109,9 +109,9 @@ pub async fn run(dirs: &FlureeDir, remote_flag: Option<&str>, direct: bool) -> C
             };
             table.add_row(vec![
                 marker.to_string(),
-                t.local_alias.clone(),
+                t.local_alias.to_string(),
                 t.remote.clone(),
-                t.remote_alias.clone(),
+                t.remote_alias.to_string(),
             ]);
         }
 

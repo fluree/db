@@ -247,15 +247,18 @@ See [Operations: Configuration](../operations/configuration.md#background-indexi
 
 ### 4. Dedicated Indexing Process
 
-For high-load deployments, run dedicated indexer:
+For high-load deployments, index maintenance can be moved out of the transacting server:
 
 ```bash
 # Main server (transact only; background indexing disabled)
-fluree-server --indexing-enabled=false
-
-# Indexing server
-./fluree-db-indexer --ledgers mydb:main,mydb:dev
+fluree server run -- --indexing-enabled=false
 ```
+
+Fluree does not ship a standalone indexer binary. The external indexer is a process you run
+against the same storage; it decides when to build from the `indexing` status the server
+reports (for example `indexing.needed` in push responses; see [Endpoints](../api/endpoints.md)).
+This needs storage several processes can share: a file storage directory is used by one process
+at a time, and the server locks it ([One process per directory](../operations/storage.md#one-process-per-directory)).
 
 ## Transaction Patterns and Indexing
 

@@ -66,6 +66,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Create S3 storage with MinIO settings (ambient credentials)
     // MinIO uses path-style URLs and we set AWS credentials via environment
     println!("\n=== Creating S3 Storage (MinIO) ===");
+    #[allow(deprecated)] // an SDK example, not a graph-source read
     let storage = S3IcebergStorage::from_default_chain(
         Some(&minio_region),
         Some(&minio_endpoint),

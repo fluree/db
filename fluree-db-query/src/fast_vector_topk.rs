@@ -47,7 +47,7 @@ use crate::eval::vector_math;
 use crate::fast_path_common::{
     allow_cursor_fast_path, build_overlay_cursor_for_predicate,
     build_overlay_cursor_for_subject_range, cached_overlay_ops, count_rows_for_predicate_psot,
-    cursor_projection_sid_otype_okey, empty_batch, leaf_entries_for_predicate, normalize_pred_sid,
+    cursor_projection_sid_otype_okey, driver_subject_boundaries, empty_batch, normalize_pred_sid,
     parallel_map_pooled, slice_overlay_ops_by_subject, FastPathOperator,
 };
 use crate::ir::{Expression, Function, Pattern, Query, Ref, Term};
@@ -300,12 +300,8 @@ impl Fold {
         match need {
             Some(n) => Fold::TopK {
                 need: n,
-                // Cap the eager reservation: `n` is a user literal (limit +
-                // offset), so a large-but-legal LIMIT would otherwise reserve an
-                // oversized heap per partition. The heap grows if genuinely
-                // needed, and `push` caps it at `need`. `saturating_add` also
-                // avoids the `n + 1` overflow debug-panic at pathological limits.
-                heap: BinaryHeap::with_capacity(n.saturating_add(1).min(4096)),
+                // `push` caps the heap at `need`.
+                heap: BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(n)),
             },
             None => Fold::All(Vec::new()),
         }
@@ -440,11 +436,7 @@ pub fn vector_topk_operator(
             if ctx.to_t < store.max_t() {
                 return Ok(None);
             }
-            let overlay_present = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let overlay_present = crate::fast_path_common::overlay_has_novelty(ctx);
             let g_id: GraphId = ctx.binary_g_id;
 
             let _span = tracing::debug_span!(
@@ -490,10 +482,17 @@ pub fn vector_topk_operator(
                 if (key as u32) >= crate::dict_overlay::EPHEMERAL_VECTOR_BASE
                     && !ephemeral.contains_key(&key)
                 {
-                    let Some(gv) = ctx.graph_view() else {
+                    let Some(gv) = ctx.one_graph_view() else {
                         return Ok(None);
                     };
-                    match gv.decode_value_from_kind(ObjKind::VECTOR_ID.as_u8(), key, p_id, 0, 0) {
+                    match gv.decode_value_from_kind(
+                        ObjKind::VECTOR_ID.as_u8(),
+                        key,
+                        p_id,
+                        0,
+                        0,
+                        gv.g_id(),
+                    ) {
                         Ok(FlakeValue::Vector(v)) => {
                             ephemeral.insert(key, v.iter().copied().collect());
                         }
@@ -572,7 +571,7 @@ pub fn vector_topk_operator(
             // Overlay-lane subjects may be novelty-only (absent from the
             // persisted dict) — materialize via the novelty-aware view.
             let view = if overlay_present {
-                Some(ctx.graph_view().ok_or_else(|| {
+                Some(ctx.one_graph_view().ok_or_else(|| {
                     QueryError::Internal("graph view unavailable for overlay subjects".into())
                 })?)
             } else {
@@ -634,7 +633,7 @@ fn scan_serial(scan: &VectorScan, pred_sid: &Sid) -> Result<Option<Vec<(u64, f64
     let mut scratch: Vec<f64> = Vec::new();
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for r in 0..batch.row_count {
             match scorer.score(batch.o_type.get(r), batch.o_key.get(r), &mut scratch) {
@@ -690,10 +689,6 @@ fn scan_partitioned(
         need,
     } = scan;
     let to_t = ctx.to_t;
-    let epoch = ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0);
     let ncpu = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(1);
@@ -701,29 +696,7 @@ fn scan_partitioned(
     if k < 2 {
         return Ok(PartitionScan::TooFewPartitions);
     }
-    // Candidate subject boundaries: leaf first-subjects when there are
-    // enough leaves; else refine to leaflet first-subjects (opens the few
-    // driver leaves, which the partitions scan anyway).
-    let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
-    let candidates: Vec<u64> = if leaves.len() >= k {
-        leaves.iter().map(|e| e.first_key.s_id.as_u64()).collect()
-    } else {
-        use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
-        let mut bounds: Vec<u64> = Vec::new();
-        for leaf in leaves {
-            let handle = store
-                .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-                .map_err(|e| QueryError::from_io("leaf open", e))?;
-            for entry in &handle.dir().entries {
-                if entry.row_count == 0 || entry.p_const != Some(p_id) {
-                    continue;
-                }
-                let first = read_ordered_key_v2(RunSortOrder::Psot, &entry.first_key);
-                bounds.push(first.s_id.as_u64());
-            }
-        }
-        bounds
-    };
+    let candidates = driver_subject_boundaries(store, g_id, p_id, k)?;
     if candidates.len() < 2 {
         return Ok(PartitionScan::TooFewPartitions);
     }
@@ -741,6 +714,7 @@ fn scan_partitioned(
     let ranges: Vec<(u64, u64)> = bounds.windows(2).map(|w| (w[0], w[1])).collect();
 
     let cancellation = &ctx.cancellation;
+    let tracker = &ctx.tracker;
     let partials: Vec<Result<Option<ScoredRows>>> = parallel_map_pooled(ranges, |(lo, hi)| {
         crate::fast_path_common::bail_if_cancelled(cancellation)?;
         let sliced = slice_overlay_ops_by_subject(ops, lo, hi);
@@ -753,7 +727,7 @@ fn scan_partitioned(
             hi,
             sliced,
             to_t,
-            epoch,
+            tracker,
         ) else {
             return Ok(Some(Vec::new()));
         };
@@ -761,7 +735,7 @@ fn scan_partitioned(
         let mut scratch: Vec<f64> = Vec::new();
         while let Some(batch) = cursor
             .next_batch()
-            .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+            .map_err(|e| QueryError::from_io("cursor batch", e))?
         {
             for r in 0..batch.row_count {
                 let s = batch.s_id.get(r);

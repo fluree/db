@@ -14,7 +14,7 @@ path = "src/main.rs"
 # HTTP + async. Versions track the workspace's pins so this tool stays
 # binary-compatible with what the server crate is built against.
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 
 # CLI.
 clap = { version = "4", features = ["derive", "env"] }

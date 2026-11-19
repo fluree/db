@@ -389,6 +389,25 @@ impl OverlayProvider for SchemaBundleOverlay<'_> {
         self.base.as_any()
     }
 
+    fn list_predicates(
+        &self,
+    ) -> Option<std::sync::Arc<std::collections::HashSet<fluree_db_core::Sid>>> {
+        let base = self.base.list_predicates()?;
+        let mut bundle = self
+            .bundle
+            .spot
+            .iter()
+            .filter(|f| f.m.as_ref().is_some_and(|m| m.i.is_some()))
+            .map(|f| f.p.clone())
+            .peekable();
+        if bundle.peek().is_none() {
+            return Some(base);
+        }
+        let mut all = (*base).clone();
+        all.extend(bundle);
+        Some(std::sync::Arc::new(all))
+    }
+
     fn epoch(&self) -> u64 {
         self.epoch
     }

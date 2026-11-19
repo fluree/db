@@ -25,7 +25,8 @@ pub const STORAGE_METHOD_MEMORY: &str = "memory";
 /// (via `Arc<RwLock<...>>`) to support both reading and writing.
 #[derive(Debug, Clone)]
 pub struct MemoryStorage {
-    data: Arc<RwLock<HashMap<String, Vec<u8>>>>,
+    data: Arc<RwLock<HashMap<String, Arc<[u8]>>>>,
+    remote: bool,
 }
 
 impl Default for MemoryStorage {
@@ -39,6 +40,17 @@ impl MemoryStorage {
     pub fn new() -> Self {
         Self {
             data: Arc::new(RwLock::new(HashMap::new())),
+            remote: false,
+        }
+    }
+
+    /// A view of the same data that reports its reads as remote and holds
+    /// no bytes resident, for tests and benchmarks of what only remote
+    /// storage gets — the disk artifact cache.
+    pub fn simulating_remote(&self) -> Self {
+        Self {
+            data: Arc::clone(&self.data),
+            remote: true,
         }
     }
 
@@ -46,7 +58,7 @@ impl MemoryStorage {
     ///
     /// Note: This method takes `&self` (not `&mut self`) due to interior mutability.
     pub fn insert(&self, address: impl Into<String>, data: Vec<u8>) {
-        self.data.write().insert(address.into(), data);
+        self.data.write().insert(address.into(), data.into());
     }
 
     /// Insert JSON data at the given address
@@ -70,11 +82,35 @@ impl MemoryStorage {
 
 #[async_trait]
 impl StorageRead for MemoryStorage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    /// Reads are served from memory, unless built by [`Self::simulating_remote`].
+    fn is_remote(&self) -> bool {
+        self.remote
+    }
+
+    /// The stored bytes themselves, shared. A [`Self::simulating_remote`]
+    /// view holds nothing resident: a remote store's bytes are not in this
+    /// process.
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        if self.remote {
+            return None;
+        }
+        self.data.read().get(address).cloned()
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn crate::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> Result<Vec<u8>> {
         self.data
             .read()
             .get(address)
-            .cloned()
+            .map(|bytes| bytes.to_vec())
             .ok_or_else(|| crate::error::Error::not_found(address))
     }
 
@@ -170,21 +206,24 @@ impl StorageCas for MemoryStorage {
         if data.contains_key(address) {
             Ok(false)
         } else {
-            data.insert(address.into(), bytes.to_vec());
+            data.insert(address.into(), bytes.into());
             Ok(true)
         }
     }
 
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send,
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
     {
         let mut data = self.data.write();
-        let current = data.get(address).map(std::vec::Vec::as_slice);
+        let current = data.get(address).map(|bytes| &bytes[..]);
         match f(current)? {
             CasAction::Write(new_bytes) => {
-                data.insert(address.to_string(), new_bytes);
+                data.insert(address.to_string(), new_bytes.into());
                 Ok(CasOutcome::Written)
             }
             CasAction::Abort(t) => Ok(CasOutcome::Aborted(t)),
@@ -217,6 +256,16 @@ impl MemoryContentStore {
 
 #[async_trait]
 impl ContentStore for MemoryContentStore {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    /// Reads are served from memory.
+    fn is_remote(&self) -> bool {
+        false
+    }
+
     async fn has(&self, id: &ContentId) -> Result<bool> {
         Ok(self.data.read().contains_key(id))
     }
@@ -279,6 +328,28 @@ mod tests {
 
         assert!(storage.exists("test/path").await.unwrap());
         assert!(!storage.exists("nonexistent").await.unwrap());
+    }
+
+    #[test]
+    fn resolve_local_bytes_shares_the_stored_bytes() {
+        let storage = MemoryStorage::new();
+        storage.insert("test/path", b"hello world".to_vec());
+
+        let first = storage.resolve_local_bytes("test/path").expect("resident");
+        let second = storage.resolve_local_bytes("test/path").expect("resident");
+        assert_eq!(&first[..], b"hello world");
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "each lookup shares one allocation"
+        );
+        assert!(storage.resolve_local_bytes("nonexistent").is_none());
+        assert!(
+            storage
+                .simulating_remote()
+                .resolve_local_bytes("test/path")
+                .is_none(),
+            "a remote store's bytes are not in this process"
+        );
     }
 
     #[tokio::test]

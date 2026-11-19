@@ -91,8 +91,8 @@ impl Function {
             Function::Pow => numeric::eval_pow(args, row, ctx),
 
             // DateTime functions
-            Function::Now => datetime::eval_now(args),
-            Function::Today => datetime::eval_today(args),
+            Function::Now => datetime::eval_now(args, ctx),
+            Function::Today => datetime::eval_today(args, ctx),
             Function::Year => datetime::eval_year(args, row, ctx),
             Function::Month => datetime::eval_month(args, row, ctx),
             Function::Day => datetime::eval_day(args, row, ctx),
@@ -192,6 +192,7 @@ impl Function {
             Function::XsdDateTime => cast::eval_xsd_datetime(args, row, ctx),
             Function::XsdDate => cast::eval_xsd_date(args, row, ctx),
             Function::XsdTime => cast::eval_xsd_time(args, row, ctx),
+            Function::CypherToFloat => cast::eval_cypher_to_float(args, row, ctx),
 
             // Path functions
             Function::PathLength => path::eval_path_length(args, row),

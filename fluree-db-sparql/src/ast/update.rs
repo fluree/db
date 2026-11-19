@@ -264,6 +264,9 @@ pub struct Modify {
     pub insert_clause: Option<QuadPattern>,
     /// WHERE clause
     pub where_clause: GraphPattern,
+    /// Span of the WHERE keyword, where USING clauses end. `None` when the
+    /// operation was not built by the parser.
+    pub where_keyword: Option<SourceSpan>,
     /// Source span
     pub span: SourceSpan,
 }
@@ -282,6 +285,7 @@ impl Modify {
             delete_clause,
             insert_clause,
             where_clause,
+            where_keyword: None,
             span,
         }
     }
@@ -295,6 +299,12 @@ impl Modify {
     /// Set the USING clause.
     pub fn with_using(mut self, using: UsingClause) -> Self {
         self.using = Some(using);
+        self
+    }
+
+    /// Record the span of the WHERE keyword.
+    pub fn with_where_keyword(mut self, span: SourceSpan) -> Self {
+        self.where_keyword = Some(span);
         self
     }
 }
@@ -370,7 +380,7 @@ pub struct UsingClause {
     /// Multiple USING clauses are allowed. Semantics follow SPARQL dataset rules:
     /// the WHERE clause evaluates over the merged default graph of these entries.
     pub default_graphs: Vec<Iri>,
-    /// Named graphs (USING NAMED <iri>) - not supported by Fluree
+    /// Named graphs (USING NAMED <iri>)
     pub named_graphs: Vec<Iri>,
     /// Source span
     pub span: SourceSpan,

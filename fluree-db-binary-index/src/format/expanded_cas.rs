@@ -351,6 +351,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for GetCountingStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
         async fn has(&self, id: &ContentId) -> Result<bool> {
             self.inner.has(id).await
         }
@@ -431,6 +439,7 @@ mod tests {
             annotation_index: None,
             had_annotation_arena: false,
             has_list_meta: None,
+            graph_drops: Vec::new(),
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
         }

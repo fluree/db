@@ -217,6 +217,7 @@ pub fn count_rows_numeric_compare_operator(
                     p_id,
                     compare,
                     &threshold,
+                    &ctx.tracker,
                 )?;
                 return match count {
                     Some(count) => Ok(Some(build_count_batch(
@@ -309,6 +310,7 @@ pub fn sum_compare_as_count_operator(
                     p_id,
                     compare,
                     &threshold,
+                    &ctx.tracker,
                 )?;
                 return match count {
                     Some(count) => Ok(Some(build_count_batch(
@@ -360,6 +362,7 @@ fn count_rows_for_predicate_numeric_compare_post(
     p_id: u32,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
 
@@ -382,15 +385,15 @@ fn count_rows_for_predicate_numeric_compare_post(
                 // now without opening any leaves.
                 return Ok(None);
             }
-            let Some(threshold_key) = encode_numeric_threshold_for_otype(otype, threshold)? else {
+            let Some(interval) = threshold_key_interval(otype, compare, threshold) else {
                 // Threshold not encodable for the uniform o_type (e.g. a
                 // decimal constant over integer rows): same doomed scan.
                 return Ok(None);
             };
-            if leaflet_fully_excluded(compare, min_ok, max_ok, threshold_key) {
+            if leaflet_fully_excluded(min_ok, max_ok, interval) {
                 return Ok(Some(0));
             }
-            if leaflet_fully_matches(compare, min_ok, max_ok, threshold_key) {
+            if leaflet_fully_matches(min_ok, max_ok, interval) {
                 return Ok(Some(count_rows_for_predicate_psot(store, g_id, p_id)?));
             }
         } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
@@ -410,7 +413,7 @@ fn count_rows_for_predicate_numeric_compare_post(
     // predicate's total row count.
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
     parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk)
+        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk, tracker)
     })
 }
 
@@ -473,10 +476,10 @@ fn boundary_leaf_pid_extent(
     leaf: &LeafEntry,
     last: bool,
 ) -> Result<Option<(u16, u64)>> {
-    let handle = store
-        .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-        .map_err(|e| QueryError::from_io("leaf open", e))?;
-    let entries = &handle.dir().entries;
+    let dir = store
+        .open_leaf_dir(&leaf.leaf_cid)
+        .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+    let entries = &dir.entries;
     let mut indices = (0..entries.len()).collect::<Vec<_>>();
     if last {
         indices.reverse();
@@ -512,6 +515,7 @@ fn count_numeric_compare_in_leaf_slice(
     compare: NumericCompareOp,
     threshold: &FlakeValue,
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let projection = projection_okey_only();
     let mut total: u64 = 0;
@@ -534,9 +538,8 @@ fn count_numeric_compare_in_leaf_slice(
             if !matches!(otype, OType::XSD_INTEGER | OType::XSD_DOUBLE) {
                 return Ok(None);
             }
-            let threshold_key = match encode_numeric_threshold_for_otype(otype, threshold)? {
-                Some(key) => key,
-                None => return Ok(None),
+            let Some(interval) = threshold_key_interval(otype, compare, threshold) else {
+                return Ok(None);
             };
 
             let first = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key);
@@ -546,78 +549,121 @@ fn count_numeric_compare_in_leaf_slice(
                 return Ok(None);
             }
 
-            if leaflet_fully_matches(compare, first.o_key, last.o_key, threshold_key) {
+            if leaflet_fully_matches(first.o_key, last.o_key, interval) {
                 total = total.saturating_add(entry.row_count as u64);
                 continue;
             }
-            if leaflet_fully_excluded(compare, first.o_key, last.o_key, threshold_key) {
+            if leaflet_fully_excluded(first.o_key, last.o_key, interval) {
                 continue;
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
-            total = total.saturating_add(count_matching_rows_in_sorted_batch(
-                &batch,
-                compare,
-                threshold_key,
-            ) as u64);
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
+            total =
+                total.saturating_add(count_matching_rows_in_sorted_batch(&batch, interval) as u64);
         }
     }
 
     Ok(Some(total))
 }
 
-fn encode_numeric_threshold_for_otype(otype: OType, threshold: &FlakeValue) -> Result<Option<u64>> {
-    let key = match (otype, threshold) {
-        (OType::XSD_INTEGER, FlakeValue::Long(n)) => ObjKey::encode_i64(*n).as_u64(),
-        (OType::XSD_DOUBLE, FlakeValue::Long(n)) => ObjKey::encode_f64(*n as f64)
-            .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-            .as_u64(),
-        (OType::XSD_DOUBLE, FlakeValue::Double(d)) => ObjKey::encode_f64(*d)
-            .map_err(|_| QueryError::execution("cannot encode f64 threshold".to_string()))?
-            .as_u64(),
-        _ => return Ok(None),
-    };
-    Ok(Some(key))
-}
+/// The rows of one o_type that `?o <compare> threshold` selects, as an
+/// inclusive `o_key` interval (keys are order-preserving per o_type).
+///
+/// - `None`: the threshold is not comparable by key for this o_type (e.g. a
+///   decimal threshold over integer rows); the caller defers.
+/// - `Some(None)`: the comparison selects no row of this o_type.
+/// - `Some(Some((lo, hi)))`: it selects exactly the keys in `lo..=hi`.
+///
+/// Every comparison with NaN is false (XPath F&O 3.1 §4.3.2): a NaN threshold
+/// selects nothing, and a double interval stops at `+INF`'s key, below NaN's.
+pub(crate) type KeyInterval = Option<(u64, u64)>;
 
-fn leaflet_fully_matches(compare: NumericCompareOp, first: u64, last: u64, threshold: u64) -> bool {
-    match compare {
-        NumericCompareOp::Gt => first > threshold,
-        NumericCompareOp::Ge => first >= threshold,
-        NumericCompareOp::Lt => last < threshold,
-        NumericCompareOp::Le => last <= threshold,
-    }
-}
-
-fn leaflet_fully_excluded(
+pub(crate) fn threshold_key_interval(
+    otype: OType,
     compare: NumericCompareOp,
-    first: u64,
-    last: u64,
-    threshold: u64,
-) -> bool {
-    match compare {
-        NumericCompareOp::Gt => last <= threshold,
-        NumericCompareOp::Ge => last < threshold,
-        NumericCompareOp::Lt => first >= threshold,
-        NumericCompareOp::Le => first > threshold,
-    }
+    threshold: &FlakeValue,
+) -> Option<KeyInterval> {
+    let (compare, key, max) = match (otype, threshold) {
+        (OType::XSD_INTEGER, FlakeValue::Long(n)) => {
+            (compare, ObjKey::encode_i64(*n).as_u64(), u64::MAX)
+        }
+        (OType::XSD_DOUBLE, FlakeValue::Long(n)) => {
+            let (compare, d) = long_threshold_as_double(compare, *n);
+            (
+                compare,
+                ObjKey::encode_f64(d).as_u64(),
+                ObjKey::F64_COMPARABLE_MAX.as_u64(),
+            )
+        }
+        (OType::XSD_DOUBLE, FlakeValue::Double(d)) => {
+            if d.is_nan() {
+                return Some(None);
+            }
+            (
+                compare,
+                ObjKey::encode_f64(*d).as_u64(),
+                ObjKey::F64_COMPARABLE_MAX.as_u64(),
+            )
+        }
+        _ => return None,
+    };
+    let interval = match compare {
+        NumericCompareOp::Gt => key.checked_add(1).map(|lo| (lo, max)),
+        NumericCompareOp::Ge => Some((key, max)),
+        NumericCompareOp::Lt => key.checked_sub(1).map(|hi| (0, hi)),
+        NumericCompareOp::Le => Some((0, key)),
+    };
+    Some(interval.filter(|(lo, hi)| lo <= hi))
+}
+
+/// `?v compare n`, for a double `?v`, as a comparison with a double: `n`
+/// itself when it is one, else the double `n` rounds to, with the comparison
+/// adjusted to its side of `n`. No double lies strictly between `n` and that
+/// neighbour, so the comparison selects exactly the doubles the exact one
+/// does (Fluree compares numbers exactly).
+fn long_threshold_as_double(compare: NumericCompareOp, n: i64) -> (NumericCompareOp, f64) {
+    use std::cmp::Ordering;
+    use NumericCompareOp::{Ge, Gt, Le, Lt};
+    let d = n as f64;
+    // Every double at or beyond 2^53 is an integer, and `d` is at most 2^63,
+    // so this comparison is exact.
+    let compare = match (d as i128).cmp(&i128::from(n)) {
+        Ordering::Equal => compare,
+        // `d` is above `n`: `> n` and `>= n` are `>= d`; `< n` and `<= n` are `< d`.
+        Ordering::Greater => match compare {
+            Gt | Ge => Ge,
+            Lt | Le => Lt,
+        },
+        // `d` is below `n`: `> n` and `>= n` are `> d`; `< n` and `<= n` are `<= d`.
+        Ordering::Less => match compare {
+            Gt | Ge => Gt,
+            Lt | Le => Le,
+        },
+    };
+    (compare, d)
+}
+
+fn leaflet_fully_matches(first: u64, last: u64, interval: KeyInterval) -> bool {
+    interval.is_some_and(|(lo, hi)| first >= lo && last <= hi)
+}
+
+fn leaflet_fully_excluded(first: u64, last: u64, interval: KeyInterval) -> bool {
+    interval.is_none_or(|(lo, hi)| last < lo || first > hi)
 }
 
 fn count_matching_rows_in_sorted_batch(
     batch: &fluree_db_binary_index::ColumnBatch,
-    compare: NumericCompareOp,
-    threshold: u64,
+    interval: KeyInterval,
 ) -> usize {
-    let lower = lower_bound_okey(batch, threshold);
-    let upper = upper_bound_okey(batch, threshold);
-    match compare {
-        NumericCompareOp::Gt => batch.row_count.saturating_sub(upper),
-        NumericCompareOp::Ge => batch.row_count.saturating_sub(lower),
-        NumericCompareOp::Lt => lower,
-        NumericCompareOp::Le => upper,
-    }
+    interval.map_or(0, |(lo, hi)| {
+        upper_bound_okey(batch, hi).saturating_sub(lower_bound_okey(batch, lo))
+    })
 }
 
 fn lower_bound_okey(batch: &fluree_db_binary_index::ColumnBatch, threshold: u64) -> usize {
@@ -648,16 +694,11 @@ fn upper_bound_okey(batch: &fluree_db_binary_index::ColumnBatch, threshold: u64)
     lo
 }
 
-/// Scalar form of the numeric comparison on the order-preserving `o_key` encoding
-/// (the same encoding the binary-search bounds rely on).
+/// Scalar form of the numeric comparison on the order-preserving `o_key`
+/// encoding (the same intervals the binary-search bounds use).
 #[inline]
-fn okey_matches(compare: NumericCompareOp, o_key: u64, threshold: u64) -> bool {
-    match compare {
-        NumericCompareOp::Gt => o_key > threshold,
-        NumericCompareOp::Ge => o_key >= threshold,
-        NumericCompareOp::Lt => o_key < threshold,
-        NumericCompareOp::Le => o_key <= threshold,
-    }
+fn okey_matches(o_key: u64, interval: KeyInterval) -> bool {
+    interval.is_some_and(|(lo, hi)| lo <= o_key && o_key <= hi)
 }
 
 /// Overlay/time-travel lane for the numeric-compare count: counts rows of `p_id`
@@ -682,8 +723,8 @@ fn count_numeric_compare_overlay_parallel(
     compare: NumericCompareOp,
     threshold: &FlakeValue,
 ) -> Result<Option<u64>> {
-    let tk_int = encode_numeric_threshold_for_otype(OType::XSD_INTEGER, threshold)?;
-    let tk_dbl = encode_numeric_threshold_for_otype(OType::XSD_DOUBLE, threshold)?;
+    let tk_int = threshold_key_interval(OType::XSD_INTEGER, compare, threshold);
+    let tk_dbl = threshold_key_interval(OType::XSD_DOUBLE, compare, threshold);
 
     // Pre-check the base predicate's POST extent: if the base rows are
     // uniformly an unsupported o_type (e.g. all-decimal), or the threshold
@@ -733,7 +774,7 @@ fn count_numeric_compare_overlay_parallel(
                 _ => return false,
             };
             match tk {
-                Some(tk) => okey_matches(compare, o_key, tk),
+                Some(interval) => okey_matches(o_key, interval),
                 None => {
                     // Threshold not encodable for this row's o_type (e.g. a
                     // decimal threshold against integer rows): the comparison
@@ -793,7 +834,7 @@ pub fn count_rows_encoded_filters_operator(
                 };
                 // Compile the FILTERs to encoded pre-filters. If any can't be pushed
                 // down (needs value decoding), defer to the serial scan-count fallback.
-                let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                let (encoded, pruned, _) = compile_encoded_pre_filters_and_prune_inline_ops(
                     &inline_ops,
                     &pattern,
                     store,
@@ -805,7 +846,13 @@ pub fn count_rows_encoded_filters_operator(
                 let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
                 let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
                 let count = parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-                    count_rows_matching_encoded_filters_in_leaf_slice(store, p_id, &encoded, chunk)
+                    count_rows_matching_encoded_filters_in_leaf_slice(
+                        store,
+                        p_id,
+                        &encoded,
+                        chunk,
+                        &ctx.tracker,
+                    )
                 })?;
                 return match count {
                     Some(c) => Ok(Some(build_count_batch(
@@ -823,7 +870,7 @@ pub fn count_rows_encoded_filters_operator(
                 let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
                     return Ok(None);
                 };
-                let (encoded, pruned) = compile_encoded_pre_filters_and_prune_inline_ops(
+                let (encoded, pruned, _) = compile_encoded_pre_filters_and_prune_inline_ops(
                     &inline_ops,
                     &pattern,
                     store,
@@ -864,6 +911,7 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
     p_id: u32,
     filters: &[EncodedPreFilter],
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let projection = projection_sid_otype_okey();
     let mut total: u64 = 0;
@@ -876,9 +924,13 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for r in 0..batch.row_count {
                 let s_id = batch.s_id.get(r);
                 let o_type = batch.o_type.get(r);
@@ -929,6 +981,7 @@ pub fn count_rows_lang_filter_operator(
                     ctx.binary_g_id,
                     p_id,
                     required_otype,
+                    &ctx.tracker,
                 )?;
                 return Ok(Some(build_count_batch(
                     out_var,
@@ -974,6 +1027,7 @@ fn count_rows_for_predicate_lang_psot(
     g_id: GraphId,
     p_id: u32,
     required_otype: u16,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_otype_only();
@@ -996,9 +1050,13 @@ fn count_rows_for_predicate_lang_psot(
                 continue;
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 if batch.o_type.get(row) == required_otype {
                     total += 1;
@@ -1017,15 +1075,28 @@ fn count_rows_for_predicate_lang_psot(
 // COUNT(*) / COUNT(?x) for `?s ?p ?o` and COUNT(DISTINCT ?lead)
 // ---------------------------------------------------------------------------
 
-/// Fast-path: count total triples across all patterns.
-pub fn count_triples_operator(out_var: VarId, fallback: Option<BoxedOperator>) -> FastPathOperator {
+/// Fast-path: count total triples across all patterns. With `lists`, the
+/// count is of SPARQL's view of RDF lists (`crate::list_view`): each list's
+/// members give way to its owner edge and two triples per cell, so the
+/// stored count gains the members and lists of the index's list census.
+pub fn count_triples_operator(
+    out_var: VarId,
+    lists: bool,
+    fallback: Option<BoxedOperator>,
+) -> FastPathOperator {
     FastPathOperator::new(
         out_var,
         move |ctx| {
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_triples_from_branch_manifest(store, ctx.binary_g_id)?;
+            let mut count = count_triples_from_branch_manifest(store, ctx.binary_g_id)?;
+            if lists {
+                let census = store
+                    .list_census(ctx.binary_g_id)
+                    .map_err(|e| QueryError::from_io("list census", e))?;
+                count += census.values().map(|c| c.lists + c.members).sum::<u64>();
+            }
             let count_i64 = count_to_i64(count, "COUNT triples")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
@@ -1115,9 +1186,11 @@ pub fn count_distinct_position_operator(
                 // and so is not an object identity for a NumBig arena handle.
                 // Those terms are counted exactly from the in-memory arenas
                 // (see `count_distinct_numbig_objects`); declining is reserved
-                // for an inconsistent index or the explicit kill switch.
+                // for a graph holding vectors, an inconsistent index or the
+                // explicit kill switch.
                 DistinctPosition::Objects => {
-                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
+                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id, &ctx.tracker)?
+                    else {
                         return Ok(None);
                     };
                     (count, "COUNT(DISTINCT) objects")
@@ -1226,13 +1299,23 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// its distinct terms come from [`count_distinct_numbig_objects`], which reads
 /// the arenas rather than the rows.
 ///
-/// The per-predicate distinct-object count is unaffected and stays on its fast
-/// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
-/// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
+/// A graph that holds vectors declines: a vector's `o_key` is a handle into a
+/// per-predicate arena that does not deduplicate, so neither the lead nor the
+/// arena's size counts its distinct values
+/// ([`OType::o_key_is_predicate_identifying`]).
+///
+/// The per-predicate distinct-object count stays on its fast path for every
+/// other predicate: its 14-byte POST lead starts with `p_id`, which scopes a
+/// NumBig handle correctly. So is the distinct-subject count, whose SPOT lead
+/// is `s_id`.
 pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
+    if store.graph_holds_vectors(g_id) {
+        return Ok(None);
+    }
     let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
     else {
         return Ok(None);
@@ -1240,7 +1323,7 @@ pub(crate) fn count_distinct_objects(
     if walk.skipped_non_identifying_rows == 0 {
         return Ok(Some(walk.count));
     }
-    let Some(exact) = count_distinct_numbig_objects(store, g_id)? else {
+    let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
         return Ok(None);
     };
     crate::fast_path_outcome::stamp_fast_path(
@@ -1281,7 +1364,11 @@ pub(crate) fn count_distinct_objects(
 /// entry, including repeated values across predicates. On typical 64-bit targets
 /// each key occupies 48 bytes, plus allocations for wide values and temporary
 /// buffers. Legacy arenas also pay for normalization during key construction.
-fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<Option<u64>> {
+fn count_distinct_numbig_objects(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<u64>> {
     use rayon::prelude::*;
 
     let arenas: Vec<(u32, &NumBigArena)> = store
@@ -1299,7 +1386,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
     let mut keys: Vec<NumBigDistinctKey> = Vec::new();
     for (p_id, arena) in arenas {
         let normalized = arena.values_are_normalized();
-        let live = count_live_numbig_handles(store, g_id, p_id)?;
+        let live = count_live_numbig_handles(store, g_id, p_id, tracker)?;
         if live == 0 {
             continue;
         }
@@ -1312,7 +1399,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
             );
             continue;
         }
-        let handles = live_numbig_handles(store, g_id, p_id)?;
+        let handles = live_numbig_handles(store, g_id, p_id, tracker)?;
         let mapped: Result<Vec<NumBigDistinctKey>> = handles
             .par_iter()
             .map(|&h| {
@@ -1474,11 +1561,16 @@ fn decode_numbig_handle_run(
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     leaflet_idx: usize,
     o_type_const: Option<u16>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<(u64, u64, u64)>> {
     let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    let batch = handle
-        .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
-        .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+    let batch = crate::fast_path_common::load_leaflet_columns_charged(
+        handle,
+        leaflet_idx,
+        &projection_otype_okey(),
+        RunSortOrder::Post,
+        tracker,
+    )?;
     let o_type_default = o_type_const.unwrap_or(0);
     let mut count = 0u64;
     let mut first = None;
@@ -1502,7 +1594,12 @@ fn decode_numbig_handle_run(
 /// seam dedup on the handle, decoding only a leaflet that straddles the NumBig
 /// range or predates `lead_group_count`. Compared against the arena's size, this
 /// says whether every arena entry is still live without reading a row.
-fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<u64> {
+fn count_live_numbig_handles(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(0);
@@ -1536,9 +1633,12 @@ fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
                                     .map_err(|e| QueryError::from_io("leaf open", e))?,
                             ),
                         };
-                        if let Some((count, first, last)) =
-                            decode_numbig_handle_run(handle.as_ref(), idx, entry.o_type_const)?
-                        {
+                        if let Some((count, first, last)) = decode_numbig_handle_run(
+                            handle.as_ref(),
+                            idx,
+                            entry.o_type_const,
+                            tracker,
+                        )? {
                             partial.push_run(count, first, last);
                         }
                     }
@@ -1559,7 +1659,12 @@ fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
 /// deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
 /// leaflet) over the predicate's NumBig leaflets only — the fallback for a
 /// predicate whose arena holds retracted values.
-fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Vec<u32>> {
+fn live_numbig_handles(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Vec<u32>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(Vec::new());
@@ -1589,9 +1694,13 @@ fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Re
                 .map_err(|e| QueryError::from_io("leaf open", e))?;
             for idx in wanted {
                 let entry = &dir.entries[idx];
-                let batch = handle
-                    .load_columns(idx, &projection_otype_okey(), RunSortOrder::Post)
-                    .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    &*handle,
+                    idx,
+                    &projection_otype_okey(),
+                    RunSortOrder::Post,
+                    tracker,
+                )?;
                 let o_type_default = entry.o_type_const.unwrap_or(0);
                 for row in 0..batch.row_count {
                     if batch.o_type.get_or(row, o_type_default) != numbig {
@@ -1778,11 +1887,23 @@ struct PredicateLeadPartial {
 /// POST keys are `p_id(4) + o_type(2) + o_key(8) + o_i(4) + s_id(8)` and POST
 /// `lead_group_count` counts distinct `(o_type, o_key)` per leaflet (`o_i`
 /// excluded), so the 14-byte `p+o` prefix defines a group.
+///
+/// `None` where one value can sit under several keys
+/// ([`BinaryIndexStore::objects_keyed_by_value`]): a vector arena gives every
+/// stored fact its own handle (unless it holds no value twice), and a legacy
+/// decimal arena gives each scale variant one, so the lead groups would count
+/// keys rather than values.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
 ) -> Result<Option<u64>> {
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
+        return Ok(None);
+    }
     count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, 14)
 }
 
@@ -1969,7 +2090,7 @@ pub fn count_literal_objects_operator(
                     tracing::debug!(count, "literal COUNT answered from datatype stats");
                     count
                 }
-                None => count_literal_rows_psot(store, ctx.binary_g_id)?,
+                None => count_literal_rows_psot(store, ctx.binary_g_id, &ctx.tracker)?,
             };
             let count_i64 = count_to_i64(count, "COUNT literals")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -2026,7 +2147,11 @@ fn is_literal_otype(ot_u16: u16) -> bool {
     !ot.is_node_ref()
 }
 
-fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+fn count_literal_rows_psot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
         return Ok(0);
     };
@@ -2050,9 +2175,13 @@ fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u6
             }
 
             // Mixed types: decode OType column only.
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 if is_literal_otype(batch.o_type.get(row)) {
                     total += 1;
@@ -2075,7 +2204,7 @@ pub fn count_blank_node_subjects_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_blank_subject_rows_spot(store, ctx.binary_g_id)?;
+            let count = count_blank_subject_rows_spot(store, ctx.binary_g_id, &ctx.tracker)?;
             let count_i64 = count_to_i64(count, "COUNT blank nodes")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
@@ -2091,7 +2220,11 @@ fn blank_subject_range() -> (u64, u64) {
     (min, max)
 }
 
-fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+fn count_blank_subject_rows_spot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
         return Ok(0);
     };
@@ -2147,9 +2280,13 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
             }
 
             // Boundary leaflet: count exact rows by scanning SId column only.
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Spot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Spot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if (s_min..=s_max).contains(&sid) {
@@ -2172,6 +2309,63 @@ mod tests {
     use super::*;
     use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
     use fluree_db_core::IndexStats;
+
+    /// An integer threshold selects exactly the doubles the generic lane's
+    /// exact comparison does, around and beyond 2^53 where an `i64` has no
+    /// double of its own.
+    #[test]
+    fn a_long_threshold_selects_doubles_exactly() {
+        use std::cmp::Ordering;
+        // `v` against `n`, exactly.
+        fn exact(v: f64, n: i64) -> Ordering {
+            let floor = v.floor();
+            match (floor as i128).cmp(&i128::from(n)) {
+                Ordering::Equal if v > floor => Ordering::Greater,
+                other => other,
+            }
+        }
+        let p53 = 1_i64 << 53;
+        for n in [
+            0,
+            7,
+            p53 - 1,
+            p53,
+            p53 + 1,
+            p53 + 3,
+            -(p53 + 1),
+            i64::MAX,
+            i64::MIN,
+        ] {
+            let d = n as f64;
+            let near = [
+                d,
+                d.next_up(),
+                d.next_down(),
+                d.next_up().next_up(),
+                d.next_down().next_down(),
+            ];
+            for op in [
+                NumericCompareOp::Gt,
+                NumericCompareOp::Ge,
+                NumericCompareOp::Lt,
+                NumericCompareOp::Le,
+            ] {
+                let interval = threshold_key_interval(OType::XSD_DOUBLE, op, &FlakeValue::Long(n))
+                    .expect("an integer threshold is comparable with doubles");
+                for v in near {
+                    let key = ObjKey::encode_f64(v).as_u64();
+                    let selected = interval.is_some_and(|(lo, hi)| lo <= key && key <= hi);
+                    let expected = match op {
+                        NumericCompareOp::Gt => exact(v, n) == Ordering::Greater,
+                        NumericCompareOp::Ge => exact(v, n) != Ordering::Less,
+                        NumericCompareOp::Lt => exact(v, n) == Ordering::Less,
+                        NumericCompareOp::Le => exact(v, n) != Ordering::Greater,
+                    };
+                    assert_eq!(selected, expected, "{v:e} {op:?} {n}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn numbig_signed_keys_preserve_boundaries() {
@@ -2312,6 +2506,44 @@ mod tests {
     const STRING: u8 = 1;
     const INTEGER: u8 = 2;
     const UNKNOWN: u8 = 255;
+
+    #[test]
+    fn double_key_intervals_follow_numeric_comparison() {
+        use NumericCompareOp::{Ge, Gt, Le, Lt};
+        let values = [f64::NEG_INFINITY, -1.5, 0.0, 2.5, f64::INFINITY, f64::NAN];
+        let keys: Vec<u64> = values
+            .iter()
+            .map(|d| ObjKey::encode_f64(*d).as_u64())
+            .collect();
+        let selected = |compare: NumericCompareOp, threshold: FlakeValue| -> Vec<usize> {
+            let interval = threshold_key_interval(OType::XSD_DOUBLE, compare, &threshold)
+                .expect("a double threshold is comparable by key");
+            (0..keys.len())
+                .filter(|&i| okey_matches(keys[i], interval))
+                .collect()
+        };
+        // XPath comparisons (F&O 3.1 §4.3.2): +INF is above and -INF below
+        // every other number, and NaN satisfies none of them.
+        assert_eq!(selected(Gt, FlakeValue::Double(0.0)), [3, 4]);
+        assert_eq!(selected(Gt, FlakeValue::Long(0)), [3, 4]);
+        assert_eq!(selected(Lt, FlakeValue::Long(0)), [0, 1]);
+        assert_eq!(
+            selected(Ge, FlakeValue::Double(f64::NEG_INFINITY)),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            selected(Le, FlakeValue::Double(f64::INFINITY)),
+            [0, 1, 2, 3, 4]
+        );
+        assert_eq!(
+            selected(Lt, FlakeValue::Double(f64::INFINITY)),
+            [0, 1, 2, 3]
+        );
+        assert!(selected(Gt, FlakeValue::Double(f64::INFINITY)).is_empty());
+        for compare in [Gt, Ge, Lt, Le] {
+            assert!(selected(compare, FlakeValue::Double(f64::NAN)).is_empty());
+        }
+    }
 
     #[test]
     fn literal_fold_sums_non_ref_tags() {

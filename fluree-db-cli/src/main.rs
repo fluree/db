@@ -1,4 +1,4 @@
-// Opt-in global allocator (see the `mimalloc` feature). In the binary only, so
+// Global allocator (the default `mimalloc` feature). In the binary only, so
 // embedders of the cli library keep their own allocator.
 #[cfg(feature = "mimalloc")]
 #[global_allocator]
@@ -203,13 +203,19 @@ async fn shutdown_tracer() {
 /// lazily, so the unused headroom costs no resident memory.
 const WORKER_STACK_SIZE: usize = 8 * 1024 * 1024;
 
+/// How long the runtime waits on blocking tasks after the command returns.
+/// Dropping a runtime waits on them without limit, so one stuck task would
+/// keep a server that has drained on SIGTERM from exiting.
+const RUNTIME_SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 fn main() {
-    tokio::runtime::Builder::new_multi_thread()
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(WORKER_STACK_SIZE)
         .build()
-        .expect("failed to build Tokio runtime")
-        .block_on(async_main());
+        .expect("failed to build Tokio runtime");
+    runtime.block_on(async_main());
+    runtime.shutdown_timeout(RUNTIME_SHUTDOWN_GRACE);
 }
 
 async fn async_main() {

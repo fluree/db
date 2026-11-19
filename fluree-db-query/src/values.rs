@@ -123,9 +123,10 @@ impl ValuesOperator {
     fn is_compatible(
         &self,
         ctx: &ExecutionContext<'_>,
+        norm: &Option<crate::object_binding::EqualityNorm>,
         input_row: &[&Binding],
         value_row: &[Binding],
-    ) -> bool {
+    ) -> Result<bool> {
         for (val_idx, overlap_pos) in self.overlap_positions.iter().enumerate() {
             if let Some(child_pos) = overlap_pos {
                 // This value var exists in child schema - check compatibility
@@ -144,12 +145,12 @@ impl ValuesOperator {
                 // while dataset execution can produce `IriMatch` bindings. We treat
                 // Sid vs IriMatch/Iri as comparable by decoding the SID using the
                 // primary db in the execution context.
-                if !bindings_compatible_for_values(ctx, child_val, values_val) {
-                    return false;
+                if !bindings_compatible_for_values(ctx, norm, child_val, values_val)? {
+                    return Ok(false);
                 }
             }
         }
-        true
+        Ok(true)
     }
 
     /// Inside a cross-ledger SERVICE body every reference binding is
@@ -171,14 +172,13 @@ impl ValuesOperator {
 
     /// Build the value-row hash lane (see the field docs). Called once per
     /// open, on the first batch.
-    fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) {
+    fn build_value_index(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         let has_overlap = self.overlap_positions.iter().any(Option::is_some);
         if !has_overlap || self.value_rows.len() < VALUES_HASH_MIN_ROWS {
-            return;
+            return Ok(());
         }
-        let gv = ctx.graph_view();
-        let store_arc = crate::object_binding::equality_norm_store(ctx);
-        let store = store_arc.as_deref();
+        let norm = crate::object_binding::equality_norm(ctx);
+        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&norm);
         let mut index: FxHashMap<CompositeGroupKey, Vec<usize>> = FxHashMap::default();
         let mut fallback: Vec<usize> = Vec::new();
         'rows: for (i, row) in self.value_rows.iter().enumerate() {
@@ -192,12 +192,13 @@ impl ValuesOperator {
                     fallback.push(i);
                     continue 'rows;
                 }
-                keys.push(binding_to_group_key_normalized(b, store, gv.as_ref()));
+                keys.push(binding_to_group_key_normalized(b, dicts, gv)?);
             }
             index.entry(CompositeGroupKey(keys)).or_default().push(i);
         }
         self.fallback_value_rows = fallback;
         self.value_index = Some(index);
+        Ok(())
     }
 
     /// Merge an input row with a compatible value row
@@ -252,7 +253,7 @@ impl Operator for ValuesOperator {
         if ctx.scan_provenance_ledger.is_some() {
             self.stamp_value_rows(ctx);
         }
-        self.build_value_index(ctx);
+        self.build_value_index(ctx)?;
         Ok(())
     }
 
@@ -303,9 +304,8 @@ impl Operator for ValuesOperator {
             .map(|_| Vec::with_capacity(max_rows))
             .collect();
 
-        let gv = ctx.graph_view();
-        let norm_store_arc = crate::object_binding::equality_norm_store(ctx);
-        let norm_store = norm_store_arc.as_deref();
+        let norm = crate::object_binding::equality_norm(ctx);
+        let (dicts, gv) = crate::object_binding::EqualityNorm::parts(&norm);
         for row_idx in 0..input_batch.len() {
             // Get input row as slice of references
             let input_row: Vec<&Binding> = (0..child_num_cols)
@@ -318,30 +318,36 @@ impl Operator for ValuesOperator {
             // this only ever removes provably-mismatching candidates. A
             // row whose own overlap bindings are unbound or fragile keys
             // nothing exactly — it scans the full set like before.
-            let bucket: Option<&Vec<usize>> = self.value_index.as_ref().and_then(|index| {
-                let mut keys = Vec::new();
+            let mut bucket: Option<&Vec<usize>> = None;
+            if let Some(index) = self.value_index.as_ref() {
+                let mut keys = Some(Vec::new());
                 for overlap_pos in self.overlap_positions.iter().flatten() {
                     let b = input_row[*overlap_pos];
                     if b.is_unbound_or_poisoned() || hash_fragile(b) {
-                        return None;
+                        keys = None;
+                        break;
                     }
-                    keys.push(binding_to_group_key_normalized(b, norm_store, gv.as_ref()));
+                    if let Some(keys) = keys.as_mut() {
+                        keys.push(binding_to_group_key_normalized(b, dicts, gv)?);
+                    }
                 }
-                Some(
+                bucket = keys.map(|keys| {
                     index
                         .get(&CompositeGroupKey(keys))
-                        .unwrap_or(const { &Vec::new() }),
-                )
-            });
+                        .unwrap_or(const { &Vec::new() })
+                });
+            }
 
-            let check_and_merge = |value_row: &[Binding], columns: &mut Vec<Vec<Binding>>| {
-                if self.is_compatible(ctx, &input_row, value_row) {
-                    let merged = self.merge_rows(&input_row, value_row);
-                    for (col_idx, binding) in merged.into_iter().enumerate() {
-                        columns[col_idx].push(binding);
+            let check_and_merge =
+                |value_row: &[Binding], columns: &mut Vec<Vec<Binding>>| -> Result<()> {
+                    if self.is_compatible(ctx, &norm, &input_row, value_row)? {
+                        let merged = self.merge_rows(&input_row, value_row);
+                        for (col_idx, binding) in merged.into_iter().enumerate() {
+                            columns[col_idx].push(binding);
+                        }
                     }
-                }
-            };
+                    Ok(())
+                };
 
             if let Some(bucket) = bucket {
                 // Emit candidates in original value-row order (bucket and
@@ -354,11 +360,11 @@ impl Operator for ValuesOperator {
                     .collect();
                 idxs.sort_unstable();
                 for i in idxs {
-                    check_and_merge(&self.value_rows[i], &mut columns);
+                    check_and_merge(&self.value_rows[i], &mut columns)?;
                 }
             } else {
                 for value_row in &self.value_rows {
-                    check_and_merge(value_row, &mut columns);
+                    check_and_merge(value_row, &mut columns)?;
                 }
             }
         }
@@ -384,35 +390,20 @@ impl Operator for ValuesOperator {
     }
 }
 
-fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &Binding) -> bool {
-    if a == b {
-        return true;
+fn bindings_compatible_for_values(
+    ctx: &ExecutionContext<'_>,
+    norm: &Option<crate::object_binding::EqualityNorm>,
+    a: &Binding,
+    b: &Binding,
+) -> Result<bool> {
+    // Encoded scan output vs decoded VALUES constants, and arena-backed
+    // NUM_BIG scan output vs a decoded decimal/bigint constant: one term in
+    // two forms, compared the way every equality surface compares them.
+    if crate::object_binding::same_term(a, b, norm)? {
+        return Ok(true);
     }
 
-    // Encoded scan output vs decoded VALUES constants: normalize the decoded
-    // side to its encoded form and retry the structural comparison.
-    if let Some(store) = crate::object_binding::equality_norm_store(ctx) {
-        let an = crate::object_binding::encoded_equivalent(a, &store);
-        let bn = crate::object_binding::encoded_equivalent(b, &store);
-        if (an.is_some() || bn.is_some()) && an.as_ref().unwrap_or(a) == bn.as_ref().unwrap_or(b) {
-            return true;
-        }
-    }
-
-    // Arena-backed NUM_BIG scan output vs a decoded decimal/bigint constant:
-    // the constant can't encode (handles are per-predicate), so decode the
-    // encoded side and compare by value.
-    if crate::object_binding::is_numbig_encoded(a) || crate::object_binding::is_numbig_encoded(b) {
-        if let Some(gv) = ctx.graph_view() {
-            let am = crate::group_aggregate::materialize_encoded(a, Some(&gv));
-            let bm = crate::group_aggregate::materialize_encoded(b, Some(&gv));
-            if am == bm {
-                return true;
-            }
-        }
-    }
-
-    match (a, b) {
+    Ok(match (a, b) {
         // Compare SID to IRI-bearing bindings by decoding SID via primary db.
         (Binding::Sid { sid, .. }, Binding::Iri(iri) | Binding::IriMatch { iri, .. })
         | (Binding::Iri(iri) | Binding::IriMatch { iri, .. }, Binding::Sid { sid, .. }) => ctx
@@ -421,7 +412,7 @@ fn bindings_compatible_for_values(ctx: &ExecutionContext<'_>, a: &Binding, b: &B
             .map(|decoded| decoded == iri.as_ref())
             .unwrap_or(false),
         _ => false,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -490,7 +481,7 @@ mod tests {
         use fluree_db_core::LedgerSnapshot;
 
         let vars = VarRegistry::new();
-        let snapshot = LedgerSnapshot::genesis("values-test/main");
+        let snapshot = LedgerSnapshot::genesis("values-test:main");
         let ctx = ExecutionContext::new(&snapshot, &vars);
 
         let child_schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
@@ -509,38 +500,47 @@ mod tests {
         // Compatible: child has 10, values has 10
         let binding_10 = Binding::lit(FlakeValue::Long(10), xsd_long());
         let input_row = vec![&binding_10];
-        assert!(op.is_compatible(
-            &ctx,
-            &input_row,
-            &[
-                Binding::lit(FlakeValue::Long(10), xsd_long()),
-                Binding::lit(FlakeValue::Long(20), xsd_long())
-            ]
-        ));
+        assert!(op
+            .is_compatible(
+                &ctx,
+                &None,
+                &input_row,
+                &[
+                    Binding::lit(FlakeValue::Long(10), xsd_long()),
+                    Binding::lit(FlakeValue::Long(20), xsd_long())
+                ]
+            )
+            .unwrap());
 
         // Incompatible: child has 10, values has 99
         let binding_10 = Binding::lit(FlakeValue::Long(10), xsd_long());
         let input_row = vec![&binding_10];
-        assert!(!op.is_compatible(
-            &ctx,
-            &input_row,
-            &[
-                Binding::lit(FlakeValue::Long(99), xsd_long()),
-                Binding::lit(FlakeValue::Long(20), xsd_long())
-            ]
-        ));
+        assert!(!op
+            .is_compatible(
+                &ctx,
+                &None,
+                &input_row,
+                &[
+                    Binding::lit(FlakeValue::Long(99), xsd_long()),
+                    Binding::lit(FlakeValue::Long(20), xsd_long())
+                ]
+            )
+            .unwrap());
 
         // Compatible: child is Unbound (matches anything)
         let unbound = Binding::Unbound;
         let input_row = vec![&unbound];
-        assert!(op.is_compatible(
-            &ctx,
-            &input_row,
-            &[
-                Binding::lit(FlakeValue::Long(99), xsd_long()),
-                Binding::lit(FlakeValue::Long(20), xsd_long())
-            ]
-        ));
+        assert!(op
+            .is_compatible(
+                &ctx,
+                &None,
+                &input_row,
+                &[
+                    Binding::lit(FlakeValue::Long(99), xsd_long()),
+                    Binding::lit(FlakeValue::Long(20), xsd_long())
+                ]
+            )
+            .unwrap());
     }
 
     // Helper struct for testing: an operator with a specific schema that returns empty

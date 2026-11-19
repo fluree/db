@@ -122,13 +122,17 @@ mod file;
 mod memory;
 pub mod residency;
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+mod root_lock;
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 mod wal;
 
 #[cfg(all(feature = "native", not(target_arch = "wasm32")))]
 pub use file::{FileStorage, STORAGE_METHOD_FILE};
 pub use memory::{MemoryContentStore, MemoryStorage, STORAGE_METHOD_MEMORY};
+#[cfg(all(feature = "native", not(target_arch = "wasm32")))]
+pub use root_lock::{RootLock, RootLockError, ALLOW_UNLOCKED_ENV_VAR, ROOT_LOCK_FILE};
 
-use crate::address_path::{ledger_id_to_path_prefix, shared_prefix_for_path};
+use crate::address_path::{storage_ledger_id, SHARED_NAMESPACE};
 use crate::error::Result;
 use async_trait::async_trait;
 use sha2::Digest;
@@ -226,12 +230,54 @@ pub trait StorageRead: Debug + Send + Sync {
     /// the local filesystem (e.g., `FileStorage`). Returns `None` for
     /// remote or in-memory backends.
     ///
-    /// Callers use this to avoid redundant copy-to-cache when the data
-    /// is already locally accessible.
+    /// Callers read or map the path in place, and never copy it into the
+    /// disk cache. A storage whose reads transform the bytes at rest
+    /// (decryption) must return `None`.
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         let _ = address;
         None
     }
+
+    /// Bytes this storage already holds in process memory for `address`,
+    /// shared rather than copied: the in-memory counterpart of
+    /// [`Self::resolve_local_path`]. Readers borrow them in place and never
+    /// copy them into the disk cache. No I/O and no blocking; a storage
+    /// whose reads transform the bytes at rest (decryption) must return
+    /// `None`, which is the default.
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        let _ = address;
+        None
+    }
+
+    /// Whether bytes read from this storage may be persisted unencrypted
+    /// outside it. The binary-index disk cache spills fetched leaves,
+    /// branches and dictionaries to a local directory as a read-through
+    /// cache; a storage that decrypts on read must answer `false`, or that
+    /// cache becomes a plaintext copy of the ledger. Storages whose reads
+    /// return exactly the bytes at rest answer `true`; wrappers delegate to
+    /// what they wrap.
+    ///
+    /// Deliberately without a default: a wrapper that forgot to delegate
+    /// would silently re-open the plaintext leak, so every implementation
+    /// has to answer.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// Whether reads from this storage leave the machine.
+    ///
+    /// `false` when bytes come from local disk or memory: a copy in the disk
+    /// artifact cache can never be cheaper than the read it would replace.
+    /// A storage that routes addresses across several backends answers
+    /// `true` when any of them is remote. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that forgot to delegate
+    /// would quietly cache local reads, or stop caching remote ones.
+    fn is_remote(&self) -> bool;
+
+    /// The encryption administration surface, when this storage encrypts
+    /// at rest. `None` for plaintext storages; wrappers delegate to what
+    /// they wrap. Required for the same reason as
+    /// [`Self::permits_plaintext_cache`]: a wrapper that answered `None` by
+    /// default would report an encrypted store as plaintext.
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>>;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -463,6 +509,29 @@ pub trait StorageMethod {
 ///
 /// Used for type erasure in `AnyStorage`.
 pub trait Storage: StorageRead + ContentAddressedWrite + StorageMethod {}
+
+/// What a key rotation needs from an encrypting storage.
+///
+/// Addresses are hashes of plaintext, so re-enveloping a blob under a new
+/// key is an in-place overwrite at the same address: no pointer changes,
+/// and a crash between blobs leaves each one on exactly one key.
+#[async_trait]
+pub trait EncryptionAdmin: Send + Sync {
+    /// Ids of every key the storage can decrypt with, current first.
+    fn key_ids(&self) -> Vec<u32>;
+
+    /// Id of the key that encrypts new writes.
+    fn current_key_id(&self) -> u32;
+
+    /// The key id recorded in the envelope at `address`, read from its
+    /// header alone. `None` when the bytes there are not an envelope.
+    async fn key_id_at(&self, address: &str) -> Result<Option<u32>>;
+
+    /// Re-envelope the blob at `address` under the current key, verifying
+    /// the result reads back. Returns the plaintext size rewritten, or
+    /// `None` when the blob was already on the current key.
+    async fn reencrypt(&self, address: &str) -> Result<Option<u64>>;
+}
 impl<T: StorageRead + ContentAddressedWrite + StorageMethod> Storage for T {}
 
 // ============================================================================
@@ -501,6 +570,22 @@ impl StorageRead for Arc<dyn Storage> {
 
     fn resolve_local_path(&self, address: &str) -> Option<PathBuf> {
         self.as_ref().resolve_local_path(address)
+    }
+
+    fn resolve_local_bytes(&self, address: &str) -> Option<Arc<[u8]>> {
+        self.as_ref().resolve_local_bytes(address)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.as_ref().is_remote()
+    }
+
+    fn encryption_admin(&self) -> Option<Arc<dyn EncryptionAdmin>> {
+        self.as_ref().encryption_admin()
     }
 
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
@@ -599,6 +684,19 @@ pub trait ContentStore: Debug + Send + Sync {
         let _ = id;
         None
     }
+
+    /// Whether bytes returned by [`Self::get`] may be persisted unencrypted
+    /// outside this store — see [`StorageRead::permits_plaintext_cache`],
+    /// including why there is no default. The disk artifact cache consults
+    /// this, through [`crate::disk_cache::uses_disk_cache`], before reading or
+    /// writing an artifact in its directory.
+    fn permits_plaintext_cache(&self) -> bool;
+
+    /// Whether [`Self::get`] leaves the machine — see
+    /// [`StorageRead::is_remote`], including why there is no default.
+    /// Callers deciding whether to use the disk artifact cache go through
+    /// [`crate::disk_cache::uses_disk_cache`] rather than reading this.
+    fn is_remote(&self) -> bool;
 
     /// Synchronous, non-blocking lookup of already-resident bytes for a CID.
     ///
@@ -724,6 +822,14 @@ impl ContentStore for Arc<dyn ContentStore> {
         self.as_ref().resolve_local_path(id)
     }
 
+    fn permits_plaintext_cache(&self) -> bool {
+        self.as_ref().permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.as_ref().is_remote()
+    }
+
     fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
         self.as_ref().resolve_cached_bytes(id)
     }
@@ -767,6 +873,8 @@ pub struct StorageContentStore<S: Storage> {
     storage: S,
     ledger_id: String,
     method: String,
+    /// `(name/branch, name/@shared)`, derived once rather than per address.
+    prefixes: (String, String),
 }
 
 impl<S: Storage> StorageContentStore<S> {
@@ -778,10 +886,13 @@ impl<S: Storage> StorageContentStore<S> {
     /// * `ledger_id` - Ledger identifier (e.g., `"mydb:main"`)
     /// * `method` - Storage method name for address generation (e.g., `"file"`, `"memory"`)
     pub fn new(storage: S, ledger_id: impl Into<String>, method: impl Into<String>) -> Self {
+        let ledger_id = ledger_id.into();
+        let prefixes = storage_path_prefixes(&ledger_id);
         Self {
             storage,
-            ledger_id: ledger_id.into(),
+            ledger_id,
             method: method.into(),
+            prefixes,
         }
     }
 
@@ -790,9 +901,9 @@ impl<S: Storage> StorageContentStore<S> {
         let kind = id.content_kind().ok_or_else(|| {
             crate::error::Error::storage(format!("unknown codec {} in CID {}", id.codec(), id))
         })?;
-        let hex_digest = id.digest_hex();
-        let addr = content_address(&self.method, kind, &self.ledger_id, &hex_digest);
-        Ok(addr)
+        let (prefix, shared) = &self.prefixes;
+        let path = content_path_from_prefixes(kind, prefix, shared, &id.digest_hex());
+        Ok(format!("fluree:{}://{path}", self.method))
     }
 
     /// For dict blobs, return the pre-global-dicts address where dicts lived
@@ -999,7 +1110,30 @@ impl<S: Storage + Send + Sync> ContentStore for StorageContentStore<S> {
         // CID-keyed straight through — no address formatting on the lookup.
         // A resident tier indexes by CID regardless of which (current or
         // legacy) address the bytes were fetched from.
-        self.storage.resolve_cached_bytes(id)
+        if let Some(bytes) = self.storage.resolve_cached_bytes(id) {
+            return Some(bytes);
+        }
+        // A storage holding its bytes in memory is keyed by address: the same
+        // current-then-legacy order as `resolve_local_path`.
+        let address = self.cid_to_address(id).ok()?;
+        if let Some(bytes) = self.storage.resolve_local_bytes(&address) {
+            return Some(bytes);
+        }
+        if let Some(legacy) = self.legacy_dict_address(id) {
+            if let Some(bytes) = self.storage.resolve_local_bytes(&legacy) {
+                return Some(bytes);
+            }
+        }
+        let legacy = self.legacy_index_root_address(id)?;
+        self.storage.resolve_local_bytes(&legacy)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.storage.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.storage.is_remote()
     }
 
     fn miss_register(&self) -> Option<&residency::MissRegister> {
@@ -1343,6 +1477,22 @@ impl ContentStore for BranchedContentStore {
             .or_else(|| self.parents.iter().find_map(|p| p.resolve_cached_bytes(id)))
     }
 
+    /// A read may be served by any ancestor, so every store in the
+    /// ancestry must permit the spill.
+    fn permits_plaintext_cache(&self) -> bool {
+        self.branch_store.permits_plaintext_cache()
+            && self
+                .parents
+                .iter()
+                .all(ContentStore::permits_plaintext_cache)
+    }
+
+    /// A read may be served by any ancestor, so one remote store in the
+    /// ancestry makes the whole chain remote.
+    fn is_remote(&self) -> bool {
+        self.branch_store.is_remote() || self.parents.iter().any(ContentStore::is_remote)
+    }
+
     fn miss_register(&self) -> Option<&residency::MissRegister> {
         self.branch_store
             .miss_register()
@@ -1402,11 +1552,35 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(digest)
 }
 
-/// Convert a ledger ID to a path prefix.
-///
-/// Handles the standard ledger ID format (e.g., "mydb:main" -> "mydb/main").
+/// A path relative to a storage root as an address path: its segments
+/// joined with `/` on every platform. A Windows path's `\` would name a file
+/// no address matches.
+pub fn address_path(relative: &std::path::Path) -> String {
+    relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+/// Convert a ledger ID to a path prefix (`"mydb:main"` -> `"mydb/main"`).
 pub fn ledger_id_prefix_for_path(ledger_id: &str) -> String {
-    ledger_id_to_path_prefix(ledger_id).unwrap_or_else(|_| ledger_id.replace(':', "/"))
+    storage_path_prefixes(ledger_id).0
+}
+
+/// `(name/branch, name/@shared)` for a ledger id a storage seam received.
+///
+/// An id that neither the current nor the persisted grammar accepts is never
+/// listed or addressed; its paths keep the pre-validation shape so a read of
+/// it misses rather than landing in another ledger's namespace.
+fn storage_path_prefixes(ledger_id: &str) -> (String, String) {
+    match storage_ledger_id(ledger_id, "a storage path") {
+        Ok(id) => (id.path_prefix(), id.shared_prefix()),
+        Err(_) => (
+            ledger_id.replace(':', "/"),
+            format!("{ledger_id}/{SHARED_NAMESPACE}").replace(':', "/"),
+        ),
+    }
 }
 
 /// Leading path segment under which graph-source artifacts (snapshots and
@@ -1426,7 +1600,16 @@ pub const GRAPH_SOURCES_PATH_SEGMENT: &str = "graph-sources";
 ///   (note: keyed by graph_source_id, not a ledger id)
 /// - etc.
 pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> String {
-    let prefix = ledger_id_prefix_for_path(ledger_id);
+    let (prefix, shared) = storage_path_prefixes(ledger_id);
+    content_path_from_prefixes(kind, &prefix, &shared, hash_hex)
+}
+
+fn content_path_from_prefixes(
+    kind: ContentKind,
+    prefix: &str,
+    shared: &str,
+    hash_hex: &str,
+) -> String {
     match kind {
         ContentKind::Commit => format!("{prefix}/commit/{hash_hex}.fcv2"),
         ContentKind::Txn => format!("{prefix}/txn/{hash_hex}.json"),
@@ -1435,7 +1618,6 @@ pub fn content_path(kind: ContentKind, ledger_id: &str, hash_hex: &str) -> Strin
         ContentKind::DictBlob { dict } => {
             // Dictionaries are global per ledger — shared across all branches.
             // Use the @shared namespace (can't collide with branch names since @ is forbidden).
-            let shared = shared_prefix_for_path(ledger_id);
             let ext = dict_kind_extension(dict);
             format!("{shared}/dicts/{hash_hex}.{ext}")
         }
@@ -1700,10 +1882,16 @@ pub trait StorageCas: Debug + Send + Sync {
     ///
     /// The closure should be a pure function of its input — it may be called
     /// multiple times on retry.
+    ///
+    /// The closure is `'static` so an implementation can run it off the
+    /// calling task, for example on a blocking thread.
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send;
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static;
 }
 
 #[cfg(test)]
@@ -1721,7 +1909,7 @@ mod tests {
     #[cfg(feature = "native")]
     #[tokio::test]
     async fn releasing_a_blob_evicts_its_cached_copy() {
-        let storage = MemoryStorage::new();
+        let storage = MemoryStorage::new().simulating_remote();
         let store = content_store_for(storage.clone(), LEDGER);
         let bytes = b"root bytes";
         let id = store.put(ContentKind::IndexRoot, bytes).await.unwrap();
@@ -1751,6 +1939,52 @@ mod tests {
     /// unreferenced see every address `ContentStore::get` would resolve it to.
     /// A dict blob left at the pre-`@shared` address is readable, so it must
     /// also be listed — otherwise a sweep deletes a live blob.
+    /// Memory storage is keyed by address while readers ask by CID: the
+    /// bridge resolves resident bytes at every address the blob could sit
+    /// at, as it does for local paths, without copying them.
+    #[tokio::test]
+    async fn resolve_cached_bytes_borrows_memory_storage_bytes_at_any_candidate_address() {
+        let storage = MemoryStorage::new();
+        let store = content_store_for(storage.clone(), LEDGER);
+
+        let leaf = store
+            .put(ContentKind::IndexLeaf, b"leaf bytes")
+            .await
+            .unwrap();
+        let resident = store
+            .resolve_cached_bytes(&leaf)
+            .expect("resident at the current address");
+        assert_eq!(&resident[..], b"leaf bytes");
+        assert!(
+            Arc::ptr_eq(&resident, &store.resolve_cached_bytes(&leaf).unwrap()),
+            "the bytes are shared, not copied"
+        );
+
+        let dict = ContentId::new(
+            ContentKind::DictBlob {
+                dict: DictKind::Graphs,
+            },
+            b"dict bytes",
+        );
+        let legacy = legacy_dict_address(storage.storage_method(), LEDGER, &dict).unwrap();
+        storage.write_bytes(&legacy, b"dict bytes").await.unwrap();
+        assert_eq!(
+            &store
+                .resolve_cached_bytes(&dict)
+                .expect("resident at the legacy address")[..],
+            b"dict bytes"
+        );
+
+        let absent = ContentId::new(ContentKind::IndexLeaf, b"absent");
+        assert!(store.resolve_cached_bytes(&absent).is_none());
+        assert!(
+            content_store_for(storage.simulating_remote(), LEDGER)
+                .resolve_cached_bytes(&leaf)
+                .is_none(),
+            "a remote view holds nothing resident"
+        );
+    }
+
     #[tokio::test]
     async fn candidate_addresses_cover_the_legacy_dict_fallback() {
         let storage = MemoryStorage::new();

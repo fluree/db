@@ -13,7 +13,7 @@
 
 use std::sync::Arc;
 
-use fluree_db_binary_index::BinaryIndexStore;
+use fluree_db_binary_index::{BinaryIndexStore, HeadGraphNames};
 use fluree_db_core::db::LedgerSnapshot;
 use fluree_db_core::{CommitId, ContentId};
 use fluree_db_ledger::{HeadTemporal, LedgerState, TypeErasedStore};
@@ -86,17 +86,19 @@ impl CommitRef {
     /// happened and did not. The length rule belongs where the stripping does.
     pub fn parse(s: &str) -> Result<Self> {
         if let Some(t_str) = s.strip_prefix("t:") {
-            let t: i64 = t_str
-                .parse()
-                .map_err(|_| ApiError::query(format!("invalid t value in commit ref '{s}'")))?;
+            let t: i64 = t_str.parse().map_err(|_| {
+                ApiError::invalid_query(format!("invalid t value in commit ref '{s}'"))
+            })?;
             Ok(CommitRef::T(t))
         } else if let Some(prefix) = s.strip_prefix("commit:") {
             if prefix.is_empty() {
-                return Err(ApiError::query(format!("empty commit prefix in '{s}'")));
+                return Err(ApiError::invalid_query(format!(
+                    "empty commit prefix in '{s}'"
+                )));
             }
             Ok(CommitRef::Prefix(prefix.to_string()))
         } else if s.is_empty() {
-            Err(ApiError::query("empty commit reference"))
+            Err(ApiError::invalid_query("empty commit reference"))
         } else if let Ok(t) = s.parse::<i64>() {
             Ok(CommitRef::T(t))
         } else if let Some(cid) = ContentId::parse_canonical(s) {
@@ -104,6 +106,28 @@ impl CommitRef {
         } else {
             Ok(CommitRef::Prefix(s.to_string()))
         }
+    }
+}
+
+/// A ledger head's graph names, read as [`LedgerView::assigned_graph_id`]
+/// reads them, without the rest of a view: two shared handles, so taking one
+/// copies nothing ([`LedgerHandle::graph_names`](crate::LedgerHandle::graph_names)).
+#[derive(Clone)]
+pub struct GraphNames {
+    pub(crate) snapshot: Arc<LedgerSnapshot>,
+    pub(crate) binary_store: Option<Arc<BinaryIndexStore>>,
+}
+
+impl GraphNames {
+    /// The graph id registered under `iri`, if any.
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        self.table().graph_id(iri)
+    }
+
+    /// These names as the table every reader resolves a graph name against
+    /// ([`HeadGraphNames`]).
+    pub fn table(&self) -> HeadGraphNames<'_> {
+        HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
     }
 }
 
@@ -173,6 +197,15 @@ impl LedgerView {
             binary_store: None,
             head_temporal: state.head_temporal,
         }
+    }
+
+    /// The graph id registered under `iri`, read through [`HeadGraphNames`]:
+    /// the snapshot's graph registry, then the binary index store's. A
+    /// borrowed lookup: nothing is copied, so a request pays O(1) per
+    /// reference however many graphs the ledger holds.
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<fluree_db_core::GraphId> {
+        HeadGraphNames::new(&self.snapshot.graph_registry, self.binary_store.as_deref())
+            .graph_id(iri)
     }
 
     /// Get the ledger name (without branch suffix)
@@ -295,7 +328,7 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
     }
 
     if stripped.len() < COMMIT_PREFIX_MIN_LEN {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "Commit prefix must be at least {COMMIT_PREFIX_MIN_LEN} characters, got {}",
             stripped.len()
         )));
@@ -304,20 +337,10 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
     // An abbreviated CID carries almost no digest — the first twelve characters
     // are a constant — so it cannot be scanned for. Say that, rather than
     // reporting it as a prefix that matched nothing.
-    //
-    // Typed the same way as the "No commit found with prefix" case it stands
-    // beside. That is not a good type — `ApiError::query` builds an
-    // `ApiError::Internal`, so every commit-resolution failure reaches the CLI
-    // as "Internal error: Query error: …" and the server as a 500, for what is
-    // a user typing the wrong thing. Retyping it is a separate change: the
-    // obvious candidate, `NotFound`, is swallowed by `build_source_view`, which
-    // rewrites any `is_not_found()` from `db_at` into "ledger not found", so
-    // switching would make the `from`-clause surface worse while making the
-    // others better.
     if stripped.starts_with(COMMIT_CID_CONSTANT_HEAD)
         || COMMIT_CID_CONSTANT_HEAD.starts_with(stripped)
     {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "'{input}' is an abbreviated CID, not a commit id this can resolve: \
              its leading characters are a constant shared by every commit. \
              Pass the hex digest that `fluree log` prints, or a full CID."
@@ -326,7 +349,7 @@ pub(crate) fn normalize_commit_ref(input: &str) -> Result<String> {
 
     // SHA-256 in hex is 64 characters
     if stripped.len() > 64 {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "Commit prefix too long ({} chars). SHA-256 in hex is 64 characters.",
             stripped.len()
         )));
@@ -354,7 +377,7 @@ pub(crate) fn ambiguous_commit_prefix<'a>(
     hex_digests: impl IntoIterator<Item = &'a str>,
 ) -> ApiError {
     let candidates: Vec<&str> = hex_digests.into_iter().collect();
-    ApiError::query(format!(
+    ApiError::invalid_query(format!(
         "Ambiguous commit prefix '{prefix}': it matches at least {candidates:?}. \
          Retype it with enough characters to pick one out."
     ))
@@ -422,7 +445,7 @@ async fn resolve_commit_prefix(
     }
 
     match matches.len() {
-        0 => Err(ApiError::NotFound(format!(
+        0 => Err(ApiError::CommitNotFound(format!(
             "No commit found with prefix: {normalized}"
         ))),
         1 => {
@@ -461,12 +484,12 @@ async fn resolve_t_to_commit_id(
     use fluree_vocab::namespaces::{FLUREE_COMMIT, FLUREE_DB};
 
     if target_t < 1 {
-        return Err(ApiError::query(format!(
+        return Err(ApiError::invalid_query(format!(
             "Transaction number must be >= 1, got {target_t}"
         )));
     }
     if target_t > current_t {
-        return Err(ApiError::NotFound(format!(
+        return Err(ApiError::CommitNotFound(format!(
             "Transaction t={target_t} not found (latest is t={current_t})"
         )));
     }
@@ -514,7 +537,7 @@ async fn resolve_t_to_commit_id(
     }
 
     match matches.len() {
-        0 => Err(ApiError::NotFound(format!(
+        0 => Err(ApiError::CommitNotFound(format!(
             "No commit found for t={target_t}"
         ))),
         1 => {
@@ -529,7 +552,7 @@ async fn resolve_t_to_commit_id(
         }
         _ => {
             let ids: Vec<_> = matches.iter().map(|h| &h[..7.min(h.len())]).collect();
-            Err(ApiError::query(format!(
+            Err(ApiError::invalid_query(format!(
                 "Ambiguous t={target_t}: multiple commits match {ids:?} (likely a rebased history). Disambiguate by passing the full commit CID."
             )))
         }

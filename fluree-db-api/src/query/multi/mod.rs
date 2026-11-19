@@ -288,6 +288,24 @@ pub enum MultiQueryValidationError {
     JsonLdBodyNotObject { alias: String },
     #[error("sub-query '{alias}': SPARQL query body must be a string")]
     SparqlBodyNotString { alias: String },
+    /// The SPARQL text's dataset clause cannot be read. `message` is that
+    /// error.
+    #[error("sub-query '{alias}': {message}")]
+    SparqlUnreadable { alias: String, message: String },
+    /// The JSON-LD body's dataset cannot be read, so the envelope cannot tell
+    /// which ledgers the sub-query reads. `message` is the error the query
+    /// engine reports for the same body.
+    #[error("sub-query '{alias}': {message}")]
+    JsonLdDatasetUnreadable { alias: String, message: String },
+    /// The JSON-LD body names part of its dataset (its default graphs, its
+    /// named graphs, or a history end), and the envelope's or the sub-query's
+    /// `opts` name a different one: the body would not run on the dataset it
+    /// names.
+    #[error(
+        "sub-query '{alias}': its body names its {part}, and the envelope's or the \
+         sub-query's 'opts' name different ones; name the dataset in one place"
+    )]
+    DatasetConflict { alias: String, part: String },
     #[error(
         "sub-query '{alias}': missing or empty 'from' — each sub-query must specify its own dataset"
     )]
@@ -311,16 +329,62 @@ pub enum MultiQueryValidationError {
     HistoryQueryInEnvelope { alias: String },
 }
 
+/// The ledgers an envelope reads.
+#[derive(Debug, Clone, Default)]
+pub struct EnvelopeLedgers {
+    /// Every distinct ledger the sub-queries read (canonical id, temporal
+    /// suffix and graph fragment stripped).
+    pub distinct: BTreeSet<String>,
+    /// Per sub-query, by alias: each member of its dataset that names a
+    /// ledger, read with the engine's own dataset parsing (a SPARQL alias from
+    /// the text the dispatcher runs, a JSON-LD alias from its body).
+    pub members: IndexMap<String, Vec<SubqueryLedger>>,
+}
+
+/// One dataset member of a sub-query that names a ledger.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubqueryLedger {
+    /// Canonical ledger id (temporal suffix and graph fragment stripped).
+    pub ledger: String,
+    /// The time the member names for itself (`FROM <ledger@t:5>`, a JSON-LD
+    /// `t` / `at`), if any.
+    pub at: Option<crate::TimeSpec>,
+}
+
+impl SubqueryLedger {
+    /// The ledger `source` reads, and the time it names for itself: `None`
+    /// for a member that names no ledger (a graph IRI or keyword, which a
+    /// connection surface refuses). Validation counts and checks these, and
+    /// the snapshot pins exactly the members this reads unpinned.
+    pub(crate) fn of(source: &crate::dataset::GraphSource) -> Option<Self> {
+        source.address().map(|address| Self {
+            ledger: address.id().to_string(),
+            at: source.time_spec().cloned(),
+        })
+    }
+}
+
 /// Validate an envelope against server bounds and the merge/collision rules.
 ///
 /// Returns the set of distinct ledger identifiers referenced by the sub-queries
 /// (with any per-query temporal suffix stripped) on success. The dispatcher
 /// reuses this set to drive snapshot resolution without re-walking the
-/// envelope.
+/// envelope. [`validate_envelope_ledgers`] also returns each sub-query's
+/// members.
 pub fn validate_envelope(
     req: &MultiQueryRequest,
     bounds: &MultiQueryBounds,
 ) -> Result<BTreeSet<String>, MultiQueryValidationError> {
+    validate_envelope_ledgers(req, bounds).map(|ledgers| ledgers.distinct)
+}
+
+/// [`validate_envelope`], returning the ledgers each sub-query reads as well
+/// as the distinct set. A host that checks the envelope's ledgers, or
+/// waits on them, reads them from here so it sees the set the envelope pins.
+pub fn validate_envelope_ledgers(
+    req: &MultiQueryRequest,
+    bounds: &MultiQueryBounds,
+) -> Result<EnvelopeLedgers, MultiQueryValidationError> {
     if req.queries.is_empty() {
         return Err(MultiQueryValidationError::EmptyEnvelope);
     }
@@ -338,6 +402,7 @@ pub fn validate_envelope(
 
     let envelope_pinned = req.as_of.is_some();
     let mut distinct_ledgers: BTreeSet<String> = BTreeSet::new();
+    let mut members: IndexMap<String, Vec<SubqueryLedger>> = IndexMap::new();
 
     for (alias, sq) in &req.queries {
         if alias.is_empty() {
@@ -353,14 +418,16 @@ pub fn validate_envelope(
             }
         }
 
-        match sq.language {
+        let alias_members = match sq.language {
             SubqueryLanguage::JsonLd => {
-                validate_jsonld_subquery(alias, sq, envelope_pinned, &mut distinct_ledgers)?;
+                validate_jsonld_subquery(alias, sq, req.opts.as_ref(), envelope_pinned)?
             }
             SubqueryLanguage::Sparql => {
-                validate_sparql_subquery(alias, sq, envelope_pinned, &mut distinct_ledgers)?;
+                validate_sparql_subquery(alias, sq, req.context.as_ref(), envelope_pinned)?
             }
-        }
+        };
+        distinct_ledgers.extend(alias_members.iter().map(|m| m.ledger.clone()));
+        members.insert(alias.clone(), alias_members);
     }
 
     if distinct_ledgers.len() > bounds.max_distinct_ledgers {
@@ -377,7 +444,10 @@ pub fn validate_envelope(
         });
     }
 
-    Ok(distinct_ledgers)
+    Ok(EnvelopeLedgers {
+        distinct: distinct_ledgers,
+        members,
+    })
 }
 
 fn validate_envelope_opts(
@@ -427,23 +497,37 @@ fn validate_envelope_opts(
     Ok(())
 }
 
+/// The members of a JSON-LD sub-query's dataset, as the engine will read them.
+///
+/// Validation reads the body the dispatcher runs ([`effective_jsonld_body`]:
+/// the body with the envelope's and the sub-query's `opts` merged under its
+/// own), with the engine's own parser
+/// ([`DatasetSpec::from_json`](crate::dataset::DatasetSpec::from_json)): its
+/// default and named graphs, from `opts` or the top level, in the parser's
+/// precedence. A body the parser cannot read is refused here with the
+/// parser's error. The body must still name its own `from`, and a part of its
+/// dataset it names may not be named differently by the outer `opts`.
 fn validate_jsonld_subquery(
     alias: &str,
     sq: &MultiQuerySubquery,
+    envelope_opts: Option<&JsonValue>,
     envelope_pinned: bool,
-    distinct: &mut BTreeSet<String>,
-) -> Result<(), MultiQueryValidationError> {
-    let body =
+) -> Result<Vec<SubqueryLedger>, MultiQueryValidationError> {
+    let raw =
         sq.query
             .as_object()
             .ok_or_else(|| MultiQueryValidationError::JsonLdBodyNotObject {
                 alias: alias.to_string(),
             })?;
+    let effective = effective_jsonld_body(envelope_opts, sq.opts.as_ref(), sq.query.clone());
+    let body = effective
+        .as_object()
+        .expect("merging opts into an object body keeps it an object");
 
     // History queries (explicit `to` endpoint) span a range across two `t`
     // values rather than a single snapshot. The envelope's shared-snapshot
     // contract doesn't compose meaningfully with that; reject in v1.
-    if body.contains_key("to") {
+    if crate::dataset::names_history_range(body) {
         return Err(MultiQueryValidationError::HistoryQueryInEnvelope {
             alias: alias.to_string(),
         });
@@ -471,275 +555,116 @@ fn validate_jsonld_subquery(
         });
     }
 
-    let from = body
-        .get("from")
-        .ok_or_else(|| MultiQueryValidationError::MissingFrom {
+    let missing_from = || MultiQueryValidationError::MissingFrom {
+        alias: alias.to_string(),
+    };
+    if !raw.contains_key("from") {
+        return Err(missing_from());
+    }
+    if let Some(part) = crate::dataset::dataset_part_overridden(raw, body) {
+        return Err(MultiQueryValidationError::DatasetConflict {
             alias: alias.to_string(),
-        })?;
-
-    let extracted = jsonld_extract_from(from);
-    if extracted.is_empty() {
-        // `from` was present but yielded no ledger identifiers (empty array,
-        // object missing `@id`/`id`, or an unsupported shape) — surface as
-        // missing so downstream parsing produces a clearer error if needed.
-        return Err(MultiQueryValidationError::MissingFrom {
-            alias: alias.to_string(),
+            part: part.to_string(),
         });
     }
-
-    for entry in extracted {
-        if envelope_pinned {
-            if let Some(loc) = entry.pin_location {
-                return Err(MultiQueryValidationError::AsOfCollision {
-                    alias: alias.to_string(),
-                    location: loc,
-                });
-            }
+    let spec = crate::dataset::DatasetSpec::from_json(&effective).map_err(|e| {
+        MultiQueryValidationError::JsonLdDatasetUnreadable {
+            alias: alias.to_string(),
+            message: e.to_string(),
         }
-        distinct.insert(entry.ledger);
+    })?;
+    if spec.sources().next().is_none() {
+        return Err(missing_from());
     }
 
-    Ok(())
+    let members: Vec<SubqueryLedger> = spec.sources().filter_map(SubqueryLedger::of).collect();
+    if envelope_pinned {
+        if let Some(member) = members.iter().find(|m| m.at.is_some()) {
+            return Err(MultiQueryValidationError::AsOfCollision {
+                alias: alias.to_string(),
+                location: format!("a source names its own time for '{}'", member.ledger),
+            });
+        }
+    }
+
+    Ok(members)
 }
 
+/// The members of a SPARQL sub-query's dataset, read from its
+/// [`sparql_subquery_text`]. Text that does not parse cleanly reads nothing,
+/// so it has none; a dataset clause that cannot be read is an error.
 fn validate_sparql_subquery(
     alias: &str,
     sq: &MultiQuerySubquery,
+    envelope_context: Option<&JsonValue>,
     envelope_pinned: bool,
-    distinct: &mut BTreeSet<String>,
-) -> Result<(), MultiQueryValidationError> {
+) -> Result<Vec<SubqueryLedger>, MultiQueryValidationError> {
     let body = sq
         .query
         .as_str()
         .ok_or_else(|| MultiQueryValidationError::SparqlBodyNotString {
             alias: alias.to_string(),
         })?;
+    let unreadable = |e: crate::ApiError| MultiQueryValidationError::SparqlUnreadable {
+        alias: alias.to_string(),
+        message: e.to_string(),
+    };
 
-    if sparql_is_history_query(body) {
+    let text = sparql_subquery_text(body, envelope_context);
+    let Ok(ast) = crate::query::helpers::parse_sparql_strict(&text) else {
+        return Ok(Vec::new());
+    };
+
+    // Fluree's history-range extension (`FROM <a> TO <b>`) reads a range of
+    // times rather than one snapshot.
+    if sparql_dataset_clause(&ast).is_some_and(|d| d.to_graph.is_some()) {
         return Err(MultiQueryValidationError::HistoryQueryInEnvelope {
             alias: alias.to_string(),
         });
     }
 
-    // If the SPARQL fails to parse, defer to the downstream parser for a
-    // clearer error at execution time — validation only enforces the
-    // multi-query invariants, not SPARQL grammar.
-    let Some(extracted) = sparql_extract_from(body) else {
-        return Ok(());
-    };
-
-    if extracted.is_empty() {
+    let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast).map_err(unreadable)?;
+    if spec.sources().next().is_none() {
         return Err(MultiQueryValidationError::MissingFrom {
             alias: alias.to_string(),
         });
     }
-
-    for entry in extracted {
-        if envelope_pinned {
-            if let Some(loc) = entry.pin_location {
-                return Err(MultiQueryValidationError::AsOfCollision {
-                    alias: alias.to_string(),
-                    location: loc,
-                });
-            }
+    let members: Vec<SubqueryLedger> = spec.sources().filter_map(SubqueryLedger::of).collect();
+    if envelope_pinned {
+        if let Some(member) = members.iter().find(|m| m.at.is_some()) {
+            return Err(MultiQueryValidationError::AsOfCollision {
+                alias: alias.to_string(),
+                location: format!("FROM names its own time for '{}'", member.ledger),
+            });
         }
-        distinct.insert(entry.ledger);
     }
 
-    Ok(())
+    Ok(members)
 }
 
-/// Detect Fluree's SPARQL history-range extension: `FROM <a> TO <b>`. The
-/// parser surfaces this via `DatasetClause::to_graph`.
-fn sparql_is_history_query(sparql: &str) -> bool {
+/// The dataset clause of a parsed SPARQL query, if it has one.
+fn sparql_dataset_clause(
+    ast: &fluree_db_sparql::SparqlAst,
+) -> Option<&fluree_db_sparql::ast::DatasetClause> {
     use fluree_db_sparql::ast::QueryBody;
-    let parsed = fluree_db_sparql::parse_sparql(sparql);
-    let Some(ast) = parsed.ast.as_ref() else {
-        return false;
-    };
-    let dataset = match &ast.body {
+    match &ast.body {
         QueryBody::Select(q) => q.dataset.as_ref(),
         QueryBody::Construct(q) => q.dataset.as_ref(),
         QueryBody::Ask(q) => q.dataset.as_ref(),
         QueryBody::Describe(q) => q.dataset.as_ref(),
         QueryBody::Update(_) => None,
-    };
-    dataset.map(|d| d.to_graph.is_some()).unwrap_or(false)
-}
-
-// =============================================================================
-// Ledger / temporal-pin extraction helpers
-// =============================================================================
-
-/// Per-entry result of `from`-extraction: the bare ledger identifier and, when
-/// the entry carries an explicit temporal pin, a human-readable location string
-/// used in the collision error message.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct ExtractedFrom {
-    /// Bare ledger identifier with any `@t:`/`@iso:`/`@commit:` suffix and
-    /// `#named-graph` fragment stripped.
-    ledger: String,
-    /// `Some(location)` if the source entry expressed a temporal pin
-    /// (suffix marker in the identifier string, or an explicit `t`/`at` field
-    /// on an object-form entry).
-    pin_location: Option<String>,
-}
-
-/// Extract per-entry ledger identifiers and temporal-pin status from a JSON-LD
-/// `from` value.
-///
-/// Mirrors the dataset parser surface (`parse_single_graph_source` /
-/// `parse_graph_sources` in `crate::dataset`):
-/// - String → single graph source. The identifier may carry a
-///   `@t:`/`@iso:`/`@commit:` suffix (temporal pin) and an optional
-///   `#named-graph` fragment.
-/// - Object → single graph source with `@id`/`id` for the identifier and
-///   optional `t` (integer) or `at` (string: `commit:HASH` or ISO timestamp)
-///   for an explicit temporal pin.
-/// - Array → any mix of the two element shapes above.
-///
-/// Entries that lack a usable identifier (empty string, object without
-/// `@id`/`id`) are skipped silently — the language parsers produce a clearer
-/// error at execution time.
-fn jsonld_extract_from(from: &JsonValue) -> Vec<ExtractedFrom> {
-    let mut out = Vec::new();
-    extract_jsonld_from_value(from, &mut out);
-    out
-}
-
-fn extract_jsonld_from_value(val: &JsonValue, out: &mut Vec<ExtractedFrom>) {
-    match val {
-        JsonValue::String(s) if !s.is_empty() => {
-            out.push(extract_jsonld_from_string(s));
-        }
-        JsonValue::Object(obj) => {
-            if let Some(entry) = extract_jsonld_from_object(obj) {
-                out.push(entry);
-            }
-        }
-        JsonValue::Array(items) => {
-            for item in items {
-                extract_jsonld_from_value(item, out);
-            }
-        }
-        _ => {}
     }
 }
 
-fn extract_jsonld_from_string(s: &str) -> ExtractedFrom {
-    let pin_location = TEMPORAL_MARKERS.iter().find_map(|m| {
-        if s.contains(m) {
-            Some(format!("'from' contains temporal pin: {s}"))
-        } else {
-            None
+/// A SPARQL sub-query's text with the envelope context's `PREFIX` / `BASE`
+/// directives applied.
+pub fn sparql_subquery_text(sparql: &str, envelope_context: Option<&JsonValue>) -> String {
+    match envelope_context {
+        Some(context) => {
+            apply_sparql_context(sparql, &SparqlContextDirectives::from_context(context))
         }
-    });
-    ExtractedFrom {
-        ledger: strip_temporal_suffix(s).to_string(),
-        pin_location,
+        None => sparql.to_string(),
     }
-}
-
-fn extract_jsonld_from_object(obj: &JsonMap<String, JsonValue>) -> Option<ExtractedFrom> {
-    let id = obj
-        .get("@id")
-        .or_else(|| obj.get("id"))
-        .and_then(JsonValue::as_str)
-        .filter(|s| !s.is_empty())?;
-
-    let mut entry = extract_jsonld_from_string(id);
-
-    // Explicit `t`/`at` on the object are temporal pins regardless of any
-    // suffix on the identifier; their presence is enough to flag a collision.
-    if entry.pin_location.is_none() {
-        if obj.contains_key("t") {
-            entry.pin_location = Some(format!(
-                "'from' object for '{}' carries explicit 't' field",
-                entry.ledger
-            ));
-        } else if obj.contains_key("at") {
-            entry.pin_location = Some(format!(
-                "'from' object for '{}' carries explicit 'at' field",
-                entry.ledger
-            ));
-        }
-    }
-
-    Some(entry)
-}
-
-/// Strip a `@t:`/`@iso:`/`@commit:` suffix from a ledger identifier so distinct
-/// ledger counting is independent of temporal pins.
-fn strip_temporal_suffix(ledger: &str) -> &str {
-    // Fragment (`#named-graph`) may follow the temporal marker; we strip it
-    // alongside the marker to keep counting on the bare ledger name.
-    let bare = ledger.split('#').next().unwrap_or(ledger);
-    for marker in TEMPORAL_MARKERS {
-        if let Some(idx) = bare.find(marker) {
-            return &bare[..idx];
-        }
-    }
-    bare
-}
-
-const TEMPORAL_MARKERS: &[&str] = &["@t:", "@iso:", "@commit:"];
-
-/// Extract per-IRI ledger identifiers and temporal-pin status from a SPARQL
-/// query's `FROM` / `FROM NAMED` dataset clauses.
-///
-/// Uses the real SPARQL parser ([`fluree_db_sparql::parse_sparql`]) so
-/// commented-out `FROM` clauses and string literals containing the word
-/// don't trip detection. Prefixed-name IRIs are ignored (they can't be ledger
-/// references without context resolution); only full `<iri>` literals
-/// participate.
-///
-/// Returns `None` when the SPARQL fails to parse — validation defers to the
-/// downstream parser so the user sees a clearer SPARQL-parse error rather than
-/// a misleading "missing from" or false-negative collision check.
-fn sparql_extract_from(sparql: &str) -> Option<Vec<ExtractedFrom>> {
-    use fluree_db_sparql::ast::QueryBody;
-
-    let parsed = fluree_db_sparql::parse_sparql(sparql);
-    let ast = parsed.ast.as_ref()?;
-    let dataset = match &ast.body {
-        QueryBody::Select(q) => q.dataset.as_ref(),
-        QueryBody::Construct(q) => q.dataset.as_ref(),
-        QueryBody::Ask(q) => q.dataset.as_ref(),
-        QueryBody::Describe(q) => q.dataset.as_ref(),
-        QueryBody::Update(_) => None,
-    };
-
-    let Some(ds) = dataset else {
-        return Some(Vec::new());
-    };
-
-    let mut out = Vec::new();
-    for iri in ds.default_graphs.iter().chain(ds.named_graphs.iter()) {
-        if let Some(entry) = extract_sparql_iri(iri) {
-            out.push(entry);
-        }
-    }
-    if let Some(to) = ds.to_graph.as_ref() {
-        if let Some(entry) = extract_sparql_iri(to) {
-            out.push(entry);
-        }
-    }
-    Some(out)
-}
-
-fn extract_sparql_iri(iri: &fluree_db_sparql::ast::Iri) -> Option<ExtractedFrom> {
-    use fluree_db_sparql::ast::IriValue;
-    // Prefixed names need context resolution to be ledger references; skip
-    // them here. Full IRIs are taken at face value as ledger identifiers
-    // (matching how the server interprets `FROM <ledger>` today).
-    let value = match &iri.value {
-        IriValue::Full(s) => s.as_ref(),
-        IriValue::Prefixed { .. } => return None,
-    };
-    if value.is_empty() {
-        return None;
-    }
-    Some(extract_jsonld_from_string(value))
 }
 
 // =============================================================================
@@ -772,6 +697,121 @@ pub fn merged_opts(envelope: Option<&JsonValue>, inner: Option<&JsonValue>) -> O
         (None, None) => None,
         (Some(v), None) | (None, Some(v)) => Some(v.clone()),
         (Some(env), Some(inner)) => Some(shallow_merge_objects(env, inner)),
+    }
+}
+
+/// A sub-query's `opts` as it runs: three layers merged shallowly, the most
+/// specific winning: `body_opts` (a JSON-LD body's own `opts`, a SPARQL
+/// alias's `# PRAGMA` options), then the sub-query's `opts`, then the
+/// envelope's.
+pub fn alias_opts(
+    envelope_opts: Option<&JsonValue>,
+    sub_opts: Option<&JsonValue>,
+    body_opts: Option<&JsonValue>,
+) -> Option<JsonValue> {
+    merged_opts(merged_opts(envelope_opts, sub_opts).as_ref(), body_opts)
+}
+
+/// A JSON-LD sub-query's body as it runs, as far as its dataset goes: `body`
+/// with its `opts` replaced by [`alias_opts`]. Validation reads this body and
+/// the dispatcher runs it (the dispatcher also merges the envelope's
+/// `@context` into it, which no dataset key reads), so the ledgers an
+/// envelope counts, pins and waits on are the ones the sub-query reads,
+/// whichever layer names them. A host that also merges the layers itself
+/// before dispatch does it with this function, after it has validated the
+/// envelope as submitted: validation refuses outer `opts` that would change
+/// the dataset a body names, which it can only see while the layers are apart.
+pub fn effective_jsonld_body(
+    envelope_opts: Option<&JsonValue>,
+    sub_opts: Option<&JsonValue>,
+    mut body: JsonValue,
+) -> JsonValue {
+    if let Some(obj) = body.as_object_mut() {
+        if let Some(opts) = alias_opts(envelope_opts, sub_opts, obj.get("opts")) {
+            obj.insert("opts".to_string(), opts);
+        }
+    }
+    body
+}
+
+/// A SPARQL sub-query's `# PRAGMA` options as the `opts` object a JSON-LD body
+/// would carry: the body layer of the alias's opts merge, so they win over the
+/// alias's and the envelope's `opts` as a JSON-LD body's do. `Err` names a
+/// pragma that does not parse.
+pub fn sparql_pragma_opts(sparql: &str) -> std::result::Result<Option<JsonValue>, String> {
+    let pragmas = fluree_db_sparql::request_pragmas(sparql)?;
+    let mut opts = serde_json::Map::new();
+    if let Some(meta) = pragmas.meta {
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({"time": meta.time, "fuel": meta.fuel, "policy": meta.policy}),
+        );
+    }
+    if let Some(max_fuel) = pragmas.max_fuel {
+        opts.insert("max-fuel".into(), serde_json::json!(max_fuel));
+    }
+    if let Some(min_t) = pragmas.min_t {
+        opts.insert("min-t".into(), serde_json::json!(min_t));
+    }
+    if let Some(identity) = pragmas.identity {
+        opts.insert("identity".into(), JsonValue::String(identity));
+    }
+    if let Some(classes) = pragmas.policy_class {
+        opts.insert("policy-class".into(), serde_json::json!(classes));
+    }
+    if let Some(values) = pragmas.policy_values {
+        opts.insert("policy-values".into(), JsonValue::Object(values));
+    }
+    if let Some(default_allow) = pragmas.default_allow {
+        opts.insert("default-allow".into(), JsonValue::Bool(default_allow));
+    }
+    Ok((!opts.is_empty()).then_some(JsonValue::Object(opts)))
+}
+
+/// Hold the tracking options a SPARQL alias's pragmas put into `merged` to
+/// those its `outer` (envelope ⊕ alias) opts already set. Unlike the alias's
+/// other pragmas, which win as body `opts` do, a pragma's `max-fuel` can
+/// tighten the outer cap but never lift it, and its `meta` adds to the outer
+/// tracking but never removes it — as they combine with `fluree-max-fuel` and
+/// `fluree-track-*` on a single query.
+pub fn hold_pragma_tracking(merged: &mut Option<JsonValue>, outer: Option<&JsonValue>) {
+    let (Some(outer), Some(JsonValue::Object(opts))) = (outer, merged.as_mut()) else {
+        return;
+    };
+    let cap = ["max-fuel", "max_fuel", "maxFuel"]
+        .iter()
+        .find_map(|key| outer.get(*key))
+        .and_then(JsonValue::as_f64);
+    if let Some(cap) = cap {
+        if opts
+            .get("max-fuel")
+            .and_then(JsonValue::as_f64)
+            .is_some_and(|max_fuel| max_fuel > cap)
+        {
+            opts.insert("max-fuel".into(), serde_json::json!(cap));
+        }
+    }
+    let flags = |meta: Option<&JsonValue>| {
+        let flag = |key: &str| {
+            matches!(meta, Some(JsonValue::Bool(true)))
+                || meta
+                    .and_then(|m| m.get(key))
+                    .and_then(JsonValue::as_bool)
+                    .unwrap_or(false)
+        };
+        [flag("time"), flag("fuel"), flag("policy")]
+    };
+    let outer_flags = flags(outer.get("meta"));
+    if opts.contains_key("meta") && outer_flags.contains(&true) {
+        let [time, fuel, policy] = flags(opts.get("meta"));
+        opts.insert(
+            "meta".into(),
+            serde_json::json!({
+                "time": time || outer_flags[0],
+                "fuel": fuel || outer_flags[1],
+                "policy": policy || outer_flags[2],
+            }),
+        );
     }
 }
 
@@ -1149,7 +1189,7 @@ mod tests {
         let req = envelope_with(&[("a", jsonld("ledgerA"))], Some(AsOf::T(42)));
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
     }
 
     #[test]
@@ -1346,7 +1386,49 @@ mod tests {
         );
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 1);
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
+    }
+
+    /// `mydb` and `mydb:main` are one ledger: counting them twice trips the
+    /// distinct-ledger limit and the single-ledger `asOf` rule.
+    #[test]
+    fn distinct_ledger_set_counts_spellings_of_one_ledger_once() {
+        let req = envelope_with(
+            &[("a", jsonld("mydb")), ("b", jsonld("mydb:main@t:3"))],
+            None,
+        );
+        let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert_eq!(distinct.len(), 1, "{distinct:?}");
+        assert!(distinct.contains("mydb:main"));
+    }
+
+    /// Every tag of the shared grammar is a pin to the validator — the same
+    /// set the snapshot rewriter honours, so a pin it leaves alone is one the
+    /// collision check saw and the distinct-ledger count stripped.
+    #[test]
+    fn validator_recognises_every_grammar_tag_as_a_pin() {
+        for pinned in [
+            "ledgerA@time:2024-01-01T00:00:00Z",
+            "ledgerA@iso:2024-01-01T00:00:00Z",
+            "ledgerA@recorded:2024-01-01T00:00:00Z",
+            "ledgerA@snapshot:42",
+            "ledgerA@commit:abcdef",
+            "ledgerA@time:2024-01-01T00:00:00Z#txn-meta",
+        ] {
+            let req = envelope_with(
+                &[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))],
+                Some(AsOf::Iso("2024-01-01T00:00:00Z".into())),
+            );
+            let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
+            assert!(
+                matches!(err, MultiQueryValidationError::AsOfCollision { .. }),
+                "{pinned}: {err:?}"
+            );
+            let req = envelope_with(&[("a", jsonld(pinned)), ("b", jsonld("ledgerA"))], None);
+            let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+            assert_eq!(distinct.len(), 1, "{pinned}: {distinct:?}");
+            assert!(distinct.contains("ledgerA:main"), "{pinned}: {distinct:?}");
+        }
     }
 
     #[test]
@@ -1363,9 +1445,54 @@ mod tests {
         );
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
         assert_eq!(distinct.len(), 3);
-        assert!(distinct.contains("ledgerA"));
-        assert!(distinct.contains("ledgerB"));
-        assert!(distinct.contains("ledgerC"));
+        assert!(distinct.contains("ledgerA:main"));
+        assert!(distinct.contains("ledgerB:main"));
+        assert!(distinct.contains("ledgerC:main"));
+    }
+
+    /// A prefixed name in `FROM` counts as the ledger written there.
+    #[test]
+    fn distinct_ledger_set_counts_prefixed_sparql_from_names() {
+        let req = envelope_with(
+            &[(
+                "a",
+                sparql(
+                    "SELECT ?x FROM <ledgerA> FROM ledgerB:main FROM NAMED ledgerC:dev \
+                     WHERE { ?x ?p ?o }",
+                ),
+            )],
+            None,
+        );
+        let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert_eq!(distinct.len(), 3, "{distinct:?}");
+        assert!(distinct.contains("ledgerA:main"));
+        assert!(distinct.contains("ledgerB:main"));
+        assert!(distinct.contains("ledgerC:dev"));
+    }
+
+    /// A SPARQL sub-query that does not parse reads nothing: it has no
+    /// members, and its siblings' ledgers are counted as usual.
+    #[test]
+    fn a_sparql_subquery_that_does_not_parse_has_no_members() {
+        for text in [
+            "not a SPARQL query",
+            "SELECT ?x FROM <ledgerA> WHERE { this is not valid SPARQL }",
+        ] {
+            let req = envelope_with(
+                &[
+                    ("a", sparql(text)),
+                    ("b", sparql("SELECT ?x FROM <ledgerB> WHERE { ?x ?p ?o }")),
+                ],
+                None,
+            );
+            let ledgers = validate_envelope_ledgers(&req, &MultiQueryBounds::DEFAULT).unwrap();
+            assert_eq!(ledgers.members["a"], Vec::new(), "{text}");
+            assert_eq!(
+                ledgers.distinct.into_iter().collect::<Vec<_>>(),
+                vec!["ledgerB:main".to_string()],
+                "{text}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -1395,6 +1522,30 @@ mod tests {
         let env = json!({ "schema": "http://schema.org/" });
         let merged = merged_context(Some(&env), Some(&JsonValue::Null));
         assert!(merged.is_none());
+    }
+
+    /// A JSON-LD body runs with its own `opts` over the sub-query's over the
+    /// envelope's, key by key; validation and the dispatcher both read it so.
+    #[test]
+    fn effective_jsonld_body_merges_opts_most_specific_first() {
+        let body = json!({ "from": "a", "opts": { "from": "b", "meta": true } });
+        let effective = effective_jsonld_body(
+            Some(&json!({ "from": "c", "fromNamed": ["d"], "max-fuel": 1 })),
+            Some(&json!({ "fromNamed": ["e"], "max-fuel": 2 })),
+            body,
+        );
+        assert_eq!(
+            effective,
+            json!({
+                "from": "a",
+                "opts": { "from": "b", "meta": true, "fromNamed": ["e"], "max-fuel": 2 }
+            })
+        );
+        let untouched = json!({ "from": "a" });
+        assert_eq!(
+            effective_jsonld_body(None, None, untouched.clone()),
+            untouched
+        );
     }
 
     #[test]
@@ -1484,14 +1635,15 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Temporal-pin scanner sanity (AST-based)
+    // SPARQL sub-query members
     // -------------------------------------------------------------------------
 
-    fn pin_count(extracted: &[ExtractedFrom]) -> usize {
-        extracted
-            .iter()
-            .filter(|e| e.pin_location.is_some())
-            .count()
+    fn sparql_members(text: &str) -> Vec<SubqueryLedger> {
+        validate_sparql_subquery("a", &sparql(text), None, false).expect("SPARQL parses")
+    }
+
+    fn pin_count(members: &[SubqueryLedger]) -> usize {
+        members.iter().filter(|m| m.at.is_some()).count()
     }
 
     #[test]
@@ -1501,45 +1653,238 @@ mod tests {
             "SELECT * FROM NAMED <ledger@iso:2024-01-01T00:00:00Z> WHERE { ?x ?p ?o }",
             "SELECT * FROM <ledger@commit:abc123> WHERE { ?x ?p ?o }",
         ];
-        for sparql in cases {
-            let extracted = sparql_extract_from(sparql).expect("SPARQL parses");
+        for text in cases {
+            let members = sparql_members(text);
             assert!(
-                pin_count(&extracted) >= 1,
-                "expected temporal pin in: {sparql} (got {extracted:?})"
+                pin_count(&members) >= 1,
+                "expected temporal pin in: {text} (got {members:?})"
             );
         }
     }
 
     #[test]
     fn sparql_temporal_pin_not_detected_in_plain_query() {
-        let extracted = sparql_extract_from("SELECT * FROM <ledger> WHERE { ?x ?p ?o }")
-            .expect("SPARQL parses");
-        assert_eq!(pin_count(&extracted), 0);
+        let members = sparql_members("SELECT * FROM <ledger> WHERE { ?x ?p ?o }");
+        assert_eq!(pin_count(&members), 0);
 
-        let extracted = sparql_extract_from(
+        let members = sparql_members(
             "PREFIX ex: <http://example.org/> SELECT * FROM <ledger> WHERE { ?x ex:name ?n }",
-        )
-        .expect("SPARQL parses");
-        assert_eq!(pin_count(&extracted), 0);
+        );
+        assert_eq!(pin_count(&members), 0);
     }
 
     #[test]
     fn sparql_temporal_marker_inside_string_literal_not_flagged() {
         // The marker only appears inside a string literal (not a FROM IRI),
-        // so the AST-based detector should not flag it — substring scans
+        // so the AST-based reading does not flag it — substring scans
         // would false-positive here.
-        let sparql = r#"SELECT ?x FROM <ledgerA> WHERE { ?x <http://example.org/note> "see @t:42 in the docs" }"#;
-        let extracted = sparql_extract_from(sparql).expect("SPARQL parses");
-        assert_eq!(pin_count(&extracted), 0);
+        let text = r#"SELECT ?x FROM <ledgerA> WHERE { ?x <http://example.org/note> "see @t:42 in the docs" }"#;
+        assert_eq!(pin_count(&sparql_members(text)), 0);
+    }
+
+    /// A fragment or a pin on a member does not change which ledger it names.
+    #[test]
+    fn sparql_members_name_the_ledger_the_engine_reads() {
+        let members = sparql_members(
+            "SELECT * FROM <ledgerA@t:3#txn-meta> FROM NAMED ledgerB:dev WHERE { ?x ?p ?o }",
+        );
+        assert_eq!(
+            members,
+            vec![
+                SubqueryLedger {
+                    ledger: "ledgerA:main".into(),
+                    at: Some(crate::TimeSpec::AtT(3)),
+                },
+                SubqueryLedger {
+                    ledger: "ledgerB:dev".into(),
+                    at: None,
+                },
+            ]
+        );
+    }
+
+    /// The envelope context's `PREFIX` / `BASE` apply to the text the members
+    /// are read from.
+    #[test]
+    fn sparql_members_are_read_from_the_text_the_dispatcher_runs() {
+        let context = json!({ "ex": "http://example.org/" });
+        let text = "SELECT ?x FROM <ledgerA> WHERE { ?x ex:name ?n }";
+        assert_eq!(
+            sparql_subquery_text(text, Some(&context)),
+            format!("PREFIX ex: <http://example.org/>\n{text}")
+        );
+        let members = validate_sparql_subquery("a", &sparql(text), Some(&context), false)
+            .expect("SPARQL parses");
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].ledger, "ledgerA:main");
+    }
+
+    /// Text with a parse error the parser recovers from has no members
+    /// either: validation reads it as strictly as the query runs.
+    #[test]
+    fn a_sparql_subquery_with_a_recovered_parse_error_has_no_members() {
+        let text = "SELECT ?x FROM <ledgerA> WHERE { ?x ?p ?o . ?x }";
+        let parsed = fluree_db_sparql::parse_sparql(text);
+        assert!(
+            parsed.has_errors() && parsed.ast.is_some(),
+            "the fixture must parse with an error and still yield an AST"
+        );
+        let members = validate_sparql_subquery("a", &sparql(text), None, false).unwrap();
+        assert_eq!(members, Vec::new());
     }
 
     #[test]
-    fn sparql_extract_returns_none_on_parse_failure() {
-        // Syntactically invalid SPARQL — extractor returns None so the
-        // downstream parser produces the user-facing error rather than
-        // validation guessing.
-        let extracted = sparql_extract_from("not a SPARQL query");
-        assert!(extracted.is_none());
+    fn a_sparql_dataset_clause_that_cannot_be_read_is_an_error() {
+        let text = "SELECT ?x FROM <ledgerA@foo> WHERE { ?x ?p ?o }";
+        let err = validate_sparql_subquery("a", &sparql(text), None, false).unwrap_err();
+        assert!(
+            matches!(err, MultiQueryValidationError::SparqlUnreadable { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    /// A spelling of a ledger is one ledger, whichever surface and form names
+    /// it, and a member that names no ledger (a graph IRI, which a connection
+    /// surface refuses) counts none.
+    #[test]
+    fn members_are_keyed_by_the_ledger_each_spelling_names() {
+        let req = envelope_with(
+            &[
+                (
+                    "a",
+                    sparql(
+                        "SELECT * FROM <urn:fluree:mydb:main> FROM NAMED <mydb#txn-meta> \
+                         FROM NAMED <http://ex.org/g> WHERE { ?x ?p ?o }",
+                    ),
+                ),
+                ("b", jsonld("urn:fluree:mydb")),
+            ],
+            None,
+        );
+        let ledgers = validate_envelope_ledgers(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert_eq!(ledgers.distinct.iter().collect::<Vec<_>>(), ["mydb:main"]);
+        let names = |alias: &str| -> Vec<String> {
+            ledgers.members[alias]
+                .iter()
+                .map(|m| m.ledger.clone())
+                .collect()
+        };
+        assert_eq!(names("a"), ["mydb:main", "mydb:main"]);
+        assert_eq!(names("b"), ["mydb:main"]);
+    }
+
+    /// A JSON-LD body's dataset is read where the engine reads it: its named
+    /// graphs, and its `opts`, which win over the top level.
+    #[test]
+    fn jsonld_members_are_every_ledger_the_body_reads() {
+        let sq = |query: JsonValue| MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query,
+            opts: None,
+        };
+        let req = envelope_with(
+            &[
+                (
+                    "named",
+                    sq(json!({
+                        "from": "ledgerA",
+                        "fromNamed": { "b": { "@id": "ledgerB", "@graph": "txn-meta" } },
+                        "select": ["?s"], "where": []
+                    })),
+                ),
+                (
+                    "legacy",
+                    sq(json!({
+                        "from": "ledgerA",
+                        "from-named": ["ledgerC@t:2"],
+                        "select": ["?s"], "where": []
+                    })),
+                ),
+                (
+                    "opts",
+                    sq(json!({
+                        "from": "ledgerOverridden",
+                        "opts": { "from": ["ledgerD", { "@id": "ledgerE" }] },
+                        "select": ["?s"], "where": []
+                    })),
+                ),
+            ],
+            None,
+        );
+        let ledgers = validate_envelope_ledgers(&req, &MultiQueryBounds::DEFAULT).unwrap();
+        assert_eq!(
+            ledgers.distinct.iter().collect::<Vec<_>>(),
+            [
+                "ledgerA:main",
+                "ledgerB:main",
+                "ledgerC:main",
+                "ledgerD:main",
+                "ledgerE:main"
+            ]
+        );
+        assert_eq!(
+            ledgers.members["legacy"][1],
+            SubqueryLedger {
+                ledger: "ledgerC:main".into(),
+                at: Some(crate::TimeSpec::AtT(2)),
+            }
+        );
+
+        // The named ledgers count toward the envelope's bound.
+        let bounds = MultiQueryBounds {
+            max_distinct_ledgers: 1,
+            ..MultiQueryBounds::DEFAULT
+        };
+        let req = envelope_with(&[("named", req.queries["named"].clone())], None);
+        assert!(matches!(
+            validate_envelope(&req, &bounds).unwrap_err(),
+            MultiQueryValidationError::TooManyDistinctLedgers { actual: 2, .. }
+        ));
+    }
+
+    /// Under an envelope `asOf`, a JSON-LD member that names its own time
+    /// collides wherever the body names it, and a history end (`to`) is
+    /// refused wherever the parser reads one.
+    #[test]
+    fn jsonld_pins_and_history_ends_are_found_where_the_parser_reads_them() {
+        let as_of = || Some(AsOf::Iso("2024-01-01T00:00:00Z".into()));
+        for query in [
+            json!({ "from": "ledgerA", "fromNamed": { "b": { "@id": "ledgerB", "t": 1 } } }),
+            json!({ "from": "ledgerA", "from-named": "ledgerB@t:1" }),
+            json!({ "from": "ledgerA", "opts": { "from": "ledgerA@t:1" } }),
+        ] {
+            let sq = MultiQuerySubquery {
+                language: SubqueryLanguage::JsonLd,
+                query: query.clone(),
+                opts: None,
+            };
+            let req = envelope_with(&[("a", sq.clone())], as_of());
+            assert!(
+                matches!(
+                    validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err(),
+                    MultiQueryValidationError::AsOfCollision { .. }
+                ),
+                "{query}"
+            );
+            validate_envelope(
+                &envelope_with(&[("a", sq)], None),
+                &MultiQueryBounds::DEFAULT,
+            )
+            .unwrap();
+        }
+        let sq = MultiQuerySubquery {
+            language: SubqueryLanguage::JsonLd,
+            query: json!({ "from": "ledgerA@t:1", "opts": { "to": "ledgerA@t:2" } }),
+            opts: None,
+        };
+        assert!(matches!(
+            validate_envelope(
+                &envelope_with(&[("a", sq)], None),
+                &MultiQueryBounds::DEFAULT
+            )
+            .unwrap_err(),
+            MultiQueryValidationError::HistoryQueryInEnvelope { .. }
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -1560,7 +1905,7 @@ mod tests {
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
         assert!(
-            matches!(err, MultiQueryValidationError::AsOfCollision { ref location, .. } if location.contains("'t' field")),
+            matches!(err, MultiQueryValidationError::AsOfCollision { ref location, .. } if location.contains("names its own time for 'ledgerA:main'")),
             "got: {err:?}"
         );
     }
@@ -1579,7 +1924,7 @@ mod tests {
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
         assert!(
-            matches!(err, MultiQueryValidationError::AsOfCollision { ref location, .. } if location.contains("'at' field")),
+            matches!(err, MultiQueryValidationError::AsOfCollision { ref location, .. } if location.contains("names its own time for 'ledgerA:main'")),
             "got: {err:?}"
         );
     }
@@ -1619,7 +1964,7 @@ mod tests {
         };
         let req = envelope_with(&[("a", sq)], Some(AsOf::Iso("2024-01-01T00:00:00Z".into())));
         let distinct = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap();
-        assert!(distinct.contains("ledgerA"));
+        assert!(distinct.contains("ledgerA:main"));
     }
 
     #[test]
@@ -1681,8 +2026,14 @@ mod tests {
         let req = envelope_with(&[("a", valid), ("b", no_id)], None);
         let err = validate_envelope(&req, &MultiQueryBounds::DEFAULT).unwrap_err();
         match err {
-            MultiQueryValidationError::MissingFrom { ref alias } => assert_eq!(alias, "b"),
-            other => panic!("expected MissingFrom on alias 'b', got {other:?}"),
+            MultiQueryValidationError::JsonLdDatasetUnreadable {
+                ref alias,
+                ref message,
+            } => {
+                assert_eq!(alias, "b");
+                assert!(message.contains("'@id' or 'id'"), "{message}");
+            }
+            other => panic!("expected the parser's error on alias 'b', got {other:?}"),
         }
     }
 

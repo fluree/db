@@ -18,8 +18,8 @@ pub struct IndexOutcome {
 /// a full rebuild when incremental isn't possible.
 pub async fn run_index(ledger: Option<&str>, dirs: &FlureeDir) -> CliResult<()> {
     let alias = context::resolve_ledger(ledger, dirs)?;
-    let fluree = build_fluree(dirs)?;
-    let ledger_id = context::to_ledger_id(&alias);
+    let fluree = build_fluree(dirs).await?;
+    let ledger_id = context::to_ledger_id(&alias)?;
 
     // Verify ledger exists
     if !fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
@@ -92,7 +92,7 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
         };
         if ledger_has_annotations {
             if let Some(provider) = fluree.attachment_events_provider() {
-                config.attachment_events = provider.attachment_events(ledger_id).await;
+                config.attachment_events = provider.attachment_events(handle.id()).await;
             }
             // Second chance, the one `reindex` already has — and the reason
             // it has to sit *outside* the provider branch: the provider
@@ -231,7 +231,7 @@ pub async fn run_reindex(
             print_reindex_result(&result);
         }
         LedgerMode::Local { fluree, alias } => {
-            let ledger_id = context::to_ledger_id(&alias);
+            let ledger_id = context::to_ledger_id(&alias)?;
 
             if !fluree.ledger_exists(&ledger_id).await.unwrap_or(false) {
                 return Err(CliError::NotFound(format!("ledger '{alias}' not found")));

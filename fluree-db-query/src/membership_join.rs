@@ -13,13 +13,13 @@
 //!
 //! **The "matches at most once" premise is graph-scoped.** Across a
 //! multi-graph active scope the same ground triple can exist in more than
-//! one graph, and the nested loop emits one row per matching graph where a
-//! hash set collapses them to one — a cardinality change, not just a
-//! reordering. Rather than assume what that duplication should be, the
-//! operator checks the active graph count at `open()` and routes EVERY row
-//! through the exact per-row fallback below when more than one graph is in
-//! scope. So the lane is join-equivalent unconditionally, and the hash fast
-//! path engages only where the premise provably holds.
+//! one graph. A union of graphs whose scans deduplicate on fact identity
+//! (current mode, `union_dedups_on_fact_identity`) holds it once, so the
+//! premise holds there as over one graph, and the key-set drain runs over
+//! the union. Any other scope of several graphs routes EVERY row through
+//! the exact per-row fallback below, checked at `open()`. So the lane is
+//! join-equivalent unconditionally, and the hash fast path engages only
+//! where the premise provably holds.
 //!
 //! **The premise can also fail inside one graph: RDF list rows.** A
 //! list-valued predicate stores one flake per position, so the same
@@ -60,7 +60,7 @@ use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
-use crate::group_aggregate::{binding_to_group_key_normalized, CompositeGroupKey};
+use crate::group_aggregate::CompositeGroupKey;
 use crate::ir::{Pattern, TriplePattern};
 use crate::object_binding::{equality_norm, EqualityNorm};
 use crate::operator::{BoxedOperator, Operator, OperatorState};
@@ -144,30 +144,25 @@ impl MembershipJoinOperator {
         })
     }
 
-    fn extract_key(&self, batch: &Batch, row_idx: usize) -> CompositeGroupKey {
-        let keys = self
-            .key_vars
-            .iter()
-            .map(|v| {
-                let (store, gv) = EqualityNorm::parts(&self.norm);
-                let binding = batch.get(row_idx, *v).unwrap_or(&Binding::Unbound);
-                binding_to_group_key_normalized(binding, store, gv)
-            })
-            .collect();
-        CompositeGroupKey(keys)
+    fn extract_key(&self, batch: &Batch, row_idx: usize) -> Result<CompositeGroupKey> {
+        CompositeGroupKey::normalized(
+            self.key_vars
+                .iter()
+                .map(|v| batch.get(row_idx, *v).unwrap_or(&Binding::Unbound)),
+            &self.norm,
+        )
     }
 
     /// Drain the triple once (unseeded planned scan — overlay-merged and
     /// policy-filtered) into the key set.
     async fn build_key_set(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
-        let key_var_slice: Vec<VarId> = self.key_vars.clone();
         #[allow(clippy::box_default)]
         let seed: BoxedOperator = Box::new(EmptyOperator::new());
         let mut inner = build_where_operators_seeded(
             Some(seed),
             std::slice::from_ref(&Pattern::Triple(self.pattern.clone())),
             None,
-            Some(&key_var_slice),
+            Some(&self.key_vars),
             &self.planning,
         )?;
         let mut set = FxHashSet::default();
@@ -176,16 +171,7 @@ impl MembershipJoinOperator {
         while let Some(batch) = inner.next_batch(ctx).await? {
             ctx.check_cancelled()?;
             for row_idx in 0..batch.len() {
-                let key = self
-                    .key_vars
-                    .iter()
-                    .map(|v| {
-                        let (store, gv) = EqualityNorm::parts(&self.norm);
-                        let binding = batch.get(row_idx, *v).unwrap_or(&Binding::Unbound);
-                        binding_to_group_key_normalized(binding, store, gv)
-                    })
-                    .collect();
-                duplicate_ground_rows |= !set.insert(CompositeGroupKey(key));
+                duplicate_ground_rows |= !set.insert(self.extract_key(&batch, row_idx)?);
             }
         }
         inner.close();
@@ -278,11 +264,21 @@ impl Operator for MembershipJoinOperator {
         if self.norm.is_none() {
             self.norm = equality_norm(ctx);
         }
-        // Keep/drop is only join-equivalent over a single graph; with more
-        // than one in scope a ground triple can match once per graph.
+        // Keep/drop is join-equivalent over one graph, and over a union of
+        // graphs whose every scan deduplicates on fact identity: a ground
+        // triple two members hold is one fact of the union there, and the
+        // build drain below runs over the union, so a key it sees twice is
+        // two facts and the detector routes it to exact joins. Any other
+        // scope of several graphs can match a ground triple once per graph.
         self.exact_only = match ctx.active_graphs() {
             crate::dataset::ActiveGraphs::Single => false,
-            crate::dataset::ActiveGraphs::Many(graphs) => graphs.len() > 1,
+            crate::dataset::ActiveGraphs::Many(graphs) => {
+                graphs.len() > 1
+                    && !crate::dataset_operator::union_dedups_on_fact_identity(
+                        graphs.len(),
+                        self.planning.mode(),
+                    )
+            }
         };
         if self.exact_only {
             crate::fast_path_outcome::stamp_fast_path(
@@ -333,7 +329,7 @@ impl Operator for MembershipJoinOperator {
                     // does not cover.
                     if !self.exact_only {
                         self.probed_rows += 1;
-                        let key = self.extract_key(&input_batch, row_idx);
+                        let key = self.extract_key(&input_batch, row_idx)?;
                         let keep = self
                             .key_set
                             .as_ref()

@@ -12,6 +12,10 @@ repository.workspace = true
 # miss-register read arms with a residency-tier content store. Off by default
 # so production native builds compile the exact pre-residency read path.
 residency = []
+# Counters only tests read (dictionary leaf lookups). Off by default: a
+# shared counter on every lookup contends across query threads, so production
+# builds compile none of it. fluree-db-api enables it for its tests alone.
+test-counters = []
 
 [dependencies]
 fluree-db-core = { path = "../fluree-db-core" }
@@ -58,6 +62,8 @@ rust-stemmers = "1.2"
 [dev-dependencies]
 async-trait.workspace = true
 fluree-db-novelty = { path = "../fluree-db-novelty" }
+fluree-test-support = { path = "../fluree-test-support" }
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true

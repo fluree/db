@@ -61,8 +61,22 @@ pub fn field_type_from_trino(type_name: &str) -> FieldType {
     }
 }
 
+/// The fractional-second digits a timestamp type signature declares
+/// (`timestamp(3)` → 3, `timestamp(6) with time zone` → 6), or `None` when it
+/// declares none (a bare `timestamp`) or is not a timestamp.
+pub fn fractional_digits_from_trino(type_name: &str) -> Option<u8> {
+    let lower = type_name.trim().to_ascii_lowercase();
+    let args = lower
+        .strip_prefix("timestamp")?
+        .trim_start()
+        .strip_prefix('(')?;
+    args[..args.find(')')?].trim().parse().ok()
+}
+
 /// Build a batch schema from the protocol's column list. Field ids are
-/// positional (1-based); the R2RML layer looks columns up by name.
+/// positional (1-based); the R2RML layer looks columns up by name. A
+/// timestamp's declared precision rides along: values decode to the
+/// microsecond, so a lane can tell whether two source values may share a cell.
 pub fn schema_from_columns(columns: &[(String, String)]) -> Arc<BatchSchema> {
     let fields = columns
         .iter()
@@ -74,7 +88,11 @@ pub fn schema_from_columns(columns: &[(String, String)]) -> Arc<BatchSchema> {
             field_id: i as i32 + 1,
         })
         .collect();
-    Arc::new(BatchSchema::new(fields))
+    let digits = columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (_, ty))| fractional_digits_from_trino(ty).map(|d| (i as i32 + 1, d)));
+    Arc::new(BatchSchema::new(fields).with_fractional_digits(digits))
 }
 
 /// Decode one page of rows into a batch.
@@ -395,6 +413,30 @@ mod tests {
         assert_eq!(parse_decimal_unscaled("5.101", 2), None);
         assert_eq!(parse_decimal_unscaled("abc", 2), None);
         assert_eq!(parse_decimal_unscaled(".5", 1), Some(5));
+    }
+
+    #[test]
+    fn timestamp_precision_rides_with_the_schema() {
+        assert_eq!(fractional_digits_from_trino("timestamp(3)"), Some(3));
+        assert_eq!(
+            fractional_digits_from_trino("timestamp(6) with time zone"),
+            Some(6)
+        );
+        assert_eq!(fractional_digits_from_trino("TIMESTAMP(9)"), Some(9));
+        assert_eq!(fractional_digits_from_trino("timestamp"), None);
+        assert_eq!(
+            fractional_digits_from_trino("timestamp with time zone"),
+            None
+        );
+        assert_eq!(fractional_digits_from_trino("decimal(10,2)"), None);
+        let schema = schema_from_columns(&[
+            ("id".into(), "bigint".into()),
+            ("at".into(), "timestamp(9)".into()),
+            ("on".into(), "timestamp".into()),
+        ]);
+        assert_eq!(schema.fractional_digits("at"), Some(9));
+        assert_eq!(schema.fractional_digits("on"), None);
+        assert_eq!(schema.fractional_digits("id"), None);
     }
 
     #[test]

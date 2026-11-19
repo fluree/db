@@ -111,25 +111,45 @@ pub enum Expression {
     Resolved(Box<crate::binding::Binding>),
 }
 
+/// Which variables an [`Expression`] walk covers: every one it mentions, or
+/// only the ones it reads from its row (see [`Expression::row_reads`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VarScope {
+    All,
+    RowReads,
+}
+
 impl Expression {
     /// Rename every occurrence of variable `old` to `new` (recursively through
     /// call arguments and EXISTS sub-patterns). Used by the equijoin-filter fold.
     pub fn substitute_var(&mut self, old: VarId, new: VarId) {
+        self.substitute(old, new, VarScope::All);
+    }
+
+    /// Rename `old` to `new` where this expression reads it from its row
+    /// ([`Self::row_reads`]), leaving its correlated sub-patterns alone: inside
+    /// them `old` stays the variable the row binds, or a free one. The grouped
+    /// SAMPLE rewrite renames this way.
+    pub fn substitute_row_read(&mut self, old: VarId, new: VarId) {
+        self.substitute(old, new, VarScope::RowReads);
+    }
+
+    fn substitute(&mut self, old: VarId, new: VarId, scope: VarScope) {
         match self {
             Expression::Var(v) => {
                 if *v == old {
                     *v = new;
                 }
             }
-            Expression::Const(_) => {}
+            Expression::Const(_) | Expression::Resolved(_) => {}
             Expression::Call { args, .. } => {
                 for arg in args {
-                    arg.substitute_var(old, new);
+                    arg.substitute(old, new, scope);
                 }
             }
             Expression::Map(entries) => {
                 for (_, v) in entries {
-                    v.substitute_var(old, new);
+                    v.substitute(old, new, scope);
                 }
             }
             // Scoped iteration: always rename in the list/init (outer scope), but
@@ -140,13 +160,13 @@ impl Expression {
                 filter,
                 map,
             } => {
-                list.substitute_var(old, new);
+                list.substitute(old, new, scope);
                 if *var != old {
                     if let Some(f) = filter {
-                        f.substitute_var(old, new);
+                        f.substitute(old, new, scope);
                     }
                     if let Some(m) = map {
-                        m.substitute_var(old, new);
+                        m.substitute(old, new, scope);
                     }
                 }
             }
@@ -157,10 +177,10 @@ impl Expression {
                 list,
                 body,
             } => {
-                init.substitute_var(old, new);
-                list.substitute_var(old, new);
+                init.substitute(old, new, scope);
+                list.substitute(old, new, scope);
                 if *acc != old && *var != old {
-                    body.substitute_var(old, new);
+                    body.substitute(old, new, scope);
                 }
             }
             Expression::ListPredicate {
@@ -169,27 +189,41 @@ impl Expression {
                 predicate,
                 ..
             } => {
-                list.substitute_var(old, new);
+                list.substitute(old, new, scope);
                 if *var != old {
-                    predicate.substitute_var(old, new);
+                    predicate.substitute(old, new, scope);
                 }
             }
-            Expression::Member { target, .. } => target.substitute_var(old, new),
+            Expression::Member { target, .. } => target.substitute(old, new, scope),
             Expression::Exists { patterns, .. } => {
-                for p in patterns {
-                    p.substitute_var(old, new);
+                if scope == VarScope::All {
+                    for p in patterns {
+                        p.substitute_var(old, new);
+                    }
                 }
             }
             Expression::PatternComprehension {
                 patterns,
                 projection,
-            } => {
-                for p in patterns {
-                    p.substitute_var(old, new);
+            } => match scope {
+                VarScope::All => {
+                    for p in patterns.iter_mut() {
+                        p.substitute_var(old, new);
+                    }
+                    projection.substitute(old, new, scope);
                 }
-                projection.substitute_var(old, new);
-            }
-            Expression::Resolved(_) => {}
+                // A projection variable the pattern also mentions is the
+                // pattern's; only an outer one is a read of the row.
+                VarScope::RowReads => {
+                    if !patterns
+                        .iter()
+                        .flat_map(Pattern::referenced_vars)
+                        .any(|v| v == old)
+                    {
+                        projection.substitute(old, new, scope);
+                    }
+                }
+            },
         }
     }
 
@@ -235,6 +269,37 @@ impl Expression {
                     || projection.contains_function(target)
             }
             Expression::Resolved(_) => false,
+        }
+    }
+
+    /// Whether evaluating this expression reads the dataset rather than its row
+    /// alone: through an embedded pattern, a node's property, or a function that
+    /// looks facts up ([`Function::reads_dataset`]). Such an expression answers
+    /// for the graph it is evaluated in, so it cannot move into a scope that
+    /// switches the active graph or source.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => false,
+            Expression::Call { func, args } => {
+                func.reads_dataset() || args.iter().any(Self::reads_dataset)
+            }
+            Expression::Map(entries) => entries.iter().any(|(_, v)| v.reads_dataset()),
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.reads_dataset()
+                    || filter.as_deref().is_some_and(Self::reads_dataset)
+                    || map.as_deref().is_some_and(Self::reads_dataset)
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => init.reads_dataset() || list.reads_dataset() || body.reads_dataset(),
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => list.reads_dataset() || predicate.reads_dataset(),
+            Expression::Member { .. }
+            | Expression::Exists { .. }
+            | Expression::PatternComprehension { .. } => true,
         }
     }
 
@@ -289,6 +354,57 @@ impl Expression {
             } => {
                 f(patterns);
                 projection.for_each_embedded_patterns(f);
+            }
+        }
+    }
+
+    /// [`Self::for_each_embedded_patterns`], with each list given to `f` to
+    /// change.
+    pub fn for_each_embedded_patterns_mut(&mut self, f: &mut dyn FnMut(&mut Vec<Pattern>)) {
+        match self {
+            Expression::Var(_) | Expression::Const(_) | Expression::Resolved(_) => {}
+            Expression::Call { args, .. } => {
+                for a in args {
+                    a.for_each_embedded_patterns_mut(f);
+                }
+            }
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.for_each_embedded_patterns_mut(f);
+                }
+            }
+            Expression::ListComprehension {
+                list, filter, map, ..
+            } => {
+                list.for_each_embedded_patterns_mut(f);
+                if let Some(x) = filter {
+                    x.for_each_embedded_patterns_mut(f);
+                }
+                if let Some(x) = map {
+                    x.for_each_embedded_patterns_mut(f);
+                }
+            }
+            Expression::Reduce {
+                init, list, body, ..
+            } => {
+                init.for_each_embedded_patterns_mut(f);
+                list.for_each_embedded_patterns_mut(f);
+                body.for_each_embedded_patterns_mut(f);
+            }
+            Expression::ListPredicate {
+                list, predicate, ..
+            } => {
+                list.for_each_embedded_patterns_mut(f);
+                predicate.for_each_embedded_patterns_mut(f);
+            }
+            Expression::Member { target, .. } => target.for_each_embedded_patterns_mut(f),
+            Expression::Exists { patterns, .. } => f(patterns),
+            Expression::PatternComprehension {
+                patterns,
+                projection,
+            } => {
+                f(patterns);
+                projection.for_each_embedded_patterns_mut(f);
             }
         }
     }
@@ -510,6 +626,16 @@ impl Expression {
     // Query methods
     // =========================================================================
 
+    /// Whether this expression is a constant IRI, `IRI("…")`: what SPARQL
+    /// `<iri>` / `ex:x` and JSON-LD `["iri", "…"]` lower to.
+    pub fn is_constant_iri(&self) -> bool {
+        matches!(
+            self,
+            Expression::Call { func: Function::Iri, args }
+                if matches!(args.as_slice(), [Expression::Const(FlakeValue::String(_))])
+        )
+    }
+
     /// Whether this expression contains a `BNODE(...)` call.
     ///
     /// `BNODE` is *solution-scoped* (SPARQL 1.1 §17.4.2.9): its result
@@ -547,20 +673,47 @@ impl Expression {
         }
     }
 
-    /// Variables this expression references when evaluated. Expressions
-    /// produce values, never bindings, so there is no `produced_vars`
-    /// counterpart.
+    /// Variables this expression references when evaluated, including every
+    /// variable its correlated sub-patterns mention (see [`Self::row_reads`]).
+    /// Expressions produce values, never bindings, so there is no
+    /// `produced_vars` counterpart.
     pub fn referenced_vars(&self) -> Vec<VarId> {
+        let mut vars = Vec::new();
+        self.collect_vars(VarScope::All, &mut vars);
+        vars
+    }
+
+    /// Variables this expression reads from the row it is evaluated on:
+    /// [`Self::referenced_vars`] without the variables of its correlated
+    /// sub-patterns, an `EXISTS` / `NOT EXISTS` body and a pattern
+    /// comprehension's pattern (with what its projection reads from that
+    /// pattern).
+    ///
+    /// A sub-pattern correlates with the row only where the row binds its
+    /// variables; any other variable is free inside it (SPARQL's
+    /// `substitute(P, μ)`). Over a group row, then, these are what the grouping
+    /// has to supply: a sub-pattern variable it does not supply is not read,
+    /// it is free.
+    pub fn row_reads(&self) -> Vec<VarId> {
+        let mut vars = Vec::new();
+        self.collect_vars(VarScope::RowReads, &mut vars);
+        vars
+    }
+
+    fn collect_vars(&self, scope: VarScope, out: &mut Vec<VarId>) {
         match self {
-            Expression::Var(v) => vec![*v],
-            Expression::Const(_) => Vec::new(),
+            Expression::Var(v) => out.push(*v),
+            Expression::Const(_) | Expression::Resolved(_) => {}
             Expression::Call { args, .. } => {
-                args.iter().flat_map(Expression::referenced_vars).collect()
+                for arg in args {
+                    arg.collect_vars(scope, out);
+                }
             }
-            Expression::Map(entries) => entries
-                .iter()
-                .flat_map(|(_, v)| v.referenced_vars())
-                .collect(),
+            Expression::Map(entries) => {
+                for (_, v) in entries {
+                    v.collect_vars(scope, out);
+                }
+            }
             // The loop/acc variables are bound internally — exclude them, but
             // keep the free vars referenced by the list and the scoped bodies.
             Expression::ListComprehension {
@@ -569,17 +722,15 @@ impl Expression {
                 filter,
                 map,
             } => {
-                let mut vars = list.referenced_vars();
+                list.collect_vars(scope, out);
                 let mut inner = Vec::new();
                 if let Some(f) = filter {
-                    inner.extend(f.referenced_vars());
+                    f.collect_vars(scope, &mut inner);
                 }
                 if let Some(m) = map {
-                    inner.extend(m.referenced_vars());
+                    m.collect_vars(scope, &mut inner);
                 }
-                inner.retain(|x| x != var);
-                vars.extend(inner);
-                vars
+                out.extend(inner.into_iter().filter(|x| x != var));
             }
             Expression::Reduce {
                 acc,
@@ -588,12 +739,11 @@ impl Expression {
                 list,
                 body,
             } => {
-                let mut vars = init.referenced_vars();
-                vars.extend(list.referenced_vars());
-                let mut inner = body.referenced_vars();
-                inner.retain(|x| x != acc && x != var);
-                vars.extend(inner);
-                vars
+                init.collect_vars(scope, out);
+                list.collect_vars(scope, out);
+                let mut inner = Vec::new();
+                body.collect_vars(scope, &mut inner);
+                out.extend(inner.into_iter().filter(|x| x != acc && x != var));
             }
             Expression::ListPredicate {
                 var,
@@ -601,35 +751,46 @@ impl Expression {
                 predicate,
                 ..
             } => {
-                let mut vars = list.referenced_vars();
-                let mut inner = predicate.referenced_vars();
-                inner.retain(|x| x != var);
-                vars.extend(inner);
-                vars
+                list.collect_vars(scope, out);
+                let mut inner = Vec::new();
+                predicate.collect_vars(scope, &mut inner);
+                out.extend(inner.into_iter().filter(|x| x != var));
             }
-            Expression::Member { target, .. } => target.referenced_vars(),
+            Expression::Member { target, .. } => target.collect_vars(scope, out),
             // EXISTS has no projection — only the pattern's correlation vars.
             Expression::Exists { patterns, .. } => {
-                patterns.iter().flat_map(Pattern::referenced_vars).collect()
+                if scope == VarScope::All {
+                    out.extend(patterns.iter().flat_map(Pattern::referenced_vars));
+                }
             }
             // A pattern comprehension's projection can capture OUTER variables
             // that never appear in the inner pattern (e.g. `[(a)-->(b) | c]`).
-            // Those are real dependencies — include them so dependency trimming
-            // can't drop them. Pattern-internal vars (`b`) are already covered.
+            // Those are real dependencies, and reads of the row — include them
+            // so dependency trimming can't drop them. Pattern-internal vars
+            // (`b`) are correlation variables.
             Expression::PatternComprehension {
                 patterns,
                 projection,
             } => {
-                let mut vars: Vec<VarId> =
+                let inner: Vec<VarId> =
                     patterns.iter().flat_map(Pattern::referenced_vars).collect();
-                for v in projection.referenced_vars() {
-                    if !vars.contains(&v) {
-                        vars.push(v);
+                let mut projected = Vec::new();
+                projection.collect_vars(scope, &mut projected);
+                match scope {
+                    VarScope::All => {
+                        let mut vars = inner;
+                        for v in projected {
+                            if !vars.contains(&v) {
+                                vars.push(v);
+                            }
+                        }
+                        out.extend(vars);
+                    }
+                    VarScope::RowReads => {
+                        out.extend(projected.into_iter().filter(|v| !inner.contains(v)));
                     }
                 }
-                vars
             }
-            Expression::Resolved(_) => Vec::new(),
         }
     }
 
@@ -669,9 +830,73 @@ impl Expression {
     /// (< 10 ?x 20)                     -> range-safe (sandwich: const var const)
     /// (< ?x ?y 20)                     -> NOT range-safe (non-sandwich variadic)
     /// ```
+    /// The typed literal this is when it is `STRDT` of two constants
+    /// (a SPARQL `"x"^^ex:T` lowers to one, as does JSON-LD
+    /// `(str-dt "x" "ex:T")`) whose datatype has no value space of its own,
+    /// as `(lexical form, datatype IRI)`. `=` against such a literal is
+    /// identity of terms, so a scan can apply it as that term
+    /// ([`fluree_db_core::ObjectBounds::string_datatype`]).
+    ///
+    /// A datatype whose values are numbers, temporals, booleans or JSON is
+    /// compared by value, so it is not one; nor are `xsd:string` (a plain
+    /// string), `rdf:langString`, and the datatypes the index keys other
+    /// than by their string (WKT geometries, full text).
+    pub fn as_typed_string_literal(&self) -> Option<(&str, &str)> {
+        let Expression::Call {
+            func: Function::StrDt,
+            args,
+        } = self
+        else {
+            return None;
+        };
+        let [Expression::Const(FlakeValue::String(value)), datatype] = args.as_slice() else {
+            return None;
+        };
+        // The datatype is a constant IRI: a string (a typed literal, JSON-LD
+        // `str-dt`) or `IRI(…)` of one (SPARQL's `STRDT(…, ex:T)`).
+        let datatype = match datatype {
+            Expression::Const(FlakeValue::String(iri)) => iri,
+            Expression::Call {
+                func: Function::Iri,
+                args,
+            } => match args.as_slice() {
+                [Expression::Const(FlakeValue::String(iri))] => iri,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        let keyed_otherwise = [
+            fluree_vocab::xsd::STRING,
+            fluree_vocab::rdf::LANG_STRING,
+            fluree_vocab::geo::WKT_LITERAL,
+            fluree_vocab::fluree::FULL_TEXT,
+        ];
+        if keyed_otherwise.contains(&datatype.as_str())
+            || !fluree_db_core::graph_registry::is_iri_reference(datatype)
+        {
+            return None;
+        }
+        matches!(
+            fluree_db_core::coerce_value(FlakeValue::String(value.clone()), datatype),
+            Ok(FlakeValue::String(_))
+        )
+        .then_some((value.as_str(), datatype.as_str()))
+    }
+
     pub fn is_range_safe(&self) -> bool {
         match self {
             Expression::Call { func, args } => match func {
+                // `=` against a typed literal it can bound as that term.
+                Function::Eq
+                    if args.len() == 2
+                        && matches!(
+                            (&args[0], &args[1]),
+                            (Expression::Var(_), typed) | (typed, Expression::Var(_))
+                                if typed.as_typed_string_literal().is_some()
+                        ) =>
+                {
+                    true
+                }
                 // Comparison operators (except Ne) are range-safe if var vs const
                 Function::Eq | Function::Lt | Function::Le | Function::Gt | Function::Ge => {
                     // 2-arg: var vs const (either order)
@@ -749,15 +974,22 @@ pub enum ArithmeticOp {
     Mod,
 }
 
+impl ArithmeticOp {
+    /// Return the operator symbol as a static string.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            ArithmeticOp::Add => "+",
+            ArithmeticOp::Sub => "-",
+            ArithmeticOp::Mul => "*",
+            ArithmeticOp::Div => "/",
+            ArithmeticOp::Mod => "%",
+        }
+    }
+}
+
 impl std::fmt::Display for ArithmeticOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ArithmeticOp::Add => write!(f, "+"),
-            ArithmeticOp::Sub => write!(f, "-"),
-            ArithmeticOp::Mul => write!(f, "*"),
-            ArithmeticOp::Div => write!(f, "/"),
-            ArithmeticOp::Mod => write!(f, "%"),
-        }
+        f.write_str(self.symbol())
     }
 }
 
@@ -812,7 +1044,12 @@ impl From<&crate::parse::ast::UnresolvedFilterValue> for FlakeValue {
 }
 
 /// Built-in functions
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Hash` agrees with `Eq` over the whole value, fields included: a
+/// `Lang { strict }` or `Datatype { strict }` computes a different answer in
+/// each mode, so anything keyed by a function (the encoded bool-predicate
+/// cache) must see the mode.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum Function {
     // =========================================================================
     // Comparison operators
@@ -1031,6 +1268,8 @@ pub enum Function {
     XsdDateTime,
     XsdDate,
     XsdTime,
+    /// Cypher `toFloat(x)`: `xsd:double(x)` with Cypher's string spellings.
+    CypherToFloat,
 
     // =========================================================================
     // Path functions (Cypher shortestPath result values)
@@ -1108,9 +1347,193 @@ pub enum Function {
     Custom(String),
 }
 
+impl Function {
+    /// Whether this function looks facts up in the active graph, where every
+    /// other function computes from its arguments alone. An unknown function
+    /// is taken to.
+    pub fn reads_dataset(&self) -> bool {
+        match self {
+            Function::Fulltext
+            | Function::Labels
+            | Function::Keys
+            | Function::Properties
+            | Function::RelType
+            | Function::StartNode
+            | Function::EndNode
+            | Function::Custom(_) => true,
+            Function::Eq
+            | Function::Ne
+            | Function::Lt
+            | Function::Le
+            | Function::Gt
+            | Function::Ge
+            | Function::Add
+            | Function::Sub
+            | Function::Mul
+            | Function::Div
+            | Function::Mod
+            | Function::Negate
+            | Function::And
+            | Function::Or
+            | Function::Not
+            | Function::Xor
+            | Function::In
+            | Function::NotIn
+            | Function::Strlen
+            | Function::Substr
+            | Function::Ucase
+            | Function::Lcase
+            | Function::Contains
+            | Function::StrStarts
+            | Function::StrEnds
+            | Function::Regex
+            | Function::Concat
+            | Function::StrBefore
+            | Function::StrAfter
+            | Function::Replace
+            | Function::Str
+            | Function::StrDt
+            | Function::StrLang
+            | Function::EncodeForUri
+            | Function::ReplaceAll
+            | Function::Split
+            | Function::Trim
+            | Function::LTrim
+            | Function::RTrim
+            | Function::Left
+            | Function::Right
+            | Function::Abs
+            | Function::Round
+            | Function::Ceil
+            | Function::Floor
+            | Function::Rand
+            | Function::Sqrt
+            | Function::Sign
+            | Function::Ln
+            | Function::Pow
+            | Function::Iri
+            | Function::Bnode
+            | Function::Now
+            | Function::Today
+            | Function::Year
+            | Function::Month
+            | Function::Day
+            | Function::Hours
+            | Function::Minutes
+            | Function::Seconds
+            | Function::Tz
+            | Function::Timezone
+            | Function::IsIri
+            | Function::IsBlank
+            | Function::IsLiteral
+            | Function::IsNumeric
+            | Function::Lang { .. }
+            | Function::Datatype { .. }
+            | Function::LangMatches
+            | Function::SameTerm
+            | Function::T
+            | Function::Op
+            | Function::Md5
+            | Function::Sha1
+            | Function::Sha256
+            | Function::Sha384
+            | Function::Sha512
+            | Function::Uuid
+            | Function::StrUuid
+            | Function::DotProduct
+            | Function::CosineSimilarity
+            | Function::EuclideanDistance
+            | Function::GeofDistance
+            | Function::Bound
+            | Function::If
+            | Function::Coalesce
+            | Function::XsdBoolean
+            | Function::XsdInteger
+            | Function::XsdFloat
+            | Function::XsdDouble
+            | Function::XsdDecimal
+            | Function::XsdString
+            | Function::XsdDateTime
+            | Function::XsdDate
+            | Function::XsdTime
+            | Function::CypherToFloat
+            | Function::PathLength
+            | Function::Size
+            | Function::Head
+            | Function::Last
+            | Function::Tail
+            | Function::Reverse
+            | Function::MakeList
+            | Function::Nodes
+            | Function::Range
+            | Function::PathPairs
+            | Function::ListIndex
+            | Function::Relationships
+            | Function::MakeRel
+            | Function::MakePath
+            | Function::MakePathHops => false,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `STRDT` of two constants folds into a typed bound only for a datatype
+    /// whose `=` is identity of terms, its datatype a string or `IRI(…)`.
+    #[test]
+    fn typed_string_literal_folds_only_term_identity_datatypes() {
+        use fluree_vocab::{fluree, geo, rdf, xsd};
+        let c = |s: &str| Expression::Const(FlakeValue::String(s.into()));
+        let strdt = |value: &str, datatype: Expression| Expression::Call {
+            func: Function::StrDt,
+            args: vec![c(value), datatype],
+        };
+        let iri = |s: &str| Expression::Call {
+            func: Function::Iri,
+            args: vec![c(s)],
+        };
+        let custom = "http://example.org/T";
+        assert_eq!(
+            strdt("x", c(custom)).as_typed_string_literal(),
+            Some(("x", custom))
+        );
+        assert_eq!(
+            strdt("x", iri(custom)).as_typed_string_literal(),
+            Some(("x", custom))
+        );
+        for datatype in [xsd::ANY_URI, xsd::TOKEN, "T"] {
+            assert!(
+                strdt("x", c(datatype)).as_typed_string_literal().is_some(),
+                "{datatype}"
+            );
+        }
+        for (value, datatype) in [
+            ("x", xsd::STRING),
+            ("5", xsd::INTEGER),
+            ("5.5", xsd::DECIMAL),
+            ("2026-01-01", xsd::DATE),
+            ("true", xsd::BOOLEAN),
+            ("x", rdf::LANG_STRING),
+            (r#"{"a":1}"#, rdf::JSON),
+            ("POLYGON((0 0, 1 0, 1 1, 0 0))", geo::WKT_LITERAL),
+            ("x", fluree::FULL_TEXT),
+            ("x", "not an iri"),
+        ] {
+            assert_eq!(
+                strdt(value, c(datatype)).as_typed_string_literal(),
+                None,
+                "{datatype}"
+            );
+        }
+        // Not two constants.
+        let var = Expression::Call {
+            func: Function::StrDt,
+            args: vec![Expression::Var(VarId(0)), c(custom)],
+        };
+        assert_eq!(var.as_typed_string_literal(), None);
+    }
 
     #[test]
     fn test_filter_expr_is_range_safe() {

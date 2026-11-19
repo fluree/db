@@ -6,6 +6,7 @@
 
 use crate::transport::{HttpTransport, TransportRequest};
 use async_trait::async_trait;
+use fluree_db_core::LedgerId;
 use fluree_db_nameservice::{NameServiceError, NsRecord, Result};
 use http::StatusCode;
 use serde::Deserialize;
@@ -41,8 +42,6 @@ impl Debug for ProxyNameService {
 /// forward-compatible when the server adds new fields.
 #[derive(Debug, Deserialize)]
 struct NsRecordResponse {
-    #[serde(default)]
-    name: Option<String>,
     branch: String,
     commit_head_id: Option<String>,
     commit_t: i64,
@@ -67,26 +66,22 @@ struct NsRecordResponse {
 }
 
 impl NsRecordResponse {
-    /// Convert to NsRecord, using the original lookup key as the ledger_id.
+    /// Convert to NsRecord for the ledger the caller looked up.
     ///
-    /// When the server omits `name`, derive it from `lookup_key` by splitting
-    /// on `:` (e.g., `"books:main"` → `"books"`). This avoids copying the full
-    /// `ledger_id` (which includes the branch) into the `name` field.
-    fn into_ns_record(self, lookup_key: &str) -> NsRecord {
+    /// The id is built from the lookup key's name and the server's branch, so
+    /// a branchless lookup (`books`) still yields a canonical `books:main`
+    /// record — a branchless id would derive storage paths without a branch
+    /// segment (#1540).
+    fn into_ns_record(self, lookup_key: &str) -> Result<NsRecord> {
         use fluree_db_core::ContentId;
 
-        let derived_name = self.name.unwrap_or_else(|| {
-            lookup_key
-                .split_once(':')
-                .map(|(name, _branch)| name.to_string())
-                .unwrap_or_else(|| lookup_key.to_string())
-        });
+        let requested = LedgerId::parse(lookup_key)?;
+        let ledger_id = requested.with_branch(&self.branch)?;
 
-        NsRecord {
-            // ledger_id is the key used for lookup (may differ from name)
-            ledger_id: lookup_key.to_string(),
-            name: derived_name,
-            branch: self.branch,
+        Ok(NsRecord {
+            name: ledger_id.name().to_string(),
+            branch: ledger_id.branch().to_string(),
+            ledger_id,
             commit_head_id: self
                 .commit_head_id
                 .and_then(|s| s.parse::<ContentId>().ok()),
@@ -100,7 +95,7 @@ impl NsRecordResponse {
             retracted: self.retracted,
             source_branch: self.source_branch,
             branches: self.branches,
-        }
+        })
     }
 }
 
@@ -256,7 +251,7 @@ impl fluree_db_nameservice::NameServiceLookup for ProxyNameService {
                     .map_err(|e| {
                         NameServiceError::storage(format!("Failed to parse NS response: {e}"))
                     })?;
-                Ok(Some(ns_response.into_ns_record(ledger_id)))
+                Ok(Some(ns_response.into_ns_record(ledger_id)?))
             }
             StatusCode::NOT_FOUND => Ok(None),
             StatusCode::UNAUTHORIZED => Err(NameServiceError::storage(format!(
@@ -367,7 +362,6 @@ mod tests {
     #[test]
     fn test_ns_record_conversion() {
         let response = NsRecordResponse {
-            name: Some("books".to_string()),
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 42,
@@ -380,10 +374,10 @@ mod tests {
             branches: 0,
         };
 
-        // Use the lookup key as ledger_id (simulating lookup("books"))
-        let record = response.into_ns_record("books");
-        // ledger_id should be the lookup key, not the alias
-        assert_eq!(record.ledger_id, "books");
+        // A branchless lookup still yields a canonical id (#1540): a
+        // branchless one derives storage paths with no branch segment.
+        let record = response.into_ns_record("books").unwrap();
+        assert_eq!(record.ledger_id, "books:main");
         assert_eq!(record.name, "books");
         assert_eq!(record.branch, "main");
         assert_eq!(record.commit_t, 42);
@@ -395,7 +389,6 @@ mod tests {
 
     fn record(retracted: bool) -> NsRecord {
         NsRecordResponse {
-            name: Some("books".to_string()),
             branch: "main".to_string(),
             commit_head_id: Some(ContentId::new(ContentKind::Commit, b"c").to_string()),
             commit_t: 42,
@@ -408,6 +401,7 @@ mod tests {
             branches: 0,
         }
         .into_ns_record("books:main")
+        .unwrap()
     }
 
     #[test]
@@ -448,7 +442,6 @@ mod tests {
         assert_eq!(project_heads(None), None);
 
         let unborn = NsRecordResponse {
-            name: Some("books".to_string()),
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 0,
@@ -460,7 +453,8 @@ mod tests {
             source_branch: None,
             branches: 0,
         }
-        .into_ns_record("books:main");
+        .into_ns_record("books:main")
+        .unwrap();
         let heads = project_heads(Some(unborn)).expect("unborn branch is known");
         assert_eq!(heads.commit, RefValue { id: None, t: 0 });
         assert_eq!(heads.index, RefValue { id: None, t: 0 });
@@ -474,7 +468,6 @@ mod tests {
     #[test]
     fn ns_record_conversion_preserves_branch_lineage() {
         let response = NsRecordResponse {
-            name: Some("books".to_string()),
             branch: "feature".to_string(),
             commit_head_id: None,
             commit_t: 7,
@@ -487,7 +480,7 @@ mod tests {
             branches: 3,
         };
 
-        let record = response.into_ns_record("books:feature");
+        let record = response.into_ns_record("books:feature").unwrap();
         assert_eq!(record.source_branch.as_deref(), Some("main"));
         assert_eq!(record.branches, 3);
     }
@@ -516,7 +509,6 @@ mod tests {
     fn test_ns_record_name_derived_from_lookup_key() {
         // When server omits `name`, derive it by splitting lookup_key on ':'
         let response = NsRecordResponse {
-            name: None,
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 10,
@@ -529,7 +521,7 @@ mod tests {
             branches: 0,
         };
 
-        let record = response.into_ns_record("books:main");
+        let record = response.into_ns_record("books:main").unwrap();
         assert_eq!(record.ledger_id, "books:main");
         // name should be "books", NOT "books:main"
         assert_eq!(record.name, "books");
@@ -539,7 +531,6 @@ mod tests {
     fn test_ns_record_name_no_branch_in_lookup_key() {
         // When lookup_key has no colon, use it as-is
         let response = NsRecordResponse {
-            name: None,
             branch: "main".to_string(),
             commit_head_id: None,
             commit_t: 10,
@@ -552,8 +543,8 @@ mod tests {
             branches: 0,
         };
 
-        let record = response.into_ns_record("books");
-        assert_eq!(record.ledger_id, "books");
+        let record = response.into_ns_record("books").unwrap();
+        assert_eq!(record.ledger_id, "books:main");
         assert_eq!(record.name, "books");
     }
 }

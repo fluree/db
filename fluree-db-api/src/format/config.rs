@@ -50,6 +50,29 @@ pub enum OutputFormat {
     /// query builder `.execute_formatted_string()`.
     RdfXml,
 
+    /// Turtle graph serialization (`text/turtle`)
+    ///
+    /// **Graph results only** (SPARQL CONSTRUCT / DESCRIBE). Produces `String`.
+    /// The query's prefixes become `@prefix` declarations and prefixed names.
+    Turtle,
+
+    /// N-Triples graph serialization (`application/n-triples`)
+    ///
+    /// **Graph results only** (SPARQL CONSTRUCT / DESCRIBE). Produces `String`.
+    NTriples,
+
+    /// TriG dataset serialization (`application/trig`)
+    ///
+    /// **Graph results only.** Needed when a CONSTRUCT template writes into
+    /// named graphs (`GRAPH` blocks); otherwise the output is plain Turtle.
+    TriG,
+
+    /// N-Quads dataset serialization (`application/n-quads`)
+    ///
+    /// **Graph results only.** Needed when a CONSTRUCT template writes into
+    /// named graphs (`GRAPH` blocks); otherwise the output is plain N-Triples.
+    NQuads,
+
     /// Typed JSON format
     ///
     /// Always includes explicit datatype (even for inferable types):
@@ -199,6 +222,32 @@ pub struct FormatterConfig {
 }
 
 impl FormatterConfig {
+    /// Hash this configuration for the query-result cache. `Err` when the
+    /// output embeds the time it was written (agent JSON's envelope).
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            format,
+            pretty,
+            normalize_arrays,
+            max_bytes,
+            agent_json_context,
+            absolute_iris,
+        } = self;
+        if *format == OutputFormat::AgentJson || agent_json_context.is_some() {
+            return Err("agent JSON");
+        }
+        std::mem::discriminant(format).hash(h);
+        pretty.hash(h);
+        normalize_arrays.hash(h);
+        max_bytes.hash(h);
+        absolute_iris.hash(h);
+        Ok(())
+    }
+
     /// Create a default JSON-LD Query config (array rows)
     pub fn jsonld() -> Self {
         Self::default()
@@ -233,6 +282,52 @@ impl FormatterConfig {
             format: OutputFormat::RdfXml,
             ..Default::default()
         }
+    }
+
+    /// Create a Turtle config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn turtle() -> Self {
+        Self {
+            format: OutputFormat::Turtle,
+            ..Default::default()
+        }
+    }
+
+    /// Create an N-Triples config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn ntriples() -> Self {
+        Self {
+            format: OutputFormat::NTriples,
+            ..Default::default()
+        }
+    }
+
+    /// Create a TriG config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn trig() -> Self {
+        Self {
+            format: OutputFormat::TriG,
+            ..Default::default()
+        }
+    }
+
+    /// Create an N-Quads config (graph results only: CONSTRUCT/DESCRIBE)
+    pub fn nquads() -> Self {
+        Self {
+            format: OutputFormat::NQuads,
+            ..Default::default()
+        }
+    }
+
+    /// Whether this format serializes a graph to text (RDF/XML, Turtle,
+    /// N-Triples, TriG, N-Quads), and so only applies to CONSTRUCT /
+    /// DESCRIBE results.
+    pub fn is_graph_text(&self) -> bool {
+        matches!(
+            self.format,
+            OutputFormat::RdfXml
+                | OutputFormat::Turtle
+                | OutputFormat::NTriples
+                | OutputFormat::TriG
+                | OutputFormat::NQuads
+        )
     }
 
     /// Create a TypedJson config
@@ -297,6 +392,14 @@ impl FormatterConfig {
     pub fn with_max_bytes(mut self, max_bytes: usize) -> Self {
         self.max_bytes = Some(max_bytes);
         self
+    }
+
+    /// Whether this format may answer with a prefix of the rows, which the
+    /// client continues with an OFFSET query: AgentJson under a byte budget
+    /// (`hasMore`, `resume`). The rows must then be read in one order on every
+    /// execution, as under a LIMIT, so the pages partition the answer.
+    pub fn pages_rows(&self) -> bool {
+        self.format == OutputFormat::AgentJson && self.max_bytes.is_some()
     }
 
     /// Set AgentJson context (SPARQL text, FROM count, ISO timestamp)

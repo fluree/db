@@ -3,15 +3,38 @@
 //! Operators form a tree that produces batches of results through the
 //! `open/next_batch/close` lifecycle pattern.
 
+pub(crate) mod flush;
 pub mod inline;
 
-use crate::binding::Batch;
+use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
 use crate::sort::SortSpec;
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use std::sync::Arc;
+
+/// One nonempty group returned by a grouped count drain.
+#[derive(Debug)]
+pub struct CountGroup {
+    /// Representative bindings in the requested group-variable order.
+    pub keys: Vec<Binding>,
+    /// Number of remaining output rows in this group.
+    pub count: u64,
+}
+
+/// What one row of a triple pattern's scan needs beside its bindings to name
+/// the fact it matched. Storage's fact identity is one fact per value
+/// and list position. The bindings carry neither the term a constant object
+/// matched (a constant can match terms of several datatypes: `1` matches
+/// `1` and `1.0e0`) nor the list position, so two facts can bind one row.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct RowFact {
+    /// The matched object, when the pattern's object is a constant literal.
+    pub object: Option<Binding>,
+    /// The list position, when the fact is a list item.
+    pub list_index: Option<u32>,
+}
 
 /// Query execution operator
 ///
@@ -68,6 +91,23 @@ pub trait Operator: Send + Sync {
         false
     }
 
+    /// Schema variables bound in every row this operator emits, when it can see
+    /// its rows. A plan seeded by this operator holds a BIND or FILTER reading
+    /// any other schema variable until the triples that could still bind it
+    /// have run. `None` plans every schema variable as bound.
+    fn bound_in_every_row(&self) -> Option<Vec<VarId>> {
+        None
+    }
+
+    /// Extract the input of a DISTINCT wrapper during planning, before `open()`.
+    /// The caller must prove that its consumer cannot observe input duplicates.
+    /// A successful extraction leaves the wrapper closed; discard it immediately.
+    /// Only DISTINCT implements this: do not forward through other operators,
+    /// since a LIMIT, projection or subquery can make deduplication significant.
+    fn take_distinct_input(&mut self) -> Option<BoxedOperator> {
+        None
+    }
+
     /// Consume all remaining output rows to exhaustion and return the total count.
     ///
     /// # Contract
@@ -83,6 +123,24 @@ pub trait Operator: Send + Sync {
     /// Operators that implement this avoid materializing output batches, reducing
     /// allocation and cloning overhead when the downstream consumer only needs a count.
     async fn drain_count(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<u64>> {
+        Ok(None)
+    }
+
+    /// Count remaining rows by `group_vars`, using ordinary GROUP BY equality.
+    /// A successful drain exhausts this operator and returns each nonempty group
+    /// exactly once. Empty input returns an empty vector. Returning `None` must
+    /// leave the input untouched so the consumer can aggregate ordinary rows.
+    /// Do not forward through row-changing operators such as DISTINCT or LIMIT.
+    ///
+    /// `bound_vars` are the variables a `COUNT(?v)` reads: such a count is a
+    /// row count only if every row binds `?v`, so a drain that cannot show
+    /// that for each of them returns `None`.
+    async fn drain_grouped_count(
+        &mut self,
+        _ctx: &ExecutionContext<'_>,
+        _group_vars: &[VarId],
+        _bound_vars: &[VarId],
+    ) -> Result<Option<Vec<CountGroup>>> {
         Ok(None)
     }
 
@@ -127,6 +185,20 @@ pub trait Operator: Send + Sync {
     /// authoritative, so honoring it never changes results. Set **before**
     /// `open()`.
     fn set_distinct(&mut self, _vars: &[VarId]) {}
+
+    /// Record the fact each returned row matched ([`RowFact`]), for a union
+    /// of graphs that deduplicates on fact identity. Returns whether this
+    /// operator records them; a triple pattern's scan does. Set **before**
+    /// `open()`.
+    fn record_row_facts(&mut self) -> bool {
+        false
+    }
+
+    /// The facts of the rows of the batch `next_batch` last returned, in row
+    /// order, once [`Self::record_row_facts`] armed recording.
+    fn take_row_facts(&mut self) -> Option<Vec<RowFact>> {
+        None
+    }
 
     // ------------------------------------------------------------------
     // EXPLAIN introspection (never called on the hot path)

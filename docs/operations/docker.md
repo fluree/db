@@ -16,7 +16,7 @@ The official image (`fluree/server`) ships the `fluree` binary on a slim Debian 
 | Healthcheck        | `GET /health` every 30s                |
 | Default log filter | `RUST_LOG=info`                        |
 
-**Entrypoint behavior:** on first start, if `/var/lib/fluree/.fluree/` does not exist, the entrypoint runs `fluree init` to create a default `.fluree/config.toml` and `.fluree/storage/` directory. Subsequent starts skip init. Any arguments passed to `docker run` after the image name are forwarded to `fluree server run`, so you can append CLI flags (e.g. `--log-level debug`) directly.
+**Entrypoint behavior:** on first start, if `/var/lib/fluree/.fluree/` does not exist, the entrypoint runs `fluree init` to create a default `.fluree/config.toml` and `.fluree/storage/` directory. Subsequent starts skip init. Any arguments passed to `docker run` after the image name are forwarded to `fluree server run`, so you can append CLI flags (e.g. `--log-level debug`) directly. Server flags that `fluree server run` doesn't take itself go after `--` (e.g. `fluree/server:latest -- --cache-max-mb 4096`); see [Configuration](configuration.md).
 
 ## Quick Start
 
@@ -31,6 +31,12 @@ curl http://localhost:8090/health
 ```
 
 Data lives inside the container's writable layer here — fine for trying things out, lost when the container is removed. For anything beyond a smoke test, mount a volume.
+
+For a throwaway server (a CI service container, say), pass `--memory` to keep ledgers in memory instead; the entrypoint still runs `fluree init`, but the server stores nothing in `.fluree/storage/`:
+
+```bash
+docker run --rm -p 8090:8090 fluree/server:latest --memory
+```
 
 ## Persisting Data
 
@@ -178,6 +184,8 @@ docker run -d --name fluree \
 ### Tuning the LRU Cache
 
 `cache_max_mb` is the global budget for the in-memory index/flake cache. The default is tiered by effective system memory: <4GB uses 30%, 4-8GB uses 40%, and >=8GB uses 35%. On a container with a hard memory limit, the auto-tier clamps to the cgroup limit when available; set this explicitly if you need a tighter cache budget.
+
+If clients use the [query result cache](../query/result-cache.md), its answers have their own ceiling, `query_result_cache_max_mb` (`FLUREE_QUERY_RESULT_CACHE_MAX_MB`). It defaults to 10% of `cache_max_mb` and comes on top of it. Nothing is allocated for it until a request opts in.
 
 ```yaml
 # docker-compose.yml fragment
@@ -368,7 +376,7 @@ docker run -d --name fluree-peer \
   -v fluree-peer-data:/var/lib/fluree \
   -e FLUREE_SERVER_ROLE=peer \
   -e FLUREE_TX_SERVER_URL=http://tx.internal:8090 \
-  fluree/server:latest --peer-subscribe-all
+  fluree/server:latest -- --peer-subscribe-all
 ```
 
 See [Query peers and replication](query-peers.md) for the proxy-mode and auth options.

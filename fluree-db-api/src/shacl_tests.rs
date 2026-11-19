@@ -19,6 +19,24 @@ fn shacl_context() -> JsonValue {
     json!([default_context(), {"ex": "http://example.org/ns/"}])
 }
 
+/// A new ledger whose config enables SHACL. Shapes are enforced only where the
+/// ledger config sets `f:shaclEnabled true`, and these tests exercise
+/// enforcement.
+async fn create_shacl_ledger(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+) -> crate::Result<crate::LedgerState> {
+    let ledger = fluree.create_ledger(ledger_id).await?;
+    let config = json!({
+        "@context": {"f": "https://ns.flur.ee/db#"},
+        "@id": "urn:config:main",
+        "@type": "f:LedgerConfig",
+        "@graph": "config",
+        "f:shaclDefaults": {"@id": "urn:config:shacl", "f:shaclEnabled": true}
+    });
+    Ok(fluree.insert(ledger, &config).await?.ledger)
+}
+
 /// The violation text from a rejected transaction, or a panic naming what came
 /// back instead.
 ///
@@ -28,7 +46,7 @@ fn shacl_context() -> JsonValue {
 /// text is identical either way, and the text is what these tests are about.
 fn shacl_violation_message(err: ApiError) -> String {
     match err {
-        ApiError::Transact(TransactError::ShaclViolation(message)) => message,
+        ApiError::Transact(TransactError::ShaclViolation(message)) => message.to_string(),
         ApiError::Http {
             status: 400,
             message,
@@ -67,8 +85,7 @@ async fn shacl_cardinality_constraints() {
         }]
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/cardinality-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/cardinality-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -95,8 +112,7 @@ async fn shacl_cardinality_constraints() {
     let jsonld = result.to_jsonld(&ledger_ok.snapshot).unwrap();
     assert_eq!(jsonld, json!(["John"]));
 
-    let ledger_min = fluree
-        .create_ledger("shacl/cardinality-min:main")
+    let ledger_min = create_shacl_ledger(&fluree, "shacl/cardinality-min:main")
         .await
         .unwrap();
     let ledger_min = fluree.upsert(ledger_min, &shape_txn).await.unwrap().ledger;
@@ -113,8 +129,7 @@ async fn shacl_cardinality_constraints() {
         .unwrap_err();
     assert_shacl_violation(err, "Expected at least 1 value(s) but found 0");
 
-    let ledger_max = fluree
-        .create_ledger("shacl/cardinality-max:main")
+    let ledger_max = create_shacl_ledger(&fluree, "shacl/cardinality-max:main")
         .await
         .unwrap();
     let ledger_max = fluree.upsert(ledger_max, &shape_txn).await.unwrap().ledger;
@@ -158,8 +173,7 @@ async fn violation_message_names_terms_and_constraint() {
         }]
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/violation-message:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/violation-message:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -233,8 +247,7 @@ async fn violation_message_compacts_terms_on_the_policy_path() {
         }]
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/violation-message-policy:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/violation-message-policy:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -342,8 +355,7 @@ async fn violation_message_distinguishes_constraints_sharing_one_message() {
     ];
 
     for (label, mut node, expected_component) in cases {
-        let ledger = fluree
-            .create_ledger(&format!("shacl/constraint-{label}:main"))
+        let ledger = create_shacl_ledger(&fluree, &format!("shacl/constraint-{label}:main"))
             .await
             .unwrap();
         let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -391,8 +403,7 @@ async fn turtle_violation_resolves_a_namespace_the_document_introduced() {
         }]
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/turtle-violation:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/turtle-violation:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -440,8 +451,7 @@ async fn shacl_datatype_constraints() {
         }]
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/datatype-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/datatype-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -468,8 +478,7 @@ async fn shacl_datatype_constraints() {
     let jsonld = result.to_jsonld(&ledger_ok.snapshot).unwrap();
     assert_eq!(jsonld, json!(["John"]));
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/datatype-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/datatype-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -505,7 +514,9 @@ async fn shacl_range_constraints() {
         }]
     });
 
-    let ledger_min = fluree.create_ledger("shacl/range-min:main").await.unwrap();
+    let ledger_min = create_shacl_ledger(&fluree, "shacl/range-min:main")
+        .await
+        .unwrap();
     let ledger_min = fluree.upsert(ledger_min, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -521,7 +532,9 @@ async fn shacl_range_constraints() {
         .unwrap_err();
     assert_shacl_violation(err, "must be greater than");
 
-    let ledger_max = fluree.create_ledger("shacl/range-max:main").await.unwrap();
+    let ledger_max = create_shacl_ledger(&fluree, "shacl/range-max:main")
+        .await
+        .unwrap();
     let ledger_max = fluree.upsert(ledger_max, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -555,7 +568,9 @@ async fn shacl_length_constraints() {
         }]
     });
 
-    let ledger_min = fluree.create_ledger("shacl/length-min:main").await.unwrap();
+    let ledger_min = create_shacl_ledger(&fluree, "shacl/length-min:main")
+        .await
+        .unwrap();
     let ledger_min = fluree.upsert(ledger_min, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -571,7 +586,9 @@ async fn shacl_length_constraints() {
         .unwrap_err();
     assert_shacl_violation(err, "less than minimum");
 
-    let ledger_max = fluree.create_ledger("shacl/length-max:main").await.unwrap();
+    let ledger_max = create_shacl_ledger(&fluree, "shacl/length-max:main")
+        .await
+        .unwrap();
     let ledger_max = fluree.upsert(ledger_max, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -604,7 +621,9 @@ async fn shacl_pattern_constraints() {
         }]
     });
 
-    let ledger_ok = fluree.create_ledger("shacl/pattern-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/pattern-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -629,8 +648,7 @@ async fn shacl_pattern_constraints() {
     let jsonld = result.to_jsonld(&ledger_ok.snapshot).unwrap();
     assert_eq!(jsonld, json!(["hello big world"]));
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/pattern-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/pattern-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -665,8 +683,7 @@ async fn shacl_has_value_constraint() {
         }]
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/has-value-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/has-value-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -693,8 +710,7 @@ async fn shacl_has_value_constraint() {
     let jsonld = result.to_jsonld(&ledger_ok.snapshot).unwrap();
     assert_eq!(jsonld, json!(["admin"]));
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/has-value-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/has-value-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -729,8 +745,7 @@ async fn shacl_node_kind_constraint() {
         }]
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/node-kind-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/node-kind-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -757,8 +772,7 @@ async fn shacl_node_kind_constraint() {
     let jsonld = result.to_jsonld(&ledger_ok.snapshot).unwrap();
     assert_eq!(jsonld, json!(["ex:homepage"]));
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/node-kind-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/node-kind-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -807,7 +821,9 @@ async fn shacl_closed_constraint() {
     });
 
     // Valid: only uses declared properties
-    let ledger_ok = fluree.create_ledger("shacl/closed-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/closed-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -834,7 +850,9 @@ async fn shacl_closed_constraint() {
     assert_eq!(jsonld, json!(["Alice"]));
 
     // Invalid: uses undeclared property (schema:email)
-    let ledger_bad = fluree.create_ledger("shacl/closed-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/closed-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -872,8 +890,7 @@ async fn shacl_closed_with_ignored_properties() {
     });
 
     // Valid: rdf:type is ignored even though not declared
-    let ledger_ok = fluree
-        .create_ledger("shacl/closed-ignored-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/closed-ignored-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -916,8 +933,7 @@ async fn shacl_pattern_with_flags() {
     });
 
     // Valid: "HELLO" matches "hello" with case-insensitive flag
-    let ledger_ok = fluree
-        .create_ledger("shacl/pattern-flags-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/pattern-flags-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -945,8 +961,7 @@ async fn shacl_pattern_with_flags() {
     assert_eq!(jsonld, json!(["HELLO WORLD"]));
 
     // Invalid: "goodbye" doesn't match pattern
-    let ledger_bad = fluree
-        .create_ledger("shacl/pattern-flags-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/pattern-flags-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -988,7 +1003,9 @@ async fn shacl_in_constraint() {
     });
 
     // Valid: "active" is in the allowed list
-    let ledger_ok = fluree.create_ledger("shacl/in-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/in-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -1014,7 +1031,9 @@ async fn shacl_in_constraint() {
     assert_eq!(jsonld, json!(["active"]));
 
     // Invalid: "cancelled" is not in the allowed list
-    let ledger_bad = fluree.create_ledger("shacl/in-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/in-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1054,7 +1073,9 @@ async fn shacl_equals_constraint() {
     });
 
     // Valid: startDate equals endDate
-    let ledger_ok = fluree.create_ledger("shacl/equals-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/equals-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -1081,7 +1102,9 @@ async fn shacl_equals_constraint() {
     assert_eq!(jsonld, json!(["2024-01-15"]));
 
     // Invalid: startDate does not equal endDate
-    let ledger_bad = fluree.create_ledger("shacl/equals-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/equals-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1122,8 +1145,7 @@ async fn shacl_disjoint_constraint() {
     });
 
     // Valid: primary and secondary emails are different.
-    let ledger_ok = fluree
-        .create_ledger("shacl/disjoint-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/disjoint-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -1142,8 +1164,7 @@ async fn shacl_disjoint_constraint() {
         .expect("disjoint email sets should pass");
 
     // Invalid: overlapping emails.
-    let ledger_bad = fluree
-        .create_ledger("shacl/disjoint-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/disjoint-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -1186,7 +1207,9 @@ async fn shacl_less_than_constraint() {
     });
 
     // Valid: 2020 < 2024.
-    let ledger_ok = fluree.create_ledger("shacl/lt-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/lt-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -1203,7 +1226,9 @@ async fn shacl_less_than_constraint() {
         .expect("startYear strictly less than endYear should pass");
 
     // Invalid: 2025 >= 2024.
-    let ledger_bad = fluree.create_ledger("shacl/lt-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/lt-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1221,7 +1246,9 @@ async fn shacl_less_than_constraint() {
     assert_shacl_violation(err, "not less than");
 
     // Invalid: equal is also a violation of strict sh:lessThan.
-    let ledger_eq = fluree.create_ledger("shacl/lt-eq:main").await.unwrap();
+    let ledger_eq = create_shacl_ledger(&fluree, "shacl/lt-eq:main")
+        .await
+        .unwrap();
     let ledger_eq = fluree.upsert(ledger_eq, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1261,7 +1288,9 @@ async fn shacl_less_than_or_equals_constraint() {
     });
 
     // Valid: spent <= cap (including equal).
-    let ledger_ok = fluree.create_ledger("shacl/lte-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/lte-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -1278,7 +1307,9 @@ async fn shacl_less_than_or_equals_constraint() {
         .expect("spent == cap should pass under sh:lessThanOrEquals");
 
     // Invalid: spent > cap.
-    let ledger_bad = fluree.create_ledger("shacl/lte-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/lte-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1319,7 +1350,9 @@ async fn shacl_class_constraint_direct_type() {
     });
 
     // Valid: author is declared as ex:Person.
-    let ledger_ok = fluree.create_ledger("shacl/class-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/class-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -1342,8 +1375,7 @@ async fn shacl_class_constraint_direct_type() {
         .expect("author of type ex:Person should pass");
 
     // Invalid: author has no rdf:type at all.
-    let ledger_untyped = fluree
-        .create_ledger("shacl/class-untyped:main")
+    let ledger_untyped = create_shacl_ledger(&fluree, "shacl/class-untyped:main")
         .await
         .unwrap();
     let ledger_untyped = fluree
@@ -1372,8 +1404,7 @@ async fn shacl_class_constraint_direct_type() {
     assert_shacl_violation(err, "not an instance of class");
 
     // Invalid: author is typed, but as the wrong class.
-    let ledger_wrong = fluree
-        .create_ledger("shacl/class-wrong:main")
+    let ledger_wrong = create_shacl_ledger(&fluree, "shacl/class-wrong:main")
         .await
         .unwrap();
     let ledger_wrong = fluree
@@ -1403,8 +1434,7 @@ async fn shacl_class_constraint_direct_type() {
     assert_shacl_violation(err, "not an instance of class");
 
     // Invalid: literal value cannot be an instance of any class.
-    let ledger_literal = fluree
-        .create_ledger("shacl/class-literal:main")
+    let ledger_literal = create_shacl_ledger(&fluree, "shacl/class-literal:main")
         .await
         .unwrap();
     let ledger_literal = fluree
@@ -1459,8 +1489,7 @@ async fn shacl_class_constraint_subclass_reasoning() {
         }
     ]);
 
-    let ledger = fluree
-        .create_ledger("shacl/class-subclass:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/class-subclass:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &seed).await.unwrap().ledger;
@@ -1517,8 +1546,7 @@ async fn shacl_class_constraint_subclass_reasoning_cross_graph() {
             }]
         }
     ]);
-    let ledger = fluree
-        .create_ledger("shacl/class-subclass-xgraph:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/class-subclass-xgraph:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &seed).await.unwrap().ledger;
@@ -1574,7 +1602,9 @@ async fn shacl_target_subjects_of() {
     });
 
     // Valid: subject has ex:ssn AND ex:name.
-    let ledger_ok = fluree.create_ledger("shacl/tso-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/tso-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -1590,7 +1620,9 @@ async fn shacl_target_subjects_of() {
         .expect("subject with ex:ssn and ex:name should pass");
 
     // Invalid: subject has ex:ssn but no ex:name — must still be a focus.
-    let ledger_bad = fluree.create_ledger("shacl/tso-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/tso-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1633,8 +1665,7 @@ async fn shacl_target_subjects_of_ignores_retractions() {
         }]
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/tso-retract:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/tso-retract:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -1701,7 +1732,9 @@ async fn shacl_target_objects_of() {
     });
 
     // Valid: referenced company has ex:name.
-    let ledger_ok = fluree.create_ledger("shacl/too-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/too-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -1724,7 +1757,9 @@ async fn shacl_target_objects_of() {
 
     // Invalid: referenced company has no ex:name. The object-ref (ex:opaque)
     // must be pulled in as a focus node by the staged validator.
-    let ledger_bad = fluree.create_ledger("shacl/too-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/too-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -1769,7 +1804,9 @@ async fn shacl_target_subjects_of_fires_on_base_state_edge() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/tso-base:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/tso-base:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // Seed: alice has ex:ssn AND ex:name — shape satisfied.
@@ -1825,7 +1862,9 @@ async fn shacl_target_objects_of_fires_on_base_state_edge() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/too-base:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/too-base:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // Seed: acme has ex:name AND is referenced as bob's employer.
@@ -1885,7 +1924,9 @@ async fn shacl_target_subjects_of_does_not_leak_across_graphs() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/tso-xgraph:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/tso-xgraph:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // TriG: alice gets ex:ssn AND ex:name in graph A (shape satisfied there).
@@ -1946,7 +1987,9 @@ async fn shacl_not_constraint() {
     ]);
 
     // Valid: user with status "active" (not "banned")
-    let ledger_ok = fluree.create_ledger("shacl/not-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/not-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shapes_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -1972,7 +2015,9 @@ async fn shacl_not_constraint() {
     assert_eq!(jsonld, json!(["active"]));
 
     // Invalid: user with status "banned" matches the forbidden shape
-    let ledger_bad = fluree.create_ledger("shacl/not-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/not-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shapes_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2029,7 +2074,9 @@ async fn shacl_and_constraint() {
     ]);
 
     // Valid: has both name and email
-    let ledger_ok = fluree.create_ledger("shacl/and-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/and-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shapes_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -2056,7 +2103,9 @@ async fn shacl_and_constraint() {
     assert_eq!(jsonld, json!(["Alice"]));
 
     // Invalid: missing email (only has name)
-    let ledger_bad = fluree.create_ledger("shacl/and-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/and-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shapes_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2113,7 +2162,9 @@ async fn shacl_or_constraint() {
     ]);
 
     // Valid: has email (satisfies one option)
-    let ledger_ok = fluree.create_ledger("shacl/or-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/or-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shapes_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -2139,7 +2190,9 @@ async fn shacl_or_constraint() {
     assert_eq!(jsonld, json!(["alice@example.org"]));
 
     // Invalid: has neither phone nor email
-    let ledger_bad = fluree.create_ledger("shacl/or-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/or-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shapes_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2196,7 +2249,9 @@ async fn shacl_xone_constraint() {
     ]);
 
     // Valid: has only personalId (exactly one shape matches)
-    let ledger_ok = fluree.create_ledger("shacl/xone-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/xone-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shapes_txn).await.unwrap().ledger;
     let ledger_ok = fluree
         .upsert(
@@ -2222,7 +2277,9 @@ async fn shacl_xone_constraint() {
     assert_eq!(jsonld, json!(["P12345"]));
 
     // Invalid: has both personalId AND businessId (both shapes match)
-    let ledger_both = fluree.create_ledger("shacl/xone-both:main").await.unwrap();
+    let ledger_both = create_shacl_ledger(&fluree, "shacl/xone-both:main")
+        .await
+        .unwrap();
     let ledger_both = fluree
         .upsert(ledger_both, &shapes_txn)
         .await
@@ -2244,7 +2301,9 @@ async fn shacl_xone_constraint() {
     assert_shacl_violation(err, "sh:xone");
 
     // Invalid: has neither (no shapes match)
-    let ledger_none = fluree.create_ledger("shacl/xone-none:main").await.unwrap();
+    let ledger_none = create_shacl_ledger(&fluree, "shacl/xone-none:main")
+        .await
+        .unwrap();
     let ledger_none = fluree
         .upsert(ledger_none, &shapes_txn)
         .await
@@ -2292,8 +2351,7 @@ async fn shacl_or_with_inline_anonymous_shapes() {
     });
 
     // Valid: plain string value (matches xsd:string)
-    let ledger_ok = fluree
-        .create_ledger("shacl/or-inline-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/or-inline-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -2312,8 +2370,7 @@ async fn shacl_or_with_inline_anonymous_shapes() {
         .ledger;
 
     // Invalid: integer value (matches neither rdf:langString nor xsd:string)
-    let ledger_bad = fluree
-        .create_ledger("shacl/or-inline-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/or-inline-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -2355,8 +2412,7 @@ async fn shacl_and_with_inline_anonymous_shapes() {
     });
 
     // Valid: string with length >= 3
-    let ledger_ok = fluree
-        .create_ledger("shacl/and-inline-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/and-inline-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -2375,8 +2431,7 @@ async fn shacl_and_with_inline_anonymous_shapes() {
         .ledger;
 
     // Invalid: string with length < 3 (violates minLength)
-    let ledger_bad = fluree
-        .create_ledger("shacl/and-inline-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/and-inline-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -2417,7 +2472,9 @@ async fn shacl_inverse_path() {
     });
 
     // Valid: ex:mom is a Parent and ex:kid points at her via ex:parent.
-    let ledger_ok = fluree.create_ledger("shacl/inv-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/inv-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2434,7 +2491,9 @@ async fn shacl_inverse_path() {
         .expect("parent with an inbound ex:parent edge should pass");
 
     // Invalid: ex:childless is a Parent nobody points at → 0 inverse values.
-    let ledger_bad = fluree.create_ledger("shacl/inv-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/inv-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2469,7 +2528,9 @@ async fn shacl_sequence_path() {
     });
 
     // Valid: alice knows bob, bob has a (string) name → sequence reaches "Bob".
-    let ledger_ok = fluree.create_ledger("shacl/seq-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/seq-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2486,7 +2547,9 @@ async fn shacl_sequence_path() {
         .expect("sequence path reaching a named acquaintance should pass");
 
     // Invalid: carol is a Socialite who knows nobody → sequence reaches nothing.
-    let ledger_bad = fluree.create_ledger("shacl/seq-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/seq-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2521,7 +2584,9 @@ async fn shacl_alternative_path() {
     });
 
     // Valid: dave has only ex:altEmail — the second branch must be evaluated.
-    let ledger_ok = fluree.create_ledger("shacl/alt-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/alt-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2537,7 +2602,9 @@ async fn shacl_alternative_path() {
         .expect("alternative path reaching a value via the second branch should pass");
 
     // Invalid: eve has neither email predicate.
-    let ledger_bad = fluree.create_ledger("shacl/alt-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/alt-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2572,7 +2639,9 @@ async fn shacl_one_or_more_path() {
     });
 
     // Valid: child → mom → grandma gives 2 transitive ancestors.
-    let ledger_ok = fluree.create_ledger("shacl/oom-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/oom-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2590,7 +2659,9 @@ async fn shacl_one_or_more_path() {
         .expect("two-hop ancestry should satisfy minCount 2");
 
     // Invalid: child has a single (direct) parent only.
-    let ledger_bad = fluree.create_ledger("shacl/oom-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/oom-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2626,7 +2697,9 @@ async fn shacl_unsupported_path_rejected() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/badpath:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/badpath:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // The unsupported path surfaces as a violation when the shape fires on a
@@ -2664,8 +2737,7 @@ async fn shacl_unsupported_path_scoped_to_targets() {
         }]
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/badpath-scoped:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/badpath-scoped:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -2705,8 +2777,7 @@ async fn shacl_complex_path_in_nested_or() {
     });
 
     // Valid: doc1 has no title but IS cited → satisfied via the inverse-path member.
-    let ledger_ok = fluree
-        .create_ledger("shacl/nested-path-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/nested-path-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -2725,8 +2796,7 @@ async fn shacl_complex_path_in_nested_or() {
         .expect("a Doc satisfied only via the inverse-path sh:or member should pass");
 
     // Invalid: doc2 has no title and is cited by nothing → both members fail.
-    let ledger_bad = fluree
-        .create_ledger("shacl/nested-path-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/nested-path-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -2766,7 +2836,9 @@ async fn shacl_custom_message_property_shape() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/msg-prop:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/msg-prop:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     let err = fluree
@@ -2802,7 +2874,9 @@ async fn shacl_custom_message_node_shape_closed() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/msg-closed:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/msg-closed:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     let err = fluree
@@ -2857,7 +2931,9 @@ async fn shacl_node_named_shape_on_property() {
     });
 
     // Valid: the address node has a postal code.
-    let ledger_ok = fluree.create_ledger("shacl/node-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/node-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2873,7 +2949,9 @@ async fn shacl_node_named_shape_on_property() {
         .expect("address conforming to AddressShape should pass");
 
     // Invalid: the address node lacks a postal code.
-    let ledger_bad = fluree.create_ledger("shacl/node-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/node-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2918,7 +2996,9 @@ async fn shacl_node_on_node_shape() {
     });
 
     // Valid: manager carries an employeeId, so it conforms to EmployeeShape.
-    let ledger_ok = fluree.create_ledger("shacl/nodens-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/nodens-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2934,7 +3014,9 @@ async fn shacl_node_on_node_shape() {
         .expect("manager with employeeId should pass");
 
     // Invalid: manager without an employeeId.
-    let ledger_bad = fluree.create_ledger("shacl/nodens-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/nodens-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -2977,7 +3059,9 @@ async fn shacl_node_recursive_shape_cyclic_data() {
     });
 
     // Valid: both nodes named; the knows-cycle must not hang validation.
-    let ledger_ok = fluree.create_ledger("shacl/rec-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/rec-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -2996,7 +3080,9 @@ async fn shacl_node_recursive_shape_cyclic_data() {
         .expect("cyclic knows-graph with conforming nodes should pass");
 
     // Invalid: bob has no name, so alice's knows-value fails FriendShape.
-    let ledger_bad = fluree.create_ledger("shacl/rec-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/rec-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3035,7 +3121,9 @@ async fn shacl_value_constraint_on_node_shape() {
         "sh:in": [{"@id": "ex:active"}, {"@id": "ex:inactive"}]
     });
 
-    let ledger_ok = fluree.create_ledger("shacl/nodeval-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/nodeval-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3049,8 +3137,7 @@ async fn shacl_value_constraint_on_node_shape() {
         .await
         .expect("status in the allowed set should pass");
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/nodeval-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/nodeval-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -3086,7 +3173,9 @@ async fn shacl_deactivated_shape_ignored() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/deact:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/deact:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // Would violate minCount if the shape were active.
@@ -3120,7 +3209,9 @@ async fn shacl_implicit_class_target() {
         }]
     });
 
-    let ledger_ok = fluree.create_ledger("shacl/impl-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/impl-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3135,7 +3226,9 @@ async fn shacl_implicit_class_target() {
         .await
         .expect("instance with employeeId should pass");
 
-    let ledger_bad = fluree.create_ledger("shacl/impl-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/impl-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3184,7 +3277,9 @@ async fn shacl_qualified_value_shape_min_count() {
     });
 
     // Valid: one of the two members carries a badge.
-    let ledger_ok = fluree.create_ledger("shacl/qual-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/qual-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3203,7 +3298,9 @@ async fn shacl_qualified_value_shape_min_count() {
         .expect("team with one badged member should pass");
 
     // Invalid: no member conforms to BadgedShape.
-    let ledger_bad = fluree.create_ledger("shacl/qual-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/qual-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3241,7 +3338,9 @@ async fn shacl_ignored_properties_turtle_list() {
           sh:property [ sh:path ex:label ] .
     ";
 
-    let ledger_ok = fluree.create_ledger("shacl/ignored-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/ignored-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree
         .stage_owned(ledger_ok)
         .upsert_turtle(shapes_ttl)
@@ -3263,8 +3362,7 @@ async fn shacl_ignored_properties_turtle_list() {
         .await
         .expect("list-declared ignored property must be allowed on a closed shape");
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/ignored-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/ignored-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree
@@ -3310,7 +3408,9 @@ async fn shacl_warning_severity_on_closed_shape_does_not_reject() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/warnsev:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/warnsev:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // ex:extra is undeclared — a Violation-severity closed shape would reject
@@ -3349,8 +3449,7 @@ async fn shacl_pattern_on_integer_literal() {
         }]
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/pattern-int-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/pattern-int-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -3367,8 +3466,7 @@ async fn shacl_pattern_on_integer_literal() {
         .await
         .expect("4-digit integer must match ^\\d{4}$ via its lexical form");
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/pattern-int-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/pattern-int-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -3413,7 +3511,9 @@ async fn shacl_class_inside_or_member() {
     });
 
     // Valid: owner is a Person.
-    let ledger_ok = fluree.create_ledger("shacl/orclass-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/orclass-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3431,8 +3531,7 @@ async fn shacl_class_inside_or_member() {
 
     // Invalid: owner exists but is not a Person — pre-fix the sh:class check
     // silently passed, so the member (and the sh:or) conformed.
-    let ledger_bad = fluree
-        .create_ledger("shacl/orclass-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/orclass-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -3484,7 +3583,9 @@ async fn shacl_qualified_inside_or_member() {
         ]
     });
 
-    let ledger_ok = fluree.create_ledger("shacl/orqual-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/orqual-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3500,7 +3601,9 @@ async fn shacl_qualified_inside_or_member() {
         .await
         .expect("badged member satisfies the qualified count in the sh:or member");
 
-    let ledger_bad = fluree.create_ledger("shacl/orqual-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/orqual-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3537,8 +3640,7 @@ async fn shacl_node_inline_class_value_shape() {
         }]
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/nodeclass-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/nodeclass-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -3556,8 +3658,7 @@ async fn shacl_node_inline_class_value_shape() {
         .await
         .expect("artifact typed ex:Artifact conforms to the inline sh:node class shape");
 
-    let ledger_bad = fluree
-        .create_ledger("shacl/nodeclass-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/nodeclass-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -3600,7 +3701,9 @@ async fn shacl_language_in() {
     });
 
     // Valid: en, fr, and en-US (basic language-range match) labels.
-    let ledger_ok = fluree.create_ledger("shacl/langin-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/langin-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3620,7 +3723,9 @@ async fn shacl_language_in() {
         .expect("en / fr / en-US labels are all within sh:languageIn (en fr)");
 
     // Invalid: a German label.
-    let ledger_bad = fluree.create_ledger("shacl/langin-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/langin-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3637,8 +3742,7 @@ async fn shacl_language_in() {
     assert_shacl_violation(err, "not in the allowed set");
 
     // Invalid: a plain (untagged) string.
-    let ledger_plain = fluree
-        .create_ledger("shacl/langin-plain:main")
+    let ledger_plain = create_shacl_ledger(&fluree, "shacl/langin-plain:main")
         .await
         .unwrap();
     let ledger_plain = fluree
@@ -3679,7 +3783,9 @@ async fn shacl_unique_lang() {
     });
 
     // Valid: one label per language.
-    let ledger_ok = fluree.create_ledger("shacl/uniq-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/uniq-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3698,7 +3804,9 @@ async fn shacl_unique_lang() {
         .expect("distinct language tags satisfy sh:uniqueLang");
 
     // Invalid: two English labels.
-    let ledger_bad = fluree.create_ledger("shacl/uniq-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/uniq-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3711,6 +3819,64 @@ async fn shacl_unique_lang() {
                     {"@value": "colour", "@language": "en"},
                     {"@value": "color", "@language": "en"}
                 ]
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "more than one value");
+}
+
+/// An upsert that replaces every language's label satisfies `sh:uniqueLang`:
+/// the replaced values are retracted with their language tags, so the
+/// staged state holds one label per language. A second label in a language
+/// is still refused.
+#[tokio::test]
+async fn a_refresh_upsert_satisfies_unique_lang() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let shape_txn = json!({
+        "@context": context.clone(),
+        "@id": "ex:UniqueLabelShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Translated"},
+        "sh:property": [{
+            "@id": "ex:pshape_unique_label",
+            "sh:path": {"@id": "ex:label"},
+            "sh:uniqueLang": true
+        }]
+    });
+    let ledger = create_shacl_ledger(&fluree, "shacl/uniq-refresh:main")
+        .await
+        .unwrap();
+    let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
+    let doc = |en: &str, fr: &str| {
+        json!({
+            "@context": context.clone(),
+            "@id": "ex:doc1",
+            "@type": "ex:Translated",
+            "ex:label": [
+                {"@value": en, "@language": "en"},
+                {"@value": fr, "@language": "fr"}
+            ]
+        })
+    };
+    let ledger = fluree
+        .upsert(ledger, &doc("colour", "couleur"))
+        .await
+        .expect("first labels")
+        .ledger;
+    let ledger = fluree
+        .upsert(ledger, &doc("color", "coloris"))
+        .await
+        .expect("a refresh replaces each language's label")
+        .ledger;
+    let err = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": context.clone(),
+                "@id": "ex:doc1",
+                "ex:label": {"@value": "hue", "@language": "en"}
             }),
         )
         .await
@@ -3737,7 +3903,9 @@ async fn shacl_pattern_on_iri_values() {
         }]
     });
 
-    let ledger_ok = fluree.create_ledger("shacl/iripat-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/iripat-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3754,7 +3922,9 @@ async fn shacl_pattern_on_iri_values() {
 
     // Violating IRI in a namespace committed by an earlier transaction — the
     // full IRI decodes and fails the pattern with the precise message.
-    let ledger_bad = fluree.create_ledger("shacl/iripat-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/iripat-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let ledger_bad = fluree
         .upsert(
@@ -3785,8 +3955,7 @@ async fn shacl_pattern_on_iri_values() {
     // An IRI whose namespace is first seen in this very transaction can't be
     // decoded against the base snapshot — pattern fails closed (still a
     // violation, with the generic non-literal message).
-    let ledger_fresh = fluree
-        .create_ledger("shacl/iripat-fresh:main")
+    let ledger_fresh = create_shacl_ledger(&fluree, "shacl/iripat-fresh:main")
         .await
         .unwrap();
     let ledger_fresh = fluree
@@ -3828,7 +3997,9 @@ async fn shacl_custom_message_on_nested_member() {
         }]
     });
 
-    let ledger = fluree.create_ledger("shacl/nestmsg:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/nestmsg:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -3918,7 +4089,9 @@ async fn shacl_qualified_value_shapes_disjoint() {
     });
 
     // Distinct members satisfy both qualified counts under disjointness.
-    let ledger = fluree.create_ledger("shacl/disj-ok:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/disj-ok:main")
+        .await
+        .unwrap();
     let ledger = fluree
         .upsert(ledger, &crew_shape(true))
         .await
@@ -3931,7 +4104,9 @@ async fn shacl_qualified_value_shapes_disjoint() {
 
     // A dual-role member conforms to the sibling shape too, so it counts for
     // neither → both qualifiedMinCounts fail.
-    let ledger = fluree.create_ledger("shacl/disj-bad:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/disj-bad:main")
+        .await
+        .unwrap();
     let ledger = fluree
         .upsert(ledger, &crew_shape(true))
         .await
@@ -3941,7 +4116,9 @@ async fn shacl_qualified_value_shapes_disjoint() {
     assert_shacl_violation(err, "at least 1 value(s) conforming");
 
     // Control: without disjointness the dual-role member counts for both.
-    let ledger = fluree.create_ledger("shacl/disj-off:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/disj-off:main")
+        .await
+        .unwrap();
     let ledger = fluree
         .upsert(ledger, &crew_shape(false))
         .await
@@ -3975,7 +4152,9 @@ async fn shacl_value_only_member_in_node_level_or() {
         ]
     });
 
-    let ledger_ok = fluree.create_ledger("shacl/valmem-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/valmem-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -3991,7 +4170,9 @@ async fn shacl_value_only_member_in_node_level_or() {
         .await
         .expect("a Person actor satisfies the value-only sh:or member");
 
-    let ledger_bad = fluree.create_ledger("shacl/valmem-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/valmem-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -4024,8 +4205,7 @@ async fn shacl_pattern_on_node_shape_focus_iri() {
         "sh:pattern": "^http://example\\.org/"
     });
 
-    let ledger_ok = fluree
-        .create_ledger("shacl/focuspat-ok:main")
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/focuspat-ok:main")
         .await
         .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
@@ -4042,8 +4222,7 @@ async fn shacl_pattern_on_node_shape_focus_iri() {
         .expect("focus IRI under example.org matches the node-shape pattern");
 
     // Register the foreign namespace first so the violating focus decodes.
-    let ledger_bad = fluree
-        .create_ledger("shacl/focuspat-bad:main")
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/focuspat-bad:main")
         .await
         .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
@@ -4088,7 +4267,9 @@ async fn shacl_warning_severity_on_node_value_constraint() {
         "sh:in": [{"@id": "ex:on"}, {"@id": "ex:off"}]
     });
 
-    let ledger = fluree.create_ledger("shacl/warnval:main").await.unwrap();
+    let ledger = create_shacl_ledger(&fluree, "shacl/warnval:main")
+        .await
+        .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
 
     // Out-of-set value — would reject under Violation severity (covered by
@@ -4125,7 +4306,9 @@ async fn shacl_inverse_of_sequence_path() {
     });
 
     // Valid: child → mom → grandma, so grandma has a grandchild via ^(parent/parent).
-    let ledger_ok = fluree.create_ledger("shacl/invseq-ok:main").await.unwrap();
+    let ledger_ok = create_shacl_ledger(&fluree, "shacl/invseq-ok:main")
+        .await
+        .unwrap();
     let ledger_ok = fluree.upsert(ledger_ok, &shape_txn).await.unwrap().ledger;
     fluree
         .upsert(
@@ -4143,7 +4326,9 @@ async fn shacl_inverse_of_sequence_path() {
         .expect("grandchild reachable via inverse sequence path should pass");
 
     // Invalid: grandma has a child but no grandchild.
-    let ledger_bad = fluree.create_ledger("shacl/invseq-bad:main").await.unwrap();
+    let ledger_bad = create_shacl_ledger(&fluree, "shacl/invseq-bad:main")
+        .await
+        .unwrap();
     let ledger_bad = fluree.upsert(ledger_bad, &shape_txn).await.unwrap().ledger;
     let err = fluree
         .upsert(
@@ -4169,8 +4354,7 @@ async fn shacl_inverse_of_sequence_path() {
 async fn validate_report_attached_shapes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/validate-report:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-report:main")
         .await
         .unwrap();
     // Data first (no shapes yet, so staging enforcement doesn't run), then
@@ -4247,8 +4431,7 @@ async fn validate_report_attached_shapes() {
 async fn validate_report_conforming_state() {
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/validate-conforms:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-conforms:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4297,8 +4480,7 @@ async fn validate_report_conforming_state() {
 async fn validate_report_inline_turtle_replaces_attached() {
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/validate-inline:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-inline:main")
         .await
         .unwrap();
     // Non-conforming against the ATTACHED shape (missing schema:name),
@@ -4380,8 +4562,7 @@ async fn validate_report_inline_turtle_replaces_attached() {
 async fn validate_report_inline_jsonld_shapes() {
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/validate-inline-jsonld:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-inline-jsonld:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4430,8 +4611,7 @@ async fn validate_report_inline_jsonld_shapes() {
 #[tokio::test]
 async fn validate_report_unknown_graph_is_not_found() {
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = fluree
-        .create_ledger("shacl/validate-nograph:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-nograph:main")
         .await
         .unwrap();
     let view = crate::ledger_view::LedgerView::from_state(&ledger);
@@ -4445,6 +4625,81 @@ async fn validate_report_unknown_graph_is_not_found() {
     assert!(matches!(err, ApiError::NotFound(_)), "got {err:?}");
 }
 
+/// A config that cannot be read fails validation, as it fails a transaction,
+/// rather than validating without it. Here the config lists a catalog graph
+/// whose tag puts `ex:item` over `sh:maxCount 1`; read as "no config", the
+/// catalog would drop out and the report would conform.
+#[tokio::test]
+async fn validate_report_fails_when_the_config_cannot_be_read() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "shacl/validate-config-unreadable:main";
+    let ledger = fluree.create_ledger(ledger_id).await.unwrap();
+    let trig = format!(
+        r#"
+        @prefix f:   <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        @prefix ex:  <http://example.org/ns/> .
+
+        GRAPH <http://example.org/ns/org-a> {{ ex:item ex:tag "a" . }}
+        GRAPH <http://example.org/ns/catalog> {{ ex:item ex:tag "b" . }}
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig ; f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:additionalDataSource <urn:config:catalog> .
+            <urn:config:catalog> rdf:type f:GraphRef ; f:graphSource <urn:config:catalog-graph> .
+            <urn:config:catalog-graph> f:graphSelector <http://example.org/ns/catalog> .
+        }}
+    "#
+    );
+    let ledger = fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&trig)
+        .execute()
+        .await
+        .unwrap()
+        .ledger;
+    let view = crate::ledger_view::LedgerView::from_state(&ledger);
+    let options = crate::validate::ValidateOptions {
+        graph: Some("http://example.org/ns/org-a".to_string()),
+        shapes: crate::validate::ShapesSource::InlineTurtle(
+            r"
+            @prefix sh: <http://www.w3.org/ns/shacl#> .
+            @prefix ex: <http://example.org/ns/> .
+            ex:TagShape a sh:NodeShape ;
+                sh:targetNode ex:item ;
+                sh:property [ sh:path ex:tag ; sh:maxCount 1 ] .
+        "
+            .to_string(),
+        ),
+        ..Default::default()
+    };
+
+    let report = crate::validate::validate_view(&view, ledger_id, &options)
+        .await
+        .unwrap();
+    assert_eq!(
+        report.violation_count(),
+        1,
+        "the catalog's tag counts: {:?}",
+        report.results
+    );
+
+    let _fault = crate::config_resolver::config_read_fault::arm();
+    let err = crate::validate::validate_view(&view, ledger_id, &options)
+        .await
+        .expect_err("validate_view without its config");
+    assert!(matches!(err, ApiError::ConfigUnavailable(_)), "{err:?}");
+    assert_eq!(
+        err.status_code(),
+        500,
+        "a storage failure, not a request error"
+    );
+    let err = fluree
+        .validate_ledger(ledger_id, &options)
+        .await
+        .expect_err("validate_ledger without its config");
+    assert!(matches!(err, ApiError::ConfigUnavailable(_)), "{err:?}");
+}
+
 #[tokio::test]
 async fn validate_report_inline_shapes_carry_class_value_set() {
     // An ad-hoc shapes doc may ship both a sh:class constraint AND the
@@ -4454,8 +4709,7 @@ async fn validate_report_inline_shapes_carry_class_value_set() {
     // the bundle never touches the ledger.
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/validate-valueset:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-valueset:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4506,8 +4760,7 @@ async fn validate_report_value_term_fidelity() {
     // @language, non-native datatypes carry @type with the lexical form.
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/validate-fidelity:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-fidelity:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4595,8 +4848,7 @@ async fn validate_report_literal_target_nodes() {
     // validated directly against the shape's value constraints and reported
     // with a value-object focus in the report.
     let fluree = FlureeBuilder::memory().build_memory();
-    let ledger = fluree
-        .create_ledger("shacl/validate-literal-target:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/validate-literal-target:main")
         .await
         .unwrap();
     let view = crate::ledger_view::LedgerView::from_state(&ledger);
@@ -4659,8 +4911,7 @@ async fn shacl_subclass_target_sees_unindexed_schema() {
     // index-time hierarchy and Manager records slipped through.
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/subclass-currency:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/subclass-currency:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4717,8 +4968,7 @@ async fn shacl_same_transaction_schema_not_entailed() {
     // transaction. (Workaround: two transactions, schema first.)
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/subclass-same-txn:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/subclass-same-txn:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4763,8 +5013,7 @@ async fn shacl_compile_cache_invalidates_on_new_shapes() {
     // them. Exercises the shacl_epoch invalidation path end to end.
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/compile-cache:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/compile-cache:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4848,8 +5097,7 @@ async fn shacl_path_sees_subproperty_values() {
     // values asserted via ex:firstName when firstName ⊑ name.
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/subprop-path:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/subprop-path:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -4894,8 +5142,7 @@ async fn shacl_path_sees_subproperty_values() {
     assert_shacl_violation(err, "exceeds maximum");
 
     // Conforming subproperty value passes.
-    let ledger2 = fluree
-        .create_ledger("shacl/subprop-path-ok:main")
+    let ledger2 = create_shacl_ledger(&fluree, "shacl/subprop-path-ok:main")
         .await
         .unwrap();
     let ledger2 = fluree
@@ -4941,8 +5188,7 @@ async fn shacl_target_subjects_of_sees_subproperties() {
     // carry ex:homePhone ⊑ ex:phone.
     let fluree = FlureeBuilder::memory().build_memory();
     let context = shacl_context();
-    let ledger = fluree
-        .create_ledger("shacl/subprop-target:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/subprop-target:main")
         .await
         .unwrap();
     let ledger = fluree
@@ -5002,8 +5248,7 @@ async fn shacl_sparql_node_constraint() {
         }
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/sparql-node:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/sparql-node:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -5065,8 +5310,7 @@ async fn validate_sparql_constraint_is_bounded_by_fuel() {
         }
     });
 
-    let mut ledger = fluree
-        .create_ledger("shacl/validate-fuel:main")
+    let mut ledger = create_shacl_ledger(&fluree, "shacl/validate-fuel:main")
         .await
         .unwrap();
 
@@ -5145,8 +5389,7 @@ async fn shacl_sparql_node_constraint_with_path_in_a_literal() {
         }
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/sparql-path-literal:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/sparql-path-literal:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -5203,8 +5446,7 @@ async fn shacl_sparql_property_constraint_with_path() {
         }
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/sparql-path:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/sparql-path:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -5257,8 +5499,7 @@ async fn shacl_sparql_invalid_query_fails_closed() {
         }
     });
 
-    let ledger = fluree
-        .create_ledger("shacl/sparql-invalid:main")
+    let ledger = create_shacl_ledger(&fluree, "shacl/sparql-invalid:main")
         .await
         .unwrap();
     let ledger = fluree.upsert(ledger, &shape_txn).await.unwrap().ledger;
@@ -5279,4 +5520,1055 @@ async fn shacl_sparql_invalid_query_fails_closed() {
         message.contains("MINUS"),
         "expected pre-binding restriction error naming MINUS, got: {message}"
     );
+}
+
+/// A rejected transaction carries each violation resolved to full IRIs, as
+/// `validate` reports them, alongside the readable message.
+#[tokio::test]
+async fn violation_carries_resolved_results() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = shacl_context();
+    let ledger = create_shacl_ledger(&fluree, "shacl/violation-results:main")
+        .await
+        .unwrap();
+    let shape = json!({
+        "@context": context.clone(),
+        "@id": "ex:UserShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:User"},
+        "sh:property": [{"sh:path": {"@id": "schema:name"}, "sh:minCount": 1}]
+    });
+    let ledger = fluree.upsert(ledger, &shape).await.unwrap().ledger;
+    let err = fluree
+        .upsert(
+            ledger,
+            &json!({"@context": context, "@id": "ex:alex", "@type": "ex:User"}),
+        )
+        .await
+        .unwrap_err();
+
+    let ApiError::Transact(TransactError::ShaclViolation(violations)) = err else {
+        panic!("expected SHACL violation, got {err:?}");
+    };
+    assert!(violations.contains("Focus node: ex:alex"), "{violations}");
+    let [result] = violations.results() else {
+        panic!("expected one result, got {:?}", violations.results());
+    };
+    assert_eq!(result.focus_node, json!("http://example.org/ns/alex"));
+    assert_eq!(
+        result.result_path.as_deref(),
+        Some("http://schema.org/name")
+    );
+    assert_eq!(result.source_shape, "http://example.org/ns/UserShape");
+    assert_eq!(
+        result.constraint_component,
+        "http://www.w3.org/ns/shacl#MinCountConstraintComponent"
+    );
+    assert_eq!(result.severity, "http://www.w3.org/ns/shacl#Violation");
+}
+
+/// A ledger whose `ex:Player` nodes are checked by one `sh:sparql` constraint
+/// with the given `sh:select`.
+async fn ledger_with_player_constraint(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    select: &str,
+) -> crate::LedgerState {
+    let shape_txn = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:sparql": {
+            "@id": "ex:PlayerShape-sparql",
+            "sh:message": "player constraint",
+            "sh:select": select
+        }
+    });
+    let ledger = create_shacl_ledger(fluree, ledger_id).await.unwrap();
+    fluree.upsert(ledger, &shape_txn).await.unwrap().ledger
+}
+
+/// Insert one `ex:Player` with the given `ex:score`.
+async fn insert_player(
+    fluree: &crate::Fluree,
+    ledger: crate::LedgerState,
+    id: &str,
+    score: i64,
+) -> Result<crate::LedgerState, ApiError> {
+    let player = json!({
+        "@context": shacl_context(),
+        "@id": id,
+        "@type": "ex:Player",
+        "ex:score": score
+    });
+    fluree
+        .upsert(ledger, &player)
+        .await
+        .map(|result| result.ledger)
+}
+
+// `sh:select` is lowered like a SPARQL query but skips the SPARQL validator,
+// so the grouped-query semantics reach shape constraints directly: a stored
+// shape's verdict follows them.
+
+/// HAVING without GROUP BY or an aggregate is a filter over the solutions
+/// (SPARQL 1.1 §18.2.4.2). It used to be dropped, so every scored player was a
+/// violation.
+#[tokio::test]
+async fn shacl_sparql_having_without_grouping_filters() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-having-filter:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } HAVING (?s > 10)",
+    )
+    .await;
+    let ledger = insert_player(&fluree, ledger, "ex:low", 5)
+        .await
+        .expect("HAVING filters out a score of 5");
+    let err = insert_player(&fluree, ledger, "ex:high", 20)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "player constraint");
+}
+
+/// A HAVING read of a variable that is not a GROUP BY key means `SAMPLE(?v)`
+/// (SPARQL 1.1 §18.2.4.1). It used to read the per-group list: a panic in a
+/// debug build, and no solutions (so no violation) in release.
+#[tokio::test]
+async fn shacl_sparql_having_reads_a_sample_of_a_non_key_variable() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-having-sample:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } \
+         GROUP BY $this HAVING (?s > 10)",
+    )
+    .await;
+    let ledger = insert_player(&fluree, ledger, "ex:low", 5)
+        .await
+        .expect("the sampled score 5 is not > 10");
+    let err = insert_player(&fluree, ledger, "ex:high", 20)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "player constraint");
+}
+
+/// Projecting a variable that is neither a GROUP BY key nor an aggregate is a
+/// validator error for a SPARQL query; `sh:select` skips the validator, and the
+/// plan-time check now fails the constraint closed. The per-group list used to
+/// read as no value, reporting a violation at the focus node. The failure is
+/// the SPARQL-constraint type, naming the constraint, its shape and the
+/// variable.
+#[tokio::test]
+async fn shacl_sparql_grouped_projection_of_a_non_key_fails_closed() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_player_constraint(
+        &fluree,
+        "shacl/sparql-grouped-projection:main",
+        "SELECT $this ?value WHERE { $this <http://example.org/ns/score> ?value } \
+         GROUP BY $this",
+    )
+    .await;
+    let err = insert_player(&fluree, ledger, "ex:p1", 5)
+        .await
+        .unwrap_err();
+    let ApiError::Transact(TransactError::Shacl(fluree_db_shacl::ShaclError::SparqlConstraint {
+        constraint,
+        message,
+    })) = err
+    else {
+        panic!("expected a sh:sparql constraint failure, got: {err:?}");
+    };
+    assert_eq!(constraint, "http://example.org/ns/PlayerShape-sparql");
+    assert!(
+        message.contains("on shape http://example.org/ns/PlayerShape: projected variable ?value is neither a GROUP BY key nor an aggregate result"),
+        "{message}"
+    );
+    assert!(!message.contains("VarId("), "{message}");
+}
+
+/// A player shape whose `sh:sparql` constraint cannot run (`select` does not
+/// parse, lower or plan), at `severity` (the default, Violation, when `None`),
+/// on a ledger whose config puts SHACL in Warn mode when `warn_mode`.
+async fn ledger_with_failing_player_constraint(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    select: &str,
+    severity: Option<&str>,
+    warn_mode: bool,
+) -> crate::LedgerState {
+    let mut shape = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:sparql": {
+            "@id": "ex:PlayerShape-sparql",
+            "sh:message": "player constraint",
+            "sh:select": select
+        }
+    });
+    if let Some(severity) = severity {
+        shape["sh:severity"] = json!({"@id": severity});
+    }
+    let ledger = create_shacl_ledger(fluree, ledger_id).await.unwrap();
+    let ledger = fluree.upsert(ledger, &shape).await.unwrap().ledger;
+    if !warn_mode {
+        return ledger;
+    }
+    let config = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true ;
+                               f:validationMode f:ValidationWarn .
+        }}
+        "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("warn-mode config")
+        .ledger
+}
+
+/// An `sh:sparql` constraint that cannot run (its query does not parse, lower
+/// or plan, or fails on its own terms: an aggregate reads a variable nothing
+/// binds, two aggregates output one variable, an expression calls an unknown
+/// function) follows the shape's severity and the graph's validation mode, as
+/// a result would: on a Violation shape in a reject-mode graph it fails the
+/// transaction with the constraint's error, which names the shape and any
+/// variable (fail closed); on a Warning or Info shape, or in a warn-mode
+/// graph, it is logged and the write commits. Every such failure used to fail
+/// the transaction, whatever the severity or mode, and the aggregate errors
+/// printed raw variable ids.
+#[tokio::test]
+async fn shacl_sparql_constraint_failure_follows_severity_and_mode() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // (failure, constraint query, what the error says)
+    let failing = [
+        (
+            "plan",
+            "SELECT $this ?value WHERE { $this <http://example.org/ns/score> ?value } \
+             GROUP BY $this",
+            "projected variable ?value is neither a GROUP BY key",
+        ),
+        (
+            "parse",
+            "SELECT $this WHERE { $this <http://example.org/ns/score> ",
+            "invalid sh:select query",
+        ),
+        (
+            "lower",
+            "SELECT $this WHERE { $this nope:score ?value }",
+            "failed to lower sh:select query",
+        ),
+        (
+            "aggregate",
+            "SELECT $this WHERE { $this <http://example.org/ns/score> ?s } \
+             GROUP BY $this HAVING (SUM(?nosuch) > 0)",
+            "an aggregate reads variable ?nosuch, which is unbound",
+        ),
+        (
+            "output",
+            "SELECT $this (MIN(?s) AS ?m) (MAX(?s) AS ?m) \
+             WHERE { $this <http://example.org/ns/score> ?s } GROUP BY $this",
+            "variable ?m is the output of more than one aggregate",
+        ),
+        (
+            "expression",
+            "SELECT $this WHERE { $this <http://example.org/ns/score> ?s \
+             BIND(<http://example.org/fn>(?s) AS ?b) }",
+            "Unknown function: http://example.org/fn",
+        ),
+    ];
+    // (severity, warn-mode graph, the write commits)
+    let cells = [
+        (None, false, false),
+        (Some("sh:Violation"), false, false),
+        (Some("sh:Violation"), true, true),
+        (Some("sh:Warning"), false, true),
+        (Some("sh:Warning"), true, true),
+        (Some("sh:Info"), false, true),
+        (Some("sh:Info"), true, true),
+    ];
+    for (kind, select, says) in failing {
+        for (i, (severity, warn_mode, commits)) in cells.into_iter().enumerate() {
+            let ledger_id = format!("shacl/sparql-failure-{kind}-{i}:main");
+            let cell = format!("{kind} failure, severity {severity:?}, warn mode {warn_mode}");
+            let ledger = ledger_with_failing_player_constraint(
+                &fluree, &ledger_id, select, severity, warn_mode,
+            )
+            .await;
+            let outcome = insert_player(&fluree, ledger, "ex:p1", 5).await;
+            match (outcome, commits) {
+                (Ok(_), true) => {}
+                (
+                    Err(ApiError::Transact(TransactError::Shacl(
+                        fluree_db_shacl::ShaclError::SparqlConstraint {
+                            constraint,
+                            message,
+                        },
+                    ))),
+                    false,
+                ) => {
+                    assert_eq!(
+                        constraint, "http://example.org/ns/PlayerShape-sparql",
+                        "{cell}"
+                    );
+                    assert!(message.contains(says), "{cell}: {message}");
+                    assert!(
+                        message.contains("on shape http://example.org/ns/PlayerShape:"),
+                        "{cell}: {message}"
+                    );
+                    assert!(!message.contains("VarId("), "{cell}: {message}");
+                }
+                (outcome, _) => panic!(
+                    "{cell}: expected {}, got {outcome:?}",
+                    if commits {
+                        "a commit"
+                    } else {
+                        "the constraint's error"
+                    }
+                ),
+            }
+        }
+    }
+}
+
+/// A constraint that cannot run on a Warning shape is logged, not fatal, and
+/// the node's other shapes are still enforced: a Violation shape on the same
+/// target class rejects the write.
+#[tokio::test]
+async fn shacl_sparql_constraint_failure_keeps_other_shapes_enforced() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = ledger_with_failing_player_constraint(
+        &fluree,
+        "shacl/sparql-failure-others:main",
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ",
+        Some("sh:Warning"),
+        false,
+    )
+    .await;
+    let name_shape = json!({
+        "@context": shacl_context(),
+        "@id": "ex:PlayerNameShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:property": [{"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}]
+    });
+    let ledger = fluree.upsert(ledger, &name_shape).await.unwrap().ledger;
+    let err = insert_player(&fluree, ledger.clone(), "ex:p1", 5)
+        .await
+        .unwrap_err();
+    assert_shacl_violation(err, "ex:p1");
+    let named = json!({
+        "@context": shacl_context(),
+        "@id": "ex:p2",
+        "@type": "ex:Player",
+        "ex:name": "Pat",
+        "ex:score": 5
+    });
+    fluree
+        .upsert(ledger, &named)
+        .await
+        .expect("a named player commits; the failing Warning constraint is logged");
+}
+
+/// A node shape whose only constraint is `sh:sparql` keeps its `sh:severity`.
+/// Only its `rdf:type sh:NodeShape` registers such a shape, after the shape
+/// compiler has read `sh:severity`, which it used to apply only to an already
+/// registered shape. A Warning or Info shape then compiled as a Violation
+/// shape and rejected the write. Here the shape is also a class, so it targets
+/// its own instances; it is written in JSON-LD and with SPARQL UPDATE.
+#[tokio::test]
+async fn shacl_sparql_only_shape_keeps_its_severity() {
+    const SELECT: &str =
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s FILTER(?s < 0) }";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for (i, (severity, commits)) in [
+            ("sh:Warning", true),
+            ("sh:Info", true),
+            ("sh:Violation", false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let ledger_id = format!("shacl/sparql-only-severity-{i}-{via_sparql}:main");
+            let ledger = create_shacl_ledger(&fluree, &ledger_id).await.unwrap();
+            let ledger = if via_sparql {
+                let update = format!(
+                    r#"PREFIX sh: <http://www.w3.org/ns/shacl#>
+                       PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+                       PREFIX ex: <http://example.org/ns/>
+                       INSERT DATA {{
+                         ex:Scored a sh:NodeShape, rdfs:Class ;
+                           sh:severity {severity} ;
+                           sh:sparql ex:Scored-sparql .
+                         ex:Scored-sparql sh:message "score is negative" ;
+                           sh:select "{SELECT}" .
+                       }}"#
+                );
+                drop(ledger);
+                fluree
+                    .graph(&ledger_id)
+                    .transact()
+                    .sparql_update(&update)
+                    .commit()
+                    .await
+                    .expect("shape via SPARQL UPDATE");
+                fluree.ledger(&ledger_id).await.expect("ledger")
+            } else {
+                let shape = json!({
+                    "@context": shacl_context(),
+                    "@id": "ex:Scored",
+                    "@type": ["sh:NodeShape", "rdfs:Class"],
+                    "sh:severity": {"@id": severity},
+                    "sh:sparql": {
+                        "@id": "ex:Scored-sparql",
+                        "sh:message": "score is negative",
+                        "sh:select": SELECT
+                    }
+                });
+                fluree.upsert(ledger, &shape).await.unwrap().ledger
+            };
+            let outcome = fluree
+                .upsert(
+                    ledger,
+                    &json!({
+                        "@context": shacl_context(),
+                        "@id": "ex:s1",
+                        "@type": "ex:Scored",
+                        "ex:score": -1
+                    }),
+                )
+                .await;
+            match (outcome, commits) {
+                (Ok(_), true) => {}
+                (Err(err), false) => {
+                    let message = shacl_violation_message(err);
+                    if !message.contains("score is negative") {
+                        wrong.push(format!("{severity} (SPARQL {via_sparql}): {message}"));
+                    }
+                }
+                (outcome, _) => wrong.push(format!(
+                    "{severity} (SPARQL {via_sparql}): expected {}, got {:?}",
+                    if commits { "a commit" } else { "a violation" },
+                    outcome.map(|_| ())
+                )),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// `sh:and`, `sh:or` and `sh:xone` lists resolve however they were written.
+/// A JSON-LD `@list` stores one statement per member; a SPARQL UPDATE stores
+/// `( … )` as an `rdf:first` / `rdf:rest` collection, whose head the shape
+/// compiler used to take for a shape ("Referenced shape … could not be
+/// resolved"). Two members each, so the walk goes past the first.
+#[tokio::test]
+async fn shacl_logical_lists_resolve_from_either_surface() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    // (class, data, the write commits)
+    let cases = [
+        ("ex:A", json!({"ex:name": "n", "ex:age": 1}), true),
+        ("ex:A", json!({"ex:name": "n"}), false),
+        ("ex:O", json!({"ex:age": 1}), true),
+        ("ex:O", json!({"ex:note": "x"}), false),
+        ("ex:X", json!({"ex:name": "n"}), true),
+        ("ex:X", json!({"ex:name": "n", "ex:age": 1}), false),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for (i, (class, data, commits)) in cases.iter().enumerate() {
+            let ledger_id = format!("shacl/logical-lists-{i}-{via_sparql}:main");
+            let ledger = create_shacl_ledger(&fluree, &ledger_id).await.unwrap();
+            let ledger = if via_sparql {
+                let update = r"PREFIX sh: <http://www.w3.org/ns/shacl#>
+                    PREFIX ex: <http://example.org/ns/>
+                    INSERT DATA {
+                      ex:HasName a sh:NodeShape ; sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+                      ex:HasAge a sh:NodeShape ; sh:property [ sh:path ex:age ; sh:minCount 1 ] .
+                      ex:AndShape a sh:NodeShape ; sh:targetClass ex:A ;
+                        sh:and ( ex:HasName ex:HasAge ) .
+                      ex:OrShape a sh:NodeShape ; sh:targetClass ex:O ;
+                        sh:or ( ex:HasName ex:HasAge ) .
+                      ex:XoneShape a sh:NodeShape ; sh:targetClass ex:X ;
+                        sh:xone ( ex:HasName ex:HasAge ) .
+                    }";
+                drop(ledger);
+                fluree
+                    .graph(&ledger_id)
+                    .transact()
+                    .sparql_update(update)
+                    .commit()
+                    .await
+                    .expect("shapes via SPARQL UPDATE");
+                fluree.ledger(&ledger_id).await.expect("ledger")
+            } else {
+                let members = json!({"@list": [{"@id": "ex:HasName"}, {"@id": "ex:HasAge"}]});
+                let shapes = json!({
+                    "@context": shacl_context(),
+                    "@graph": [
+                        {"@id": "ex:HasName", "@type": "sh:NodeShape",
+                         "sh:property": {"sh:path": {"@id": "ex:name"}, "sh:minCount": 1}},
+                        {"@id": "ex:HasAge", "@type": "sh:NodeShape",
+                         "sh:property": {"sh:path": {"@id": "ex:age"}, "sh:minCount": 1}},
+                        {"@id": "ex:AndShape", "@type": "sh:NodeShape",
+                         "sh:targetClass": {"@id": "ex:A"}, "sh:and": members.clone()},
+                        {"@id": "ex:OrShape", "@type": "sh:NodeShape",
+                         "sh:targetClass": {"@id": "ex:O"}, "sh:or": members.clone()},
+                        {"@id": "ex:XoneShape", "@type": "sh:NodeShape",
+                         "sh:targetClass": {"@id": "ex:X"}, "sh:xone": members}
+                    ]
+                });
+                fluree.upsert(ledger, &shapes).await.unwrap().ledger
+            };
+            let mut node = data.clone();
+            node["@context"] = shacl_context();
+            node["@id"] = json!("ex:n1");
+            node["@type"] = json!(class);
+            let outcome = fluree.upsert(ledger, &node).await;
+            let case = format!("{class} {data} (SPARQL {via_sparql})");
+            match (outcome, commits) {
+                (Ok(_), true) => {}
+                (Err(ApiError::Transact(TransactError::ShaclViolation(_))), false) => {}
+                (outcome, _) => wrong.push(format!(
+                    "{case}: expected {}, got {:?}",
+                    if *commits { "a commit" } else { "a violation" },
+                    outcome.map(|_| ())
+                )),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// How an outer shape on `ex:Player` reaches `ex:InnerShape` in
+/// [`ledger_with_nested_failing_constraint`].
+#[derive(Clone, Copy, Debug)]
+enum Nesting {
+    Node,
+    Not,
+    And,
+    Or,
+    Xone,
+    /// `sh:node` on a property shape over `ex:friend`.
+    PropertyNode,
+    /// `sh:qualifiedValueShape` on a property shape over `ex:friend`.
+    Qualified,
+    /// `sh:node ex:MiddleShape`, a Violation shape whose `sh:node` is the
+    /// inner shape: the outermost shape's severity wins over the middle one's.
+    Chain,
+}
+
+/// An inner shape whose `sh:sparql` constraint cannot run (its `select` does
+/// not parse), at `inner` severity (Violation when `None`), reached from an
+/// outer shape on `ex:Player` at `outer` severity through `nesting`. The
+/// property-shape nestings put `outer` on the property shape, which reports
+/// their results. Written with a SPARQL UPDATE `INSERT DATA` when `via_sparql`,
+/// a JSON-LD upsert otherwise; in a warn-mode graph when `warn_mode`.
+async fn ledger_with_nested_failing_constraint(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    nesting: Nesting,
+    outer: &str,
+    inner: Option<&str>,
+    warn_mode: bool,
+    via_sparql: bool,
+) -> crate::LedgerState {
+    const SELECT: &str = "SELECT $this WHERE { $this <http://example.org/ns/score> ";
+    let ledger = create_shacl_ledger(fluree, ledger_id).await.unwrap();
+    let ledger = if via_sparql {
+        let reach = match nesting {
+            Nesting::Node => "sh:node ex:InnerShape".to_string(),
+            Nesting::Not => "sh:not ex:InnerShape".to_string(),
+            Nesting::And => "sh:and ( ex:InnerShape )".to_string(),
+            Nesting::Or => "sh:or ( ex:InnerShape )".to_string(),
+            Nesting::Xone => "sh:xone ( ex:InnerShape )".to_string(),
+            Nesting::PropertyNode => format!(
+                "sh:property [ sh:path ex:friend ; sh:node ex:InnerShape ; sh:severity {outer} ]"
+            ),
+            Nesting::Qualified => format!(
+                "sh:property [ sh:path ex:friend ; sh:qualifiedValueShape ex:InnerShape ; \
+                 sh:qualifiedMinCount 1 ; sh:severity {outer} ]"
+            ),
+            Nesting::Chain => "sh:node ex:MiddleShape . \
+                 ex:MiddleShape a sh:NodeShape ; sh:severity sh:Violation ; \
+                 sh:node ex:InnerShape"
+                .to_string(),
+        };
+        let inner_severity = inner.map_or(String::new(), |s| format!("sh:severity {s} ;"));
+        let update = format!(
+            r#"PREFIX sh: <http://www.w3.org/ns/shacl#>
+               PREFIX ex: <http://example.org/ns/>
+               INSERT DATA {{
+                 ex:InnerShape a sh:NodeShape ;
+                   {inner_severity} sh:sparql ex:InnerShape-sparql .
+                 ex:InnerShape-sparql sh:message "inner constraint" ;
+                   sh:select "{SELECT}" .
+                 ex:OuterShape a sh:NodeShape ;
+                   sh:targetClass ex:Player ;
+                   sh:severity {outer} ;
+                   {reach} .
+               }}"#
+        );
+        drop(ledger);
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&update)
+            .commit()
+            .await
+            .expect("shapes via SPARQL UPDATE");
+        fluree.ledger(ledger_id).await.expect("ledger")
+    } else {
+        let mut inner_shape = json!({
+            "@id": "ex:InnerShape",
+            "@type": "sh:NodeShape",
+            "sh:sparql": {
+                "@id": "ex:InnerShape-sparql",
+                "sh:message": "inner constraint",
+                "sh:select": SELECT
+            }
+        });
+        if let Some(inner) = inner {
+            inner_shape["sh:severity"] = json!({"@id": inner});
+        }
+        let inner_ref = json!({"@id": "ex:InnerShape"});
+        let mut outer_shape = json!({
+            "@id": "ex:OuterShape",
+            "@type": "sh:NodeShape",
+            "sh:targetClass": {"@id": "ex:Player"},
+            "sh:severity": {"@id": outer}
+        });
+        let list = json!({"@list": [inner_ref.clone()]});
+        match nesting {
+            Nesting::Node => outer_shape["sh:node"] = inner_ref,
+            Nesting::Not => outer_shape["sh:not"] = inner_ref,
+            Nesting::And => outer_shape["sh:and"] = list,
+            Nesting::Or => outer_shape["sh:or"] = list,
+            Nesting::Xone => outer_shape["sh:xone"] = list,
+            Nesting::PropertyNode => {
+                outer_shape["sh:property"] = json!({
+                    "sh:path": {"@id": "ex:friend"},
+                    "sh:node": inner_ref,
+                    "sh:severity": {"@id": outer}
+                });
+            }
+            Nesting::Qualified => {
+                outer_shape["sh:property"] = json!({
+                    "sh:path": {"@id": "ex:friend"},
+                    "sh:qualifiedValueShape": inner_ref,
+                    "sh:qualifiedMinCount": 1,
+                    "sh:severity": {"@id": outer}
+                });
+            }
+            Nesting::Chain => outer_shape["sh:node"] = json!({"@id": "ex:MiddleShape"}),
+        }
+        let middle_shape = json!({
+            "@id": "ex:MiddleShape",
+            "@type": "sh:NodeShape",
+            "sh:severity": {"@id": "sh:Violation"},
+            "sh:node": {"@id": "ex:InnerShape"}
+        });
+        let shapes = json!({
+            "@context": shacl_context(),
+            "@graph": [inner_shape, middle_shape, outer_shape]
+        });
+        fluree.upsert(ledger, &shapes).await.unwrap().ledger
+    };
+    if !warn_mode {
+        return ledger;
+    }
+    let config = format!(
+        r"
+        @prefix f: <https://ns.flur.ee/db#> .
+        @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+        GRAPH <urn:fluree:{ledger_id}#config> {{
+            <urn:config:main> rdf:type f:LedgerConfig ;
+                              f:shaclDefaults <urn:config:shacl> .
+            <urn:config:shacl> f:shaclEnabled true ;
+                               f:validationMode f:ValidationWarn .
+        }}
+        "
+    );
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&config)
+        .execute()
+        .await
+        .expect("warn-mode config")
+        .ledger
+}
+
+/// An `sh:sparql` constraint that cannot run in a shape checked as a nested
+/// shape (`sh:node`, `sh:not`, `sh:and`, `sh:or`, `sh:xone`, and `sh:node` or
+/// `sh:qualifiedValueShape` on a property shape, and through a Violation
+/// middle shape) takes the severity of the outermost shape that reports the
+/// result, as the nested shape's own results do: a Warning or Info outer shape logs it and the write commits, whatever
+/// the inner shape's severity; a Violation outer shape in a reject-mode graph
+/// fails the write with the constraint's error, also when the inner shape is a
+/// Warning; a warn-mode graph logs it. Before, the failure took the inner
+/// shape's severity (Violation by default), so it rejected the write under a
+/// Warning outer shape. Shapes written in JSON-LD and with SPARQL UPDATE.
+#[tokio::test]
+async fn shacl_nested_constraint_failure_takes_the_outer_severity() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let nestings = [
+        Nesting::Node,
+        Nesting::Not,
+        Nesting::And,
+        Nesting::Or,
+        Nesting::Xone,
+        Nesting::PropertyNode,
+        Nesting::Qualified,
+        Nesting::Chain,
+    ];
+    // (outer severity, inner severity, warn-mode graph, the write commits)
+    let cells = [
+        ("sh:Warning", None, false, true),
+        ("sh:Info", None, false, true),
+        ("sh:Warning", Some("sh:Warning"), false, true),
+        ("sh:Violation", None, false, false),
+        ("sh:Violation", Some("sh:Warning"), false, false),
+        ("sh:Violation", None, true, true),
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for nesting in nestings {
+            for (i, (outer, inner, warn_mode, commits)) in cells.into_iter().enumerate() {
+                let ledger_id = format!("shacl/nested-failure-{nesting:?}-{i}-{via_sparql}:main")
+                    .to_lowercase();
+                let cell = format!(
+                    "{nesting:?}, outer {outer}, inner {inner:?}, warn mode {warn_mode}, \
+                     SPARQL-defined {via_sparql}"
+                );
+                let ledger = ledger_with_nested_failing_constraint(
+                    &fluree, &ledger_id, nesting, outer, inner, warn_mode, via_sparql,
+                )
+                .await;
+                let outcome = insert_friends(&fluree, ledger, "ex:p1", &["ex:f1"]).await;
+                match (outcome, commits) {
+                    (Ok(_), true) => {}
+                    (
+                        Err(ApiError::Transact(TransactError::Shacl(
+                            fluree_db_shacl::ShaclError::SparqlConstraint { constraint, .. },
+                        ))),
+                        false,
+                    ) if constraint == "http://example.org/ns/InnerShape-sparql" => {}
+                    (outcome, _) => wrong.push(format!(
+                        "{cell}: expected {}, got {outcome:?}",
+                        if commits {
+                            "a commit"
+                        } else {
+                            "the inner constraint's error"
+                        }
+                    )),
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// What the inner shape of [`ledger_with_nested_warning_result`] checks.
+#[derive(Clone, Copy, Debug)]
+enum InnerCheck {
+    /// An `sh:sparql` constraint (the inner shape's only constraint).
+    Sparql,
+    /// A Warning property shape: `ex:score` at least 10. Its results take its
+    /// own severity, not the node shape's.
+    Property,
+}
+
+/// An inner Warning shape that reports a result for a node scoring under 10,
+/// reached from an outer shape on `ex:Player` at `outer` severity through
+/// `nesting`. Written with SPARQL UPDATE when `via_sparql`, JSON-LD otherwise.
+async fn ledger_with_nested_warning_result(
+    fluree: &crate::Fluree,
+    ledger_id: &str,
+    nesting: Nesting,
+    outer: &str,
+    check: InnerCheck,
+    via_sparql: bool,
+) -> crate::LedgerState {
+    const SELECT: &str =
+        "SELECT $this WHERE { $this <http://example.org/ns/score> ?s FILTER(?s < 10) }";
+    let ledger = create_shacl_ledger(fluree, ledger_id).await.unwrap();
+    if via_sparql {
+        let inner = match check {
+            InnerCheck::Sparql => format!(
+                r#"ex:InnerShape a sh:NodeShape ; sh:severity sh:Warning ;
+                     sh:sparql ex:InnerShape-sparql .
+                   ex:InnerShape-sparql sh:message "inner result" ; sh:select "{SELECT}" ."#
+            ),
+            InnerCheck::Property => "ex:InnerShape a sh:NodeShape ; sh:severity sh:Warning ; \
+                 sh:property [ sh:path ex:score ; sh:minInclusive 10 ; sh:severity sh:Warning ] ."
+                .to_string(),
+        };
+        let reach = match nesting {
+            Nesting::Node => "sh:node ex:InnerShape".to_string(),
+            Nesting::Not => "sh:not ex:InnerShape".to_string(),
+            Nesting::And => "sh:and ( ex:InnerShape )".to_string(),
+            Nesting::Or => "sh:or ( ex:InnerShape )".to_string(),
+            Nesting::Xone => "sh:xone ( ex:InnerShape )".to_string(),
+            Nesting::PropertyNode => format!(
+                "sh:property [ sh:path ex:friend ; sh:node ex:InnerShape ; sh:severity {outer} ]"
+            ),
+            Nesting::Qualified => format!(
+                "sh:property [ sh:path ex:friend ; sh:qualifiedValueShape ex:InnerShape ; \
+                 sh:qualifiedMinCount 1 ; sh:severity {outer} ]"
+            ),
+            Nesting::Chain => unreachable!("not used here"),
+        };
+        let update = format!(
+            r"PREFIX sh: <http://www.w3.org/ns/shacl#>
+               PREFIX ex: <http://example.org/ns/>
+               INSERT DATA {{
+                 {inner}
+                 ex:OuterShape a sh:NodeShape ;
+                   sh:targetClass ex:Player ;
+                   sh:severity {outer} ;
+                   {reach} .
+               }}"
+        );
+        drop(ledger);
+        fluree
+            .graph(ledger_id)
+            .transact()
+            .sparql_update(&update)
+            .commit()
+            .await
+            .expect("shapes via SPARQL UPDATE");
+        return fluree.ledger(ledger_id).await.expect("ledger");
+    }
+    let mut inner_shape = json!({
+        "@id": "ex:InnerShape",
+        "@type": "sh:NodeShape",
+        "sh:severity": {"@id": "sh:Warning"}
+    });
+    match check {
+        InnerCheck::Sparql => {
+            inner_shape["sh:sparql"] = json!({
+                "@id": "ex:InnerShape-sparql",
+                "sh:message": "inner result",
+                "sh:select": SELECT
+            });
+        }
+        InnerCheck::Property => {
+            inner_shape["sh:property"] = json!({
+                "sh:path": {"@id": "ex:score"},
+                "sh:minInclusive": 10,
+                "sh:severity": {"@id": "sh:Warning"}
+            });
+        }
+    }
+    let inner_ref = json!({"@id": "ex:InnerShape"});
+    let mut outer_shape = json!({
+        "@id": "ex:OuterShape",
+        "@type": "sh:NodeShape",
+        "sh:targetClass": {"@id": "ex:Player"},
+        "sh:severity": {"@id": outer}
+    });
+    let list = json!({"@list": [inner_ref.clone()]});
+    match nesting {
+        Nesting::Node => outer_shape["sh:node"] = inner_ref,
+        Nesting::Not => outer_shape["sh:not"] = inner_ref,
+        Nesting::And => outer_shape["sh:and"] = list,
+        Nesting::Or => outer_shape["sh:or"] = list,
+        Nesting::Xone => outer_shape["sh:xone"] = list,
+        Nesting::PropertyNode => {
+            outer_shape["sh:property"] = json!({
+                "sh:path": {"@id": "ex:friend"},
+                "sh:node": inner_ref,
+                "sh:severity": {"@id": outer}
+            });
+        }
+        Nesting::Qualified => {
+            outer_shape["sh:property"] = json!({
+                "sh:path": {"@id": "ex:friend"},
+                "sh:qualifiedValueShape": inner_ref,
+                "sh:qualifiedMinCount": 1,
+                "sh:severity": {"@id": outer}
+            });
+        }
+        Nesting::Chain => unreachable!("not used here"),
+    }
+    let shapes = json!({
+        "@context": shacl_context(),
+        "@graph": [inner_shape, outer_shape]
+    });
+    fluree.upsert(ledger, &shapes).await.unwrap().ledger
+}
+
+/// A nested shape's results count toward conformance whatever their severity
+/// (SHACL §3.5: a node conforms to a shape when validating it there reports no
+/// result; §2.1.4: severity only categorizes results). The inner shape is a
+/// Warning shape whose check, an `sh:sparql` constraint or a property shape,
+/// reports a result for `ex:p1` (score 5) or its friend (score 1).
+///
+/// So the node, or the friend, does not conform to it. `sh:node`, `sh:and`,
+/// `sh:or`, `sh:xone`, and `sh:node` or `sh:qualifiedValueShape` on a property
+/// shape report under the outer shape: a Violation outer shape rejects the
+/// write, a Warning one logs it. `sh:not` is satisfied, so the write commits.
+/// Before, only Violation results counted: the Warning inner shape conformed,
+/// so the Violation cells committed and `sh:not` rejected.
+#[tokio::test]
+async fn shacl_nested_warning_results_count_toward_conformance() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let nestings = [
+        Nesting::Node,
+        Nesting::Not,
+        Nesting::And,
+        Nesting::Or,
+        Nesting::Xone,
+        Nesting::PropertyNode,
+        Nesting::Qualified,
+    ];
+    let mut wrong: Vec<String> = Vec::new();
+    for via_sparql in [false, true] {
+        for check in [InnerCheck::Sparql, InnerCheck::Property] {
+            for nesting in nestings {
+                for (i, outer) in ["sh:Violation", "sh:Warning"].into_iter().enumerate() {
+                    let ledger_id =
+                        format!("shacl/nested-warning-{nesting:?}-{check:?}-{i}-{via_sparql}:main")
+                            .to_lowercase();
+                    let ledger = ledger_with_nested_warning_result(
+                        &fluree, &ledger_id, nesting, outer, check, via_sparql,
+                    )
+                    .await;
+                    let commits = matches!(nesting, Nesting::Not) || outer == "sh:Warning";
+                    let outcome = insert_friends(&fluree, ledger, "ex:p1", &["ex:f1"]).await;
+                    let cell = format!(
+                        "{nesting:?}, {check:?} inner, outer {outer}, SPARQL-defined {via_sparql}"
+                    );
+                    match (outcome, commits) {
+                        (Ok(_), true) => {}
+                        (Err(ApiError::Transact(TransactError::ShaclViolation(_))), false) => {}
+                        (outcome, _) => wrong.push(format!(
+                            "{cell}: expected {}, got {:?}",
+                            if commits { "a commit" } else { "a violation" },
+                            outcome.map(|_| ())
+                        )),
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
+/// Insert an `ex:Player` with the given friends, each scoring 1.
+async fn insert_friends(
+    fluree: &crate::Fluree,
+    ledger: crate::LedgerState,
+    player: &str,
+    friends: &[&str],
+) -> Result<crate::LedgerState, ApiError> {
+    let mut graph: Vec<JsonValue> = friends
+        .iter()
+        .map(|f| json!({"@id": f, "ex:score": 1}))
+        .collect();
+    graph.push(json!({
+        "@id": player,
+        "@type": "ex:Player",
+        "ex:score": 5,
+        "ex:friend": friends.iter().map(|f| json!({"@id": f})).collect::<Vec<_>>()
+    }));
+    let data = json!({"@context": shacl_context(), "@graph": graph});
+    fluree
+        .upsert(ledger, &data)
+        .await
+        .map(|result| result.ledger)
+}
+
+/// Grouped `sh:select` shapes, each run against a player with three friends
+/// (a violation: more than two, or two sharing a score) and one with a single
+/// friend (conforms).
+///
+/// `$this` is constant within one evaluation, so a (sub-)SELECT that projects
+/// it groups by it. The sub-SELECT form grouped by another variable (every
+/// sub-SELECT here must project `$this`) used to join a per-group list and
+/// never fired; after the plan-time check it refused every write. It now
+/// evaluates, and fires.
+#[tokio::test]
+async fn shacl_sparql_grouped_constraints_fire_on_their_groups() {
+    const FRIEND: &str = "<http://example.org/ns/friend>";
+    const SCORE: &str = "<http://example.org/ns/score>";
+    let shapes = [
+        // Two friends sharing a score (a sub-SELECT grouped by the score).
+        (
+            format!(
+                "SELECT $this WHERE {{ {{ SELECT $this ?v (COUNT(?x) AS ?c) WHERE {{ \
+                 $this {FRIEND} ?x . ?x {SCORE} ?v }} GROUP BY ?v }} FILTER(?c > 1) }}"
+            ),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this WHERE {{ $this {FRIEND} ?x }} GROUP BY $this HAVING (COUNT(?x) > 2)"
+            ),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this WHERE {{ {{ SELECT $this (COUNT(?x) AS ?c) WHERE {{ \
+                 $this {FRIEND} ?x }} GROUP BY $this }} FILTER (?c > 2) }}"
+            ),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this WHERE {{ {{ SELECT $this (COUNT(?x) AS ?c) WHERE {{ \
+                 $this {FRIEND} ?x }} }} FILTER (?c > 2) }}"
+            ),
+            "player constraint",
+        ),
+        (
+            format!("SELECT $this WHERE {{ $this {FRIEND} ?x }} HAVING (COUNT(?x) > 2)"),
+            "player constraint",
+        ),
+        (
+            format!(
+                "SELECT $this (CONCAT(\"has \", STR(COUNT(?x))) AS ?message) WHERE {{ \
+                 $this {FRIEND} ?x }} GROUP BY $this HAVING (COUNT(?x) > 2)"
+            ),
+            "has 3",
+        ),
+        (
+            format!(
+                "SELECT $this (STR($this) AS ?value) WHERE {{ $this {FRIEND} ?x }} \
+                 GROUP BY $this HAVING (COUNT(?x) > 2)"
+            ),
+            "player constraint",
+        ),
+    ];
+    let fluree = FlureeBuilder::memory().build_memory();
+    for (i, (select, message)) in shapes.iter().enumerate() {
+        let ledger =
+            ledger_with_player_constraint(&fluree, &format!("shacl/grouped-{i}:main"), select)
+                .await;
+        let err = insert_friends(&fluree, ledger, "ex:p1", &["ex:f1", "ex:f2", "ex:f3"])
+            .await
+            .expect_err(select);
+        let violation = shacl_violation_message(err);
+        assert!(violation.contains(message), "{select}: {violation}");
+        let ledger =
+            ledger_with_player_constraint(&fluree, &format!("shacl/grouped-{i}-ok:main"), select)
+                .await;
+        insert_friends(&fluree, ledger, "ex:p2", &["ex:g1"])
+            .await
+            .unwrap_or_else(|e| panic!("{select}: {e:?}"));
+    }
 }

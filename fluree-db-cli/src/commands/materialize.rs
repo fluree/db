@@ -53,8 +53,8 @@ pub struct MaterializeParams<'a> {
     pub verify: MaterializeVerify,
     pub max_performance: bool,
     pub allow_mor_deletes: bool,
-    /// `--allow-duplicate-parent-keys`: build over a source whose FK parent keys are
-    /// non-unique (default `false` = decline). See the import builder for the rationale.
+    /// `--allow-duplicate-parent-keys`: no effect (a duplicate parent key gives one
+    /// edge per parent subject); passing it prints a note.
     pub allow_duplicate_parent_keys: bool,
     /// Global `--parallelism` (0 = unset).
     pub parallelism: usize,
@@ -71,9 +71,8 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     // Reject up front — before any work — rather than build then fail.
     if params.output == MaterializeOutput::S3 {
         return Err(CliError::Usage(
-            "--output s3 is not yet wired in the file-backed CLI; build with \
-             --output pack and upload the pack, or use the direct-S3 CAS builder \
-             (DEC-003 §3)"
+            "--output s3 is not yet supported by the file-backed CLI; build with \
+             --output pack and upload the pack"
                 .to_string(),
         ));
     }
@@ -114,7 +113,7 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     // import producer thread. Reclaimed by the OS at process exit. Keeping ONE
     // provider (hence one catalog session) across the build is required for the
     // snapshot pin + watermark capture.
-    let fluree: &'static Fluree = Box::leak(Box::new(context::build_fluree(dirs)?));
+    let fluree: &'static Fluree = Box::leak(Box::new(context::build_fluree(dirs).await?));
     let provider = Arc::new(FlureeR2rmlProvider::new(fluree));
 
     // CRITICAL-1 (#1529 review): a failed parity gate drops the WHOLE ledger NAME
@@ -129,7 +128,7 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
     let (twin_name, twin_branch) = fluree_db_core::ledger_id::split_ledger_id(&twin_ledger)?;
     let existing_branches = fluree
         .nameservice()
-        .list_branches(&twin_name)
+        .branch_records(&twin_name)
         .await
         .map_err(|e| CliError::Import(format!("check twin ledger freshness: {e}")))?;
     if let Some(other) = blocking_existing_branch(&existing_branches, &twin_branch) {
@@ -156,6 +155,12 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
             params.verify,
         );
     }
+    if params.allow_duplicate_parent_keys && !params.quiet {
+        eprintln!(
+            "note: --allow-duplicate-parent-keys has no effect: a parent join key matching \
+             several parent rows gives one edge per distinct parent subject"
+        );
+    }
 
     // Build the twin.
     let result = fluree
@@ -163,7 +168,6 @@ pub async fn run(dirs: &FlureeDir, params: &MaterializeParams<'_>) -> CliResult<
         .import_r2rml(Arc::clone(&provider), params.graph_source)
         .parallelism(parallelism)
         .memory_budget_mb(memory_budget_mb)
-        .allow_duplicate_parent_keys(params.allow_duplicate_parent_keys)
         .execute()
         .await
         .map_err(|e| classify_build_error(&e.to_string(), params.allow_mor_deletes))?;
@@ -414,7 +418,7 @@ mod tests {
     #[test]
     fn blocking_existing_branch_refuses_a_live_non_target_branch() {
         // CRITICAL-1: the name-scoped gate-fail drop would purge this live 'main'.
-        let existing = vec![NsRecord::new("analytics-twin", "main")];
+        let existing = vec![NsRecord::new("analytics-twin:main")];
         let blocker = blocking_existing_branch(&existing, "v2");
         assert!(blocker.is_some(), "a live non-target branch must block");
         assert_eq!(blocker.unwrap().branch, "main");
@@ -426,11 +430,11 @@ mod tests {
         assert!(blocking_existing_branch(&[], "main").is_none());
         // Only the target branch present (governed by the build's own freshness
         // guard, and the drop can only hit what this build created) → no block.
-        let target_only = vec![NsRecord::new("dw-twin", "main")];
+        let target_only = vec![NsRecord::new("dw-twin:main")];
         assert!(blocking_existing_branch(&target_only, "main").is_none());
         // A RETRACTED non-target branch is already gone → purging it is no data
         // loss → no block.
-        let retracted_other = vec![retracted(NsRecord::new("dw-twin", "old"))];
+        let retracted_other = vec![retracted(NsRecord::new("dw-twin:old"))];
         assert!(blocking_existing_branch(&retracted_other, "main").is_none());
     }
 

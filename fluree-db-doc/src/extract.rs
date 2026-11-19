@@ -740,7 +740,7 @@ pub fn resolve(
             let admitted = !matches!(verdict, Verdict::Rejected { .. });
             let asserted = admitted && mode == RelationMode::Direct && object.is_some();
             let mut node = json!({
-                "@id": format!("{doc_iri}/relation/{relation_seq}"),
+                "@id": format!("{doc_iri}-relation-{relation_seq}"),
                 "@type": vocab::RELATION,
                 "rdf:subject": { "@id": entities[subject].iri },
                 "rdf:predicate": { "@id": effective },
@@ -871,7 +871,7 @@ fn mention_node(
     by: &str,
 ) -> Value {
     let mut node = json!({
-        "@id": format!("{chunk_iri}/mention/{seq}"),
+        "@id": format!("{chunk_iri}-mention-{seq}"),
         "@type": [vocab::MENTION, "nif:RFC5147String"],
         "nif:beginIndex": begin,
         "nif:endIndex": end,
@@ -1040,9 +1040,9 @@ mod tests {
         Chunk {
             header_path: vec![],
             text: text.into(),
-            source_ids: vec!["urn:d/element/1".into()],
+            source_ids: vec!["urn:d-element-1".into()],
             spans: vec![crate::chunk::ChunkSpan {
-                source_id: "urn:d/element/1".into(),
+                source_id: "urn:d-element-1".into(),
                 begin: 0,
                 end: text.chars().count(),
             }],
@@ -1355,7 +1355,7 @@ mod tests {
             .unwrap();
         assert_eq!(acme_mention["nif:entity"]["@id"], "https://ex.org/org/acme");
         assert_eq!(acme_mention["nif:anchorOf"], "Acme");
-        assert_eq!(acme_mention[vocab::SOURCE_ELEMENT], "urn:d/element/1");
+        assert_eq!(acme_mention[vocab::SOURCE_ELEMENT], "urn:d-element-1");
 
         let rel = out
             .nodes

@@ -385,6 +385,60 @@ Inline `@annotation` queries return one row per occurrence.
 
 For the full surface — including SPARQL 1.2 / RDF 1.2 annotation tails (`{| |}`), the named reifier (`~`), the cardinality / multiplicity contract, anonymous vs explicit-IRI lifecycle, and named-graph behavior — see the [Edge annotations concept doc](../concepts/edge-annotations.md). For cascade semantics when a base edge or annotation metadata is removed, see [Retractions](retractions.md).
 
+## Named graphs in JSON-LD
+
+A node's `@graph` names the graph it is written to, and the graph covers every node nested in it:
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@id": "ex:alice",
+  "@graph": "http://example.org/graphs/hr",
+  "ex:salary": 95000,
+  "ex:manager": { "@id": "ex:bob", "ex:name": "Bob" }
+}
+```
+
+Both `ex:alice`'s and `ex:bob`'s statements land in `http://example.org/graphs/hr`. A nested node's own `@graph` wins for its subtree; `"@graph": "default"` sends it to the default graph.
+
+The JSON-LD 1.1 named-graph form is accepted too: an object whose `@id` names the graph and whose `@graph` holds the nodes written to it.
+
+```json
+{
+  "@context": { "ex": "http://example.org/ns/" },
+  "@id": "http://example.org/graphs/hr",
+  "@graph": [
+    { "@id": "ex:alice", "ex:salary": 95000 },
+    { "@id": "ex:bob", "ex:salary": 90000 }
+  ]
+}
+```
+
+Graph names are absolute IRIs, or compact IRIs your `@context` expands; a relative name is resolved against the context's `@base`, and refused without one. `"default"` names the default graph, and `"config"` the ledger's config graph (see [Writing config data](../ledger-config/writing-config.md)).
+
+## Turtle and TriG
+
+`/insert` also takes RDF text. Turtle (`text/turtle`) is parsed straight to flakes. TriG (`application/trig`) adds graph blocks, which land in their named graphs; a `GRAPH <#txn-meta> { ... }` block becomes commit metadata instead:
+
+```bash
+curl -X POST "http://localhost:8090/v1/fluree/insert?ledger=mydb:main" \
+  -H "Content-Type: application/trig" \
+  --data-binary '
+@prefix ex: <http://example.org/ns/> .
+
+ex:alice ex:name "Alice" .
+
+GRAPH <http://example.org/graphs/hr> {
+  ex:alice ex:salary 95000 .
+}'
+```
+
+A body with graph blocks is read as TriG even when sent as `text/turtle`. From the CLI, `fluree insert -f data.trig` does the same. See [Turtle and TriG](turtle.md) for the syntax, the TriG rules, and querying named graphs.
+
+A list, a Turtle `( … )` or the same list written out as `rdf:first` / `rdf:rest` triples over the document's own blank nodes (N-Triples has no `( … )`), is stored as a JSON-LD `@list` is. A second list on one subject and property, or one whose cells carry other triples, is stored as its triples.
+
+Inserting a list that a subject and property already hold, the same members in the same order, restates it, as inserting a stored fact does. A different list is a second list on the property, beside the first. To replace a list, upsert it.
+
 ## Insert Semantics
 
 ### Additive by Default
@@ -664,6 +718,7 @@ Use compact contexts:
 
 - [Overview](overview.md) - Transaction overview
 - [Upsert](upsert.md) - Replace mode inserts
+- [Turtle and TriG](turtle.md) - RDF text formats and named graphs
 - [Update](update-where-delete-insert.md) - Updating existing data
 - [Data Types](../concepts/datatypes.md) - Supported datatypes
 - [API Endpoints](../api/endpoints.md) - HTTP API details

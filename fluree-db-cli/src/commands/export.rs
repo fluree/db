@@ -189,7 +189,7 @@ async fn run_ledger_archive(
         ));
     }
 
-    let local_ledger_id = context::to_ledger_id(alias);
+    let local_ledger_id = context::to_ledger_id(alias)?;
 
     if let Some(remote_name) = remote_flag {
         // When the alias is tracked AND points at this same remote, archive
@@ -199,9 +199,7 @@ async fn run_ledger_archive(
         // at a different remote (or the alias isn't tracked), fall back to
         // using the alias literally on that remote.
         let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-        let tracked = store
-            .get_tracked(alias)
-            .or_else(|| store.get_tracked(&local_ledger_id));
+        let tracked = store.get_tracked(&local_ledger_id);
         let remote_ledger_id = match tracked.as_ref() {
             Some(t) if t.remote == remote_name => t.remote_alias.clone(),
             _ => local_ledger_id.clone(),
@@ -220,7 +218,7 @@ async fn run_ledger_archive(
     let ledger_id = local_ledger_id;
 
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(alias).is_some() || store.get_tracked(&ledger_id).is_some() {
+    if store.get_tracked(&ledger_id).is_some() {
         return Err(CliError::Usage(
             "this alias points at a tracked ledger (no local data); \
              pass `--remote <name>` to archive the upstream copy."
@@ -228,7 +226,7 @@ async fn run_ledger_archive(
         ));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
 
     match output {
         Some(path) => {
@@ -407,6 +405,16 @@ async fn run_ledger_archive_remote(
 // RDF formats (turtle, ntriples, nquads, trig, jsonld)
 // =============================================================================
 
+/// `--at` as the export body carries it: parsed first, so a malformed value
+/// fails before the request as it does for `query --at`, then re-rendered in
+/// the wire spelling `query` sends (a timestamp goes as `iso:`, which servers
+/// older than the `time:` alias still accept).
+fn remote_at(at: &str) -> CliResult<String> {
+    let spec = crate::commands::query::parse_time_spec(at)?;
+    let suffix = crate::commands::query::time_spec_to_suffix(&spec);
+    Ok(suffix.trim_start_matches('@').to_string())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_remote_rdf(
     alias: &str,
@@ -437,7 +445,7 @@ async fn run_remote_rdf(
         body["graph"] = serde_json::Value::String(iri.to_string());
     }
     if let Some(at_str) = at {
-        body["at"] = serde_json::Value::String(at_str.to_string());
+        body["at"] = serde_json::Value::String(remote_at(at_str)?);
     }
     if let Some(ctx) = context_override {
         body["context"] = ctx;
@@ -466,16 +474,14 @@ async fn run_local_rdf(
     dirs: &FlureeDir,
 ) -> CliResult<()> {
     let store = crate::config::TomlSyncConfigStore::new(dirs.config_dir().to_path_buf());
-    if store.get_tracked(alias).is_some()
-        || store.get_tracked(&context::to_ledger_id(alias)).is_some()
-    {
+    if store.get_tracked(&context::to_ledger_id(alias)?).is_some() {
         return Err(CliError::Usage(
             "export is not available for tracked ledgers (no local data); pass --remote <name> to export from the upstream."
                 .to_string(),
         ));
     }
 
-    let fluree = context::build_fluree(dirs)?;
+    let fluree = context::build_fluree(dirs).await?;
     let format = parse_rdf_format(format_str)?;
 
     let mut builder = fluree.export(alias).format(format);
@@ -672,5 +678,25 @@ fn resolve_context_override(
             Ok(Some(ctx))
         }
         None => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remote_at;
+
+    #[test]
+    fn remote_at_sends_the_wire_spelling() {
+        assert_eq!(
+            remote_at("time:2024-01-15T10:30:00Z").unwrap(),
+            "iso:2024-01-15T10:30:00Z"
+        );
+        assert_eq!(
+            remote_at("2024-01-15T10:30:00Z").unwrap(),
+            "iso:2024-01-15T10:30:00Z"
+        );
+        assert_eq!(remote_at("5").unwrap(), "t:5");
+        assert_eq!(remote_at("commit:abc123def").unwrap(), "commit:abc123def");
+        assert!(remote_at("t:abc").is_err());
     }
 }

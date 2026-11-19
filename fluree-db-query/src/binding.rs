@@ -51,6 +51,10 @@ pub enum Binding {
     /// OPTIONAL clause. Unlike Unbound, a Poisoned binding **blocks** future
     /// pattern matching - any pattern that uses a Poisoned variable yields
     /// no matches (not "match anything", but "match nothing").
+    ///
+    /// This is Cypher's null semantics and is emitted only under
+    /// [`UnmatchedOptional::Poisoned`]. SPARQL has no such state: an
+    /// unmatched OPTIONAL leaves its variables `Unbound` (§18.2.4).
     Poisoned,
     /// IRI/node reference (for subject, predicate, or ref-typed object)
     ///
@@ -108,7 +112,8 @@ pub enum Binding {
         /// Only populated in history mode when both assertions and retractions are returned.
         op: Option<bool>,
         /// Optional predicate ID from binary index (metadata, excluded from eq/hash).
-        /// Set when early-materializing novelty values in BinaryScanOperator.
+        /// Set by every BinaryScanOperator lane that reads a stored predicate:
+        /// materialized cursor rows and decoded flakes alike.
         /// Used by `fulltext()` to identify the correct per-predicate arena/stats.
         p_id: Option<u32>,
     },
@@ -123,6 +128,11 @@ pub enum Binding {
     /// - `p_id` is required for `BinaryIndexStore::decode_value`
     /// - `dt_id`/`lang_id`/`i_val` provide literal metadata
     /// - `t` is the assertion transaction time (metadata)
+    /// - `arena_g_id` is the graph whose arena an arena-backed literal (a
+    ///   big number or a vector) indexes: such a handle is numbered per
+    ///   `(graph, predicate)` and names a value only with both. Every other
+    ///   kind is the same term in every graph of the store and carries
+    ///   [`fluree_db_core::NO_ARENA_GRAPH`].
     ///
     /// NOTE: EncodedLit represents only literal values. References use
     /// `Binding::Sid` (eagerly resolved via subject dictionaries) or
@@ -136,6 +146,7 @@ pub enum Binding {
         lang_id: u16,
         i_val: i32,
         t: i64,
+        arena_g_id: fluree_db_core::GraphId,
     },
     /// Encoded subject/predicate/ref-object ID (late materialization).
     ///
@@ -248,6 +259,14 @@ pub enum Binding {
     Map(Vec<(Arc<str>, Binding)>),
 }
 
+/// Whether an encoded literal of kind `o_kind` is a handle into a per-graph,
+/// per-predicate arena (a big number or a vector):
+/// [`ObjKind::is_arena_handle`](fluree_db_core::ObjKind::is_arena_handle).
+#[inline]
+pub(crate) fn is_arena_kind(o_kind: u8) -> bool {
+    fluree_db_core::ObjKind::from_u8(o_kind).is_arena_handle()
+}
+
 // `Binding` is cloned on nearly every join/sort/materialize step, so its size is
 // a hot-path tax. The rare large variants (`Rel`) are boxed to keep the enum at
 // 88 bytes; this guard fails the build if a new or widened variant regresses
@@ -293,6 +312,32 @@ pub fn is_string_dict_term(binding: &Binding) -> bool {
             *o_kind == fluree_db_core::value_id::ObjKind::LEX_ID.as_u8()
         }
         _ => false,
+    }
+}
+
+/// What an OPTIONAL that matched nothing writes for its optional-only variables.
+///
+/// Chosen per query by the surface language and carried on
+/// [`PlanningContext`](crate::temporal_mode::PlanningContext).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnmatchedOptional {
+    /// SPARQL / JSON-LD: the variable is unbound, and so compatible with any
+    /// later binding of it — a second OPTIONAL or a join can still bind it.
+    #[default]
+    Unbound,
+    /// Cypher: the variable is null, and a null matches nothing — a later
+    /// `MATCH` using it drops the row, a later `OPTIONAL MATCH` stays null.
+    Poisoned,
+}
+
+impl UnmatchedOptional {
+    /// The binding written for an optional-only variable with no match.
+    #[inline]
+    pub fn binding(self) -> Binding {
+        match self {
+            Self::Unbound => Binding::Unbound,
+            Self::Poisoned => Binding::Poisoned,
+        }
     }
 }
 
@@ -938,6 +983,7 @@ impl PartialEq for Binding {
                     p_id: p1,
                     dt_id: dt1,
                     lang_id: l1,
+                    arena_g_id: g1,
                     ..
                 },
                 Binding::EncodedLit {
@@ -946,6 +992,7 @@ impl PartialEq for Binding {
                     p_id: p2,
                     dt_id: dt2,
                     lang_id: l2,
+                    arena_g_id: g2,
                     ..
                 },
             ) => {
@@ -953,15 +1000,17 @@ impl PartialEq for Binding {
                 // - `t` is metadata and intentionally excluded (see docs above).
                 // - `i_val` is list index metadata and is intentionally excluded from
                 //   term identity (it should not affect DISTINCT/GROUP BY/join unification).
-                // - `p_id` is only required for NUM_BIG decoding (per-predicate arena);
-                //   for other kinds it must NOT affect term identity.
+                // - An arena handle (NUM_BIG, VECTOR) is numbered per
+                //   (graph, predicate), so its graph and predicate are part of
+                //   which handle it is; for every other kind they must NOT
+                //   affect term identity. Two handles holding one value are
+                //   still two keys here: equality surfaces key arena literals
+                //   by value (`normalize_for_key`).
                 if k1 != k2 || ok1 != ok2 || dt1 != dt2 || l1 != l2 {
                     return false;
                 }
-
-                let num_big = fluree_db_core::ObjKind::NUM_BIG.as_u8();
-                if *k1 == num_big {
-                    p1 == p2
+                if is_arena_kind(*k1) {
+                    p1 == p2 && g1 == g2
                 } else {
                     true
                 }
@@ -1081,6 +1130,7 @@ impl std::hash::Hash for Binding {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => {
                 // t intentionally excluded - metadata only
@@ -1089,10 +1139,12 @@ impl std::hash::Hash for Binding {
                 o_key.hash(state);
                 dt_id.hash(state);
                 lang_id.hash(state);
-                // `p_id` is only required for NUM_BIG decoding (per-predicate arena).
-                // For all other literal kinds, it must not affect hash identity.
-                if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
+                // An arena handle's graph and predicate are part of which
+                // handle it is; for every other kind they must not affect
+                // hash identity (see `PartialEq`).
+                if is_arena_kind(*o_kind) {
                     p_id.hash(state);
+                    arena_g_id.hash(state);
                 }
             }
             Binding::EncodedSid { s_id, .. } => {
@@ -1496,6 +1548,36 @@ impl Batch {
         (0..self.len).map(move |row| RowView { batch: self, row })
     }
 
+    /// Keep the rows whose `keep` flag is set, or `None` when none survive.
+    ///
+    /// The row count is carried explicitly, so a zero-column batch keeps its
+    /// surviving rows (#1439).
+    pub fn filter_rows(self, keep: &[bool]) -> Option<Self> {
+        debug_assert_eq!(keep.len(), self.len, "Batch::filter_rows: mask length");
+        let kept = keep.iter().filter(|&&k| k).count();
+        if kept == 0 {
+            return None;
+        }
+        if kept == self.len {
+            return Some(self);
+        }
+        let columns = self
+            .columns
+            .into_iter()
+            .map(|col| {
+                col.into_iter()
+                    .zip(keep)
+                    .filter_map(|(b, &k)| k.then_some(b))
+                    .collect()
+            })
+            .collect();
+        Some(Self {
+            len: kept,
+            schema: self.schema,
+            columns,
+        })
+    }
+
     /// Retain only the specified variables, dropping all other columns.
     ///
     /// The output preserves the original schema order (i.e. columns that
@@ -1713,6 +1795,41 @@ mod tests {
 
     fn xsd_string() -> Sid {
         Sid::new(2, "string")
+    }
+
+    /// An arena handle is numbered per (graph, predicate): handles of two
+    /// predicates, or of two graphs, are two keys even with one number. A
+    /// store-wide literal is one term whatever predicate bound it.
+    #[test]
+    fn arena_handles_are_keyed_by_graph_and_predicate() {
+        use std::hash::{BuildHasher, BuildHasherDefault};
+        let hash = |b: &Binding| {
+            BuildHasherDefault::<std::collections::hash_map::DefaultHasher>::default().hash_one(b)
+        };
+        let lit = |o_kind: u8, p_id: u32, arena_g_id: u16| Binding::EncodedLit {
+            o_kind,
+            o_key: 0,
+            p_id,
+            dt_id: 0,
+            lang_id: 0,
+            i_val: i32::MIN,
+            t: 0,
+            arena_g_id,
+        };
+        for kind in [
+            fluree_db_core::ObjKind::NUM_BIG,
+            fluree_db_core::ObjKind::VECTOR_ID,
+        ] {
+            let k = kind.as_u8();
+            assert_eq!(lit(k, 1, 2), lit(k, 1, 2));
+            assert_eq!(hash(&lit(k, 1, 2)), hash(&lit(k, 1, 2)));
+            assert_ne!(lit(k, 1, 2), lit(k, 3, 2), "{kind:?}: two predicates");
+            assert_ne!(lit(k, 1, 2), lit(k, 1, 4), "{kind:?}: two graphs");
+        }
+        let k = fluree_db_core::ObjKind::NUM_INT.as_u8();
+        let none = fluree_db_core::NO_ARENA_GRAPH;
+        assert_eq!(lit(k, 1, none), lit(k, 3, none));
+        assert_eq!(hash(&lit(k, 1, none)), hash(&lit(k, 3, none)));
     }
 
     #[test]
@@ -1941,6 +2058,28 @@ mod tests {
             0,
             "Batch::new with no columns infers len = 0"
         );
+    }
+
+    #[test]
+    fn test_batch_filter_rows() {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let long = |n| Binding::lit(FlakeValue::Long(n), xsd_long());
+        let batch = || Batch::new(schema.clone(), vec![vec![long(1), long(2), long(3)]]).unwrap();
+
+        let kept = batch().filter_rows(&[true, false, true]).unwrap();
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept.column(VarId(0)).unwrap(), &[long(1), long(3)]);
+
+        assert_eq!(batch().filter_rows(&[true; 3]).unwrap().len(), 3);
+        assert!(batch().filter_rows(&[false; 3]).is_none());
+    }
+
+    #[test]
+    fn test_batch_filter_rows_keeps_len_for_empty_schema() {
+        let kept = Batch::empty_schema_with_len(3)
+            .filter_rows(&[true, false, true])
+            .unwrap();
+        assert_eq!(kept.len(), 2);
     }
 
     #[test]

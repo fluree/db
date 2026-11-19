@@ -132,18 +132,10 @@ async fn validate_local(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&alias) {
+            if !p.can_read(&crate::error::scope_id(&alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
-        }
-
-        // Validation reads the local index; proxy storage mode has none.
-        if state.config.is_proxy_storage_mode() {
-            set_span_error_code(&span, "error:NotImplemented");
-            return Err(ServerError::NotImplemented(
-                "SHACL validation is not available in proxy storage mode".to_string(),
-            ));
         }
 
         // Same execution control the query endpoints use: a request-scoped
@@ -167,13 +159,7 @@ async fn validate_local(
             .fluree
             .validate_ledger(&alias, &options)
             .await
-            .map_err(|e| {
-                if e.is_not_found() {
-                    ServerError::not_found(format!("Ledger not found: {alias}"))
-                } else {
-                    ServerError::Api(e)
-                }
-            })?;
+            .map_err(ServerError::Api)?;
 
         tracing::info!(
             status = "success",

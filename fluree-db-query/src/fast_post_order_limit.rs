@@ -19,9 +19,9 @@
 //! (`index_t`). Querying *before* the index point needs the history sidecar and
 //! defers to the generic pipeline. They split on whether novelty is present:
 //!
-//! - **Base lane** (`epoch == 0`): the persisted index is exact, so a plain
+//! - **Base lane** (no live novelty): the persisted index is exact, so a plain
 //!   reverse leaf-walk suffices.
-//! - **Overlay lane** (`epoch != 0`): the same reverse leaf-walk is merged with
+//! - **Overlay lane** (live novelty): the same reverse leaf-walk is merged with
 //!   the predicate's resolved novelty ops. This is a *row-set* merge (skip base
 //!   rows retracted by overlay; add overlay asserts; dedup by fact identity), so
 //!   it sidesteps the "base + asserts − retracts" arithmetic pitfall that only
@@ -139,11 +139,7 @@ pub fn post_order_desc_limit_operator(
             if ctx.to_t < store.max_t() {
                 return Ok(None);
             }
-            let overlay_present = ctx
-                .overlay
-                .map(fluree_db_core::OverlayProvider::epoch)
-                .unwrap_or(0)
-                != 0;
+            let overlay_present = crate::fast_path_common::overlay_has_novelty(ctx);
 
             let g_id: GraphId = ctx.binary_g_id;
             let need = offset.saturating_add(limit);
@@ -226,6 +222,7 @@ pub fn post_order_desc_limit_operator(
                     distinct,
                     emit_subject,
                     need,
+                    &ctx.tracker,
                 )?
             };
             let Some(rows) = rows_opt else {
@@ -252,7 +249,7 @@ pub fn post_order_desc_limit_operator(
             // through a novelty-aware graph view instead. The base lane keeps the
             // lazy encoded form (all subjects are persisted there).
             let view = if overlay_present {
-                Some(ctx.graph_view().ok_or_else(|| {
+                Some(ctx.one_graph_view().ok_or_else(|| {
                     QueryError::Internal("graph view unavailable for overlay subjects".into())
                 })?)
             } else {
@@ -364,10 +361,10 @@ fn base_predicate_o_type(
 ) -> Result<OneOType> {
     let mut found = OneOType::Empty;
     for leaf in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
-        let handle = store
-            .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
-            .map_err(|e| QueryError::from_io("leaf open", e))?;
-        for entry in &handle.dir().entries {
+        let dir = store
+            .open_leaf_dir(&leaf.leaf_cid)
+            .map_err(|e| QueryError::from_io("leaf dir open", e))?;
+        for entry in &dir.entries {
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
@@ -400,6 +397,7 @@ fn collect_post_desc_topk(
     distinct: bool,
     dedup_includes_subject: bool,
     need: usize,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Vec<TopKRow>>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
@@ -413,7 +411,8 @@ fn collect_post_desc_topk(
     // SortOperator's multiset semantics), and DISTINCT collapses them by the
     // projected `(s?, o)` below — neither needs `o_i`.
     let projection = projection_sid_okey();
-    let mut results: Vec<TopKRow> = Vec::with_capacity(need);
+    let mut results: Vec<TopKRow> =
+        Vec::with_capacity(fluree_db_core::topk::initial_capacity(need));
     // DISTINCT dedup key: (subject-or-0, o_type, o_key). When DISTINCT is set the
     // detector guarantees the object var is projected, so the object component is
     // always meaningful; the subject component is included only when projected.
@@ -440,9 +439,13 @@ fn collect_post_desc_topk(
                 return Ok(None);
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
             scanned += batch.row_count;
             for row in (0..batch.row_count).rev() {
                 leaf_cands.push((expected_o_type, batch.o_key.get(row), batch.s_id.get(row)));
@@ -456,7 +459,7 @@ fn collect_post_desc_topk(
                 uniq.sort_unstable();
                 uniq.dedup();
                 let type_map =
-                    batched_lookup_predicate_refs(store, g_id, rdf_type_p_id, &uniq, to_t)
+                    batched_lookup_predicate_refs(store, g_id, rdf_type_p_id, &uniq, to_t, tracker)
                         .map_err(|e| {
                             QueryError::Internal(format!("batched_lookup_predicate_refs: {e}"))
                         })?;
@@ -568,7 +571,8 @@ fn collect_post_desc_topk_overlay(
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let projection = projection_sid_okey_oi();
 
-    let mut results: Vec<TopKRow> = Vec::with_capacity(need);
+    let mut results: Vec<TopKRow> =
+        Vec::with_capacity(fluree_db_core::topk::initial_capacity(need));
     let mut emitted: FxHashSet<OvRow> = FxHashSet::default(); // full-fact dedup
     let mut distinct_seen: FxHashSet<(u64, u64)> = FxHashSet::default(); // (s_or0, o_key)
     let mut assert_idx = 0usize;
@@ -591,9 +595,13 @@ fn collect_post_desc_topk_overlay(
             if entry.o_type_const != Some(o_type) {
                 return Ok(None); // defensive: stale single-type proof
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                &ctx.tracker,
+            )?;
             scanned += batch.row_count;
             for row in (0..batch.row_count).rev() {
                 leaf_base.push(OvRow {
@@ -634,7 +642,14 @@ fn collect_post_desc_topk_overlay(
         debug_assert!(upper.is_none_or(|u| window_asserts.iter().all(|r| r.o_key < u)));
 
         let merged = merge_desc(window_asserts, &leaf_base);
-        let members = batch_members(class_filter.as_ref(), store, g_id, ctx.to_t, &merged)?;
+        let members = batch_members(
+            class_filter.as_ref(),
+            store,
+            g_id,
+            ctx.to_t,
+            &merged,
+            &ctx.tracker,
+        )?;
         if emit_merged(
             &merged,
             o_type,
@@ -659,7 +674,14 @@ fn collect_post_desc_topk_overlay(
     // Asserts below every base row (and all asserts when the base is empty).
     let tail_asserts: Vec<OvRow> = asserts[assert_idx..].to_vec();
     let merged = merge_desc(&tail_asserts, &[]);
-    let members = batch_members(class_filter.as_ref(), store, g_id, ctx.to_t, &merged)?;
+    let members = batch_members(
+        class_filter.as_ref(),
+        store,
+        g_id,
+        ctx.to_t,
+        &merged,
+        &ctx.tracker,
+    )?;
     let _ = emit_merged(
         &merged,
         o_type,
@@ -705,11 +727,12 @@ fn batch_members(
     g_id: GraphId,
     to_t: i64,
     merged: &[(OvRow, bool)],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<FxHashSet<u64>>> {
     match class_filter {
         Some(f) => {
             let subjects: Vec<u64> = merged.iter().map(|(r, _)| r.s_id).collect();
-            Ok(Some(f.members(store, g_id, to_t, &subjects)?))
+            Ok(Some(f.members(store, g_id, to_t, &subjects, tracker)?))
         }
         None => Ok(None),
     }
@@ -788,12 +811,14 @@ impl OverlayClassFilter {
         g_id: GraphId,
         to_t: i64,
         subjects: &[u64],
+        tracker: &fluree_db_core::Tracker,
     ) -> Result<FxHashSet<u64>> {
         let mut uniq: Vec<u64> = subjects.to_vec();
         uniq.sort_unstable();
         uniq.dedup();
-        let type_map = batched_lookup_predicate_refs(store, g_id, self.rdf_type_p_id, &uniq, to_t)
-            .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?;
+        let type_map =
+            batched_lookup_predicate_refs(store, g_id, self.rdf_type_p_id, &uniq, to_t, tracker)
+                .map_err(|e| QueryError::Internal(format!("batched_lookup_predicate_refs: {e}")))?;
         let mut out: FxHashSet<u64> = FxHashSet::default();
         for s in uniq {
             let base_member = type_map

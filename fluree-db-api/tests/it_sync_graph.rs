@@ -188,38 +188,39 @@ async fn empty_payload_requires_allow_empty() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "it/sync-graph/empty:main";
     seed(&fluree, ledger_id).await;
-    fluree
-        .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
-        .await
-        .expect("sync");
 
-    let empty = json!({ "@graph": [] });
+    for empty in [json!({ "@graph": [] }), json!([])] {
+        fluree
+            .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
+            .await
+            .expect("sync");
 
-    let err = fluree
-        .sync_named_graph(ledger_id, ONT_IRI, &empty, SyncGraphOpts::default())
-        .await
-        .expect_err("empty payload without allowEmpty must be rejected");
-    assert!(
-        err.to_string().contains("allowEmpty"),
-        "error should name the opt-in: {err}"
-    );
+        let err = fluree
+            .sync_named_graph(ledger_id, ONT_IRI, &empty, SyncGraphOpts::default())
+            .await
+            .expect_err("empty payload without allowEmpty must be rejected");
+        assert!(
+            err.to_string().contains("allowEmpty"),
+            "{empty}: error should name the opt-in: {err}"
+        );
 
-    let report = fluree
-        .sync_named_graph(
-            ledger_id,
-            ONT_IRI,
-            &empty,
-            SyncGraphOpts {
-                allow_empty: true,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("empty sync with allowEmpty");
-    assert_eq!(report.asserted, 0);
-    assert_eq!(report.retracted, 3, "clears the whole graph");
-    assert!(report.committed);
-    assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 0);
+        let report = fluree
+            .sync_named_graph(
+                ledger_id,
+                ONT_IRI,
+                &empty,
+                SyncGraphOpts {
+                    allow_empty: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("empty sync with allowEmpty");
+        assert_eq!(report.asserted, 0, "{empty}");
+        assert_eq!(report.retracted, 3, "{empty}: clears the whole graph");
+        assert!(report.committed, "{empty}");
+        assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 0);
+    }
 }
 
 #[tokio::test]
@@ -321,7 +322,7 @@ async fn payload_addressing_named_graphs_is_rejected() {
     });
     // The insert-shaped JSON-LD parse has no named-graph selector form, so
     // the nested-graph document fails parsing; if a future parser learns
-    // one, `parse_sync_transaction`'s graph_delta guard rejects it with
+    // one, `parse_sync_transaction`'s write_graphs guard rejects it with
     // "must not address named graphs". Either way: an error, no commit.
     fluree
         .sync_named_graph(ledger_id, ONT_IRI, &nested, SyncGraphOpts::default())
@@ -468,7 +469,7 @@ async fn staging_rejects_malformed_and_system_graph_targets() {
 /// An identical resync must still be a no-op after the graph has been
 /// indexed — the case the memory-backed tests cannot reach.
 ///
-/// `scan_graph_flakes` reads through the range provider, and
+/// `whole_graph_facts` reads through the range provider, and
 /// `BinaryRangeProvider` materializes flakes with `g: None`
 /// (`binary_range.rs:753`, `:1393`). The accumulator buckets on `flake.g`,
 /// so without the explicit stamp in the sync wave the retractions land in a
@@ -631,11 +632,55 @@ async fn graph_management_verbs_work_on_indexed_data() {
                 .execute()
                 .await
                 .expect("MOVE on indexed graphs");
-            assert_eq!(
-                graph_counts(&fluree, ledger_id).await,
-                (1, 1, 0),
-                "MOVE emptied the source"
-            );
+            // MOVE drops its source: the graph is gone, not emptied.
+            let source_gone = |fluree: &fluree_db_api::Fluree| {
+                let q = json!({
+                    "from": format!("{ledger_id}#{OTHER_IRI}"),
+                    "select": ["?s"],
+                    "where": {"@id": "?s", "?p": "?o"}
+                });
+                let fluree = fluree.clone();
+                async move { fluree.query_connection(&q).await.unwrap_err().to_string() }
+            };
+            assert_eq!(count_in_graph(&fluree, ledger_id, None).await, 1);
+            assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 1);
+            assert!(source_gone(&fluree).await.contains("dropped"));
+
+            // And stays gone once the index holds the drop.
+            let ledger = fluree.ledger(ledger_id).await.unwrap();
+            trigger_index_and_wait_outcome(&handle, ledger_id, ledger.t()).await;
+            assert_eq!(count_in_graph(&fluree, ledger_id, None).await, 1);
+            assert_eq!(count_in_graph(&fluree, ledger_id, Some(ONT_IRI)).await, 1);
+            assert!(source_gone(&fluree).await.contains("dropped"));
         })
         .await;
+}
+
+#[tokio::test]
+async fn a_sync_commit_carries_its_message_and_reports_its_id() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/sync-graph/message:main";
+    seed(&fluree, ledger_id).await;
+    let report = fluree
+        .sync_named_graph(
+            ledger_id,
+            ONT_IRI,
+            &payload_v1(),
+            SyncGraphOpts {
+                message: Some("nightly ontology".to_string()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("sync");
+    let (log, _) = fluree.commit_log(ledger_id, Some(1)).await.expect("log");
+    assert_eq!(report.commit_id.as_ref(), Some(&log[0].commit_id));
+    assert_eq!(log[0].message.as_deref(), Some("nightly ontology"));
+
+    let unchanged = fluree
+        .sync_named_graph(ledger_id, ONT_IRI, &payload_v1(), SyncGraphOpts::default())
+        .await
+        .expect("identical sync");
+    assert!(!unchanged.committed);
+    assert_eq!(unchanged.commit_id, None);
 }

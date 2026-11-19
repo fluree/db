@@ -22,10 +22,11 @@ use fluree_db_core::VerifiedIdentity;
 use fluree_db_core::{FlakeValue, Sid};
 use fluree_db_novelty::TxnMetaEntry;
 use fluree_db_query::parse::UnresolvedPattern;
-use fluree_db_query::{VarId, VarRegistry};
+use fluree_db_query::{UnmatchedOptional, VarId, VarRegistry};
 use fluree_db_sparql::ast::{GraphPattern as SparqlGraphPattern, Prologue as SparqlPrologue};
-use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+use std::sync::Arc;
 
 /// Named graph spec for scoping JSON-LD UPDATE `where` evaluation.
 #[derive(Debug, Clone)]
@@ -130,6 +131,11 @@ pub struct Txn {
     /// Optional inline VALUES bindings
     pub values: Option<InlineValues>,
 
+    /// What an unmatched OPTIONAL in the WHERE binds its optional-only
+    /// variables to. `Unbound` (SPARQL / JSON-LD) unless the transaction was
+    /// lowered from Cypher, whose nulls match nothing (`Poisoned`).
+    pub unmatched_optional: UnmatchedOptional,
+
     /// Optional default graph IRI(s) for JSON-LD update WHERE execution.
     ///
     /// When present, staging executes `where_patterns` against the merged default
@@ -150,6 +156,13 @@ pub struct Txn {
     /// added as additional named-graph keys, allowing `["graph", "<alias>", ...]` patterns.
     pub update_where_named_graphs: Option<Vec<UpdateNamedGraph>>,
 
+    /// The JSON-LD update's where reads the ledger's default graph by name, as
+    /// `GRAPH <urn:default>` (a `"@graph": "default"` while the WHERE reads
+    /// another default graph, a top-level `graph` or `from`). Staging keeps
+    /// `urn:default` in the WHERE dataset when `fromNamed` restricts its
+    /// named graphs.
+    pub update_where_names_ledger_default: bool,
+
     /// Transaction options
     pub opts: TxnOpts,
 
@@ -163,18 +176,16 @@ pub struct Txn {
     /// commit as subject.
     pub txn_meta: Vec<TxnMetaEntry>,
 
-    /// Named graph IRI to g_id mappings introduced by this transaction.
+    /// Named graphs this transaction writes to, by IRI: `GRAPH <iri>`
+    /// template blocks, a `WITH <iri>` default, a sync target, a `CREATE
+    /// GRAPH` or transfer destination. Graphs a `GRAPH ?g` template resolves
+    /// to are only known once the WHERE runs; staging adds them.
     ///
-    /// When a transaction references named graphs (via TriG GRAPH blocks or
-    /// JSON-LD @graph with graph IRIs), this map tracks the g_id assignment
-    /// for each graph IRI. These mappings are stored in the commit envelope
-    /// for replay-safe persistence.
-    ///
-    /// Reserved g_ids:
-    /// - `0`: default graph
-    /// - `1`: txn-meta graph (`#txn-meta`)
-    /// - `2+`: user-defined named graphs
-    pub graph_delta: FxHashMap<u16, String>,
+    /// Staging resolves each in the ledger it writes, as it does the
+    /// templates' graphs (the ledger's own address is its default graph, and
+    /// `L#<g>` the graph `<g>`), reports the full set keyed by ledger graph
+    /// id, and the commit registers any that are new.
+    pub write_graphs: BTreeSet<String>,
 
     /// Namespace allocations made during lowering that the staging path must
     /// merge into its own registry before flake generation.
@@ -202,11 +213,10 @@ pub struct Txn {
     /// See [`GraphMgmtOp`] and `stage_graph_mgmt`.
     pub graph_mgmt: Option<GraphMgmtOp>,
 
-    /// Graph-synchronization directive: make the named graph's contents
-    /// exactly this transaction's insert templates, committing only the
-    /// delta.
+    /// Graph-synchronization directive: make the graph's contents exactly
+    /// this transaction's insert templates, committing only the delta.
     ///
-    /// When `Some(iri)`, staging adds a second wave after assertion
+    /// When `Some(graph)`, staging adds a second wave after assertion
     /// generation (like the upsert wave): every currently-asserted flake in
     /// the target graph is pushed as a retraction, and the mixed
     /// [`FlakeAccumulator`](crate::generate::FlakeAccumulator) nets
@@ -215,38 +225,60 @@ pub struct Txn {
     /// payload stages zero flakes (no commit).
     ///
     /// The transaction's insert templates must all target this graph (the
-    /// parser re-homes them) and the graph must be a user graph — reserved
-    /// system graphs and (for now) the default graph are rejected at
-    /// staging. `None` for every ordinary transaction.
-    pub sync_graph: Option<String>,
+    /// parser homes them there): the default graph or a user named graph.
+    /// Reserved system graphs are rejected at staging. `None` for every
+    /// ordinary transaction.
+    pub sync_graph: Option<GraphSel>,
 }
 
-/// A SPARQL graph-management operation, executed by whole-graph scan/re-home
-/// at staging time (SPARQL 1.1 Update §3.2). Carried on [`Txn::graph_mgmt`].
+/// A SPARQL graph-management operation (SPARQL 1.1 Update §3.2), executed at
+/// staging time. Carried on [`Txn::graph_mgmt`].
 ///
 /// `CREATE` and a `SILENT` `LOAD` of an unfetchable source lower to an ordinary
-/// empty no-op `Txn` (Fluree cannot represent an empty named graph — roadmap
-/// D-6), so they are **not** represented here.
+/// `Txn` that writes no flake (a `CREATE` registers its graph through
+/// `write_graphs`), so they are **not** represented here.
 #[derive(Debug, Clone)]
 pub enum GraphMgmtOp {
-    /// Retract every flake in the target graph(s). Backs both `CLEAR` and
-    /// `DROP` — the two are indistinguishable in Fluree's flake-tagged model
-    /// (the registry is additive-only and the harness cannot observe an empty
-    /// graph), so `DROP ≡ CLEAR` (roadmap decision D-6).
+    /// Retract every flake in the target graph(s) (`CLEAR`). The graphs
+    /// remain, and so does their history: a query as of an earlier `t` still
+    /// sees what they held.
     Clear(GraphTarget),
 
+    /// Take the target graph(s) out of the ledger (`DROP`): nothing they held
+    /// is queryable afterwards, at the head or as of any earlier `t`. The
+    /// commits that wrote it keep it, so a rebuild that ignores the drop — a
+    /// branch from before it, say — recovers it. The commit records the drop
+    /// and retracts nothing (see `Commit::graph_drops`).
+    ///
+    /// A named graph no longer exists until something writes to it again; the
+    /// default graph always exists, so `DROP DEFAULT` leaves it empty, without
+    /// its history. The reserved system graphs cannot be dropped, and only an
+    /// unrestricted identity may drop at all: the drop takes facts a policy
+    /// may hide from the caller.
+    Drop {
+        /// The graph(s) to drop.
+        target: GraphTarget,
+        /// `SILENT`: dropping a graph that does not exist is a no-op rather
+        /// than an error.
+        silent: bool,
+    },
+
     /// Copy all flakes from `from` into `to` (`ADD`), optionally clearing the
-    /// destination first (`COPY`, `MOVE`) and/or the source afterwards
-    /// (`MOVE`). A `from == to` transfer is a no-op (staging short-circuits).
+    /// destination first (`COPY`, `MOVE`) and/or dropping the source
+    /// afterwards (`MOVE`). A `from == to` transfer is a no-op (staging
+    /// short-circuits).
     Transfer {
         /// Source graph to scan.
         from: GraphSel,
         /// Destination graph to assert the copied flakes into.
         to: GraphSel,
         /// Retract the destination before copying (COPY / MOVE, not ADD).
+        /// The destination lives on, so it is cleared, keeping its history.
         clear_dest: bool,
-        /// Retract the source after copying (MOVE only).
-        clear_src: bool,
+        /// Drop the source after copying (MOVE only): the source ceases to
+        /// exist, as [`GraphMgmtOp::Drop`] — and needs an unrestricted
+        /// identity for the same reason.
+        drop_src: bool,
         /// `SILENT`: suppress the "source graph does not exist" error. Per
         /// SPARQL 1.1 Update §3.2, a transfer from a never-registered source
         /// graph errors unless `SILENT`; without the guard COPY/MOVE would
@@ -293,12 +325,14 @@ impl Txn {
             delete_templates: Vec::new(),
             insert_templates: Vec::new(),
             values: None,
+            unmatched_optional: UnmatchedOptional::Unbound,
             update_where_default_graph_iris: None,
             update_where_named_graphs: None,
+            update_where_names_ledger_default: false,
             opts: TxnOpts::default(),
             vars: VarRegistry::new(),
             txn_meta: Vec::new(),
-            graph_delta: FxHashMap::default(),
+            write_graphs: BTreeSet::new(),
             namespace_delta: std::collections::HashMap::new(),
             graph_mgmt: None,
             sync_graph: None,
@@ -309,8 +343,8 @@ impl Txn {
     ///
     /// The DELETE/INSERT templates and WHERE clause are empty; staging reads
     /// the directive from [`Txn::graph_mgmt`] and executes it by whole-graph
-    /// scan. `graph_delta` still carries any newly-referenced destination
-    /// graph IRI so the commit envelope registers it.
+    /// scan. `write_graphs` still carries any newly-referenced destination
+    /// graph IRI so the commit registers it.
     pub fn graph_mgmt(op: GraphMgmtOp) -> Self {
         Self {
             graph_mgmt: Some(op),
@@ -319,16 +353,18 @@ impl Txn {
     }
 
     /// Retract every flake in a named graph (the non-SPARQL analog of
-    /// `CLEAR GRAPH <iri>`). In Fluree's model this is indistinguishable from
-    /// [`Txn::drop_graph`] (roadmap D-6).
+    /// `CLEAR GRAPH <iri>`). The graph and its history remain.
     pub fn clear_graph(iri: impl Into<String>) -> Self {
         Txn::graph_mgmt(GraphMgmtOp::Clear(GraphTarget::Graph(iri.into())))
     }
 
-    /// Drop a named graph (retract all of its flakes). `DROP ≡ CLEAR` in
-    /// Fluree's additive-only registry model (roadmap D-6).
+    /// Drop a named graph (the non-SPARQL analog of `DROP GRAPH <iri>`): it
+    /// and its history are no longer queryable. See [`GraphMgmtOp::Drop`].
     pub fn drop_graph(iri: impl Into<String>) -> Self {
-        Txn::clear_graph(iri)
+        Txn::graph_mgmt(GraphMgmtOp::Drop {
+            target: GraphTarget::Graph(iri.into()),
+            silent: false,
+        })
     }
 
     /// Retract every flake in the default graph.
@@ -345,34 +381,32 @@ impl Txn {
             from: GraphSel::Graph(from.into()),
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: true,
-            clear_src: false,
+            drop_src: false,
             // Builder-API COPY errors on a never-registered source, matching
             // non-SILENT SPARQL COPY (roadmap O3).
             silent: false,
         });
         // Register the (possibly-new) destination graph so the commit envelope
         // persists its g_id; `apply_delta` skips already-registered IRIs.
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.write_graphs.insert(to_iri);
         txn
     }
 
-    /// Move all flakes from one named graph into another — copy semantics plus
-    /// retraction of the source (the non-SPARQL analog of `MOVE <from> TO
-    /// <to>`). A destination equal to the source is a no-op.
+    /// Move all flakes from one named graph into another — copy semantics, then
+    /// the source is dropped (the non-SPARQL analog of `MOVE <from> TO <to>`).
+    /// A destination equal to the source is a no-op.
     pub fn move_graph(from: impl Into<String>, to: impl Into<String>) -> Self {
         let to_iri = to.into();
         let mut txn = Txn::graph_mgmt(GraphMgmtOp::Transfer {
             from: GraphSel::Graph(from.into()),
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: true,
-            clear_src: true,
+            drop_src: true,
             // Builder-API MOVE errors on a never-registered source, matching
             // non-SILENT SPARQL MOVE (roadmap O3).
             silent: false,
         });
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.write_graphs.insert(to_iri);
         txn
     }
 
@@ -385,13 +419,12 @@ impl Txn {
             from: GraphSel::Graph(from.into()),
             to: GraphSel::Graph(to_iri.clone()),
             clear_dest: false,
-            clear_src: false,
+            drop_src: false,
             // Builder-API ADD errors on a never-registered source, matching
             // non-SILENT SPARQL ADD (roadmap O3).
             silent: false,
         });
-        txn.graph_delta
-            .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, to_iri);
+        txn.write_graphs.insert(to_iri);
         txn
     }
 
@@ -412,8 +445,8 @@ impl Txn {
     }
 
     /// Set the graph-synchronization target (see [`Txn::sync_graph`]).
-    pub fn with_sync_graph(mut self, iri: impl Into<String>) -> Self {
-        self.sync_graph = Some(iri.into());
+    pub fn with_sync_graph(mut self, graph: GraphSel) -> Self {
+        self.sync_graph = Some(graph);
         self
     }
 
@@ -510,19 +543,13 @@ pub struct TripleTemplate {
     /// - `Some(i)`: list element at position `i`
     pub list_index: Option<i32>,
 
-    /// Transaction-local graph ID for named graphs
-    ///
-    /// - `0`: default graph
-    /// - `1`: txn-meta graph (reserved)
-    /// - `2+`: user-defined named graphs
-    ///
-    /// If None, defaults to 0 (default graph).
-    ///
-    /// IMPORTANT: this ID is scoped to the transaction envelope (see `Txn.graph_delta`).
-    /// It is **not** ledger-stable and must be translated via:
-    /// `txn_local_id -> graph IRI (Txn.graph_delta) -> ledger GraphId (GraphRegistry)`
-    /// before doing any per-graph index/range queries.
-    pub graph_id: Option<u16>,
+    /// The list a member belongs to, unique among a transaction's insert
+    /// templates. A position names no list, so this is what tells two lists
+    /// on one subject and predicate apart (see [`crate::lists`]).
+    pub list_id: Option<u32>,
+
+    /// The graph this template writes to.
+    pub graph: TemplateGraph,
 }
 
 impl TripleTemplate {
@@ -534,7 +561,8 @@ impl TripleTemplate {
             object,
             dtc: None,
             list_index: None,
-            graph_id: None,
+            list_id: None,
+            graph: TemplateGraph::Default,
         }
     }
 
@@ -550,14 +578,220 @@ impl TripleTemplate {
         self
     }
 
-    /// Set the graph ID (for named graph support)
-    ///
-    /// - `0`: default graph
-    /// - `1`: txn-meta graph (reserved for commit metadata)
-    /// - `2+`: user-defined named graphs
-    pub fn with_graph_id(mut self, graph_id: u16) -> Self {
-        self.graph_id = Some(graph_id);
+    /// Make this template member `index` of list `list` (see
+    /// [`Self::list_id`]).
+    pub fn in_list(mut self, list: u32, index: i32) -> Self {
+        self.list_index = Some(index);
+        self.list_id = Some(list);
         self
+    }
+
+    /// Write to the named graph `iri`. The transaction must also list it in
+    /// [`Txn::write_graphs`]. Staging resolves `iri` in the ledger it writes
+    /// (the ledger's own address is its default graph).
+    pub fn in_graph(mut self, iri: impl Into<Arc<str>>) -> Self {
+        self.graph = TemplateGraph::Iri(iri.into());
+        self
+    }
+
+    /// Write to the graph named by `var`'s binding in each WHERE solution.
+    pub fn with_graph_var(mut self, var: VarId) -> Self {
+        self.graph = TemplateGraph::Var(var);
+        self
+    }
+}
+
+/// The graph a [`TripleTemplate`] writes to.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub enum TemplateGraph {
+    /// The default graph.
+    #[default]
+    Default,
+    /// A named graph, by IRI.
+    Iri(Arc<str>),
+    /// `GRAPH ?g`: the graph named by this variable's binding in each WHERE
+    /// solution, resolved at staging time.
+    Var(VarId),
+}
+
+/// A write-side graph name after resolution: the default graph, a named
+/// graph by absolute IRI (the ledger's config graph included), a ledger
+/// address, or a WHERE variable (`GRAPH ?g`, update templates only).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GraphName {
+    /// The default graph.
+    Default,
+    /// A named graph.
+    Iri(fluree_db_core::dataset_ref::GraphIri),
+    /// An address of the ledger being written that expands to no absolute IRI.
+    Address(AddressName),
+    /// The graph a WHERE variable binds.
+    Var(VarId),
+}
+
+/// A graph name written as an address of the ledger being written that
+/// expands to no absolute IRI: `mydb#config` or a bare `mydb` (no scheme), or
+/// `mydb:main` under strict compact-IRI checking with no `mydb` prefix in the
+/// `@context`. It is kept as written, as a `from` source is, and staging reads
+/// it through the ledger's graph-position table like any graph IRI (the
+/// ledger's own address writes its default graph, `L#config` the config
+/// graph, `L#<g>` the graph `<g>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddressName(Arc<str>);
+
+impl AddressName {
+    /// `written`, if it is an address of the ledger `ledger_id`, in any
+    /// spelling. Another ledger's address is not one: it stays the name it
+    /// is, which expands to no absolute IRI.
+    pub fn parse(written: &str, ledger_id: &str) -> Option<Self> {
+        let ledger = fluree_db_core::LedgerId::parse(ledger_id).ok()?;
+        let no_graphs = |_: &str| None;
+        fluree_db_core::TargetLedger::new(&ledger, &no_graphs)
+            .names_this_ledger(written)
+            .then(|| Self(written.into()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The graph every template of one lexical scope is written to.
+///
+/// A JSON-LD node's statements, and those of every node nested in it, are
+/// written to the node's scope: its own graph selector if it has one, else
+/// its parent's. The parser passes the scope down the recursion by
+/// reference, so a nested node cannot be emitted without one.
+///
+/// Built only by [`WriteGraphs::scope`] or [`GraphScope::default_graph`], so
+/// a named graph a scope can carry is always registered in
+/// [`Txn::write_graphs`]. Every scope's IRI, the update `graph` key's
+/// included, is read by staging through the ledger's graph-position table
+/// ([`TargetLedger::graph_position`](fluree_db_core::TargetLedger::graph_position)),
+/// so the ledger's own address writes its default graph in every scope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphScope {
+    graph: TemplateGraph,
+}
+
+impl GraphScope {
+    /// The default graph.
+    pub fn default_graph() -> Self {
+        GraphScope {
+            graph: TemplateGraph::Default,
+        }
+    }
+
+    /// The graph this scope writes to.
+    pub fn graph(&self) -> &TemplateGraph {
+        &self.graph
+    }
+
+    /// Emit one template in this scope.
+    ///
+    /// This is the one template-level emitter of `f:reifiesGraph`: a
+    /// reifier's `f:reifiesSubject` statement emitted in a named scope is
+    /// accompanied by `(reifier, f:reifiesGraph, <the scope's graph>)` in the
+    /// same scope, so a reifier bundle always names the graph of the edge it
+    /// reifies, which is the graph the bundle itself is written to. Nothing
+    /// else writes the anchor into templates.
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit(
+        &self,
+        out: &mut Vec<TripleTemplate>,
+        ns: &mut crate::namespace::NamespaceRegistry,
+        subject: TemplateTerm,
+        predicate: TemplateTerm,
+        object: TemplateTerm,
+        dtc: Option<DatatypeConstraint>,
+        list_index: Option<i32>,
+        list_id: Option<u32>,
+    ) {
+        let anchor = match (&self.graph, &predicate) {
+            (TemplateGraph::Default, _) => None,
+            (graph, TemplateTerm::Sid(p)) if is_reifies_subject(p) => Some(match graph {
+                TemplateGraph::Iri(iri) => TemplateTerm::Sid(ns.sid_for_iri(iri)),
+                TemplateGraph::Var(var) => TemplateTerm::Var(*var),
+                TemplateGraph::Default => unreachable!("matched above"),
+            }),
+            _ => None,
+        };
+        let anchor_subject = anchor.as_ref().map(|_| subject.clone());
+        out.push(TripleTemplate {
+            subject,
+            predicate,
+            object,
+            dtc,
+            list_index,
+            list_id,
+            graph: self.graph.clone(),
+        });
+        if let (Some(reifier), Some(graph)) = (anchor_subject, anchor) {
+            out.push(TripleTemplate {
+                subject: reifier,
+                predicate: TemplateTerm::Sid(Sid::new(
+                    fluree_vocab::namespaces::FLUREE_DB,
+                    fluree_vocab::db::REIFIES_GRAPH,
+                )),
+                object: graph,
+                dtc: None,
+                list_index: None,
+                list_id: None,
+                graph: self.graph.clone(),
+            });
+        }
+    }
+}
+
+/// Whether `p` is `f:reifiesSubject`, compared without allocating.
+pub(crate) fn is_reifies_subject(p: &Sid) -> bool {
+    p.namespace_code == fluree_vocab::namespaces::FLUREE_DB
+        && &*p.name == fluree_vocab::db::REIFIES_SUBJECT
+}
+
+/// The named graphs one transaction writes to, interned so every template of
+/// a graph shares its IRI. The only way to obtain a named [`GraphScope`].
+#[derive(Debug, Default)]
+pub struct WriteGraphs {
+    interned: std::collections::HashMap<String, Arc<str>>,
+}
+
+impl WriteGraphs {
+    /// No graphs yet.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The scope for `name`, registering a named graph as a write target.
+    pub fn scope(&mut self, name: GraphName) -> GraphScope {
+        match name {
+            GraphName::Default => GraphScope::default_graph(),
+            GraphName::Var(var) => GraphScope {
+                graph: TemplateGraph::Var(var),
+            },
+            GraphName::Iri(iri) => GraphScope {
+                graph: TemplateGraph::Iri(self.intern(iri.as_arc())),
+            },
+            GraphName::Address(address) => GraphScope {
+                graph: TemplateGraph::Iri(self.intern(&address.0)),
+            },
+        }
+    }
+
+    /// `name`, registered as a write target, shared with every scope of it.
+    fn intern(&mut self, name: &Arc<str>) -> Arc<str> {
+        match self.interned.get(&**name) {
+            Some(interned) => Arc::clone(interned),
+            None => {
+                self.interned.insert(name.to_string(), Arc::clone(name));
+                Arc::clone(name)
+            }
+        }
+    }
+
+    /// The registered named-graph IRIs, for [`Txn::write_graphs`].
+    pub fn into_iris(self) -> BTreeSet<String> {
+        self.interned.into_keys().collect()
     }
 }
 
@@ -609,6 +843,17 @@ impl InlineValues {
     pub fn new(vars: Vec<VarId>, rows: Vec<Vec<TemplateTerm>>) -> Self {
         Self { vars, rows }
     }
+}
+
+/// A Cypher relationship variable's `DELETE`: the delete template that
+/// retracts the edge the relationship was matched on (see
+/// [`TxnOpts::relationship_deletes`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RelationshipDelete {
+    /// The relationship variable, which a refusal names.
+    pub var: String,
+    /// The template's index in [`Txn::delete_templates`].
+    pub template: usize,
 }
 
 /// Transaction options
@@ -666,6 +911,19 @@ pub struct TxnOpts {
     /// (camelCase) when `None` here.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lpg_edge_lifecycle: Option<bool>,
+
+    /// The delete templates of a Cypher `DELETE r` (or several), each of which
+    /// retracts the edge relationship `r` was matched on. An edge one of them
+    /// retracts must carry at most one relationship: retracting the edge takes
+    /// every relationship on it with it (the `f:reifies*` cascade), so staging
+    /// refuses an edge that carries others, naming the variable. Deleting one
+    /// of several parallel relationships isn't supported.
+    ///
+    /// An edge another delete template retracts too is exempt: that is a
+    /// `DETACH DELETE` of an endpoint, which takes every relationship on the
+    /// node. Edges no relationship's DELETE retracts aren't checked.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub relationship_deletes: Option<Vec<RelationshipDelete>>,
 
     /// Skolemization id override for blank-node minting in this transaction.
     ///

@@ -244,12 +244,11 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
 
     /// Execute: fetch the commit blob, decode it, resolve IRIs, return detail.
     pub async fn execute(self) -> Result<CommitDetail> {
-        // 1. Load the ledger to get namespace_codes for IRI resolution
-        let handle = self
-            .graph
-            .fluree
-            .ledger_cached(&self.graph.ledger_id)
-            .await?;
+        // 1. Load the ledger to get namespace_codes for IRI resolution. A
+        // commit belongs to the whole ledger, so a graph or pin in the handle's
+        // address does not narrow it.
+        let ledger_id = self.graph.id()?.clone();
+        let handle = self.graph.fluree.ledger_cached(ledger_id.as_str()).await?;
         let snapshot = handle.snapshot().await;
         let namespace_codes = snapshot.snapshot.shared_namespaces();
 
@@ -267,10 +266,10 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
         };
 
         // 4. Fetch commit blob from content-addressed storage
-        let content_store = self.graph.fluree.content_store(&self.graph.ledger_id);
+        let content_store = self.graph.fluree.content_store(ledger_id.as_str());
         let blob = content_store.get(&commit_id).await.map_err(|e| {
             if matches!(e, fluree_db_core::error::Error::NotFound(_)) {
-                ApiError::NotFound(format!("Commit {commit_id} not found"))
+                ApiError::CommitNotFound(format!("Commit {commit_id} not found"))
             } else {
                 ApiError::internal(format!(
                     "Failed to read commit {commit_id} from storage: {e}"
@@ -313,22 +312,10 @@ impl<'a, 'g> CommitBuilder<'a, 'g> {
             if let Some(policy_ctx) = policy_ctx.filter(|p| !p.wrapper().is_root()) {
                 let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx));
                 let tracker = Tracker::disabled();
-
-                // Populate subject class membership before filtering — otherwise
-                // filter_flakes_for_graph reads an empty class cache and every
-                // f:onClass restriction silently drops to default_allow.
-                let mut subjects: Vec<_> = commit.flakes.iter().map(|f| f.s.clone()).collect();
-                subjects.sort();
-                subjects.dedup();
-                let db = fluree_db_core::GraphDbRef::new(&snapshot.snapshot, 0, overlay, commit.t);
-                enforcer
-                    .populate_class_cache_for_graph(db, &subjects)
-                    .await?;
-
                 commit.flakes = enforcer
                     .filter_flakes_for_graph(
                         &snapshot.snapshot,
-                        db.g_id,
+                        0,
                         overlay,
                         commit.t,
                         &tracker,

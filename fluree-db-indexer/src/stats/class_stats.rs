@@ -246,7 +246,6 @@ pub fn build_class_stat_entries(
     use crate::run_index::dict_io;
     use fluree_db_core::sid::Sid;
     use fluree_db_core::subject_id::SubjectId;
-    use fluree_db_core::{ClassPropertyUsage, ClassRefCount, ClassStatEntry};
     use std::io::{Read as _, Seek as _, SeekFrom};
 
     if cs.class_counts.is_empty() {
@@ -261,7 +260,8 @@ pub fn build_class_stat_entries(
     let (fwd_offsets, fwd_lens) = dict_io::read_forward_index(&idx_path)?;
     let mut fwd_file = std::fs::File::open(&fwd_path)?;
 
-    let resolve_sid = |sid64: u64, file: &mut std::fs::File| -> Option<Sid> {
+    let mut resolve_sid = |sid64: u64| -> Option<Sid> {
+        let file = &mut fwd_file;
         let subj = SubjectId::from_u64(sid64);
         let ns_code = subj.ns_code();
         let pos = sids_vec.binary_search(&sid64).ok()?;
@@ -282,6 +282,28 @@ pub fn build_class_stat_entries(
         };
         Some(Sid::new(ns_code, suffix))
     };
+
+    Ok(build_class_stat_entries_with(
+        cs,
+        predicate_sids,
+        language_tags,
+        class_ref_targets_override,
+        &mut resolve_sid,
+    ))
+}
+
+/// [`build_class_stat_entries`] resolving class ids through `resolve_sid`
+/// instead of the import's on-disk forward dictionary. A class it cannot
+/// resolve is left out.
+pub fn build_class_stat_entries_with(
+    cs: &SpotClassStats,
+    predicate_sids: &[(u16, String)],
+    language_tags: &[String],
+    class_ref_targets_override: Option<&ClassRefTargets>,
+    resolve_sid: &mut dyn FnMut(u64) -> Option<fluree_db_core::sid::Sid>,
+) -> HashMap<GraphId, Vec<fluree_db_core::ClassStatEntry>> {
+    use fluree_db_core::sid::Sid;
+    use fluree_db_core::{ClassPropertyUsage, ClassRefCount, ClassStatEntry};
 
     // Sort by (g_id, class_sid64) for deterministic output.
     let mut class_entries: Vec<(&(GraphId, u64), &u64)> = cs.class_counts.iter().collect();
@@ -312,7 +334,7 @@ pub fn build_class_stat_entries(
     let mut per_graph: HashMap<GraphId, Vec<ClassStatEntry>> = HashMap::new();
 
     for &(&(g_id, class_sid64), &count) in &class_entries {
-        let class_sid = match resolve_sid(class_sid64, &mut fwd_file) {
+        let class_sid = match resolve_sid(class_sid64) {
             Some(s) => s,
             None => continue,
         };
@@ -376,7 +398,7 @@ pub fn build_class_stat_entries(
                                 targets
                                     .iter()
                                     .filter_map(|&(&target_sid, &tcount)| {
-                                        let tsid = resolve_sid(target_sid, &mut fwd_file)?;
+                                        let tsid = resolve_sid(target_sid)?;
                                         Some(ClassRefCount {
                                             class_sid: tsid,
                                             count: tcount,
@@ -412,5 +434,5 @@ pub fn build_class_stat_entries(
         graphs = per_graph.len(),
         "class stats resolved to per-graph entries"
     );
-    Ok(per_graph)
+    per_graph
 }

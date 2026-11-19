@@ -126,7 +126,7 @@ async fn assert_fp_conflict_after_merge(fp_subject: &str, spo_subject: &str) {
     ];
     f.sort_by(|a, b| IndexType::Spot.compare(a, b));
 
-    let mut snapshot = LedgerSnapshot::genesis("test/main");
+    let mut snapshot = LedgerSnapshot::genesis("test:main");
     for (code, iri) in [
         (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
         (4, "http://www.w3.org/2000/01/rdf-schema#"),
@@ -184,7 +184,7 @@ async fn capped_run_preserves_rules_fired() {
     ];
     f.sort_by(|a, b| IndexType::Spot.compare(a, b));
 
-    let mut snapshot = LedgerSnapshot::genesis("test/main");
+    let mut snapshot = LedgerSnapshot::genesis("test:main");
     for (code, iri) in [
         (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
         (4, "http://www.w3.org/2000/01/rdf-schema#"),
@@ -241,7 +241,7 @@ async fn prp_fp_detects_conflict_when_merge_is_final_iteration() {
     ];
     f.sort_by(|a, b| IndexType::Spot.compare(a, b));
 
-    let mut snapshot = LedgerSnapshot::genesis("test/main");
+    let mut snapshot = LedgerSnapshot::genesis("test:main");
     for (code, iri) in [
         (3, "http://www.w3.org/1999/02/22-rdf-syntax-ns#"),
         (4, "http://www.w3.org/2000/01/rdf-schema#"),

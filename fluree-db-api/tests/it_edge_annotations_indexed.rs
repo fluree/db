@@ -812,7 +812,12 @@ async fn non_annotation_ledger_skips_inject_annotations() {
     local
         .run_until(async {
             let _ = fluree.ledger_cached(ledger_id).await.unwrap();
-            let completion = handle.trigger(ledger_id, after.receipt.t).await;
+            let completion = handle
+                .trigger(
+                    &fluree_db_api::LedgerId::parse(ledger_id).unwrap(),
+                    after.receipt.t,
+                )
+                .await;
             let _ = completion.wait().await;
             support::wait_for_index_application(&fluree, ledger_id, after.receipt.t).await;
 

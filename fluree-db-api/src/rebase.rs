@@ -4,20 +4,19 @@
 //! of its source branch's current HEAD, bringing the branch up to date with
 //! upstream changes.
 
+use crate::commit_data::{key_of, ConfigGraphs, OwnChanges};
 use crate::error::{ApiError, Result};
-use fluree_db_core::ledger_id::format_ledger_id;
-use fluree_db_core::{
-    range_with_overlay, ConflictKey, ContentId, Flake, IndexType, RangeMatch, RangeOptions,
-    RangeTest, DEFAULT_GRAPH_ID,
-};
-use fluree_db_core::{trace_first_parent_commits_by_id, Commit};
+use fluree_db_core::LedgerId;
+use fluree_db_core::{BranchedContentStore, Commit, ConflictKey, ContentId, ContentStore, Flake};
 use fluree_db_ledger::LedgerState;
 use fluree_db_nameservice::NsRecordSnapshot;
-use fluree_db_novelty::{compute_delta_keys, FactKey};
-use fluree_db_transact::{CommitOpts, NamespaceRegistry, StagedCommit};
-use futures::TryStreamExt;
+use fluree_db_novelty::{delta_keys_of, FactKey};
+use fluree_db_transact::{
+    CommitOpts, CurrentFacts, NamespaceRegistry, Slot, StagedCommit, StoredFact,
+};
 use rustc_hash::FxHashSet;
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use tracing::Instrument;
 
 // ---------------------------------------------------------------------------
@@ -135,19 +134,20 @@ pub struct RebaseReport {
 /// - `Some(_)` → write all `pending_replays` then advance the branch
 ///   HEAD from `pre_rebase_head_id` to `new_head_id` (one operation
 ///   atomically; local: `publish_commit`; Raft: `AdvanceRef`).
-/// - `None` → all source commits were skipped (`Skip` strategy on
-///   every conflicting commit, or every commit's flake set was
-///   empty after resolution); nothing to apply, return the report
-///   with `replayed == 0`.
+/// - `None` → no branch commit survived (`Skip` strategy on every
+///   conflicting commit, or every commit's flake set was empty after
+///   resolution). Nothing is written; the local apply moves the branch
+///   onto the source's head and index, and the Raft path, whose heads
+///   only advance, completes the entry with the branch unchanged.
 pub struct StagedRebase {
     /// Branch being rebased (without ledger prefix).
     pub branch: String,
     /// Fully-qualified branch id (`"<ledger>:<branch>"`).
-    pub branch_id: String,
+    pub branch_id: LedgerId,
     /// Source branch name (without ledger prefix).
     pub source: String,
     /// Fully-qualified source id.
-    pub source_id: String,
+    pub source_id: LedgerId,
     /// Source's current head ref. For fast-forward, this is also
     /// what the branch's HEAD advances to (`new_head_*` reflects
     /// it).
@@ -204,6 +204,15 @@ pub struct StagedRebase {
     /// content-addressed objects but aren't on the active head
     /// chain until that single advance commits.
     pub pending_replays: Vec<PendingReplay>,
+    /// The source's index as copied into the branch's namespace, or `None`
+    /// when the source has none or the copy failed. After a rebase that
+    /// replays commits it replaces the branch's own index, which indexes
+    /// the line the replay replaces.
+    pub source_index: Option<(ContentId, i64)>,
+    /// The source's published index, not copied. A rebase that replays
+    /// nothing makes the branch the source, and the local apply copies
+    /// this onto the branch with the source's head.
+    pub source_record_index: Option<(ContentId, i64)>,
 }
 
 /// Built-but-unwritten replay commit. Carried inside
@@ -299,8 +308,8 @@ impl crate::Fluree {
     ///   `needs_reindex` and the background indexer rebuilds.
     /// - All-skipped (every conflicting commit dropped by `Skip`,
     ///   or every replay produced empty flakes):
-    ///   [`StagedRebase::new_head_id`] is `None`; the apply step
-    ///   does nothing.
+    ///   [`StagedRebase::new_head_id`] is `None`, and the branch becomes
+    ///   the source: the local apply moves it onto the source's head.
     ///
     /// Errors with [`ApiError::InvalidBranch`] when called on a
     /// root branch, [`ApiError::NotFound`] when the source can't be
@@ -312,12 +321,12 @@ impl crate::Fluree {
         branch: &str,
         strategy: ConflictStrategy,
     ) -> Result<StagedRebase> {
-        let branch_id = format_ledger_id(ledger_name, branch);
+        let branch_id = LedgerId::from_parts(ledger_name, branch)?;
         let branch_record = self
             .nameservice()
             .lookup(&branch_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(branch_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(branch_id.clone().to_string()))?;
 
         // Refuse the root structurally — there's nothing to rebase onto.
         // "main" carries no special meaning here; a ledger whose root is
@@ -330,47 +339,53 @@ impl crate::Fluree {
             ))
         })?;
 
-        let source_id = format_ledger_id(ledger_name, source_name);
+        let source_id = LedgerId::from_parts(ledger_name, source_name)?;
         let source_record = self
             .nameservice()
             .lookup(&source_id)
             .await?
-            .ok_or_else(|| ApiError::NotFound(source_id.clone()))?;
+            .ok_or_else(|| ApiError::NotFound(source_id.clone().to_string()))?;
 
         let source_head_id = source_record.commit_head_id.clone().ok_or_else(|| {
             ApiError::internal(format!("Source branch {source_id} has no commit head"))
         })?;
         let source_head_t = source_record.commit_t;
 
-        // Build a BranchedContentStore for reading commits across namespaces.
-        let branch_store = LedgerState::build_branched_store(
-            &self.nameservice_mode,
-            &branch_record,
-            self.backend(),
-        )
-        .await?;
+        // Branch-aware stores for reading commits across namespaces.
+        let branch_store = self.branch_store(&branch_record, &branch_id).await?;
+        let source_store = self.branch_store(&source_record, &source_id).await?;
 
-        // Compute common ancestor by walking commit chains.
         let branch_head_id = branch_record
             .commit_head_id
             .clone()
             .ok_or_else(|| ApiError::internal(format!("Branch {branch_id} has no commit head")))?;
-        let ancestor =
-            fluree_db_core::find_common_ancestor(&branch_store, &branch_head_id, &source_head_id)
-                .await?;
+
+        // What each side changed since they last shared a commit, by commit
+        // identity. The branch may have merged the source in, which puts the
+        // source's head on another clock than the branch's own commits.
+        let union_store = BranchedContentStore::with_parents(
+            Arc::new(branch_store.clone()) as Arc<dyn ContentStore>,
+            vec![source_store.clone()],
+        );
+        let diff =
+            fluree_db_core::diff_branches(&union_store, &branch_head_id, &source_head_id).await?;
 
         let pre_rebase_head_t = branch_record.commit_t;
         let pre_rebase_head_id = branch_record.commit_head_id.clone();
         let rollback_snapshot = NsRecordSnapshot::from_record(&branch_record);
         let source_name_owned = source_name.to_string();
 
-        // Fast-forward: branch has no unique commits beyond the ancestor.
-        let is_fast_forward = branch_head_id == ancestor.commit_id;
+        // Fast-forward: the branch has no commits of its own to replay.
+        let is_fast_forward = diff.source.commits.is_empty();
+        if !is_fast_forward {
+            crate::merge::refuse_merging_graph_drops(&diff)?;
+        }
 
         if is_fast_forward {
             // Copy the source index into the branch namespace
             // (best-effort, matches local single-node behavior).
-            self.copy_source_index(&source_id, &branch_id, &source_record)
+            let source_index = self
+                .copy_source_index(&source_id, &branch_id, &source_record)
                 .await;
 
             // Load the source's state under the branch's id so the
@@ -400,32 +415,35 @@ impl crate::Fluree {
                 write_guard,
                 final_state,
                 pending_replays: Vec::new(),
+                source_index,
+                source_record_index: None,
             });
         }
 
-        // Compute source delta: all (s,p,g) tuples modified on source since ancestor.
-        // The source may itself be a branch, so use a BranchedContentStore if it has
-        // a source_branch, otherwise a plain store.
-        let source_delta = if source_record.source_branch.is_some() {
-            let source_store = LedgerState::build_branched_store(
-                &self.nameservice_mode,
-                &source_record,
-                self.backend(),
-            )
-            .await?;
-            compute_delta_keys(source_store, source_head_id.clone(), ancestor.t).await?
-        } else {
-            let source_store = self.content_store(&source_id);
-            compute_delta_keys(source_store, source_head_id.clone(), ancestor.t).await?
-        };
+        // The replay starts from the source's queryable state, relabeled to
+        // the branch; both sides' keys and flakes name the config graph as
+        // it does.
+        let mut current_state = self.ledger(&source_id).await?;
+        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
+        let mut config = ConfigGraphs::for_target(&current_state);
 
-        // Pass 1: stream branch commits to collect lightweight summaries
-        // (CID, t, conflict keys) without retaining flake payloads in memory.
+        // The keys the source changed since the two sides diverged.
+        let source_delta = config.keys(delta_keys_of(&source_store, &diff.target.own).await?);
+
+        // Pass 1: walk every commit on the branch's line to collect
+        // lightweight summaries (CID, t, conflict keys) without retaining
+        // flake payloads in memory.
+        //
+        // Merges on the line are replayed too, because a merge the branch
+        // made carries how it resolved that merge. A merge that brought the
+        // source in keeps only its resolution: the rest of its flakes are
+        // the source's own changes, which the replay base already holds.
         let summaries = scan_branch_commits(
-            branch_store.clone(),
-            branch_head_id,
-            ancestor.t,
+            &branch_store,
+            &diff.source.commits,
+            &diff.source.own,
             &source_delta,
+            &mut config,
         )
         .await?;
         let total_commits = summaries.len();
@@ -446,11 +464,6 @@ impl crate::Fluree {
         // transactions on the same branch.
         let write_guard = self.lock_ledger(&branch_id).await?;
 
-        // Start replay from the source's queryable state, relabeled
-        // to the branch.
-        let mut current_state = self.ledger(&source_id).await?;
-        std::sync::Arc::make_mut(&mut current_state.snapshot).ledger_id = branch_id.clone();
-
         let mut conflicts: Vec<RebaseConflict> = Vec::new();
         let mut skipped = 0;
         let mut replayed = 0;
@@ -470,8 +483,13 @@ impl crate::Fluree {
                 continue;
             }
 
-            let commit =
+            let mut commit =
                 fluree_db_core::load_commit_by_id(&branch_store, &summary.commit_id).await?;
+            config.adopt(&commit.namespace_delta);
+            config.flakes(&mut commit.flakes);
+            if let Some(keys) = &summary.resolution_keys {
+                commit.flakes.retain(|flake| keys.contains(&key_of(flake)));
+            }
 
             let flakes = self
                 .resolve_flakes(
@@ -539,9 +557,16 @@ impl crate::Fluree {
         // rollback, nothing put it back. The branch then loaded the
         // source's index and its own commits dropped out of every read.
         // Replay itself reads the source's state, never the copied index,
-        // so nothing above needs this to have happened. Best-effort.
-        self.copy_source_index(&source_id, &branch_id, &source_record)
-            .await;
+        // so nothing above needs this to have happened. Best-effort. A
+        // rebase that replayed nothing publishes no index here: the local
+        // apply moves the branch onto the source's head and index together,
+        // and the Raft path leaves the branch where it was.
+        let source_index = if pending_replays.is_empty() {
+            None
+        } else {
+            self.copy_source_index(&source_id, &branch_id, &source_record)
+                .await
+        };
 
         let new_head_id = pending_replays.last().map(|b| b.commit_id.clone());
         let new_head_t = current_state.t();
@@ -566,6 +591,11 @@ impl crate::Fluree {
             write_guard,
             final_state: current_state,
             pending_replays,
+            source_index,
+            source_record_index: source_record
+                .index_head_id
+                .clone()
+                .map(|id| (id, source_record.index_t)),
         })
     }
 
@@ -583,7 +613,7 @@ impl crate::Fluree {
             branch: _,
             branch_id,
             source: _,
-            source_id: _,
+            source_id,
             source_head_id,
             source_head_t,
             fast_forward,
@@ -599,6 +629,8 @@ impl crate::Fluree {
             write_guard,
             final_state,
             pending_replays,
+            source_index,
+            source_record_index,
         } = staged;
 
         if let Some(ref last_head_id) = new_head_id {
@@ -613,8 +645,66 @@ impl crate::Fluree {
                         })?;
                 }
             }
-            self.publisher()?
-                .publish_commit(&branch_id, new_head_t, last_head_id)
+            if fast_forward {
+                // The branch's own index is on the source's line already.
+                self.publisher()?
+                    .publish_commit(&branch_id, new_head_t, last_head_id)
+                    .await?;
+            } else {
+                // The new head and the index move in one write, so no reader
+                // sees the new head over the replaced line's index. The copy
+                // above published the source's index only if it was newer
+                // than the branch's own; the branch's own indexes the
+                // replaced line, so it goes whatever its `t`.
+                let (index_head_id, index_t) =
+                    source_index.map_or((None, 0), |(id, t)| (Some(id), t));
+                self.branch_admin()?
+                    .reset_head(
+                        &branch_id,
+                        NsRecordSnapshot {
+                            commit_head_id: Some(last_head_id.clone()),
+                            commit_t: new_head_t,
+                            index_head_id,
+                            index_t,
+                        },
+                    )
+                    .await?;
+            }
+        }
+
+        // No branch commit survived, so the branch becomes the source: its
+        // head and index move to the source's together. A reset, since the
+        // source's head can be at or below the branch's `t`.
+        let became_source = new_head_id.is_none() && !fast_forward;
+        if became_source {
+            let (index_head_id, index_t) = match source_record_index {
+                Some((index_cid, index_t)) => {
+                    match self
+                        .copy_index_to_branch(&source_id, &branch_id, &index_cid)
+                        .await
+                    {
+                        Ok(()) => (Some(index_cid), index_t),
+                        Err(e) => {
+                            tracing::warn!(
+                                %e, source = %source_id, branch = %branch_id,
+                                "failed to copy index during rebase; branch will replay from genesis"
+                            );
+                            (None, 0)
+                        }
+                    }
+                }
+                None => (None, 0),
+            };
+            self.branch_admin()?
+                .reset_head(
+                    &branch_id,
+                    NsRecordSnapshot {
+                        commit_head_id: Some(source_head_id.clone()),
+                        commit_t: source_head_t,
+                        index_head_id,
+                        index_t,
+                    },
+                )
                 .await?;
         }
 
@@ -623,7 +713,12 @@ impl crate::Fluree {
         // never a clone of the cached state, so the cache co-holds none of the
         // dictionaries the replay's `make_mut`s extend — the state threads
         // owned through the loop. This install performs no dictionary work.
-        if let Some(guard) = write_guard {
+        // `final_state` is the replay's last state, or the source's when
+        // nothing replayed: installed wherever the branch's head moved.
+        if let Some(mut guard) = write_guard.filter(|_| new_head_id.is_some() || became_source) {
+            // The rebased state is another line than the cached one: an index
+            // install planned on that line must not land on this one.
+            guard.start_line();
             let needs_reindex = final_state.should_reindex(&self.index_config);
             let commit_t = final_state.t();
             self.finalize_commit(guard, final_state, commit_t, needs_reindex)
@@ -668,16 +763,27 @@ impl crate::Fluree {
         flakes: Vec<Flake>,
         original_commit: &Commit,
     ) -> Result<StagedCommit> {
+        // A commit written before the staging fix can hold a retraction and
+        // an assertion of one fact at one `t`. The pair means the fact holds,
+        // and a commit built here may not hold it, so the replay keeps the
+        // assertion alone.
+        let flakes = fluree_db_transact::resolve_same_t_pairs(&state, flakes);
         // A commit that conformed on the branch can violate a shape the
         // source installed since the fork. Each replay is validated against
         // the state it lands on; the first violation aborts the whole rebase,
         // which has published nothing yet, naming the commit it stopped on.
         let (view, outcome) = self
-            .stage_validated(state, flakes, &original_commit.namespace_delta, "rebase")
+            .stage_validated(
+                state,
+                flakes,
+                &original_commit.namespace_delta,
+                &original_commit.graph_delta.values().cloned().collect(),
+                "rebase",
+            )
             .await?;
         outcome.into_result_with(|report| {
             format!(
-                "replaying commit t={} would violate the source branch's shapes:\n{report}",
+                "replaying commit t={} was refused:\n{report}",
                 original_commit.t
             )
         })?;
@@ -686,7 +792,7 @@ impl crate::Fluree {
         let commit_opts = CommitOpts::default()
             .with_skip_backpressure()
             .with_namespace_delta(original_commit.namespace_delta.clone())
-            .with_graph_delta(original_commit.graph_delta.clone());
+            .with_graph_iris(original_commit.graph_delta.values().cloned());
 
         // Replay commits never go through `StagedCommit::apply` — the
         // caller publishes the batch's final head once — so
@@ -824,43 +930,44 @@ impl crate::Fluree {
                 current_asserted_for_key(source_state, key)
                     .await?
                     .into_iter()
-                    .filter(|flake| !reasserted.contains(&FactKey::of(flake)))
-                    .map(|flake| Flake {
-                        op: false,
-                        t: 0, // restamped by StagedLedger::new
-                        ..flake
-                    }),
+                    .filter(|fact| !reasserted.contains(&FactKey::of(fact.flake())))
+                    // `t` is restamped by StagedLedger::new.
+                    .map(|fact| fact.retract(0).into_flake()),
             );
         }
 
         Ok(retractions)
     }
 
-    /// Copy index artifacts from source to branch (best-effort).
+    /// Copy index artifacts from source to branch (best-effort), and
+    /// publish them on the branch where newer than its own. The index now in
+    /// the branch's namespace, if any.
     async fn copy_source_index(
         &self,
         source_id: &str,
         branch_id: &str,
         source_record: &fluree_db_nameservice::NsRecord,
-    ) {
-        if let Some(ref index_cid) = source_record.index_head_id {
-            if let Err(e) = self
-                .copy_index_to_branch(source_id, branch_id, index_cid)
+    ) -> Option<(ContentId, i64)> {
+        let index_cid = source_record.index_head_id.as_ref()?;
+        if let Err(e) = self
+            .copy_index_to_branch(source_id, branch_id, index_cid)
+            .await
+        {
+            tracing::warn!(
+                %e, source = %source_id, branch = %branch_id,
+                "failed to copy index during rebase; branch will replay from genesis"
+            );
+            return None;
+        }
+        if let Some(publisher) = self.nameservice_mode.publisher() {
+            if let Err(e) = publisher
+                .publish_index(branch_id, source_record.index_t, index_cid)
                 .await
             {
-                tracing::warn!(
-                    %e, source = %source_id, branch = %branch_id,
-                    "failed to copy index during rebase; branch will replay from genesis"
-                );
-            } else if let Some(publisher) = self.nameservice_mode.publisher() {
-                if let Err(e) = publisher
-                    .publish_index(branch_id, source_record.index_t, index_cid)
-                    .await
-                {
-                    tracing::warn!(%e, "failed to publish index for rebased branch");
-                }
+                tracing::warn!(%e, "failed to publish index for rebased branch");
             }
         }
+        Some((index_cid.clone(), source_record.index_t))
     }
 }
 
@@ -875,31 +982,39 @@ struct CommitSummary {
     commit_id: ContentId,
     t: i64,
     conflict_keys: Vec<ConflictKey>,
+    /// For a merge that brought the source in, the keys whose flakes are
+    /// that merge's resolution. Every other flake it carries copies a change
+    /// the replay base already holds. `None` for a commit the branch made.
+    resolution_keys: Option<FxHashSet<ConflictKey>>,
 }
 
-/// Stream branch commits HEAD→oldest, extract conflict keys, and return
-/// lightweight summaries in oldest-first order. Full flake payloads are
-/// dropped after conflict key extraction so only summaries remain in memory.
-async fn scan_branch_commits<C: fluree_db_core::ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
+/// Read the branch's line, oldest first, and extract each commit's conflict
+/// keys. Full flake payloads are dropped after that, so only summaries
+/// remain in memory.
+async fn scan_branch_commits<C: fluree_db_core::ContentStore + ?Sized>(
+    store: &C,
+    cids: &[ContentId],
+    own: &[ContentId],
     source_delta: &FxHashSet<ConflictKey>,
+    config: &mut ConfigGraphs,
 ) -> Result<Vec<CommitSummary>> {
-    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
-    futures::pin_mut!(stream);
-
-    let mut summaries = Vec::new();
-    while let Some(commit) = stream.try_next().await? {
-        let conflict_keys = find_conflicting_keys(&commit.flakes, source_delta);
+    let mut changes = OwnChanges::new(own);
+    let mut summaries = Vec::with_capacity(cids.len());
+    for cid in cids {
+        let mut commit = fluree_db_core::load_commit_by_id(store, cid).await?;
+        config.adopt(&commit.namespace_delta);
+        config.flakes(&mut commit.flakes);
+        let is_own = changes.is_own(cid);
+        changes.retain_changes(cid, &mut commit.flakes);
         summaries.push(CommitSummary {
-            commit_id: commit.id.expect("loaded commit should have an id"),
+            conflict_keys: find_conflicting_keys(&commit.flakes, source_delta),
+            // Pass 2 reloads the commit, so it needs the keys this pass
+            // kept. They are few: a merge resolves what both sides changed.
+            resolution_keys: (!is_own).then(|| commit.flakes.iter().map(key_of).collect()),
+            commit_id: cid.clone(),
             t: commit.t,
-            conflict_keys,
         });
     }
-
-    summaries.reverse();
     Ok(summaries)
 }
 
@@ -922,41 +1037,24 @@ fn find_conflicting_keys(
         .collect()
 }
 
+/// The facts `state` currently holds for a conflict key's `(subject,
+/// predicate, graph)`, graph stamped.
+///
+/// Read through [`CurrentFacts`], which stamps the key's graph on index
+/// rows. A range read returns an index-resident row with `g: None` whatever
+/// graph it lives in, so filtering on `g == key.g` dropped every indexed
+/// named-graph value: a take-source merge then left the target's value in
+/// place next to the source's.
 pub(crate) async fn current_asserted_for_key(
     state: &LedgerState,
     key: &ConflictKey,
-) -> Result<Vec<Flake>> {
-    let g_id = match &key.g {
-        None => DEFAULT_GRAPH_ID,
-        Some(g_sid) => match state
-            .snapshot
-            .decode_sid(g_sid)
-            .and_then(|iri| state.snapshot.graph_registry.graph_id_for_iri(&iri))
-        {
-            Some(g_id) => g_id,
-            None => return Ok(Vec::new()),
-        },
+) -> Result<Vec<StoredFact>> {
+    let Some(slot) = Slot::in_ledger(state, &key.g, &key.s, &key.p) else {
+        return Ok(Vec::new());
     };
-
-    let match_val = RangeMatch::subject_predicate(key.s.clone(), key.p.clone());
-    let opts = RangeOptions {
-        to_t: Some(state.t()),
-        ..Default::default()
-    };
-
-    let flakes = range_with_overlay(
-        &state.snapshot,
-        g_id,
-        state.novelty.as_ref(),
-        IndexType::Spot,
-        RangeTest::Eq,
-        match_val,
-        opts,
-    )
-    .await?;
-
-    Ok(flakes
-        .into_iter()
-        .filter(|flake| flake.op && flake.g == key.g)
-        .collect())
+    Ok(CurrentFacts::new(state)
+        .of_slots(std::slice::from_ref(&slot))
+        .await?
+        .pop()
+        .unwrap_or_default())
 }

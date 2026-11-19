@@ -17,14 +17,16 @@ use std::time::Duration;
 
 use fluree_db_core::clock::Instant;
 use fluree_db_core::ids::DatatypeDictId;
-use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
+use fluree_db_core::ns_encoding::{
+    canonical_split, encode_registered, table_full, NsLookup, NsSplitMode,
+};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
-use fluree_db_core::GraphId;
 use fluree_db_core::{
     ContentId, ContentStore, FlakeMeta, FlakeValue, PrefixTrie, RuntimeSmallDicts, Sid,
 };
+use fluree_db_core::{GraphId, NO_ARENA_GRAPH};
 use fluree_vocab::{geo_names, jsonld_names, namespaces, rdf_names, xsd_names};
 use parking_lot::RwLock;
 
@@ -37,7 +39,7 @@ use crate::format::index_root::{IndexRoot, OTypeTableEntry};
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::format::run_record::RunSortOrder;
 
-use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid};
+use super::artifact_cache::{fetch_cached_bytes, fetch_cached_bytes_cid, uses_disk_cache};
 use super::leaflet_cache::LeafletCache;
 
 const HOT_REMOTE_LEAF_PROMOTION_TOUCHES: usize = 2;
@@ -87,6 +89,42 @@ pub(crate) fn cas_sync_timeout() -> Option<Duration> {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_millis)
+}
+
+/// How a remote leaf is fetched when a reader first needs its data.
+///
+/// Directory-only opens ([`BinaryIndexStore::open_leaf_dir`]) read just the
+/// header+directory prefix under either policy.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RemoteLeafFetch {
+    /// One GET for the whole leaf, persisted to the disk cache and shared by
+    /// concurrent readers. A remote request costs about the same for a few KB
+    /// as for a whole leaf, so this halves requests for a point read and
+    /// bounds a traversal's requests by the leaves it touches.
+    #[default]
+    Whole,
+    /// Header+directory, then byte-range reads per leaflet; the whole leaf
+    /// is fetched once a leaf is reopened or scanned. Fewer bytes per cold
+    /// touch, more requests.
+    Ranged,
+}
+
+impl RemoteLeafFetch {
+    /// `FLUREE_REMOTE_LEAF_FETCH=ranged|whole`, else the default.
+    pub fn from_env() -> Self {
+        match std::env::var("FLUREE_REMOTE_LEAF_FETCH").as_deref() {
+            Ok("ranged") => Self::Ranged,
+            Ok("whole") => Self::Whole,
+            Ok(other) => {
+                tracing::warn!(
+                    value = other,
+                    "unknown FLUREE_REMOTE_LEAF_FETCH; using whole"
+                );
+                Self::Whole
+            }
+            Err(_) => Self::default(),
+        }
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -243,16 +281,12 @@ struct GraphIndex {
 static NEXT_STORE_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whole-leaf bytes: a shared memory mapping when the leaf is local
-/// (saving the per-call open/read/copy), or an owned buffer for remote
-/// leaves.
+/// (saving the per-call open/read/copy), a shared view of bytes the store
+/// already holds in memory (`resolve_cached_bytes`), or an owned buffer
+/// for remote leaves.
 pub enum SharedLeafBytes {
     Mmap(Arc<memmap2::Mmap>),
     Owned(Vec<u8>),
-    /// Zero-copy view of the content store's resident tier
-    /// (`resolve_cached_bytes`). Compiled only for residency-capable builds
-    /// (wasm32, or native with the `residency` feature) so default native
-    /// match sites and layout stay exactly as they were.
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     Shared(Arc<[u8]>),
 }
 
@@ -262,11 +296,61 @@ impl std::ops::Deref for SharedLeafBytes {
         match self {
             SharedLeafBytes::Mmap(mmap) => mmap,
             SharedLeafBytes::Owned(bytes) => bytes,
-            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             SharedLeafBytes::Shared(bytes) => bytes,
         }
     }
 }
+
+/// Memo behind [`BinaryIndexStore::predicate_id_for_sid`]: the map, and per
+/// namespace code the name lengths (mod 64) its predicates have, so most IRIs
+/// that are not predicates — every one outside a predicate's namespace — are
+/// answered without hashing their name.
+struct PredicateIdsBySid {
+    by_sid: rustc_hash::FxHashMap<Sid, u32>,
+    /// Indexed by namespace code, up to the highest one a predicate uses.
+    name_lengths: Box<[u64]>,
+}
+
+impl PredicateIdsBySid {
+    fn new(sids: &[Sid]) -> Self {
+        let top = sids
+            .iter()
+            .map(|sid| usize::from(sid.namespace_code) + 1)
+            .max()
+            .unwrap_or(0);
+        let mut name_lengths = vec![0u64; top];
+        let mut by_sid = rustc_hash::FxHashMap::default();
+        by_sid.reserve(sids.len());
+        for (p_id, sid) in sids.iter().enumerate() {
+            name_lengths[usize::from(sid.namespace_code)] |= Self::length_bit(sid);
+            by_sid.insert(sid.clone(), p_id as u32);
+        }
+        Self {
+            by_sid,
+            name_lengths: name_lengths.into(),
+        }
+    }
+
+    #[inline]
+    fn length_bit(sid: &Sid) -> u64 {
+        1 << (sid.name.len() % 64)
+    }
+
+    #[inline]
+    fn get(&self, sid: &Sid) -> Option<u32> {
+        let lengths = *self.name_lengths.get(usize::from(sid.namespace_code))?;
+        if lengths & Self::length_bit(sid) == 0 {
+            return None;
+        }
+        self.by_sid.get(sid).copied()
+    }
+}
+
+/// Slot of [`BinaryIndexStore::predicate_subject_id`]'s memo before its
+/// predicate is resolved.
+const PREDICATE_SUBJECT_UNRESOLVED: u64 = u64::MAX;
+/// Slot of a predicate whose IRI is no subject.
+const PREDICATE_NOT_A_SUBJECT: u64 = u64::MAX - 1;
 
 /// Index store — reads FLI3/FBR3/FHS1 artifacts via FIR6 root.
 ///
@@ -277,8 +361,10 @@ pub struct BinaryIndexStore {
     /// Process-unique instance id (see [`NEXT_STORE_ID`]) — the identity of this
     /// store's frozen dictionary id-assignment, for the per-segment cache key.
     store_id: u64,
-    dicts: DictionarySet,
-    graph_indexes: HashMap<GraphId, GraphIndex>,
+    /// Shared with the stores [`Self::without_graphs`] derives.
+    dicts: Arc<DictionarySet>,
+    /// Shared per graph with the stores [`Self::without_graphs`] derives.
+    graph_indexes: HashMap<GraphId, Arc<GraphIndex>>,
     /// o_type table: full list (for iteration / serialization).
     o_type_table: Vec<OTypeTableEntry>,
     /// O(1) lookup: o_type value → index into o_type_table.
@@ -298,7 +384,7 @@ pub struct BinaryIndexStore {
     cache_dir: PathBuf,
     /// Shared disk artifact cache — kept alive here so the global `CACHE_REGISTRY`
     /// weak ref survives across calls, avoiding repeated dir scans on every write.
-    disk_cache: Arc<super::artifact_cache::DiskArtifactCache>,
+    _disk_cache: Arc<super::artifact_cache::DiskArtifactCache>,
     leaflet_cache: Option<Arc<LeafletCache>>,
     /// Remote leaf metadata cache keyed by leaf CID.
     ///
@@ -310,6 +396,7 @@ pub struct BinaryIndexStore {
     /// Once a remote leaf is touched repeatedly, we promote it to the local
     /// disk cache so subsequent opens use `FullBlobLeafHandle`.
     remote_leaf_open_counts: RwLock<HashMap<ContentId, usize>>,
+    remote_leaf_fetch: RemoteLeafFetch,
     max_t: i64,
     base_t: i64,
     language_tags: Vec<String>,
@@ -324,9 +411,38 @@ pub struct BinaryIndexStore {
     /// configuration (`set_ns_split_mode`, namespace augmentation), which
     /// cannot occur once the store is behind `Arc`.
     p_sid_table: std::sync::OnceLock<Arc<[Sid]>>,
+    /// Per persisted predicate, the subject id of its IRI, each resolved on
+    /// its first use. See [`Self::predicate_subject_id`].
+    pred_subject_ids: std::sync::OnceLock<Box<[std::sync::atomic::AtomicU64]>>,
+    /// Persisted `Sid → p_id`, built on first use from `p_sid_table`. See
+    /// [`Self::predicate_id_for_sid`].
+    p_id_by_sid: std::sync::OnceLock<PredicateIdsBySid>,
     /// Conclusive per-`(graph, predicate)` decimal-only proofs. Index contents
     /// are immutable per store, so a proof holds for the store's lifetime.
     decimal_only_proofs: RwLock<HashMap<(GraphId, u32), bool>>,
+    /// Per `(graph, predicate)` vector arena, its identity table, built on
+    /// first use. The store owns it, so it lives and dies with the store's
+    /// immutable arenas. See [`Self::vector_identity`].
+    vector_identities: RwLock<HashMap<(GraphId, u32), IdentityCell>>,
+    /// Identity tables this store has built.
+    #[cfg(test)]
+    identity_builds: std::sync::atomic::AtomicUsize,
+    /// The predicates with list rows, built on first use. See
+    /// [`Self::list_predicate_ids`].
+    list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
+    /// Per SPOT leaf, the subjects with list rows, sorted. See
+    /// [`Self::subject_holds_lists`].
+    leaf_list_subjects: RwLock<HashMap<ContentId, Arc<[u64]>>>,
+    /// Per graph, its list census. See [`Self::list_census`].
+    list_census: RwLock<HashMap<GraphId, Arc<HashMap<u32, ListCensus>>>>,
+}
+
+/// One predicate's compactly stored lists in a graph's index: the subjects
+/// holding members under it (one list each) and the members.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ListCensus {
+    pub lists: u64,
+    pub members: u64,
 }
 
 /// Lowercase the root's language tags, preserving position.
@@ -359,7 +475,7 @@ impl BinaryIndexStore {
     pub fn empty(cache_dir: PathBuf) -> Self {
         Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts: DictionarySet {
+            dicts: Arc::new(DictionarySet {
                 predicates: PredicateDict::new(),
                 predicate_reverse: HashMap::new(),
                 graphs_reverse: HashMap::new(),
@@ -374,18 +490,19 @@ impl BinaryIndexStore {
                 prefix_trie: Arc::new(PrefixTrie::new()),
                 language_tags: LanguageTagDict::new(),
                 dt_sids: Vec::new(),
-            },
+            }),
             graph_indexes: HashMap::new(),
             o_type_table: Vec::new(),
             o_type_index: HashMap::new(),
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             residency_mode: false,
             cas: None,
-            disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
+            _disk_cache: crate::read::artifact_cache::DiskArtifactCache::for_dir(&cache_dir),
             cache_dir,
             leaflet_cache: None,
             remote_leaf_metadata: RwLock::new(HashMap::new()),
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: RemoteLeafFetch::from_env(),
             max_t: 0,
             base_t: 0,
             language_tags: Vec::new(),
@@ -393,7 +510,15 @@ impl BinaryIndexStore {
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            identity_builds: std::sync::atomic::AtomicUsize::new(0),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         }
     }
 
@@ -447,7 +572,7 @@ impl BinaryIndexStore {
             root,
             cache_dir,
             leaflet_cache.as_ref(),
-            prev.map(|p| &p.dicts),
+            prev.map(|p| &*p.dicts),
         )
         .await?;
 
@@ -556,18 +681,22 @@ impl BinaryIndexStore {
         let disk_cache = super::artifact_cache::DiskArtifactCache::for_dir(cache_dir);
         Ok(Self {
             store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            dicts,
-            graph_indexes,
+            dicts: Arc::new(dicts),
+            graph_indexes: graph_indexes
+                .into_iter()
+                .map(|(g_id, gi)| (g_id, Arc::new(gi)))
+                .collect(),
             o_type_table,
             o_type_index,
             #[cfg(any(target_arch = "wasm32", feature = "residency"))]
             residency_mode: cs.miss_register().is_some(),
             cas: Some(cs),
             cache_dir: cache_dir.to_path_buf(),
-            disk_cache,
+            _disk_cache: disk_cache,
             leaflet_cache,
             remote_leaf_metadata: RwLock::new(HashMap::new()),
             remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: RemoteLeafFetch::from_env(),
             max_t: root.index_t,
             base_t: root.base_t,
             language_tags: normalize_root_lang_tags(&root.language_tags),
@@ -575,7 +704,15 @@ impl BinaryIndexStore {
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            identity_builds: std::sync::atomic::AtomicUsize::new(0),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
         })
     }
 
@@ -586,6 +723,12 @@ impl BinaryIndexStore {
     /// from-scratch store rebuild.
     pub fn store_id(&self) -> u64 {
         self.store_id
+    }
+
+    /// The dictionaries, to write in a test's hand-built store.
+    #[cfg(test)]
+    fn dicts_mut(&mut self) -> &mut DictionarySet {
+        Arc::get_mut(&mut self.dicts).expect("a test store does not share its dictionaries")
     }
 
     pub fn max_t(&self) -> i64 {
@@ -599,6 +742,10 @@ impl BinaryIndexStore {
     /// Set the ledger's split mode for canonical IRI encoding.
     ///
     /// Called after loading to sync with the snapshot's `ns_split_mode`.
+    pub fn set_remote_leaf_fetch(&mut self, policy: RemoteLeafFetch) {
+        self.remote_leaf_fetch = policy;
+    }
+
     pub fn set_ns_split_mode(&mut self, mode: NsSplitMode) {
         self.ns_split_mode = mode;
         self.ns_split_mode_set = true;
@@ -608,6 +755,75 @@ impl BinaryIndexStore {
     #[inline]
     pub fn lex_sorted_string_ids(&self) -> bool {
         self.lex_sorted_string_ids
+    }
+
+    /// This store less what it holds of `g_ids`: their branches, leaves and
+    /// arenas. Everything else — the dictionaries, the other graphs, the leaf
+    /// caches — is shared, so this costs a map clone, not a load.
+    ///
+    /// For a ledger that dropped those graphs after this store's `max_t`:
+    /// the index still holds their facts from before the drop, which no read
+    /// may return. Without an index of its own, a graph reads from novelty
+    /// alone, exactly as one created since the last index build does — so
+    /// every reader, scans, fast paths and arenas alike, sees what the drop
+    /// left without knowing about drops.
+    ///
+    /// The derived store gets its own id: a cache keyed by store id may hold
+    /// what this store read of the removed graphs.
+    pub fn without_graphs(&self, g_ids: &[GraphId]) -> Self {
+        // Short u16 slices scan cheaply, so keep those allocation-free.
+        // Large drops must not scan the list for every indexed graph
+        // (quadratic for DROP ALL); amortize the set over a large store too.
+        const LINEAR_DROP_LIMIT: usize = 512;
+        let dropped: Option<std::collections::HashSet<GraphId>> = (g_ids.len() > LINEAR_DROP_LIMIT
+            && self.graph_indexes.len() > LINEAR_DROP_LIMIT)
+            .then(|| g_ids.iter().copied().collect());
+        Self {
+            store_id: NEXT_STORE_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            dicts: Arc::clone(&self.dicts),
+            graph_indexes: self
+                .graph_indexes
+                .iter()
+                .filter(|(g_id, _)| {
+                    !dropped
+                        .as_ref()
+                        .map_or_else(|| g_ids.contains(g_id), |ids| ids.contains(*g_id))
+                })
+                .map(|(g_id, gi)| (*g_id, Arc::clone(gi)))
+                .collect(),
+            o_type_table: self.o_type_table.clone(),
+            o_type_index: self.o_type_index.clone(),
+            #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+            residency_mode: self.residency_mode,
+            cas: self.cas.clone(),
+            cache_dir: self.cache_dir.clone(),
+            _disk_cache: Arc::clone(&self._disk_cache),
+            leaflet_cache: self.leaflet_cache.clone(),
+            remote_leaf_metadata: RwLock::new(HashMap::new()),
+            remote_leaf_open_counts: RwLock::new(HashMap::new()),
+            remote_leaf_fetch: self.remote_leaf_fetch,
+            max_t: self.max_t,
+            base_t: self.base_t,
+            language_tags: self.language_tags.clone(),
+            lex_sorted_string_ids: self.lex_sorted_string_ids,
+            ns_split_mode: self.ns_split_mode,
+            ns_split_mode_set: self.ns_split_mode_set,
+            p_sid_table: std::sync::OnceLock::new(),
+            pred_subject_ids: std::sync::OnceLock::new(),
+            p_id_by_sid: std::sync::OnceLock::new(),
+            decimal_only_proofs: RwLock::new(HashMap::new()),
+            vector_identities: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            identity_builds: std::sync::atomic::AtomicUsize::new(0),
+            list_predicate_ids: std::sync::OnceLock::new(),
+            leaf_list_subjects: RwLock::new(HashMap::new()),
+            list_census: RwLock::new(HashMap::new()),
+        }
+    }
+
+    /// Whether this store holds an index (branches or arenas) for `g_id`.
+    pub fn has_graph_index(&self, g_id: GraphId) -> bool {
+        self.graph_indexes.contains_key(&g_id)
     }
 
     /// Get the branch manifest for a graph + sort order.
@@ -655,9 +871,10 @@ impl BinaryIndexStore {
     /// comparator the read path uses, so the warmed leaves are exactly those the
     /// scan reads. Only warms the disk cache — results are byte-identical.
     ///
-    /// Remote-only: no CAS, or leaves that resolve to a local path, are skipped
-    /// (a local read is already cheap). Bounded by the shared `budget`; per-leaf
-    /// failures are logged and ignored — the scan fetches them the old way.
+    /// Only for a store the disk cache serves (see `uses_disk_cache`); leaves
+    /// that resolve to a local path are skipped too (a local read is already
+    /// cheap). Bounded by the shared `budget`; per-leaf failures are logged
+    /// and ignored — the scan fetches them the old way.
     pub async fn prefetch_leaves_for_range(
         &self,
         g_id: GraphId,
@@ -672,6 +889,9 @@ impl BinaryIndexStore {
         let Some(cs) = self.cas.as_ref() else {
             return;
         };
+        if !uses_disk_cache(cs.as_ref()) {
+            return;
+        }
         let Some(branch) = self.branch_for_order(g_id, order) else {
             return;
         };
@@ -938,9 +1158,11 @@ impl BinaryIndexStore {
         if let Some(cs) = self.cas.as_ref() {
             let leaf_id = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
             let mut local = cs.resolve_local_path(leaf_cid);
-            let promoted = self.cache_dir.join(leaf_cid.to_string());
-            if local.is_none() && promoted.exists() {
-                local = Some(promoted);
+            if local.is_none() && uses_disk_cache(cs.as_ref()) {
+                let promoted = self.cache_dir.join(leaf_cid.to_string());
+                if promoted.exists() {
+                    local = Some(promoted);
+                }
             }
             if let Some(path) = local {
                 let load = || -> io::Result<Arc<memmap2::Mmap>> {
@@ -961,6 +1183,9 @@ impl BinaryIndexStore {
                     Err(err) if err.kind() == io::ErrorKind::NotFound => {}
                     Err(err) => return Err(err),
                 }
+            }
+            if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+                return Ok(SharedLeafBytes::Shared(bytes));
             }
         }
         self.get_leaf_bytes_sync(leaf_cid)
@@ -998,40 +1223,39 @@ impl BinaryIndexStore {
             }
         }
 
-        // Check cache.
-        let cache_path = self.cache_dir.join(leaf_cid.to_string());
-        match std::fs::read(&cache_path) {
-            Ok(bytes) => return Ok(bytes),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+        // Bytes the store holds in memory: one copy into the owned buffer
+        // this returns. The shared readers borrow them instead.
+        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+            return Ok(bytes.to_vec());
         }
 
-        // Fetch from CAS via sync bridge: capture the Tokio handle on the caller's
-        // sync bridge: run the async CAS request without deadlocking current-thread runtimes.
+        self.fetch_remote_leaf_whole(cs, leaf_cid)
+    }
+
+    /// The whole leaf through the disk cache: a cached copy when present,
+    /// else one store GET persisted there, shared by concurrent callers.
+    /// Stores the cache must not serve are read directly, still coalesced.
+    fn fetch_remote_leaf_whole(
+        &self,
+        cs: &Arc<dyn ContentStore>,
+        leaf_cid: &ContentId,
+    ) -> io::Result<Vec<u8>> {
         let cs = Arc::clone(cs);
         let cid = leaf_cid.clone();
-        let cache_path_owned = cache_path.clone();
-        let disk_cache = Arc::clone(&self.disk_cache);
+        let cache_dir = self.cache_dir.clone();
         let timeout = cas_sync_timeout();
         run_sync_on_runtime(async move {
-            let fut = cs.get(&cid);
-            let data = if let Some(dur) = timeout {
-                tokio::time::timeout(dur, fut)
-                    .await
-                    .map_err(|_| {
-                        io::Error::other(format!(
-                            "CAS fetch timed out after {}ms (cid={})",
-                            dur.as_millis(),
-                            cid
-                        ))
-                    })?
-                    .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))?
-            } else {
-                fut.await
-                    .map_err(|e| io::Error::other(format!("CAS fetch failed: {e}")))?
-            };
-            disk_cache.best_effort_write(&cache_path_owned, &data);
-            Ok(data)
+            let fut = fetch_cached_bytes_cid(cs.as_ref(), &cid, &cache_dir);
+            match timeout {
+                Some(dur) => tokio::time::timeout(dur, fut).await.map_err(|_| {
+                    io::Error::other(format!(
+                        "CAS fetch timed out after {}ms (cid={})",
+                        dur.as_millis(),
+                        cid
+                    ))
+                })?,
+                None => fut.await,
+            }
         })
     }
 
@@ -1040,6 +1264,8 @@ impl BinaryIndexStore {
     /// Open a leaf for reading, choosing the optimal access strategy.
     ///
     /// - Local filesystem: returns `FullBlobLeafHandle` (OS page cache is optimal)
+    /// - Held in memory by the store: returns `SharedBlobLeafHandle` (borrowed,
+    ///   no copy)
     /// - Cached locally: returns `FullBlobLeafHandle` (read from disk cache)
     /// - Remote (S3/etc): returns `RangeReadLeafHandle` (header+dir only, lazy
     ///   column fetch via byte-range reads)
@@ -1053,7 +1279,21 @@ impl BinaryIndexStore {
         if self.residency_mode() {
             return self.open_resident_leaf_handle(leaf_cid, sidecar_cid, need_replay);
         }
-        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay)
+        self.open_leaf_handle_native(leaf_cid, sidecar_cid, need_replay, self.remote_leaf_fetch)
+    }
+
+    /// [`Self::open_leaf_handle`] for reading a few leaflets' columns: a
+    /// remote leaf is range-read whatever [`RemoteLeafFetch`] the store uses,
+    /// so a walk that reads one leaflet in many leaves fetches no whole leaf.
+    pub fn open_leaf_handle_ranged(
+        &self,
+        leaf_cid: &ContentId,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        if self.residency_mode() {
+            return self.open_resident_leaf_handle(leaf_cid, None, false);
+        }
+        self.open_leaf_handle_native(leaf_cid, None, false, RemoteLeafFetch::Ranged)
     }
 
     /// Residency-mode leaf open: whole leaf (and sidecar when replaying)
@@ -1087,6 +1327,7 @@ impl BinaryIndexStore {
         leaf_cid: &ContentId,
         sidecar_cid: Option<&ContentId>,
         need_replay: bool,
+        remote_fetch: RemoteLeafFetch,
     ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
         use super::leaf_access::{
             fetch_header_and_directory, FullBlobLeafHandle, RangeReadLeafHandle,
@@ -1119,13 +1360,28 @@ impl BinaryIndexStore {
             return self.open_mmapped_leaf(&local_path, leaf_id, sidecar_cid, need_replay);
         }
 
+        // Fast path 1b: the store holds the bytes in memory — borrow them,
+        // with the directory shared through the cache as for a mapped leaf.
+        if let Some(bytes) = cs.resolve_cached_bytes(leaf_cid) {
+            return self.leaf_handle_from_resident(bytes, leaf_id, sidecar_cid, need_replay);
+        }
+
         // Fast path 2: locally cached (remote-promoted) — same mmap path; a
         // missing cache file falls through to the range-read paths below.
-        let cache_path = self.cache_dir.join(leaf_cid.to_string());
-        match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
-            Ok(handle) => return Ok(handle),
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err),
+        // Skipped for a store the cache does not serve.
+        if uses_disk_cache(cs.as_ref()) {
+            let cache_path = self.cache_dir.join(leaf_cid.to_string());
+            match self.open_mmapped_leaf(&cache_path, leaf_id, sidecar_cid, need_replay) {
+                Ok(handle) => return Ok(handle),
+                Err(err) if err.kind() == io::ErrorKind::NotFound => {}
+                Err(err) => return Err(err),
+            }
+        }
+
+        if remote_fetch == RemoteLeafFetch::Whole {
+            tracing::debug!(leaf = %leaf_cid, need_replay, source = "remote_whole", "binary leaf open");
+            let bytes = self.fetch_remote_leaf_whole(cs, leaf_cid)?;
+            return self.leaf_handle_from_resident(bytes.into(), leaf_id, sidecar_cid, need_replay);
         }
 
         let touch_count = self.note_remote_leaf_open(leaf_cid);
@@ -1178,10 +1434,13 @@ impl BinaryIndexStore {
             self.cache_dir.clone(),
         ));
 
-        let (dir, payload_base) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
+        let (dir, payload_base, whole) = fetch_header_and_directory(fetcher.as_ref(), leaf_cid)?;
         self.remote_leaf_metadata
             .write()
             .insert(leaf_cid.clone(), dir.clone());
+        if let Some(bytes) = whole {
+            return self.leaf_handle_from_resident(bytes.into(), leaf_id, sidecar_cid, need_replay);
+        }
 
         let sc_cid = if need_replay {
             sidecar_cid.cloned()
@@ -1271,6 +1530,34 @@ impl BinaryIndexStore {
         )))
     }
 
+    /// Build the handle for a leaf whose bytes the store holds in memory,
+    /// sharing the decoded directory through the cache.
+    fn leaf_handle_from_resident(
+        &self,
+        bytes: Arc<[u8]>,
+        leaf_id: u128,
+        sidecar_cid: Option<&ContentId>,
+        need_replay: bool,
+    ) -> io::Result<Box<dyn super::leaf_access::LeafHandle>> {
+        let decode = || {
+            let header = crate::format::leaf::decode_leaf_header_v3(&bytes)?;
+            crate::format::leaf::decode_leaf_dir_v3_with_base(&bytes, &header).map(Arc::new)
+        };
+        let dir = if let Some(cache) = &self.leaflet_cache {
+            cache.try_get_or_load_leaf_dir(leaf_id, decode)?
+        } else {
+            decode()?
+        };
+        let sidecar = if need_replay {
+            self.fetch_sidecar_bytes_sync(sidecar_cid)?.map(Arc::from)
+        } else {
+            None
+        };
+        Ok(Box::new(
+            super::leaf_access::SharedBlobLeafHandle::with_dir(bytes, dir, sidecar, leaf_id),
+        ))
+    }
+
     /// Callers that may need `load_columns` must use [`Self::open_leaf_handle`].
     pub fn open_leaf_dir(&self, leaf_cid: &ContentId) -> io::Result<Arc<DecodedLeafDirV3>> {
         let key = xxhash_rust::xxh3::xxh3_128(leaf_cid.to_bytes().as_ref());
@@ -1291,8 +1578,7 @@ impl BinaryIndexStore {
             .as_ref()
             .ok_or_else(|| io::Error::other("no content store"))?;
         let fetcher = ContentStoreRangeFetcher::new(Arc::clone(cs), self.cache_dir.clone());
-        let (dir, _payload_base) =
-            super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
+        let (dir, _, _) = super::leaf_access::fetch_header_and_directory(&fetcher, leaf_cid)?;
         Ok(Arc::new(dir))
     }
 
@@ -1423,16 +1709,22 @@ impl BinaryIndexStore {
                 Ok(FlakeValue::Ref(Sid::new(0, &bnode_iri)))
             }
             DecodeKind::IriRef => {
-                let iri = self.resolve_subject_iri(o_key).map_err(|e| {
-                    tracing::debug!(
-                        g_id,
-                        o_key,
-                        error = %e,
-                        "binary index failed to resolve IRI ref subject"
-                    );
-                    e
-                })?;
-                Ok(FlakeValue::Ref(self.encode_iri(&iri)))
+                // Decoded as a subject is: re-encoding the IRI through the
+                // namespace table would give an OVERFLOW subject the EMPTY
+                // code, a Sid no stored fact has.
+                let sid = self
+                    .resolve_subject_parts(o_key)
+                    .and_then(|(ns_code, suffix)| self.subject_sid_of_parts(ns_code, suffix))
+                    .map_err(|e| {
+                        tracing::debug!(
+                            g_id,
+                            o_key,
+                            error = %e,
+                            "binary index failed to resolve IRI ref subject"
+                        );
+                        e
+                    })?;
+                Ok(FlakeValue::Ref(sid))
             }
             DecodeKind::StringDict => {
                 let s = self.resolve_string_value(o_key as u32).map_err(|e| {
@@ -1532,6 +1824,25 @@ impl BinaryIndexStore {
             None => return Ok(None),
         };
         arena.lookup_vector(handle)
+    }
+
+    /// The length of `(g_id, p_id)`'s vectors, from the arena manifest (no
+    /// shard is loaded). `None` when the predicate has no vectors in `g_id`.
+    pub fn vector_dims(&self, g_id: GraphId, p_id: u32) -> Option<u16> {
+        self.graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+            .map(crate::arena::vector::LazyVectorArena::dims)
+            .filter(|&dims| dims != 0)
+    }
+
+    /// Whether any predicate of `g_id` has a vector arena, whose object keys
+    /// are not value identities even within the predicate
+    /// (`OType::o_key_is_predicate_identifying`).
+    pub fn graph_holds_vectors(&self, g_id: GraphId) -> bool {
+        self.graph_indexes
+            .get(&g_id)
+            .is_some_and(|gi| !gi.vectors.is_empty())
     }
 
     /// Pin all of `(g_id, p_id)`'s vector shards for direct scan access.
@@ -1879,26 +2190,100 @@ impl BinaryIndexStore {
         })
     }
 
+    /// The persisted subject id of predicate `p_id`'s IRI: `Some` when that
+    /// IRI is also a subject or a ref object in this index, `None` when it is
+    /// only ever a predicate (or `p_id` is not a persisted predicate).
+    ///
+    /// One IRI is encoded twice: as an `EncodedPid` where a pattern reaches it
+    /// in predicate position, as an `EncodedSid` where it is a subject or
+    /// object. Equality surfaces map the first onto the second through this on
+    /// every predicate-valued key, so it must cost a load, not a dictionary
+    /// lookup. Each predicate resolves on its own first use, so a query pays
+    /// one dictionary lookup per predicate it meets, never one per predicate
+    /// the index holds. A dictionary I/O error is reported as `None` and not
+    /// memoized.
+    #[inline]
+    pub fn predicate_subject_id(&self, p_id: u32) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let slot = self
+            .pred_subject_ids
+            .get()
+            .and_then(|slots| slots.get(p_id as usize));
+        if let Some(slot) = slot {
+            match slot.load(Ordering::Relaxed) {
+                PREDICATE_NOT_A_SUBJECT => return None,
+                PREDICATE_SUBJECT_UNRESOLVED => {}
+                s_id => return Some(s_id),
+            }
+        }
+        self.predicate_subject_id_slow(p_id)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn predicate_subject_id_slow(&self, p_id: u32) -> Option<u64> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let slot = self
+            .pred_subject_ids
+            .get_or_init(|| {
+                (0..self.p_sid_table().len())
+                    .map(|_| AtomicU64::new(PREDICATE_SUBJECT_UNRESOLVED))
+                    .collect()
+            })
+            .get(p_id as usize)?;
+        let sid = &self.p_sid_table()[p_id as usize];
+        match self.find_subject_id_by_parts(sid.namespace_code, &sid.name) {
+            Ok(found) => {
+                // A subject id is a namespace code and a local id below the
+                // two sentinels; one that is not is answered unmemoized.
+                match found {
+                    None => slot.store(PREDICATE_NOT_A_SUBJECT, Ordering::Relaxed),
+                    Some(s_id) if s_id < PREDICATE_NOT_A_SUBJECT => {
+                        slot.store(s_id, Ordering::Relaxed);
+                    }
+                    Some(_) => {}
+                }
+                found
+            }
+            Err(e) => {
+                tracing::debug!(p_id, error = %e, "predicate subject id lookup failed");
+                None
+            }
+        }
+    }
+
+    /// The persisted `p_id` of a predicate IRI given as a canonical `Sid`,
+    /// without building its IRI string — the per-row form of
+    /// [`Self::sid_to_p_id`]. An IRI in no predicate's namespace answers on a
+    /// bit test.
+    #[inline]
+    pub fn predicate_id_for_sid(&self, sid: &Sid) -> Option<u32> {
+        self.p_id_by_sid
+            .get_or_init(|| PredicateIdsBySid::new(self.p_sid_table()))
+            .get(sid)
+    }
+
     /// Lookup a predicate IRI → p_id.
     pub fn find_predicate_id(&self, iri: &str) -> Option<u32> {
         self.dicts.predicate_reverse.get(iri).copied()
     }
 
-    /// Encode an IRI to a namespaced `Sid` using canonical splitting and exact-prefix lookup.
-    ///
-    /// Uses `canonical_split` + exact-prefix lookup via reverse map. If the
-    /// canonical prefix is not registered, returns `Sid(EMPTY, iri)`.
-    /// No longest-prefix-match — canonical encoding prohibits `starts_with` matching.
+    /// Encode an IRI to a namespaced `Sid` using canonical splitting and
+    /// exact-prefix lookup, per [`encode_registered`]: an IRI whose prefix has
+    /// no code is `Sid(OVERFLOW, iri)` once the table is full, else
+    /// `Sid(EMPTY, iri)`. No longest-prefix-match — canonical encoding
+    /// prohibits `starts_with` matching.
     pub fn encode_iri(&self, iri: &str) -> Sid {
         debug_assert!(
             self.ns_split_mode_set,
             "BinaryIndexStore::encode_iri called before ns_split_mode was set"
         );
-        let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
-        if let Some(&code) = self.dicts.namespace_reverse.get(canonical_prefix) {
-            return Sid::new(code, canonical_suffix);
-        }
-        Sid::new(0, iri)
+        encode_registered(
+            iri,
+            self.ns_split_mode,
+            |prefix| self.dicts.namespace_reverse.get(prefix).copied(),
+            || table_full(&self.dicts.namespace_codes),
+        )
     }
 
     /// Resolve language ID to BCP 47 tag string.
@@ -2033,6 +2418,23 @@ impl BinaryIndexStore {
             .or_else(|| val.overflow_numeric_datatype_sid())
     }
 
+    /// Resolve the datatype Sid of a decoded `EncodedLit` — the `dt_id`-keyed
+    /// twin of [`resolve_datatype_sid_for_value`].
+    ///
+    /// Every NUM_BIG `EncodedLit` carries `dt_id = DECIMAL`, because the scan
+    /// cannot tell an overflow `xsd:integer` from an `xsd:decimal` without
+    /// decoding. The decoded value's variant therefore wins over `dt_id`. Any
+    /// site that turns a decoded `EncodedLit` into a typed term must resolve
+    /// its datatype here; one that reads `dt_sids()` directly reports overflow
+    /// integers as `xsd:decimal` and keys them apart from decoded copies of
+    /// the same value (issue #1329).
+    ///
+    /// [`resolve_datatype_sid_for_value`]: Self::resolve_datatype_sid_for_value
+    pub fn resolve_dt_id_sid_for_value(&self, dt_id: u16, val: &FlakeValue) -> Option<Sid> {
+        val.overflow_numeric_datatype_sid()
+            .or_else(|| self.dt_sids().get(dt_id as usize).cloned())
+    }
+
     /// Look up an o_type table entry by o_type value. O(1).
     pub fn lookup_o_type(&self, o_type: u16) -> Option<&OTypeTableEntry> {
         self.o_type_index
@@ -2111,6 +2513,44 @@ impl BinaryIndexStore {
         Ok(self
             .find_full_iri_subject_fallback(iri)?
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
+    }
+
+    /// The `Sid` of a persisted subject stored as `(ns_code, suffix)`.
+    ///
+    /// An OVERFLOW subject's parts are its `Sid`: a lookup by its IRI tries
+    /// EMPTY first, and could name another subject holding the same IRI there
+    /// (#2138) instead of the one stored here. Any other subject takes what
+    /// [`Self::find_subject_sid`] gives for its IRI, else [`Self::encode_iri`].
+    ///
+    /// When the canonical split of the IRI is exactly the parts the subject is
+    /// stored under, they are the answer: the reverse dictionary holds that
+    /// key, so the lookup `find_subject_sid` would make returns them. An EMPTY
+    /// subject, or a split the current rules do not produce, takes the lookup.
+    pub fn subject_sid_of_parts(&self, ns_code: u16, suffix: String) -> io::Result<Sid> {
+        if ns_code == namespaces::OVERFLOW {
+            return Ok(Sid::new(ns_code, suffix));
+        }
+        if namespaces::is_full_iri(ns_code) {
+            return Ok(self
+                .find_subject_sid(&suffix)?
+                .unwrap_or_else(|| self.encode_iri(&suffix)));
+        }
+        let prefix = self.dicts.namespace_codes.get(&ns_code).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no namespace prefix for code={ns_code}"),
+            )
+        })?;
+        let iri = format!("{prefix}{suffix}");
+        let (canonical_prefix, canonical_suffix) = canonical_split(&iri, self.ns_split_mode);
+        if canonical_suffix == suffix
+            && self.dicts.namespace_reverse.get(canonical_prefix) == Some(&ns_code)
+        {
+            return Ok(Sid::new(ns_code, suffix));
+        }
+        Ok(self
+            .find_subject_sid(&iri)?
+            .unwrap_or_else(|| self.encode_iri(&iri)))
     }
 
     /// Translate a `Sid` to `p_id` via the predicate reverse map.
@@ -2204,6 +2644,121 @@ impl BinaryIndexStore {
             .is_some_and(crate::arena::numbig::NumBigArena::is_decimal_only)
     }
 
+    /// Whether `(g_id, p_id)`'s object keys name values one to one, so a
+    /// consumer may count or group the predicate's objects by their raw
+    /// `(o_type, o_key)`. Two arenas can break that within one predicate: a
+    /// vector arena, which gives every stored fact its own handle
+    /// (`OType::o_key_is_predicate_identifying`), unless it holds no value
+    /// twice ([`Self::vector_handles_name_values`]); and a legacy NumBig arena
+    /// with scale-variant duplicates
+    /// ([`Self::graph_numbig_has_duplicate_handles`]).
+    pub fn objects_keyed_by_value(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+        let Some(gi) = self.graph_indexes.get(&g_id) else {
+            return Ok(true);
+        };
+        if gi
+            .numbig
+            .get(&p_id)
+            .is_some_and(crate::arena::numbig::NumBigArena::has_duplicate_handles)
+        {
+            return Ok(false);
+        }
+        self.vector_handles_name_values(g_id, p_id)
+    }
+
+    /// Whether `(g_id, p_id)`'s vector arena holds no value twice, so within
+    /// the predicate a vector's handle names its value. True without an
+    /// arena. Builds the arena's [identity table](Self::vector_identity) if
+    /// it isn't built yet. This certifies the persisted arena only: a caller
+    /// that also reads novelty must not rely on it unless it merges novelty
+    /// by value.
+    pub fn vector_handles_name_values(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+        Ok(self
+            .vector_identity(g_id, p_id)?
+            .is_none_or(|identity| identity.duplicate_free))
+    }
+
+    /// `(g_id, p_id)`'s vector identity table, built on first use: one pass
+    /// that hashes every vector in the arena (shards read without entering
+    /// the shared cache), then compares the vectors of any hash that repeats.
+    /// `None` without an arena. The arena is immutable for the store's
+    /// lifetime, so the table is too. It is built once: concurrent first
+    /// callers wait on that build rather than each read the arena, and a
+    /// build that fails leaves it to the next caller.
+    pub fn vector_identity(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+    ) -> io::Result<Option<Arc<VectorIdentity>>> {
+        let Some(arena) = self
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        if let Some(built) = self.built_vector_identity(g_id, p_id) {
+            return Ok(Some(built));
+        }
+        let cell = Arc::clone(
+            self.vector_identities
+                .write()
+                .entry((g_id, p_id))
+                .or_default(),
+        );
+        let identity = cell.get_or_try_init(|| {
+            #[cfg(test)]
+            self.identity_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            VectorIdentity::build(arena).map(Arc::new)
+        })?;
+        Ok(Some(Arc::clone(identity)))
+    }
+
+    /// `(g_id, p_id)`'s vector identity table if something has built it;
+    /// never builds it.
+    pub fn built_vector_identity(&self, g_id: GraphId, p_id: u32) -> Option<Arc<VectorIdentity>> {
+        self.vector_identities
+            .read()
+            .get(&(g_id, p_id))
+            .and_then(|cell| cell.get().cloned())
+    }
+
+    /// Whether any NumBig arena of `g_id` holds one value under several
+    /// handles: a legacy pre-normalization arena, where `1.5` and `1.50` kept
+    /// a handle each. Its rows are then not one key per value even within a
+    /// predicate, so a consumer that relies on that declines.
+    pub fn graph_numbig_has_duplicate_handles(&self, g_id: GraphId) -> bool {
+        self.numbig_arenas(g_id)
+            .any(|(_, arena)| arena.has_duplicate_handles())
+    }
+
+    /// Install `arena` as `(g_id, p_id)`'s NumBig arena. For tests that need
+    /// an arena shape no current build writes, such as a legacy arena with
+    /// scale-variant duplicates.
+    #[doc(hidden)]
+    pub fn set_numbig_arena_for_test(
+        &mut self,
+        g_id: GraphId,
+        p_id: u32,
+        arena: crate::arena::numbig::NumBigArena,
+    ) {
+        let gi = self.graph_indexes.entry(g_id).or_insert_with(|| {
+            Arc::new(GraphIndex {
+                orders: HashMap::new(),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            })
+        });
+        Arc::get_mut(gi)
+            .expect("set_numbig_arena_for_test on a store whose graph index is shared")
+            .numbig
+            .insert(p_id, arena);
+    }
+
     /// Memoizes `prove` per `(graph, predicate)`. An inconclusive (`None`)
     /// proof is not cached, so a transient read failure is retried later.
     pub fn memoized_decimal_only_proof(
@@ -2220,6 +2775,205 @@ impl BinaryIndexStore {
             .write()
             .insert((g_id, p_id), proven);
         Some(proven)
+    }
+
+    /// The predicates with list rows (`o_i`, an RDF-list position) in any
+    /// graph, read from POST leaflet directories once per store: the index is
+    /// immutable, so the set holds for the store's lifetime. Only directories
+    /// are read, except that a list-bearing leaflet spanning several
+    /// predicates has its predicate and position columns range-read; no whole
+    /// leaf is fetched. Concurrent first callers may each walk the branch.
+    pub fn list_predicate_ids(&self) -> io::Result<Arc<std::collections::HashSet<u32>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(ids) = self.list_predicate_ids.get() {
+            return Ok(Arc::clone(ids));
+        }
+        let mut ids = std::collections::HashSet::new();
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::PId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        for g_id in self.graph_ids() {
+            let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Post) else {
+                continue;
+            };
+            for leaf in &branch.leaves {
+                let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                let mut handle = None;
+                for (idx, entry) in dir.entries.iter().enumerate() {
+                    if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                        continue;
+                    }
+                    if let Some(p_id) = entry.p_const {
+                        ids.insert(p_id);
+                        continue;
+                    }
+                    let handle = match &mut handle {
+                        Some(handle) => handle,
+                        None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                    };
+                    let batch = handle.load_columns(idx, &projection, RunSortOrder::Post)?;
+                    for row in 0..batch.row_count {
+                        if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                            ids.insert(batch.p_id.get_or(row, 0));
+                        }
+                    }
+                }
+            }
+        }
+        let ids = Arc::new(ids);
+        let _ = self.list_predicate_ids.set(Arc::clone(&ids));
+        Ok(ids)
+    }
+
+    /// Graph `g_id`'s compactly stored lists, per predicate holding them, as
+    /// of the index: read once per graph for the store's life from the PSOT
+    /// leaflets of [`Self::list_predicate_ids`] flagged as holding list rows.
+    /// PSOT sorts a predicate's rows by subject, so each run of a subject's
+    /// members is one list.
+    pub fn list_census(&self, g_id: GraphId) -> io::Result<Arc<HashMap<u32, ListCensus>>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(census) = self.list_census.read().get(&g_id) {
+            return Ok(Arc::clone(census));
+        }
+        let mut census: HashMap<u32, ListCensus> = HashMap::new();
+        if let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Psot) {
+            let mut columns = ColumnSet::EMPTY;
+            for column in [ColumnId::SId, ColumnId::PId, ColumnId::OI] {
+                columns.insert(column);
+            }
+            let projection = ColumnProjection {
+                output: columns,
+                internal: ColumnSet::EMPTY,
+            };
+            for &p_id in self.list_predicate_ids()?.iter() {
+                let mut found = ListCensus::default();
+                let mut last_owner = None;
+                let leaves = branch
+                    .leaves
+                    .iter()
+                    .filter(|leaf| leaf.first_key.p_id <= p_id && p_id <= leaf.last_key.p_id);
+                for leaf in leaves {
+                    let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+                    let mut handle = None;
+                    for (idx, entry) in dir.entries.iter().enumerate() {
+                        if entry.row_count == 0
+                            || entry.flags & HAS_O_I == 0
+                            || entry.p_const.is_some_and(|p| p != p_id)
+                        {
+                            continue;
+                        }
+                        let handle = match &mut handle {
+                            Some(handle) => handle,
+                            None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+                        };
+                        let batch = handle.load_columns(idx, &projection, RunSortOrder::Psot)?;
+                        for row in 0..batch.row_count {
+                            if batch.p_id.get_or(row, p_id) != p_id
+                                || batch.o_i.get_or(row, LIST_INDEX_NONE) == LIST_INDEX_NONE
+                            {
+                                continue;
+                            }
+                            found.members += 1;
+                            let owner = batch.s_id.get(row);
+                            if last_owner != Some(owner) {
+                                found.lists += 1;
+                                last_owner = Some(owner);
+                            }
+                        }
+                    }
+                }
+                if found.members > 0 {
+                    census.insert(p_id, found);
+                }
+            }
+        }
+        let census = Arc::new(census);
+        self.list_census.write().insert(g_id, Arc::clone(&census));
+        Ok(census)
+    }
+
+    /// Whether subject `s_id` has list rows in graph `g_id`'s index. Reads
+    /// the directories of the SPOT leaves holding its rows and, once per leaf
+    /// for the store's life, the subject and position columns of a leaflet
+    /// flagged as holding list rows.
+    pub fn subject_holds_lists(&self, g_id: GraphId, s_id: u64) -> io::Result<bool> {
+        let Some(branch) = self.branch_for_order(g_id, RunSortOrder::Spot) else {
+            return Ok(false);
+        };
+        for leaf in &branch.leaves[branch.find_leaves_for_subject(s_id)] {
+            if self.leaf_list_subjects(leaf)?.binary_search(&s_id).is_ok() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The subjects with list rows in SPOT leaf `leaf`, sorted.
+    fn leaf_list_subjects(
+        &self,
+        leaf: &crate::format::branch::LeafEntry,
+    ) -> io::Result<Arc<[u64]>> {
+        use crate::format::column_block::ColumnId;
+        use crate::format::leaflet::flags::HAS_O_I;
+        use crate::format::run_record::LIST_INDEX_NONE;
+        use crate::read::column_types::{ColumnProjection, ColumnSet};
+
+        if let Some(subjects) = self.leaf_list_subjects.read().get(&leaf.leaf_cid) {
+            return Ok(Arc::clone(subjects));
+        }
+        let dir = self.open_leaf_dir(&leaf.leaf_cid)?;
+        let mut columns = ColumnSet::EMPTY;
+        columns.insert(ColumnId::SId);
+        columns.insert(ColumnId::OI);
+        let projection = ColumnProjection {
+            output: columns,
+            internal: ColumnSet::EMPTY,
+        };
+        let mut subjects = Vec::new();
+        let mut handle = None;
+        for (idx, entry) in dir.entries.iter().enumerate() {
+            if entry.row_count == 0 || entry.flags & HAS_O_I == 0 {
+                continue;
+            }
+            let handle = match &mut handle {
+                Some(handle) => handle,
+                None => handle.insert(self.open_leaf_handle_ranged(&leaf.leaf_cid)?),
+            };
+            let batch = handle.load_columns(idx, &projection, RunSortOrder::Spot)?;
+            for row in 0..batch.row_count {
+                if batch.o_i.get_or(row, LIST_INDEX_NONE) != LIST_INDEX_NONE {
+                    subjects.push(batch.s_id.get(row));
+                }
+            }
+        }
+        subjects.sort_unstable();
+        subjects.dedup();
+        let subjects: Arc<[u64]> = subjects.into();
+        self.leaf_list_subjects
+            .write()
+            .insert(leaf.leaf_cid.clone(), Arc::clone(&subjects));
+        Ok(subjects)
+    }
+
+    /// Subject IRI → id lookups since load that searched a dictionary leaf.
+    #[cfg(feature = "test-counters")]
+    pub fn subject_reverse_leaf_lookups(&self) -> u64 {
+        self.dicts
+            .subject_reverse_tree
+            .as_ref()
+            .map_or(0, |tree| tree.leaf_lookups())
     }
 
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
@@ -2387,9 +3141,14 @@ impl BinaryIndexStore {
         // be shared with the previous store; `make_mut` unshares only when
         // there is something to add.
         if !new_entries.is_empty() {
-            let codes = Arc::make_mut(&mut self.dicts.namespace_codes);
-            let trie = Arc::make_mut(&mut self.dicts.prefix_trie);
-            let reverse = Arc::make_mut(&mut self.dicts.namespace_reverse);
+            // A store shares its dictionaries only with the stores derived
+            // from it once it was loaded, and loading is where it is augmented.
+            let dicts = Arc::get_mut(&mut self.dicts).ok_or_else(|| {
+                io::Error::other("cannot augment the namespaces of a derived index store")
+            })?;
+            let codes = Arc::make_mut(&mut dicts.namespace_codes);
+            let trie = Arc::make_mut(&mut dicts.prefix_trie);
+            let reverse = Arc::make_mut(&mut dicts.namespace_reverse);
             for (code, prefix) in new_entries {
                 codes.insert(code, prefix.clone());
                 if !prefix.is_empty() {
@@ -2464,7 +3223,7 @@ impl BinaryIndexStore {
     }
 
     /// Lookup graph IRI → `GraphId`. Returns `None` if the IRI is not known.
-    pub fn graph_id_for_iri(&self, iri: &str) -> Option<GraphId> {
+    pub fn assigned_graph_id(&self, iri: &str) -> Option<GraphId> {
         self.dicts.graphs_reverse.get(iri).copied()
     }
 
@@ -2692,7 +3451,326 @@ impl NsLookup for BinaryIndexStore {
 // BinaryGraphView — graph-scoped wrapper
 // ============================================================================
 
-/// Graph-scoped view for V6 store. Binds a specific `g_id` for value decoding.
+/// A vector arena's identity table, built at most once
+/// ([`BinaryIndexStore::vector_identity`]).
+type IdentityCell = Arc<once_cell::sync::OnceCell<Arc<VectorIdentity>>>;
+
+/// One vector arena's identity table: per handle, the hash of its value
+/// ([`fluree_db_core::value::vector_value_hash_f32`], the same function a
+/// decoded vector's key hashes with) and its canonical handle, the lowest
+/// handle holding an equal vector. 12 bytes per handle; it holds no shards.
+pub struct VectorIdentity {
+    hashes: Box<[u64]>,
+    canonical: Box<[u32]>,
+    duplicate_free: bool,
+}
+
+impl VectorIdentity {
+    fn build(arena: &crate::arena::vector::LazyVectorArena) -> io::Result<Self> {
+        let len = arena.len() as usize;
+        let mut hashes = vec![0u64; len];
+        let mut canonical: Vec<u32> = (0..len as u32).collect();
+        let mut by_hash: Vec<(u64, u32)> = Vec::with_capacity(len);
+        arena.scan_all(|handle, components| {
+            let hash = fluree_db_core::value::vector_value_hash_f32(components);
+            if let Some(slot) = hashes.get_mut(handle as usize) {
+                *slot = hash;
+                by_hash.push((hash, handle));
+            }
+            std::ops::ControlFlow::Continue(())
+        })?;
+        by_hash.sort_unstable();
+        let mut duplicate_free = true;
+        for run in by_hash.chunk_by(|a, b| a.0 == b.0) {
+            if run.len() < 2 {
+                continue;
+            }
+            // Handles ascend within a run, so the first equal vector met is
+            // the canonical one.
+            let mut seen: Vec<(u32, crate::arena::vector::VectorSlice)> = Vec::new();
+            for &(_, handle) in run {
+                let Some(slice) = arena.lookup_vector(handle)? else {
+                    continue;
+                };
+                match seen
+                    .iter()
+                    .find(|(_, s)| fluree_db_core::value::vector_eq_f32(s.as_f32(), slice.as_f32()))
+                {
+                    Some(&(canon, _)) => {
+                        canonical[handle as usize] = canon;
+                        duplicate_free = false;
+                    }
+                    None => seen.push((handle, slice)),
+                }
+            }
+        }
+        Ok(Self {
+            hashes: hashes.into_boxed_slice(),
+            canonical: canonical.into_boxed_slice(),
+            duplicate_free,
+        })
+    }
+
+    /// The value hash and canonical handle of `handle`; `None` out of range.
+    pub fn of(&self, handle: u32) -> Option<(u64, u32)> {
+        Some((
+            *self.hashes.get(handle as usize)?,
+            *self.canonical.get(handle as usize)?,
+        ))
+    }
+
+    /// Whether no value is held twice: every handle is its own canonical one.
+    pub fn duplicate_free(&self) -> bool {
+        self.duplicate_free
+    }
+
+    /// The table's heap bytes.
+    pub fn heap_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.hashes) + std::mem::size_of_val(&*self.canonical)
+    }
+}
+
+/// The first read failure met while building or comparing a hash-table key.
+/// `PartialEq` can't return an error, and counting the pair unequal (or
+/// keying a value by its arena handle) would answer wrong, so the failure is
+/// recorded here and the operator that owns the table fails the query on its
+/// next check. One slot per
+/// query: every view the query keys through carries it
+/// ([`BinaryGraphView::with_key_read_errors`]), and so does every key read
+/// from those views. The first error is kept as is, so a residency miss
+/// stays a typed `NeedFetch`.
+#[derive(Debug, Default)]
+pub struct KeyReadErrors(std::sync::OnceLock<io::Error>);
+
+impl KeyReadErrors {
+    /// Record `err`, unless an earlier failure is already recorded.
+    pub fn record(&self, err: io::Error) {
+        let _ = self.0.set(err);
+    }
+
+    /// The first failure recorded, if any.
+    pub fn first(&self) -> Option<&io::Error> {
+        self.0.get()
+    }
+}
+
+/// A stored vector as a key: the arena's identity (store, graph, predicate)
+/// and handle, its value hash, and how its value is reached ([`ArenaVectorForm`]).
+#[derive(Clone, Debug)]
+pub struct ArenaVector {
+    pub hash: u64,
+    pub store_id: u64,
+    pub g_id: GraphId,
+    pub p_id: u32,
+    pub handle: u32,
+    pub form: ArenaVectorForm,
+}
+
+/// How an [`ArenaVector`] reaches its value.
+#[derive(Clone)]
+pub enum ArenaVectorForm {
+    /// Read without the arena's identity table: a zero-copy slice of its
+    /// shard, hashed in place.
+    Slice(crate::arena::vector::VectorSlice),
+    /// Resolved by the arena's identity table, which gave the hash and the
+    /// canonical handle, the lowest handle holding an equal vector. It holds
+    /// no shard. Two keys of one arena compare by canonical handle; only a
+    /// comparison with another arena's key or a decoded vector, on a hash
+    /// match, reads the components ([`ArenaVector::components`]), through the
+    /// [`ShardPins`] its graph's keys share.
+    Canonical {
+        canonical: u32,
+        pins: Arc<ShardPins>,
+        /// Where a comparison that can't return its read failure records
+        /// it: the query's slot, from the view that read the key.
+        read_errors: Arc<KeyReadErrors>,
+    },
+}
+
+/// The shards that comparisons of one query's table-resolved vector keys of
+/// a graph have read, shared by those keys. A comparison that reads a
+/// vector's components pins its shard here, so later comparisons in that
+/// shard reuse it rather than reload it after the shared cache evicts it (a
+/// scan in subject order reads handles out of order). The query holds it
+/// ([`QueryShardPins`]), so its shards drop when the query and its keys do,
+/// whatever other queries still hold. Each shard is pinned at most once, and
+/// only shards a comparison needed, so a `DISTINCT` or `GROUP BY` over one
+/// tabled predicate pins none.
+pub struct ShardPins {
+    store: Arc<BinaryIndexStore>,
+    g_id: GraphId,
+    shards: std::sync::Mutex<
+        rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
+    >,
+}
+
+impl ShardPins {
+    fn new(store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
+        Self {
+            store,
+            g_id,
+            shards: std::sync::Mutex::default(),
+        }
+    }
+
+    fn lock(
+        &self,
+    ) -> std::sync::MutexGuard<
+        '_,
+        rustc_hash::FxHashMap<(u32, usize), Arc<crate::arena::vector::VectorShard>>,
+    > {
+        self.shards
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// `handle` of `p_id`'s arena, pinning its shard; `None` for a handle
+    /// the arena doesn't hold.
+    fn slice(
+        &self,
+        p_id: u32,
+        handle: u32,
+    ) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&self.g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let held = self.lock().get(&(p_id, shard_idx)).cloned();
+        let shard = match held {
+            Some(shard) => shard,
+            None => {
+                // The load can read from disk; don't hold the lock meanwhile.
+                let shard = arena.shard(shard_idx)?;
+                Arc::clone(self.lock().entry((p_id, shard_idx)).or_insert(shard))
+            }
+        };
+        Ok(crate::arena::vector::VectorSlice::new(shard, offset))
+    }
+}
+
+/// One query's [`ShardPins`], per store and graph. One per query: every view
+/// the query keys through carries it ([`TermView::with_shard_pins`]), since
+/// an operator may key each batch through a fresh view and its keys from
+/// every batch compare against each other. A view the query doesn't attach
+/// one to has its own.
+#[derive(Default)]
+pub struct QueryShardPins(
+    parking_lot::Mutex<rustc_hash::FxHashMap<(u64, GraphId), Arc<ShardPins>>>,
+);
+
+impl QueryShardPins {
+    /// The query's pins for `store`'s graph `g_id`.
+    fn of_graph(&self, store: &Arc<BinaryIndexStore>, g_id: GraphId) -> Arc<ShardPins> {
+        Arc::clone(
+            self.0
+                .lock()
+                .entry((store.store_id(), g_id))
+                .or_insert_with(|| Arc::new(ShardPins::new(Arc::clone(store), g_id))),
+        )
+    }
+}
+
+impl std::fmt::Debug for ArenaVectorForm {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Slice(slice) => f.debug_tuple("Slice").field(slice).finish(),
+            Self::Canonical { canonical, .. } => f
+                .debug_struct("Canonical")
+                .field("canonical", canonical)
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl ArenaVector {
+    /// Its canonical handle, when the identity table resolved it.
+    pub fn canonical(&self) -> Option<u32> {
+        match &self.form {
+            ArenaVectorForm::Slice(_) => None,
+            ArenaVectorForm::Canonical { canonical, .. } => Some(*canonical),
+        }
+    }
+
+    /// Whether `self` and `other` are keys of one arena.
+    pub fn same_arena(&self, other: &Self) -> bool {
+        self.store_id == other.store_id && self.g_id == other.g_id && self.p_id == other.p_id
+    }
+
+    /// Its components: the slice it holds, or its arena's, read through its
+    /// graph's [`ShardPins`]. `None` if the arena doesn't hold the handle,
+    /// which an arena that built a table for it always does.
+    pub fn components(&self) -> io::Result<Option<crate::arena::vector::VectorSlice>> {
+        match &self.form {
+            ArenaVectorForm::Slice(slice) => Ok(Some(slice.clone())),
+            ArenaVectorForm::Canonical { pins, .. } => pins.slice(self.p_id, self.handle),
+        }
+    }
+
+    /// Whether `self` and `other` hold equal vectors (bitwise-equal
+    /// components). Keys of one arena that the identity table resolved
+    /// compare by canonical handle and read nothing; any other pair compares
+    /// components on a hash match, reading them for a key that holds none.
+    pub fn same_value(&self, other: &Self) -> io::Result<bool> {
+        if self.hash != other.hash {
+            return Ok(false);
+        }
+        if self.same_arena(other) {
+            if self.handle == other.handle {
+                return Ok(true);
+            }
+            if let (Some(x), Some(y)) = (self.canonical(), other.canonical()) {
+                return Ok(x == y);
+            }
+        }
+        if let (ArenaVectorForm::Slice(x), ArenaVectorForm::Slice(y)) = (&self.form, &other.form) {
+            if x.same_slot(y) {
+                return Ok(true);
+            }
+        }
+        let (Some(x), Some(y)) = (self.components()?, other.components()?) else {
+            return Ok(false);
+        };
+        Ok(fluree_db_core::value::vector_eq_f32(x.as_f32(), y.as_f32()))
+    }
+
+    /// Whether `self` holds the decoded vector `wide`
+    /// ([`fluree_db_core::value::vector_eq_f32_f64`]), on a hash match.
+    pub fn same_value_as_decoded(&self, wide_hash: u64, wide: &[f64]) -> io::Result<bool> {
+        if self.hash != wide_hash {
+            return Ok(false);
+        }
+        Ok(self
+            .components()?
+            .is_some_and(|slice| fluree_db_core::value::vector_eq_f32_f64(slice.as_f32(), wide)))
+    }
+
+    /// The query's read-failure slot this key records into: a key resolved
+    /// by the identity table carries one, since only it reads to compare. A
+    /// slice key holds its components and never fails a comparison.
+    pub fn read_errors(&self) -> Option<&KeyReadErrors> {
+        match &self.form {
+            ArenaVectorForm::Slice(_) => None,
+            ArenaVectorForm::Canonical { read_errors, .. } => Some(read_errors),
+        }
+    }
+}
+
+/// A store's decoder for terms that are the same in every graph: subjects,
+/// predicates, string-dictionary values and inline literals, read through the
+/// store's dictionaries and, when `dict_novelty` is present, its novelty
+/// dictionaries.
+///
+/// It has no graph. An arena-backed literal (a big number or a vector) is a
+/// handle into one graph's arena, so decoding one takes that graph
+/// explicitly ([`Self::decode_value_from_kind`]): the literal's own, never
+/// the view's.
 ///
 /// When `dict_novelty` is present, all decode methods automatically perform
 /// watermark-based routing: IDs at or below the watermark delegate to the
@@ -2701,9 +3779,8 @@ impl NsLookup for BinaryIndexStore {
 ///
 /// When `dict_novelty` is `None`, all methods delegate straight to the store
 /// with zero overhead (single well-predicted branch).
-pub struct BinaryGraphView {
+pub struct TermView {
     store: Arc<BinaryIndexStore>,
-    g_id: GraphId,
     dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     namespace_codes_fallback: Option<Arc<HashMap<u16, String>>>,
     /// Optional fuel tracker. When set, each forward-pack dict touch (a call
@@ -2716,6 +3793,71 @@ pub struct BinaryGraphView {
     /// the life of the store and novelty window the view holds.
     subject_sids: SubjectMemo<Sid>,
     subject_iris: SubjectMemo<Arc<str>>,
+    /// The vector shard this view's keys read last, and that arena's
+    /// identity table if it was built. See [`Self::arena_vector`].
+    vector_cursor: VectorCursor,
+    /// Where keys read from this view record a read failure they can't
+    /// return. Its own unless the query attaches its slot
+    /// ([`Self::with_key_read_errors`]).
+    key_read_errors: Arc<KeyReadErrors>,
+    /// Where comparisons of keys read from this view pin the shards they
+    /// read. Its own unless the query attaches its pins
+    /// ([`Self::with_shard_pins`]).
+    shard_pins: Arc<QueryShardPins>,
+}
+
+/// A vector arena of a store: its graph and predicate. A [`TermView`] has no
+/// graph, and a union of graphs keys vectors of several through one view, so
+/// everything its cursor holds is per arena.
+type ArenaId = (GraphId, u32);
+
+/// Where a view's vector keys read: the shard read last, by
+/// `(arena, shard index)` (a scan reads handles mostly in runs, so a key
+/// usually skips the shared cache's probe), and the identity table of the
+/// arena read last. One shard only, so the view never holds more of an
+/// arena than the cache's eviction allows; a key's own slice keeps its shard
+/// for as long as the key lives, and keys share one copy of each shard.
+#[derive(Default)]
+struct VectorCursor(std::sync::Mutex<VectorCursorInner>);
+
+#[derive(Default)]
+struct VectorCursorInner {
+    shard: Option<(ArenaId, usize, Arc<crate::arena::vector::VectorShard>)>,
+    identity: Option<(ArenaId, Option<Arc<VectorIdentity>>)>,
+    /// Every shard this view has handed to a key, weakly: while some key
+    /// still holds a shard, a later key reuses that copy rather than load
+    /// another once the shared cache has evicted it, so keys never hold more
+    /// than one copy of the arena. Holds nothing alive itself.
+    handed_out:
+        rustc_hash::FxHashMap<(ArenaId, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
+    /// The query's [`ShardPins`] for the graph keyed last, so a key skips
+    /// the query's lock.
+    pins: Option<(GraphId, Arc<ShardPins>)>,
+}
+
+impl VectorCursor {
+    fn lock(&self) -> std::sync::MutexGuard<'_, VectorCursorInner> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A [`TermView`] bound to one graph, for a reader of that graph's index:
+/// it decodes the graph's own rows by `o_type` ([`Self::decode_value`]) and
+/// names its graph ([`Self::g_id`]). Everything else it decodes as its
+/// [`TermView`] does.
+pub struct BinaryGraphView {
+    terms: TermView,
+    g_id: GraphId,
+}
+
+impl std::ops::Deref for BinaryGraphView {
+    type Target = TermView;
+
+    fn deref(&self) -> &TermView {
+        &self.terms
+    }
 }
 
 /// Per-view id-to-name memo, bounded by clearing rather than evicting.
@@ -2750,15 +3892,7 @@ impl<V: Clone> SubjectMemo<V> {
 
 impl BinaryGraphView {
     pub fn new(store: Arc<BinaryIndexStore>, g_id: GraphId) -> Self {
-        Self {
-            store,
-            g_id,
-            dict_novelty: None,
-            namespace_codes_fallback: None,
-            tracker: None,
-            subject_sids: SubjectMemo::new(),
-            subject_iris: SubjectMemo::new(),
-        }
+        Self::with_novelty(store, g_id, None)
     }
 
     /// Create a novelty-aware graph view.
@@ -2773,14 +3907,101 @@ impl BinaryGraphView {
         dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
     ) -> Self {
         Self {
-            store,
+            terms: TermView::new(store, dict_novelty),
             g_id,
+        }
+    }
+
+    /// Attach a fuel tracker ([`TermView::with_tracker`]).
+    pub fn with_tracker(mut self, tracker: fluree_db_core::Tracker) -> Self {
+        self.terms = self.terms.with_tracker(tracker);
+        self
+    }
+
+    /// [`TermView::with_namespace_codes_fallback`].
+    pub fn with_namespace_codes_fallback(
+        mut self,
+        namespace_codes_fallback: Option<Arc<HashMap<u16, String>>>,
+    ) -> Self {
+        self.terms = self
+            .terms
+            .with_namespace_codes_fallback(namespace_codes_fallback);
+        self
+    }
+
+    /// [`TermView::with_key_read_errors`].
+    pub fn with_key_read_errors(mut self, slot: Arc<KeyReadErrors>) -> Self {
+        self.terms = self.terms.with_key_read_errors(slot);
+        self
+    }
+
+    /// [`TermView::with_shard_pins`].
+    pub fn with_shard_pins(mut self, pins: Arc<QueryShardPins>) -> Self {
+        self.terms = self.terms.with_shard_pins(pins);
+        self
+    }
+
+    pub fn g_id(&self) -> GraphId {
+        self.g_id
+    }
+
+    /// The view's terms, without its graph.
+    pub fn terms(&self) -> &TermView {
+        &self.terms
+    }
+
+    /// [`Self::terms`], by value.
+    pub fn into_terms(self) -> TermView {
+        self.terms
+    }
+
+    /// Decode a value of this graph's rows from `(o_type, o_key)`, an arena
+    /// handle through this graph's arena. Novelty-aware when `dict_novelty`
+    /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
+    /// watermark checks; all other types delegate directly to the store.
+    pub fn decode_value(&self, o_type: u16, o_key: u64, p_id: u32) -> io::Result<FlakeValue> {
+        self.terms.decode_value_in(o_type, o_key, p_id, self.g_id)
+    }
+}
+
+impl TermView {
+    /// A decoder over `store`'s dictionaries and, when present, `dict_novelty`.
+    pub fn new(
+        store: Arc<BinaryIndexStore>,
+        dict_novelty: Option<Arc<fluree_db_core::dict_novelty::DictNovelty>>,
+    ) -> Self {
+        Self {
+            store,
             dict_novelty,
             namespace_codes_fallback: None,
             tracker: None,
             subject_sids: SubjectMemo::new(),
             subject_iris: SubjectMemo::new(),
+            vector_cursor: VectorCursor::default(),
+            key_read_errors: Arc::default(),
+            shard_pins: Arc::default(),
         }
+    }
+
+    /// Record the read failures of keys read from this view in `slot`, the
+    /// query's, so the operators that key through it can fail the query.
+    pub fn with_key_read_errors(mut self, slot: Arc<KeyReadErrors>) -> Self {
+        self.key_read_errors = slot;
+        self
+    }
+
+    /// Where keys read from this view record a read failure they can't
+    /// return; a caller that builds keys records its own failures here too.
+    pub fn key_read_errors(&self) -> &KeyReadErrors {
+        &self.key_read_errors
+    }
+
+    /// Pin the shards that comparisons of keys read from this view read in
+    /// `pins`, the query's, so they drop with the query.
+    pub fn with_shard_pins(mut self, pins: Arc<QueryShardPins>) -> Self {
+        self.shard_pins = pins;
+        self.vector_cursor.lock().pins = None;
+        self
     }
 
     /// Attach a fuel tracker. When set, each forward-pack dict touch (a call
@@ -2816,10 +4037,14 @@ impl BinaryGraphView {
         self.namespace_codes_fallback.clone()
     }
 
-    /// Decode a value from `(o_type, o_key)`. Novelty-aware when `dict_novelty`
-    /// is set: dict-backed types (IriRef, StringDict, JsonArena) route through
-    /// watermark checks; all other types delegate directly to the store.
-    pub fn decode_value(&self, o_type: u16, o_key: u64, p_id: u32) -> io::Result<FlakeValue> {
+    /// [`BinaryGraphView::decode_value`] for graph `g_id`'s rows.
+    fn decode_value_in(
+        &self,
+        o_type: u16,
+        o_key: u64,
+        p_id: u32,
+        g_id: GraphId,
+    ) -> io::Result<FlakeValue> {
         let ot = OType::from_u16(o_type);
         let kind = ot.decode_kind();
         if let Some(ref dn) = self.dict_novelty {
@@ -2867,10 +4092,16 @@ impl BinaryGraphView {
         ) {
             self.charge_dict_touch()?;
         }
-        self.store.decode_value_v3(o_type, o_key, p_id, self.g_id)
+        self.store.decode_value_v3(o_type, o_key, p_id, g_id)
     }
 
     /// Decode a value from `(o_kind, dt_id, lang_id)` fields. Novelty-aware.
+    ///
+    /// `arena_g_id` is the graph whose arena an arena-backed literal (a big
+    /// number or a vector) indexes: the literal's own, as it was bound. Every
+    /// other kind ignores it and carries [`NO_ARENA_GRAPH`]; an arena-backed
+    /// literal that carries it has no graph to be read through, and is an
+    /// error rather than a value read from some graph's arena.
     ///
     /// See [`BinaryIndexStore::decode_value_from_kind`] for the persisted path.
     pub fn decode_value_from_kind(
@@ -2880,7 +4111,16 @@ impl BinaryGraphView {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: GraphId,
     ) -> io::Result<FlakeValue> {
+        if arena_g_id == NO_ARENA_GRAPH
+            && (o_kind == ObjKind::NUM_BIG.as_u8() || o_kind == ObjKind::VECTOR_ID.as_u8())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("an arena-backed literal (kind {o_kind:#x}, handle {o_key}) has no graph"),
+            ));
+        }
         let novelty_initialized = self
             .dict_novelty
             .as_ref()
@@ -2912,10 +4152,10 @@ impl BinaryGraphView {
         }
         let result = self
             .store
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, self.g_id);
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id);
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
+                arena_g_id,
                 o_kind,
                 o_key,
                 p_id,
@@ -2924,7 +4164,7 @@ impl BinaryGraphView {
                 has_dict_novelty = self.dict_novelty.is_some(),
                 novelty_initialized,
                 error = %err,
-                "BinaryGraphView decode_value_from_kind failed"
+                "TermView decode_value_from_kind failed"
             );
         }
         result
@@ -2946,10 +4186,9 @@ impl BinaryGraphView {
                 if let Some(result) = self.resolve_novel_subject_iri(dn, s_id) {
                     if let Err(err) = &result {
                         tracing::debug!(
-                            g_id = self.g_id,
                             s_id,
                             error = %err,
-                            "BinaryGraphView novelty subject lookup failed"
+                            "TermView novelty subject lookup failed"
                         );
                     }
                     return result;
@@ -2969,11 +4208,10 @@ impl BinaryGraphView {
         });
         if let Err(err) = &result {
             tracing::debug!(
-                g_id = self.g_id,
                 s_id,
                 has_dict_novelty = self.dict_novelty.is_some(),
                 error = %err,
-                "BinaryGraphView persisted subject lookup failed"
+                "TermView persisted subject lookup failed"
             );
         }
         result
@@ -3003,29 +4241,144 @@ impl BinaryGraphView {
         }
         // Persisted forward-pack lookup; charge before the I/O.
         self.charge_dict_touch()?;
-        let iri = self.store.resolve_subject_iri(s_id)?;
-        if let Some(sid) = self.store.find_subject_sid(&iri)? {
-            Ok(sid)
-        } else {
-            Ok(self.store.encode_iri(&iri))
-        }
+        let (ns_code, suffix) = self.store.resolve_subject_parts(s_id)?;
+        self.store.subject_sid_of_parts(ns_code, suffix)
     }
 
     pub fn store(&self) -> &BinaryIndexStore {
         &self.store
     }
 
-    pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
-        Arc::clone(&self.store)
+    /// `handle` of graph `g_id`'s vector arena for `p_id`, as a key: the
+    /// arena the literal was read from, which it carries (`arena_g_id`), never
+    /// a graph the view assumes. When the arena's identity table is built, the
+    /// key is the table's hash and canonical handle, and no shard is read.
+    /// Otherwise it is a zero-copy slice of its shard, hashed in place with
+    /// the same function. This never builds the table: a small query would
+    /// pay for the whole arena. `None` for a handle the arena does not hold,
+    /// such as a novelty handle. A literal that carries no graph
+    /// ([`NO_ARENA_GRAPH`]) is an error, as in [`Self::decode_value_from_kind`].
+    pub fn arena_vector(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        handle: u32,
+    ) -> io::Result<Option<ArenaVector>> {
+        if g_id == NO_ARENA_GRAPH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("a vector literal (handle {handle} of p_id {p_id}) has no graph"),
+            ));
+        }
+        let arena_id = (g_id, p_id);
+        let mut cursor = self.vector_cursor.lock();
+        if !matches!(&cursor.identity, Some((id, _)) if *id == arena_id) {
+            cursor.identity = Some((arena_id, self.store.built_vector_identity(g_id, p_id)));
+        }
+        // With the identity table built, the key is its hash and canonical
+        // handle: no shard is read or held, and the arena isn't looked up.
+        if let Some((hash, canonical)) = cursor
+            .identity
+            .as_ref()
+            .and_then(|(_, identity)| identity.as_ref()?.of(handle))
+        {
+            let pins = match cursor.pins.as_ref().filter(|(g, _)| *g == g_id) {
+                Some((_, pins)) => Arc::clone(pins),
+                None => {
+                    let pins = self.shard_pins.of_graph(&self.store, g_id);
+                    cursor.pins = Some((g_id, Arc::clone(&pins)));
+                    pins
+                }
+            };
+            drop(cursor);
+            return Ok(Some(ArenaVector {
+                hash,
+                store_id: self.store.store_id(),
+                g_id,
+                p_id,
+                handle,
+                form: ArenaVectorForm::Canonical {
+                    canonical,
+                    pins,
+                    read_errors: Arc::clone(&self.key_read_errors),
+                },
+            }));
+        }
+        let Some(arena) = self
+            .store
+            .graph_indexes
+            .get(&g_id)
+            .and_then(|gi| gi.vectors.get(&p_id))
+        else {
+            return Ok(None);
+        };
+        let Some((shard_idx, offset)) = arena.shard_of(handle) else {
+            return Ok(None);
+        };
+        let held = cursor
+            .shard
+            .as_ref()
+            .filter(|(id, i, _)| *id == arena_id && *i == shard_idx)
+            .map(|(_, _, shard)| Arc::clone(shard));
+        let held = held.or_else(|| {
+            cursor
+                .handed_out
+                .get(&(arena_id, shard_idx))
+                .and_then(std::sync::Weak::upgrade)
+        });
+        let shard = match held {
+            Some(shard) => shard,
+            None => {
+                // The load can read from disk; don't hold the cursor meanwhile.
+                drop(cursor);
+                let shard = arena.shard(shard_idx)?;
+                cursor = self.vector_cursor.lock();
+                cursor
+                    .handed_out
+                    .insert((arena_id, shard_idx), Arc::downgrade(&shard));
+                shard
+            }
+        };
+        if !matches!(&cursor.shard, Some((id, i, _)) if *id == arena_id && *i == shard_idx) {
+            cursor.shard = Some((arena_id, shard_idx, Arc::clone(&shard)));
+        }
+        drop(cursor);
+        let Some(slice) = crate::arena::vector::VectorSlice::new(shard, offset) else {
+            return Ok(None);
+        };
+        Ok(Some(ArenaVector {
+            hash: fluree_db_core::value::vector_value_hash_f32(slice.as_f32()),
+            store_id: self.store.store_id(),
+            g_id,
+            p_id,
+            handle,
+            form: ArenaVectorForm::Slice(slice),
+        }))
     }
 
-    pub fn g_id(&self) -> GraphId {
-        self.g_id
+    pub fn clone_store(&self) -> Arc<BinaryIndexStore> {
+        Arc::clone(&self.store)
     }
 
     /// Check whether this view has DictNovelty attached.
     pub fn has_dict_novelty(&self) -> bool {
         self.dict_novelty.is_some()
+    }
+
+    /// The novelty dictionary this view resolves novel ids through.
+    pub fn dict_novelty(&self) -> Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>> {
+        self.dict_novelty.as_ref()
+    }
+
+    /// Whether `s_id` was assigned by the store's own dictionary, not by
+    /// novelty: at or below its namespace's persisted watermark.
+    pub fn is_persisted_subject_id(&self, s_id: u64) -> bool {
+        use fluree_db_core::subject_id::SubjectId;
+        let Some(dn) = self.dict_novelty.as_ref() else {
+            return true;
+        };
+        let sid64 = SubjectId::from_u64(s_id);
+        sid64.local_id() <= dn.subjects.watermark_for_ns(sid64.ns_code())
     }
 
     // ── Internal watermark helpers ──────────────────────────────────────
@@ -3261,12 +4614,12 @@ async fn build_dictionary_set(
         .datatype_iris
         .iter()
         .map(|iri| {
-            let (canonical_prefix, canonical_suffix) = canonical_split(iri, root.ns_split_mode);
-            if let Some(&code) = namespace_reverse.get(canonical_prefix) {
-                Sid::new(code, canonical_suffix)
-            } else {
-                Sid::new(0, iri)
-            }
+            encode_registered(
+                iri,
+                root.ns_split_mode,
+                |prefix| namespace_reverse.get(prefix).copied(),
+                || table_full(&namespace_codes),
+            )
         })
         .collect();
 
@@ -3323,6 +4676,34 @@ async fn build_dictionary_set(
 // Arena loading (reuses V5 infrastructure)
 // ============================================================================
 
+/// Where a vector shard's bytes come from: its local CAS file when one
+/// exists, else the disk cache — which counts as present only for a store the
+/// cache serves, so a stale shard left there by an earlier run is fetched
+/// afresh rather than served.
+fn vector_shard_source(
+    cs: &dyn ContentStore,
+    shard_cid: &ContentId,
+    cache_dir: &Path,
+) -> crate::arena::vector::ShardSource {
+    let cid_hash = LeafletCache::cid_cache_key(&shard_cid.to_bytes());
+    if let Some(local) = cs.resolve_local_path(shard_cid) {
+        return crate::arena::vector::ShardSource {
+            cid_hash,
+            cid: None,
+            path: local,
+            on_disk: std::sync::atomic::AtomicBool::new(true),
+        };
+    }
+    let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
+    let on_disk = uses_disk_cache(cs) && cache_path.exists();
+    crate::arena::vector::ShardSource {
+        cid_hash,
+        cid: Some(shard_cid.clone()),
+        path: cache_path,
+        on_disk: std::sync::atomic::AtomicBool::new(on_disk),
+    }
+}
+
 /// Per-graph arenas (before injection into GraphIndex).
 struct LoadedArenas {
     numbig: HashMap<u32, crate::arena::numbig::NumBigArena>,
@@ -3367,27 +4748,11 @@ async fn load_per_graph_arenas(
                 fetch_cached_bytes(cs.as_ref(), &entry.manifest, cache_dir, "vam").await?;
             let manifest = crate::arena::vector::read_vector_manifest(&manifest_bytes)?;
 
-            let mut shard_sources = Vec::with_capacity(entry.shards.len());
-            for shard_cid in &entry.shards {
-                let cid_hash = LeafletCache::cid_cache_key(&shard_cid.to_bytes());
-                if let Some(local) = cs.resolve_local_path(shard_cid) {
-                    shard_sources.push(crate::arena::vector::ShardSource {
-                        cid_hash,
-                        cid: None,
-                        path: local,
-                        on_disk: std::sync::atomic::AtomicBool::new(true),
-                    });
-                } else {
-                    let cache_path = cache_dir.join(format!("{shard_cid}.vas"));
-                    let exists = cache_path.exists();
-                    shard_sources.push(crate::arena::vector::ShardSource {
-                        cid_hash,
-                        cid: Some(shard_cid.clone()),
-                        path: cache_path,
-                        on_disk: std::sync::atomic::AtomicBool::new(exists),
-                    });
-                }
-            }
+            let shard_sources: Vec<_> = entry
+                .shards
+                .iter()
+                .map(|shard_cid| vector_shard_source(cs.as_ref(), shard_cid, cache_dir))
+                .collect();
 
             // LazyVectorArena needs a LeafletCache for shard caching and
             // an optional ContentStore for remote shard fetching.
@@ -3566,10 +4931,19 @@ impl ContentStoreRangeFetcher {
             }
         }
 
-        // Check cache.
-        let cache_path = self.cache_dir.join(id.to_string());
-        if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
-            return Ok(buf);
+        // Bytes the store holds in memory: slice them.
+        if let Some(bytes) = self.cs.resolve_cached_bytes(id) {
+            let start = (range.start as usize).min(bytes.len());
+            let end = (range.end as usize).min(bytes.len());
+            return Ok(bytes[start..end].to_vec());
+        }
+
+        // Check cache, for a store the cache serves.
+        if uses_disk_cache(self.cs.as_ref()) {
+            let cache_path = self.cache_dir.join(id.to_string());
+            if let Some(buf) = read_range_from_file(&cache_path, range.clone())? {
+                return Ok(buf);
+            }
         }
 
         // Remote CAS: use async get_range via sync bridge.
@@ -3602,6 +4976,539 @@ impl ContentStoreRangeFetcher {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// A lazy arena of `shards`, each a shard of capacity `capacity`, over
+    /// files in `dir`.
+    fn vector_arena_of(
+        dir: &std::path::Path,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+    ) -> crate::arena::vector::LazyVectorArena {
+        vector_arena_cached(
+            dir,
+            capacity,
+            dims,
+            shards,
+            Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024)),
+        )
+    }
+
+    /// [`vector_arena_of`] reading through `cache`.
+    fn vector_arena_cached(
+        dir: &std::path::Path,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+        cache: Arc<LeafletCache>,
+    ) -> crate::arena::vector::LazyVectorArena {
+        use crate::arena::vector::tests::write_test_shard;
+        use crate::arena::vector::{ShardInfo, VectorManifest};
+        let mut sources = Vec::new();
+        let mut infos = Vec::new();
+        for (i, vectors) in shards.iter().enumerate() {
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let (_, source) = write_test_shard(dir, &format!("s{i}.vas"), dims, &refs);
+            sources.push(source);
+            infos.push(ShardInfo {
+                cas: format!("s{i}"),
+                count: vectors.len() as u32,
+            });
+        }
+        let manifest = VectorManifest {
+            version: 1,
+            dims,
+            dtype: "f32".to_string(),
+            normalized: false,
+            shard_capacity: capacity,
+            total_count: shards.iter().map(|v| v.len() as u32).sum(),
+            shards: infos,
+        };
+        crate::arena::vector::LazyVectorArena::new(manifest, sources, cache, None)
+    }
+
+    /// A view of graph 0 of a store holding `arena` as predicate `p_id`'s
+    /// vector arena.
+    fn view_with_vector_arena(
+        p_id: u32,
+        arena: crate::arena::vector::LazyVectorArena,
+    ) -> BinaryGraphView {
+        view_with_vector_arenas(vec![(p_id, arena)])
+    }
+
+    /// A view of graph 0 of a store holding each `(p_id, arena)` as that
+    /// predicate's vector arena.
+    fn view_with_vector_arenas(
+        arenas: Vec<(u32, crate::arena::vector::LazyVectorArena)>,
+    ) -> BinaryGraphView {
+        let store = store_with_vector_arenas(arenas.into_iter().map(|(p, a)| (0, p, a)).collect());
+        BinaryGraphView::new(Arc::new(store), 0)
+    }
+
+    /// A store holding each `(g_id, p_id, arena)` as that graph's vector
+    /// arena for that predicate.
+    fn store_with_vector_arenas(
+        arenas: Vec<(GraphId, u32, crate::arena::vector::LazyVectorArena)>,
+    ) -> BinaryIndexStore {
+        let mut store = BinaryIndexStore::empty(std::env::temp_dir());
+        let mut graphs: HashMap<GraphId, GraphIndex> = HashMap::new();
+        for (g_id, p_id, arena) in arenas {
+            graphs
+                .entry(g_id)
+                .or_insert_with(|| GraphIndex {
+                    orders: HashMap::new(),
+                    order_cids: HashMap::new(),
+                    numbig: HashMap::new(),
+                    vectors: HashMap::new(),
+                    spatial: HashMap::new(),
+                    fulltext: HashMap::new(),
+                })
+                .vectors
+                .insert(p_id, arena);
+        }
+        for (g_id, gi) in graphs {
+            store.graph_indexes.insert(g_id, Arc::new(gi));
+        }
+        store
+    }
+
+    fn slice_of(key: &ArenaVector) -> &crate::arena::vector::VectorSlice {
+        match &key.form {
+            ArenaVectorForm::Slice(slice) => slice,
+            ArenaVectorForm::Canonical { .. } => panic!("expected a slice key: {key:?}"),
+        }
+    }
+
+    /// Two keys over one shard share one loaded copy of it, even after the
+    /// shared cache has evicted it between them: the view reuses the copy an
+    /// earlier key still holds rather than load a second.
+    #[test]
+    fn vector_keys_over_an_evicted_shard_share_one_copy() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_shared_shard");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        let first = view.arena_vector(0, 7, 0).unwrap().unwrap();
+        // Move the view's cursor to the other shard, then evict everything.
+        let _other = view.arena_vector(0, 7, 2).unwrap().unwrap();
+        cache.invalidate_all();
+        let again = view.arena_vector(0, 7, 1).unwrap().unwrap();
+        assert_eq!(slice_of(&again).as_f32(), &[0.0, 1.0]);
+        assert!(
+            slice_of(&first).same_shard(slice_of(&again)),
+            "a second key over shard 0 loaded another copy of it"
+        );
+        drop((first, again));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A key's hash doesn't depend on whether the identity table is built,
+    /// and keys compare by value with the table, without it, and with one
+    /// key from each side (a query that keyed some rows before another built
+    /// the table), for every pair of handles of an arena with repeats.
+    #[test]
+    fn vector_keys_agree_with_and_without_the_identity_table() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_table_on_off");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Eight handles over three shards; values repeat within and across
+        // shards, and include `-0.0` beside `0.0`.
+        let values: [[f32; 2]; 8] = [
+            [1.0, 0.0],
+            [0.5, 0.5],
+            [1.0, 0.0],
+            [-0.0, 1.0],
+            [0.0, 1.0],
+            [0.5, 0.5],
+            [0.25, 0.75],
+            [1.0, 0.0],
+        ];
+        let shards: Vec<Vec<Vec<f32>>> = values
+            .chunks(3)
+            .map(|c| c.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        let arena = vector_arena_of(&dir, 3, 2, &shards);
+        let view = view_with_vector_arena(7, arena);
+        let off: Vec<ArenaVector> = (0..8)
+            .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
+            .collect();
+        assert!(off.iter().all(|k| k.canonical().is_none()));
+
+        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+        assert!(!table.duplicate_free());
+        // A fresh view, as a later query has, sees the built table.
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let on: Vec<ArenaVector> = (0..8)
+            .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for i in 0..8 {
+            assert_eq!(off[i].hash, on[i].hash, "handle {i}'s hash");
+            for j in 0..8 {
+                let same = bits(&values[i]) == bits(&values[j]);
+                assert_eq!(
+                    on[i].canonical() == on[j].canonical(),
+                    same,
+                    "handles {i} and {j}"
+                );
+                assert_eq!(on[i].same_value(&on[j]).unwrap(), same, "{i} {j} with");
+                assert_eq!(off[i].same_value(&off[j]).unwrap(), same, "{i} {j} without");
+                assert_eq!(on[i].same_value(&off[j]).unwrap(), same, "{i} {j} mixed");
+                assert_eq!(off[i].same_value(&on[j]).unwrap(), same, "{i} {j} mixed");
+                if same {
+                    assert_eq!(off[i].hash, off[j].hash);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent first callers share one build of an arena's identity table
+    /// rather than each read the arena.
+    #[test]
+    fn concurrent_first_callers_build_the_identity_table_once() {
+        let dir = std::env::temp_dir().join("fluree_vector_identity_built_once");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Enough vectors that a build outlasts the callers' start.
+        let shards: Vec<Vec<Vec<f32>>> = (0..8)
+            .map(|s| {
+                (0..4096)
+                    .map(|i| vec![s as f32, i as f32, 0.5, 0.25])
+                    .collect()
+            })
+            .collect();
+        let arena = vector_arena_of(&dir, 4096, 4, &shards);
+        let store = store_with_vector_arenas(vec![(0, 7, arena)]);
+        let callers = 8;
+        let start = std::sync::Barrier::new(callers);
+        let tables: Vec<Arc<VectorIdentity>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..callers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        store.vector_identity(0, 7).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            store
+                .identity_builds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(tables.iter().all(|t| Arc::ptr_eq(t, &tables[0])));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// With the identity table built, keying a vector reads no shard: every
+    /// handle keys, and keys of the arena compare by value, with the shard
+    /// files gone and the cache empty. Only a comparison that needs
+    /// components (here against a decoded vector) reads the arena, and its
+    /// failure surfaces rather than reading as an answer.
+    #[test]
+    fn vector_keys_read_no_shard_once_the_identity_table_is_built() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_no_shard_read");
+        std::fs::create_dir_all(&dir).unwrap();
+        let values: [[f32; 2]; 5] = [[1.0, 0.0], [0.5, 0.5], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
+        let shards: Vec<Vec<Vec<f32>>> = values
+            .chunks(2)
+            .map(|c| c.iter().map(|v| v.to_vec()).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+
+        cache.invalidate_all();
+        for i in 0..shards.len() {
+            std::fs::remove_file(dir.join(format!("s{i}.vas"))).unwrap();
+        }
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let keys: Vec<ArenaVector> = (0..5)
+            .map(|h| {
+                view.arena_vector(0, 7, h)
+                    .unwrap_or_else(|e| panic!("handle {h} read its shard: {e}"))
+                    .unwrap()
+            })
+            .collect();
+        let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        for (h, key) in keys.iter().enumerate() {
+            assert_eq!(
+                Some((key.hash, key.canonical().unwrap())),
+                table.of(h as u32)
+            );
+            for (g, other) in keys.iter().enumerate() {
+                assert_eq!(
+                    key.same_value(other).unwrap(),
+                    bits(&values[h]) == bits(&values[g]),
+                    "handles {h} and {g}"
+                );
+            }
+        }
+        let decoded = [1.0f64, 0.0];
+        let decoded_hash = fluree_db_core::value::vector_value_hash(&decoded);
+        assert!(
+            keys[0]
+                .same_value_as_decoded(decoded_hash, &decoded)
+                .is_err(),
+            "a comparison that needs the components reads them"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Comparisons of table-resolved keys pin the shards they read, shared by
+    /// a query's keys across its views (an operator may key each batch
+    /// through a fresh view): after the shared cache evicts a shard, a later
+    /// comparison in it reuses the copy an earlier one read rather than load
+    /// another, so a join whose matches jump between shards loads each once.
+    #[test]
+    fn tabled_vector_key_comparisons_share_the_shards_they_read() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_pinned_reads");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..2)
+            .map(|s| (0..2).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
+        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        let view = view_with_vector_arena(7, arena);
+        view.store().vector_identity(0, 7).unwrap().unwrap();
+        let store = view.clone_store();
+        let query = Arc::new(QueryShardPins::default());
+        // Each key through its own view, as a batch-at-a-time operator has.
+        let keys: Vec<ArenaVector> = (0..4)
+            .map(|h| {
+                BinaryGraphView::new(Arc::clone(&store), 0)
+                    .with_shard_pins(Arc::clone(&query))
+                    .arena_vector(0, 7, h)
+                    .unwrap()
+                    .unwrap()
+            })
+            .collect();
+        let first = keys[0].components().unwrap().unwrap();
+        // Read the other shard, then evict everything.
+        let _other = keys[2].components().unwrap().unwrap();
+        cache.invalidate_all();
+        drop(first);
+        let again = keys[1].components().unwrap().unwrap();
+        assert_eq!(again.as_f32(), &[0.0, 1.0]);
+        cache.invalidate_all();
+        assert!(
+            keys[0].components().unwrap().unwrap().same_shard(&again),
+            "a second read of shard 0 loaded another copy of it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shards a query's comparisons pin drop when that query's keys do,
+    /// though another query still holds keys of the same graph.
+    #[test]
+    fn a_query_holds_no_pins_once_it_ends() {
+        let dir = std::env::temp_dir().join("fluree_vector_pins_per_query");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let a = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let b = vec![vec![vec![0.5f32, 0.5], vec![1.0, 0.0]]];
+        let view = view_with_vector_arenas(vec![
+            (7, vector_arena_of(&dir.join("a"), 2, 2, &a)),
+            (8, vector_arena_of(&dir.join("b"), 2, 2, &b)),
+        ]);
+        let store = view.clone_store();
+        store.vector_identity(0, 7).unwrap().unwrap();
+        store.vector_identity(0, 8).unwrap().unwrap();
+        let query_view = || {
+            BinaryGraphView::new(Arc::clone(&store), 0)
+                .with_shard_pins(Arc::new(QueryShardPins::default()))
+        };
+        let pins_of = |key: &ArenaVector| match &key.form {
+            ArenaVectorForm::Canonical { pins, .. } => Arc::downgrade(pins),
+            ArenaVectorForm::Slice(_) => panic!("a tabled key"),
+        };
+
+        // A later query keys the graph and is still running.
+        let later = query_view();
+        let later_key = later.arena_vector(0, 7, 1).unwrap().unwrap();
+
+        // A query's comparison across the two arenas reads, and pins, both
+        // vectors' shards.
+        let earlier = query_view();
+        let x = earlier.arena_vector(0, 7, 1).unwrap().unwrap();
+        let y = earlier.arena_vector(0, 8, 0).unwrap().unwrap();
+        assert!(x.same_value(&y).unwrap());
+        let pinned = pins_of(&x);
+        assert_eq!(pinned.upgrade().unwrap().lock().len(), 2);
+
+        drop((x, y, earlier));
+        assert!(
+            pinned.upgrade().is_none(),
+            "the ended query's pinned shards outlive it"
+        );
+        assert!(pins_of(&later_key).upgrade().unwrap().lock().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Keys of two arenas whose tables are both built compare components on
+    /// a hash match: an equal vector in each arena is one value wherever it
+    /// sits, since canonical handles only name values within one arena.
+    #[test]
+    fn vector_keys_of_two_tabled_arenas_compare_components() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_two_arenas");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let a = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let b = vec![vec![vec![0.5f32, 0.5], vec![1.0, 0.0], vec![0.25, 0.25]]];
+        let view = view_with_vector_arenas(vec![
+            (7, vector_arena_of(&dir.join("a"), 2, 2, &a)),
+            (8, vector_arena_of(&dir.join("b"), 3, 2, &b)),
+        ]);
+        view.store().vector_identity(0, 7).unwrap().unwrap();
+        view.store().vector_identity(0, 8).unwrap().unwrap();
+        let view = BinaryGraphView::new(view.clone_store(), 0);
+        let ka: Vec<ArenaVector> = (0..2)
+            .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
+            .collect();
+        let kb: Vec<ArenaVector> = (0..3)
+            .map(|h| view.arena_vector(0, 8, h).unwrap().unwrap())
+            .collect();
+        assert!(ka.iter().chain(&kb).all(|k| k.canonical().is_some()));
+        for (i, x) in ka.iter().enumerate() {
+            for (j, y) in kb.iter().enumerate() {
+                let same = a[0][i] == b[0][j];
+                assert_eq!(x.same_value(y).unwrap(), same, "7/{i} against 8/{j}");
+                assert_eq!(y.same_value(x).unwrap(), same, "8/{j} against 7/{i}");
+                if same {
+                    assert_eq!(x.hash, y.hash);
+                }
+            }
+        }
+        // `[1.0, 0.0]` is canonical handle 0 of one arena and 1 of the other.
+        assert_eq!((ka[0].canonical(), kb[1].canonical()), (Some(0), Some(1)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One predicate's vector arenas in two graphs, keyed through one view
+    /// (as a union of graphs keys them): a handle keys the value of the graph
+    /// the literal carries, so one handle in each graph holding different
+    /// vectors is two keys, and equal vectors in the two graphs are one
+    /// value. Reading the graphs alternately, the view's cursor never answers
+    /// one graph's key from the other's shard or identity table, with the
+    /// tables built or not. A literal with no graph is refused.
+    #[test]
+    fn vector_keys_are_read_from_the_graph_the_literal_carries() {
+        let dir = std::env::temp_dir().join("fluree_vector_keys_two_graphs");
+        std::fs::create_dir_all(dir.join("g1")).unwrap();
+        std::fs::create_dir_all(dir.join("g2")).unwrap();
+        let g1 = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let g2 = vec![vec![vec![0.5f32, 0.5], vec![0.25, 0.75]]];
+        let store = Arc::new(store_with_vector_arenas(vec![
+            (1, 7, vector_arena_of(&dir.join("g1"), 2, 2, &g1)),
+            (2, 7, vector_arena_of(&dir.join("g2"), 2, 2, &g2)),
+        ]));
+        let values = |g_id: GraphId| if g_id == 1 { &g1[0] } else { &g2[0] };
+        for tabled in [false, true] {
+            if tabled {
+                store.vector_identity(1, 7).unwrap().unwrap();
+                store.vector_identity(2, 7).unwrap().unwrap();
+            }
+            let view = TermView::new(Arc::clone(&store), None);
+            let mut keys = Vec::new();
+            for handle in 0..2u32 {
+                for g_id in [1, 2] {
+                    let key = view.arena_vector(g_id, 7, handle).unwrap().unwrap();
+                    assert_eq!(key.canonical().is_some(), tabled);
+                    let read = key.components().unwrap().unwrap();
+                    assert_eq!(
+                        read.as_f32(),
+                        values(g_id)[handle as usize].as_slice(),
+                        "graph {g_id} handle {handle}, tabled {tabled}"
+                    );
+                    keys.push((g_id, handle, key));
+                }
+            }
+            for (ga, ha, a) in &keys {
+                for (gb, hb, b) in &keys {
+                    let same = values(*ga)[*ha as usize] == values(*gb)[*hb as usize];
+                    assert_eq!(
+                        a.same_value(b).unwrap(),
+                        same,
+                        "{ga}/{ha} against {gb}/{hb}, tabled {tabled}"
+                    );
+                    if same {
+                        assert_eq!(a.hash, b.hash);
+                    }
+                }
+            }
+        }
+        let view = TermView::new(store, None);
+        let err = view
+            .arena_vector(NO_ARENA_GRAPH, 7, 0)
+            .expect_err("a vector literal with no graph");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The identity table hashes each vector with the function a decoded
+    /// vector's key uses, gives equal vectors one canonical handle, and is
+    /// duplicate-free exactly when no vector repeats.
+    #[test]
+    fn vector_identity_hashes_by_value_and_canonicalizes_repeats() {
+        use fluree_db_core::value::{vector_value_hash, vector_value_hash_f32};
+        let dir = std::env::temp_dir().join("fluree_vector_identity_table");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Handles 0..4 over two shards; handle 3 repeats handle 1.
+        let shards = vec![
+            vec![vec![0.5f32, 0.25], vec![1.0, 0.0]],
+            vec![vec![0.0, 1.0], vec![1.0, 0.0]],
+        ];
+        let arena = vector_arena_of(&dir, 2, 2, &shards);
+        let table = VectorIdentity::build(&arena).unwrap();
+        assert!(!table.duplicate_free());
+        assert_eq!(table.of(3).unwrap().1, 1, "a repeat's canonical handle");
+        assert_eq!(table.of(1).unwrap().1, 1);
+        assert_eq!(table.of(2).unwrap().1, 2);
+        assert_eq!(table.of(1).unwrap().0, table.of(3).unwrap().0);
+        // The same vector arriving decoded (novelty, VALUES) hashes the same.
+        assert_eq!(table.of(1).unwrap().0, vector_value_hash(&[1.0, 0.0]));
+        assert_eq!(table.of(0).unwrap().0, vector_value_hash_f32(&[0.5, 0.25]));
+        assert_eq!(table.heap_bytes(), 4 * 12);
+
+        let distinct = vector_arena_of(&dir, 2, 2, &shards[..1]);
+        assert!(VectorIdentity::build(&distinct).unwrap().duplicate_free());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An arena-backed literal is decoded through the graph it carries, and
+    /// one that carries none is refused before any graph's arena is read.
+    #[test]
+    fn an_arena_literal_without_a_graph_is_refused() {
+        let dir = std::env::temp_dir().join(format!("arena-graph-{}", std::process::id()));
+        let terms = TermView::new(Arc::new(BinaryIndexStore::empty(dir)), None);
+        for kind in [ObjKind::NUM_BIG, ObjKind::VECTOR_ID] {
+            let err = terms
+                .decode_value_from_kind(kind.as_u8(), 0, 1, 0, 0, NO_ARENA_GRAPH)
+                .expect_err("no graph to read the arena through");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{kind:?}: {err}");
+            // With a graph, the arena is looked up there (this store has none).
+            let err = terms
+                .decode_value_from_kind(kind.as_u8(), 0, 1, 0, 0, 2)
+                .expect_err("no arena in an empty store");
+            assert_eq!(err.kind(), io::ErrorKind::NotFound, "{kind:?}: {err}");
+        }
+        // A store-wide kind ignores the graph.
+        let long = terms.decode_value_from_kind(
+            ObjKind::NUM_INT.as_u8(),
+            ObjKey::encode_i64(7).as_u64(),
+            1,
+            DatatypeDictId::INTEGER.as_u16(),
+            0,
+            NO_ARENA_GRAPH,
+        );
+        assert!(long.is_ok(), "{long:?}");
+    }
     use async_trait::async_trait;
     use fluree_db_core::content_kind::ContentKind;
     use fluree_db_core::o_type::OType;
@@ -3622,6 +5529,8 @@ pub(crate) mod tests {
         inner: MemoryContentStore,
         get_calls: Arc<AtomicUsize>,
         range_calls: Arc<AtomicUsize>,
+        permits_plaintext_cache: bool,
+        get_delay: Duration,
     }
 
     impl CountingContentStore {
@@ -3630,6 +5539,25 @@ pub(crate) mod tests {
                 inner: MemoryContentStore::new(),
                 get_calls: Arc::new(AtomicUsize::new(0)),
                 range_calls: Arc::new(AtomicUsize::new(0)),
+                permits_plaintext_cache: true,
+                get_delay: Duration::ZERO,
+            }
+        }
+
+        /// Holds every whole-object GET open for `delay`, so concurrent
+        /// readers overlap.
+        fn with_get_delay(delay: Duration) -> Self {
+            Self {
+                get_delay: delay,
+                ..Self::new()
+            }
+        }
+
+        /// Answers like a store that decrypts on read.
+        fn forbidding_plaintext_cache() -> Self {
+            Self {
+                permits_plaintext_cache: false,
+                ..Self::new()
             }
         }
 
@@ -3650,6 +5578,9 @@ pub(crate) mod tests {
 
         async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
             self.get_calls.fetch_add(1, AtomicOrdering::Relaxed);
+            if !self.get_delay.is_zero() {
+                tokio::time::sleep(self.get_delay).await;
+            }
             self.inner.get(id).await
         }
 
@@ -3672,6 +5603,14 @@ pub(crate) mod tests {
         ) -> fluree_db_core::Result<Vec<u8>> {
             self.range_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.inner.get_range(id, range).await
+        }
+
+        fn permits_plaintext_cache(&self) -> bool {
+            self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            true
         }
     }
 
@@ -3727,6 +5666,40 @@ pub(crate) mod tests {
         store
     }
 
+    #[test]
+    fn masking_graphs_keeps_shared_indexes_and_handles_unordered_duplicate_ids() {
+        let cache = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache.clone());
+        for g_id in 0..2048 {
+            store.graph_indexes.insert(
+                g_id,
+                Arc::new(GraphIndex {
+                    orders: HashMap::new(),
+                    order_cids: HashMap::new(),
+                    numbig: HashMap::new(),
+                    vectors: HashMap::new(),
+                    spatial: HashMap::new(),
+                    fulltext: HashMap::new(),
+                }),
+            );
+        }
+        let mut many: Vec<GraphId> = (0..2048).step_by(2).rev().collect();
+        many.extend([2, 2, u16::MAX]);
+        for dropped in [Vec::new(), vec![6, 2, 6, u16::MAX], many] {
+            let masked = store.without_graphs(&dropped);
+            assert_ne!(masked.store_id, store.store_id);
+            assert!(Arc::ptr_eq(&masked.dicts, &store.dicts));
+            for g_id in 0..2048 {
+                assert!(store.has_graph_index(g_id));
+                assert_eq!(masked.has_graph_index(g_id), !dropped.contains(&g_id));
+                if let Some(kept) = masked.graph_indexes.get(&g_id) {
+                    assert!(Arc::ptr_eq(kept, &store.graph_indexes[&g_id]));
+                }
+            }
+        }
+        std::fs::remove_dir_all(cache).unwrap();
+    }
+
     fn make_rec(s_id: u64, p_id: u32, o_type: u16, o_key: u64, t: u32) -> RunRecordV2 {
         RunRecordV2 {
             s_id: SubjectId(s_id),
@@ -3766,17 +5739,35 @@ pub(crate) mod tests {
         writer.finish().unwrap().remove(0).leaf_bytes
     }
 
-    /// Same leaf as [`build_test_leaf_bytes`], keeping the routing keys so a
-    /// `BranchManifest` can be built around it.
-    fn build_test_leaf_info() -> crate::format::leaf::LeafInfo {
-        let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+    /// Rows in [`build_large_test_leaf_info`]'s leaf.
+    const LARGE_TEST_LEAF_ROWS: u64 = 20_000;
+
+    /// A leaf of incompressible rows, too big for the speculative first read,
+    /// so a `Ranged` open loads its columns by range.
+    fn build_large_test_leaf_info() -> crate::format::leaf::LeafInfo {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let mut rows: Vec<(u64, u64)> = (0..LARGE_TEST_LEAF_ROWS)
+            .map(|_| (next() >> 1, next() >> 1))
+            .collect();
+        rows.sort_unstable_by_key(|&(s, o)| (o, s));
+        let mut writer = LeafWriter::new(RunSortOrder::Post, 1_000, 100_000, 1);
         writer.set_skip_history(true);
-        for i in 0..5u64 {
+        for (s, o) in rows {
             writer
-                .push_record(make_rec(i + 1, 1, OType::XSD_INTEGER.as_u16(), i * 10, 1))
+                .push_record(make_rec(s, 1, OType::XSD_INTEGER.as_u16(), o, 1))
                 .unwrap();
         }
-        writer.finish().unwrap().remove(0)
+        let info = writer.finish().unwrap().remove(0);
+        assert!(
+            info.leaf_bytes.len() as u64 > crate::read::leaf_access::SPECULATIVE_HEADER_DIR_BYTES
+        );
+        info
     }
 
     /// Content store that fails exactly one CAS read — the `fail_on`-th
@@ -3816,6 +5807,14 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for FailNthContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            self.inner.is_remote()
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -3850,12 +5849,12 @@ pub(crate) mod tests {
     /// Drive a full scan over the single test leaf through a store whose
     /// `fail_on`-th CAS read fails once, retrying `next_batch` on error.
     /// Returns (rows_seen, errors_seen, cas_calls).
-    fn scan_with_injected_failure(fail_on: usize) -> (u64, usize, usize) {
+    fn scan_with_injected_failure(policy: RemoteLeafFetch, fail_on: usize) -> (u64, usize, usize) {
         use crate::read::binary_cursor::BinaryCursor;
         use crate::read::column_types::{BinaryFilter, ColumnProjection};
 
         let store = FailNthContentStore::new(fail_on);
-        let info = build_test_leaf_info();
+        let info = build_large_test_leaf_info();
         let leaf_cid = run_sync_on_runtime({
             let store = store.clone();
             let bytes = info.leaf_bytes.clone();
@@ -3870,7 +5869,9 @@ pub(crate) mod tests {
         .expect("seed leaf");
 
         let cache_dir = temp_cache_dir();
-        let binary_store = Arc::new(empty_store(Arc::new(store.clone()), cache_dir.clone()));
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(policy);
+        let binary_store = Arc::new(binary_store);
         let branch = Arc::new(crate::format::branch::BranchManifest {
             leaves: vec![crate::format::branch::LeafEntry {
                 first_key: info.first_key,
@@ -3916,28 +5917,33 @@ pub(crate) mod tests {
     /// wasm NeedFetch fetch-and-retry contract at cursor granularity.
     #[test]
     fn cursor_retries_failed_cas_reads_without_losing_rows() {
-        // Baseline: no injected failure. Positively establish that the scan
-        // reads through CAS at all — otherwise the sweep below is vacuous.
-        let (rows, errors, total_calls) = scan_with_injected_failure(0);
-        assert_eq!(rows, 5, "baseline scan must see every row");
-        assert_eq!(errors, 0, "baseline scan must not error");
-        assert!(
-            total_calls >= 2,
-            "expected the remote scan to issue CAS reads (got {total_calls})"
-        );
+        for (policy, min_calls) in [(RemoteLeafFetch::Ranged, 2), (RemoteLeafFetch::Whole, 1)] {
+            // Baseline: no injected failure. Positively establish that the
+            // scan reads through CAS at all — otherwise the sweep is vacuous.
+            let (rows, errors, total_calls) = scan_with_injected_failure(policy, 0);
+            assert_eq!(
+                rows, LARGE_TEST_LEAF_ROWS,
+                "{policy:?}: baseline scan must see every row"
+            );
+            assert_eq!(errors, 0, "{policy:?}: baseline scan must not error");
+            assert!(
+                total_calls >= min_calls,
+                "{policy:?}: expected the remote scan to issue CAS reads (got {total_calls})"
+            );
 
-        // Sweep: fail each CAS call position once (header, directory, column
-        // loads, promotion refetch, ...) and require full recovery.
-        for fail_on in 1..=total_calls {
-            let (rows, errors, _) = scan_with_injected_failure(fail_on);
-            assert_eq!(
-                errors, 1,
-                "injected failure at CAS call {fail_on} must surface exactly once"
-            );
-            assert_eq!(
-                rows, 5,
-                "retry after failure at CAS call {fail_on} must not lose rows"
-            );
+            // Sweep: fail each CAS call position once (header, directory,
+            // column loads, promotion refetch, ...) and require full recovery.
+            for fail_on in 1..=total_calls {
+                let (rows, errors, _) = scan_with_injected_failure(policy, fail_on);
+                assert_eq!(
+                    errors, 1,
+                    "{policy:?}: injected failure at CAS call {fail_on} must surface exactly once"
+                );
+                assert_eq!(
+                    rows, LARGE_TEST_LEAF_ROWS,
+                    "{policy:?}: retry after failure at CAS call {fail_on} must not lose rows"
+                );
+            }
         }
     }
 
@@ -4198,7 +6204,7 @@ pub(crate) mod tests {
 
         let cache_dir = temp_cache_dir();
         let mut binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
-        binary_store.dicts.subject_reverse_tree = Some(Arc::new(tree));
+        binary_store.dicts_mut().subject_reverse_tree = Some(Arc::new(tree));
         let binary_store = Arc::new(binary_store);
 
         // Cold: the translation lookup misses, typed and registered.
@@ -4259,6 +6265,82 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(cache_dir);
     }
 
+    /// Each disk-cache read path, given a cache entry left by an earlier run
+    /// under the same CID: a permitting store serves it (the control that
+    /// makes the other half non-vacuous), a store that decrypts on read
+    /// ignores it and serves its own bytes.
+    #[test]
+    fn stale_cache_entries_are_served_only_when_plaintext_cache_permitted() {
+        use crate::read::leaf_access::RangeReadFetcher;
+        const STALE: &[u8] = b"stale plaintext left by an earlier run";
+
+        for permits in [true, false] {
+            let store = if permits {
+                CountingContentStore::new()
+            } else {
+                CountingContentStore::forbidding_plaintext_cache()
+            };
+            let leaf_bytes = build_test_leaf_bytes();
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                let leaf_bytes = leaf_bytes.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &leaf_bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            let cs: Arc<dyn ContentStore> = Arc::new(store.clone());
+            let cache_dir = temp_cache_dir();
+            std::fs::write(cache_dir.join(leaf_cid.to_string()), STALE).unwrap();
+            let shard_path = cache_dir.join(format!("{leaf_cid}.vas"));
+            std::fs::write(&shard_path, STALE).unwrap();
+            let binary_store = empty_store(Arc::clone(&cs), cache_dir.clone());
+            let expected: &[u8] = if permits { STALE } else { &leaf_bytes };
+
+            assert_eq!(
+                binary_store.get_leaf_bytes_sync(&leaf_cid).unwrap(),
+                expected,
+                "get_leaf_bytes_sync, permits={permits}"
+            );
+            assert_eq!(
+                &*binary_store.get_leaf_bytes_shared(&leaf_cid).unwrap(),
+                expected,
+                "get_leaf_bytes_shared, permits={permits}"
+            );
+            let fetcher = ContentStoreRangeFetcher::new(Arc::clone(&cs), cache_dir.clone());
+            assert_eq!(
+                fetcher.fetch_range(&leaf_cid, 0..8).unwrap(),
+                &expected[..8],
+                "range fetch, permits={permits}"
+            );
+            let shard = vector_shard_source(cs.as_ref(), &leaf_cid, &cache_dir);
+            assert_eq!(
+                shard.on_disk.load(AtomicOrdering::Acquire),
+                permits,
+                "vector shard counted as on disk, permits={permits}"
+            );
+            // The stale entry is not a valid leaf: a permitting store fails
+            // to open it, a forbidding one never looks and opens its own.
+            let opened = binary_store.open_leaf_handle(&leaf_cid, None, false);
+            assert_eq!(
+                opened.is_ok(),
+                !permits,
+                "open_leaf_handle, permits={permits}"
+            );
+            if !permits {
+                assert_eq!(
+                    std::fs::read(cache_dir.join(leaf_cid.to_string())).unwrap(),
+                    STALE,
+                    "a forbidding store must not overwrite the cache either"
+                );
+            }
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
     #[test]
     fn open_leaf_handle_caches_remote_metadata() {
         let store = CountingContentStore::new();
@@ -4274,16 +6356,17 @@ pub(crate) mod tests {
         })
         .expect("store leaf bytes");
         let cache_dir = temp_cache_dir();
-        let binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Ranged);
 
         let handle = binary_store
             .open_leaf_handle(&leaf_cid, None, false)
             .expect("first remote open");
         assert_eq!(handle.dir().entries.len(), 1);
         let first_range_calls = store.range_calls();
-        assert!(
-            first_range_calls >= 2,
-            "expected initial remote open to fetch header+directory"
+        assert_eq!(
+            first_range_calls, 1,
+            "initial remote open fetches header+directory in one request"
         );
         drop(handle);
 
@@ -4320,6 +6403,284 @@ pub(crate) mod tests {
             store.get_calls(),
             1,
             "once promoted, repeated opens should not refetch the full blob"
+        );
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// A leaf that fits in the speculative first read is served from it: its
+    /// column loads cost no further requests.
+    #[test]
+    fn ranged_policy_serves_a_small_leaf_from_its_first_read() {
+        use crate::read::column_types::ColumnProjection;
+
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Ranged);
+
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("remote open");
+        let batch = handle
+            .load_columns(0, &ColumnProjection::all(), RunSortOrder::Post)
+            .expect("load columns");
+        assert_eq!(batch.row_count, 5);
+        assert_eq!((store.get_calls(), store.range_calls()), (0, 1));
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn whole_policy_fetches_a_remote_leaf_once_and_reuses_the_disk_copy() {
+        let store = CountingContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+
+        // A directory-only open stays directory-only under either policy.
+        let dir = binary_store.open_leaf_dir(&leaf_cid).expect("dir open");
+        assert_eq!(dir.entries.len(), 1);
+        assert_eq!((store.get_calls(), store.range_calls()), (0, 1));
+
+        let handle = binary_store
+            .open_leaf_handle(&leaf_cid, None, false)
+            .expect("first remote open");
+        let batch = handle
+            .load_columns(
+                0,
+                &crate::read::column_types::ColumnProjection::all(),
+                RunSortOrder::Post,
+            )
+            .expect("columns");
+        assert_eq!(batch.row_count, 5);
+        assert_eq!(
+            (store.get_calls(), store.range_calls()),
+            (1, 1),
+            "first data access is one whole-leaf GET, even with the directory known"
+        );
+        assert!(cache_dir.join(leaf_cid.to_string()).exists());
+        drop(handle);
+
+        // A second store over the same cache dir (a restarted process) opens
+        // the persisted copy without touching the remote store.
+        let mut restarted = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        restarted.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        for s in [&binary_store, &restarted] {
+            let handle = s.open_leaf_handle(&leaf_cid, None, false).expect("reopen");
+            assert_eq!(handle.dir().entries.len(), 1);
+        }
+        assert_eq!((store.get_calls(), store.range_calls()), (1, 1));
+
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// List predicates come from POST leaflet directories alone: no whole
+    /// leaf is fetched, even under the `Whole` policy.
+    #[test]
+    fn list_predicates_are_read_without_fetching_a_whole_leaf() {
+        let member = |s: u64, p: u32, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, p, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // One leaf holding a plain predicate and a list predicate, one
+        // leaflet each, and one holding a list predicate alone.
+        let spanning = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            make_rec(2, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+            member(3, 6, 30, 0),
+            member(3, 6, 40, 1),
+        ];
+        let single = [member(4, 7, 50, 0), member(4, 7, 60, 1)];
+        let store = CountingContentStore::new();
+        let mut leaves = Vec::new();
+        for records in [&spanning[..], &single[..]] {
+            let mut writer = LeafWriter::new(RunSortOrder::Post, 100, 1000, 1);
+            writer.set_skip_history(true);
+            for rec in records {
+                writer.push_record(*rec).unwrap();
+            }
+            let info = writer.finish().unwrap().remove(0);
+            let leaf_cid = run_sync_on_runtime({
+                let store = store.clone();
+                let bytes = info.leaf_bytes.clone();
+                async move {
+                    store
+                        .put(ContentKind::IndexLeaf, &bytes)
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .expect("store leaf bytes");
+            leaves.push(crate::format::branch::LeafEntry {
+                first_key: info.first_key,
+                last_key: info.last_key,
+                row_count: info.total_rows,
+                leaf_cid,
+                sidecar_cid: None,
+            });
+        }
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        binary_store.graph_indexes.insert(
+            0,
+            Arc::new(GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Post,
+                    Arc::new(crate::format::branch::BranchManifest { leaves }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            }),
+        );
+
+        let ids = binary_store.list_predicate_ids().expect("list predicates");
+        assert_eq!(*ids, std::collections::HashSet::from([6, 7]));
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// A subject's list rows are found exactly: a neighbor sharing the
+    /// list-bearing leaflet holds none, and no whole leaf is fetched.
+    #[test]
+    fn a_subjects_list_rows_are_found_exactly() {
+        let member = |s: u64, o: u64, i: u32| RunRecordV2 {
+            o_i: i,
+            ..make_rec(s, 7, OType::XSD_INTEGER.as_u16(), o, 1)
+        };
+        // Subjects 1 and 3 hold plain rows; subject 2 owns a list. One leaflet.
+        let records = [
+            make_rec(1, 5, OType::XSD_INTEGER.as_u16(), 10, 1),
+            member(2, 30, 0),
+            member(2, 40, 1),
+            make_rec(3, 5, OType::XSD_INTEGER.as_u16(), 20, 1),
+        ];
+        let store = CountingContentStore::new();
+        let mut writer = LeafWriter::new(RunSortOrder::Spot, 100, 1000, 1);
+        writer.set_skip_history(true);
+        for rec in records {
+            writer.push_record(rec).unwrap();
+        }
+        let info = writer.finish().unwrap().remove(0);
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let bytes = info.leaf_bytes.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        binary_store.leaflet_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+        let leaf = crate::format::branch::LeafEntry {
+            first_key: info.first_key,
+            last_key: info.last_key,
+            row_count: info.total_rows,
+            leaf_cid,
+            sidecar_cid: None,
+        };
+        binary_store.graph_indexes.insert(
+            0,
+            Arc::new(GraphIndex {
+                orders: HashMap::from([(
+                    RunSortOrder::Spot,
+                    Arc::new(crate::format::branch::BranchManifest { leaves: vec![leaf] }),
+                )]),
+                order_cids: HashMap::new(),
+                numbig: HashMap::new(),
+                vectors: HashMap::new(),
+                spatial: HashMap::new(),
+                fulltext: HashMap::new(),
+            }),
+        );
+
+        let holds = |s_id| binary_store.subject_holds_lists(0, s_id).unwrap();
+        assert_eq!(
+            (holds(1), holds(2), holds(3), holds(9)),
+            (false, true, false, false)
+        );
+        assert_eq!(store.get_calls(), 0, "no whole-leaf GET");
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    #[test]
+    fn whole_policy_coalesces_concurrent_cold_opens() {
+        let store = CountingContentStore::with_get_delay(Duration::from_millis(200));
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            async move {
+                store
+                    .put(ContentKind::IndexLeaf, &leaf_bytes)
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+        binary_store.set_remote_leaf_fetch(RemoteLeafFetch::Whole);
+        let binary_store = Arc::new(binary_store);
+
+        let readers: Vec<_> = (0..8)
+            .map(|_| {
+                let binary_store = Arc::clone(&binary_store);
+                let leaf_cid = leaf_cid.clone();
+                std::thread::spawn(move || {
+                    let handle = binary_store
+                        .open_leaf_handle(&leaf_cid, None, false)
+                        .expect("concurrent open");
+                    handle
+                        .load_columns(
+                            0,
+                            &crate::read::column_types::ColumnProjection::all(),
+                            RunSortOrder::Post,
+                        )
+                        .expect("columns")
+                        .row_count
+                })
+            })
+            .collect();
+        for reader in readers {
+            assert_eq!(reader.join().expect("reader"), 5);
+        }
+        assert_eq!(
+            (store.get_calls(), store.range_calls()),
+            (1, 0),
+            "concurrent cold opens share one whole-leaf GET"
         );
 
         let _ = std::fs::remove_dir_all(cache_dir);
@@ -4405,9 +6766,9 @@ pub(crate) mod tests {
             "dir-only open must never fetch the full blob"
         );
         let first_range_calls = store.range_calls();
-        assert!(
-            first_range_calls >= 2,
-            "expected header + directory range reads"
+        assert_eq!(
+            first_range_calls, 1,
+            "header + directory come from one range read"
         );
 
         let dir2 = binary_store
@@ -4456,6 +6817,14 @@ pub(crate) mod tests {
 
     #[async_trait]
     impl ContentStore for LocalFileContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            self.inner.permits_plaintext_cache()
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             self.inner.has(id).await
         }
@@ -4490,6 +6859,146 @@ pub(crate) mod tests {
             self.local_path_calls.fetch_add(1, AtomicOrdering::Relaxed);
             self.local.read().get(id).cloned()
         }
+    }
+
+    /// A store that holds its blobs in memory and hands them out shared, as
+    /// `MemoryStorage` does through the bridge. Every fetch counts.
+    #[derive(Debug, Clone)]
+    struct ResidentContentStore {
+        inner: CountingContentStore,
+        resident: Arc<RwLock<HashMap<ContentId, Arc<[u8]>>>>,
+    }
+
+    impl ResidentContentStore {
+        fn new() -> Self {
+            Self {
+                inner: CountingContentStore::new(),
+                resident: Arc::new(RwLock::new(HashMap::new())),
+            }
+        }
+
+        async fn put_resident(&self, kind: ContentKind, bytes: &[u8]) -> ContentId {
+            let cid = self.inner.put(kind, bytes).await.expect("put");
+            self.resident.write().insert(cid.clone(), Arc::from(bytes));
+            cid
+        }
+    }
+
+    #[async_trait]
+    impl ContentStore for ResidentContentStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get(id).await
+        }
+
+        async fn put(&self, kind: ContentKind, bytes: &[u8]) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+
+        async fn get_range(
+            &self,
+            id: &ContentId,
+            range: std::ops::Range<u64>,
+        ) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get_range(id, range).await
+        }
+
+        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+            self.resident.read().get(id).cloned()
+        }
+    }
+
+    #[test]
+    fn resident_leaves_open_without_fetching_or_copying() {
+        let store = ResidentContentStore::new();
+        let leaf_bytes = build_test_leaf_bytes();
+        let leaf_cid = run_sync_on_runtime({
+            let store = store.clone();
+            let leaf_bytes = leaf_bytes.clone();
+            async move {
+                io::Result::Ok(
+                    store
+                        .put_resident(ContentKind::IndexLeaf, &leaf_bytes)
+                        .await,
+                )
+            }
+        })
+        .expect("store leaf bytes");
+        let cache_dir = temp_cache_dir();
+        let mut binary_store = empty_store(Arc::new(store.clone()), cache_dir.clone());
+
+        // Without a leaflet cache, then with one: a full open, a
+        // directory-only open and whole-leaf bytes all borrow the resident
+        // blob, so the store sees no fetch of any kind and nothing lands in
+        // the disk cache.
+        for cache in [None, Some(Arc::new(LeafletCache::with_max_mb(4)))] {
+            binary_store.leaflet_cache = cache;
+            for _ in 0..2 {
+                let handle = binary_store
+                    .open_leaf_handle(&leaf_cid, None, false)
+                    .expect("resident open");
+                assert_eq!(handle.dir().entries[0].row_count, 5);
+                let dir = binary_store
+                    .open_leaf_dir(&leaf_cid)
+                    .expect("resident dir open");
+                assert_eq!(dir.entries.len(), 1);
+                let shared = binary_store
+                    .get_leaf_bytes_shared(&leaf_cid)
+                    .expect("resident bytes");
+                let resident = store.resolve_cached_bytes(&leaf_cid).unwrap();
+                assert!(
+                    matches!(shared, SharedLeafBytes::Shared(ref bytes) if Arc::ptr_eq(bytes, &resident)),
+                    "whole-leaf bytes must be the store's own allocation"
+                );
+                assert_eq!(
+                    binary_store
+                        .get_leaf_bytes_sync(&leaf_cid)
+                        .expect("owned copy"),
+                    leaf_bytes,
+                    "an owned copy is taken from the resident bytes"
+                );
+            }
+        }
+        assert_eq!(
+            store.inner.get_calls(),
+            0,
+            "resident leaves must not be fetched"
+        );
+        assert_eq!(
+            store.inner.range_calls(),
+            0,
+            "resident leaves must not be range-read"
+        );
+        assert!(
+            binary_store.remote_leaf_metadata.read().is_empty(),
+            "a resident leaf must not take the remote range-read path"
+        );
+        assert!(
+            std::fs::read_dir(&cache_dir)
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(true),
+            "nothing of a resident leaf lands in the disk cache"
+        );
+        let _ = std::fs::remove_dir_all(cache_dir);
     }
 
     #[test]
@@ -4581,7 +7090,7 @@ pub(crate) mod tests {
                 drop(view);
                 Arc::get_mut(&mut store)
                     .unwrap()
-                    .dicts
+                    .dicts_mut()
                     .subject_forward_packs
                     .insert(
                         ns_code,
@@ -4598,15 +7107,161 @@ pub(crate) mod tests {
         }
     }
 
+    /// A subject stored under its IRI's canonical split, or under OVERFLOW,
+    /// resolves to its stored parts without the reverse lookup; every other
+    /// subject takes it, and each resolves to what that lookup gives.
+    #[test]
+    fn subject_sids_skip_the_reverse_lookup_only_for_canonical_splits_and_overflow() {
+        use crate::dict::reverse_leaf::{subject_reverse_key, ReverseEntry};
+
+        const EX: u16 = 100;
+        // Registered, but its subject's IRI splits under a prefix that is not.
+        const EX_A: u16 = 101;
+        // Same prefix as EX; the reverse map names EX for it.
+        const DUP: u16 = 102;
+        // Its IRI's canonical prefix maps back to it, with another suffix.
+        const EX_C: u16 = 103;
+        let subjects: [(u16, &str); 6] = [
+            (EX, "alice"),
+            (EX_A, "b/c"),
+            (DUP, "carol"),
+            (EX_C, "/d"),
+            (namespaces::EMPTY, "urn:isbn:123"),
+            (namespaces::OVERFLOW, "https://example.org/zed"),
+        ];
+
+        let cache_dir = temp_cache_dir();
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+        store.set_ns_split_mode(NsSplitMode::MostGranular);
+        // Full-IRI namespaces have no prefix, as in a real store.
+        store.dicts_mut().namespace_codes = Arc::new(HashMap::from([
+            (EX, "https://example.org/".to_string()),
+            (EX_A, "https://example.org/a/".to_string()),
+            (DUP, "https://example.org/".to_string()),
+            (EX_C, "https://example.org/c".to_string()),
+        ]));
+        store.dicts_mut().namespace_reverse = Arc::new(HashMap::from([
+            ("https://example.org/".to_string(), EX),
+            ("https://example.org/a/".to_string(), EX_A),
+            ("https://example.org/c/".to_string(), EX_C),
+        ]));
+        let mut reverse = Vec::new();
+        for (ns_code, suffix) in subjects {
+            store.dicts_mut().subject_forward_packs.insert(
+                ns_code,
+                ForwardPackReader::from_memory(vec![Arc::from(
+                    make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
+                )])
+                .unwrap(),
+            );
+            reverse.push(ReverseEntry {
+                key: subject_reverse_key(ns_code, suffix.as_bytes()),
+                id: SubjectId::new(ns_code, 1).as_u64(),
+            });
+        }
+        reverse.sort_by(|a, b| a.key.cmp(&b.key));
+        let tree = Arc::new(build_reverse_reader(reverse));
+        store.dicts_mut().subject_reverse_tree = Some(Arc::clone(&tree));
+        let store = Arc::new(store);
+        let view = BinaryGraphView::new(Arc::clone(&store), 0);
+
+        for (ns_code, suffix) in subjects {
+            let s_id = SubjectId::new(ns_code, 1).as_u64();
+            let iri = store.resolve_subject_iri(s_id).unwrap();
+            let expected = store
+                .find_subject_sid(&iri)
+                .unwrap()
+                .unwrap_or_else(|| store.encode_iri(&iri));
+            let lookups = tree.cache_hits();
+            assert_eq!(
+                view.resolve_subject_sid(s_id).unwrap(),
+                expected,
+                "{suffix}"
+            );
+            let lookups = tree.cache_hits() - lookups;
+            if ns_code == EX || ns_code == namespaces::OVERFLOW {
+                assert_eq!(expected, Sid::new(ns_code, suffix));
+                assert_eq!(lookups, 0, "{suffix} needs no reverse lookup");
+            } else {
+                assert!(lookups > 0, "{suffix} takes the reverse lookup");
+            }
+        }
+        let _ = std::fs::remove_dir_all(cache_dir);
+    }
+
+    /// An OVERFLOW subject decodes to its stored `Sid`, in subject and object
+    /// position, even when another subject holds the same IRI where a lookup
+    /// by IRI finds it first: under EMPTY, as #2138 left, or under a coded
+    /// prefix. A retraction carrying the twin's `Sid` would name the twin and
+    /// leave the stored fact in place.
+    #[test]
+    fn overflow_subject_decodes_to_its_own_sid_beside_a_twin() {
+        use crate::dict::reverse_leaf::subject_reverse_key;
+
+        const IRI: &str = "http://vendors.example/v/1";
+        const VENDORS: u16 = 100;
+        const VENDORS_PREFIX: &str = "http://vendors.example/v/";
+        for (twin_ns, twin_suffix) in [(namespaces::EMPTY, IRI), (VENDORS, "1")] {
+            let cache_dir = temp_cache_dir();
+            let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
+            store.set_ns_split_mode(NsSplitMode::MostGranular);
+            if twin_ns == VENDORS {
+                store.dicts_mut().namespace_codes =
+                    Arc::new(HashMap::from([(VENDORS, VENDORS_PREFIX.to_string())]));
+                store.dicts_mut().namespace_reverse =
+                    Arc::new(HashMap::from([(VENDORS_PREFIX.to_string(), VENDORS)]));
+            }
+            let mut reverse = Vec::new();
+            for (ns_code, suffix) in [(twin_ns, twin_suffix), (namespaces::OVERFLOW, IRI)] {
+                store.dicts_mut().subject_forward_packs.insert(
+                    ns_code,
+                    ForwardPackReader::from_memory(vec![Arc::from(
+                        make_subject_pack_bytes(&[(1, suffix.as_bytes())]).into_boxed_slice(),
+                    )])
+                    .unwrap(),
+                );
+                reverse.push(ReverseEntry {
+                    key: subject_reverse_key(ns_code, suffix.as_bytes()),
+                    id: SubjectId::new(ns_code, 1).as_u64(),
+                });
+            }
+            reverse.sort_by(|a, b| a.key.cmp(&b.key));
+            store.dicts_mut().subject_reverse_tree = Some(Arc::new(build_reverse_reader(reverse)));
+            let store = Arc::new(store);
+            assert_eq!(
+                store.find_subject_sid(IRI).unwrap(),
+                Some(Sid::new(twin_ns, twin_suffix)),
+                "a lookup by IRI finds the twin"
+            );
+
+            let s_id = SubjectId::new(namespaces::OVERFLOW, 1).as_u64();
+            let stored = Sid::new(namespaces::OVERFLOW, IRI);
+            let view = BinaryGraphView::new(Arc::clone(&store), 0);
+            assert_eq!(
+                view.resolve_subject_sid(s_id).unwrap(),
+                stored,
+                "twin under {twin_ns}"
+            );
+            assert_eq!(
+                store
+                    .decode_value_v3(OType::IRI_REF.as_u16(), s_id, 0, 0)
+                    .unwrap(),
+                FlakeValue::Ref(stored),
+                "twin under {twin_ns}"
+            );
+            let _ = std::fs::remove_dir_all(cache_dir);
+        }
+    }
+
     #[test]
     fn subject_decodes_are_memoized_per_view() {
         use fluree_db_core::tracking::{Tracker, TrackingOptions};
 
         let cache_dir = temp_cache_dir();
         let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
-        store.dicts.namespace_codes =
+        store.dicts_mut().namespace_codes =
             Arc::new(HashMap::from([(100, "https://example.org/".to_string())]));
-        store.dicts.subject_forward_packs.insert(
+        store.dicts_mut().subject_forward_packs.insert(
             100,
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(1, b"product")]).into_boxed_slice(),
@@ -4650,7 +7305,7 @@ pub(crate) mod tests {
         for initialized in [true, false] {
             let cache_dir = temp_cache_dir();
             let mut store = empty_store(Arc::new(MemoryContentStore::new()), cache_dir.clone());
-            store.dicts.namespace_codes = Arc::new(HashMap::from([
+            store.dicts_mut().namespace_codes = Arc::new(HashMap::from([
                 (100, "https://example.org/".to_string()),
                 (namespaces::BLANK_NODE, "_:".to_string()),
             ]));
@@ -4694,7 +7349,7 @@ pub(crate) mod tests {
         let full_iri = "https://dblp.org/streams/conf/IEEEpact";
         let s_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
 
-        store.dicts.subject_reverse_tree =
+        store.dicts_mut().subject_reverse_tree =
             Some(Arc::new(build_reverse_reader(vec![ReverseEntry {
                 key: crate::dict::reverse_leaf::subject_reverse_key(
                     namespaces::OVERFLOW,
@@ -4702,7 +7357,7 @@ pub(crate) mod tests {
                 ),
                 id: s_id,
             }])));
-        store.dicts.subject_forward_packs.insert(
+        store.dicts_mut().subject_forward_packs.insert(
             namespaces::OVERFLOW,
             ForwardPackReader::from_memory(vec![Arc::from(
                 make_subject_pack_bytes(&[(7, full_iri.as_bytes())]).into_boxed_slice(),
@@ -4715,6 +7370,29 @@ pub(crate) mod tests {
             store.find_subject_sid(full_iri).unwrap(),
             Some(Sid::new(namespaces::OVERFLOW, full_iri))
         );
+    }
+
+    /// A dt id past the `OType` payload width can only come from a damaged or
+    /// future-format row. Decoding it yields an unknown value.
+    #[test]
+    fn decode_value_from_kind_dt_past_payload_width_is_null() {
+        use fluree_db_core::o_type::OType;
+
+        let cache_dir = temp_cache_dir();
+        let cs: Arc<dyn ContentStore> = Arc::new(CountingContentStore::new());
+        let store = empty_store(cs, cache_dir);
+
+        for dt in [OType::MAX_PAYLOAD + 1, u16::MAX] {
+            let o_kind = ObjKind::LEX_ID.as_u8();
+            assert_eq!(
+                store.o_type_from_kind(o_kind, dt, 0),
+                OType::RESERVED.as_u16()
+            );
+            let val = store
+                .decode_value_from_kind(o_kind, 7, 0, dt, 0, 0)
+                .unwrap();
+            assert_eq!(val, FlakeValue::Null, "dt {dt}");
+        }
     }
 
     /// Regression test for fluree/db-r#142: legacy data where integral doubles

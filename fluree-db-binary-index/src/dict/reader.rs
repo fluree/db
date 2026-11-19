@@ -21,6 +21,38 @@ use super::reverse_leaf::ReverseLeaf;
 use crate::read::leaflet_cache::LeafletCache;
 use fluree_db_core::{ContentId, ContentStore};
 
+/// A clock for the slow-lookup debug logs below, read only when this module
+/// logs at debug level. Nothing else reads these timings, and a clock read is
+/// a large share of a lookup that hits a cached leaf. Its cost depends on the
+/// platform and clock source: on arm64, macOS and Linux alike, a read and its
+/// `elapsed()` take about 35 ns.
+struct DebugClock(Option<Instant>);
+
+impl DebugClock {
+    fn start() -> Self {
+        Self(tracing::enabled!(tracing::Level::DEBUG).then(Instant::now))
+    }
+
+    /// Time since the start or the previous lap, and restart the lap; zero
+    /// when not timing.
+    fn lap(&mut self) -> std::time::Duration {
+        match &mut self.0 {
+            Some(started) => {
+                let now = Instant::now();
+                let lap = now.duration_since(*started);
+                *started = now;
+                lap
+            }
+            None => std::time::Duration::ZERO,
+        }
+    }
+}
+
+/// Whole milliseconds, for log fields.
+fn millis(d: std::time::Duration) -> u64 {
+    d.as_millis() as u64
+}
+
 /// Leaf data source for demand-loading.
 #[derive(Debug)]
 pub enum LeafSource {
@@ -66,6 +98,10 @@ pub struct DictTreeReader {
     remote_fetches: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    /// Reverse lookups that searched a leaf: every one except a key routed
+    /// outside the tree.
+    #[cfg(feature = "test-counters")]
+    leaf_lookups: AtomicU64,
 }
 
 impl DictTreeReader {
@@ -81,6 +117,8 @@ impl DictTreeReader {
             local_file_reads: AtomicU64::new(0),
             remote_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            #[cfg(feature = "test-counters")]
+            leaf_lookups: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
     }
@@ -105,6 +143,8 @@ impl DictTreeReader {
             local_file_reads: AtomicU64::new(0),
             remote_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            #[cfg(feature = "test-counters")]
+            leaf_lookups: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
     }
@@ -125,6 +165,8 @@ impl DictTreeReader {
             local_file_reads: AtomicU64::new(0),
             remote_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            #[cfg(feature = "test-counters")]
+            leaf_lookups: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
     }
@@ -282,25 +324,25 @@ impl DictTreeReader {
     pub fn reverse_lookup(&self, key: &[u8]) -> io::Result<Option<u64>> {
         const SLOW_LOOKUP_WARN_MS: u64 = 250;
 
-        let lookup_started = Instant::now();
-        let find_leaf_started = Instant::now();
+        let mut clock = DebugClock::start();
         let leaf_idx = match self.branch.find_leaf(key) {
             Some(idx) => idx,
             None => return Ok(None),
         };
-        let find_leaf_ms = find_leaf_started.elapsed().as_millis() as u64;
+        let find_leaf = clock.lap();
+        #[cfg(feature = "test-counters")]
+        self.leaf_lookups.fetch_add(1, Ordering::Relaxed);
 
         let address = &self.branch.leaves[leaf_idx].address;
-        let load_leaf_started = Instant::now();
         let leaf_data = self.load_leaf(address)?;
-        let load_leaf_ms = load_leaf_started.elapsed().as_millis() as u64;
-        let decode_started = Instant::now();
+        let load_leaf = clock.lap();
         let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
-        let decode_leaf_ms = decode_started.elapsed().as_millis() as u64;
-        let leaf_lookup_started = Instant::now();
+        let decode_leaf = clock.lap();
         let result = leaf.lookup(key);
-        let lookup_leaf_ms = leaf_lookup_started.elapsed().as_millis() as u64;
-        let total_ms = lookup_started.elapsed().as_millis() as u64;
+        let lookup_leaf = clock.lap();
+        let total_ms = millis(find_leaf + load_leaf + decode_leaf + lookup_leaf);
+        let (find_leaf_ms, load_leaf_ms) = (millis(find_leaf), millis(load_leaf));
+        let (decode_leaf_ms, lookup_leaf_ms) = (millis(decode_leaf), millis(lookup_leaf));
 
         if total_ms >= SLOW_LOOKUP_WARN_MS || load_leaf_ms >= SLOW_LOOKUP_WARN_MS {
             tracing::debug!(
@@ -372,13 +414,12 @@ impl DictTreeReader {
     {
         const SLOW_BATCH_WARN_MS: u64 = 250;
 
-        let lookup_started = Instant::now();
+        let mut clock = DebugClock::start();
         let key_refs: Vec<&[u8]> = keys.into_iter().collect();
         if key_refs.is_empty() {
             return Ok(Vec::new());
         }
 
-        let find_leaf_started = Instant::now();
         let mut results = vec![None; key_refs.len()];
         let mut key_indices_by_leaf = vec![Vec::<usize>::new(); self.branch.leaves.len()];
 
@@ -387,9 +428,8 @@ impl DictTreeReader {
                 key_indices_by_leaf[leaf_idx].push(idx);
             }
         }
-        let find_leaf_ms = find_leaf_started.elapsed().as_millis() as u64;
+        let find_leaf = clock.lap();
 
-        let load_and_decode_started = Instant::now();
         let mut touched_leaves = 0usize;
         for (leaf_idx, key_indices) in key_indices_by_leaf.iter().enumerate() {
             if key_indices.is_empty() {
@@ -404,8 +444,9 @@ impl DictTreeReader {
                 results[key_idx] = leaf.lookup(key_refs[key_idx]);
             }
         }
-        let load_and_decode_ms = load_and_decode_started.elapsed().as_millis() as u64;
-        let total_ms = lookup_started.elapsed().as_millis() as u64;
+        let load_and_decode = clock.lap();
+        let total_ms = millis(find_leaf + load_and_decode);
+        let (find_leaf_ms, load_and_decode_ms) = (millis(find_leaf), millis(load_and_decode));
 
         if total_ms >= SLOW_BATCH_WARN_MS {
             tracing::debug!(
@@ -531,13 +572,19 @@ impl DictTreeReader {
                 return self.load_leaf_resident(cs, remote_cids, address);
             }
         }
+        /// A store that decrypts on read gets no disk cache: nothing left
+        /// there by an earlier run is consulted.
         fn read_disk_cached_leaf(
+            cs: &dyn ContentStore,
             disk_cache_dir: Option<&PathBuf>,
             cid: &ContentId,
         ) -> io::Result<Option<Vec<u8>>> {
             let Some(cache_dir) = disk_cache_dir else {
                 return Ok(None);
             };
+            if !crate::read::artifact_cache::uses_disk_cache(cs) {
+                return Ok(None);
+            }
             let cache_path = cache_dir.join(cid.to_string());
             match std::fs::read(&cache_path) {
                 Ok(bytes) => Ok(Some(bytes)),
@@ -593,7 +640,7 @@ impl DictTreeReader {
             })
         }
 
-        let load_started = Instant::now();
+        let mut clock = DebugClock::start();
         let result = match &self.leaf_source {
             LeafSource::LocalFiles(map) => {
                 let path = map.get(address).ok_or_else(|| {
@@ -679,7 +726,12 @@ impl DictTreeReader {
                     let address = address.to_owned();
                     let disk_cache_dir = self.disk_cache_dir.clone();
                     cache.try_get_or_load_dict_leaf(cache_key, || {
-                        if let Some(bytes) = read_disk_cached_leaf(disk_cache_dir.as_ref(), &cid)? {
+                        if let Some(bytes) = cs.resolve_cached_bytes(&cid) {
+                            return Ok(bytes);
+                        }
+                        if let Some(bytes) =
+                            read_disk_cached_leaf(cs.as_ref(), disk_cache_dir.as_ref(), &cid)?
+                        {
                             disk_reads.fetch_add(1, Ordering::Relaxed);
                             local_file_reads.fetch_add(1, Ordering::Relaxed);
                             return Ok(Arc::from(bytes.into_boxed_slice()));
@@ -702,7 +754,12 @@ impl DictTreeReader {
                         Ok(Arc::from(bytes.into_boxed_slice()))
                     })
                 } else {
-                    if let Some(bytes) = read_disk_cached_leaf(self.disk_cache_dir.as_ref(), cid)? {
+                    if let Some(bytes) = cs.resolve_cached_bytes(cid) {
+                        return Ok(bytes);
+                    }
+                    if let Some(bytes) =
+                        read_disk_cached_leaf(cs.as_ref(), self.disk_cache_dir.as_ref(), cid)?
+                    {
                         self.disk_reads.fetch_add(1, Ordering::Relaxed);
                         self.local_file_reads.fetch_add(1, Ordering::Relaxed);
                         return Ok(Arc::from(bytes.into_boxed_slice()));
@@ -741,7 +798,7 @@ impl DictTreeReader {
         };
 
         if let Ok(bytes) = &result {
-            let elapsed_ms = load_started.elapsed().as_millis() as u64;
+            let elapsed_ms = millis(clock.lap());
             if elapsed_ms >= 250 {
                 tracing::debug!(
                     address,
@@ -789,6 +846,12 @@ impl DictTreeReader {
     /// Number of cache misses since creation.
     pub fn cache_misses(&self) -> u64 {
         self.cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Number of reverse lookups that searched a leaf since creation.
+    #[cfg(feature = "test-counters")]
+    pub fn leaf_lookups(&self) -> u64 {
+        self.leaf_lookups.load(Ordering::Relaxed)
     }
 
     /// Preload all leaves into the global cache (or just read them into OS page cache).
@@ -868,6 +931,14 @@ mod tests {
 
     #[async_trait::async_trait]
     impl ContentStore for CountingFileStore {
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+
+        fn is_remote(&self) -> bool {
+            false
+        }
+
         async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
             Ok(self.paths.lock().contains_key(id))
         }
@@ -1003,6 +1074,246 @@ mod tests {
         let _ = std::fs::remove_dir_all(&store.dir);
     }
 
+    /// In-memory remote store (no local paths) whose plaintext-cache answer
+    /// is set by the test.
+    #[derive(Debug)]
+    struct RemoteStore {
+        inner: fluree_db_core::MemoryContentStore,
+        permits_plaintext_cache: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for RemoteStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.inner.get(id).await
+        }
+        async fn put(
+            &self,
+            kind: fluree_db_core::ContentKind,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<ContentId> {
+            self.inner.put(kind, bytes).await
+        }
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await
+        }
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+        fn permits_plaintext_cache(&self) -> bool {
+            self.permits_plaintext_cache
+        }
+
+        fn is_remote(&self) -> bool {
+            true
+        }
+    }
+
+    /// A disk-cache entry left under a leaf's CID by an earlier run — here a
+    /// valid leaf mapping the same key to a different id — is served only by
+    /// a store that permits a plaintext cache; one that decrypts on read
+    /// fetches its own leaf.
+    #[test]
+    fn stale_disk_cached_leaf_is_ignored_when_plaintext_cache_forbidden() {
+        let tree = |id_offset: u64| {
+            let entries = ["a", "b", "c"]
+                .iter()
+                .enumerate()
+                .map(|(i, k)| ReverseEntry {
+                    key: k.as_bytes().to_vec(),
+                    id: id_offset + i as u64,
+                })
+                .collect();
+            builder::build_reverse_tree(entries, builder::DEFAULT_TARGET_LEAF_BYTES).unwrap()
+        };
+        let current = tree(0);
+        let stale = tree(1000);
+        assert_eq!(current.leaves.len(), 1);
+        assert_eq!(stale.leaves.len(), 1);
+
+        for permits in [true, false] {
+            let store = Arc::new(RemoteStore {
+                inner: fluree_db_core::MemoryContentStore::new(),
+                permits_plaintext_cache: permits,
+            });
+            let cs: Arc<dyn ContentStore> = store.clone();
+            let cid = crate::read::binary_index_store::run_sync_on_runtime({
+                let cs = Arc::clone(&cs);
+                let bytes = current.leaves[0].bytes.clone();
+                async move {
+                    cs.put(
+                        fluree_db_core::ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::SubjectReverse,
+                        },
+                        &bytes,
+                    )
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .unwrap();
+
+            static N: AtomicU64 = AtomicU64::new(0);
+            let cache_dir = std::env::temp_dir().join(format!(
+                "fluree_dict_reader_stale_{}_{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir_all(&cache_dir).unwrap();
+            std::fs::write(cache_dir.join(cid.to_string()), &stale.leaves[0].bytes).unwrap();
+
+            let mut remote_cids = HashMap::new();
+            remote_cids.insert(current.branch.leaves[0].address.clone(), cid);
+            let mut reader = DictTreeReader::new(
+                current.branch.clone(),
+                LeafSource::CasOnDemand {
+                    cs,
+                    local_files: HashMap::new(),
+                    remote_cids,
+                },
+            );
+            reader.set_disk_cache_dir(Some(cache_dir.clone()));
+
+            let expected = if permits { 1002 } else { 2 };
+            assert_eq!(
+                reader.reverse_lookup(b"c").unwrap(),
+                Some(expected),
+                "permits={permits}"
+            );
+            let _ = std::fs::remove_dir_all(&cache_dir);
+        }
+    }
+
+    /// In-memory store that hands its leaves out shared, as memory storage
+    /// does through the bridge. Fetches count.
+    #[derive(Debug)]
+    struct ResidentStore {
+        inner: fluree_db_core::MemoryContentStore,
+        resident: std::sync::RwLock<HashMap<ContentId, Arc<[u8]>>>,
+        gets: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl ContentStore for ResidentStore {
+        async fn has(&self, id: &ContentId) -> fluree_db_core::Result<bool> {
+            self.inner.has(id).await
+        }
+        async fn get(&self, id: &ContentId) -> fluree_db_core::Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::Relaxed);
+            self.inner.get(id).await
+        }
+        async fn put(
+            &self,
+            kind: fluree_db_core::ContentKind,
+            bytes: &[u8],
+        ) -> fluree_db_core::Result<ContentId> {
+            let id = self.inner.put(kind, bytes).await?;
+            self.resident
+                .write()
+                .unwrap()
+                .insert(id.clone(), Arc::from(bytes));
+            Ok(id)
+        }
+        async fn put_with_id(&self, id: &ContentId, bytes: &[u8]) -> fluree_db_core::Result<()> {
+            self.inner.put_with_id(id, bytes).await?;
+            self.resident
+                .write()
+                .unwrap()
+                .insert(id.clone(), Arc::from(bytes));
+            Ok(())
+        }
+        async fn release(&self, id: &ContentId) -> fluree_db_core::Result<()> {
+            self.inner.release(id).await
+        }
+        fn permits_plaintext_cache(&self) -> bool {
+            true
+        }
+        fn is_remote(&self) -> bool {
+            false
+        }
+        fn resolve_cached_bytes(&self, id: &ContentId) -> Option<Arc<[u8]>> {
+            self.resident.read().unwrap().get(id).cloned()
+        }
+    }
+
+    /// A store holding its dict leaves in memory hands them out shared: a
+    /// lookup borrows the leaf, through the global cache or not, and never
+    /// fetches it.
+    #[test]
+    fn resident_dict_leaves_are_borrowed_not_fetched() {
+        let entries = ["a", "b", "c"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| ReverseEntry {
+                key: k.as_bytes().to_vec(),
+                id: i as u64,
+            })
+            .collect();
+        let tree =
+            builder::build_reverse_tree(entries, builder::DEFAULT_TARGET_LEAF_BYTES).unwrap();
+        assert_eq!(tree.leaves.len(), 1);
+        let address = tree.branch.leaves[0].address.clone();
+
+        for with_cache in [false, true] {
+            let store = Arc::new(ResidentStore {
+                inner: fluree_db_core::MemoryContentStore::new(),
+                resident: Default::default(),
+                gets: AtomicU64::new(0),
+            });
+            let cs: Arc<dyn ContentStore> = store.clone();
+            let cid = crate::read::binary_index_store::run_sync_on_runtime({
+                let cs = Arc::clone(&cs);
+                let bytes = tree.leaves[0].bytes.clone();
+                async move {
+                    cs.put(
+                        fluree_db_core::ContentKind::DictBlob {
+                            dict: fluree_db_core::DictKind::SubjectReverse,
+                        },
+                        &bytes,
+                    )
+                    .await
+                    .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .unwrap();
+
+            let mut remote_cids = HashMap::new();
+            remote_cids.insert(address.clone(), cid.clone());
+            let mut reader = DictTreeReader::new(
+                tree.branch.clone(),
+                LeafSource::CasOnDemand {
+                    cs,
+                    local_files: HashMap::new(),
+                    remote_cids,
+                },
+            );
+            if with_cache {
+                reader.global_cache = Some(Arc::new(LeafletCache::with_max_mb(4)));
+            }
+
+            for _ in 0..2 {
+                assert_eq!(
+                    reader.reverse_lookup(b"c").unwrap(),
+                    Some(2),
+                    "with_cache={with_cache}"
+                );
+            }
+            let leaf = reader.load_leaf(&address).unwrap();
+            assert!(
+                Arc::ptr_eq(&leaf, &store.resolve_cached_bytes(&cid).unwrap()),
+                "with_cache={with_cache}: the leaf must be the store's own allocation"
+            );
+            assert_eq!(
+                store.gets.load(Ordering::Relaxed),
+                0,
+                "with_cache={with_cache}: a resident leaf must not be fetched"
+            );
+        }
+    }
+
     #[test]
     fn test_reverse_lookup() {
         let mut entries: Vec<ReverseEntry> = (0..100)
@@ -1017,5 +1328,51 @@ mod tests {
 
         assert_eq!(reader.reverse_lookup(b"key_0050").unwrap(), Some(50));
         assert_eq!(reader.reverse_lookup(b"nonexistent").unwrap(), None);
+    }
+
+    /// The target the slow-lookup logs, and the clock's `enabled!` check, use.
+    const DICT_READER_TARGET: &str = "fluree_db_binary_index::dict::reader";
+
+    /// Runs `f` under `subscriber` as this thread's default, so a cached
+    /// interest from another test can't decide whether the clock runs.
+    fn with_subscriber<S, R>(subscriber: S, f: impl FnOnce() -> R) -> R
+    where
+        S: tracing::Subscriber + Send + Sync + 'static,
+    {
+        fluree_test_support::with_scoped_default(subscriber, f)
+    }
+
+    fn reader_at(level: tracing::Level) -> impl tracing::Subscriber + Send + Sync {
+        use tracing_subscriber::layer::SubscriberExt;
+        tracing_subscriber::registry()
+            .with(tracing_subscriber::filter::Targets::new().with_target(DICT_READER_TARGET, level))
+    }
+
+    fn lap_after_sleep() -> (bool, std::time::Duration) {
+        let mut clock = DebugClock::start();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        (clock.0.is_some(), clock.lap())
+    }
+
+    #[test]
+    fn debug_clock_does_not_read_without_debug() {
+        let none = with_subscriber(
+            tracing::subscriber::NoSubscriber::default(),
+            lap_after_sleep,
+        );
+        assert_eq!(none, (false, std::time::Duration::ZERO), "no subscriber");
+
+        let info = with_subscriber(reader_at(tracing::Level::INFO), lap_after_sleep);
+        assert_eq!(info, (false, std::time::Duration::ZERO), "reader at INFO");
+    }
+
+    #[test]
+    fn debug_clock_times_laps_with_debug() {
+        let (timing, lap) = with_subscriber(reader_at(tracing::Level::DEBUG), lap_after_sleep);
+        assert!(timing, "reader at DEBUG should read the clock");
+        assert!(
+            lap >= std::time::Duration::from_millis(5),
+            "lap {lap:?} should cover the 5ms sleep"
+        );
     }
 }

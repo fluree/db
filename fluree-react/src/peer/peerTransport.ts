@@ -1,0 +1,510 @@
+/**
+ * Peer mode: the `LiveTransport` backed by the wasm engine in a web worker.
+ *
+ * The engine already does the expensive half. It hears commits over SSE,
+ * applies them locally, re-runs the affected subscriptions against ONE frozen
+ * snapshot, hashes the formatted bytes worker-side, and emits exactly one
+ * batched cycle — unchanged subscriptions carrying zero payload. This
+ * transport is therefore mostly translation: engine subscription ids to cache
+ * subscription ids, and the engine's cycle to ours.
+ *
+ * Two things it owns beyond translation:
+ *
+ * - **Async registration against a synchronous seam.** `subscribe` is
+ *   fire-and-forget here but `Peer.subscribe` is a promise, and the engine
+ *   itself may not have connected yet. Registrations queue and drain; an
+ *   unsubscribe that arrives first cancels the pending registration rather
+ *   than leaking a live query into the engine.
+ * - **Crash recycles.** A recycled engine has no subscriptions. Nothing
+ *   errors and no cycle ever arrives again, so without re-registration every
+ *   component would silently freeze on stale data — the exact failure mode
+ *   this package exists to prevent. The transport re-subscribes on `"ready"`
+ *   and, when the engine goes `"terminal"`, errors every live subscription so
+ *   the UI can say so.
+ * - **The auto-prime race.** The engine primes a subscription the moment it
+ *   registers, so its first cycle can reach `applyCycle` before the
+ *   `subscribe()` reply that would populate `byEngineId` for it — the reply
+ *   and the cycle are separate postMessages, and nothing guarantees the reply
+ *   wins. An unresolvable cycle entry is stashed (keyed by the raw engine id)
+ *   for as long as a registration is in flight and replayed the moment that
+ *   id's mapping lands, instead of being silently dropped — a drop here would
+ *   leave `hasResult` false in the cache and turn the NEXT "unchanged" cycle
+ *   into a spurious transport-contract error. The stash is cleared whenever
+ *   no registration is in flight, so it cannot accumulate entries for engine
+ *   ids this transport will never own (another consumer may share the peer),
+ *   and it is cleared again on a crash recycle, since a fresh worker restarts
+ *   its id counter and could otherwise reuse a stashed id for an unrelated
+ *   subscription.
+ */
+
+import type {
+  CycleChange,
+  CycleErrored,
+  CycleUpdate,
+  LiveTransport,
+  SubscriptionSpec,
+  TransportSink,
+} from "../core/transport.js";
+import type { ConnectionState, QueryError, ResolvedSpec } from "../core/types.js";
+import type {
+  PeerConnect,
+  PeerEngine,
+  PeerError,
+  PeerSubscription,
+} from "./peerEngine.js";
+
+export interface PeerTransportOptions {
+  /**
+   * `connect` from `@fluree/db-wasm`, passed in rather than imported so this
+   * package carries no dependency on the wasm engine (see `peerEngine.ts`).
+   */
+  connect: PeerConnect;
+  /** The server's versioned API base, e.g. `https://host/v1/fluree`. */
+  url: string;
+  /** Bearer-token supplier. The worker asks for one on connect and again
+   * after a crash recycle; the token is never embedded in the worker's init
+   * message. */
+  getToken?: (reason: "connect" | "reconnect") => string | Promise<string>;
+  /**
+   * Ledgers to start SSE head tracking for. Defaults to `[]`, which means
+   * "everything this token may see" — the engine only delivers cycles for
+   * tracked ledgers, so a narrower list silently makes untracked queries
+   * non-live. Narrow it only when you know every ledger the app will query.
+   */
+  watch?: string[];
+  workerUrl?: string | URL;
+  wasmUrl?: string | URL;
+  maxMemoryBytes?: number | null;
+  /** Injectable for tests: use an already-built engine instead of connecting. */
+  engine?: Promise<PeerEngine>;
+}
+
+interface Registration {
+  spec: SubscriptionSpec;
+  /** Set once the engine has accepted it. */
+  sub?: PeerSubscription;
+  /** Set when unsubscribe arrived before registration completed. */
+  cancelled: boolean;
+}
+
+/**
+ * A cycle entry that arrived for an engine id `byEngineId` doesn't know yet,
+ * stashed to replay once a registration resolves that id. See `register`'s
+ * `pendingRegistrations` bracket and `applyCycle`'s unresolved branch.
+ */
+type PendingCycleEntry =
+  | { kind: "changed"; data: unknown; t: number | undefined }
+  | { kind: "unchanged"; t: number | undefined }
+  | { kind: "errored"; error: PeerError; t: number | undefined };
+
+/** The format a query language produces natively. The engine has no format
+ * parameter — a subscription's results are always its language's — so a
+ * different `opts.format` cannot be honoured in peer mode and must fail
+ * loudly rather than hand a component the wrong shape. */
+function nativeFormat(kind: string): string {
+  return kind === "sparql" ? "sparql-json" : "jsonld";
+}
+
+function toQueryError(err: unknown): QueryError {
+  if (typeof err === "object" && err !== null && "message" in err) {
+    const e = err as PeerError;
+    const out: QueryError = {
+      code: typeof e.code === "string" ? e.code : "peer",
+      message: String(e.message),
+    };
+    if (typeof e.status === "number") out.status = e.status;
+    return out;
+  }
+  return { code: "peer", message: String(err) };
+}
+
+export class PeerTransport implements LiveTransport {
+  private readonly options: PeerTransportOptions;
+  private sink: TransportSink | undefined;
+  private engine: PeerEngine | undefined;
+  private enginePromise: Promise<PeerEngine> | undefined;
+  private connState: ConnectionState = "connecting";
+  private closed = false;
+  /**
+   * The failure that took the engine out, if any. Remembered because a
+   * subscribe can arrive AFTER it — an expired token fails the connect, the
+   * first route's queries correctly show `unauthorized`, the user navigates,
+   * and the new route mounts fresh `useQuery`s. Without a replay those are
+   * stored and never acted on: `loading` forever, no error, no cycle, which
+   * is the silent freeze this transport exists to prevent.
+   */
+  private failure: QueryError | undefined;
+
+  /** Cache subId -> registration. */
+  private readonly subs = new Map<number, Registration>();
+  /** Engine subId -> cache subId. */
+  private readonly byEngineId = new Map<number, number>();
+  /** Count of `register()` calls currently between their `engine.subscribe()`
+   * call and its reply — i.e. engine ids that exist but aren't in
+   * `byEngineId` yet. Gates whether an unresolved cycle entry is worth
+   * stashing (see `pendingCycles`) instead of just dropped. */
+  private pendingRegistrations = 0;
+  /** Cycle entries for an engine id not yet in `byEngineId`, keyed by that
+   * raw engine id — only populated while `pendingRegistrations > 0`. See the
+   * class docstring's "auto-prime race" note. */
+  private readonly pendingCycles = new Map<number, PendingCycleEntry>();
+  private detachCycle: (() => void) | undefined;
+  private detachState: (() => void) | undefined;
+
+  constructor(options: PeerTransportOptions) {
+    this.options = options;
+  }
+
+  start(sink: TransportSink): void {
+    this.sink = sink;
+    const pending =
+      this.options.engine ??
+      this.options.connect(this.options.url, {
+        ...(this.options.getToken ? { getToken: this.options.getToken } : {}),
+        // Always pass a tracking list: without one the engine never starts
+        // head tracking and no subscription is ever live.
+        subscribe: this.options.watch ?? [],
+        ...(this.options.workerUrl !== undefined
+          ? { workerUrl: this.options.workerUrl }
+          : {}),
+        ...(this.options.wasmUrl !== undefined ? { wasmUrl: this.options.wasmUrl } : {}),
+        ...(this.options.maxMemoryBytes !== undefined
+          ? { maxMemoryBytes: this.options.maxMemoryBytes }
+          : {}),
+      });
+    this.enginePromise = pending;
+    void pending.then(
+      (engine) => this.onEngineReady(engine),
+      (err) => this.onEngineFailed(err),
+    );
+  }
+
+  private onEngineReady(engine: PeerEngine): void {
+    if (this.closed) {
+      engine.close();
+      return;
+    }
+    this.engine = engine;
+    this.detachCycle = engine.onCycle((cycle) => this.applyCycle(cycle));
+    this.detachState = engine.onEngineState((state) => {
+      if (state === "recycling") {
+        // Every engine id died with the worker. Drop the mapping outright:
+        // a fresh worker restarts its id counter, so a stale entry could
+        // otherwise route another query's results to this subscription. The
+        // same reasoning applies to any stashed pre-mapping cycle entries —
+        // the new worker can reissue an id a dead one used, so a stashed
+        // entry left standing could be replayed onto the wrong subscription.
+        this.byEngineId.clear();
+        this.pendingCycles.clear();
+        for (const reg of this.subs.values()) reg.sub = undefined;
+        this.setConnection("reconnecting");
+      } else if (state === "ready") {
+        // A recycled engine has no subscriptions: re-register everything
+        // this transport still holds, or every component freezes silently.
+        this.failure = undefined; // the engine came back
+        this.setConnection("live");
+        for (const [subId, reg] of this.subs) {
+          reg.sub = undefined;
+          void this.register(subId, reg);
+        }
+      } else {
+        this.setConnection("closed");
+        this.failure = {
+          code: "engine_unavailable",
+          message: "the peer engine stopped and could not be restarted",
+          status: 503,
+        };
+        this.failAll(this.failure);
+      }
+    });
+    this.setConnection("live");
+    for (const [subId, reg] of this.subs) {
+      if (!reg.sub) void this.register(subId, reg);
+    }
+  }
+
+  private onEngineFailed(err: unknown): void {
+    if (this.closed) return;
+    this.setConnection("closed");
+    this.failure = toQueryError(err);
+    this.failAll(this.failure);
+  }
+
+  /** Report an error for every live subscription, grouped per ledger so each
+   * delivery is still one coherent cycle. */
+  private failAll(error: QueryError): void {
+    const byLedger = new Map<string, CycleErrored[]>();
+    for (const [subId, reg] of this.subs) {
+      const list = byLedger.get(reg.spec.ledger) ?? [];
+      list.push({ subId, error });
+      byLedger.set(reg.spec.ledger, list);
+    }
+    for (const [ledger, errored] of byLedger) {
+      this.sink?.onCycle({ ledger, changed: [], unchanged: [], errored });
+    }
+  }
+
+  private setConnection(state: ConnectionState): void {
+    if (this.connState === state) return;
+    this.connState = state;
+    this.sink?.onConnection(state);
+  }
+
+  /**
+   * The two things peer mode cannot answer, checked in one place because
+   * they must hold on EVERY public path. Both refusals exist so switching
+   * client modes can never change a component's data shape; enforcing one on
+   * a path and not the other is worse than having neither, because the half
+   * that is missing fails silently.
+   */
+  private unsupported(spec: ResolvedSpec): QueryError | undefined {
+    // The engine has no notion of a past watermark: `snapshot` freezes the
+    // CURRENT head, and a subscription is always against the live ledger.
+    // Silently serving current data for a time-travel query would be a
+    // correctness bug, so say so.
+    if (spec.at !== undefined) {
+      return {
+        code: "unsupported",
+        message:
+          `peer mode cannot serve a time-anchored query (at: ${spec.at}) — ` +
+          "the in-browser engine has no historical view. Use remote mode for time travel.",
+      };
+    }
+    // The engine has no format parameter — a query's results are always its
+    // language's — so a different `opts.format` cannot be honoured here.
+    if (spec.format !== nativeFormat(spec.kind)) {
+      return {
+        code: "unsupported",
+        message:
+          `peer mode cannot serve format "${spec.format}" for a ${spec.kind} query — ` +
+          `the engine always produces "${nativeFormat(spec.kind)}". Use remote mode for other formats.`,
+      };
+    }
+    return undefined;
+  }
+
+  subscribe(spec: SubscriptionSpec): void {
+    if (this.closed) return;
+
+    const refused = this.unsupported(spec);
+    if (refused) {
+      this.reject(spec, refused);
+      return;
+    }
+    if (this.failure) {
+      // The engine is already gone. Storing this registration would leave
+      // the component loading forever; nothing will ever drain it.
+      this.reject(spec, this.failure);
+      return;
+    }
+
+    const reg: Registration = { spec, cancelled: false };
+    this.subs.set(spec.subId, reg);
+    if (this.engine) void this.register(spec.subId, reg);
+  }
+
+  /** Deliver a rejection for a spec that was never registered. */
+  private reject(spec: SubscriptionSpec, error: QueryError): void {
+    // Asynchronously, so a subscribe that fails synchronously still reaches
+    // the cache after the caller has finished attaching observers.
+    queueMicrotask(() => {
+      if (this.closed) return;
+      this.sink?.onCycle({
+        ledger: spec.ledger,
+        changed: [],
+        unchanged: [],
+        errored: [{ subId: spec.subId, error }],
+      });
+    });
+  }
+
+  private async register(subId: number, reg: Registration): Promise<void> {
+    const engine = this.engine;
+    if (!engine || reg.cancelled) return;
+    // Brackets the window in which the engine has this registration's id but
+    // `byEngineId` does not — the auto-prime race the class docstring
+    // describes. `finally` clears the stash the moment no such window is
+    // open anywhere, so it never outlives the registrations that justified it.
+    this.pendingRegistrations++;
+    try {
+      const sub = await engine.subscribe(
+        reg.spec.ledger,
+        // The engine infers the query language from the argument's type, so
+        // a JSON-LD query must go over as an object, not as its text.
+        reg.spec.kind === "sparql" ? reg.spec.text : JSON.parse(reg.spec.text),
+        () => {},
+      );
+      if (this.closed || reg.cancelled || this.subs.get(subId) !== reg) {
+        void sub.unsubscribe().catch(() => {});
+        return;
+      }
+      reg.sub = sub;
+      this.byEngineId.set(sub.subId, subId);
+      this.drainStash(sub.subId, subId, reg.spec.ledger);
+    } catch (err) {
+      if (this.closed || reg.cancelled) return;
+      this.sink?.onCycle({
+        ledger: reg.spec.ledger,
+        changed: [],
+        unchanged: [],
+        errored: [{ subId, error: toQueryError(err) }],
+      });
+    } finally {
+      this.pendingRegistrations--;
+      if (this.pendingRegistrations === 0) this.pendingCycles.clear();
+    }
+  }
+
+  /** Replay a cycle entry that arrived for `engineId` before its mapping did
+   * (see the class docstring's "auto-prime race" note), as its own
+   * one-subscription cycle. A no-op when nothing was stashed for it. */
+  private drainStash(engineId: number, subId: number, ledger: string): void {
+    const entry = this.pendingCycles.get(engineId);
+    if (!entry) return;
+    this.pendingCycles.delete(engineId);
+    const update: CycleUpdate = { ledger, changed: [], unchanged: [], errored: [] };
+    if (entry.kind === "changed") {
+      update.changed = [{ subId, payload: entry.data }];
+    } else if (entry.kind === "unchanged") {
+      update.unchanged = [subId];
+    } else {
+      update.errored = [{ subId, error: toQueryError(entry.error) }];
+    }
+    if (entry.t !== undefined) update.t = entry.t;
+    this.sink?.onCycle(update);
+  }
+
+  /** Stash a cycle entry `resolve()` couldn't place, but only while some
+   * registration is in flight — otherwise `engineId` belongs to a
+   * subscription this transport will never own (another consumer may share
+   * the peer) and stashing it would never be drained. */
+  private stashIfPending(engineId: number, entry: PendingCycleEntry): void {
+    if (this.pendingRegistrations === 0) return;
+    this.pendingCycles.set(engineId, entry);
+  }
+
+  unsubscribe(subId: number): void {
+    const reg = this.subs.get(subId);
+    if (!reg) return;
+    this.subs.delete(subId);
+    reg.cancelled = true;
+    if (reg.sub) {
+      this.byEngineId.delete(reg.sub.subId);
+      void reg.sub.unsubscribe().catch(() => {});
+    }
+  }
+
+  /** Translate one engine cycle into ours, dropping entries for engine
+   * subscriptions this transport does not own (another consumer may share
+   * the same peer). */
+  private applyCycle(cycle: {
+    ledger: string;
+    t: number | undefined;
+    changed: { subId: number; data: unknown }[];
+    unchanged: number[];
+    errored: { subId: number; error: PeerError }[];
+  }): void {
+    if (this.closed) return;
+    // Group by the SUBSCRIBING spec's ledger spelling, not a single spelling
+    // claimed from the first entry. The engine names ledgers canonically
+    // (`demo/board:main`), but one page can hold useQuery("demo/board") and
+    // useQuery("demo/board:main") at once; each must be delivered — and keyed
+    // downstream (`client.ledgerHead`) — under the spelling ITS subscription
+    // used, or the other spelling reads as unknown and its head never fires.
+    type Bucket = {
+      changed: CycleChange[];
+      unchanged: number[];
+      errored: CycleErrored[];
+    };
+    const byLedger = new Map<string, Bucket>();
+    const bucketFor = (ledger: string): Bucket => {
+      let b = byLedger.get(ledger);
+      if (!b) {
+        b = { changed: [], unchanged: [], errored: [] };
+        byLedger.set(ledger, b);
+      }
+      return b;
+    };
+    const resolve = (
+      engineId: number,
+    ): { subId: number; ledger: string } | undefined => {
+      const subId = this.byEngineId.get(engineId);
+      if (subId === undefined) return undefined;
+      const ledger = this.subs.get(subId)?.spec.ledger;
+      if (ledger === undefined) return undefined;
+      return { subId, ledger };
+    };
+
+    for (const entry of cycle.changed) {
+      const r = resolve(entry.subId);
+      if (r) {
+        bucketFor(r.ledger).changed.push({ subId: r.subId, payload: entry.data });
+      } else {
+        this.stashIfPending(entry.subId, { kind: "changed", data: entry.data, t: cycle.t });
+      }
+    }
+    for (const engineId of cycle.unchanged) {
+      const r = resolve(engineId);
+      if (r) {
+        bucketFor(r.ledger).unchanged.push(r.subId);
+      } else {
+        this.stashIfPending(engineId, { kind: "unchanged", t: cycle.t });
+      }
+    }
+    for (const entry of cycle.errored) {
+      const r = resolve(entry.subId);
+      if (r) {
+        bucketFor(r.ledger).errored.push({
+          subId: r.subId,
+          error: toQueryError(entry.error),
+        });
+      } else {
+        this.stashIfPending(entry.subId, { kind: "errored", error: entry.error, t: cycle.t });
+      }
+    }
+
+    // One coherent CycleUpdate per distinct ledger spelling (as failAll does).
+    for (const [ledger, b] of byLedger) {
+      const update: CycleUpdate = {
+        ledger,
+        changed: b.changed,
+        unchanged: b.unchanged,
+        errored: b.errored,
+      };
+      if (cycle.t !== undefined) update.t = cycle.t;
+      this.sink?.onCycle(update);
+    }
+  }
+
+  async fetchOnce(spec: ResolvedSpec): Promise<unknown> {
+    // `LiveClient.query()` routes straight here with the caller's `opts`, so
+    // this is a public path and both refusals have to hold on it.
+    const refused = this.unsupported(spec);
+    if (refused) throw refused;
+    if (this.failure) throw this.failure;
+    const engine = this.engine ?? (await this.enginePromise);
+    if (!engine) throw { code: "closed", message: "peer engine is not available" };
+    const ledger = await engine.ledger(spec.ledger);
+    return ledger.query(
+      spec.kind === "sparql" ? spec.text : JSON.parse(spec.text),
+    );
+  }
+
+  connectionState(): ConnectionState {
+    return this.connState;
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.closed = true;
+    this.detachCycle?.();
+    this.detachState?.();
+    this.subs.clear();
+    this.byEngineId.clear();
+    this.pendingCycles.clear();
+    this.setConnection("closed");
+    // The engine may still be connecting; close it whenever it lands.
+    if (this.engine) this.engine.close();
+    else void this.enginePromise?.then((e) => e.close()).catch(() => {});
+  }
+}

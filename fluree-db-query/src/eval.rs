@@ -25,7 +25,7 @@ mod fulltext;
 mod geo;
 mod hash;
 mod helpers;
-pub(crate) use helpers::expression_is_duplication_safe;
+pub(crate) use helpers::{expression_is_duplication_safe, function_supported_for_bool_cache};
 mod iter;
 pub(crate) use iter::eval_single_node_predicate;
 mod list;
@@ -46,6 +46,7 @@ pub use metadata::cypher_name_from_iri;
 
 pub(crate) use helpers::build_regex_with_flags;
 pub use helpers::PreparedBoolExpression;
+pub(crate) use value::legacy_import_infinity;
 pub use value::{ArithmeticError, ComparableValue, ComparisonError, NullValueError};
 
 use crate::binding::{Binding, BindingRow, RowAccess};
@@ -159,10 +160,18 @@ impl Expression {
                     p_id,
                     dt_id,
                     lang_id,
+                    arena_g_id,
                     ..
                 }) => {
                     let Some(decoded) = ctx.and_then(|c| {
-                        c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                        c.decode_encoded_value(
+                            *o_kind,
+                            *o_key,
+                            *p_id,
+                            *dt_id,
+                            *lang_id,
+                            *arena_g_id,
+                        )
                     }) else {
                         return Ok(None);
                     };
@@ -185,6 +194,19 @@ impl Expression {
                         if let FlakeValue::Double(d) = val {
                             return Ok(Some(ComparableValue::Float(d as f32)));
                         }
+                    }
+                    // A stored `@fulltext` literal decodes to a bare string as
+                    // well, so `=` and `<` read it as an `xsd:string` here and
+                    // as `f:fullText` on the Lit path. Re-tag it the same way;
+                    // the string builtins still read it as text
+                    // (`value::reads_as_text`).
+                    if *dt_id == DatatypeDictId::FULL_TEXT.as_u16() {
+                        return Ok(Some(ComparableValue::TypedLiteral {
+                            val,
+                            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                                Arc::from(fluree_vocab::fluree::FULL_TEXT),
+                            )),
+                        }));
                     }
                     // A stored language-tagged literal decodes to a bare string
                     // (`FlakeValue::String` cannot carry the tag), so `=`/`!=`/
@@ -242,10 +264,14 @@ impl Expression {
                     }
                 }
                 Some(Binding::Unbound | Binding::Poisoned) | None => Ok(None),
-                Some(Binding::Grouped(_)) => {
-                    debug_assert!(false, "Grouped binding in filter evaluation");
-                    Ok(None)
-                }
+                // A per-group list is not a value. The plan-time check
+                // (`Grouping::first_ungrouped_read`) keeps it out of every
+                // expression; reaching here is a planning bug, so fail the query
+                // (in every build) rather than read it as unbound. `Internal` is
+                // outside the FILTER/BIND demotion sets, so it propagates.
+                Some(Binding::Grouped(_)) => Err(QueryError::Internal(
+                    "grouped (list-valued) binding reached scalar evaluation".to_string(),
+                )),
                 // A path or list is not a scalar — no comparable value. The
                 // relevant functions (`length`, `size`/`head`/…) read the
                 // binding directly via dispatch / the binding-producing path.
@@ -502,10 +528,11 @@ pub(crate) fn stored_float_f64<R: RowAccess>(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         } if *dt_id == DatatypeDictId::FLOAT.as_u16() => {
             match ctx?
-                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                .decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                 .ok()?
             {
                 FlakeValue::Double(d) => Some(d),
@@ -606,6 +633,7 @@ fn binding_effective_bool(
             p_id,
             dt_id,
             lang_id,
+            arena_g_id,
             ..
         }) => {
             // A language-tagged literal has no effective boolean value (§17.2.2),
@@ -617,8 +645,9 @@ fn binding_effective_bool(
             if *lang_id != 0 {
                 return Err(ebv_type_error());
             }
-            let decoded =
-                ctx.and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id));
+            let decoded = ctx.and_then(|c| {
+                c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
+            });
             match decoded {
                 Some(Ok(val)) => match ComparableValue::try_from(&val) {
                     Ok(cv) => comparable_effective_bool(&cv),
@@ -837,6 +866,30 @@ mod tests {
         ];
 
         Batch::new(schema, vec![age_col, name_col]).unwrap()
+    }
+
+    /// A per-group list reaching scalar evaluation is a planning bug: it fails
+    /// the query in every build (it used to debug-panic and read as unbound in
+    /// release), and FILTER / BIND do not demote it.
+    #[test]
+    fn grouped_binding_fails_scalar_evaluation() {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+        let list = Binding::Grouped(vec![Binding::lit(FlakeValue::Long(1), Sid::new(2, "long"))]);
+        let batch = Batch::new(schema, vec![vec![list]]).unwrap();
+        let row = batch.row_view(0).unwrap();
+        let expr = Expression::gt(
+            Expression::Var(VarId(0)),
+            Expression::Const(FlakeValue::Long(0)),
+        );
+        for err in [
+            expr.eval_to_bool::<_>(&row, None).unwrap_err(),
+            expr.eval_to_bool_non_strict::<_>(&row, None).unwrap_err(),
+            Expression::Var(VarId(0))
+                .eval_to_comparable::<_>(&row, None)
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, QueryError::Internal(_)), "{err}");
+        }
     }
 
     #[test]

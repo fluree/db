@@ -288,6 +288,19 @@ impl S3Storage {
 
 #[async_trait]
 impl StorageRead for S3Storage {
+    /// Reads return exactly the bytes at rest.
+    fn permits_plaintext_cache(&self) -> bool {
+        true
+    }
+
+    fn is_remote(&self) -> bool {
+        true
+    }
+
+    fn encryption_admin(&self) -> Option<std::sync::Arc<dyn fluree_db_core::EncryptionAdmin>> {
+        None
+    }
+
     async fn read_bytes(&self, address: &str) -> std::result::Result<Vec<u8>, CoreError> {
         const SLOW_S3_SEND_WARN_MS: u64 = 1_000;
         const SLOW_S3_BODY_WARN_MS: u64 = 5_000;
@@ -1142,8 +1155,11 @@ impl StorageCas for S3Storage {
 
     async fn compare_and_swap<T, F>(&self, address: &str, f: F) -> StorageExtResult<CasOutcome<T>>
     where
-        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError> + Send + Sync,
-        T: Send,
+        F: Fn(Option<&[u8]>) -> std::result::Result<CasAction<T>, StorageExtError>
+            + Send
+            + Sync
+            + 'static,
+        T: Send + 'static,
     {
         let key = address_to_key(address, self.prefix.as_deref())
             .map_err(|e| StorageExtError::io(format!("Invalid address: {e}")))?;

@@ -7,7 +7,9 @@
 mod snapshot;
 mod table;
 
-pub use snapshot::{select_snapshot, Snapshot, SnapshotSelection};
+pub use snapshot::{
+    earliest_as_of_time_ms, main_lineage, select_snapshot, Snapshot, SnapshotSelection,
+};
 pub use table::{
     PartitionField, PartitionSpec, Schema, SchemaField, SnapshotLogEntry, SortField, SortOrder,
     TableMetadata, WindowCap,

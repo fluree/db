@@ -229,7 +229,7 @@ async fn run_in_process(
     })?;
     inject_policy_into_envelope(&mut envelope, policy)?;
 
-    let fluree = Arc::new(context::build_fluree(dirs)?);
+    let fluree = Arc::new(context::build_fluree(dirs).await?);
     let mut builder = fluree.multi_query().envelope(envelope);
     if let Some(cfg) = formatter_config {
         builder = builder.format(cfg);

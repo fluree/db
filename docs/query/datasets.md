@@ -76,7 +76,11 @@ WHERE {
 
 In SPARQL, `FROM NAMED` identifies **named graphs in the dataset**. In Fluree, these are often *graph sources* such as:
 - another ledger (federation / multi-ledger queries), or
-- a graph source (search, tabular mapping, etc.).
+- a mapped graph source (an Iceberg, R2RML, SQL or Delta table mapping).
+
+A search index (BM25, vector) is not a dataset member: it is queried with an
+`f:graphSource` pattern, with its source ledger in the dataset, and naming it in
+`FROM` / `FROM NAMED` is refused with `err:db/GraphSourceNotAGraph`.
 
 Note: On the **ledger-scoped HTTP query endpoint** (`POST /query/{ledger}`), `FROM` / `FROM NAMED` is also supported, but is interpreted as selecting **named graphs inside that same ledger**. Use the connection-scoped endpoint (`POST /query`) when you want a dataset that spans multiple ledgers.
 
@@ -175,7 +179,7 @@ WHERE {
 Fluree supports user-defined named graphs ingested via TriG format. These graphs are queryable using the structured `from` object syntax with a `graph` field.
 
 For the ledger-scoped HTTP endpoint (`POST /query/{ledger}`), the server also accepts a convenient shorthand:
-- `"from": "txn-meta"` / `"from": "default"` / `"from": "<graph IRI>"`
+- `"from": "txn-meta"` / `"from": "default"` (or `"urn:default"`) / `"from": "<graph IRI>"`
 to select a graph **within** the ledger in the URL.
 
 **Ingesting data with named graphs (TriG):**
@@ -261,7 +265,7 @@ Query across the default graph and user-defined named graphs:
 | Field | Type | Required | Description |
 |-------|------|----------|-------------|
 | `@id` | string | Yes | Ledger reference (e.g., `mydb:main`, `mydb:main@t:100`) |
-| `@graph` | string | No | Graph selector: `"default"`, `"txn-meta"`, or full IRI |
+| `@graph` | string | No | Graph selector: `"default"` (or `"urn:default"`), `"txn-meta"`, or full IRI |
 | `t` | integer | No | Time-travel: specific transaction number |
 | `at` | string | No | Time-travel: ISO-8601 timestamp or `commit:<hash>` |
 | `policy` | object | No | Per-source policy override (see below) |
@@ -274,7 +278,7 @@ When using object syntax for `from`, the following fields are available:
 |-------|------|----------|-------------|
 | `@id` | string | Yes | Ledger reference (e.g., `mydb:main`, `mydb:main@t:100`) |
 | `alias` | string | No | Dataset-local alias for GRAPH pattern reference |
-| `graph` | string | No | Graph selector: `"default"`, `"txn-meta"`, or full IRI |
+| `graph` | string | No | Graph selector: `"default"` (or `"urn:default"`), `"txn-meta"`, or full IRI |
 | `t` | integer | No | Time-travel: specific transaction number |
 | `iso` | string | No | Time-travel: ISO-8601 timestamp |
 | `commit_id` | string | No | Time-travel: commit ContentId |
@@ -324,7 +328,7 @@ The `graph` field accepts three types of values:
 
 | Value | Meaning |
 |-------|---------|
-| `"default"` | Explicitly select the ledger's default graph |
+| `"default"` or `"urn:default"` | Explicitly select the ledger's default graph. `urn:default` is the name ledger info lists it under. |
 | `"txn-meta"` | Select the built-in transaction metadata graph (`urn:fluree:{ledger_id}#txn-meta`) |
 | `"<full-iri>"` | Select a user-defined named graph by its full IRI |
 
@@ -627,11 +631,13 @@ WHERE {
 
 ### Connection-Bound Mode
 
-When querying across multiple ledgers, use SERVICE to select which ledger each pattern executes against:
+When querying across multiple ledgers, use SERVICE to select which ledger each pattern executes against. Each ledger a SERVICE names must be in the query's dataset, so list it with `FROM NAMED`:
 
 ```sparql
 -- Connection-bound: SERVICE selects the target ledger
 SELECT ?name ?stock
+FROM NAMED <sales:main>
+FROM NAMED <inventory:main>
 WHERE {
   SERVICE <fluree:ledger:sales:main> {
     GRAPH <http://example.org/graphs/products> {

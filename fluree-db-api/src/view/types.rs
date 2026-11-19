@@ -202,6 +202,10 @@ pub struct GraphDb {
     pub(crate) resolved_config: Option<ResolvedConfig>,
     /// Successful resolution found no config; distinct from not yet resolved.
     pub(crate) config_absent: bool,
+    /// This view's own union default graph switch, ahead of the ledger's
+    /// `f:unionDefaultGraph` and behind the query's; see
+    /// [`Self::with_union_default_graph`].
+    pub(crate) union_default_graph: Option<bool>,
 
     // ========================================================================
     // Datalog config (from config graph, applied at query boundary)
@@ -225,14 +229,15 @@ pub struct GraphDb {
     ///
     /// `wrap_policy` and `query` are separate Rust API calls but
     /// model a single HTTP request; if both touch the same model
-    /// ledger M, they must observe the same `resolved_t` for M.
+    /// ledger M, they must observe the same head of M.
     /// Carrying this map on the view lets `wrap_policy` capture
-    /// M's head-t and the subsequent `query` reuse that capture
+    /// M's head and the subsequent `query` reuse that capture
     /// when building its own `ResolveCtx`.
     ///
     /// Empty by default. Cloned via `Arc` so policy-wrap doesn't
     /// inflate the cached `GraphDb` cost.
-    pub(crate) cross_ledger_resolved_ts: Arc<std::collections::HashMap<String, i64>>,
+    pub(crate) cross_ledger_resolved_heads:
+        Arc<std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>>,
 
     // ========================================================================
     // Graph source context (optional — set when view is created from a graph source)
@@ -241,6 +246,15 @@ pub struct GraphDb {
     /// rather than a real ledger. Query patterns should be auto-wrapped in
     /// `GRAPH <gs_id> { ... }` so the R2RML provider handles them.
     pub(crate) graph_source_id: Option<Arc<str>>,
+    /// The table state a time-specified graph-source view reads
+    /// (`alias@time:` / `@recorded:` / `@snapshot:`). Pushed into the R2RML
+    /// provider before execution; `None` reads the source's current state.
+    pub(crate) graph_source_time: Option<fluree_db_query::r2rml::SourceTime>,
+    /// The snapshot is a graph source's empty genesis. Set together with
+    /// `graph_source_id`, and kept when a system graph is selected (which
+    /// drops `graph_source_id`), because the view's own id still names the
+    /// graph source: see [`Self::member_kind`].
+    pub(crate) over_graph_source: bool,
 }
 
 impl std::fmt::Debug for GraphDb {
@@ -302,12 +316,15 @@ impl GraphDb {
             ledger_config: None,
             resolved_config: None,
             config_absent: false,
+            union_default_graph: None,
             datalog_enabled: true,
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
             rules_source_g_id: None,
-            cross_ledger_resolved_ts: Arc::new(std::collections::HashMap::new()),
+            cross_ledger_resolved_heads: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
+            graph_source_time: None,
+            over_graph_source: false,
         }
     }
 
@@ -551,6 +568,7 @@ impl GraphDb {
             // model config must also drop the virtual-data routing tag.
             if graph_id != fluree_db_core::DEFAULT_GRAPH_ID {
                 self.graph_source_id = None;
+                self.graph_source_time = None;
             }
         }
         self.graph_id = graph_id;
@@ -635,6 +653,17 @@ impl GraphDb {
         self.config_absent || self.resolved_config.is_some()
     }
 
+    /// Set whether a query on this view reads its default graph as the union
+    /// of the ledger's default graph and its named graphs, whatever the
+    /// ledger's `f:unionDefaultGraph` says. A query's own switch still wins.
+    ///
+    /// A write-branch probe sets it off: it must see what the write will
+    /// stage against, and writes go to the default graph alone.
+    pub(crate) fn with_union_default_graph(mut self, on: bool) -> Self {
+        self.union_default_graph = Some(on);
+        self
+    }
+
     /// Get the full ledger config (if any).
     pub fn ledger_config(&self) -> Option<&LedgerConfig> {
         self.ledger_config.as_deref()
@@ -699,18 +728,23 @@ impl GraphDb {
     }
 
     /// Replace the carried governance-context capture (per-ledger
-    /// `resolved_t`s seen so far in this logical request).
-    pub fn with_cross_ledger_resolved_ts(
+    /// model heads seen so far in this logical request).
+    pub fn with_cross_ledger_resolved_heads(
         mut self,
-        ts: Arc<std::collections::HashMap<String, i64>>,
+        heads: Arc<
+            std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>,
+        >,
     ) -> Self {
-        self.cross_ledger_resolved_ts = ts;
+        self.cross_ledger_resolved_heads = heads;
         self
     }
 
     /// Read the carried governance-context capture.
-    pub fn cross_ledger_resolved_ts(&self) -> &Arc<std::collections::HashMap<String, i64>> {
-        &self.cross_ledger_resolved_ts
+    pub fn cross_ledger_resolved_heads(
+        &self,
+    ) -> &Arc<std::collections::HashMap<fluree_db_core::LedgerId, crate::cross_ledger::ModelHead>>
+    {
+        &self.cross_ledger_resolved_heads
     }
 }
 
@@ -792,6 +826,16 @@ impl GraphDb {
         self.policy_enforcer.as_ref()
     }
 
+    /// What this view reads, for the executor's graph-source classification:
+    /// a view over a ledger is never looked up as a graph source.
+    pub(crate) fn member_kind(&self) -> fluree_db_query::MemberKind {
+        if self.graph_source_id.is_some() || self.over_graph_source {
+            fluree_db_query::MemberKind::GraphSource
+        } else {
+            fluree_db_query::MemberKind::Native
+        }
+    }
+
     /// Check if this is a root/unrestricted policy view.
     ///
     /// Returns `true` if no policy is attached, or if the policy is root.
@@ -823,6 +867,7 @@ impl GraphDb {
             // `evaluate::allow_view_flake`, before any policy runs.
             denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         })
     }
 }
@@ -1000,6 +1045,95 @@ impl std::fmt::Debug for DerivedFactsHandle {
     }
 }
 
+// ============================================================================
+// Query-result cache
+// ============================================================================
+
+impl GraphDb {
+    /// Hash everything about this view that decides a query's answer, for
+    /// the query-result cache. `Err` names what the cache cannot key.
+    ///
+    /// The ledger state is the overlay's content version, unique to its
+    /// contents, and the content-addressed index root: a commit, an index
+    /// build or a recreated ledger changes one of them.
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            snapshot,
+            overlay,
+            t,
+            ledger_id,
+            graph_id,
+            policy,
+            default_context,
+            union_default_graph,
+            cross_ledger_resolved_heads,
+            graph_source_id,
+            graph_source_time,
+            over_graph_source,
+            // Derived from the ledger state hashed below.
+            novelty: _,
+            binary_store: _,
+            dict_novelty: _,
+            runtime_small_dicts: _,
+            ledger_config: _,
+            resolved_config: _,
+            config_absent: _,
+            // Read only when reasoning or rules run, which the caller
+            // bypasses once the plan shows them.
+            reasoning: _,
+            reasoning_precedence: _,
+            config_reasoning_budget: _,
+            datalog_enabled: _,
+            query_time_rules_allowed: _,
+            datalog_override_allowed: _,
+            rules_source_g_id: _,
+            // Serves `f:query` restrictions, which the policy hash refuses.
+            policy_enforcer: _,
+        } = self;
+        if graph_source_id.is_some() || graph_source_time.is_some() || *over_graph_source {
+            return Err("graph source");
+        }
+        if !cross_ledger_resolved_heads.is_empty() {
+            return Err("cross-ledger governance");
+        }
+        let content_version = overlay
+            .content_version()
+            .ok_or("overlay without a content version")?;
+        let index_root = snapshot.index_root_id();
+        if snapshot.t > 0 && index_root.is_none() {
+            return Err("index root unknown");
+        }
+        ledger_id.hash(h);
+        t.hash(h);
+        snapshot.t.hash(h);
+        index_root.hash(h);
+        content_version.hash(h);
+        graph_id.hash(h);
+        union_default_graph.hash(h);
+        match default_context {
+            None => 0u8.hash(h),
+            Some(ctx) => {
+                1u8.hash(h);
+                crate::query::result_cache::hash_json(ctx, h).map_err(|_| "default context")?;
+            }
+        }
+        match policy {
+            None => 0u8.hash(h),
+            Some(policy) => {
+                1u8.hash(h);
+                if !policy.hash_view_policy(h) {
+                    return Err("f:query policy");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1007,6 +1141,41 @@ mod tests {
 
     fn make_test_snapshot() -> LedgerSnapshot {
         LedgerSnapshot::genesis("test:main")
+    }
+
+    #[test]
+    fn result_cache_key_covers_each_view_input() {
+        fn key(view: &GraphDb) -> u128 {
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            view.hash_for_result_cache(&mut h).expect("keyable");
+            h.digest128()
+        }
+        let novelty = Arc::new(Novelty::new(0));
+        let overlay = novelty.clone() as Arc<dyn OverlayProvider>;
+        let base = GraphDb::new(
+            Arc::new(make_test_snapshot()),
+            overlay,
+            Some(novelty),
+            5,
+            "test:main",
+        );
+        assert_eq!(key(&base), key(&base.clone()));
+        let variants = [
+            ("t", base.clone().as_of(4)),
+            ("graph", base.clone().with_graph_id(3)),
+            (
+                "default context",
+                base.clone()
+                    .with_default_context(Some(serde_json::json!({"ex": "http://ex/"}))),
+            ),
+            ("union switch", base.clone().with_union_default_graph(true)),
+        ];
+        let unkeyed: Vec<&str> = variants
+            .iter()
+            .filter(|(_, view)| key(view) == key(&base))
+            .map(|(input, _)| *input)
+            .collect();
+        assert!(unkeyed.is_empty(), "not keyed: {unkeyed:?}");
     }
 
     #[test]

@@ -431,6 +431,7 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # graphql_max_depth = {graphql_max_depth}                 # GraphQL nesting depth; 0 disables the limit
 # graphql_max_complexity = {graphql_max_complexity}         # GraphQL fields per document; 0 disables the limit
 # cache_max_mb = 4096                    # global cache budget (MB); default: tiered by RAM (<4GB: 30%, 4-8GB: 40%, >=8GB: 35%)
+# query_result_cache_max_mb = 200        # opted-in query answers (MB), in addition to cache_max_mb; default: 10% of it; 0 disables
 
 # [server.query_refresh]
 # enabled = {query_refresh_enabled}            # opt-in nameservice refresh before current-head queries
@@ -440,6 +441,9 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
 # enabled = {indexing_enabled}                    # disable only when a separate peer/indexer owns indexing for this storage
 # reindex_min_bytes = {reindex_min_bytes}         # bytes of novelty before a background reindex (default ≈ every commit)
 # reindex_max_bytes = {reindex_max_bytes}      # {reindex_max_mb} MB (default: 20% of system RAM) — transactions rejected (503, retryable) until reindexed
+# gc_min_time_mins = {gc_min_time_mins}                 # minutes a superseded index version is kept for queries still reading it
+# gc_max_old_indexes = {gc_max_old_indexes}                # old index versions always kept, whatever their age
+# gc_hard_max_old_indexes = {gc_hard_max_old_indexes}          # past this many old versions, collect even inside gc_min_time_mins
 
 # [server.auth.events]
 # mode = "{auth_mode}"                      # none, optional, required
@@ -522,6 +526,9 @@ pub fn generate_config_template(storage_path_override: Option<&str>) -> String {
         reindex_min_bytes = DEFAULT_REINDEX_MIN_BYTES,
         reindex_max_bytes = default_reindex_max_bytes(),
         reindex_max_mb = default_reindex_max_bytes() / (1024 * 1024),
+        gc_min_time_mins = crate::wasm_compat::DEFAULT_MIN_TIME_GARBAGE_MINS,
+        gc_max_old_indexes = crate::wasm_compat::DEFAULT_MAX_OLD_INDEXES,
+        gc_hard_max_old_indexes = crate::wasm_compat::DEFAULT_HARD_MAX_OLD_INDEXES,
         auth_mode = DEFAULT_AUTH_MODE,
         jwks_cache_ttl = DEFAULT_JWKS_CACHE_TTL,
         mcp_enabled = DEFAULT_MCP_ENABLED,
@@ -640,6 +647,18 @@ mod tests {
         assert!(t.contains(&format!("# log_level = \"{DEFAULT_LOG_LEVEL}\"")));
         assert!(t.contains(&format!("# enabled = {DEFAULT_INDEXING_ENABLED}")));
         assert!(t.contains("# cache_max_mb = 4096"));
+        use crate::wasm_compat::{
+            DEFAULT_HARD_MAX_OLD_INDEXES, DEFAULT_MAX_OLD_INDEXES, DEFAULT_MIN_TIME_GARBAGE_MINS,
+        };
+        assert!(t.contains(&format!(
+            "# gc_min_time_mins = {DEFAULT_MIN_TIME_GARBAGE_MINS} "
+        )));
+        assert!(t.contains(&format!(
+            "# gc_max_old_indexes = {DEFAULT_MAX_OLD_INDEXES} "
+        )));
+        assert!(t.contains(&format!(
+            "# gc_hard_max_old_indexes = {DEFAULT_HARD_MAX_OLD_INDEXES} "
+        )));
     }
 
     #[test]

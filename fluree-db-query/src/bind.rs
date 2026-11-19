@@ -51,6 +51,9 @@ pub struct BindOperator {
     state: OperatorState,
     /// Variables required by downstream operators; if set, output is trimmed.
     out_schema: Option<Arc<[VarId]>>,
+    /// Term normalization for the clobber check, built at open: a bound value
+    /// and the computed one can be one term in two forms.
+    norm: Option<crate::object_binding::EqualityNorm>,
     /// True when `expr` contains an `EXISTS { ... }` subexpression, which must
     /// be resolved per-row (seeded with the row's bindings) before the value
     /// is computed — projection/BIND counterpart to the FilterOperator path.
@@ -121,6 +124,7 @@ impl BindOperator {
             is_new_var,
             state: OperatorState::Created,
             out_schema: None,
+            norm: None,
             has_exists,
             has_metadata,
             planning: crate::temporal_mode::PlanningContext::current(),
@@ -138,6 +142,28 @@ impl BindOperator {
     pub fn with_out_schema(mut self, downstream_vars: Option<&[VarId]>) -> Self {
         self.out_schema = compute_trimmed_vars(&self.in_schema, downstream_vars);
         self
+    }
+
+    /// `BIND(?x AS ?y)` where `?x` holds a store id binds that id, without
+    /// its history metadata, as evaluating would. Evaluated, the id decodes
+    /// to a `Sid`, which every keyed operator downstream (DISTINCT, joins,
+    /// GROUP BY) looks up in the subject dictionary again, once per row.
+    /// An eager caller wants decoded terms, so it still evaluates.
+    fn copied_store_id(&self, row: &impl RowAccess, ctx: &ExecutionContext<'_>) -> Option<Binding> {
+        let Expression::Var(source) = self.expr else {
+            return None;
+        };
+        if ctx.eager_materialization {
+            return None;
+        }
+        match row.get(source)? {
+            Binding::EncodedSid { s_id, .. } => Some(Binding::EncodedSid {
+                s_id: *s_id,
+                t: None,
+                op: None,
+            }),
+            _ => None,
+        }
     }
 }
 
@@ -162,6 +188,7 @@ impl Operator for BindOperator {
 
     async fn open(&mut self, ctx: &ExecutionContext<'_>) -> Result<()> {
         self.child.open(ctx).await?;
+        self.norm = crate::object_binding::equality_norm(ctx);
         self.state = OperatorState::Open;
         Ok(())
     }
@@ -240,7 +267,9 @@ impl Operator for BindOperator {
 
                 // Evaluate expression. Non-strict mode still propagates fatal
                 // execution issues such as dictionary lookup failures.
-                let computed = if ctx.strict_bind_errors {
+                let computed = if let Some(copied) = self.copied_store_id(&row_view, ctx) {
+                    copied
+                } else if ctx.strict_bind_errors {
                     expr.try_eval_to_binding(&row_view, Some(ctx))?
                 } else {
                     expr.try_eval_to_binding_non_strict(&row_view, Some(ctx))?
@@ -256,8 +285,13 @@ impl Operator for BindOperator {
                     match existing {
                         Some(Binding::Unbound) | None => true, // Unbound - can bind
                         Some(existing_val) => {
-                            // Check if same value
-                            existing_val == &computed || matches!(computed, Binding::Unbound)
+                            // Check if same term, whichever form each carries it in
+                            matches!(computed, Binding::Unbound)
+                                || crate::object_binding::same_term(
+                                    existing_val,
+                                    &computed,
+                                    &self.norm,
+                                )?
                         }
                     }
                 };
@@ -376,6 +410,74 @@ mod tests {
         assert_eq!(op.schema()[1], VarId(1));
         assert!(!op.is_new_var);
         assert_eq!(op.var_position, 0);
+    }
+
+    #[tokio::test]
+    async fn bind_of_a_var_holding_a_store_id_copies_the_id() {
+        // Copied, the id needs no dictionary to bind; evaluated, it would.
+        // History metadata stays with the source, as evaluating leaves it.
+        // An eager caller still gets it evaluated: this context has no store
+        // to decode it with, so that reads as unbound.
+        async fn bound(eager: bool) -> Vec<Binding> {
+            let schema: Arc<[VarId]> = Arc::from(vec![VarId(0)].into_boxed_slice());
+            let rows = vec![Binding::EncodedSid {
+                s_id: 42,
+                t: Some(3),
+                op: Some(true),
+            }];
+            let child = Box::new(OneBatch {
+                batch: Some(Batch::new(Arc::clone(&schema), vec![rows]).unwrap()),
+                schema,
+            });
+            let mut op = BindOperator::new(child, VarId(1), Expression::Var(VarId(0)), vec![]);
+            let snapshot = fluree_db_core::LedgerSnapshot::genesis("test:main");
+            let vars = crate::var_registry::VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            ctx.eager_materialization = eager;
+            op.open(&ctx).await.unwrap();
+            let batch = op.next_batch(&ctx).await.unwrap().expect("one row");
+            batch.column(VarId(1)).unwrap().to_vec()
+        }
+
+        let copied = bound(false).await;
+        assert!(
+            matches!(
+                copied.as_slice(),
+                [Binding::EncodedSid {
+                    s_id: 42,
+                    t: None,
+                    op: None
+                }]
+            ),
+            "{copied:?}"
+        );
+        let evaluated = bound(true).await;
+        assert!(
+            matches!(evaluated.as_slice(), [Binding::Unbound]),
+            "{evaluated:?}"
+        );
+    }
+
+    struct OneBatch {
+        batch: Option<Batch>,
+        schema: Arc<[VarId]>,
+    }
+
+    #[async_trait]
+    impl Operator for OneBatch {
+        fn schema(&self) -> &[VarId] {
+            &self.schema
+        }
+
+        async fn open(&mut self, _ctx: &ExecutionContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        async fn next_batch(&mut self, _ctx: &ExecutionContext<'_>) -> Result<Option<Batch>> {
+            Ok(self.batch.take())
+        }
+
+        fn close(&mut self) {}
     }
 
     // Helper struct for testing

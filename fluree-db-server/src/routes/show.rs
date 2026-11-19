@@ -115,7 +115,7 @@ async fn show_local(
             return Err(ServerError::unauthorized("Bearer token required"));
         }
         if let Some(p) = bearer.0.as_ref() {
-            if !p.can_read(&alias) {
+            if !p.can_read(&crate::error::scope_id(&alias)?) {
                 set_span_error_code(&span, "error:Forbidden");
                 return Err(ServerError::not_found("Ledger not found"));
             }
@@ -137,14 +137,6 @@ async fn show_local(
                 ..Default::default()
             }
         };
-
-        // Proxy storage mode cannot decode commits (no local index).
-        if state.config.is_proxy_storage_mode() {
-            set_span_error_code(&span, "error:NotImplemented");
-            return Err(ServerError::NotImplemented(
-                "Commit show is not available in proxy storage mode".to_string(),
-            ));
-        }
 
         let fluree = &state.fluree;
 

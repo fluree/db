@@ -60,18 +60,49 @@ fn parse_expr_with_ctx(
     value: &JsonValue,
     ctx: &JsonLdParseCtx,
 ) -> Result<super::ast::UnresolvedExpression> {
-    Ok(resolve_compact_iri_atoms(parse_filter_value(value)?, ctx))
+    resolve_compact_iri_atoms(parse_filter_value(value)?, ctx)
 }
 
 /// Walk an expression tree, expanding [`UnresolvedFilterValue::Curie`] atoms
-/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`].
+/// whose prefix the context knows into [`UnresolvedFilterValue::Iri`],
+/// expanding a constant `str-dt` datatype as a JSON-LD `@type` is expanded
+/// (see [`expand_str_dt_datatype`]), and a constant `iri` argument as an
+/// `@id` is (see [`expand_iri_argument`]).
 pub(crate) fn resolve_compact_iri_atoms(
     expr: super::ast::UnresolvedExpression,
     ctx: &JsonLdParseCtx,
-) -> super::ast::UnresolvedExpression {
+) -> Result<super::ast::UnresolvedExpression> {
+    resolve_expression(expr, ctx, true)
+}
+
+/// Expand the constant `str-dt` datatypes and `iri` arguments of an
+/// array-form (data) filter, as [`resolve_compact_iri_atoms`] does for the
+/// other forms. Every element of the array form is a JSON string, so a bare
+/// atom there stays a string; only these two arguments, which name an IRI
+/// whatever their spelling, go through the `@context`.
+fn expand_constant_iri_arguments(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> Result<super::ast::UnresolvedExpression> {
+    resolve_expression(expr, ctx, false)
+}
+
+/// The walk behind [`resolve_compact_iri_atoms`] (`atoms`) and
+/// [`expand_constant_iri_arguments`] (not `atoms`).
+fn resolve_expression(
+    expr: super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+    atoms: bool,
+) -> Result<super::ast::UnresolvedExpression> {
     use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
-    match expr {
-        E::Const(V::Curie(atom)) => match ctx.expand_iri(&atom) {
+    let resolve_all = |items: Vec<E>| -> Result<Vec<E>> {
+        items
+            .into_iter()
+            .map(|e| resolve_expression(e, ctx, atoms))
+            .collect()
+    };
+    Ok(match expr {
+        E::Const(V::Curie(atom)) if atoms => match ctx.expand_iri(&atom) {
             // Expansion changed the text *and* produced something that is
             // actually an IRI: the prefix was defined and meant a namespace.
             //
@@ -88,40 +119,78 @@ pub(crate) fn resolve_compact_iri_atoms(
             }
             _ => E::Const(V::Curie(atom)),
         },
-        E::And(items) => E::And(
-            items
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
-        ),
-        E::Or(items) => E::Or(
-            items
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
-        ),
-        E::Not(inner) => E::Not(Box::new(resolve_compact_iri_atoms(*inner, ctx))),
+        E::And(items) => E::And(resolve_all(items)?),
+        E::Or(items) => E::Or(resolve_all(items)?),
+        E::Not(inner) => E::Not(Box::new(resolve_expression(*inner, ctx, atoms)?)),
         E::In {
             expr,
             values,
             negated,
         } => E::In {
-            expr: Box::new(resolve_compact_iri_atoms(*expr, ctx)),
-            values: values
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
+            expr: Box::new(resolve_expression(*expr, ctx, atoms)?),
+            values: resolve_all(values)?,
             negated,
         },
-        E::Call { func, args } => E::Call {
-            func,
-            args: args
-                .into_iter()
-                .map(|e| resolve_compact_iri_atoms(e, ctx))
-                .collect(),
-        },
+        E::Call { func, args } => {
+            let mut args = resolve_all(args)?;
+            if func.eq_ignore_ascii_case("strdt") || func.eq_ignore_ascii_case("str-dt") {
+                if let Some(datatype) = args.get_mut(1) {
+                    expand_str_dt_datatype(datatype, ctx)?;
+                }
+            } else if func.eq_ignore_ascii_case("iri") {
+                if let Some(iri) = args.get_mut(0) {
+                    expand_iri_argument(iri, ctx)?;
+                }
+            }
+            E::Call { func, args }
+        }
         other => other,
+    })
+}
+
+/// Expand a constant `str-dt` datatype the way a JSON-LD insert expands a
+/// value's `@type`: through the `@context`, under the same compact-IRI guard.
+///
+/// `STRDT` builds its literal for any datatype IRI, including one in a
+/// namespace the ledger has never seen, so this is where a datatype written
+/// as a string is checked. `(str-dt ?v "ex:T")` with `ex` in the context is
+/// the expanded IRI, an absolute IRI (`http://…`, `urn:…`) is itself, and
+/// `"xsd:integer"` with no `xsd` prefix is the error the insert
+/// `{"@value": …, "@type": "xsd:integer"}` raises, not a literal typed with
+/// the IRI `xsd:integer`. A datatype computed at run time (a variable, `IRI()`)
+/// is already an IRI.
+fn expand_str_dt_datatype(
+    datatype: &mut super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> Result<()> {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    if let E::Const(V::String(raw) | V::Bare(raw) | V::Curie(raw)) = datatype {
+        let (expanded, _) = ctx.expand_vocab(raw)?;
+        *datatype = E::Const(V::String(Arc::from(expanded)));
     }
+    Ok(())
+}
+
+/// Expand a constant `iri` argument the way a JSON-LD insert expands an
+/// `@id`: through the `@context`, under the same compact-IRI guard.
+///
+/// An update writes the IRI `iri` builds in any namespace, as an insert
+/// does, so this is where an IRI written as a string is checked, as
+/// [`expand_str_dt_datatype`] checks a datatype. `(iri "ex:x")` with `ex` in
+/// the context is the expanded IRI, an absolute IRI is itself, and
+/// `"bad:thing"` with no `bad` prefix is the error the insert
+/// `{"@id": "bad:thing"}` raises, not the IRI `bad:thing`. An argument
+/// computed at run time (a variable, `str`) is taken as it is.
+fn expand_iri_argument(
+    iri: &mut super::ast::UnresolvedExpression,
+    ctx: &JsonLdParseCtx,
+) -> Result<()> {
+    use super::ast::{UnresolvedExpression as E, UnresolvedFilterValue as V};
+    if let E::Const(V::String(raw) | V::Bare(raw) | V::Curie(raw)) = iri {
+        let (expanded, _) = ctx.expand_id(raw)?;
+        *iri = E::Const(V::String(Arc::from(expanded)));
+    }
+    Ok(())
 }
 
 /// Resolve compact-IRI atoms in the expression positions that sit outside the
@@ -135,25 +204,27 @@ pub(crate) fn resolve_compact_iri_atoms(
 pub(crate) fn resolve_atoms_outside_where(
     query: &mut super::ast::UnresolvedQuery,
     ctx: &JsonLdParseCtx,
-) {
+) -> Result<()> {
     use super::ast::{UnresolvedColumn as C, UnresolvedProjection as P};
 
-    let mut fix_column = |col: &mut C| {
+    let fix_column = |col: &mut C| -> Result<()> {
         if let C::Computation { expr, .. } = col {
             let taken =
                 std::mem::replace(expr, super::ast::UnresolvedExpression::Var(Arc::from("")));
-            *expr = resolve_compact_iri_atoms(taken, ctx);
+            *expr = resolve_compact_iri_atoms(taken, ctx)?;
         }
+        Ok(())
     };
     match &mut query.select {
-        P::Tuple(cols) => cols.iter_mut().for_each(&mut fix_column),
-        P::Scalar(col) => fix_column(col),
+        P::Tuple(cols) => cols.iter_mut().try_for_each(fix_column)?,
+        P::Scalar(col) => fix_column(col)?,
         P::Wildcard => {}
     }
 
     if let Some(having) = query.options.having.take() {
-        query.options.having = Some(resolve_compact_iri_atoms(having, ctx));
+        query.options.having = Some(resolve_compact_iri_atoms(having, ctx)?);
     }
+    Ok(())
 }
 
 /// Validate that a string looks like a variable (starts with ?)
@@ -437,9 +508,10 @@ pub fn parse_where_array_element(
             for expr_val in &arr[1..] {
                 let filter_expr = match expr_val {
                     // Array expressions may contain EXISTS/NOT EXISTS
-                    JsonValue::Array(_) => {
-                        super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?
-                    }
+                    JsonValue::Array(_) => expand_constant_iri_arguments(
+                        super::filter_data::parse_filter_expr_ctx(expr_val, &pattern_parser)?,
+                        ctx,
+                    )?,
                     // Non-array values (strings, etc.) use the standard parser
                     _ => parse_expr_with_ctx(expr_val, ctx)?,
                 };
@@ -576,8 +648,15 @@ pub fn parse_where_array_element(
             // Parse the subquery as a full query, but reuse the parent counters so implicit vars
             // (?__sN/?__nN) cannot collide between parent and subquery scopes.
             // Subqueries inherit context from re-parsing; pass None for strict_override.
-            let (subquery, _select_mode) =
-                parse_query_ast_internal(&arr[1], subject_counter, nested_counter, None)?;
+            // The subquery is part of this where: it names graphs as this where does.
+            let (subquery, _select_mode) = parse_query_ast_internal(
+                &arr[1],
+                subject_counter,
+                nested_counter,
+                None,
+                Some(ctx),
+                &std::collections::HashSet::new(),
+            )?;
             query
                 .patterns
                 .push(UnresolvedPattern::Subquery(Box::new(subquery)));
@@ -596,16 +675,19 @@ pub fn parse_where_array_element(
                 ParseError::InvalidWhere("graph name must be a string".to_string())
             })?;
             // Remaining elements are patterns
-            let graph_patterns = parse_subquery_patterns(
-                &arr[2..],
-                ctx,
-                subject_counter,
-                nested_counter,
-                object_var_parsing,
-            )?;
-            query
-                .patterns
-                .push(UnresolvedPattern::graph(graph_name, graph_patterns));
+            let graph_patterns = ctx.in_graph_scope(|| {
+                parse_subquery_patterns(
+                    &arr[2..],
+                    ctx,
+                    subject_counter,
+                    nested_counter,
+                    object_var_parsing,
+                )
+            })?;
+            query.patterns.push(UnresolvedPattern::graph(
+                ctx.graph_name(graph_name),
+                graph_patterns,
+            ));
             Ok(())
         }
         _ => Err(ParseError::InvalidWhere(format!(
@@ -805,6 +887,208 @@ mod tests {
         });
         parse_where_test(&where_val, &context, &mut query).unwrap();
         assert!(!query.patterns.is_empty());
+    }
+
+    /// A node-level `@graph` selector in `where` is GRAPH sugar: the same
+    /// patterns as `["graph", <name>, {…}]`, nested nodes included. It used
+    /// to be parsed as a predicate named `@graph` and match nothing.
+    #[test]
+    fn node_level_graph_in_where_is_graph_sugar() {
+        let context = test_context();
+        let sugar = |where_val: JsonValue| {
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_test(&where_val, &context, &mut query).unwrap();
+            format!("{:?}", query.patterns)
+        };
+        let node_level = sugar(json!({
+            "@id": "?s", "@graph": "http://example.org/g",
+            "ex:p": "?o", "ex:child": {"ex:q": "?v"}
+        }));
+        let explicit = sugar(json!([[
+            "graph", "http://example.org/g",
+            {"@id": "?s", "ex:p": "?o", "ex:child": {"ex:q": "?v"}}
+        ]]));
+        assert_eq!(node_level, explicit);
+        assert!(node_level.contains("Graph"), "{node_level}");
+
+        // A variable graph and a context alias of `@graph` work the same way.
+        let aliased_ctx =
+            parse_context(&json!({"ex": "http://example.org/", "g": "@graph"})).unwrap();
+        let mut query = UnresolvedQuery::new(aliased_ctx.clone());
+        parse_where_test(
+            &json!({"@id": "?s", "g": "?graph", "ex:p": "?o"}),
+            &aliased_ctx,
+            &mut query,
+        )
+        .unwrap();
+        assert!(
+            matches!(&query.patterns[..], [UnresolvedPattern::Graph { name, .. }] if &**name == "?graph"),
+            "{:?}",
+            query.patterns
+        );
+
+        // Content is a named graph, not a pattern.
+        let mut query = UnresolvedQuery::new(context.clone());
+        assert!(parse_where_test(
+            &json!({"@id": "ex:G", "@graph": [{"@id": "?s", "ex:p": "?o"}]}),
+            &context,
+            &mut query
+        )
+        .is_err());
+    }
+
+    /// A node-level `@graph` in `where` names its graph exactly as the same
+    /// key does in an insert or delete: a compact IRI expands against the
+    /// `@context`, and in an update's `where` the keywords and `fromNamed`
+    /// aliases resolve as the templates resolve them. `default` is the
+    /// ledger's default graph, and cannot leave an enclosing graph.
+    #[test]
+    fn node_level_graph_in_where_resolves_names_like_templates() {
+        let context = test_context();
+        let env = crate::parse::GraphNameEnv {
+            ledger_id: Some("mydb:main".to_string()),
+            aliases: [("g1".to_string(), "http://example.org/one".to_string())].into(),
+            default_by_name: false,
+        };
+        let parse = |where_val: JsonValue, env: Option<&crate::parse::GraphNameEnv>| {
+            let mut ctx = test_parse_ctx(&context);
+            if let Some(env) = env {
+                ctx = ctx.with_graph_names(env.clone());
+            }
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_with_counters(&where_val, &ctx, &mut query, &mut 0, &mut 0, true)
+                .map(|()| query.patterns)
+        };
+        let graph_name = |where_val: JsonValue, env| match &parse(where_val, env).unwrap()[..] {
+            [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+            other => panic!("expected one GRAPH pattern, got {other:?}"),
+        };
+
+        // A compact name expands, in a query and in an update alike.
+        for env in [None, Some(&env)] {
+            assert_eq!(
+                graph_name(json!({"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}), env),
+                "http://example.org/g"
+            );
+            assert_eq!(
+                graph_name(json!({"@id": "?s", "@graph": "?g", "ex:p": "?o"}), env),
+                "?g"
+            );
+        }
+        // An update's keywords name this ledger's graphs; an alias stays the
+        // name the dataset resolves.
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "config", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "urn:fluree:mydb:main#config"
+        );
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "txn-meta", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "urn:fluree:mydb:main#txn-meta"
+        );
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "g1", "ex:p": "?o"}),
+                Some(&env)
+            ),
+            "g1"
+        );
+
+        // `default` is the where's default graph: the node's patterns as they
+        // are, with no GRAPH around them.
+        let plain = parse(json!({"@id": "?s", "ex:p": "?o"}), Some(&env)).unwrap();
+        let default = parse(
+            json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+            Some(&env),
+        )
+        .unwrap();
+        assert_eq!(format!("{plain:?}"), format!("{default:?}"));
+        // When the update's where reads another default graph, `default`
+        // still names the ledger's default graph: `GRAPH <urn:default>`.
+        let elsewhere = crate::parse::GraphNameEnv {
+            default_by_name: true,
+            ..env.clone()
+        };
+        assert_eq!(
+            graph_name(
+                json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+                Some(&elsewhere)
+            ),
+            fluree_db_core::DEFAULT_GRAPH_IRI
+        );
+        // Inside another graph it would have to leave it, which a where
+        // pattern cannot do: refused, whichever form encloses it.
+        for enclosed in [
+            json!({"@id": "?s", "@graph": "ex:g", "ex:child": {"@graph": "default", "ex:q": "?v"}}),
+            json!([["graph", "http://example.org/g",
+                    {"@id": "?s", "ex:child": {"@graph": "default", "ex:q": "?v"}}]]),
+            json!([["graph", "http://example.org/g",
+                    {"@id": "?s", "@graph": "default", "ex:p": "?o"}]]),
+        ] {
+            for env in [&env, &elsewhere] {
+                let err = parse(enclosed.clone(), Some(env)).unwrap_err().to_string();
+                assert!(err.contains("\"default\""), "{enclosed}: {err}");
+            }
+        }
+    }
+
+    /// Reading `"default"` by name is recorded, so the update's WHERE dataset
+    /// carries `urn:default` when a pattern reads it. A `where` that writes
+    /// `urn:default` itself reads the same graph, as `GRAPH <urn:default>`,
+    /// and is no use of `"default"`.
+    #[test]
+    fn update_where_reads_default_by_name() {
+        let context = test_context();
+        let update = crate::parse::GraphNameEnv {
+            ledger_id: Some("mydb:main".to_string()),
+            default_by_name: true,
+            ..Default::default()
+        };
+        // The GRAPH name of a one-pattern where, and whether it read
+        // `"default"` by name.
+        let parse = |where_val: JsonValue, env: Option<&crate::parse::GraphNameEnv>| {
+            let mut ctx = test_parse_ctx(&context);
+            if let Some(env) = env {
+                ctx = ctx.with_graph_names(env.clone());
+            }
+            let mut query = UnresolvedQuery::new(context.clone());
+            parse_where_with_counters(&where_val, &ctx, &mut query, &mut 0, &mut 0, true).unwrap();
+            let name = match &query.patterns[..] {
+                [UnresolvedPattern::Graph { name, .. }] => name.to_string(),
+                other => panic!("expected one GRAPH pattern, got {other:?}"),
+            };
+            (name, ctx.reads_ledger_default())
+        };
+        assert_eq!(
+            parse(
+                json!({"@id": "?s", "@graph": "default", "ex:p": "?o"}),
+                Some(&update)
+            ),
+            (fluree_db_core::DEFAULT_GRAPH_IRI.to_string(), true)
+        );
+        assert_eq!(
+            parse(
+                json!({"@id": "?s", "@graph": "ex:g", "ex:p": "?o"}),
+                Some(&update)
+            ),
+            ("http://example.org/g".to_string(), false)
+        );
+        for env in [Some(&update), None] {
+            for written in [
+                json!({"@id": "?s", "@graph": "urn:default", "ex:p": "?o"}),
+                json!([["graph", "urn:default", {"@id": "?s", "ex:p": "?o"}]]),
+            ] {
+                assert_eq!(
+                    parse(written, env),
+                    (fluree_db_core::DEFAULT_GRAPH_IRI.to_string(), false)
+                );
+            }
+        }
     }
 
     #[test]

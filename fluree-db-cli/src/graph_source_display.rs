@@ -88,11 +88,14 @@ mod tests {
                 "uri": "https://acct.snowflakecomputing.com/polaris/api/catalog",
                 "auth": {
                     "type": "oauth2_client_credentials",
+                    "token_url": "https://acct.snowflakecomputing.com/oauth/token",
                     "client_id": "my-client",
                     "client_secret": "super-secret-pat",
                     "scope": "session:role:ICEBERG_READER"
                 }
             },
+            "table": "ns.t",
+            // Not a field of the config: masked, since nothing classifies it.
             "bearer": { "token": "live-bearer-token" }
         })
     }
@@ -159,9 +162,17 @@ mod tests {
     #[test]
     fn local_render_keeps_env_var_name_but_masks_inline_default() {
         let config = json!({
-            "auth": {
-                "client_secret": { "env_var": "FLUREE_CLIENT_SECRET", "default_val": "fallback-secret" }
-            }
+            "catalog": {
+                "type": "rest",
+                "uri": "https://catalog.example.com",
+                "auth": {
+                    "type": "oauth2_client_credentials",
+                    "token_url": "https://catalog.example.com/token",
+                    "client_id": "app",
+                    "client_secret": { "env_var": "FLUREE_CLIENT_SECRET", "default_val": "fallback-secret" }
+                }
+            },
+            "table": "ns.t"
         });
         let gs = GraphSourceRecord::new(
             "my-gs",

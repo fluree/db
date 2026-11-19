@@ -16,11 +16,14 @@ aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts
 # Iceberg / R2RML graph source support (pulls in AWS SDK + native deps). The
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
-iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws", "dep:tokio-util"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint). Stacks on `iceberg`
 # because the graph-source provider dispatch lives there; the crate itself adds
 # only an HTTP client, no database drivers.
 sql = ["iceberg", "dep:fluree-db-sql"]
+# Delta Lake graph sources (R2RML over Delta tables, read through Delta Kernel).
+# Stacks on `iceberg` for the same reason `sql` does.
+delta = ["iceberg", "dep:fluree-db-delta"]
 # Opt-in LocalStack-backed S3/DynamoDB tests (auto-start via testcontainers)
 aws-testcontainers = [
   "dep:fluree-db-storage-aws",
@@ -29,6 +32,10 @@ aws-testcontainers = [
   "dep:aws-sdk-s3",
   "dep:aws-sdk-dynamodb",
 ]
+# Opt-in moto-backed AWS Glue / S3 Tables catalog test (it_iceberg_glue_moto): the
+# test seeds a moto server (S3, Glue, S3 Tables) from a committed fixture through
+# the AWS SDK. CI's --all-features run enables it, beside the job's `moto` service.
+glue-moto = ["iceberg", "dep:aws-sdk-s3", "dep:aws-sdk-glue", "dep:aws-sdk-s3tables"]
 # DID/JWS/VerifiableCredential support for signed queries/transactions
 # Pulls in ed25519-dalek, bs58, etc. Default off to reduce compile times.
 credential = ["dep:fluree-db-credential"]
@@ -50,7 +57,7 @@ vector = ["fluree-db-query/vector"]
 residency = ["fluree-db-query/residency", "fluree-db-binary-index/residency"]
 # IPFS-backed storage (via Kubo HTTP RPC)
 ipfs = ["dep:fluree-db-storage-ipfs"]
-# Convenience bundle (excludes vector, aws, and test-only features)
+# Convenience bundle (excludes delta, vector, aws, and test-only features)
 full = ["native", "credential", "iceberg", "sql", "shacl", "ipfs", "graphql"]
 
 [dependencies]
@@ -69,8 +76,11 @@ fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
+# `AbortOnDropHandle` for an Iceberg scan's per-file reads (`r2rml::read_files_in_order`).
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
+fluree-db-delta = { path = "../fluree-db-delta", optional = true }
 fluree-db-tabular = { path = "../fluree-db-tabular" }
 fluree-db-stats = { path = "../fluree-db-stats", features = ["tabular"] }
 fluree-db-storage-aws = { path = "../fluree-db-storage-aws", optional = true }
@@ -101,6 +111,9 @@ sha2.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
+# The query-result cache seeds its key hash per pool (wasm randomness is
+# unified in fluree-db-core).
+uuid = { version = "1", features = ["v4"] }
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
@@ -113,9 +126,11 @@ csv = "1.4"
 percent-encoding = "2"
 
 # Opt-in AWS + LocalStack testing deps (feature-gated)
-testcontainers = { version = "0.23", optional = true }
+testcontainers = { version = "0.28", optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-s3 = { workspace = true, optional = true }
+aws-sdk-glue = { workspace = true, optional = true }
+aws-sdk-s3tables = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }
 aws-sdk-sts = { workspace = true, optional = true }
 
@@ -152,11 +167,16 @@ fluree-bench-alloc = { path = "../fluree-bench-alloc" }
 rand = { workspace = true }
 fluree-db-nameservice-sync = { path = "../fluree-db-nameservice-sync" }
 wiremock = { workspace = true }
+# it_iceberg_local_fs writes a modified manifest list into a staged table copy.
+apache-avro = { workspace = true }
 # Residency-mode read arms for the wasm read-path recovery tests
 # (it_residency_retry): dev-only feature unification — production native
 # builds keep the feature off and compile the pre-residency read path.
 fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
-fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency", "test-counters"] }
+# WAL background-thread hooks for the flush-count tests (it_wal): dev-only,
+# so production builds do not compile them.
+fluree-db-core = { path = "../fluree-db-core", features = ["test-hooks"] }
 
 [[test]]
 name = "it_residency_retry"
@@ -194,12 +214,75 @@ name = "it_iceberg_local_fs"
 path = "tests/it_iceberg_local_fs.rs"
 required-features = ["iceberg", "native"]
 
+# A triples map narrowed by a restricted rr:sqlQuery over the local Iceberg
+# fixtures, against a native oracle. Own binary: it flips the fast-path switch
+# and reads span-capture routing stamps.
+[[test]]
+name = "it_iceberg_filtered_logical_table"
+path = "tests/it_iceberg_filtered_logical_table.rs"
+required-features = ["iceberg", "native"]
+
+# Sub-selects over a local two-table Iceberg graph source, checked against a
+# native twin of the same rows. Own binary: it sets FLUREE_ICEBERG_LOCAL_ROOTS.
+[[test]]
+name = "it_iceberg_subselect"
+path = "tests/it_iceberg_subselect.rs"
+required-features = ["iceberg", "native"]
+
+# Routing canary for the fused R2RML aggregate on the local Iceberg fixture.
+# Own binary: it asserts the absence of a span-capture event.
+[[test]]
+name = "it_fused_aggregate_routing"
+path = "tests/it_fused_aggregate_routing.rs"
+required-features = ["iceberg", "native"]
+
+# A referencing object map over a non-unique parent key, on every lane and the
+# twin builder, checked against a native ledger holding the same triples.
+# Own binary: it flips the process-wide fast-path switch, sets
+# FLUREE_ICEBERG_LOCAL_ROOTS, and asserts routing stamps.
+[[test]]
+name = "it_r2rml_ref_fanout"
+path = "tests/it_r2rml_ref_fanout.rs"
+required-features = ["iceberg", "native"]
+
 # View-policy enforcement on R2RML / Iceberg graph sources, checked against a
 # native twin of the same fixture as the oracle.
 [[test]]
 name = "it_iceberg_policy"
 path = "tests/it_iceberg_policy.rs"
 required-features = ["iceberg", "native"]
+
+# A class-targeted view policy over an R2RML source is decided on every class
+# the subject holds, checked against a native ledger under the same policy.
+# Own binary: it flips the process-wide fast-path switch.
+[[test]]
+name = "it_r2rml_class_policy"
+path = "tests/it_r2rml_class_policy.rs"
+required-features = ["iceberg", "native"]
+
+# Patterns over tables whose rows mint the same triple more than once answer
+# over the set of triples, checked against a native ledger holding them. Own
+# binary: it flips the process-wide fast-path switch, sets
+# FLUREE_ICEBERG_LOCAL_ROOTS, and asserts routing stamps.
+[[test]]
+name = "it_r2rml_set_scan"
+path = "tests/it_r2rml_set_scan.rs"
+required-features = ["iceberg", "native"]
+
+# Standalone: re-executes itself so the child reads the host-identity policy
+# from an environment of the test's choosing (the policy is read once per
+# process).
+[[test]]
+name = "it_host_identity_env_default"
+path = "tests/it_host_identity_env_default.rs"
+required-features = ["iceberg"]
+
+# Standalone: points the operator-only Google/GCS overrides at mocks, which
+# are read once per process.
+[[test]]
+name = "it_google_storage_billing"
+path = "tests/it_google_storage_billing.rs"
+required-features = ["iceberg"]
 
 # Standalone for the same reason: catalog-less WAREHOUSE-ROOT resolution through
 # every Direct entry point, against the committed fixture's parent directory.
@@ -210,6 +293,19 @@ required-features = ["iceberg", "native"]
 
 # End-to-end over a SQL graph source against a fake Trino-protocol endpoint
 # (wiremock), through registration, the R2RML query path and pushdown.
+# Delta graph sources end to end: reads, joins, and time-pinned versions
+# against the fixtures committed in fluree-db-delta.
+[[test]]
+name = "it_delta_local_fs"
+path = "tests/it_delta_local_fs.rs"
+required-features = ["delta", "native"]
+
+# A Delta source against a native ledger holding the same triples.
+[[test]]
+name = "it_delta_differential"
+path = "tests/it_delta_differential.rs"
+required-features = ["delta", "native"]
+
 [[test]]
 name = "it_sql_graph_source"
 path = "tests/it_sql_graph_source.rs"
@@ -220,6 +316,24 @@ required-features = ["sql", "native"]
 [[test]]
 name = "it_sql_pushdown_lane"
 path = "tests/it_sql_pushdown_lane.rs"
+required-features = ["sql", "native"]
+
+# Un-annotated R2RML columns: every lane (fused aggregate, scan pushdowns, SQL
+# block and aggregate lanes) against the generic pipeline, over the local
+# Iceberg `cells` fixture and a fake Trino endpoint. Own binary: it flips the
+# process-wide fast-path switch and asserts the absence of routing stamps.
+[[test]]
+name = "it_r2rml_untyped_columns"
+path = "tests/it_r2rml_untyped_columns.rs"
+required-features = ["sql", "native"]
+
+# Set semantics on the SQL lane: tables that repeat triples, answered against
+# a native ledger holding the triples, with the per-scan and Iceberg lanes over
+# the same rows (the local `sets.*` fixture). Own binary: it flips the
+# process-wide fast-path switch and sets `FLUREE_ICEBERG_LOCAL_ROOTS`.
+[[test]]
+name = "it_sql_set_semantics"
+path = "tests/it_sql_set_semantics.rs"
 required-features = ["sql", "native"]
 
 [[test]]
@@ -257,6 +371,13 @@ path = "tests/grp_query_sparql.rs"
 [[test]]
 name = "grp_reasoning"
 path = "tests/grp_reasoning.rs"
+
+# Own binary: its tests read the overlay ops an earlier query left on a
+# reasoning materialization, which a sibling in grp_reasoning can evict from
+# the process-wide reasoning cache.
+[[test]]
+name = "it_reasoning_lane_cache"
+path = "tests/it_reasoning_lane_cache.rs"
 
 [[test]]
 name = "grp_transact"
@@ -316,10 +437,35 @@ path = "tests/it_count_datatype_pin.rs"
 name = "it_fastpath_1652_regression"
 path = "tests/it_fastpath_1652_regression.rs"
 
+# Own binary: toggles the fast-path kill switch and asserts routing.
+[[test]]
+name = "it_numeric_constant_matching"
+path = "tests/it_numeric_constant_matching.rs"
+required-features = ["native"]
+
 # Own binary for the same reason (kill switch + routing assertions).
 [[test]]
 name = "it_fastpath_1863_regression"
 path = "tests/it_fastpath_1863_regression.rs"
+
+# Own binary: asserts the geo_search routing stamp through a captured
+# subscriber, which concurrently running tests would disturb.
+[[test]]
+name = "it_geo_search_routing"
+path = "tests/it_geo_search_routing.rs"
+required-features = ["native"]
+
+# Own binary: toggles the fast-path kill switch and asserts routing.
+# Own binary: asserts which index build path ran through span capture.
+[[test]]
+name = "it_index_unindexable"
+path = "tests/it_index_unindexable.rs"
+required-features = ["native"]
+
+[[test]]
+name = "it_xsd_double_fast_paths"
+path = "tests/it_xsd_double_fast_paths.rs"
+required-features = ["native"]
 
 # Own binary: toggles the process-global fast-path kill switch.
 [[test]]
@@ -357,15 +503,45 @@ path = "tests/it_repeated_var_fast_path_guards.rs"
 name = "it_count_star_row_multiplicity"
 path = "tests/it_count_star_row_multiplicity.rs"
 
+# Own binary: toggles the process-global fast-path kill switch and asserts
+# fast-path routing.
+[[test]]
+name = "it_topk_large_limit_offset"
+path = "tests/it_topk_large_limit_offset.rs"
+
+# Own binary: fixture A and the scope matrix of the multigraph lanes. It
+# toggles the process-global fast-path kill switch and asserts fast-path
+# routing, so it must not share a process with either.
+[[test]]
+name = "it_multigraph_lanes"
+path = "tests/it_multigraph_lanes.rs"
+
+# Own binary: asserts the index-scope stamp through thread-scoped tracing
+# capture, which misses events while other tests set and drop their own.
+[[test]]
+name = "it_index_scope"
+path = "tests/it_index_scope.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
 name = "it_distinct_object_numbig_gate"
 path = "tests/it_distinct_object_numbig_gate.rs"
 
+# Own binary: toggles the process-global fast-path kill switch.
+[[test]]
+name = "it_grouped_projection_lanes"
+path = "tests/it_grouped_projection_lanes.rs"
+
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
+
+# Own binary: switches the cyclic lane off through FLUREE_CYCLIC_BGP, a
+# process-global env var, for its oracle runs.
+[[test]]
+name = "it_cyclic_bgp_multiplicity"
+path = "tests/it_cyclic_bgp_multiplicity.rs"
 
 [[test]]
 name = "it_cyclic_bgp_probe"
@@ -374,6 +550,13 @@ path = "tests/it_cyclic_bgp_probe.rs"
 [[test]]
 name = "it_cyclic_bgp_string_dict"
 path = "tests/it_cyclic_bgp_string_dict.rs"
+
+# Own binary: asserts on the load-time warning for shapes no config enforces.
+# Same convention and same two hazards as the capture tests above.
+[[test]]
+name = "it_unenforced_shapes_warning"
+path = "tests/it_unenforced_shapes_warning.rs"
+required-features = ["shacl"]
 
 # Own binary: asserts on a tracing event to pin that the BM25 incremental sync
 # really narrows its indexing query. Same convention and same two hazards as the
@@ -397,6 +580,13 @@ path = "tests/it_minmax_fast_path_fired.rs"
 [[test]]
 name = "it_upsert_skip_fires"
 path = "tests/it_upsert_skip_fires.rs"
+
+# Standalone (not in grp_transact): asserts on the `delete_witnessed` routing
+# stamp via the thread-local span capture, so it must be the only test in its
+# process. Same convention as `it_upsert_skip_fires`.
+[[test]]
+name = "it_delete_witness_routing"
+path = "tests/it_delete_witness_routing.rs"
 
 # Standalone (NOT in grp_ledger): sets FLUREE_MAX_GRAPH_SCAN_FLAKES to exercise
 # the whole-graph-scan cap, then clears it. The limit is read from the process
@@ -468,6 +658,14 @@ name = "it_rebuild_fetch_counts"
 path = "tests/it_rebuild_fetch_counts.rs"
 
 [[test]]
+name = "it_rebuild_staging_cleanup"
+path = "tests/it_rebuild_staging_cleanup.rs"
+
+[[test]]
+name = "it_key_rotation"
+path = "tests/it_key_rotation.rs"
+
+[[test]]
 name = "it_credential"
 path = "tests/it_credential.rs"
 required-features = ["credential"]
@@ -491,6 +689,16 @@ required-features = ["iceberg"]
 name = "it_iceberg_provisional_live"
 path = "tests/it_iceberg_provisional_live.rs"
 required-features = ["iceberg"]
+
+[[test]]
+name = "it_glue_live"
+path = "tests/it_glue_live.rs"
+required-features = ["iceberg"]
+
+[[test]]
+name = "it_iceberg_glue_moto"
+path = "tests/it_iceberg_glue_moto.rs"
+required-features = ["glue-moto"]
 
 [[test]]
 name = "it_iceberg_direct"
@@ -530,6 +738,14 @@ path = "tests/it_select_star_deep_crawl_stack.rs"
 name = "sql_pushdown_lane_probe"
 required-features = ["sql", "native"]
 
+[[example]]
+name = "glue_onboarding"
+required-features = ["iceberg"]
+
+[[bench]]
+name = "query_hot_list_view"
+harness = false
+
 [[bench]]
 name = "vector_query"
 harness = false
@@ -548,6 +764,10 @@ name = "insert_formats"
 harness = false
 
 [[bench]]
+name = "jsonld_parse"
+harness = false
+
+[[bench]]
 name = "import_bulk"
 harness = false
 
@@ -560,11 +780,23 @@ name = "transact_filtered_delete"
 harness = false
 
 [[bench]]
+name = "transact_delete_wide_slot"
+harness = false
+
+[[bench]]
+name = "transact_upsert_replace"
+harness = false
+
+[[bench]]
 name = "query_overlay_only_range"
 harness = false
 
 [[bench]]
 name = "query_cold_reload"
+harness = false
+
+[[bench]]
+name = "query_time_travel_below_index"
 harness = false
 
 [[bench]]
@@ -600,7 +832,15 @@ name = "query_overlay_matrix"
 harness = false
 
 [[bench]]
+name = "query_hot_construct_formats"
+harness = false
+
+[[bench]]
 name = "query_hot_bsbm_bi"
+harness = false
+
+[[bench]]
+name = "dataset_build"
 harness = false
 
 [[bench]]
@@ -612,7 +852,19 @@ name = "query_hot_optional"
 harness = false
 
 [[bench]]
+name = "query_hot_negation_count"
+harness = false
+
+[[bench]]
+name = "query_hot_limit_startup"
+harness = false
+
+[[bench]]
 name = "query_hot_whole_graph_agg"
+harness = false
+
+[[bench]]
+name = "query_hot_grouped_projection"
 harness = false
 
 [[test]]
@@ -635,6 +887,10 @@ harness = false
 
 [[bench]]
 name = "annotation_planner"
+harness = false
+
+[[bench]]
+name = "datalog_fixpoint"
 harness = false
 
 [[bench]]
@@ -669,6 +925,37 @@ required-features = ["native"]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
 required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch.
+[[test]]
+name = "it_union_annotation_chain"
+path = "tests/it_union_annotation_chain.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts string-bound seek routing via span capture.
+[[test]]
+name = "it_string_filter_pushdown"
+path = "tests/it_string_filter_pushdown.rs"
+required-features = ["native"]
+
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# the typed string-bound seek's routing via span capture.
+[[test]]
+name = "it_typed_filter_pushdown"
+path = "tests/it_typed_filter_pushdown.rs"
+required-features = ["native"]
+
+# Own binary: asserts fast-path routing via span capture.
+[[test]]
+name = "it_fast_path_fuel"
+path = "tests/it_fast_path_fuel.rs"
+required-features = ["native"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# Test hooks: halting a ledger, and building incrementally without fallback.
+fluree-db-indexer = { path = "../fluree-db-indexer", features = ["test-utils"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 moka = { workspace = true }

@@ -263,7 +263,10 @@ pub async fn derive_schema(db: &GraphDb) -> Arc<DerivedSchema> {
 /// Everything the derived schema depends on, reduced to something comparable.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SchemaCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
+    /// The view's graph: whether its config enables SHACL decides which
+    /// `sh:minCount` fields are non-null.
+    graph_id: fluree_db_core::GraphId,
     /// The indexed snapshot: its statistics are the schema's base.
     index_t: i64,
     /// The view's as-of time, which bounds the overlay half of the merge.
@@ -288,11 +291,33 @@ fn cache_key(db: &GraphDb) -> Option<SchemaCacheKey> {
     }
     Some(SchemaCacheKey {
         ledger_id: db.snapshot.ledger_id.clone(),
+        graph_id: db.graph_id,
         index_t: db.snapshot.t,
         as_of_t: db.t,
         overlay_version: db.overlay.content_version()?,
         context: hash_context(db.default_context.as_ref()),
     })
+}
+
+/// Format a lowered GraphQL read's rows, filtered by the view's policy.
+///
+/// Every GraphQL root field lowers to a subgraph projection, so this is where the
+/// whole surface's policy filtering happens. Formatting without the view's policy
+/// expands subjects the request was denied, even though its rows were filtered.
+async fn hydrate_rows(
+    result: &crate::QueryResult,
+    db: &GraphDb,
+) -> std::result::Result<JsonValue, GqlError> {
+    crate::format::format_results_async(
+        result,
+        &result.context,
+        db.as_graph_db_ref(),
+        &crate::format::FormatterConfig::jsonld(),
+        db.policy(),
+        None,
+    )
+    .await
+    .map_err(|e| GqlError::Execution(e.to_string()))
 }
 
 fn hash_context(context: Option<&JsonValue>) -> u64 {
@@ -464,9 +489,10 @@ async fn curated_schema(db: &GraphDb) -> Option<CuratedSchema> {
     }
     let (schema_subject, mut curated) = schemas.into_iter().next().expect("len checked");
 
-    // Scalar settings on the schema node itself.
+    // Scalar settings on the schema node itself, read without the
+    // Fluree-vocabulary filter: configuration predicates are in that namespace.
     for flake in subject_flakes(db, &schema_subject).await {
-        let Some(iri) = user_iri_unfiltered(&flake.p, snapshot) else {
+        let Some(iri) = snapshot.decode_sid(&flake.p) else {
             continue;
         };
         match iri.as_str() {
@@ -606,13 +632,6 @@ async fn subject_flakes(db: &GraphDb, subject: &Sid) -> Vec<fluree_db_core::Flak
         .unwrap_or_default()
 }
 
-/// A SID's IRI without the Fluree-vocabulary filter, for reading configuration
-/// predicates (which are deliberately in Fluree's own namespace).
-fn user_iri_unfiltered(sid: &Sid, snapshot: &LedgerSnapshot) -> Option<String> {
-    let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
-    Some(format!("{}{}", prefix, sid.name))
-}
-
 // =============================================================================
 // Tier 2: SHACL shapes
 // =============================================================================
@@ -627,6 +646,10 @@ async fn shapes(db: &GraphDb) -> Vec<ShapeDescription> {
     let Some(cache) = compiled_shapes(db).await else {
         return Vec::new();
     };
+    // `sh:minCount ≥ 1` makes a field non-null only where SHACL is enforced:
+    // elsewhere nothing keeps a record from lacking the value, and a non-null
+    // field would turn that record into an error on read.
+    let enforced = shacl_enforced(db).await;
     let snapshot = db.snapshot.as_ref();
     let policy = db
         .policy_enforcer()
@@ -658,7 +681,15 @@ async fn shapes(db: &GraphDb) -> Vec<ShapeDescription> {
                 name: shape.name.clone(),
                 description: shape.description.clone(),
                 closed: shape_is_closed(shape),
-                properties: shaped_properties(shape, snapshot, policy),
+                properties: shaped_properties(shape, snapshot, policy)
+                    .into_iter()
+                    .map(|mut property| {
+                        if !enforced {
+                            property.min_count = None;
+                        }
+                        property
+                    })
+                    .collect(),
             });
         }
     }
@@ -764,6 +795,29 @@ fn allowed_value(
 /// something to redo per request. The key adds `shacl_epoch` to the schema
 /// cache's: that epoch is exactly "a shape-affecting flake was committed", which
 /// is what the write path already keys its own compile cache on.
+/// Whether the ledger config enables SHACL for the view's graph: the view's
+/// resolved config, or the ledger's own when the view was built without it.
+async fn shacl_enforced(db: &GraphDb) -> bool {
+    let resolved = match db.resolved_config() {
+        Some(resolved) => Some(resolved.clone()),
+        None => {
+            let view = db.as_graph_db_ref();
+            let graph_iri = (db.graph_id != fluree_db_core::DEFAULT_GRAPH_ID)
+                .then(|| db.snapshot.graph_registry.iri_for_graph_id(db.graph_id))
+                .flatten();
+            crate::config_resolver::resolve_ledger_config(view.snapshot, view.overlay, view.t)
+                .await
+                .ok()
+                .flatten()
+                .map(|config| crate::config_resolver::resolve_effective_config(&config, graph_iri))
+        }
+    };
+    resolved
+        .as_ref()
+        .and_then(|resolved| crate::config_resolver::merge_shacl_opts(resolved, None, None))
+        .is_some_and(|shacl| shacl.enabled)
+}
+
 async fn compiled_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache>> {
     let key = shape_cache_key(db);
     if let Some(key) = &key {
@@ -784,7 +838,7 @@ async fn compiled_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache
 /// blocking a runtime worker on it would risk starving the very executor the
 /// reads need to make progress.
 async fn compile_shapes(db: &GraphDb) -> Option<Arc<fluree_db_shacl::ShaclCache>> {
-    let g_ids = crate::tx::resolve_shapes_source_g_ids(db.ledger_config(), &db.snapshot)
+    let g_ids = crate::tx::resolve_shapes_source_g_ids(db.ledger_config(), &db.snapshot, db.t)
         .unwrap_or_else(|_| vec![0]);
     let views: Vec<GraphDb> = g_ids
         .iter()
@@ -819,7 +873,7 @@ type ShapeCache =
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ShapeCacheKey {
-    ledger_id: String,
+    ledger_id: fluree_db_core::LedgerId,
     index_t: i64,
     shacl_epoch: u64,
     /// The compiled shapes bake in subclass expansion, so a hierarchy change
@@ -849,9 +903,9 @@ fn shape_cache_key(db: &GraphDb) -> Option<ShapeCacheKey> {
 /// A SID's IRI, or `None` for Fluree's own vocabulary — commit metadata and
 /// edge-annotation reifiers are not part of anyone's data model.
 fn user_iri(sid: &Sid, snapshot: &LedgerSnapshot) -> Option<String> {
-    let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
-    let iri = format!("{}{}", prefix, sid.name);
-    (!iri.starts_with("https://ns.flur.ee/")).then_some(iri)
+    snapshot
+        .decode_sid(sid)
+        .filter(|iri| !iri.starts_with("https://ns.flur.ee/"))
 }
 
 /// HEAD-index stats merged with the overlay up to `to_t`.
@@ -954,10 +1008,7 @@ impl RootExecutor for LedgerExecutor {
             .query_with_options(&self.db, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(self.db.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, &self.db).await?;
         reshape::reshape(
             &lowered.shape,
             &self.schema.model,
@@ -1111,10 +1162,7 @@ impl LedgerExecutor {
             .query_with_options(view, &lowered.query, self.options.clone())
             .await
             .map_err(|e| GqlError::Execution(e.to_string()))?;
-        let rows = result
-            .to_jsonld_async(view.as_graph_db_ref())
-            .await
-            .map_err(|e| GqlError::Execution(e.to_string()))?;
+        let rows = hydrate_rows(&result, view).await?;
         let objects = reshape::reshape(
             &lowered.shape,
             &self.schema.model,

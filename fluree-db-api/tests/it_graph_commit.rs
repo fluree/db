@@ -430,3 +430,37 @@ async fn commit_show_prefix_with_identity_filters_flakes_by_policy() {
     };
     assert_eq!(ssn_value, "111-11-1111", "should be Alice's SSN");
 }
+
+/// Writes apply at HEAD, so a `graph_at` handle — which names a past state —
+/// must refuse to transact rather than silently writing somewhere else.
+#[tokio::test]
+async fn transact_through_time_pinned_graph_is_refused() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/graph-pinned-write:main";
+    let (_ledger, t1, t2) = seed_two_commits(&fluree, ledger_id).await;
+    let tx = json!({
+        "@context": {"ex": "http://example.org/"},
+        "@graph": [{"@id": "ex:carol", "ex:name": "Carol"}]
+    });
+
+    let err = fluree
+        .graph_at(ledger_id, fluree_db_api::TimeSpec::AtT(t1))
+        .transact()
+        .insert(&tx)
+        .commit()
+        .await
+        .expect_err("commit through a pinned handle must fail");
+    assert_eq!(err.status_code(), 400, "{err}");
+
+    assert!(fluree
+        .graph_at(ledger_id, fluree_db_api::TimeSpec::AtT(t1))
+        .transact()
+        .insert(&tx)
+        .stage()
+        .await
+        .is_err());
+
+    // Nothing was written: HEAD is still the second seed commit.
+    let head = fluree.ledger(ledger_id).await.expect("load").t();
+    assert_eq!(head, t2);
+}

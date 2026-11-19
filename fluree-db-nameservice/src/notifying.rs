@@ -7,7 +7,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use fluree_db_core::ContentId;
+use fluree_db_core::{ContentId, LedgerId};
 
 use crate::{
     event_bus::LedgerEventBus, AdminPublisher, BranchLifecycle, CasResult, CommitPublisher,
@@ -78,8 +78,8 @@ where
         self.inner.all_records().await
     }
 
-    async fn list_branches(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
-        self.inner.list_branches(ledger_name).await
+    async fn branch_records(&self, ledger_name: &str) -> Result<Vec<NsRecord>> {
+        self.inner.branch_records(ledger_name).await
     }
 
     async fn heads(&self, ledger_id: &str) -> Result<Option<LedgerHeads>> {
@@ -111,13 +111,29 @@ where
         // their per-branch state. Without this notification the new
         // whole-ledger drop path would leave stale caches behind.
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
         });
         Ok(remaining)
     }
 
     async fn reset_head(&self, ledger_id: &str, snapshot: NsRecordSnapshot) -> Result<()> {
-        self.inner.reset_head(ledger_id, snapshot).await
+        let head = snapshot
+            .commit_head_id
+            .clone()
+            .map(|id| (id, snapshot.commit_t));
+        self.inner.reset_head(ledger_id, snapshot).await?;
+        // A reset moves the head (a rebase, or a rollback), and its index
+        // with it. Subscribers re-read the whole record on a commit event,
+        // so query peers follow the index too.
+        if let Some((commit_id, commit_t)) = head {
+            self.event_bus
+                .notify(NameServiceEvent::LedgerCommitPublished {
+                    ledger_id: LedgerId::parse_persisted(ledger_id)?,
+                    commit_id,
+                    commit_t,
+                });
+        }
+        Ok(())
     }
 
     // Pass-through wrapper: delegate so the inner backend's commit-CID index
@@ -153,7 +169,7 @@ where
     async fn retract(&self, ledger_id: &str) -> Result<()> {
         self.inner.retract(ledger_id).await?;
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: LedgerId::parse_persisted(ledger_id)?,
         });
         Ok(())
     }
@@ -161,7 +177,7 @@ where
     async fn purge(&self, ledger_id: &str) -> Result<()> {
         self.inner.purge(ledger_id).await?;
         self.event_bus.notify(NameServiceEvent::LedgerRetracted {
-            ledger_id: ledger_id.to_string(),
+            ledger_id: LedgerId::parse(ledger_id)?,
         });
         Ok(())
     }
@@ -183,7 +199,7 @@ where
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerCommitPublished {
-                ledger_id: ledger_id.to_string(),
+                ledger_id: LedgerId::parse(ledger_id)?,
                 commit_id: commit_id.clone(),
                 commit_t,
             });
@@ -211,7 +227,7 @@ where
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
-                ledger_id: ledger_id.to_string(),
+                ledger_id: LedgerId::parse(ledger_id)?,
                 index_id: index_id.clone(),
                 index_t,
             });
@@ -239,7 +255,7 @@ where
             .await?;
         self.event_bus
             .notify(NameServiceEvent::LedgerIndexPublished {
-                ledger_id: ledger_id.to_string(),
+                ledger_id: LedgerId::parse(ledger_id)?,
                 index_id: index_id.clone(),
                 index_t,
             });
@@ -288,7 +304,7 @@ where
                     RefKind::CommitHead => {
                         self.event_bus
                             .notify(NameServiceEvent::LedgerCommitPublished {
-                                ledger_id: ledger_id.to_string(),
+                                ledger_id: LedgerId::parse(ledger_id)?,
                                 commit_id: cid.clone(),
                                 commit_t: new.t,
                             });
@@ -296,7 +312,7 @@ where
                     RefKind::IndexHead => {
                         self.event_bus
                             .notify(NameServiceEvent::LedgerIndexPublished {
-                                ledger_id: ledger_id.to_string(),
+                                ledger_id: LedgerId::parse(ledger_id)?,
                                 index_id: cid.clone(),
                                 index_t: new.t,
                             });
@@ -351,15 +367,19 @@ where
         config: &str,
         dependencies: &[String],
     ) -> Result<()> {
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
+        let canonical_deps = dependencies
+            .iter()
+            .map(|d| LedgerId::parse(d))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
         self.inner
             .publish_graph_source(name, branch, source_type.clone(), config, dependencies)
             .await?;
-        let graph_source_id = format!("{name}:{branch}");
         self.event_bus
             .notify(NameServiceEvent::GraphSourceConfigPublished {
                 graph_source_id,
                 source_type,
-                dependencies: dependencies.to_vec(),
+                dependencies: canonical_deps,
             });
         Ok(())
     }
@@ -374,7 +394,7 @@ where
         self.inner
             .publish_graph_source_index(name, branch, index_id, index_t)
             .await?;
-        let graph_source_id = format!("{name}:{branch}");
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
         self.event_bus
             .notify(NameServiceEvent::GraphSourceIndexPublished {
                 graph_source_id,
@@ -386,7 +406,7 @@ where
 
     async fn retract_graph_source(&self, name: &str, branch: &str) -> Result<()> {
         self.inner.retract_graph_source(name, branch).await?;
-        let graph_source_id = format!("{name}:{branch}");
+        let graph_source_id = LedgerId::from_parts(name, branch)?;
         self.event_bus
             .notify(NameServiceEvent::GraphSourceRetracted { graph_source_id });
         Ok(())
@@ -456,5 +476,46 @@ where
         new: &ConfigValue,
     ) -> Result<ConfigCasResult> {
         self.inner.push_config(ledger_id, expected, new).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::memory::MemoryNameService;
+    use fluree_db_core::ContentKind;
+
+    /// A reset moves the head and the index together; subscribers (query
+    /// peers among them) hear of it as a commit and re-read the record.
+    #[tokio::test]
+    async fn a_reset_is_announced_as_a_commit() {
+        let ns =
+            NotifyingNameService::new(MemoryNameService::new(), Arc::new(LedgerEventBus::new(16)));
+        ns.init("reset:main").await.expect("init");
+        let mut events = ns.subscribe(SubscriptionScope::All).receiver;
+        let head = ContentId::new(ContentKind::Commit, b"rebased-head");
+        ns.reset_head(
+            "reset:main",
+            NsRecordSnapshot {
+                commit_head_id: Some(head.clone()),
+                commit_t: 2,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .expect("reset");
+        match events.try_recv().expect("an event") {
+            NameServiceEvent::LedgerCommitPublished {
+                ledger_id,
+                commit_id,
+                commit_t,
+            } => {
+                assert_eq!(ledger_id.as_str(), "reset:main");
+                assert_eq!(commit_id, head);
+                assert_eq!(commit_t, 2);
+            }
+            other => panic!("expected a commit event, got {other:?}"),
+        }
     }
 }

@@ -18,6 +18,9 @@
 //!   `RangeOptions::history_mode` — published parameters for the
 //!   `range_with_overlay` core API, below the planner.
 
+use crate::binding::UnmatchedOptional;
+use crate::index_scope::ScopeKind;
+
 /// Whether a query is evaluating current state or full history.
 ///
 /// History queries return the merged stream of assert + retract events
@@ -52,9 +55,7 @@ impl TemporalMode {
 /// Planning-time context threaded through the operator-tree builder.
 ///
 /// Carries decisions that must be made once at planning and captured at
-/// operator construction — never read again at runtime. Currently this
-/// is just [`TemporalMode`]; future planning inputs that want the same
-/// "decide once, capture at construction" discipline should land here.
+/// operator construction — never read again at runtime.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Default)]
 pub struct PlanningContext {
     /// Temporal mode for this query.
@@ -80,6 +81,36 @@ pub struct PlanningContext {
     /// (which assume bag cardinality over the union). Only ever `true` in
     /// current mode — history datasets keep per-event (assert/retract) rows.
     pub multi_default_graph: bool,
+    /// How many graphs the query's default graph reads ([`ScopeKind::of`]):
+    /// the planner's twin of [`ExecutionContext::scope_kind`], from the same
+    /// definition. A plan choice that reads one graph (the fused fast paths,
+    /// the partitioned GROUP BY) is made only under [`ScopeKind::One`], and
+    /// each has a runtime gate on the same definition that falls back. A
+    /// choice that also needs the graph's binary index and has no fallback
+    /// (the geo index search) gates on [`Self::reads_one_graph_index`].
+    ///
+    /// [`ScopeKind::None`] when the planner was never given its scope
+    /// ([`Self::with_dataset_scope`]), so such a plan reads no index.
+    ///
+    /// [`ExecutionContext::scope_kind`]: crate::context::ExecutionContext::scope_kind
+    pub index_scope_kind: ScopeKind,
+    /// Whether the query's dataset spans ledgers. Such a dataset reads every
+    /// graph through the range scan (the query path attaches no binary store),
+    /// so [`Self::reads_one_graph_index`] is false whatever its default graph.
+    pub spans_ledgers: bool,
+    /// What an unmatched OPTIONAL binds its optional-only variables to — the
+    /// surface language's null semantics. Folded in from `Query` at the plan
+    /// root; defaults to SPARQL's `Unbound`.
+    pub unmatched_optional: UnmatchedOptional,
+    /// Desired output prefix of a streaming join block. This is a startup-cost
+    /// hint, never a cap on input or output rows. Unlike a source row budget,
+    /// it remains useful through DISTINCT and FILTER. Blocking query modifiers
+    /// must clear it because they need the complete input.
+    pub row_goal: Option<usize>,
+    /// The row order this query's graph-source table scans owe it. Deterministic
+    /// unless the query root has shown that no LIMIT or OFFSET anywhere in the
+    /// query can observe scan order (see `build_operator_tree`).
+    pub scan_order: crate::r2rml::ScanOrder,
 }
 
 impl PlanningContext {
@@ -90,6 +121,11 @@ impl PlanningContext {
             mode: TemporalMode::Current,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            index_scope_kind: ScopeKind::None,
+            spans_ledgers: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
     }
 
@@ -100,6 +136,11 @@ impl PlanningContext {
             mode: TemporalMode::History,
             allow_semantic_elision: false,
             multi_default_graph: false,
+            index_scope_kind: ScopeKind::None,
+            spans_ledgers: false,
+            unmatched_optional: UnmatchedOptional::Unbound,
+            row_goal: None,
+            scan_order: crate::r2rml::ScanOrder::Deterministic,
         }
     }
 
@@ -125,6 +166,52 @@ impl PlanningContext {
         self
     }
 
+    /// Plan for the query's default graph over `dataset` (`None`: the
+    /// ledger's own default graph): [`Self::multi_default_graph`] when it has
+    /// two or more members, and [`Self::index_scope_kind`] by the one
+    /// definition the runtime uses. Every entry point that runs a query over a
+    /// dataset plans through this.
+    pub fn with_dataset_scope(self, dataset: Option<&crate::dataset::DataSet<'_>>) -> Self {
+        let mut planning =
+            self.with_multi_default_graph(dataset.is_some_and(|ds| ds.default_graphs().len() >= 2));
+        planning.index_scope_kind = ScopeKind::of(&crate::dataset::ActiveGraph::Default, dataset);
+        planning.spans_ledgers =
+            dataset.is_some_and(crate::dataset::DataSet::spans_multiple_ledgers);
+        planning
+    }
+
+    /// Whether a plan choice that reads one graph's binary index and has no
+    /// fallback without it may be made: the default graph is one graph, the
+    /// dataset does not span ledgers, and the query runs with a store
+    /// (`has_store`, the store the planner was given). The same definition as
+    /// the runtime's [`ExecutionContext::has_binary_store`]
+    /// ([`ScopeKind::reads_one_graph_index`]), so such a lane is planned only
+    /// where it can run.
+    ///
+    /// [`ExecutionContext::has_binary_store`]: crate::context::ExecutionContext::has_binary_store
+    pub fn reads_one_graph_index(&self, has_store: bool) -> bool {
+        self.index_scope_kind
+            .reads_one_graph_index(has_store, self.spans_ledgers)
+    }
+
+    /// Set the surface language's OPTIONAL null semantics (see
+    /// [`Self::unmatched_optional`]).
+    #[inline]
+    pub const fn with_unmatched_optional(mut self, unmatched: UnmatchedOptional) -> Self {
+        self.unmatched_optional = unmatched;
+        self
+    }
+
+    pub(crate) const fn with_row_goal(mut self, goal: Option<usize>) -> Self {
+        self.row_goal = goal;
+        self
+    }
+
+    pub(crate) const fn with_scan_order(mut self, order: crate::r2rml::ScanOrder) -> Self {
+        self.scan_order = order;
+        self
+    }
+
     /// Returns the temporal mode.
     #[inline]
     pub const fn mode(self) -> TemporalMode {
@@ -135,5 +222,23 @@ impl PlanningContext {
     #[inline]
     pub const fn is_history(self) -> bool {
         self.mode.is_history()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A plan that was never given its scope reads no index; the scope of a
+    /// ledger's own default graph is one graph.
+    #[test]
+    fn a_plan_without_its_scope_reads_no_index() {
+        for planning in [PlanningContext::current(), PlanningContext::history()] {
+            assert_eq!(planning.index_scope_kind, ScopeKind::None);
+            assert!(!planning.reads_one_graph_index(true));
+            let scoped = planning.with_dataset_scope(None);
+            assert_eq!(scoped.index_scope_kind, ScopeKind::One);
+            assert!(scoped.reads_one_graph_index(true));
+        }
     }
 }

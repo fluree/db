@@ -5,7 +5,7 @@
 //! novelty. But the system's chronic-bug seam — and the target of the
 //! audit roadmap's Phases 1–2 (`docs/audit/2026-06-architecture-audit.md`)
 //! — is the **overlay merge**: columnar base combined with row-based
-//! novelty. This bench runs the same query shapes at three ledger
+//! novelty. This bench runs the same query shapes at four ledger
 //! conditions so a refactor of the merge/translation paths cannot regress
 //! a lane that has no benchmark coverage:
 //!
@@ -15,7 +15,14 @@
 //!    with indexing thresholds set high so it stays in novelty. Exercises
 //!    overlay→binary translation and cursor-merge (strategy (b)); bails
 //!    strategy-(a) paths.
-//! 3. **`novelty`** — populate with indexing disabled; no binary index at
+//! 3. **`cached`** — populate through a cached ledger handle, then index in
+//!    the background, which installs the index on that handle in place:
+//!    indexed with novelty drained, like `base`, but the overlay's mutation
+//!    counter is nonzero. This is a long-running server's steady state. The
+//!    other conditions load the ledger fresh, which always starts the counter
+//!    at 0, so a fast path gated on the counter instead of on actual novelty
+//!    shows up only here.
+//! 4. **`novelty`** — populate with indexing disabled; no binary index at
 //!    all. Pure novelty/range path. (Skipped at `large` scale — a
 //!    multi-million-triple pure-novelty scan is a pathological shape we
 //!    don't gate on.)
@@ -43,7 +50,7 @@
 //!
 //!   inputs:    BenchScale → n_products (Tiny=100, Small=1k, Medium=10k,
 //!              Large=100k); overlay delta = n_products / 10.
-//!   scenarios: {count, star, groupby} × {base, overlay, novelty}
+//!   scenarios: {count, star, groupby} × {base, overlay, cached, novelty}
 //!   metric:    ns/query (criterion), peak/total alloc bytes (sidecar)
 //!
 //! ## Running
@@ -64,7 +71,7 @@ use fluree_bench_support::{
     BenchScale,
 };
 use fluree_db_api::admin::ReindexOptions;
-use fluree_db_api::{CommitOpts, Fluree, FlureeBuilder, IndexConfig, TxnOpts};
+use fluree_db_api::{CommitOpts, Fluree, FlureeBuilder, IndexConfig, TriggerIndexOptions, TxnOpts};
 
 #[global_allocator]
 static ALLOC: TrackingAllocator = TrackingAllocator::new();
@@ -213,6 +220,48 @@ async fn setup(
     (db_dir, fluree, alias)
 }
 
+/// Populate through a cached handle and index in the background, leaving the
+/// handle indexed and drained with a nonzero mutation counter (the `cached`
+/// condition). `reindex` would not do: it evicts the cached handle, so the
+/// next load starts fresh.
+async fn setup_cached(n_products: usize) -> (tempfile::TempDir, Fluree, String) {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+
+    let alias = next_ledger_alias("query-overlay-matrix");
+    fluree.create_ledger(&alias).await.expect("create_ledger");
+    let handle = fluree.ledger_cached(&alias).await.expect("cache ledger");
+    let turtle = bsbm_data_to_turtle(&generate_dataset(n_products));
+    fluree
+        .stage(&handle)
+        .insert_turtle(&turtle)
+        .index_config(no_auto_index())
+        .execute()
+        .await
+        .expect("populate insert");
+
+    let indexed = fluree
+        .trigger_index(&alias, TriggerIndexOptions::default())
+        .await
+        .expect("background index");
+    // The publication listener installs the new root on the cached handle.
+    for _ in 0..6_000 {
+        if handle.snapshot().await.snapshot.t >= indexed.index_t {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let state = handle.snapshot().await.to_ledger_state();
+    assert!(
+        state.binary_store.is_some() && state.novelty.is_empty() && state.novelty.epoch != 0,
+        "cached handle must be indexed and drained with a nonzero mutation counter"
+    );
+
+    (db_dir, fluree, alias)
+}
+
 fn bench_query_overlay_matrix(c: &mut Criterion) {
     init_tracing_for_bench();
     let rt = bench_runtime();
@@ -285,6 +334,18 @@ fn bench_query_overlay_matrix(c: &mut Criterion) {
         scenario!(snapshot, "count_overlay", Q_COUNT);
         scenario!(snapshot, "star_overlay", Q_STAR);
         scenario!(snapshot, "groupby_overlay", Q_GROUPBY);
+        drop(snapshot);
+        drop(fluree);
+    }
+
+    // --- condition: cached (indexed in place, novelty drained, epoch != 0) ---
+    {
+        let (_db_dir, fluree, alias) = rt.block_on(setup_cached(n_products));
+        let snapshot =
+            rt.block_on(async { fluree.graph(&alias).load().await.expect("graph load") });
+        scenario!(snapshot, "count_cached", Q_COUNT);
+        scenario!(snapshot, "star_cached", Q_STAR);
+        scenario!(snapshot, "groupby_cached", Q_GROUPBY);
         drop(snapshot);
         drop(fluree);
     }

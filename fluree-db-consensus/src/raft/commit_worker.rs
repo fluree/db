@@ -40,8 +40,8 @@ use crate::raft::state_machine::{BodyKind, PoisonReason, QueueEntry, RefKey};
 use crate::raft::state_machine_adapter::SharedState;
 use crate::raft::{NodeId, TypeConfig};
 use crate::{
-    QueuedMerge, QueuedPush, QueuedRebase, QueuedRequest, QueuedRevert, QueuedTransact,
-    SubmissionError, TransactionBody,
+    QueuedMerge, QueuedPush, QueuedPushWithMerges, QueuedRebase, QueuedRequest, QueuedRevert,
+    QueuedTransact, SubmissionError, TransactionBody,
 };
 use fluree_db_api::{
     ApiError, Base64Bytes, Fluree, PushCommitsRequest, RefreshOpts, StagedMerge, StagedPush,
@@ -76,8 +76,8 @@ const SUPERVISOR_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const RAFT_BACKOFF: Duration = Duration::from_millis(250);
 
 /// Max staging attempts before [`process_entry`] gives up and
-/// proposes a poison. Only [`PoisonReason::StagingFailed`] is
-/// retried; the other variants are deterministic.
+/// proposes a poison. Transient failures and policy denials are retried
+/// after refresh; other staging failures are poisoned immediately.
 const MAX_STAGE_ATTEMPTS: u32 = 3;
 
 /// First-attempt backoff between staging retries; doubles per
@@ -218,11 +218,10 @@ impl Worker {
     /// Reads the [`QueuedRequest`] envelope from CAS, stages the
     /// commit, writes the commit blob, and publishes the head
     /// advance through the [`CommitPublisher`]. Transient staging
-    /// failures (`PoisonReason::StagingFailed`) retry with
-    /// exponential backoff up to [`MAX_STAGE_ATTEMPTS`] times before
-    /// poisoning — the other `PoisonReason` variants are
-    /// deterministic (`BodyMalformed`, `PolicyViolation`, etc.) so
-    /// retrying them just burns a worker round. Between retries
+    /// failures and policy denials retry with exponential backoff up
+    /// to [`MAX_STAGE_ATTEMPTS`] times before poisoning. Other stage
+    /// failures are deterministic, so retrying them just burns a worker
+    /// round. Between retries
     /// the local Fluree cache is `refresh()`ed against the durable
     /// nameservice head so a conflict rooted in stale state (e.g.
     /// a namespace allocation this node missed because it took
@@ -239,7 +238,12 @@ impl Worker {
             attempt += 1;
             match self.try_advance_head(&entry).await {
                 Ok(()) => return Ok(()),
-                Err(WorkerError::Transient(error)) => {
+                Err(error @ (WorkerError::Transient(_) | WorkerError::PolicyDenied(_))) => {
+                    let (error, policy_denied) = match error {
+                        WorkerError::Transient(message) => (message, false),
+                        WorkerError::PolicyDenied(message) => (message, true),
+                        _ => unreachable!(),
+                    };
                     if attempt < MAX_STAGE_ATTEMPTS {
                         let backoff = STAGE_RETRY_BASE_BACKOFF * (1u32 << (attempt - 1));
                         debug!(
@@ -279,15 +283,15 @@ impl Worker {
                         %error,
                         "exhausted staging retries, poisoning entry"
                     );
-                    return self
-                        .propose_poison(
-                            entry.queue_id,
-                            PoisonReason::StagingFailed {
-                                error,
-                                attempts: attempt,
-                            },
-                        )
-                        .await;
+                    let reason = if policy_denied {
+                        PoisonReason::PolicyViolation { error }
+                    } else {
+                        PoisonReason::StagingFailed {
+                            error,
+                            attempts: attempt,
+                        }
+                    };
+                    return self.propose_poison(entry.queue_id, reason).await;
                 }
                 Err(WorkerError::Lagged(msg)) => {
                     // The entry is still at the queue front: either
@@ -343,6 +347,7 @@ impl Worker {
         let StagedOutcome { receipt, install } = match envelope {
             QueuedRequest::Transact(transact) => self.stage_and_persist(*transact).await?,
             QueuedRequest::Push(push) => self.process_push(*push).await?,
+            QueuedRequest::PushWithMerges(push) => self.process_push_with_merges(*push).await?,
             QueuedRequest::Revert(revert) => self.process_revert(revert).await?,
             QueuedRequest::Merge(merge) => self.process_merge(merge).await?,
             QueuedRequest::Rebase(rebase) => self.process_rebase(rebase).await?,
@@ -590,6 +595,7 @@ impl Worker {
             commit_opts,
             tracking,
             governance,
+            submission: _,
         } = transact;
 
         let ledger_id = self.ref_key.ledger_id();
@@ -598,8 +604,12 @@ impl Worker {
             .fluree
             .ledger_manager()
             .ok_or_else(|| stage_failure("LedgerManager is not configured on Fluree"))?;
+        let typed_id = self
+            .ref_key
+            .id()
+            .map_err(|e| stage_failure(&format!("invalid ledger id: {e}")))?;
         let ledger_handle = ledger_manager
-            .get_or_load(&ledger_id)
+            .get_or_load(&typed_id)
             .await
             .map_err(|e| stage_failure(&format!("ledger load failed: {e}")))?;
 
@@ -635,8 +645,26 @@ impl Worker {
             TransactionBody::JsonLdInsert(json) => staged.insert(json),
             TransactionBody::JsonLdUpsert(json) => staged.upsert(json),
             TransactionBody::JsonLdUpdate(json) => staged.update(json),
-            TransactionBody::JsonLdGraphSync { graph_iri, body } => {
-                staged.sync_graph(graph_iri.as_str(), body)
+            TransactionBody::JsonLdGraphSync { graph_iri, body } => staged.sync_graph_payload(
+                crate::graph_sel(graph_iri),
+                fluree_db_api::GraphPayload::JsonLd(body),
+                false,
+            ),
+            TransactionBody::RdfGraphSync {
+                graph_iri,
+                text,
+                allow_empty,
+            } => staged.sync_graph_payload(
+                crate::graph_sel(graph_iri),
+                fluree_db_api::GraphPayload::Rdf(text),
+                *allow_empty,
+            ),
+            TransactionBody::GraphInsert { graph_iri, payload } => {
+                let payload = match payload {
+                    crate::GraphBody::JsonLd(json) => fluree_db_api::GraphPayload::JsonLd(json),
+                    crate::GraphBody::Rdf(text) => fluree_db_api::GraphPayload::Rdf(text),
+                };
+                staged.insert_graph_payload(crate::graph_sel(graph_iri), payload)
             }
             TransactionBody::TurtleInsert(text) => staged.insert_turtle(text.as_str()),
             TransactionBody::TurtleUpsert(text) | TransactionBody::TrigUpsert(text) => {
@@ -679,10 +707,8 @@ impl Worker {
         // SHACL override gate reads it from here, not from the policy.
         builder = builder.server_identity(governance.server_identity.clone());
 
-        let Some((write_guard, staged_commit)) = builder
-            .build_commit()
-            .await
-            .map_err(|e| stage_failure(&format!("build_commit failed: {e}")))?
+        let Some((write_guard, staged_commit)) =
+            builder.build_commit().await.map_err(build_commit_failure)?
         else {
             // No-change transaction (e.g. a graph sync whose payload already
             // matches the graph): mirror the revert NoOp short-circuit —
@@ -763,6 +789,7 @@ impl Worker {
         let QueuedRevert {
             selection,
             strategy,
+            submission: _,
         } = revert;
 
         let ledger_name = self.ref_key.ledger_name.clone();
@@ -839,10 +866,28 @@ impl Worker {
     /// finalize through the held write guard so this node's cache
     /// catches up with the head we're about to publish.
     async fn process_push(&self, push: QueuedPush) -> Result<StagedOutcome, WorkerError> {
-        let QueuedPush {
-            commit_cids,
-            blobs,
-            governance,
+        self.process_push_with_merges(QueuedPushWithMerges {
+            push,
+            merged_commit_cids: Vec::new(),
+        })
+        .await
+    }
+
+    /// [`Self::process_push`] for a push that also carries the commits its
+    /// merges brought in.
+    async fn process_push_with_merges(
+        &self,
+        push: QueuedPushWithMerges,
+    ) -> Result<StagedOutcome, WorkerError> {
+        let QueuedPushWithMerges {
+            push:
+                QueuedPush {
+                    commit_cids,
+                    blobs,
+                    governance,
+                    submission: _,
+                },
+            merged_commit_cids,
         } = push;
         let ledger_id = self.ref_key.ledger_id();
         let content_store = self.staging.fluree.content_store(&ledger_id);
@@ -853,19 +898,29 @@ impl Worker {
         // malformed body. Any other error is a transport / backend
         // hiccup; raise as `Transient` so the retry/backoff loop in
         // `process_entry` heals it.
-        let mut commits = Vec::with_capacity(commit_cids.len());
-        for cid in &commit_cids {
-            let bytes = content_store.get(cid).await.map_err(|e| {
-                if matches!(e, fluree_db_core::Error::NotFound(_)) {
-                    stage(PoisonReason::BodyMalformed {
-                        error: format!("push commit {cid} missing from CAS: {e}"),
-                    })
-                } else {
-                    WorkerError::Transient(format!("push commit {cid} CAS read failed: {e}"))
+        let read_commits = |cids: Vec<fluree_db_core::CommitId>| {
+            let content_store = content_store.clone();
+            async move {
+                let mut out = Vec::with_capacity(cids.len());
+                for cid in &cids {
+                    let bytes = content_store.get(cid).await.map_err(|e| {
+                        if matches!(e, fluree_db_core::Error::NotFound(_)) {
+                            stage(PoisonReason::BodyMalformed {
+                                error: format!("push commit {cid} missing from CAS: {e}"),
+                            })
+                        } else {
+                            WorkerError::Transient(format!(
+                                "push commit {cid} CAS read failed: {e}"
+                            ))
+                        }
+                    })?;
+                    out.push(Base64Bytes(bytes));
                 }
-            })?;
-            commits.push(Base64Bytes(bytes));
-        }
+                Ok::<_, WorkerError>(out)
+            }
+        };
+        let commits = read_commits(commit_cids).await?;
+        let merged_commits = read_commits(merged_commit_cids).await?;
         let payload = PushCommitsRequest {
             commits,
             blobs: blobs
@@ -875,6 +930,7 @@ impl Worker {
             // The staged bundle carries every blob it resolved; a gap it
             // could not resolve is not distinguished here yet.
             missing_blobs: Vec::new(),
+            merged_commits,
         };
         let StagedPush {
             accepted,
@@ -918,6 +974,7 @@ impl Worker {
             source_branch,
             target_branch,
             strategy,
+            submission: _,
         } = merge;
         let ledger_name = self.ref_key.ledger_name.clone();
         let StagedMerge {
@@ -1006,7 +1063,10 @@ impl Worker {
     /// pre-rebase head so the queue entry completes without
     /// observable mutation.
     async fn process_rebase(&self, rebase: QueuedRebase) -> Result<StagedOutcome, WorkerError> {
-        let QueuedRebase { strategy } = rebase;
+        let QueuedRebase {
+            strategy,
+            submission: _,
+        } = rebase;
         let ledger_name = self.ref_key.ledger_name.clone();
         let branch = self.ref_key.branch.clone();
         let StagedRebase {
@@ -1038,6 +1098,7 @@ impl Worker {
         // without observable mutation. If the branch was at genesis
         // with no head to fall back to, the situation is anomalous
         // — poison rather than fabricate a head.
+        let advanced = new_head_id.is_some();
         let (advance_to, advance_t) = match (new_head_id, pre_rebase_head_id) {
             (Some(head), _) => (head, new_head_t),
             (None, Some(head)) => (head, pre_rebase_head_t),
@@ -1071,11 +1132,15 @@ impl Worker {
                 source_head_id,
                 strategy,
             }),
-            install: write_guard.map(|guard| StagedStateInstall {
-                write_guard: guard,
-                new_state: final_state,
-                commit_t: advance_t,
-            }),
+            // With no advance `final_state` is the source's state, not the
+            // branch's, so the cache keeps what it has.
+            install: write_guard
+                .filter(|_| advanced)
+                .map(|guard| StagedStateInstall {
+                    write_guard: guard,
+                    new_state: final_state,
+                    commit_t: advance_t,
+                }),
         })
     }
 
@@ -1196,8 +1261,12 @@ impl Worker {
                 Ok(Ok(())) => {
                     last_committed = Some(queue_id);
                 }
-                Ok(Err(WorkerError::Transient(_) | WorkerError::Stage(_))) => {
-                    unreachable!("process_entry maps Transient/Stage failures to PoisonQueueEntry")
+                Ok(Err(
+                    WorkerError::Transient(_)
+                    | WorkerError::PolicyDenied(_)
+                    | WorkerError::Stage(_),
+                )) => {
+                    unreachable!("process_entry maps staging failures to PoisonQueueEntry")
                 }
                 Ok(Err(WorkerError::Stale(_))) => {
                     unreachable!("try_advance_head consumes Stale internally and returns Ok")
@@ -1528,7 +1597,7 @@ fn drain_dead_workers(
 fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<(), WorkerError> {
     let expected = match envelope {
         QueuedRequest::Transact(t) => BodyKind::from(&t.body),
-        QueuedRequest::Push(_) => BodyKind::Pushed,
+        QueuedRequest::Push(_) | QueuedRequest::PushWithMerges(_) => BodyKind::Pushed,
         QueuedRequest::Revert(_) => BodyKind::Revert,
         QueuedRequest::Merge(_) => BodyKind::Merge,
         QueuedRequest::Rebase(_) => BodyKind::Rebase,
@@ -1546,6 +1615,35 @@ fn check_envelope_kind(body_kind: BodyKind, envelope: &QueuedRequest) -> Result<
 
 fn stage_failure(message: &str) -> WorkerError {
     WorkerError::Transient(message.into())
+}
+
+/// A `build_commit` failure the request itself caused — malformed input
+/// (400), a delta too large to ever commit (413), or a value that breaks a
+/// constraint the ledger holds (422: the datatype limit, a vector the index
+/// cannot store) — fails the same way on every attempt, so it poisons now
+/// instead of spending the retry budget. A lagging view can only miss such a
+/// constraint, never invent one, so a refusal stands after a refresh.
+/// Anything else can be rooted in this node's view (a commit or namespace
+/// conflict, policy or SHACL over lagging state, an index this node has not
+/// loaded: 503) and stays transient.
+fn build_commit_failure(err: ApiError) -> WorkerError {
+    if matches!(
+        &err,
+        ApiError::Policy(fluree_db_api::PolicyError::ModifyDenied { .. })
+            | ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+                fluree_db_api::PolicyError::ModifyDenied { .. },
+            ))
+    ) {
+        // A stale local view can affect policy evaluation. Retry after the
+        // normal refresh, then preserve the denial if it still fails.
+        return WorkerError::PolicyDenied(err.to_string());
+    }
+    match err.status_code() {
+        400 | 413 | 422 => stage(PoisonReason::BodyMalformed {
+            error: err.to_string(),
+        }),
+        _ => stage_failure(&format!("build_commit failed: {err}")),
+    }
 }
 
 fn submission_to_stage(err: SubmissionError) -> WorkerError {
@@ -1589,6 +1687,10 @@ pub enum WorkerError {
     /// the actual count rather than a placeholder.
     #[error("transient staging error: {0}")]
     Transient(String),
+    /// A typed policy denial that follows the same refresh-and-retry path as
+    /// `Transient`, then becomes `PoisonReason::PolicyViolation` if it persists.
+    #[error("policy denied during staging: {0}")]
+    PolicyDenied(String),
     /// `PoisonReason` is boxed so this enum stays small even though
     /// `PushCasFailed` carries two `Option<ContentId>`s — without
     /// the indirection every `Result<(), WorkerError>` in the worker
@@ -1673,6 +1775,68 @@ mod tests {
         ContentId::new(ContentKind::Commit, &[seed])
     }
 
+    #[test]
+    fn request_errors_from_build_commit_poison_without_retry() {
+        for status in [400, 413, 422] {
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::http(status, "bad")),
+                    WorkerError::Stage(reason) if matches!(*reason, PoisonReason::BodyMalformed { .. })
+                ),
+                "{status}"
+            );
+        }
+        // The two refusals that answer 422, as `build_commit` returns them.
+        for refused in [
+            fluree_db_api::TransactError::InvalidVector(
+                "vector dims mismatch: expected 3, got 2".into(),
+            ),
+            fluree_db_api::TransactError::DatatypeLimitExceeded {
+                used: 16_369,
+                adding: 1,
+                max: 16_369,
+            },
+        ] {
+            let what = refused.to_string();
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::Transact(refused)),
+                    WorkerError::Stage(reason) if matches!(*reason, PoisonReason::BodyMalformed { .. })
+                ),
+                "{what}"
+            );
+        }
+        for status in [403, 409, 500, 503] {
+            assert!(
+                matches!(
+                    build_commit_failure(ApiError::http(status, "maybe stale")),
+                    WorkerError::Transient(_)
+                ),
+                "{status}"
+            );
+        }
+        // This node's state, not the request's: retried after a refresh.
+        assert!(matches!(
+            build_commit_failure(ApiError::Transact(
+                fluree_db_api::TransactError::IndexNotLoaded(
+                    "the ledger's index (t=1) is not loaded".into()
+                )
+            )),
+            WorkerError::Transient(_)
+        ));
+    }
+
+    #[test]
+    fn policy_denial_keeps_its_identity_across_staging_retries() {
+        let denied = ApiError::Transact(fluree_db_api::TransactError::PolicyViolation(
+            fluree_db_api::PolicyError::modify_denied("write refused"),
+        ));
+        assert!(matches!(
+            build_commit_failure(denied),
+            WorkerError::PolicyDenied(message) if message.contains("write refused")
+        ));
+    }
+
     fn sample_transact_envelope() -> QueuedRequest {
         QueuedRequest::Transact(Box::new(QueuedTransact {
             body: TransactionBody::JsonLdInsert(json!({"@id": "ex:s", "ex:p": "ex:o"})),
@@ -1680,6 +1844,7 @@ mod tests {
             commit_opts: CommitOptsRequest::default(),
             tracking: Some(TrackingOptions::default()),
             governance: GovernanceOptions::default(),
+            submission: None,
         }))
     }
 
@@ -1688,6 +1853,7 @@ mod tests {
             commit_cids: vec![cid(5)],
             blobs: HashMap::new(),
             governance: GovernanceOptions::default(),
+            submission: None,
         }))
     }
 

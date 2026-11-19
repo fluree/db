@@ -22,7 +22,7 @@
 //! graph also gives relationship-uniqueness (no repeated edge on a path).
 
 use crate::binding::{Batch, Binding};
-use crate::context::ExecutionContext;
+use crate::context::{ExecutionContext, PathGraph};
 use crate::error::{QueryError, Result};
 use crate::frontier::{overlay_dirty_ids, reserved_edge_pids, FrontierView, PathNode};
 use crate::ir::triple::Ref;
@@ -32,9 +32,8 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_core::{
-    range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
-};
+use fluree_db_core::range::range_with_overlay_tracked;
+use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,9 +116,9 @@ impl ShortestPathOperator {
         term: &Ref,
         binding: Option<&Binding>,
     ) -> Option<Sid> {
-        // Property paths / shortest paths require a single active graph; reuse
-        // its store for IRI encoding (mirrors property_path::resolve_sid).
-        let db = ctx.require_single_graph().ok().map(|(db, _, _)| db);
+        // The path's graphs share one ledger's namespace table; encode IRIs
+        // against it (mirrors property_path::resolve_sid).
+        let db = ctx.path_snapshot().ok();
         let binary_store = ctx.binary_store.as_ref();
         match term {
             Ref::Sid(s) => Some(s.clone()),
@@ -161,9 +160,25 @@ impl ShortestPathOperator {
             (PathDirection::Either, _) => (true, true),
         };
 
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
         let mut out = Vec::new();
+        for graph in &ctx.path_graphs()? {
+            self.graph_neighbors(ctx, graph, node, use_spot, use_post, &mut out)
+                .await?;
+        }
+        Ok(out)
+    }
 
+    /// [`Self::neighbors`] within one graph of the path scope.
+    async fn graph_neighbors(
+        &self,
+        ctx: &ExecutionContext<'_>,
+        graph: &PathGraph<'_>,
+        node: &Sid,
+        use_spot: bool,
+        use_post: bool,
+        out: &mut Vec<Sid>,
+    ) -> Result<()> {
+        let (db, overlay, to_t) = (graph.snapshot, graph.overlay, graph.to_t);
         if use_spot {
             // Spot: (subject=node[, predicate]) → ref objects. Wildcard scans
             // all of the node's out-edges and drops reserved predicates
@@ -172,14 +187,15 @@ impl ShortestPathOperator {
             if let Some(pred) = &self.pattern.predicate {
                 range_match = range_match.with_predicate(pred.clone());
             }
-            let flakes = range_with_overlay(
+            let flakes = range_with_overlay_tracked(
                 db,
-                ctx.binary_g_id,
+                graph.g_id,
                 overlay,
                 IndexType::Spot,
                 RangeTest::Eq,
                 range_match,
                 RangeOptions::new().with_to_t(to_t),
+                Some(&ctx.tracker),
             )
             .await?;
             for flake in flakes {
@@ -209,14 +225,15 @@ impl ShortestPathOperator {
                     RangeMatch::new().with_object(FlakeValue::Ref(node.clone())),
                 ),
             };
-            let flakes = range_with_overlay(
+            let flakes = range_with_overlay_tracked(
                 db,
-                ctx.binary_g_id,
+                graph.g_id,
                 overlay,
                 index,
                 RangeTest::Eq,
                 range_match,
                 RangeOptions::new().with_to_t(to_t),
+                Some(&ctx.tracker),
             )
             .await?;
             for flake in flakes {
@@ -228,8 +245,7 @@ impl ShortestPathOperator {
                 out.push(flake.s);
             }
         }
-
-        Ok(out)
+        Ok(())
     }
 
     /// Post-hoc predicate lookup for one hop of a *wildcard* path: the first
@@ -241,23 +257,25 @@ impl ShortestPathOperator {
         a: &Sid,
         b: &Sid,
     ) -> Result<Option<Sid>> {
-        let (db, overlay, to_t) = ctx.require_single_graph()?;
-        let flakes = range_with_overlay(
-            db,
-            ctx.binary_g_id,
-            overlay,
-            IndexType::Spot,
-            RangeTest::Eq,
-            RangeMatch::new().with_subject(a.clone()),
-            RangeOptions::new().with_to_t(to_t),
-        )
-        .await?;
-        for flake in flakes {
-            if crate::property_path::is_reserved_edge_predicate(&flake.p) {
-                continue;
-            }
-            if matches!(&flake.o, FlakeValue::Ref(o) if o == b) {
-                return Ok(Some(flake.p));
+        for graph in ctx.path_graphs()? {
+            let flakes = range_with_overlay_tracked(
+                graph.snapshot,
+                graph.g_id,
+                graph.overlay,
+                IndexType::Spot,
+                RangeTest::Eq,
+                RangeMatch::new().with_subject(a.clone()),
+                RangeOptions::new().with_to_t(graph.to_t),
+                Some(&ctx.tracker),
+            )
+            .await?;
+            for flake in flakes {
+                if crate::property_path::is_reserved_edge_predicate(&flake.p) {
+                    continue;
+                }
+                if matches!(&flake.o, FlakeValue::Ref(o) if o == b) {
+                    return Ok(Some(flake.p));
+                }
             }
         }
         Ok(None)
@@ -513,7 +531,12 @@ impl ShortestPathOperator {
         if self.pattern.node_filter.is_some() {
             return Ok(None);
         }
-        let (_db, overlay, to_t) = ctx.require_single_graph()?;
+        // The raw-id lane reads a single graph's index.
+        let graphs = ctx.path_graphs()?;
+        let [graph] = graphs.as_slice() else {
+            return Ok(None);
+        };
+        let (overlay, to_t) = (graph.overlay, graph.to_t);
         let Some(dirty) = overlay_dirty_ids(overlay, ctx.binary_g_id, store) else {
             return Ok(None);
         };
@@ -541,6 +564,7 @@ impl ShortestPathOperator {
                 g_id,
                 to_t,
                 dirty,
+                tracker: ctx.tracker.clone(),
             },
             reserved_pids,
             typed_pid,

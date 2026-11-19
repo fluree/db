@@ -31,6 +31,15 @@ pub const FIELD_FILE_PATH: &str = "https://ns.flur.ee/system#filePath";
 /// AES-256 key field for file-based storage (optional)
 pub const FIELD_AES256_KEY: &str = "https://ns.flur.ee/system#AES256Key";
 
+/// A list of keyed AES-256 keys (`keyId` + `AES256Key` per node) for rotation
+pub const FIELD_AES256_KEYS: &str = "https://ns.flur.ee/system#AES256Keys";
+
+/// Which entry of `AES256Keys` encrypts new writes
+pub const FIELD_AES256_CURRENT_KEY: &str = "https://ns.flur.ee/system#AES256CurrentKey";
+
+/// Numeric id of one entry in `AES256Keys`; recorded in every envelope header
+pub const FIELD_KEY_ID: &str = "https://ns.flur.ee/system#keyId";
+
 /// Durability mode for file-based storage: `sync` or `page-cache` (optional)
 pub const FIELD_DURABILITY: &str = "https://ns.flur.ee/system#durability";
 
@@ -72,6 +81,10 @@ pub const FIELD_S3_MAX_CONCURRENT_REQUESTS: &str =
 /// `fluree:{addressIdentifier}:s3://...`.
 pub const FIELD_ADDRESS_IDENTIFIER: &str = "https://ns.flur.ee/system#addressIdentifier";
 
+/// IPFS API URL. Recognized only to reject it: IPFS storage is reachable
+/// through the Rust API alone.
+pub const FIELD_IPFS_API_URL: &str = "https://ns.flur.ee/system#ipfsApiUrl";
+
 // ConfigurationValue fields
 
 /// Environment variable name for ConfigurationValue
@@ -90,6 +103,9 @@ pub const FIELD_PARALLELISM: &str = "https://ns.flur.ee/system#parallelism";
 
 /// Maximum cache size in megabytes
 pub const FIELD_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#cacheMaxMb";
+
+/// Query-result cache ceiling in megabytes, in addition to `cacheMaxMb`
+pub const FIELD_QUERY_RESULT_CACHE_MAX_MB: &str = "https://ns.flur.ee/system#queryResultCacheMaxMb";
 
 /// Index storage reference
 pub const FIELD_INDEX_STORAGE: &str = "https://ns.flur.ee/system#indexStorage";
@@ -132,3 +148,4 @@ pub const FIELD_MAX_OLD_INDEXES: &str = "https://ns.flur.ee/system#maxOldIndexes
 pub const FIELD_INDEXING_ENABLED: &str = "https://ns.flur.ee/system#indexingEnabled";
 pub const FIELD_TRACK_CLASS_STATS: &str = "https://ns.flur.ee/system#trackClassStats";
 pub const FIELD_GC_MIN_TIME_MINS: &str = "https://ns.flur.ee/system#gcMinTimeMins";
+pub const FIELD_GC_HARD_MAX_OLD_INDEXES: &str = "https://ns.flur.ee/system#gcHardMaxOldIndexes";

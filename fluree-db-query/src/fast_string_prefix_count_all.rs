@@ -84,12 +84,7 @@ fn prefix_match_count(ctx: &ExecutionContext<'_>, pred: &Ref, prefix: &str) -> R
     // `ExecutionContext` usually carries an overlay provider even when there
     // is no novelty (`NoOverlay` has epoch 0), so only fall back when the
     // overlay actually contains delta rows.
-    if ctx
-        .overlay
-        .map(fluree_db_core::OverlayProvider::epoch)
-        .unwrap_or(0)
-        != 0
-    {
+    if crate::fast_path_common::overlay_has_novelty(ctx) {
         return Ok(None);
     }
     if !store.lex_sorted_string_ids() {
@@ -108,7 +103,15 @@ fn prefix_match_count(ctx: &ExecutionContext<'_>, pred: &Ref, prefix: &str) -> R
     let Ok(id_ranges) = contiguous_id_range(&string_ids) else {
         return Ok(None);
     };
-    count_prefix_rows_opst(store, ctx.binary_g_id, p_id, &id_ranges, ctx.to_t).map(Some)
+    count_prefix_rows_opst(
+        store,
+        ctx.binary_g_id,
+        p_id,
+        &id_ranges,
+        ctx.to_t,
+        &ctx.tracker,
+    )
+    .map(Some)
 }
 
 fn count_prefix_rows_opst(
@@ -117,6 +120,7 @@ fn count_prefix_rows_opst(
     p_id: u32,
     id_ranges: &[(u32, u32)],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<u64> {
     let projection = ColumnProjection {
         output: ColumnSet::EMPTY,
@@ -155,7 +159,7 @@ fn count_prefix_rows_opst(
                 o_type: Some(o_type),
                 ..Default::default()
             };
-            let Some(mut cursor) = build_range_cursor(
+            let Some(cursor) = build_range_cursor(
                 store,
                 g_id,
                 RunSortOrder::Opst,
@@ -166,11 +170,12 @@ fn count_prefix_rows_opst(
             ) else {
                 return Ok(total);
             };
+            let mut cursor = cursor.with_tracker(tracker.clone());
             cursor.set_to_t(to_t);
 
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(format!("binary cursor: {e}")))?
+                .map_err(|e| QueryError::from_io("binary cursor", e))?
             {
                 let mut batch_matches = 0u64;
                 for row_idx in 0..batch.row_count {

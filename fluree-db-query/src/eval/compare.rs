@@ -379,7 +379,7 @@ impl CompareOp {
         row: &R,
         ctx: Option<&ExecutionContext<'_>>,
     ) -> Result<Option<ComparableValue>> {
-        check_min_arity(args, 1, &self.to_string())?;
+        check_min_arity(args, 1, self.symbol())?;
 
         if let Some(b) = fast_eq_ne_for_iri_bindings(*self, args, row, ctx)? {
             return Ok(Some(ComparableValue::Bool(b)));
@@ -425,8 +425,9 @@ impl CompareOp {
                     }
                 },
                 _ => match cmp_values(&prev, &curr) {
-                    Some(ord) => self.satisfies(ord),
-                    None => {
+                    ValueOrder::Ordered(ord) => self.satisfies(ord),
+                    ValueOrder::Unordered => false,
+                    ValueOrder::Incomparable => {
                         return Err(ComparisonError::TypeMismatch {
                             operator: self.symbol(),
                             left_type: prev.type_name(),
@@ -447,23 +448,55 @@ impl CompareOp {
     }
 }
 
-/// Compare two values and return their ordering.
-///
-/// Returns `None` for type mismatches (incomparable types).
+/// How two values relate under the SPARQL comparison operators.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValueOrder {
+    /// Comparable, with this ordering.
+    Ordered(Ordering),
+    /// Two numbers, at least one of them NaN. XPath's numeric comparisons
+    /// return false whenever an operand is NaN (F&O 3.1 §4.3), so `=`, `<`,
+    /// `>`, `<=` and `>=` are all false and `!=` is true (SPARQL 1.1 §17.3).
+    /// A false comparison, not a type error.
+    Unordered,
+    /// Not comparable: a type error.
+    Incomparable,
+}
+
+/// Compare two values for the ordering operators (`<`, `<=`, `>`, `>=`).
 /// Delegates to FlakeValue's comparison methods for numeric and temporal types.
-fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> Option<Ordering> {
+fn cmp_values(left: &ComparableValue, right: &ComparableValue) -> ValueOrder {
     cmp_values_inner(left, right, true)
 }
 
-/// Ordering of two comparable values. `temporal_string_coerce` enables parsing
-/// a plain string as a temporal to order it against a typed temporal (a LEX_ID
-/// storage aid, used for `<`/`>`); it is disabled for `=`/`!=`, where a plain
-/// string is never value-equal to a temporal (eq-dateTime).
+/// Whether `v`, when its value is a string (`fv`), is a plain string term: a
+/// simple literal or `xsd:string`, the one kind of string a temporal orders
+/// against. A language-tagged, custom-typed, `@fulltext` or JSON literal, and
+/// an IRI, are not. True for every non-string value.
+fn plain_if_string(v: &ComparableValue, fv: &FlakeValue) -> bool {
+    use crate::parse::UnresolvedDatatypeConstraint as U;
+    if !matches!(fv, FlakeValue::String(_)) {
+        return true;
+    }
+    match v {
+        ComparableValue::String(_) => true,
+        ComparableValue::TypedLiteral { dtc: None, .. } => true,
+        ComparableValue::TypedLiteral {
+            dtc: Some(U::Explicit(iri)),
+            ..
+        } => iri.as_ref() == fluree_vocab::xsd::STRING,
+        _ => false,
+    }
+}
+
+/// Ordering of two comparable values. `temporal_string_coerce` enables reading
+/// a plain string as a temporal to order it against a typed temporal (used for
+/// `<`/`>`); it is disabled for `=`/`!=`, where a plain string is never
+/// value-equal to a temporal (eq-dateTime).
 fn cmp_values_inner(
     left: &ComparableValue,
     right: &ComparableValue,
     temporal_string_coerce: bool,
-) -> Option<Ordering> {
+) -> ValueOrder {
     // Normalize numeric values carried as a `TypedLiteral` (e.g. xsd:float, whose
     // value is stored string-backed) into their primitive numeric variant so the
     // numeric comparison below applies — mirroring arithmetic's operand coercion.
@@ -482,33 +515,44 @@ fn cmp_values_inner(
     let left_fv: FlakeValue = left.into();
     let right_fv: FlakeValue = right.into();
 
-    // Try numeric comparison first (handles all numeric cross-type comparisons)
-    if let Some(ordering) = left_fv.numeric_cmp(&right_fv) {
-        return Some(ordering);
+    // Numeric comparison first (handles all numeric cross-type comparisons).
+    if left_fv.is_numeric() && right_fv.is_numeric() {
+        let is_nan = |v: &FlakeValue| matches!(v, FlakeValue::Double(d) if d.is_nan());
+        return match left_fv.numeric_cmp(&right_fv) {
+            Some(ordering) => ValueOrder::Ordered(ordering),
+            None if is_nan(&left_fv) || is_nan(&right_fv) => ValueOrder::Unordered,
+            None => ValueOrder::Incomparable,
+        };
     }
 
     // Try temporal comparison (same-type temporal only)
     if let Some(ordering) = left_fv.temporal_cmp(&right_fv) {
-        return Some(ordering);
+        return ValueOrder::Ordered(ordering);
     }
 
     // Cross-type coercion: when one side is a temporal type and the other is a
-    // string, try to parse the string as that temporal type (ordering only).
-    if temporal_string_coerce {
-        if let Some(ordering) = try_coerce_temporal_string_cmp(&left_fv, &right_fv) {
-            return Some(ordering);
+    // plain string, read the string as a value of that temporal type
+    // (ordering only). A tagged or otherwise-typed literal is a term of its
+    // own type and is not read as a temporal.
+    if temporal_string_coerce
+        && plain_if_string(left, &left_fv)
+        && plain_if_string(right, &right_fv)
+    {
+        if let Some(ordering) = fluree_db_core::temporal::cmp_with_lexical(&left_fv, &right_fv) {
+            return ValueOrder::Ordered(ordering);
         }
     }
 
     // Fall back to same-type comparisons for non-numeric, non-temporal types
-    match (left, right) {
-        (ComparableValue::String(a), ComparableValue::String(b)) => Some(a.cmp(b)),
-        (ComparableValue::Bool(a), ComparableValue::Bool(b)) => Some(a.cmp(b)),
-        (ComparableValue::Sid(a), ComparableValue::Sid(b)) => Some(a.cmp(b)),
-        (ComparableValue::Iri(a), ComparableValue::Iri(b)) => Some(a.cmp(b)),
+    let ordering = match (left, right) {
+        (ComparableValue::String(a), ComparableValue::String(b)) => a.cmp(b),
+        (ComparableValue::Bool(a), ComparableValue::Bool(b)) => a.cmp(b),
+        (ComparableValue::Sid(a), ComparableValue::Sid(b)) => a.cmp(b),
+        (ComparableValue::Iri(a), ComparableValue::Iri(b)) => a.cmp(b),
         // Type mismatch
-        _ => None,
-    }
+        _ => return ValueOrder::Incomparable,
+    };
+    ValueOrder::Ordered(ordering)
 }
 
 /// Outcome of RDFterm-equal (`=` / `!=`).
@@ -623,33 +667,20 @@ pub(crate) fn rdf_term_equal_in(
 /// operator mapping. Returns a three-valued outcome so an incomparable pair is
 /// a type error (excluding the row) rather than silently `false`/`true`.
 pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutcome {
-    // XPath op:numeric-equal (F&O §4.2.3): NaN is not equal to anything,
-    // including itself — `NaN = NaN` is false and `NaN != NaN` is true. The
-    // numeric fast path below bottoms out in `numeric_cmp`'s bit-level total
-    // order (wanted for ORDER BY stability), which reports two identical-bit
-    // NaNs as Equal, so the equality entry point must catch NaN first. Scoped
-    // to numeric-vs-numeric so NaN vs an unrecognized-datatype literal still
-    // reaches the TypeError arm below. (A NaN hidden in a string-backed
-    // `TypedLiteral` — `STRDT("NaN", xsd:double)` — still takes the coercing
-    // fast path; accepted corner.)
-    let is_nan = |v: &ComparableValue| {
-        matches!(v, ComparableValue::Double(d) if d.is_nan())
-            || matches!(v, ComparableValue::Float(f) if f.is_nan())
-    };
-    if (is_nan(a) || is_nan(b)) && eq_kind(a) == EqKind::Numeric && eq_kind(b) == EqKind::Numeric {
-        return EqOutcome::Ne;
-    }
     // Value-comparable fast path: numeric promotion, string, boolean, temporal.
     // No plain-string↔temporal coercion (equality, not ordering).
-    if let Some(ord) = cmp_values_inner(a, b, false) {
-        return if ord == Ordering::Equal {
-            EqOutcome::Eq
-        } else {
-            EqOutcome::Ne
-        };
+    match cmp_values_inner(a, b, false) {
+        ValueOrder::Ordered(Ordering::Equal) => return EqOutcome::Eq,
+        ValueOrder::Ordered(_) => return EqOutcome::Ne,
+        // XPath op:numeric-equal (F&O 3.1 §4.3.1): NaN equals nothing, itself
+        // included, so `NaN = NaN` is false and `NaN != NaN` is true. Also
+        // for a NaN carried by a string-backed literal (`xsd:float`, `STRDT`),
+        // which `cmp_values_inner` coerces to a number first.
+        ValueOrder::Unordered => return EqOutcome::Ne,
+        ValueOrder::Incomparable => {}
     }
     // Same term (reflexivity): equal even for ill-typed / unrecognized literals.
-    if a == b {
+    if a == b || super::value::same_json_term(a, b) {
         return EqOutcome::Eq;
     }
     match (eq_kind(a), eq_kind(b)) {
@@ -672,71 +703,6 @@ pub(crate) fn rdf_term_equal(a: &ComparableValue, b: &ComparableValue) -> EqOutc
         // Otherwise at least one operand has an unrecognized / ill-typed datatype
         // that might still denote the same value → type error.
         _ => EqOutcome::TypeError,
-    }
-}
-
-/// Try to compare a temporal FlakeValue against a String by parsing the
-/// string as the matching temporal type. Returns `None` if neither side is
-/// a string or parsing fails.
-///
-/// This handles values stored as LEX_ID (string dict entry) with a temporal
-/// datatype annotation — the index stores the raw string but the FILTER
-/// constant is a properly-typed temporal value.
-fn try_coerce_temporal_string_cmp(left: &FlakeValue, right: &FlakeValue) -> Option<Ordering> {
-    use fluree_db_core::temporal;
-
-    match (left, right) {
-        // String on left, temporal on right → parse left as temporal
-        (FlakeValue::String(s), FlakeValue::GYear(g)) => temporal::GYear::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GYearMonth(g)) => temporal::GYearMonth::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GMonth(g)) => temporal::GMonth::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GDay(g)) => temporal::GDay::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::GMonthDay(g)) => temporal::GMonthDay::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(g.as_ref())),
-        (FlakeValue::String(s), FlakeValue::DateTime(dt)) => temporal::DateTime::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(dt.as_ref())),
-        (FlakeValue::String(s), FlakeValue::Date(d)) => temporal::Date::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(d.as_ref())),
-        (FlakeValue::String(s), FlakeValue::Time(t)) => temporal::Time::parse(s)
-            .ok()
-            .map(|parsed| parsed.cmp(t.as_ref())),
-        // Temporal on left, string on right → parse right as temporal
-        (FlakeValue::GYear(g), FlakeValue::String(s)) => temporal::GYear::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GYearMonth(g), FlakeValue::String(s)) => temporal::GYearMonth::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GMonth(g), FlakeValue::String(s)) => temporal::GMonth::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GDay(g), FlakeValue::String(s)) => temporal::GDay::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::GMonthDay(g), FlakeValue::String(s)) => temporal::GMonthDay::parse(s)
-            .ok()
-            .map(|parsed| g.as_ref().cmp(&parsed)),
-        (FlakeValue::DateTime(dt), FlakeValue::String(s)) => temporal::DateTime::parse(s)
-            .ok()
-            .map(|parsed| dt.as_ref().cmp(&parsed)),
-        (FlakeValue::Date(d), FlakeValue::String(s)) => temporal::Date::parse(s)
-            .ok()
-            .map(|parsed| d.as_ref().cmp(&parsed)),
-        (FlakeValue::Time(t), FlakeValue::String(s)) => temporal::Time::parse(s)
-            .ok()
-            .map(|parsed| t.as_ref().cmp(&parsed)),
-        _ => None,
     }
 }
 
@@ -793,30 +759,28 @@ mod tests {
     fn test_cmp_longs() {
         let a = ComparableValue::Long(10);
         let b = ComparableValue::Long(20);
-        assert_eq!(cmp_values(&a, &b), Some(Ordering::Less));
-        assert_eq!(cmp_values(&b, &a), Some(Ordering::Greater));
-        assert_eq!(cmp_values(&a, &a), Some(Ordering::Equal));
+        assert_eq!(cmp_values(&a, &b), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&b, &a), ValueOrder::Ordered(Ordering::Greater));
+        assert_eq!(cmp_values(&a, &a), ValueOrder::Ordered(Ordering::Equal));
     }
 
     #[test]
     fn test_cmp_strings() {
         let a = ComparableValue::String(Arc::from("alpha"));
         let b = ComparableValue::String(Arc::from("beta"));
-        assert_eq!(cmp_values(&a, &b), Some(Ordering::Less));
-        assert_eq!(cmp_values(&a, &a), Some(Ordering::Equal));
+        assert_eq!(cmp_values(&a, &b), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&a, &a), ValueOrder::Ordered(Ordering::Equal));
     }
 
     #[test]
     fn test_type_mismatch() {
         let long = ComparableValue::Long(10);
         let string = ComparableValue::String(Arc::from("10"));
-        // Type mismatch returns None
-        assert_eq!(cmp_values(&long, &string), None);
+        assert_eq!(cmp_values(&long, &string), ValueOrder::Incomparable);
     }
 
     // XPath op:numeric-equal: NaN is never equal, including to itself; `!=`
-    // is therefore true. numeric_cmp's bit-level total order (kept for ORDER
-    // BY) would otherwise report identical-bit NaNs as Equal.
+    // is therefore true.
     #[test]
     fn test_rdf_term_equal_nan_is_never_equal() {
         let d_nan = ComparableValue::Double(f64::NAN);
@@ -833,14 +797,36 @@ mod tests {
         );
     }
 
-    // The NaN carve-out is equality-only: the ORDER BY total order still
-    // places identical-bit NaNs as Equal (stability), and NaN vs a
-    // non-numeric operand keeps its existing outcome (recognized pair → Ne
-    // via the kind table; unrecognized-datatype literal stays a TypeError).
+    // A NaN among two numbers is unordered (every `<`, `>`, `<=`, `>=` is
+    // false, not a type error, F&O 3.1 §4.3.2), and +/-INF order around every
+    // other number. NaN vs a non-numeric operand keeps its outcome:
+    // a recognized pair is Ne via the kind table, and an
+    // unrecognized-datatype literal stays a TypeError.
     #[test]
-    fn test_nan_scope_is_equality_only() {
+    fn test_nan_is_unordered_among_numbers() {
         let d_nan = ComparableValue::Double(f64::NAN);
-        assert_eq!(cmp_values(&d_nan, &d_nan), Some(Ordering::Equal));
+        let one = ComparableValue::Long(1);
+        let inf = ComparableValue::Double(f64::INFINITY);
+        let ninf = ComparableValue::Double(f64::NEG_INFINITY);
+        assert_eq!(cmp_values(&d_nan, &d_nan), ValueOrder::Unordered);
+        assert_eq!(cmp_values(&d_nan, &one), ValueOrder::Unordered);
+        assert_eq!(cmp_values(&inf, &d_nan), ValueOrder::Unordered);
+        assert_eq!(
+            cmp_values(&inf, &one),
+            ValueOrder::Ordered(Ordering::Greater)
+        );
+        assert_eq!(cmp_values(&ninf, &one), ValueOrder::Ordered(Ordering::Less));
+        assert_eq!(cmp_values(&inf, &inf), ValueOrder::Ordered(Ordering::Equal));
+        assert_eq!(cmp_values(&ninf, &inf), ValueOrder::Ordered(Ordering::Less));
+        // A NaN carried by a string-backed float literal is a NaN too.
+        let float_nan = ComparableValue::TypedLiteral {
+            val: FlakeValue::String("NaN".to_string()),
+            dtc: Some(crate::parse::UnresolvedDatatypeConstraint::Explicit(
+                Arc::from(fluree_vocab::xsd::FLOAT),
+            )),
+        };
+        assert_eq!(cmp_values(&float_nan, &one), ValueOrder::Unordered);
+        assert_eq!(rdf_term_equal(&float_nan, &float_nan), EqOutcome::Ne);
         let s = ComparableValue::String(Arc::from("NaN"));
         assert_eq!(rdf_term_equal(&d_nan, &s), EqOutcome::Ne);
         let foreign = ComparableValue::TypedLiteral {

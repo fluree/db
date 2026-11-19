@@ -139,3 +139,62 @@ pub fn attach_binary_provider(state: &mut LedgerState, store: Arc<BinaryIndexSto
     ));
     Arc::make_mut(&mut state.snapshot).range_provider = Some(provider);
 }
+
+/// The graphs `store` still indexes that a drop after its `max_t` took: what
+/// it holds of them is no longer visible. Empty on every ledger that never
+/// dropped a graph, and once an index build past the drop purged them.
+pub fn graphs_to_hide(
+    store: &BinaryIndexStore,
+    registry: &fluree_db_core::GraphRegistry,
+) -> Vec<fluree_db_core::GraphId> {
+    if !registry.has_drops() {
+        return Vec::new();
+    }
+    registry
+        .dropped_after(store.max_t())
+        .into_iter()
+        .filter(|g_id| store.has_graph_index(*g_id))
+        .collect()
+}
+
+/// `store` less the graphs [`graphs_to_hide`] names, for a store about to be
+/// attached to a ledger whose registry is `registry`.
+pub fn store_without_dropped_graphs(
+    store: BinaryIndexStore,
+    registry: &fluree_db_core::GraphRegistry,
+) -> BinaryIndexStore {
+    let hidden = graphs_to_hide(&store, registry);
+    if hidden.is_empty() {
+        store
+    } else {
+        store.without_graphs(&hidden)
+    }
+}
+
+/// Make `state` read the graphs a drop took after its index's `max_t` from
+/// novelty alone, by swapping in a store without them
+/// ([`BinaryIndexStore::without_graphs`]) for the range provider and
+/// `binary_store` both. Call after anything that applies a commit's drops or
+/// attaches a store; a no-op when there is nothing to hide. Returns whether
+/// it swapped the store, which a holder of the store elsewhere then follows.
+pub fn hide_dropped_graphs(state: &mut LedgerState) -> bool {
+    let Some(brp) = provider_of(state) else {
+        return false;
+    };
+    let hidden = graphs_to_hide(brp.store(), &state.snapshot.graph_registry);
+    if hidden.is_empty() {
+        return false;
+    }
+    let masked = Arc::new(brp.store().without_graphs(&hidden));
+    let provider = Arc::new(BinaryRangeProvider::new(
+        Arc::clone(&masked),
+        Arc::clone(brp.dict_novelty()),
+        Arc::clone(brp.runtime_small_dicts()),
+        Some(state.snapshot.shared_namespaces()),
+    ));
+    Arc::make_mut(&mut state.snapshot).range_provider = Some(provider);
+    if state.binary_store.is_some() {
+        state.binary_store = Some(fluree_db_ledger::TypeErasedStore(masked));
+    }
+    true
+}

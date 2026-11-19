@@ -947,10 +947,13 @@ async fn sparql_order_by_expression_count_by_predicate_not_dropped() {
 }
 
 #[tokio::test]
-async fn sparql_order_by_expression_over_grouped_var_errors_cleanly() {
+async fn sparql_order_by_expression_over_non_key_var_reads_a_sample() {
     // Regression (P1b): an aggregating query whose ORDER BY expression reads a
-    // variable that is neither a GROUP BY key nor an aggregate output must be
-    // rejected with a clean error — NOT panic on a Grouped binding.
+    // variable that is neither a GROUP BY key nor an aggregate output must not
+    // panic on a Grouped binding. It used to be rejected; SPARQL 1.1 §18.2.4.1
+    // gives it a meaning — the ORDER BY reads SAMPLE(?favNum) — so it now runs
+    // (which value SAMPLE picks is implementation-defined, so only the groups
+    // are asserted, not their order).
     assert_index_defaults();
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger = seed_people(&fluree, "people:main").await;
@@ -966,10 +969,13 @@ async fn sparql_order_by_expression_over_grouped_var_errors_cleanly() {
         ORDER BY (?favNum + 1)
     ";
 
-    let result = support::query_sparql(&fluree, &ledger, query).await;
-    assert!(
-        result.is_err(),
-        "ORDER BY over a non-grouped variable should error, got: {result:?}"
+    let result = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("ORDER BY over a non-key variable reads a sample of it");
+    let rows = result.to_jsonld(&ledger.snapshot).expect("to_jsonld");
+    assert_eq!(
+        normalize_rows(&rows),
+        normalize_rows(&json!([["bbob", 1], ["jbob", 7], ["jdoe", 4]]))
     );
 }
 
@@ -1572,6 +1578,51 @@ ex:cart ex:has [ rdfs:label "Apple" ; ex:qty 3 ] , [ rdfs:label "Pear" ; ex:qty 
         normalize_rows(&json!([["Apple"]])),
         "subject-position blank-node property list must bind and join"
     );
+}
+
+#[tokio::test]
+async fn sparql_anonymous_subject_is_one_node_across_lists() {
+    // A `;` or `,` list copies its `[]` subject into each triple; every copy
+    // is the one node, so only a subject with the whole list matches. `[]`
+    // stays out of `SELECT *`.
+    assert_index_defaults();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "anon-list:main");
+    let ttl = r#"@prefix ex: <http://example.org/> .
+ex:a ex:p "one" ; ex:r ex:x .
+ex:b ex:q "two" ; ex:r ex:y .
+ex:c ex:p "three" ; ex:q "four" ; ex:r ex:x , ex:y .
+"#;
+    let ledger = fluree
+        .insert_turtle(ledger0, ttl)
+        .await
+        .expect("insert turtle")
+        .ledger;
+    for (q, expected) in [
+        (
+            "SELECT ?o ?z WHERE { [] ex:p ?o ; ex:q ?z }",
+            json!([["three", "four"]]),
+        ),
+        (
+            "SELECT * WHERE { [] ex:p ?o ; ex:q ?z }",
+            json!([{"?o": "three", "?z": "four"}]),
+        ),
+        (
+            "SELECT (COUNT(*) AS ?n) WHERE { [] ex:r ex:x , ex:y }",
+            json!([[1]]),
+        ),
+    ] {
+        let jsonld = support::query_sparql(
+            &fluree,
+            &ledger,
+            &format!("PREFIX ex: <http://example.org/> {q}"),
+        )
+        .await
+        .unwrap()
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+        assert_eq!(normalize_rows(&jsonld), normalize_rows(&expected), "{q}");
+    }
 }
 
 #[tokio::test]

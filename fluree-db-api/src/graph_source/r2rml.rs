@@ -7,11 +7,11 @@
 
 use super::lazy_storage::LazyS3Storage;
 use crate::graph_source::cache::{CachedScanFiles, R2rmlCache};
-use crate::graph_source::config::{CatalogMode, IcebergCreateConfig, R2rmlCreateConfig};
-use crate::graph_source::iceberg_catalog::{
-    decide_credential_source, storage_query_error, CredentialSource,
-};
-use crate::graph_source::result::{IcebergCreateResult, R2rmlCreateResult};
+use crate::graph_source::config::R2rmlCreateConfig;
+use crate::graph_source::iceberg_catalog::storage_query_error;
+use crate::graph_source::iceberg_validate::{keyless_map_diagnostics, KeyRemedy, QueryTables};
+use crate::graph_source::result::{ConnectionCheck, R2rmlCreateResult};
+use crate::graph_source::storage::{plan_storage, CatalogGrant, StoragePlan};
 use crate::Result;
 use async_trait::async_trait;
 use fluree_db_core::ContentStore;
@@ -20,15 +20,15 @@ use fluree_db_iceberg::{
     catalog::{
         LoadTableResponse, RestCatalogClient, RestCatalogConfig, SendCatalogClient, TableIdentifier,
     },
-    config::IoConfig,
     io::{
-        ColumnBatch, FileIcebergStorage, IcebergStorageBackend, S3IcebergStorage,
-        SendIcebergStorage, SendParquetReader,
+        ColumnBatch, FileIcebergStorage, IcebergStorageBackend, SendIcebergStorage,
+        SendParquetReader, StorageScope,
     },
-    metadata::{TableMetadata, WindowCap},
+    metadata::{SnapshotSelection, TableMetadata, WindowCap},
     scan::{
-        topk::{batch_sort_values, plan_topk_read, TopKBound},
-        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, SendScanPlanner,
+        topk::{batch_sort_values_where, plan_topk_read, TopKBound},
+        ComparisonOp, Expression, FileScanTask, LiteralValue, ScanConfig, ScanPlan,
+        SendScanPlanner,
     },
     stats::{aggregate_column_stats, send_read_snapshot_data_files},
     DeleteConvention, IcebergGsConfig,
@@ -36,12 +36,14 @@ use fluree_db_iceberg::{
 use fluree_db_nameservice::GraphSourceType;
 use fluree_db_query::error::{QueryError, Result as QueryResult};
 use fluree_db_query::r2rml::{
-    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFilter, ScanTopK,
-    ScanValue,
+    ColumnBatchStream, R2rmlProvider, R2rmlTableProvider, ScanCmpOp, ScanFileCounts, ScanFilter,
+    ScanOrder, ScanTopK, ScanValue, SourceTime, TermOrder,
 };
 use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
+use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn, Instrument};
 
 /// Max files a scan-side top-k (PR-5) reads SEQUENTIALLY (bound-ordered, with
@@ -86,19 +88,12 @@ fn iceberg_scan_concurrency(num_files: usize) -> usize {
     cpus.min(num_files.max(1)).clamp(1, 32)
 }
 
-/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
-/// catalog client cache. A config *edit* (including a secret written inline)
-/// yields a new fingerprint and a freshly built client. Note this hashes the raw
-/// JSON only: a secret referenced by env var / secret store is stored as that
-/// reference, so rotating the underlying secret leaves the fingerprint unchanged
-/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
-/// fingerprint, is what bounds staleness in that case.
-/// The R2RML mapping reference carried by a mapped graph-source record, per
-/// source family. `None` for a non-mapped type, an unparseable config, or a
-/// record registered without a mapping.
-/// The Iceberg-only paths (snapshot pinning, incremental materialization,
-/// tracking) parse the record as `IcebergGsConfig`; a SQL record would fail
-/// that parse with a misleading message. Refuse it by name instead.
+/// The Iceberg-only paths (materialization, tracking, the collecting
+/// incremental scan) parse the record as `IcebergGsConfig`; a SQL or Delta
+/// record would fail that parse with a misleading message. Refuse it by name
+/// instead. A Delta source is pinned and read whole before reaching these: see
+/// [`FlureeR2rmlProvider::current_snapshot_id`] and
+/// [`FlureeR2rmlProvider::scan_for_materialize_stream`].
 fn require_iceberg_backed(
     record: &fluree_db_nameservice::GraphSourceRecord,
     graph_source_id: &str,
@@ -111,23 +106,175 @@ fn require_iceberg_backed(
              live tables); query it directly instead"
         )));
     }
+    #[cfg(feature = "delta")]
+    if record.source_type == GraphSourceType::Delta {
+        return Err(QueryError::InvalidQuery(format!(
+            "Graph source '{graph_source_id}' is Delta-backed: materialization is not yet \
+             available for Delta graph sources; query it directly instead"
+        )));
+    }
     let _ = (record, graph_source_id);
     Ok(())
 }
 
+/// Refusal for an R2RML mapping that compiles to no `rr:TriplesMap`, naming the
+/// usual cause: the `rr:` prefix without its trailing `#` (or a misspelled
+/// class) parses as other triples, which the loader does not see as maps.
+pub(crate) const EMPTY_MAPPING: &str =
+    "the R2RML mapping defines no rr:TriplesMap; check that the rr: prefix is \
+     http://www.w3.org/ns/r2rml# (with the trailing #) and each map is typed rr:TriplesMap";
+
+/// Whether a failed catalog-mode table load carries evidence that the catalog
+/// answered: a refusal (the typed catalog and storage denials), the catalog
+/// saying it has no such table, or any other HTTP status from a REST catalog.
+/// Without such evidence (a refused connection, a DNS or TLS failure, a
+/// timeout, a client error, a Glue or S3 Tables call that failed without a
+/// typed answer) the catalog is taken not to have answered. This keys on the
+/// text `IcebergError::TableNotFound` and the REST client's status message
+/// render with, because both reach registration as an untyped
+/// [`QueryError::Internal`]; `catalog_answer_classification` pins it to the
+/// errors the real conversions produce.
+pub(crate) fn catalog_answered(error: &QueryError) -> bool {
+    match error {
+        QueryError::CatalogAccessDenied { .. }
+        | QueryError::CatalogCredentialsNotVended { .. }
+        | QueryError::StorageAccessDenied { .. } => true,
+        QueryError::Internal(message) => {
+            message.contains(TABLE_NOT_FOUND_TEXT) || message.contains(CATALOG_STATUS_TEXT)
+        }
+        _ => false,
+    }
+}
+
+/// How `IcebergError::TableNotFound` renders: the REST catalog's 404, and Glue
+/// and S3 Tables' not-found codes.
+const TABLE_NOT_FOUND_TEXT: &str = "Table not found: ";
+/// How the REST catalog client renders any other non-success HTTP status.
+const CATALOG_STATUS_TEXT: &str = "Catalog request failed (";
+
+/// A source's configuration as its nameservice record stores it: the JSON,
+/// which keys the shared catalog client and the caches that outlive a query,
+/// and its parsed form. Registration loads a source's tables from the
+/// configuration it is about to publish; a query, from the record.
+#[derive(Clone, Copy)]
+pub(crate) struct SourceConfig<'c> {
+    pub(crate) json: &'c str,
+    pub(crate) iceberg: &'c IcebergGsConfig,
+}
+
+/// What loading a source's tables at registration found: the outcome
+/// reported to the caller, and the metadata of each table that loaded.
+pub(crate) struct TableProbe {
+    pub(crate) check: ConnectionCheck,
+    pub(crate) loaded: HashMap<String, Arc<TableMetadata>>,
+}
+
+/// Refuse a mapping an `rr:sqlQuery` map of which its `FROM` table refuses:
+/// [`check_query_map`](super::row_filter::check_query_map) against the schema
+/// an unpinned read of the table reads now. A table that did not load is
+/// left to the read, which checks again (as it does for every read, since a
+/// table can change after registration).
+fn check_query_maps_against_tables(
+    compiled: &CompiledR2rmlMapping,
+    loaded: &HashMap<String, Arc<TableMetadata>>,
+) -> Result<()> {
+    use super::row_filter::{check_query_map, query_maps};
+    for tm in query_maps(compiled) {
+        // Its checks that need no schema passed before anything was stored.
+        let Ok(Some(select)) = check_query_map(compiled, tm, None) else {
+            continue;
+        };
+        let Some(metadata) = loaded.get(&select.table) else {
+            continue;
+        };
+        let Some(schema) = unpinned_read_schema(metadata) else {
+            continue;
+        };
+        check_query_map(compiled, tm, Some(schema.as_ref()))
+            .map_err(|refusal| crate::ApiError::Config(refusal.message))?;
+    }
+    Ok(())
+}
+
+/// The schema an unpinned read of a table reads: its current snapshot's, under
+/// current column names, or the current schema when it has no snapshot.
+/// Registration and the validate dry-run check a row filter against it.
+pub(crate) fn unpinned_read_schema(
+    metadata: &TableMetadata,
+) -> Option<std::borrow::Cow<'_, fluree_db_iceberg::metadata::Schema>> {
+    match metadata.current_snapshot() {
+        Some(snapshot) => metadata.read_schema_for_snapshot(snapshot),
+        None => metadata.current_schema().map(std::borrow::Cow::Borrowed),
+    }
+}
+
+/// How long registration spends loading a new source's tables. A map request
+/// can sit behind a gateway with its own deadline (API Gateway's is 29 s), and a
+/// mapping over a warehouse can name many tables, so past this the source is
+/// registered unverified rather than the request held open.
+pub(crate) const REGISTRATION_PROBE_BUDGET: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// The R2RML mapping reference carried by a mapped graph-source record, per
+/// source family. `None` for a non-mapped type, an unparseable config, or a
+/// record registered without a mapping.
 pub(crate) fn mapping_source_of(
     record: &fluree_db_nameservice::GraphSourceRecord,
 ) -> Option<fluree_db_iceberg::config::MappingSource> {
-    match record.source_type {
+    mapping_reference(record)
+        .and_then(std::result::Result::ok)
+        .flatten()
+}
+
+/// The mapping a live graph-source record answers queries from: `Ok(None)`
+/// for a record of no mapped family that is not refused below, which no
+/// R2RML probe serves.
+///
+/// A mapped record without a mapping (an Iceberg source stored before
+/// registration required one) is [`QueryError::GraphSourceUnmapped`], one of a
+/// family this build does not read (SQL without `sql`, Delta without `delta`)
+/// is [`QueryError::GraphSourceUnsupported`], an index source (BM25, vector,
+/// geo) is [`QueryError::GraphSourceNotAGraph`], and one whose config does not
+/// parse is an internal error. Read as `None`, any of them would send its query
+/// to the ledger lookup or to an empty genesis graph. The R2RML probe and the
+/// genesis-view resolver both decide here.
+pub(crate) fn served_mapping_of(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> QueryResult<Option<fluree_db_iceberg::config::MappingSource>> {
+    super::refuse_unservable(record)?;
+    let graph_source_id = record.graph_source_id.as_str();
+    match mapping_reference(record) {
+        None => Ok(None),
+        Some(Ok(Some(mapping))) => Ok(Some(mapping)),
+        Some(Ok(None)) => Err(QueryError::GraphSourceUnmapped {
+            graph_source_id: graph_source_id.to_string(),
+            empty_mapping: false,
+        }),
+        Some(Err(e)) => Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has a config that cannot be read: {e}"
+        ))),
+    }
+}
+
+/// The mapping reference of a mapped record, per source family, keeping a
+/// config that does not parse (`Some(Err)`) apart from one with no mapping
+/// (`Some(Ok(None))`). `None` when the record is not a mapped family this
+/// build reads.
+fn mapping_reference(
+    record: &fluree_db_nameservice::GraphSourceRecord,
+) -> Option<std::result::Result<Option<fluree_db_iceberg::config::MappingSource>, String>> {
+    Some(match record.source_type {
         GraphSourceType::R2rml | GraphSourceType::Iceberg => {
             IcebergGsConfig::from_json(&record.config)
-                .ok()
-                .and_then(|c| c.mapping)
+                .map(|c| c.mapping)
+                .map_err(|e| e.to_string())
         }
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::mapping_source(record),
-        _ => None,
-    }
+        #[cfg(feature = "delta")]
+        GraphSourceType::Delta => super::delta::mapping_source(record),
+        _ => return None,
+    })
 }
 
 /// The policy configuration a virtual source's record carries: its model
@@ -143,6 +290,8 @@ pub(crate) fn policy_config_of(
         }
         #[cfg(feature = "sql")]
         GraphSourceType::Sql => super::sql::policy_config(record),
+        #[cfg(feature = "delta")]
+        GraphSourceType::Delta => super::delta::policy_config(record),
         _ => (None, None),
     }
 }
@@ -185,19 +334,42 @@ pub(crate) fn source_resolved_config(
     })
 }
 
-/// An Iceberg-backed source scans tables, never queries: refuse a mapping with
+/// What a source family does with an `rr:sqlQuery` logical table, decided at
+/// registration so a mapping it cannot serve fails there, not at first query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SqlQueryPolicy {
+    /// The source's engine runs the query (a SQL graph source).
+    #[cfg_attr(not(feature = "sql"), allow(dead_code))]
+    Execute,
+    /// The source evaluates the restricted subset itself (Iceberg): one table
+    /// narrowed by a conjunction of column comparisons; see
+    /// [`super::row_filter`].
+    RestrictedSubset,
+    /// The source reads tables only (Delta).
+    #[cfg_attr(not(feature = "delta"), allow(dead_code))]
+    Refuse,
+}
+
+/// A Delta-backed source scans tables, never queries: refuse a mapping with
 /// `rr:sqlQuery` at registration rather than at first query.
-fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
+pub(crate) fn reject_sql_queries(compiled: &CompiledR2rmlMapping) -> Result<()> {
     if compiled.has_sql_queries() {
         return Err(crate::ApiError::Config(
-            "rr:sqlQuery logical tables are only supported by SQL graph sources; \
-             use rr:tableName for Iceberg-backed mappings"
+            "rr:sqlQuery logical tables are not supported by Delta graph sources; \
+             use rr:tableName"
                 .to_string(),
         ));
     }
     Ok(())
 }
 
+/// Stable hash of a graph source's raw config JSON. Keys the process-wide REST
+/// catalog client cache. A config *edit* (including a secret written inline)
+/// yields a new fingerprint and a freshly built client. Note this hashes the raw
+/// JSON only: a secret referenced by env var / secret store is stored as that
+/// reference, so rotating the underlying secret leaves the fingerprint unchanged
+/// — the client cache's TTL (see `cache::DEFAULT_REST_CLIENT_TTL_SECS`), not this
+/// fingerprint, is what bounds staleness in that case.
 fn config_fingerprint(config: &str) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -205,13 +377,146 @@ fn config_fingerprint(config: &str) -> u64 {
     h.finish()
 }
 
-/// Build the process-wide REST-client cache key for a graph source: its id plus a
-/// fingerprint of the raw config JSON. Shared by the query scan path and the
-/// `/info` row-count fetch so both reuse the SAME cached client (one OAuth token
-/// and one HTTPS connection pool), warmed by whichever path runs first. Keeping
-/// this in one place guarantees the two keys never drift.
-pub(crate) fn rest_client_cache_key(graph_source_id: &str, config: &str) -> String {
-    format!("{graph_source_id}\u{1f}{:016x}", config_fingerprint(config))
+/// Build the process-wide catalog-client cache key for a graph source: its id, a
+/// fingerprint of the raw config JSON, and the identity context's scope. Shared by
+/// the query scan path and the `/info` row-count fetch so both reuse the SAME
+/// cached client (one OAuth token and one HTTPS connection pool), warmed by
+/// whichever path runs first. Keeping this in one place guarantees the two keys
+/// never drift.
+///
+/// The identity scope (the AWS subject that signs WIF exchanges, the host-identity
+/// policy) is part of the key because the cache is shared by every clone of a
+/// `Fluree`: a client built for one tenant's subject, or under a looser policy,
+/// must never serve another.
+pub(crate) fn catalog_client_cache_key(
+    graph_source_id: &str,
+    config: &str,
+    identity: &fluree_db_iceberg::IdentityContext,
+) -> String {
+    format!(
+        "{graph_source_id}\u{1f}{:016x}\u{1f}{}",
+        config_fingerprint(config),
+        identity.cache_scope()
+    )
+}
+
+/// Key for the `loadTable` caches that OUTLIVE a query (the in-memory cross-query
+/// cache and the persisted disk pointer): the per-query `lt_key` plus the source
+/// config's fingerprint. A source dropped and re-created under the same name with
+/// a different catalog (URI, region, Glue catalog id, S3 Tables bucket) then never
+/// answers from the old one's pointer, which neither cache invalidates on drop.
+/// Per-query state (the session pin) stays on `lt_key`: one query sees one config.
+///
+/// The in-memory layer holds whole `loadTable` responses, vended credentials
+/// included, and the cache is shared by every clone of a `Fluree`, so a
+/// non-default identity context (a stricter host-identity policy, an embedder's
+/// AWS subject) is part of the key: a response the catalog gave one tenant's
+/// client is never served to another's. The default context keeps the key it
+/// always had, so persisted pointers stay warm.
+fn cross_query_key(
+    lt_key: &str,
+    raw_config: &str,
+    identity: &fluree_db_iceberg::IdentityContext,
+) -> String {
+    let base = format!("{lt_key}\u{1f}{:016x}", config_fingerprint(raw_config));
+    match super::storage::context_discriminant(identity) {
+        Some(context) => format!("{base}\u{1f}{context}"),
+        None => base,
+    }
+}
+
+/// The process-wide catalog client for a catalog-backed source — REST, AWS Glue,
+/// or AWS S3 Tables — or `None` for Direct, which has no catalog. Every query-path
+/// client comes from here, so all three catalogs share one client cache, one
+/// `loadTable` ladder ([`resolve_catalog_load_and_storage`]) and one storage
+/// decision ([`session_storage`]).
+///
+/// Construction does no network I/O beyond what each client defers: the REST
+/// client's OAuth exchange rides its first catalog op, and the AWS SDK clients
+/// resolve credentials lazily on first call (the cache gate's `oauth_token.n=0`
+/// depends on the former).
+pub(crate) async fn shared_catalog_client(
+    fluree: &crate::Fluree,
+    graph_source_id: &str,
+    raw_config: &str,
+    iceberg_config: &IcebergGsConfig,
+) -> QueryResult<Option<Arc<dyn SendCatalogClient>>> {
+    use fluree_db_iceberg::catalog::{GlueSdkCatalogClient, S3TablesSdkCatalogClient};
+    use fluree_db_iceberg::config::CatalogConfig;
+
+    if matches!(iceberg_config.catalog, CatalogConfig::Direct { .. }) {
+        return Ok(None);
+    }
+    let cache = fluree.r2rml_cache();
+    let client_fp =
+        catalog_client_cache_key(graph_source_id, raw_config, fluree.identity_context());
+    if let Some(client) = cache.catalog_client(&client_fp) {
+        return Ok(Some(client));
+    }
+    let region = iceberg_config
+        .catalog
+        .aws_catalog_region(&iceberg_config.io);
+    // The native-AWS catalogs call AWS with the host's own credential chain: the
+    // `aws` host identity, which the instance's policy may refuse. The ambient
+    // bucket allowlist does not govern the catalog call (a catalog lists what
+    // the host role can see); the storage reads that follow check each
+    // table's bucket against it.
+    if matches!(
+        iceberg_config.catalog,
+        CatalogConfig::Glue { .. } | CatalogConfig::S3Tables { .. }
+    ) {
+        fluree
+            .identity_context()
+            .policy
+            .ensure(fluree_db_iceberg::HostIdentityKind::Aws)
+            .map_err(|e| storage_query_error("Failed to create catalog client", e))?;
+    }
+    let client: Arc<dyn SendCatalogClient> = match &iceberg_config.catalog {
+        CatalogConfig::Direct { .. } => return Ok(None),
+        CatalogConfig::Rest {
+            uri,
+            warehouse,
+            auth,
+            ..
+        } => {
+            // ORDERING TRAP (§3): hydration happens ONLY here, inside the
+            // cache-miss arm, strictly AFTER `client_fp` was computed above over
+            // the RAW, reference-bearing config. The fingerprint-stability test
+            // pins this.
+            let auth_provider = hydrated_auth_provider(auth, fluree.identity_context()).await?;
+            Arc::new(
+                RestCatalogClient::new(
+                    RestCatalogConfig {
+                        uri: uri.clone(),
+                        warehouse: warehouse.clone(),
+                        ..Default::default()
+                    },
+                    auth_provider,
+                )
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create catalog client: {e}"))
+                })?,
+            )
+        }
+        CatalogConfig::Glue { catalog_id, .. } => Arc::new(
+            GlueSdkCatalogClient::new(region, catalog_id.clone())
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create Glue catalog client: {e}"))
+                })?,
+        ),
+        CatalogConfig::S3Tables {
+            table_bucket_arn, ..
+        } => Arc::new(
+            S3TablesSdkCatalogClient::new(region, table_bucket_arn.clone())
+                .await
+                .map_err(|e| {
+                    QueryError::Internal(format!("Failed to create S3 Tables catalog client: {e}"))
+                })?,
+        ),
+    };
+    cache.put_catalog_client(client_fp, Arc::clone(&client));
+    Ok(Some(client))
 }
 
 /// Whether numeric (double / decimal) FILTER pushdown — including the integer →
@@ -250,13 +555,23 @@ fn int_pushdown_literal(
         Some("int") => i32::try_from(n).ok().map(LiteralValue::Int32),
         Some(t) if t.starts_with("decimal") && numeric_stats => Some(LiteralValue::Decimal {
             unscaled: i128::from(n),
-            // precision is cosmetic for pruning (`decimal_cmp` ignores it); an i64
-            // is ≤19 digits, so the decimal128 max always covers it.
-            precision: 38,
             scale: 0,
         }),
         _ => Some(LiteralValue::Int64(n)),
     }
+}
+
+/// How a graph source's rows are materialized. A delete convention or an
+/// ordering column makes a pass latest-by-key; neither, additive.
+#[derive(Debug, Default)]
+pub struct MaterializeOptions {
+    /// The rows that delete their subject.
+    pub delete: Option<DeleteConvention>,
+    /// The column that orders the rows of one key.
+    pub order_by: Option<String>,
+    /// Incremental passes read the source's change feed, in which a deleted
+    /// or updated row retracts what it held.
+    pub change_feed: bool,
 }
 
 /// One materialize scan: what to read, how it was chosen, and how stale the window is.
@@ -265,10 +580,15 @@ fn int_pushdown_literal(
 /// from a positional return, and dropping it reintroduces the watermark-staleness
 /// failure it exists to prevent.
 pub struct MaterializeScan {
-    /// The source's current snapshot — the new watermark to persist. `None` when
-    /// the table has no snapshots at all (nothing to materialize).
+    /// The source's current snapshot — the new watermark to persist, unless
+    /// [`Self::stopped_at`] is set, which then is. `None` when the table has no
+    /// snapshots at all (nothing to materialize). A pinned read reports its
+    /// pin, and a Delta read the table version it read.
     pub to_snapshot_id: Option<i64>,
-    /// Whether an added-files scan was used, rather than a full read.
+    /// Whether the pass read only what changed after its window start, rather
+    /// than the table whole: an Iceberg added-files scan, whose rows are all
+    /// additions, or a Delta change feed, whose rows also retract. Check
+    /// [`Self::change_feed`] before treating every row as an addition.
     pub incremental: bool,
     /// Wall-clock span of the window, from Iceberg snapshot timestamps: how far the
     /// stored watermark now lags the current snapshot. `None` on a first run (no
@@ -276,7 +596,8 @@ pub struct MaterializeScan {
     /// both of which mean "persist regardless".
     pub window_age_ms: Option<i64>,
     /// The highest source COMMIT SEQUENCE this pass covers, when the pass was cut
-    /// short by the row budget — and `None` when it covers the whole plan.
+    /// short by the row budget — and `None` when it covers the whole plan, which
+    /// a pinned read always does.
     ///
     /// That distinction is the point of the field, and inverting it is silent data
     /// loss. `Some(s)` means the target will hold only a PREFIX of the window, so
@@ -292,9 +613,27 @@ pub struct MaterializeScan {
     /// that carried it has been expired away — which is the state that forced the
     /// full read to begin with.
     pub to_sequence: Option<i64>,
+    /// Whether the batches are a change feed rather than table rows. Every row
+    /// then carries [`CHANGE_TYPE_COLUMN`] and [`COMMIT_VERSION_COLUMN`], and
+    /// either asserts its values or retracts them. Only a Delta source's change
+    /// data feed sets it.
+    pub change_feed: bool,
+    /// Where a change feed window cut by the per-pass row budget stopped: the
+    /// last version whose changes the stream carried. Set while the stream is
+    /// read, so it is read only after the stream ends. Once set it, not
+    /// `to_snapshot_id`, is the window's end — a version the table had, so the
+    /// watermark advances to it and the next pass reads the changes after it.
+    pub stopped_at: Option<Arc<std::sync::OnceLock<u64>>>,
     /// Column batches, streamed. See [`Self::stream`] usage notes on the method.
     pub stream: ColumnBatchStream,
 }
+
+/// The column a change feed row names its change in: `insert` and
+/// `update_postimage` assert the row, `delete` and `update_preimage` retract it.
+pub const CHANGE_TYPE_COLUMN: &str = "_change_type";
+
+/// The column a change feed row names the source version that made it in.
+pub const COMMIT_VERSION_COLUMN: &str = "_commit_version";
 
 /// Why a materialize poll reads added files only, or re-reads the whole table.
 ///
@@ -706,12 +1045,8 @@ fn build_iceberg_filter(
         // dropped (a partial `In` could prune a file a missing member's rows need).
         if f.op == ScanCmpOp::In {
             if let ScanValue::Set(members) = &f.value {
-                if let Some(values) = set_members_to_literals(field.type_string(), members) {
-                    comparisons.push(Expression::In {
-                        field_id: field.id,
-                        column: f.column.clone(),
-                        values,
-                    });
+                if let Some(values) = set_members_to_literals(field.type_string(), members, true) {
+                    comparisons.push(Expression::in_list(field.id, f.column.clone(), values));
                 }
             }
             continue;
@@ -726,7 +1061,8 @@ fn build_iceberg_filter(
             // Handled above; `In` never reaches the scalar `ComparisonOp` mapping.
             ScanCmpOp::In => continue,
         };
-        let Some(value) = scan_value_to_literal(field.type_string(), &f.value) else {
+        let equality = op == ComparisonOp::Eq;
+        let Some(value) = scan_value_to_literal(field.type_string(), &f.value, equality) else {
             continue;
         };
         comparisons.push(Expression::Comparison {
@@ -751,10 +1087,11 @@ fn build_iceberg_filter(
 fn set_members_to_literals(
     field_type: Option<&str>,
     members: &[ScanValue],
+    equality: bool,
 ) -> Option<Vec<LiteralValue>> {
     let mut out = Vec::with_capacity(members.len());
     for m in members {
-        out.push(scan_value_to_literal(field_type, m)?);
+        out.push(scan_value_to_literal(field_type, m, equality)?);
     }
     Some(out)
 }
@@ -762,9 +1099,17 @@ fn set_members_to_literals(
 /// Translate one scalar [`ScanValue`] to an Iceberg pushdown [`LiteralValue`]
 /// against a column of the given physical type, or `None` to skip the push
 /// (leaving the in-engine FILTER as the authority). Shared by the single-value
-/// `Comparison` path and the set-membership `In` path.
-fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<LiteralValue> {
+/// `Comparison` path and the set-membership `In` path; `equality` says the value
+/// is compared by `=` or `IN`.
+fn scan_value_to_literal(
+    field_type: Option<&str>,
+    value: &ScanValue,
+    equality: bool,
+) -> Option<LiteralValue> {
     Some(match value {
+        // Not against a string column: the reader would compare the cast text
+        // `"true"`, where the operator matches a constant loosely (`"1"` too).
+        ScanValue::Bool(_) if field_type == Some("string") => return None,
         ScanValue::Bool(b) => LiteralValue::Boolean(*b),
         // Push a Date literal only against a physically-`date` column. The
         // Arrow reader applies it as an exact row filter (casting the column
@@ -780,8 +1125,21 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
         // integer pushes as an EXACT scale-0 decimal when numeric pushdown is
         // on (else stays `Int64` → no prune). An out-of-i32-range literal on an
         // `int` column is skipped rather than wrapped. See `int_pushdown_literal`.
+        // Nor against a string column: the cast text "10" misses a cell "010"
+        // the operator's integer parse matches, and "10" < "5" as text.
+        ScanValue::Int(_) if field_type == Some("string") => return None,
         ScanValue::Int(n) => int_pushdown_literal(*n, field_type, iceberg_numeric_stats_enabled())?,
-        ScanValue::Str(s) => LiteralValue::String(s.clone()),
+        // A string literal compares as a string. The reader would cast it to a
+        // non-string column's type and compare values instead, which is another
+        // comparison: an un-annotated integer column's literal is "10", and
+        // "10" < "5". So a string goes to a string column, or, by equality, to a
+        // column whose cell renders as exactly that string (see
+        // `rendered_cell_literal`).
+        ScanValue::Str(s) => match field_type {
+            Some("string") => LiteralValue::String(s.clone()),
+            _ if equality => rendered_cell_literal(field_type, s)?,
+            _ => return None,
+        },
         // xsd:double / xsd:float FILTER value. Push only against a physically
         // `double` column (exact f64 bounds); a `float` column would need an
         // f64→f32 narrowing that can round the literal and over-prune a range,
@@ -806,14 +1164,9 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
         // against the column's scale. Row-group stats prune only when the
         // column is FLBA-encoded (see `prunable_stats`); file-level manifest
         // bounds prune regardless.
-        ScanValue::Decimal {
-            unscaled,
-            precision,
-            scale,
-        } => match field_type {
+        ScanValue::Decimal { unscaled, scale } => match field_type {
             Some(t) if t.starts_with("decimal") => LiteralValue::Decimal {
                 unscaled: *unscaled,
-                precision: *precision,
                 scale: *scale,
             },
             // A decimal literal against an integer column has no exact
@@ -874,79 +1227,127 @@ fn scan_value_to_literal(field_type: Option<&str>, value: &ScanValue) -> Option<
     })
 }
 
+/// The order an Iceberg column's file bounds sort in, as the engine's
+/// [`TermOrder`] they agree with; `None` for a type the scan-side top-k does
+/// not order by (nanosecond timestamps, whose cells hold microseconds, among
+/// them).
+fn bound_order(field_type: Option<&str>) -> Option<TermOrder> {
+    Some(match field_type? {
+        "string" => TermOrder::Lexical,
+        "int" | "long" | "float" | "double" => TermOrder::Numeric,
+        t if t.starts_with("decimal") => TermOrder::Numeric,
+        "date" => TermOrder::Date,
+        "timestamp" | "timestamptz" => TermOrder::Instant,
+        "boolean" => TermOrder::Boolean,
+        _ => return None,
+    })
+}
+
+/// The cell value of a `field_type` column that an un-annotated mapping renders
+/// as exactly `s`, as a pushdown literal: `"10"` → 10 on an integer column, but
+/// nothing for `"010"`, which no cell renders. The constant is read as the
+/// column's type and rendered back through the materializer itself, so a cell
+/// equals `s` as a string exactly when it equals the literal as a value. A
+/// float pushes only a finite, non-zero value: `NaN` equals nothing by value,
+/// and `-0` and `0` render apart but compare equal. Any other type declines.
+fn rendered_cell_literal(field_type: Option<&str>, s: &str) -> Option<LiteralValue> {
+    use fluree_db_tabular::Column;
+    let field_type = field_type?;
+    let (cell, literal) = match field_type {
+        "int" => {
+            let n: i32 = s.parse().ok()?;
+            (Column::Int32(vec![Some(n)]), LiteralValue::Int32(n))
+        }
+        "long" => {
+            let n: i64 = s.parse().ok()?;
+            (Column::Int64(vec![Some(n)]), LiteralValue::Int64(n))
+        }
+        "boolean" => {
+            let b: bool = s.parse().ok()?;
+            (Column::Boolean(vec![Some(b)]), LiteralValue::Boolean(b))
+        }
+        "date" => {
+            let days = fluree_db_core::Date::parse(s).ok()?.days_since_epoch();
+            (Column::Date(vec![Some(days)]), LiteralValue::Date(days))
+        }
+        "timestamp" | "timestamptz" => {
+            let micros = fluree_db_core::DateTime::parse(s).ok()?.epoch_micros();
+            if field_type == "timestamp" {
+                (
+                    Column::Timestamp(vec![Some(micros)]),
+                    LiteralValue::Timestamp(micros),
+                )
+            } else {
+                (
+                    Column::TimestampTz(vec![Some(micros)]),
+                    LiteralValue::TimestampTz(micros),
+                )
+            }
+        }
+        "double" => {
+            let f: f64 = s
+                .parse()
+                .ok()
+                .filter(|f: &f64| f.is_finite() && *f != 0.0)?;
+            (Column::Float64(vec![Some(f)]), LiteralValue::Float64(f))
+        }
+        "float" => {
+            let f: f32 = s
+                .parse()
+                .ok()
+                .filter(|f: &f32| f.is_finite() && *f != 0.0)?;
+            (Column::Float32(vec![Some(f)]), LiteralValue::Float32(f))
+        }
+        t if t.starts_with("decimal(") => {
+            let (precision, scale) = decimal_precision_scale(t)?;
+            let unscaled = decimal_unscaled(s, scale)?;
+            let cell = Column::Decimal {
+                values: vec![Some(unscaled)],
+                precision,
+                scale,
+            };
+            // The cell carries the column's precision; a literal has none of
+            // its own (the reader compares it against the column's type).
+            let literal = LiteralValue::Decimal { unscaled, scale };
+            (cell, literal)
+        }
+        _ => return None,
+    };
+    let rendered = fluree_db_r2rml::materialize::lexical_column(&cell);
+    let Column::String(rendered) = rendered.as_ref() else {
+        return None;
+    };
+    (rendered.first()?.as_deref() == Some(s)).then_some(literal)
+}
+
+/// `(precision, scale)` of an Iceberg `decimal(p,s)` type string.
+fn decimal_precision_scale(type_string: &str) -> Option<(u8, i8)> {
+    let args = type_string.strip_prefix("decimal(")?.strip_suffix(')')?;
+    let (p, s) = args.split_once(',')?;
+    Some((p.trim().parse().ok()?, s.trim().parse().ok()?))
+}
+
+/// The unscaled value of a plain decimal string (`-0.05`) at `scale`, or
+/// `None` when it has more fractional digits than the scale holds.
+fn decimal_unscaled(s: &str, scale: i8) -> Option<i128> {
+    let width = usize::try_from(scale).ok()?;
+    let (negative, digits) = s.strip_prefix('-').map_or((false, s), |d| (true, d));
+    let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
+    if int.is_empty()
+        || frac.len() > width
+        || !int.bytes().chain(frac.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let n: i128 = format!("{int}{frac:0<width$}").parse().ok()?;
+    Some(if negative { -n } else { n })
+}
+
 // =============================================================================
 // Iceberg/R2RML Graph Source Creation
 // =============================================================================
 
 impl crate::Fluree {
-    /// Create an Iceberg graph source.
-    ///
-    /// This operation:
-    /// 1. Validates the configuration
-    /// 2. Optionally tests the catalog connection
-    /// 3. Publishes the graph source record to the nameservice
-    pub async fn create_iceberg_graph_source(
-        &self,
-        config: IcebergCreateConfig,
-    ) -> Result<IcebergCreateResult> {
-        let graph_source_id = config.graph_source_id();
-        info!(
-            graph_source_id = %graph_source_id,
-            catalog = %config.catalog_uri_or_location(),
-            table = %config.table_identifier_display(),
-            "Creating Iceberg graph source"
-        );
-
-        // 1. Validate configuration
-        config.validate()?;
-        let model_warnings = self.validate_source_model(config.model.as_deref()).await?;
-
-        // 2. Test catalog connection (REST mode only — Direct mode verified at query time)
-        let connection_tested = if config.is_rest() {
-            let ok = self.test_iceberg_connection(&config).await.is_ok();
-            if !ok {
-                warn!(
-                    graph_source_id = %graph_source_id,
-                    "Could not verify catalog connection - graph source will be created but may fail at query time"
-                );
-            }
-            ok
-        } else {
-            false
-        };
-
-        // 3. Convert config to storage format
-        let iceberg_config = config.to_iceberg_gs_config();
-        let config_json = iceberg_config
-            .to_json()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
-
-        // 4. Publish graph source record to nameservice
-        self.publisher()?
-            .publish_graph_source(
-                &config.name,
-                config.effective_branch(),
-                GraphSourceType::Iceberg,
-                &config_json,
-                &[], // No ledger dependencies for Iceberg graph sources
-            )
-            .await?;
-
-        info!(
-            graph_source_id = %graph_source_id,
-            connection_tested = connection_tested,
-            "Created Iceberg graph source"
-        );
-
-        Ok(IcebergCreateResult {
-            model_warnings,
-            graph_source_id,
-            table_identifier: config.table_identifier_display(),
-            catalog_uri: config.catalog_uri_or_location().to_string(),
-            connection_tested,
-        })
-    }
-
     /// Create an R2RML graph source (Iceberg table with R2RML mapping).
     ///
     /// For `R2rmlMappingInput::Content`, validates the mapping content and
@@ -956,70 +1357,66 @@ impl crate::Fluree {
         &self,
         config: R2rmlCreateConfig,
     ) -> Result<R2rmlCreateResult> {
-        use crate::graph_source::config::R2rmlMappingInput;
-
         let graph_source_id = config.graph_source_id();
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
         config.validate()?;
-        let model_warnings = self
+        let mut model_warnings = self
             .validate_source_model(config.iceberg.model.as_deref())
             .await?;
+        self.refuse_direct_storage_the_policy_refuses(
+            &graph_source_id,
+            &config.iceberg.to_iceberg_gs_config(),
+        )
+        .await?;
 
-        // Resolve mapping: validate and store to CAS if inline content
-        let (mapping_address, triples_map_count, table_names, mapping_validated) = match &config
-            .mapping
-        {
-            R2rmlMappingInput::Content(content) => {
-                // Inline content has no filename to sniff; the shared resolver
-                // defaults a missing media type to Turtle (matching the eventual
-                // CID address, which is also extensionless).
-                let compiled =
-                    Self::compile_r2rml_content(content, config.mapping_media_type.as_deref(), "")?;
-                reject_sql_queries(&compiled)?;
-                let count = compiled.len();
-                let tables = Self::sorted_table_names(&compiled);
-                let gs_id = config.graph_source_id();
-                let cs = self.content_store(&gs_id);
-                let cid = cs
-                    .put(
-                        fluree_db_core::ContentKind::GraphSourceMapping,
-                        content.as_bytes(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        crate::ApiError::Config(format!("Failed to store R2RML mapping: {e}"))
-                    })?;
-                let addr = cid.to_string();
-                info!(graph_source_id = %graph_source_id, mapping_cid = %addr, "R2RML mapping stored to CAS");
-                (addr, count, tables, true)
+        let registered = self
+            .register_r2rml_mapping(
+                &graph_source_id,
+                &config.mapping,
+                config.mapping_media_type.as_deref(),
+                SqlQueryPolicy::RestrictedSubset,
+            )
+            .await?;
+        let (triples_map_count, mut table_names, mapping_validated) = registered.summary();
+        // An `rr:sqlQuery` map reads its FROM table: report that, not the
+        // query's alias.
+        if let Some(compiled) = &registered.compiled {
+            table_names = crate::ledger_info::mapping_source_tables(compiled);
+            if config.iceberg.model.is_some() {
+                model_warnings.extend(fluree_db_query::r2rml::class_overlap_warnings(compiled));
             }
-            R2rmlMappingInput::Address(address) => {
-                let (count, tables, validated) = self
-                        .validate_r2rml_mapping_from_address(address, &config)
-                        .await
-                        .map(|(c, t)| (c, t, true))
-                        .unwrap_or_else(|e| {
-                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
-                            (0, Vec::new(), false)
-                        });
-                (address.clone(), count, tables, validated)
-            }
-        };
+        }
+        let mapping_address = registered.address;
         let table_count = table_names.len();
-
-        // Test catalog connection (REST mode only)
-        let connection_tested = if config.iceberg.is_rest() {
-            self.test_iceberg_connection(&config.iceberg).await.is_ok()
-        } else {
-            false
-        };
 
         // Store config with CAS mapping address
         let iceberg_config = config.to_iceberg_gs_config(&mapping_address);
         let config_json = iceberg_config
             .to_json()
             .map_err(|e| crate::ApiError::Config(format!("Failed to serialize config: {e}")))?;
+
+        // Load the tables before publishing, from the configuration about to
+        // be published, so a row filter the live table refuses refuses the
+        // registration instead of every query's first read. One provider for
+        // the probe and the key lookups after publishing, so each table is
+        // resolved once.
+        let provider = FlureeR2rmlProvider::new(self);
+        let probe = self
+            .probe_tables(
+                &provider,
+                &graph_source_id,
+                SourceConfig {
+                    json: &config_json,
+                    iceberg: &iceberg_config,
+                },
+                &table_names,
+                config.iceberg.is_direct(),
+            )
+            .await;
+        if let Some(compiled) = &registered.compiled {
+            check_query_maps_against_tables(compiled, &probe.loaded)?;
+        }
 
         self.publisher()?
             .publish_graph_source(
@@ -1031,7 +1428,23 @@ impl crate::Fluree {
             )
             .await?;
 
-        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, "Created R2RML graph source");
+        let connection_check = probe.check;
+        let connection_tested = connection_check.is_verified();
+        let diagnostics = match &registered.compiled {
+            Some(compiled) if connection_tested => {
+                registered_keyless_maps(
+                    &provider,
+                    &graph_source_id,
+                    compiled,
+                    QueryTables::FromTable,
+                    KeyRemedy::DeclareOrIdentifierFields,
+                )
+                .await
+            }
+            _ => Vec::new(),
+        };
+
+        info!(graph_source_id = %graph_source_id, mapping_address = %mapping_address, connection_tested, "Created R2RML graph source");
 
         Ok(R2rmlCreateResult {
             model_warnings,
@@ -1043,65 +1456,314 @@ impl crate::Fluree {
             table_count,
             table_names,
             connection_tested,
+            connection_check,
             mapping_validated,
+            diagnostics,
         })
     }
 
-    /// Test connection to an Iceberg REST catalog.
-    ///
-    /// Only applicable to REST mode. Direct mode has no catalog to test.
-    async fn test_iceberg_connection(&self, config: &IcebergCreateConfig) -> Result<()> {
-        use fluree_db_iceberg::catalog::parse_table_identifier;
+    /// Refuse to register a Direct source whose storage this instance's policy
+    /// refuses. A Direct source's location is its configuration, so its storage
+    /// is decided here as a query would decide it ([`plan_storage`]; a Google
+    /// identity still proves itself by minting a token). A refusal the
+    /// configuration and policy decide
+    /// ([`IcebergError::is_configuration_refusal`]) fails the registration with
+    /// the typed error a query would report. Any other failure (a token
+    /// exchange that failed) is left to query time, as the location's
+    /// reachability always was. A catalog source learns its location only from
+    /// the catalog, so its storage is decided at query time.
+    async fn refuse_direct_storage_the_policy_refuses(
+        &self,
+        graph_source_id: &str,
+        config: &IcebergGsConfig,
+    ) -> Result<()> {
+        let fluree_db_iceberg::config::CatalogConfig::Direct { table_location } = &config.catalog
+        else {
+            return Ok(());
+        };
+        match plan_storage(
+            &config.catalog,
+            &config.storage_io(),
+            table_location,
+            self.identity_context(),
+        )
+        .await
+        {
+            Ok(_) => Ok(()),
+            Err(refusal) if refusal.is_configuration_refusal() => Err(
+                match super::iceberg_catalog::identity_query_error(refusal) {
+                    Ok(typed) => crate::ApiError::Query(typed),
+                    Err(other) => crate::ApiError::Config(other.to_string()),
+                },
+            ),
+            Err(other) => {
+                warn!(graph_source_id = %graph_source_id, error = %other, "Could not decide the Direct source's storage; it is decided again at query time");
+                Ok(())
+            }
+        }
+    }
 
-        let rest = match &config.connection.catalog_mode {
-            CatalogMode::Rest(rest) => rest,
-            CatalogMode::Direct { .. } => {
-                return Err(crate::ApiError::Config(
-                    "Connection test is not supported for Direct catalog mode".to_string(),
-                ));
+    /// Load each table a source about to be published reads, the way its
+    /// queries will, within [`REGISTRATION_PROBE_BUDGET`]. A failure or an
+    /// expired budget is logged and returned as the outcome, never as an
+    /// error, so it cannot fail registration. What did load is returned for
+    /// the checks that need a table's schema.
+    async fn probe_tables(
+        &self,
+        provider: &FlureeR2rmlProvider<'_>,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+        table_names: &[String],
+        direct: bool,
+    ) -> TableProbe {
+        let probe = self
+            .probe_tables_using(
+                provider,
+                graph_source_id,
+                config,
+                table_names,
+                direct,
+                REGISTRATION_PROBE_BUDGET,
+            )
+            .await;
+        match &probe.check {
+            ConnectionCheck::Verified => {}
+            ConnectionCheck::NoTables => {
+                debug!(
+                    graph_source_id = %graph_source_id,
+                    "No mapped table to load: the mapping could not be read"
+                );
+            }
+            ConnectionCheck::ClientFailed { error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    error = %error,
+                    "Could not build the catalog client - graph source was created but may fail at query time"
+                );
+            }
+            ConnectionCheck::TableFailed { table, error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %error,
+                    "Could not load a mapped table - graph source was created but may fail at query time"
+                );
+            }
+            ConnectionCheck::CatalogUnreachable { table, error } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    table = %table,
+                    error = %error,
+                    "The catalog did not answer for a mapped table - graph source was created but may fail at query time"
+                );
+            }
+            ConnectionCheck::TimedOut {
+                loaded,
+                total,
+                budget_secs,
+            } => {
+                warn!(
+                    graph_source_id = %graph_source_id,
+                    loaded,
+                    total,
+                    budget_secs,
+                    "Loading the mapped tables ran past the registration budget ({loaded} of {total} loaded) - graph source was created but is not verified"
+                );
+            }
+        }
+        probe
+    }
+
+    /// Load each named table the way its queries do (`load_table_context`):
+    /// through the catalog's `loadTable` for REST, AWS Glue and S3 Tables, and
+    /// by resolving the table's current metadata at its location for Direct (a
+    /// warehouse root's per-table directory, the local-root guard, version-hint
+    /// or metadata listing). Table metadata only, never a manifest or data
+    /// file; the first failure ends it, and so does `budget`. A catalog-mode
+    /// (`!direct`) table failure with no sign of a catalog answer is
+    /// [`ConnectionCheck::CatalogUnreachable`] ([`catalog_answered`]).
+    #[cfg(test)]
+    pub(crate) async fn probe_tables_within(
+        &self,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+        table_names: &[String],
+        direct: bool,
+        budget: std::time::Duration,
+    ) -> TableProbe {
+        let provider = FlureeR2rmlProvider::new(self);
+        self.probe_tables_using(
+            &provider,
+            graph_source_id,
+            config,
+            table_names,
+            direct,
+            budget,
+        )
+        .await
+    }
+
+    /// [`Self::probe_tables_within`] through `provider`, which keeps each
+    /// table it loaded for reuse ([`FlureeR2rmlProvider::load_table_context`]):
+    /// once the source is published, learning its tables' keys resolves no
+    /// table a second time.
+    async fn probe_tables_using(
+        &self,
+        provider: &FlureeR2rmlProvider<'_>,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+        table_names: &[String],
+        direct: bool,
+        budget: std::time::Duration,
+    ) -> TableProbe {
+        use futures::TryStreamExt;
+        /// Catalog round trips in flight at once: a mapping over a warehouse
+        /// can name dozens of tables, each its own `loadTable`.
+        const CONCURRENT_LOADS: usize = 8;
+
+        // A mapping that could not be read names no tables, and nothing else
+        // names one: a catalog source's own `table` is the placeholder that
+        // only satisfies the identifier shape, never a table to load.
+        if table_names.is_empty() {
+            return TableProbe {
+                check: ConnectionCheck::NoTables,
+                loaded: HashMap::new(),
+            };
+        }
+        let loaded = std::sync::Mutex::new(HashMap::new());
+        let probe = async {
+            // One catalog client for every load below. The client cache does
+            // not coalesce concurrent misses, and each build hydrates the
+            // auth's secrets, so loads that each found it cold would build
+            // one apiece.
+            provider
+                .warm_catalog_client(graph_source_id, config)
+                .await
+                .map_err(|error| ConnectionCheck::ClientFailed {
+                    error: error.to_string(),
+                })?;
+            futures::stream::iter(table_names.iter().map(Ok))
+                .try_for_each_concurrent(CONCURRENT_LOADS, |table| {
+                    let loaded = &loaded;
+                    async move {
+                        let context = provider
+                            .load_table_context_in(graph_source_id, config, table)
+                            .await
+                            .map_err(|error| {
+                                let (table, answered) = (table.clone(), catalog_answered(&error));
+                                let error = error.to_string();
+                                if direct || answered {
+                                    ConnectionCheck::TableFailed { table, error }
+                                } else {
+                                    ConnectionCheck::CatalogUnreachable { table, error }
+                                }
+                            })?;
+                        provider.remember_context(graph_source_id, table, &context);
+                        loaded
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .insert(table.clone(), context.metadata);
+                        Ok(())
+                    }
+                })
+                .await
+        };
+        let outcome = tokio::time::timeout(budget, probe).await;
+        let loaded = loaded
+            .into_inner()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let check = match outcome {
+            Ok(Ok(())) => ConnectionCheck::Verified,
+            Ok(Err(failed)) => failed,
+            Err(_elapsed) => ConnectionCheck::TimedOut {
+                loaded: loaded.len(),
+                total: table_names.len(),
+                budget_secs: budget.as_secs(),
+            },
+        };
+        TableProbe { check, loaded }
+    }
+
+    /// Resolve a registration's mapping input to the address the record stores.
+    ///
+    /// Inline content must compile and is written to the source's content
+    /// store. An address is read and compiled when the backend can; one that
+    /// cannot be read registers unvalidated (`compiled: None`) and fails at
+    /// query time instead. `sql_queries` says what the source does with an
+    /// `rr:sqlQuery` logical table.
+    pub(crate) async fn register_r2rml_mapping(
+        &self,
+        graph_source_id: &str,
+        input: &crate::graph_source::config::R2rmlMappingInput,
+        media_type: Option<&str>,
+        sql_queries: SqlQueryPolicy,
+    ) -> Result<RegisteredMapping> {
+        use crate::graph_source::config::R2rmlMappingInput;
+        let check = |compiled: &CompiledR2rmlMapping| {
+            // Every query of such a source would answer no rows.
+            if compiled.is_empty() {
+                return Err(crate::ApiError::Config(EMPTY_MAPPING.to_string()));
+            }
+            match sql_queries {
+                SqlQueryPolicy::Execute => Ok(()),
+                SqlQueryPolicy::RestrictedSubset => {
+                    super::row_filter::check_restricted_queries(compiled)
+                        .map_err(crate::ApiError::Config)
+                }
+                SqlQueryPolicy::Refuse => reject_sql_queries(compiled),
             }
         };
-
-        // Hydrate any SecretRef auth BEFORE building the provider — this is the
-        // connection-test gate, so a secret reference with no resolver (or a
-        // Denied resolution) must error HERE, actionably, before any network call.
-        let hydrated_auth = rest
-            .auth
-            .hydrate(self.secret_resolver())
-            .await
-            .map_err(|e| {
-                crate::ApiError::Config(format!("Failed to resolve catalog auth secret: {e}"))
-            })?;
-
-        // Create auth provider
-        let auth = hydrated_auth
-            .create_provider_arc()
-            .map_err(|e| crate::ApiError::Config(format!("Failed to create auth provider: {e}")))?;
-
-        // Create catalog client
-        let catalog_config = RestCatalogConfig {
-            uri: rest.catalog_uri.clone(),
-            warehouse: rest.warehouse.clone(),
-            ..Default::default()
-        };
-
-        let catalog = RestCatalogClient::new(catalog_config, auth).map_err(|e| {
-            crate::ApiError::Config(format!("Failed to create catalog client: {e}"))
-        })?;
-
-        // Parse table identifier
-        let table_id = parse_table_identifier(&config.table_identifier)
-            .map_err(|e| crate::ApiError::Config(format!("Invalid table identifier: {e}")))?;
-
-        // Attempt to load table metadata (this tests the connection)
-        catalog
-            .load_table(&table_id, config.connection.io.vended_credentials)
-            .await
-            .map_err(|e| {
-                crate::ApiError::Config(format!("Failed to load table from catalog: {e}"))
-            })?;
-
-        Ok(())
+        match input {
+            R2rmlMappingInput::Content(content) => {
+                let compiled = Self::compile_r2rml_content(content, media_type, "")?;
+                check(&compiled)?;
+                let cid = self
+                    .content_store(graph_source_id)
+                    .put(
+                        fluree_db_core::ContentKind::GraphSourceMapping,
+                        content.as_bytes(),
+                    )
+                    .await
+                    .map_err(|e| {
+                        crate::ApiError::Config(format!("Failed to store R2RML mapping: {e}"))
+                    })?;
+                Ok(RegisteredMapping {
+                    address: cid.to_string(),
+                    compiled: Some(compiled),
+                })
+            }
+            R2rmlMappingInput::Address(address) => {
+                let storage = self.admin_storage().ok_or_else(|| {
+                    crate::ApiError::Config(
+                        "address-based mappings are not supported on this backend".to_string(),
+                    )
+                })?;
+                let compiled = match storage.read_bytes(address).await {
+                    Ok(bytes) => match String::from_utf8(bytes)
+                        .map_err(|e| crate::ApiError::Config(e.to_string()))
+                        .and_then(|content| {
+                            Self::compile_r2rml_content(&content, media_type, address)
+                        }) {
+                        Ok(compiled) => {
+                            check(&compiled)?;
+                            Some(compiled)
+                        }
+                        Err(e) => {
+                            warn!(graph_source_id = %graph_source_id, error = %e, "Could not validate R2RML mapping from address");
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        warn!(graph_source_id = %graph_source_id, error = %e, "Could not read R2RML mapping from address");
+                        None
+                    }
+                };
+                Ok(RegisteredMapping {
+                    address: address.clone(),
+                    compiled,
+                })
+            }
+        }
     }
 
     /// Compile R2RML content and return the compiled mapping.
@@ -1130,35 +1792,6 @@ impl crate::Fluree {
         }
     }
 
-    /// Validate an R2RML mapping from a pre-existing storage address.
-    ///
-    /// Returns the number of TriplesMap definitions and the sorted list of
-    /// distinct logical table names referenced by the mapping.
-    async fn validate_r2rml_mapping_from_address(
-        &self,
-        address: &str,
-        config: &R2rmlCreateConfig,
-    ) -> Result<(usize, Vec<String>)> {
-        let storage = self.admin_storage().ok_or_else(|| {
-            crate::ApiError::Config(format!(
-                "Cannot load R2RML mapping from address '{address}': address-based reads are not supported on this backend"
-            ))
-        })?;
-        let bytes = storage.read_bytes(address).await.map_err(|e| {
-            crate::ApiError::Config(format!(
-                "Failed to load R2RML mapping from '{address}': {e}"
-            ))
-        })?;
-        let content = String::from_utf8(bytes).map_err(|e| {
-            crate::ApiError::Config(format!("R2RML mapping is not valid UTF-8: {e}"))
-        })?;
-        // `address` may carry an extension (e.g. `.ttl`/`.jsonld`); pass it so the
-        // resolver can infer the format when no explicit media type is set.
-        let compiled =
-            Self::compile_r2rml_content(&content, config.mapping_media_type.as_deref(), address)?;
-        Ok((compiled.len(), Self::sorted_table_names(&compiled)))
-    }
-
     /// Collect the distinct logical table names referenced by a compiled
     /// mapping, sorted for deterministic reporting.
     pub(crate) fn sorted_table_names(compiled: &CompiledR2rmlMapping) -> Vec<String> {
@@ -1169,6 +1802,23 @@ impl crate::Fluree {
             .collect();
         names.sort();
         names
+    }
+}
+
+/// A registration's mapping as stored, and its compiled form when it could be
+/// read (always, for inline content).
+pub(crate) struct RegisteredMapping {
+    pub(crate) address: String,
+    pub(crate) compiled: Option<CompiledR2rmlMapping>,
+}
+
+impl RegisteredMapping {
+    /// `(triples map count, sorted table names, validated)` for a create result.
+    pub(crate) fn summary(&self) -> (usize, Vec<String>, bool) {
+        match &self.compiled {
+            Some(c) => (c.len(), crate::Fluree::sorted_table_names(c), true),
+            None => (0, Vec::new(), false),
+        }
     }
 }
 
@@ -1198,6 +1848,202 @@ pub struct FlureeR2rmlProvider<'a> {
     /// the lifetime of one query — collapsing the per-scan REST round-trip storm
     /// and pinning a single Iceberg snapshot across the query.
     session: std::sync::Arc<super::catalog_session::IcebergCatalogSession>,
+    /// Per-source table-state pins for this query (`alias@time:` / `@snapshot:`),
+    /// consulted by every scan and count of the source. See
+    /// [`R2rmlTableProvider::pin_source_time`].
+    source_times: std::sync::Mutex<std::collections::HashMap<String, SourceTime>>,
+    /// Tables this provider resolved moments ago, by `(graph source, table)`:
+    /// the next touch of a table in the same query (a scan after its key
+    /// check, a count after its plan) reuses the resolution instead of
+    /// repeating it. See [`Self::load_table_context`].
+    recent_contexts: std::sync::Mutex<std::collections::HashMap<(String, String), RecentContext>>,
+    /// Each `(graph source, logical table name)` this query has resolved to the
+    /// table it scans and the rows it keeps; see [`Self::logical_scan`].
+    logical_scans: std::sync::Mutex<
+        std::collections::HashMap<(String, String), super::row_filter::LogicalScan>,
+    >,
+}
+
+/// A [`TableContext`] a provider resolved, when, and under which pin.
+struct RecentContext {
+    at: std::time::Instant,
+    pin: Option<SourceTime>,
+    context: TableContext,
+}
+
+/// Whether a resolution made at `at` under `resolved_pin` serves a touch now
+/// under `pin`: only the same pin (a pin set after an unpinned resolution
+/// must resolve again), and only within [`RECENT_CONTEXT_REUSE`].
+fn recent_context_serves(
+    at: std::time::Instant,
+    resolved_pin: Option<SourceTime>,
+    pin: Option<SourceTime>,
+    now: std::time::Instant,
+) -> bool {
+    resolved_pin == pin && now.saturating_duration_since(at) < RECENT_CONTEXT_REUSE
+}
+
+/// How long a resolved table is reused by later touches through the same
+/// provider. A query's touches of one table come within milliseconds of each
+/// other; the bound keeps a provider that lives longer than a query (a bulk
+/// build) resolving afresh, so it sees new commits, and stays well inside the
+/// session's refresh margin for expiring vended credentials (a context is
+/// never served past a point the session would itself have reloaded it).
+const RECENT_CONTEXT_REUSE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The snapshot a query reads for one table, and whether it is the table's
+/// current snapshot — the one the `metadata_location`-keyed caches describe.
+#[derive(Clone, Copy)]
+struct SelectedSnapshot<'m> {
+    snapshot: &'m fluree_db_iceberg::metadata::Snapshot,
+    is_current: bool,
+}
+
+/// Key for the per-snapshot file-list caches. `metadata_location` alone names
+/// the current snapshot's files (the key every pre-existing entry was written
+/// under); a historical snapshot's list is just as immutable and gets its own.
+/// The flat type a mapping reads an Iceberg field as: `None` for a nested
+/// field, or one of a type the reader does not decode.
+pub(crate) fn iceberg_flat_type(
+    field: &fluree_db_iceberg::metadata::SchemaField,
+) -> Option<fluree_db_iceberg::FieldType> {
+    use fluree_db_iceberg::io::batch::IcebergFieldTypeExt;
+    if field.is_nested() {
+        return None;
+    }
+    field
+        .type_string()
+        .and_then(fluree_db_iceberg::FieldType::from_iceberg_type)
+}
+
+/// [`keyless_map_diagnostics`] for a published source, with each logical
+/// table's keys learned the way its queries learn them
+/// ([`fluree_db_query::r2rml::effective_table_keys`]) through `provider`,
+/// within [`REGISTRATION_PROBE_BUDGET`]. A table whose keys cannot be learned
+/// (it does not load, or a key the mapping declares on it cannot hold) gets
+/// no advisory: registration reports the first, and its queries refuse the
+/// second. Past the budget, no advisory at all.
+pub(crate) async fn registered_keyless_maps(
+    provider: &FlureeR2rmlProvider<'_>,
+    graph_source_id: &str,
+    compiled: &CompiledR2rmlMapping,
+    queries: QueryTables,
+    remedy: KeyRemedy,
+) -> Vec<fluree_db_r2rml::emit::Diagnostic> {
+    let tables: std::collections::BTreeSet<&str> = compiled
+        .triples_maps
+        .values()
+        .filter_map(|tm| tm.table_name())
+        .collect();
+    let learn = async {
+        let mut keys = std::collections::HashMap::new();
+        for table in tables {
+            match fluree_db_query::r2rml::effective_table_keys(
+                provider,
+                compiled,
+                graph_source_id,
+                table,
+                None,
+            )
+            .await
+            {
+                Ok(found) => {
+                    keys.insert(table.to_string(), found);
+                }
+                Err(error) => {
+                    debug!(graph_source_id = %graph_source_id, table = %table, error = %error, "Could not learn the table's keys at registration");
+                }
+            }
+        }
+        keys
+    };
+    match tokio::time::timeout(REGISTRATION_PROBE_BUDGET, learn).await {
+        Ok(keys) => keyless_map_diagnostics(compiled, &keys, queries, remedy),
+        Err(_elapsed) => {
+            debug!(graph_source_id = %graph_source_id, "Learning the tables' keys ran past the registration budget");
+            Vec::new()
+        }
+    }
+}
+
+/// [`R2rmlTableProvider::table_keys`] for a logical table over an Iceberg
+/// table read under `schema` (the pinned snapshot's, under current names):
+/// refuse a declared key naming a column the schema lacks, one that cannot
+/// identify a row, or one the logical table's query does not select
+/// (`selects`), then report the identifier fields as one key. `logical_table`
+/// names the logical table in a refusal.
+///
+/// Identifier fields count only through format version 3: version 4 replaces
+/// them with table constraints, and its readers must ignore them. A key whose
+/// field is nested (no top-level column), cannot identify a row, or is not
+/// selected is not reported. A row filter keeps a subset of the table's rows,
+/// and no two rows of a subset agree on a key no two rows of the table agree
+/// on, so the identifier fields hold for a filtered logical table too.
+fn iceberg_table_keys(
+    format_version: i32,
+    schema: &fluree_db_iceberg::metadata::Schema,
+    logical_table: &str,
+    declared: &fluree_db_r2rml::TableKeys,
+    selects: impl Fn(&str) -> bool,
+) -> fluree_db_r2rml::R2rmlResult<Option<Vec<Vec<String>>>> {
+    use fluree_db_r2rml::mapping::KeyColumn;
+    let column = |name: &str| match schema.field_by_name(name) {
+        Some(field) if selects(name) => KeyColumn::Typed(iceberg_flat_type(field)),
+        _ => KeyColumn::Absent,
+    };
+    if let Some(name) = declared
+        .iter()
+        .flatten()
+        .find(|name| schema.field_by_name(name).is_some() && !selects(name))
+    {
+        return Err(fluree_db_r2rml::R2rmlError::InvalidValue {
+            property: "f:key".to_string(),
+            message: format!(
+                "on the logical table \"{logical_table}\", a key names column \"{name}\", \
+                 which the query does not select"
+            ),
+        });
+    }
+    declared.check_columns(logical_table, column)?;
+    let names: Option<Vec<String>> = schema
+        .identifier_field_ids
+        .iter()
+        .map(|id| schema.field(*id).map(|field| field.name.clone()))
+        .collect();
+    Ok(identifier_fields_key(format_version, names, column))
+}
+
+/// The key an Iceberg table's identifier fields state for a logical table
+/// over it, as [`R2rmlTableProvider::table_keys`] reports it: the
+/// identifier columns (`identifier_columns`, by name; `None` when one of the
+/// ids names no field) as one key, when the format still has readers honor
+/// them (version 3 or older) and `column` says the logical table holds every
+/// one as a column that can identify a row. `None` when it states none.
+///
+/// Shared by the query path and the dry-run (`validate_r2rml`), so a mapping
+/// is told it is keyless exactly when its queries will find it so.
+pub(crate) fn identifier_fields_key(
+    format_version: i32,
+    identifier_columns: Option<Vec<String>>,
+    column: impl FnMut(&str) -> fluree_db_r2rml::mapping::KeyColumn,
+) -> Option<Vec<Vec<String>>> {
+    let names = identifier_columns.filter(|names| !names.is_empty())?;
+    if format_version > 3 {
+        return None;
+    }
+    let reported = fluree_db_r2rml::TableKeys::new([names]).retain_usable(column);
+    (!reported.is_empty()).then(|| reported.iter().map(<[String]>::to_vec).collect())
+}
+
+fn snapshot_cache_key(metadata_location: &str, selected: SelectedSnapshot<'_>) -> String {
+    if selected.is_current {
+        metadata_location.to_string()
+    } else {
+        format!(
+            "{metadata_location}#snapshot={}",
+            selected.snapshot.snapshot_id
+        )
+    }
 }
 
 impl<'a> FlureeR2rmlProvider<'a> {
@@ -1216,13 +2062,150 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Self {
             fluree,
             session: std::sync::Arc::new(super::catalog_session::IcebergCatalogSession::default()),
+            source_times: std::sync::Mutex::new(std::collections::HashMap::new()),
+            recent_contexts: std::sync::Mutex::new(std::collections::HashMap::new()),
+            logical_scans: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
+    /// The table a triples map's logical table scans, and the rows of it the
+    /// map keeps: `table_name` is what
+    /// [`TriplesMap::table_name`](fluree_db_r2rml::mapping::TriplesMap::table_name)
+    /// returns, a table or an `rr:sqlQuery` alias. Every Iceberg read of a map's
+    /// rows resolves through here, so the snapshot pin, the caches and the
+    /// watermark are keyed by the real table, and no reader can scan the table
+    /// without the map's filter. Memoized per query.
+    pub(crate) async fn logical_scan(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<super::row_filter::LogicalScan> {
+        use super::row_filter::LogicalScan;
+        if !fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Ok(LogicalScan::table(table_name));
+        }
+        let key = (graph_source_id.to_string(), table_name.to_string());
+        let memoized = self
+            .logical_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&key)
+            .cloned();
+        if let Some(scan) = memoized {
+            return Ok(scan);
+        }
+        let mapping = self.compiled_mapping(graph_source_id, None).await?;
+        let scan = LogicalScan::resolve(&mapping, table_name).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+        })?;
+        self.logical_scans
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key, scan.clone());
+        Ok(scan)
+    }
+
+    /// Pins are keyed by the normalized `name:branch` id; the R2RML operator
+    /// carries the GRAPH IRI as the user wrote it, which may omit the branch.
+    fn pin_key(graph_source_id: &str) -> String {
+        // A GRAPH IRI that is not a source id keys on itself and finds no pin.
+        fluree_db_core::LedgerId::parse(graph_source_id)
+            .map_or_else(|_| graph_source_id.to_string(), String::from)
+    }
+
+    /// This query's pin for `graph_source_id`, if any.
+    fn source_time(&self, graph_source_id: &str) -> Option<SourceTime> {
+        self.source_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&Self::pin_key(graph_source_id))
+            .copied()
+    }
+
+    /// A pin on a source the SQL lane serves cannot be honored there; refuse
+    /// rather than read the live tables. View construction already refuses a
+    /// pin on a non-Iceberg source, so this only guards the provider itself.
+    #[cfg(feature = "sql")]
+    fn refuse_pin_on_sql_source(&self, graph_source_id: &str) -> QueryResult<()> {
+        match self.source_time(graph_source_id) {
+            Some(_) => Err(QueryError::UnsupportedFeature(format!(
+                "graph source '{graph_source_id}' is SQL-backed and does not support \
+                 time-pinned reads"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    /// The snapshot this query reads for `table_name`: the source's pin resolved
+    /// against `metadata`, else the current snapshot. Both the scan and the
+    /// COUNT shortcut select through here, so they cannot disagree. A pin that
+    /// no retained snapshot satisfies is an error, never the current snapshot.
+    /// `Ok(None)` is only an unpinned table with no snapshots.
+    fn select_snapshot<'m>(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        metadata: &'m TableMetadata,
+    ) -> QueryResult<Option<SelectedSnapshot<'m>>> {
+        let snapshot = match self.source_time(graph_source_id) {
+            None => metadata.current_snapshot(),
+            Some(SourceTime::SnapshotId(snapshot_id)) => {
+                Some(metadata.snapshot(snapshot_id).ok_or_else(|| {
+                    QueryError::SnapshotNotFound {
+                        table: table_name.to_string(),
+                        snapshot_id,
+                    }
+                })?)
+            }
+            Some(SourceTime::AsOfTimestampMs(ms)) => Some(
+                fluree_db_iceberg::metadata::select_snapshot(
+                    metadata,
+                    &SnapshotSelection::AsOfTime(ms),
+                )
+                .ok_or_else(|| QueryError::NoSnapshotAtTime {
+                    table: table_name.to_string(),
+                    requested: crate::time_resolve::epoch_ms_to_iso(ms),
+                    oldest: fluree_db_iceberg::metadata::earliest_as_of_time_ms(metadata)
+                        .map(crate::time_resolve::epoch_ms_to_iso),
+                })?,
+            ),
+        };
+        Ok(snapshot.map(|snapshot| SelectedSnapshot {
+            snapshot,
+            is_current: Some(snapshot.snapshot_id) == metadata.current_snapshot_id,
+        }))
+    }
+
+    /// The record a per-family dispatch probe ([`Self::sql_source`],
+    /// [`Self::delta_source`]) decides on.
+    ///
+    /// The probes receive a GRAPH IRI as the query wrote it: the SQL lane asks
+    /// about every constant `GRAPH <iri>` that names a dataset member, and a
+    /// ledger's own graphs (`ledger#graph`, `urn:fluree:ledger#txn-meta`) are
+    /// members too. An IRI that does not parse as a graph-source id names no
+    /// source, so it is `Ok(None)` without a lookup. A failed lookup of a
+    /// well-formed id still fails the query, so a nameservice outage cannot
+    /// quietly send a real source down another plan.
+    #[cfg(any(feature = "sql", feature = "delta"))]
+    async fn dispatch_record(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<fluree_db_nameservice::GraphSourceRecord>> {
+        let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
+            return Ok(None);
+        };
+        self.fluree
+            .nameservice()
+            .lookup_graph_source(&id)
+            .await
+            .map(|record| record.filter(|record| !record.retracted))
+            .map_err(|e| QueryError::Nameservice(e.to_string()))
+    }
+
     /// The SQL source behind `graph_source_id`, or `None` when it is
-    /// Iceberg-backed. Decided once per query session: the nameservice lookup
-    /// is not free on a storage-backed nameservice, and a query scans a source
-    /// once per triples map it touches.
+    /// Iceberg-backed or not a graph source. Decided once per query session:
+    /// the nameservice lookup is not free on a storage-backed nameservice, and
+    /// a query scans a source once per triples map it touches.
     #[cfg(feature = "sql")]
     async fn sql_source(
         &self,
@@ -1231,13 +2214,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
         if let Some(decision) = self.session.sql_dispatch(graph_source_id) {
             return Ok(decision);
         }
-        let record = self
-            .fluree
-            .nameservice()
-            .lookup_graph_source(graph_source_id)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?;
-        let decision = match record {
+        let decision = match self.dispatch_record(graph_source_id).await? {
             Some(r) if r.source_type == GraphSourceType::Sql => Some(Arc::new(
                 super::sql::SqlSource::open(self.fluree, &r).await?,
             )),
@@ -1245,6 +2222,28 @@ impl<'a> FlureeR2rmlProvider<'a> {
         };
         self.session
             .memo_sql_dispatch(graph_source_id, decision.clone());
+        Ok(decision)
+    }
+
+    /// The Delta source behind `graph_source_id`, or `None` for any other
+    /// family. Memoized per query like [`Self::sql_source`]; the memoized source
+    /// also fixes the table versions this query reads.
+    #[cfg(feature = "delta")]
+    async fn delta_source(
+        &self,
+        graph_source_id: &str,
+    ) -> QueryResult<Option<Arc<super::delta::DeltaSource>>> {
+        if let Some(decision) = self.session.delta_dispatch(graph_source_id) {
+            return Ok(decision);
+        }
+        let decision = match self.dispatch_record(graph_source_id).await? {
+            Some(r) if r.source_type == GraphSourceType::Delta => {
+                Some(Arc::new(super::delta::DeltaSource::open(&r)?))
+            }
+            _ => None,
+        };
+        self.session
+            .memo_delta_dispatch(graph_source_id, decision.clone());
         Ok(decision)
     }
 
@@ -1260,13 +2259,24 @@ impl<'a> FlureeR2rmlProvider<'a> {
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<(Arc<IcebergStorageBackend>, Arc<TableMetadata>, String)> {
+        // The materialization reads here apply no row filter, so an
+        // `rr:sqlQuery` logical table must never reach them (the tracking
+        // materializer refuses such a mapping up front).
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::InvalidQuery(format!(
+                "Graph source '{graph_source_id}': rr:sqlQuery logical table '{table_name}' \
+                 cannot be read by an incremental or windowed scan, which applies no row filter"
+            )));
+        }
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -1302,58 +2312,42 @@ impl<'a> FlureeR2rmlProvider<'a> {
         // The effective Direct table location, captured for the relocated-table
         // remap inference below (None for REST).
         let mut direct_location: Option<String> = None;
-        let (load_response, storage) = match &iceberg_config.catalog {
-            CatalogConfig::Rest {
-                uri,
-                warehouse,
-                auth,
-                ..
-            } => {
-                let auth_provider = auth.create_provider_arc().map_err(|e| {
-                    QueryError::Internal(format!("Failed to create auth provider: {e}"))
-                })?;
-                let catalog_config = RestCatalogConfig {
-                    uri: uri.clone(),
-                    warehouse: warehouse.clone(),
-                    ..Default::default()
-                };
-                let catalog =
-                    RestCatalogClient::new(catalog_config, auth_provider).map_err(|e| {
-                        QueryError::Internal(format!("Failed to create catalog client: {e}"))
-                    })?;
+        let (load_response, storage, scope) = match &iceberg_config.catalog {
+            CatalogConfig::Rest { .. }
+            | CatalogConfig::Glue { .. }
+            | CatalogConfig::S3Tables { .. } => {
+                // A fresh catalog load: incremental and materialize reads want the
+                // catalog's current pointer, not a cached one. The client is the
+                // shared process-wide one (so REST `SecretRef` auth is hydrated, as
+                // on the query path), and storage makes the query path's
+                // decision (`super::storage`): a source that requires vended
+                // credentials is never read with the process's ambient identity.
+                let catalog = shared_catalog_client(
+                    self.fluree,
+                    graph_source_id,
+                    &record.config,
+                    &iceberg_config,
+                )
+                .await?
+                .expect("a non-Direct source has a catalog client");
                 let load_response = catalog
-                    .load_table(&table_id, iceberg_config.io.vended_credentials)
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to load table from catalog: {e}"))
-                    })?;
-                // GCS-backed tables read through this same S3 SDK path; the
-                // client is pinned to HTTP/1.1 (see `S3IcebergStorage`). Vended
-                // creds win, with the io config as fallback for region/endpoint/
-                // path-style.
-                let storage = if let Some(ref credentials) = load_response.credentials {
-                    S3IcebergStorage::from_vended_credentials(
-                        credentials,
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
+                    .load_table(
+                        &table_id,
+                        iceberg_config
+                            .io
+                            .requests_vended_credentials(&iceberg_config.catalog),
                     )
                     .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
-                } else {
-                    S3IcebergStorage::from_default_chain(
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await
-                    .map_err(|e| {
-                        QueryError::Internal(format!("Failed to create S3 storage: {e}"))
-                    })?
-                };
-                (load_response, Arc::new(IcebergStorageBackend::S3(storage)))
+                    .map_err(|e| storage_query_error("Failed to load table from catalog", e))?;
+                let plan = plan_for(
+                    self.fluree,
+                    &iceberg_config,
+                    &load_response.metadata_location,
+                )
+                .await?;
+                let grant = CatalogGrant::from_load(&load_response, Some((&catalog, &table_id)));
+                let storage = fresh_storage(&plan, &grant).await?;
+                (load_response, storage, plan.scope().clone())
             }
             CatalogConfig::Direct { table_location } => {
                 // Warehouse-root resolution — the same step the query path
@@ -1375,13 +2369,11 @@ impl<'a> FlureeR2rmlProvider<'a> {
                     &table_id.namespace,
                     &table_id.table,
                 );
+                // One decision for the whole Direct table (the root and the table
+                // beneath it share a scheme and bucket).
+                let plan = plan_for(self.fluree, &iceberg_config, table_location).await?;
                 let effective_location = self
-                    .resolve_direct_table_location(
-                        table_location,
-                        &table_id,
-                        &lt_key,
-                        &iceberg_config,
-                    )
+                    .resolve_direct_table_location(table_location, &table_id, &lt_key, &plan)
                     .await?;
                 let table_location = &effective_location;
                 // The RESOLVED table dir is what the relocation remap compares
@@ -1389,25 +2381,20 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 // never match it. Mirrors the query path's ordering.
                 direct_location = Some(effective_location.clone());
 
-                // Storage through the session, which dispatches on the location
-                // scheme (a `file://` / absolute-path table reads the filesystem
-                // directly, skipping the S3 client build and its credential-chain
+                // Storage through the session (the plan decides the backend: a
+                // `file://` / absolute-path table reads the filesystem directly,
+                // skipping the S3 client build and its credential-chain
                 // resolution). Going through the session rather than building a
                 // client here means the warehouse-root branch above — which
                 // already built one to LIST the root — hands its client over
                 // instead of having it constructed and discarded.
-                let storage = direct_session_storage(
-                    &self.session,
-                    &lt_key,
-                    table_location,
-                    iceberg_config.io.s3_region.as_deref(),
-                    iceberg_config.io.s3_endpoint.as_deref(),
-                    iceberg_config.io.s3_path_style,
-                )
-                .await?;
+                let storage =
+                    session_storage(&self.session, &lt_key, &plan, &CatalogGrant::direct()).await?;
+                let scope = plan.scope();
                 let cache = self.fluree.r2rml_cache();
-                let load_response = if let Some(metadata_location) =
-                    cache.get_direct_metadata_location(table_location).await
+                let load_response = if let Some(metadata_location) = cache
+                    .get_direct_metadata_location(scope, table_location)
+                    .await
                 {
                     fluree_db_iceberg::catalog::LoadTableResponse {
                         metadata_location,
@@ -1429,19 +2416,20 @@ impl<'a> FlureeR2rmlProvider<'a> {
                             })?;
                     cache
                         .put_direct_metadata_location(
-                            table_location.clone(),
+                            scope,
+                            table_location,
                             load_response.metadata_location.clone(),
                         )
                         .await;
                     load_response
                 };
-                (load_response, storage)
+                (load_response, storage, scope.clone())
             }
         };
 
         let cache = self.fluree.r2rml_cache();
         let metadata_location = load_response.metadata_location.clone();
-        let metadata = if let Some(cached) = cache.get_metadata(&metadata_location).await {
+        let metadata = if let Some(cached) = cache.get_metadata(&scope, &metadata_location).await {
             cached
         } else {
             let metadata_bytes = storage
@@ -1454,7 +2442,7 @@ impl<'a> FlureeR2rmlProvider<'a> {
             })?;
             let metadata = Arc::new(parsed);
             cache
-                .put_metadata(metadata_location.clone(), Arc::clone(&metadata))
+                .put_metadata(&scope, &metadata_location, Arc::clone(&metadata))
                 .await;
             metadata
         };
@@ -1467,7 +2455,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((storage, metadata, metadata_location))
     }
 
-    /// Stream a set of scan tasks as column batches, with bounded parallelism.
+    /// Stream a set of scan tasks as column batches, with bounded parallelism,
+    /// in the tasks' (commit) order (see [`read_files_in_order`]).
     ///
     /// Only `O(iceberg_scan_concurrency)` file decodes are resident at a time, so a
     /// consumer that processes and drops each batch never holds the whole table.
@@ -1488,35 +2477,19 @@ impl<'a> FlureeR2rmlProvider<'a> {
             concurrency, "streaming Parquet files (bounded parallel)"
         );
         let storage = Arc::clone(storage);
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
-                let storage = Arc::clone(&storage);
-                let footers = Arc::clone(&footers);
-                async move {
-                    tokio::spawn(async move {
-                        let reader =
-                            SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
-                        reader.read_task(&task).await.map_err(|e| {
-                            QueryError::Internal(format!(
-                                "Failed to read Parquet file '{}': {e}",
-                                task.data_file.file_path
-                            ))
-                        })
-                    })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
-                }
-            })
-            .buffer_unordered(concurrency)
-            // One file's `Result<Vec<ColumnBatch>>` becomes individual
-            // `Result<ColumnBatch>` items; a read error becomes one error item.
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
-                }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-        Box::pin(stream)
+        read_files_in_order(tasks, EmitOrder::AsListed, concurrency, move |task| {
+            let storage = Arc::clone(&storage);
+            let footers = Arc::clone(&footers);
+            async move {
+                let reader = SendParquetReader::with_cache(storage.as_ref(), footers.as_ref());
+                reader.read_task(&task).await.map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to read Parquet file '{}': {e}",
+                        task.data_file.file_path
+                    ))
+                })
+            }
+        })
     }
 
     /// Read a set of scan tasks into column batches with bounded parallelism.
@@ -1534,16 +2507,38 @@ impl<'a> FlureeR2rmlProvider<'a> {
     }
 
     /// The source table's current snapshot id (the materialization "to" point),
-    /// or `None` if the table has no snapshots yet.
+    /// or `None` if the table has no snapshots yet. For a Delta source, the
+    /// table's latest version.
     pub async fn current_snapshot_id(
         &self,
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<Option<i64>> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .latest_version(self.fluree, table_name)
+                .await
+                .map(Some);
+        }
         let (_storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
         Ok(metadata.current_snapshot().map(|s| s.snapshot_id))
+    }
+
+    /// The current metadata of `table_name` (a table, never an `rr:sqlQuery`
+    /// alias), resolved as a scan resolves it. `/info` reads a Direct
+    /// source's tables through here: it has no catalog to ask.
+    pub(crate) async fn table_metadata(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<Arc<TableMetadata>> {
+        Ok(self
+            .load_table_context(graph_source_id, table_name)
+            .await?
+            .metadata)
     }
 
     /// The table's current snapshot id and top-level column names, both
@@ -1561,8 +2556,10 @@ impl<'a> FlureeR2rmlProvider<'a> {
         graph_source_id: &str,
         table_name: &str,
     ) -> QueryResult<(Option<i64>, Vec<String>)> {
-        let (_storage, metadata, _loc) =
-            self.load_table_context(graph_source_id, table_name).await?;
+        let metadata = self
+            .load_table_context(graph_source_id, table_name)
+            .await?
+            .metadata;
         let schema = metadata
             .current_schema()
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
@@ -1575,30 +2572,48 @@ impl<'a> FlureeR2rmlProvider<'a> {
         Ok((metadata.current_snapshot().map(|s| s.snapshot_id), columns))
     }
 
-    /// The source graph source's materialization options from the persisted
-    /// `IcebergGsConfig`: the optional tombstone/delete convention and the
-    /// optional latest-by-key ordering column. Both `None` means additive,
-    /// scan-order materialization (legacy behavior).
+    /// The source graph source's materialization options from its persisted
+    /// config (`IcebergGsConfig` or `DeltaGsConfig`).
     pub async fn materialize_options(
         &self,
         graph_source_id: &str,
-    ) -> QueryResult<(Option<DeleteConvention>, Option<String>)> {
+    ) -> QueryResult<MaterializeOptions> {
         let record = self
             .fluree
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
+        #[cfg(feature = "delta")]
+        if record.source_type == GraphSourceType::Delta {
+            let config =
+                fluree_db_delta::DeltaGsConfig::from_json(&record.config).map_err(|e| {
+                    QueryError::Internal(format!(
+                        "Failed to parse Delta graph source config for '{graph_source_id}': {e}"
+                    ))
+                })?;
+            return Ok(MaterializeOptions {
+                delete: config.delete,
+                order_by: config.order_by,
+                change_feed: true,
+            });
+        }
         require_iceberg_backed(&record, graph_source_id)?;
         let config = IcebergGsConfig::from_json(&record.config).map_err(|e| {
             QueryError::Internal(format!(
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
             ))
         })?;
-        Ok((config.delete, config.order_by))
+        Ok(MaterializeOptions {
+            delete: config.delete,
+            order_by: config.order_by,
+            change_feed: false,
+        })
     }
 
     /// Scan only the data files ADDED in the snapshot window
@@ -1644,10 +2659,13 @@ impl<'a> FlureeR2rmlProvider<'a> {
                     table: snapshot_err_table.to_string(),
                     snapshot_id: to_snapshot_id,
                 })?;
+        // The mapping names columns as they are now: resolve them through the
+        // `to` snapshot's schema under current names, so a column renamed
+        // since `to` is still projected.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -1693,14 +2711,27 @@ impl<'a> FlureeR2rmlProvider<'a> {
     /// **never** a fall-forward: the from-side fall-forward below is a
     /// deliberate freshness/correctness trade a sync-to-head consumer wants,
     /// but silently moving a caller's `to` pin would change what the caller
-    /// asked to read.
+    /// asked to read. For the same reason a pinned read is never cut by the
+    /// per-pass row budget: that budget paces the tracking worker's unpinned
+    /// passes, and a prefix of a pin is a state the caller did not ask for.
     ///
-    /// Returns `(to_snapshot_id, incremental, batches)`:
+    /// **Delta sources.** `to` names a table version (`None` the latest). With a
+    /// `from_snapshot_id`, the window is the table's change data feed after that
+    /// version, flagged by [`MaterializeScan::change_feed`] and cut at a commit
+    /// boundary by the row budget unless pinned. Without one, or when the feed
+    /// cannot serve the window (not enabled, schema changed, log cleaned), the
+    /// `to` version is read whole. `from_sequence` is an Iceberg cursor and is
+    /// ignored.
+    ///
+    /// Returns a [`MaterializeScan`]:
     /// - `to_snapshot_id` — the resolved snapshot id of this read (the new
     ///   watermark to persist), or `None` if the table has no snapshots yet
     ///   (nothing to materialize; only possible when the caller didn't pin).
     /// - `incremental` — whether an added-files-only scan was used (vs a full
     ///   read of the live table state).
+    /// - `to_sequence` — set only when an unpinned Iceberg pass was cut short.
+    /// - `change_feed` / `stopped_at` — a Delta change feed window, and the
+    ///   version the row budget cut it at.
     ///
     /// An incremental scan is used when `from_snapshot_id` is set **and** the
     /// window `(from, to]` is incremental-safe — only `append`/`replace`
@@ -1742,6 +2773,26 @@ impl<'a> FlureeR2rmlProvider<'a> {
         to_snapshot_id: Option<i64>,
         from_sequence: Option<i64>,
     ) -> QueryResult<MaterializeScan> {
+        // A pinned read is never cut, on every path and for every source. `0`
+        // is the disabled budget: neither Iceberg full-read cut takes a prefix
+        // under it, the incremental cap is skipped for a pin outright, and a
+        // Delta change feed reads its whole window.
+        let pinned = to_snapshot_id.is_some();
+        let budget_rows = if pinned { 0 } else { self.pass_row_budget() };
+
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .materialize_scan(
+                    self.fluree,
+                    table_name,
+                    projection,
+                    from_snapshot_id,
+                    to_snapshot_id,
+                    budget_rows,
+                )
+                .await;
+        }
         let (storage, metadata, _loc) = self
             .prepare_iceberg_scan(graph_source_id, table_name)
             .await?;
@@ -1751,7 +2802,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
         } else {
             table_name
         };
-        let pinned = to_snapshot_id.is_some();
         let to_snapshot = match to_snapshot_id {
             // A caller's pin must resolve — typed error, never fall-forward
             // (see the doc comment).
@@ -1774,6 +2824,8 @@ impl<'a> FlureeR2rmlProvider<'a> {
                 incremental: false,
                 window_age_ms: None,
                 to_sequence: None,
+                change_feed: false,
+                stopped_at: None,
                 stream: empty_batch_stream(),
             });
         };
@@ -1807,8 +2859,6 @@ impl<'a> FlureeR2rmlProvider<'a> {
                  stopped for longer than retention."
             ),
         }
-
-        let budget_rows = self.pass_row_budget();
 
         // An UNPINNED incremental window is read in bounded steps.
         //
@@ -1901,12 +2951,14 @@ impl<'a> FlureeR2rmlProvider<'a> {
         let mut to_snapshot_id = to_snapshot.snapshot_id;
 
         // Schema AT the `to` snapshot (falls back to current when the snapshot
-        // carries no schema-id) — identical to current for an uncapped, unpinned
-        // read.
+        // carries no schema-id), under current column names: the mapping names
+        // columns as they are now, so a column renamed since `to` (a pinned or
+        // capped window) must still be projected. Identical to current for an
+        // uncapped, unpinned read.
         let schema = metadata
-            .schema_for_snapshot(to_snapshot)
+            .read_schema_for_snapshot(to_snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
-        let projected_field_ids = projected_field_ids(schema, projection);
+        let projected_field_ids = projected_field_ids(&schema, projection);
 
         let scan_config = ScanConfig::new().with_projection(projected_field_ids);
         let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
@@ -2117,8 +3169,34 @@ impl<'a> FlureeR2rmlProvider<'a> {
             incremental,
             window_age_ms,
             to_sequence,
+            change_feed: false,
+            stopped_at: None,
             stream,
         })
+    }
+
+    /// The rows a change feed source's table holds at `version`, narrowed by
+    /// `filters` where the reader can state them exactly; the caller still
+    /// tests every row. Latest-by-key materialization reads a key back this
+    /// way when a change feed retraction leaves its fate to the table. Only a
+    /// Delta source has a change feed.
+    pub async fn rows_at_version(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        version: i64,
+        filters: &[ScanFilter],
+    ) -> QueryResult<ColumnBatchStream> {
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .rows_at(self.fluree, table_name, version, filters)
+                .await;
+        }
+        let _ = (table_name, version, filters);
+        Err(QueryError::Internal(format!(
+            "graph source '{graph_source_id}' has no change data feed"
+        )))
     }
 }
 
@@ -2132,34 +3210,54 @@ impl std::fmt::Debug for FlureeR2rmlProvider<'_> {
 #[async_trait]
 impl R2rmlProvider for FlureeR2rmlProvider<'_> {
     /// Check if a graph source has an R2RML mapping.
-    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> bool {
-        match self
+    ///
+    /// The probe receives GRAPH IRIs as a query wrote them. One that does not
+    /// parse as a graph-source id names no source, so it is `false` without a
+    /// lookup. A failed lookup of a well-formed id fails the query: reading it
+    /// as "no mapping" would query an R2RML / Iceberg / SQL source as an empty
+    /// native graph whenever the nameservice is unavailable. A source no query
+    /// can read as a graph (a mapped one with no mapping, an index) fails it
+    /// for the same reason ([`served_mapping_of`]).
+    async fn has_r2rml_mapping(&self, graph_source_id: &str) -> QueryResult<bool> {
+        let Ok(id) = fluree_db_core::LedgerId::parse(graph_source_id) else {
+            return Ok(false);
+        };
+        let record = self
             .fluree
             .nameservice()
-            .lookup_graph_source(graph_source_id)
+            .lookup_graph_source(&id)
             .await
-        {
-            Ok(Some(record)) => mapping_source_of(&record).is_some(),
-            Ok(None) => false,
-            Err(_) => false,
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?;
+        match record {
+            // A drop leaves the record as a tombstone.
+            Some(record) if !record.retracted => Ok(served_mapping_of(&record)?.is_some()),
+            _ => Ok(false),
         }
     }
 
     /// Get the compiled R2RML mapping for a graph source.
     ///
-    /// This method uses the R2RML cache to avoid repeated parsing and compilation.
+    /// This method uses the R2RML cache to avoid repeated parsing and
+    /// compilation, and resolves each source once per query session: every
+    /// schema probe and key lookup would otherwise repeat the nameservice
+    /// lookup.
     async fn compiled_mapping(
         &self,
         graph_source_id: &str,
         _as_of_t: Option<i64>,
     ) -> QueryResult<Arc<CompiledR2rmlMapping>> {
+        if let Some(mapping) = self.session.mapping(graph_source_id) {
+            return Ok(mapping);
+        }
         // Look up the graph source record
         let record = self
             .fluree
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -2175,9 +3273,10 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             )));
         }
 
-        let mapping_config = mapping_source_of(&record).ok_or_else(|| {
+        let mapping_config = served_mapping_of(&record)?.ok_or_else(|| {
             QueryError::InvalidQuery(format!(
-                "Graph source '{graph_source_id}' is missing 'mapping' in config"
+                "Graph source '{}' is not an R2RML graph source (type: {:?})",
+                graph_source_id, record.source_type
             ))
         })?;
         let mapping_config = &mapping_config;
@@ -2195,6 +3294,8 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
                 cache_key = %cache_key,
                 "R2RML mapping cache hit"
             );
+            self.session
+                .memo_mapping(graph_source_id, Arc::clone(&cached));
             return Ok(cached);
         }
 
@@ -2261,6 +3362,14 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             }
         };
 
+        // A mapping that defines nothing has nothing to answer from; a source
+        // registered before registration refused one keeps it.
+        if compiled.is_empty() {
+            return Err(QueryError::GraphSourceUnmapped {
+                graph_source_id: graph_source_id.to_string(),
+                empty_mapping: true,
+            });
+        }
         let compiled = Arc::new(compiled);
 
         // Cache the compiled mapping
@@ -2275,6 +3384,8 @@ impl R2rmlProvider for FlureeR2rmlProvider<'_> {
             "Loaded, compiled, and cached R2RML mapping"
         );
 
+        self.session
+            .memo_mapping(graph_source_id, Arc::clone(&compiled));
         Ok(compiled)
     }
 
@@ -2355,7 +3466,32 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
         projection: &[String],
         filters: &[ScanFilter],
         topk: Option<&ScanTopK>,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<ColumnBatchStream> {
+        self.scan_table_ordered(
+            graph_source_id,
+            table_name,
+            projection,
+            filters,
+            topk,
+            as_of_t,
+            ScanOrder::Deterministic,
+        )
+        .await
+    }
+
+    /// [`Self::scan_table`] under `order`: a deterministic scan emits its files
+    /// smallest first; an [`ScanOrder::Any`] scan emits them as their reads
+    /// finish.
+    async fn scan_table_ordered(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        projection: &[String],
+        filters: &[ScanFilter],
+        topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
         // Time the whole scan SETUP (loadTable + planning) as one span; it closes
         // when the stream is constructed. Per-file Parquet decode happens later,
@@ -2375,6 +3511,7 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             filters,
             topk,
             _as_of_t,
+            order,
         )
         .instrument(span)
         .await
@@ -2459,6 +3596,187 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
             .await
     }
 
+    /// The keys the pinned snapshot's schema states: its identifier fields,
+    /// under the names a mapping reads them by, when the table's format still
+    /// has readers honor them (version 3 or older) and every one is a flat
+    /// column that can identify a row. Refuses the query when a key the
+    /// mapping declares on the table (`f:key`) names a column the snapshot
+    /// lacks or one whose values cannot identify a row, so no lane trusts a
+    /// key the table cannot hold. A SQL source reports the key its
+    /// duplicate-subject probe verified; a Delta source reports none.
+    async fn table_keys(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        as_of_t: Option<i64>,
+    ) -> QueryResult<Option<Vec<Vec<String>>>> {
+        #[cfg(feature = "sql")]
+        if let Some(sql) = self.sql_source(graph_source_id).await? {
+            let mapping = self.compiled_mapping(graph_source_id, as_of_t).await?;
+            return sql.table_keys(&self.session, &mapping, table_name).await;
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        // An `rr:sqlQuery` alias names the query's rows: its keys are the ones
+        // declared on it, checked against the table it reads and its select
+        // list.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table = logical.table.as_str();
+        let TableContext { metadata, .. } = self.load_table_context(graph_source_id, table).await?;
+        let schema = match self.select_snapshot(graph_source_id, table, &metadata)? {
+            Some(selected) => metadata.read_schema_for_snapshot(selected.snapshot),
+            // No snapshot holds no row; the declared keys are still checked.
+            None => metadata.current_schema().map(std::borrow::Cow::Borrowed),
+        };
+        let Some(schema) = schema else {
+            return Ok(None);
+        };
+        let mapping = self.compiled_mapping(graph_source_id, as_of_t).await?;
+        let declared = mapping.declared_keys(table_name);
+        let described = mapping
+            .sql_query_for_table(table_name)
+            .map_or(table_name, str::trim);
+        iceberg_table_keys(
+            metadata.format_version,
+            &schema,
+            described,
+            &declared,
+            |column| logical.selects(column),
+        )
+        .map_err(|e| QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}")))
+    }
+
+    /// The pinned snapshot's row count from what is already at hand, never
+    /// reading manifests to find out: the snapshot's kept file list (in
+    /// memory, from a scan of the table earlier in this process, then on
+    /// disk), else the snapshot summary's `total-records` (most writers record
+    /// it).
+    async fn known_row_count(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<u64>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        // A filtered logical table keeps at most its table's rows: the table's
+        // count bounds it, which is all a caller sizing a cache needs.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
+        let TableContext {
+            metadata,
+            metadata_location,
+            scope,
+            ..
+        } = self.load_table_context(graph_source_id, table_name).await?;
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
+            return Ok(Some(0));
+        };
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
+        if let Some(files) = self
+            .fluree
+            .r2rml_cache()
+            .get_scan_files(&scope, &cache_key)
+            .await
+        {
+            return Ok(u64::try_from(files.record_count()).ok());
+        }
+        if let Some(files) = self.catalog_disk_cache().get_scan_files(&scope, &cache_key) {
+            return Ok(u64::try_from(files.record_count()).ok());
+        }
+        Ok(selected
+            .snapshot
+            .total_records()
+            .and_then(|total| u64::try_from(total).ok()))
+    }
+
+    /// Plan the filtered scan against the same pinned snapshot the scan reads,
+    /// from the snapshot's kept file list as a scan would
+    /// (`plan_from_kept_files`): a warm snapshot reads nothing, and a cold one
+    /// reads its manifests once and keeps the list for the scan that follows.
+    /// Filters with nothing the planner can prune on report no file skipped;
+    /// SQL and Delta sources cannot tell.
+    async fn scan_file_counts(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+        filters: &[ScanFilter],
+        _as_of_t: Option<i64>,
+    ) -> QueryResult<Option<ScanFileCounts>> {
+        #[cfg(feature = "sql")]
+        if self.sql_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        #[cfg(feature = "delta")]
+        if self.delta_source(graph_source_id).await?.is_some() {
+            return Ok(None);
+        }
+        // A filtered logical table plans `filters` against the table it reads.
+        // Its row filter may prune more files than these counts show; they
+        // only decide whether a keyed read is worth making.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
+        let TableContext {
+            storage,
+            metadata,
+            metadata_location,
+            scope,
+        } = self.load_table_context(graph_source_id, table_name).await?;
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
+            return Ok(Some(ScanFileCounts {
+                selected: 0,
+                pruned: 0,
+            }));
+        };
+        let snapshot = selected.snapshot;
+        let Some(schema) = metadata.read_schema_for_snapshot(snapshot) else {
+            return Ok(None);
+        };
+        let Some(filter) = build_iceberg_filter(filters, schema.as_ref()) else {
+            return Ok(Some(ScanFileCounts {
+                selected: 0,
+                pruned: 0,
+            }));
+        };
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
+        let planner = SendScanPlanner::new(
+            storage.as_ref(),
+            &metadata,
+            ScanConfig::new().with_filter(filter),
+        );
+        let plan = self
+            .plan_from_kept_files(&planner, snapshot, &scope, &cache_key, &metadata_location)
+            .await?;
+        Ok(Some(ScanFileCounts {
+            selected: plan.files_selected as u64,
+            pruned: plan.files_pruned as u64,
+        }))
+    }
+
+    fn pin_source_time(&self, graph_source_id: &str, time: SourceTime) -> QueryResult<()> {
+        let mut pins = self
+            .source_times
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match pins.insert(Self::pin_key(graph_source_id), time) {
+            // One source, one state per query: `from` and `fromNamed` naming the
+            // same source at different times would otherwise race for the pin.
+            Some(prior) if prior != time => Err(QueryError::InvalidQuery(format!(
+                "graph source '{graph_source_id}' is pinned to two different states in one \
+                 query ({prior:?} and {time:?})"
+            ))),
+            _ => Ok(()),
+        }
+    }
+
     /// Warm the per-query catalog session pin + cross-query caches for a set of
     /// tables concurrently (PR-8 slice 1). Best-effort and side-effect-only: each
     /// `load_table_context` populates `self.session` + the moka caches, so the
@@ -2467,16 +3785,35 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
     /// scan re-resolves and surfaces them — so a warm failure degrades to today's
     /// serial GET, never a changed result.
     async fn prefetch_tables(&self, graph_source_id: &str, table_names: &[String]) {
+        #[cfg(feature = "delta")]
+        if let Ok(Some(delta)) = self.delta_source(graph_source_id).await {
+            delta
+                .prefetch(
+                    self.fluree,
+                    &self.session,
+                    table_names,
+                    self.source_time(graph_source_id),
+                )
+                .await;
+            return;
+        }
         // Dedup, preserving first-seen order, AND skip tables already resolved
         // (with unexpired creds) in this query's session pin — re-warming a
         // pinned table would issue a wasted `loadTable` GET. Collect OWNED names:
         // a `Vec<&str>` here makes the `buffered` fan-out closure take a borrowed
         // argument, which trips rustc's "FnOnce is not general enough" HRTB check.
+        // An `rr:sqlQuery` alias warms the table it scans; one that does not
+        // resolve is skipped (the scan reports why).
         let mut seen = std::collections::HashSet::new();
         let mut to_warm: Vec<String> = Vec::new();
         for t in table_names {
-            if seen.insert(t.as_str()) && !self.is_table_pinned(graph_source_id, t) {
-                to_warm.push(t.clone());
+            let Ok(scan) = self.logical_scan(graph_source_id, t).await else {
+                continue;
+            };
+            let t = scan.table;
+            if !seen.contains(&t) && !self.is_table_pinned(graph_source_id, &t) {
+                seen.insert(t.clone());
+                to_warm.push(t);
             }
         }
 
@@ -2529,122 +3866,215 @@ impl R2rmlTableProvider for FlureeR2rmlProvider<'_> {
 /// `create_provider_arc`: that resolves `ConfigValue`s SYNCHRONOUSLY, so a `SecretRef`
 /// reaching it un-hydrated hard-errors via `resolve()`'s fail-closed arm. Pairing the
 /// two here means a NEW client-construction site cannot silently ship without
-/// hydration — which is exactly how the pointer rung's copy arrived. (The one
-/// deliberate exception is `test_iceberg_connection`, which is `ApiError`-typed and
-/// hydrates inline so a missing/denied resolver surfaces as an actionable *config*
-/// error at the connection-test gate rather than a query error.)
+/// hydration — which is exactly how the pointer rung's copy arrived.
 ///
-/// ⚠️ ORDERING: the caller MUST already have computed its `rest_client_cache_key`
+/// ⚠️ ORDERING: the caller MUST already have computed its `catalog_client_cache_key`
 /// fingerprint over the RAW, reference-bearing config BEFORE calling this. Hydrating
 /// before the fingerprint re-keys the client cache on every secret rotation, turning
 /// one resolver call + OAuth exchange per client lifetime into one PER QUERY. Pinned
 /// by `secret_ref_fingerprint_is_rotation_stable`.
 async fn hydrated_auth_provider(
     auth: &fluree_db_iceberg::auth::AuthConfig,
-    resolver: Option<&Arc<dyn fluree_db_iceberg::SecretResolver>>,
+    identity: &fluree_db_iceberg::IdentityContext,
 ) -> QueryResult<Arc<dyn fluree_db_iceberg::auth::SendCatalogAuth>> {
     let hydrated = auth
-        .hydrate(resolver)
+        .hydrate(identity.secret_resolver.as_ref())
         .await
         .map_err(|e| QueryError::Internal(format!("Failed to resolve catalog auth secret: {e}")))?;
-    hydrated
-        .create_provider_arc()
-        .map_err(|e| QueryError::Internal(format!("Failed to create auth provider: {e}")))
+    hydrated.create_provider_arc(identity).map_err(|e| {
+        super::iceberg_catalog::identity_query_error(e).unwrap_or_else(|e| {
+            QueryError::Internal(format!("Failed to create auth provider: {e}"))
+        })
+    })
 }
 
-/// Resolve the S3 storage client for a REST table: the §2 credential decision, the
-/// query-session reuse (#1498), and the vended/ambient construction — in ONE place.
+/// The store a table is read with: the query session's, when this table was
+/// already resolved this query, else one built from `plan` (the source's
+/// storage decision, see [`super::storage`]) and the catalog's `grant`.
 ///
 /// **Both** the eager `load_table_context` arm and the deferred [`LazyS3Storage`]
-/// builder (via [`resolve_rest_load_and_storage`]) construct storage for the same
-/// table under the same config, so they MUST make the same credential decision. They
-/// were two independent copies; the copy the deferred builder used silently omitted
-/// §2's fail-closed check, which reopened the ambient downgrade on any lazy-forced
-/// build. Keep them behind this one helper — a second copy is a fail-open waiting to
-/// happen.
+/// builder (via [`resolve_catalog_load_and_storage`]) construct storage for the same
+/// table under the same config, so they MUST make the same credential decision.
+/// They do, because both build from the one plan the source's configuration
+/// decided, and §2 is part of it: a source that reads with vended credentials,
+/// granted none, is refused — checked BEFORE the session reuse, so a cached
+/// store can never stand in for a refusal. The loadTable caches preserve
+/// `credentials` verbatim and only ever MISS-and-reload on expiry, so a resolved
+/// `credentials == None` always means the catalog genuinely vended nothing.
 ///
-/// §2: a source configured for vended credentials (`io.vended_credentials = true`,
-/// the default) whose catalog vended none ERRORS — it must never silently fall back
-/// to the process's ambient AWS identity. Ambient is reachable only via an explicit
-/// `vended_credentials = false`. REST only: Direct never requests vending and has its
-/// own [`direct_session_storage`].
-async fn rest_session_storage(
+/// Reusing the session's store matters: building one (`aws_config` load + S3
+/// client + HTTP client) is not free, and a correlated join — or the slice-1
+/// prefetch→scan — resolves the same table repeatedly. Any fresh loadTable
+/// dropped the entry via `store_load_table`, so a hit here always corresponds to
+/// the current pinned credentials.
+async fn session_storage(
     session: &super::catalog_session::IcebergCatalogSession,
     lt_key: &str,
-    io: &IoConfig,
-    load_response: &LoadTableResponse,
-    catalog_uri: &str,
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
 ) -> QueryResult<Arc<IcebergStorageBackend>> {
-    // The loadTable caches preserve `credentials` verbatim and only ever
-    // MISS-and-reload on expiry, so a resolved `credentials == None` always means
-    // the catalog genuinely vended nothing — never a dropped-credential
-    // reconstruction. Safe to fail closed on.
-    if decide_credential_source(
-        io.vended_credentials,
-        load_response.credentials.is_some(),
-        true,
-    ) == CredentialSource::FailClosed
-    {
-        return Err(QueryError::CatalogCredentialsNotVended {
-            catalog_uri: catalog_uri.to_string(),
-        });
-    }
+    session_storage_inner(session, lt_key, plan, grant)
+        .await
+        .map_err(step_query_error)
+}
 
-    // Reuse the query session's cached S3 client for this table when one is present:
-    // constructing it (`aws_config` load + S3 client + HTTP client) is not free, and a
-    // correlated join — or the slice-1 prefetch→scan — resolves the same table
-    // repeatedly. Any fresh loadTable dropped the entry via `store_load_table`, so a
-    // hit here always corresponds to the current pinned credentials.
+/// [`session_storage`], failing with the store's own error.
+async fn session_storage_inner(
+    session: &super::catalog_session::IcebergCatalogSession,
+    lt_key: &str,
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> StepResult<Arc<IcebergStorageBackend>> {
+    plan.check_grant(grant)
+        .map_err(|e| ("Failed to create storage", e))?;
     if let Some(cached) = session.cached_storage(lt_key) {
-        debug!("S3 storage client reused (query-scoped)");
+        debug!("storage client reused (query-scoped)");
         return Ok(cached);
     }
-
-    // GCS-backed tables (S3-interop endpoint) are read through this same S3 SDK path;
-    // the SDK client is pinned to HTTP/1.1 so the GCS HTTP/2 range-read bug cannot
-    // occur.
-    let built = if let Some(ref credentials) = load_response.credentials {
-        info!(
-            region = ?io.s3_region,
-            endpoint = ?io.s3_endpoint,
-            "Using vended credentials from catalog"
-        );
-        // Thread the io overrides so a catalog that omits the region (or where we want
-        // an operator-configured endpoint/path-style) still resolves correctly.
-        // Precedence inside the call: vended > these overrides > SDK.
-        S3IcebergStorage::from_vended_credentials(
-            credentials,
-            io.s3_region.as_deref(),
-            io.s3_endpoint.as_deref(),
-            io.s3_path_style,
-        )
-        .await
-        .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
-    } else {
-        // Reachable only under an explicit `vended_credentials = false` (§2 returned
-        // above otherwise).
-        info!(
-            region = ?io.s3_region,
-            endpoint = ?io.s3_endpoint,
-            "Using ambient AWS credentials"
-        );
-        S3IcebergStorage::from_default_chain(
-            io.s3_region.as_deref(),
-            io.s3_endpoint.as_deref(),
-            io.s3_path_style,
-        )
-        .await
-        .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?
-    };
-    let built = Arc::new(IcebergStorageBackend::S3(built));
+    let built = fresh_storage_inner(plan, grant).await?;
     session.store_storage(lt_key.to_string(), Arc::clone(&built));
     Ok(built)
 }
 
-/// Resolve `loadTable` (the REST catalog GET, honoring the query pin + the
-/// cross-query cache) and build the vended-credential S3 storage — the SAME
-/// session-pin path the eager scan used before the lazy split (PR-8 loadTable-
-/// metadata cache, `21-loadtable-metadata-cache.md`).
+/// [`session_storage`] without the query session: a store built from `plan`
+/// and `grant`, for the incremental / materialize scans
+/// ([`FlureeR2rmlProvider::prepare_iceberg_scan`]) and the `/info` row counts,
+/// which load the catalog's current pointer each time and so reuse no
+/// per-query client.
+async fn fresh_storage(
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> QueryResult<Arc<IcebergStorageBackend>> {
+    fresh_storage_inner(plan, grant)
+        .await
+        .map_err(step_query_error)
+}
+
+/// [`fresh_storage`], failing with the store's own error.
+async fn fresh_storage_inner(
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> StepResult<Arc<IcebergStorageBackend>> {
+    let resolved = plan
+        .build(grant)
+        .await
+        .map_err(|e| ("Failed to create storage", e))?;
+    Ok(Arc::new(resolved.backend))
+}
+
+/// A storage step's failure before it is a query's: the step, as the eager
+/// arm names it, and the store's own error. The eager arm converts it once,
+/// at its edge ([`step_query_error`]). The deferred [`LazyS3Storage`] builder
+/// hands the error itself to the read that forced it, which converts it as it
+/// converts any store error: there is no conversion back from a
+/// [`QueryError`] to flatten a typed refusal on the way.
+type StepError = (&'static str, IcebergError);
+type StepResult<T> = std::result::Result<T, StepError>;
+
+/// The query error a failed storage step reports on the eager arm.
+fn step_query_error((context, error): StepError) -> QueryError {
+    storage_query_error(context, error)
+}
+
+/// The storage plan for a read of `location` by the source `config`, under
+/// the instance's identity context; see [`super::storage::plan_storage`].
+async fn plan_for(
+    fluree: &crate::Fluree,
+    config: &IcebergGsConfig,
+    location: &str,
+) -> QueryResult<StoragePlan> {
+    plan_storage(
+        &config.catalog,
+        &config.storage_io(),
+        location,
+        fluree.identity_context(),
+    )
+    .await
+    .map_err(|e| storage_query_error("Failed to decide storage", e))
+}
+
+/// The lower bound a cached pointer's current snapshot must meet to answer
+/// `pin` (the `min_snapshot_ms` rider of `disk_catalog_cache::pointer_is_usable`).
+fn pin_min_snapshot_ms(pin: Option<SourceTime>) -> Option<i64> {
+    match pin {
+        Some(SourceTime::AsOfTimestampMs(ms)) => Some(ms),
+        Some(SourceTime::SnapshotId(_)) | None => None,
+    }
+}
+
+/// Whether metadata served by a cross-query cache is new enough to answer `pin`.
+/// Such metadata may predate the catalog's current state, so an as-of instant
+/// past its current snapshot, or a snapshot id it does not list, needs a fresh
+/// `loadTable` rather than a `NoSnapshotAtTime`/`SnapshotNotFound` or an older
+/// snapshot read off stale metadata.
+fn cached_metadata_serves_pin(pin: Option<SourceTime>, metadata: &TableMetadata) -> bool {
+    match pin {
+        None => true,
+        Some(SourceTime::SnapshotId(id)) => metadata.snapshot(id).is_some(),
+        Some(SourceTime::AsOfTimestampMs(ms)) => metadata
+            .current_snapshot()
+            .is_some_and(|s| s.timestamp_ms >= ms),
+    }
+}
+
+/// The deferred builder of a table's store on the pointer rung: the same
+/// session-pin ladder as the eager arm ([`resolve_catalog_load_and_storage`]),
+/// run by the first read that misses every cache. A typed refusal is the
+/// store's own [`IcebergError`], unconverted (see [`StepError`]), so the read
+/// reports the same type, status and wire code the eager arm would; any other
+/// failure keeps its message and gains the step's name.
+#[allow(clippy::too_many_arguments)] // the owned captures of a `'static` builder
+fn deferred_storage_builder(
+    catalog: Arc<dyn SendCatalogClient>,
+    catalog_vends: bool,
+    cache: Arc<R2rmlCache>,
+    session: Arc<super::catalog_session::IcebergCatalogSession>,
+    table_id: TableIdentifier,
+    lt_key: String,
+    xq_key: String,
+    plan: StoragePlan,
+    loc: String,
+) -> super::lazy_storage::StorageBuilder<'static, IcebergStorageBackend> {
+    Arc::new(move || {
+        let catalog = Arc::clone(&catalog);
+        let cache = Arc::clone(&cache);
+        let session = Arc::clone(&session);
+        let table_id = table_id.clone();
+        let lt_key = lt_key.clone();
+        let xq_key = xq_key.clone();
+        let plan = plan.clone();
+        let loc = loc.clone();
+        Box::pin(async move {
+            let built = if catalog_vends {
+                resolve_catalog_load_and_storage(
+                    catalog, cache, session, table_id, lt_key, xq_key, plan,
+                )
+                .await
+                .map(|(storage, _)| storage)
+            } else {
+                // A catalog that never vends (Glue, S3 Tables) grants nothing
+                // beyond the location, and the pointer already pinned this
+                // snapshot: a forced build needs no catalog call at all.
+                session_storage_inner(&session, &lt_key, &plan, &CatalogGrant::unvended(loc)).await
+            };
+            built.map_err(|(step, error)| {
+                if super::iceberg_catalog::is_typed_storage_error(&error) {
+                    error
+                } else {
+                    // Not a refusal of its own, so the read reports it as an
+                    // internal error: name the step that failed in it, as the
+                    // eager arm's message does.
+                    IcebergError::Storage(format!("{step}: {error}"))
+                }
+            })
+        })
+    })
+}
+
+/// Resolve `loadTable` (the catalog call — REST GET, Glue `GetTable`, or S3 Tables
+/// `GetTableMetadataLocation` — honoring the query pin + the cross-query cache) and
+/// build the S3 storage — the SAME session-pin path the eager scan used before the
+/// lazy split (PR-8 loadTable-metadata cache, `21-loadtable-metadata-cache.md`).
 ///
 /// Takes OWNED handles (Arcs + owned config) so it can be called BOTH eagerly and
 /// from the deferred [`LazyS3Storage`] builder — which must be `'static`, because
@@ -2657,23 +4087,24 @@ async fn rest_session_storage(
 /// first-use OAuth token exchange, are exactly what the deterministic cache gate
 /// proves absent (`load_table.n=0` AND `oauth_token.n=0`) on a fully disk-cached
 /// query. No duplicate ladder — this IS the ladder both paths share.
-async fn resolve_rest_load_and_storage(
-    catalog: Arc<RestCatalogClient>,
+#[allow(clippy::too_many_arguments)] // owned captures of the `'static` deferred builder
+async fn resolve_catalog_load_and_storage(
+    catalog: Arc<dyn SendCatalogClient>,
     cache: Arc<R2rmlCache>,
     session: Arc<super::catalog_session::IcebergCatalogSession>,
     table_id: TableIdentifier,
-    io: IoConfig,
     lt_key: String,
-    catalog_uri: String,
-) -> QueryResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
+    cross_query_key: String,
+    plan: StoragePlan,
+) -> StepResult<(Arc<IcebergStorageBackend>, LoadTableResponse)> {
     // (1) Resolve the loadTable response, cheapest first: the per-query pin, then
-    // the cross-query cache (skips the ~1–3s GET), then a real REST load.
+    // the cross-query cache (skips the ~1–3s GET), then a real catalog load.
     let load_response = if let Some(cached) = session.cached_load_table(&lt_key) {
         cached
     } else {
         let pinned = session.pinned_metadata_location(&lt_key);
         let cross_query = if pinned.is_none() {
-            cache.get_rest_load_table(&lt_key)
+            cache.get_rest_load_table(&cross_query_key)
         } else {
             None
         };
@@ -2683,18 +4114,16 @@ async fn resolve_rest_load_and_storage(
             // The cold REST/OAuth catalog round-trip — the `r2rml.load_table` span
             // the cache gate proves absent when disk-warm.
             let actual = catalog
-                .load_table(&table_id, io.vended_credentials)
+                .load_table(&table_id, plan.reads_vended())
                 .instrument(tracing::debug_span!(
                     "r2rml.load_table",
                     namespace = %table_id.namespace,
                     table = %table_id.table,
                 ))
                 .await
-                .map_err(|e| {
-                    QueryError::Internal(format!("Failed to load table from catalog: {e}"))
-                })?;
+                .map_err(|e| ("Failed to load table from catalog", e))?;
             cache.put_rest_load_table(
-                lt_key.clone(),
+                cross_query_key.clone(),
                 Arc::new(super::catalog_session::CachedLoadTable::from_response(
                     &actual,
                 )),
@@ -2714,12 +4143,24 @@ async fn resolve_rest_load_and_storage(
         resp
     };
 
-    // (2) Build (or reuse the query session's) S3 storage — §2 fail-closed decision
-    // and session reuse included, shared verbatim with the eager arm.
-    let storage =
-        rest_session_storage(&session, &lt_key, &io, &load_response, &catalog_uri).await?;
+    // (2) Build (or reuse the query session's) storage from the source's plan —
+    // §2 fail-closed and session reuse included, shared verbatim with the eager
+    // arm.
+    let grant = CatalogGrant::from_load(&load_response, Some((&catalog, &table_id)));
+    let storage = session_storage_inner(&session, &lt_key, &plan, &grant).await?;
 
     Ok((storage, load_response))
+}
+
+/// A table resolved for one query: its store (built only when a read misses
+/// every cache, on the pointer rung), the snapshot-pinned metadata and its
+/// location, and the storage scope every cache of the table is keyed by.
+#[derive(Clone)]
+struct TableContext {
+    storage: Arc<LazyS3Storage<'static>>,
+    metadata: Arc<TableMetadata>,
+    metadata_location: String,
+    scope: StorageScope,
 }
 
 impl FlureeR2rmlProvider<'_> {
@@ -2735,29 +4176,66 @@ impl FlureeR2rmlProvider<'_> {
     ) -> QueryResult<Option<u64>> {
         #[cfg(feature = "sql")]
         if let Some(sql) = self.sql_source(graph_source_id).await? {
+            self.refuse_pin_on_sql_source(graph_source_id)?;
             let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
                 .row_count(&self.session, &mapping, table_name, non_null_cols)
                 .await;
         }
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .row_count(
+                    self.fluree,
+                    &self.session,
+                    table_name,
+                    non_null_cols,
+                    self.source_time(graph_source_id),
+                )
+                .await;
+        }
+        // A filtered map counts the rows its filter keeps, which no manifest
+        // statistic knows: decline, and the caller counts them by scanning.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        if logical.is_filtered() {
+            tracing::Span::current().record("fired", false);
+            debug!(
+                table_name = %table_name,
+                "COUNT(*) manifest shortcut declined: the triples map filters its table"
+            );
+            return Ok(None);
+        }
+        let table_name = logical.table.as_str();
         // Same pinned context as the scan: one Iceberg snapshot per query (the
         // shared `self.session` pin), so a count and a scan cannot disagree.
-        // GREP: r2rml-as-of-t — `as_of_t` is ignored here exactly as the scan path
-        // ignores it (matching breadcrumb in `scan_table_inner`); if time-travel
-        // semantics ever land on the scan, this method MUST follow, or a COUNT and
-        // a scan in one query could answer from different snapshots.
-        let (storage, metadata, metadata_location) =
-            self.load_table_context(graph_source_id, table_name).await?;
+        // GREP: r2rml-as-of-t — `as_of_t` is a Fluree `t` and is ignored here as in
+        // `scan_table_inner`; a time pin is resolved by the same `select_snapshot`
+        // the scan uses, so a COUNT and a scan in one query read the same snapshot.
+        let TableContext {
+            storage,
+            metadata,
+            metadata_location,
+            scope,
+        } = self.load_table_context(graph_source_id, table_name).await?;
 
         // The count must equal a full scan of THIS snapshot — the one the scan
-        // planner reads from the same pinned metadata. No current snapshot (an
-        // empty table) or no current schema: decline and let the scan handle it (an
-        // empty scan folds to 0; a missing schema surfaces the scan's own error).
-        let (Some(snapshot), Some(schema)) =
-            (metadata.current_snapshot(), metadata.current_schema())
-        else {
+        // planner reads from the same pinned metadata. No snapshot (an empty
+        // table) or no schema: decline and let the scan handle it (an empty scan
+        // folds to 0; a missing schema surfaces the scan's own error).
+        let Some(selected) = self.select_snapshot(graph_source_id, table_name, &metadata)? else {
             return Ok(None);
         };
+        let snapshot = selected.snapshot;
+        let Some(schema) = metadata.read_schema_for_snapshot(snapshot) else {
+            return Ok(None);
+        };
+        let schema = schema.as_ref();
+        // An unfiltered `rr:sqlQuery` still names columns; refuse one the table
+        // lacks here as the scan does.
+        logical.row_filter(schema).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+        })?;
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
 
         // Manifest-only read (never a Parquet/data file): the live data files, and
         // whether the snapshot carries merge-on-read delete manifests.
@@ -2774,7 +4252,7 @@ impl FlureeR2rmlProvider<'_> {
         // wall — no data file is read. Allowlisted in `fluree-bench-virtual::spans`.
         let catalog_cache = self.catalog_disk_cache();
         let (data_files, has_delete_manifests) = if let Some(hit) =
-            catalog_cache.get_count_stats(&metadata_location)
+            catalog_cache.get_count_stats(&scope, &cache_key)
         {
             debug!(table_name = %table_name, "COUNT(*) manifest stats disk-cache hit");
             hit
@@ -2792,7 +4270,7 @@ impl FlureeR2rmlProvider<'_> {
                             e,
                         )
                     })?;
-            catalog_cache.put_count_stats(&metadata_location, &data_files, has_delete_manifests);
+            catalog_cache.put_count_stats(&scope, &cache_key, &data_files, has_delete_manifests);
             (data_files, has_delete_manifests)
         };
 
@@ -2858,15 +4336,23 @@ impl FlureeR2rmlProvider<'_> {
     /// any S3 read — the in-memory moka first, then the persistent slice-2 disk
     /// cache (warming the moka layer on a disk hit). `None` when neither has it (a
     /// real S3 read would be required, which the caller does via `storage`). Used
-    /// by the pointer rung to serve metadata with zero storage.
-    async fn metadata_from_caches(&self, metadata_location: &str) -> Option<Arc<TableMetadata>> {
+    /// by the pointer rung to serve metadata with zero storage. Both layers are
+    /// keyed by `scope`, the storage identity the source reads as.
+    async fn metadata_from_caches(
+        &self,
+        scope: &StorageScope,
+        metadata_location: &str,
+    ) -> Option<Arc<TableMetadata>> {
         let cache = self.fluree.r2rml_cache();
-        if let Some(m) = cache.get_metadata(metadata_location).await {
+        if let Some(m) = cache.get_metadata(scope, metadata_location).await {
             return Some(m);
         }
-        if let Some(m) = self.catalog_disk_cache().get_metadata(metadata_location) {
+        if let Some(m) = self
+            .catalog_disk_cache()
+            .get_metadata(scope, metadata_location)
+        {
             cache
-                .put_metadata(metadata_location.to_string(), Arc::clone(&m))
+                .put_metadata(scope, metadata_location, Arc::clone(&m))
                 .await;
             return Some(m);
         }
@@ -2878,7 +4364,10 @@ impl FlureeR2rmlProvider<'_> {
     /// detected because its leaf directory does not name the requested table —
     /// LIST the root once (session-cached, one LIST per build) and match THIS
     /// table's own `<name>.<suffix>/` (or bare `<name>/`) directory beneath it,
-    /// case-insensitively on the name part. Ambiguity or a miss fails loud, naming
+    /// case-insensitively on the name part. A root laid out by namespace
+    /// (`<root>/<namespace>/<table>`, or `<namespace>.db/`) is searched there
+    /// and only there, so same-named tables in different namespaces stay
+    /// distinct; a root with no directory for the namespace is matched flat. Ambiguity or a miss fails loud, naming
     /// the candidates. Otherwise (a single-table direct location) returns
     /// `table_location` unchanged, so the caller's resolution is byte-identical.
     ///
@@ -2889,7 +4378,7 @@ impl FlureeR2rmlProvider<'_> {
         table_location: &str,
         table_id: &TableIdentifier,
         lt_key: &str,
-        iceberg_config: &IcebergGsConfig,
+        plan: &StoragePlan,
     ) -> QueryResult<String> {
         let trimmed = table_location.trim_end_matches('/');
         let leaf = trimmed.rsplit('/').next().unwrap_or("");
@@ -2901,29 +4390,55 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         let root = trimmed.to_string();
-        let listing = match self.session.cached_warehouse_listing(&root) {
-            Some(l) => l,
-            None => {
-                let storage = direct_session_storage(
-                    &self.session,
-                    lt_key,
-                    &root,
-                    iceberg_config.io.s3_region.as_deref(),
-                    iceberg_config.io.s3_endpoint.as_deref(),
-                    iceberg_config.io.s3_path_style,
-                )
-                .await?;
-                let dirs = storage.list_dir(&root).await.map_err(|e| {
-                    storage_query_error(&format!("Failed to LIST warehouse root {root}"), e)
-                })?;
-                info!(
-                    warehouse_root = %root,
-                    tables_found = dirs.len(),
-                    "Listed catalog-less warehouse root (direct mode)"
-                );
-                self.session.store_warehouse_listing(root.clone(), dirs)
+        let listing = self.warehouse_listing(&root, lt_key, plan).await?;
+
+        // Namespaced layout first: `<root>/<namespace>/<table>`, one directory
+        // per namespace level. Without it two namespaces holding a same-named
+        // table collide on the table name. A root with no directory for the
+        // namespace is the flat layout below (a Snowflake-style copy, where the
+        // namespace names no directory at all). A directory that is itself a
+        // table (a flat root's `sales/` for a mapping naming `sales.orders`)
+        // is no namespace either. A namespace directory is authoritative: a
+        // table missing from it is a miss, never a match on a stray
+        // `<root>/<table>`.
+        if let Some(ns_dir) = self
+            .resolve_namespace_dir(&root, &listing, &table_id.namespace, lt_key, plan)
+            .await?
+        {
+            let ns_listing = self.warehouse_listing(&ns_dir, lt_key, plan).await?;
+            let candidates = if listing_is_single_table(&ns_listing) {
+                None
+            } else {
+                Some(fluree_db_iceberg::catalog::warehouse_table_dir_candidates(
+                    requested,
+                    &ns_listing,
+                ))
+            };
+            match candidates.as_deref() {
+                None => {}
+                Some([one]) => return Ok(format!("{ns_dir}/{}", one.trim_end_matches('/'))),
+                Some([]) => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "warehouse-root resolution for table '{table_id}': no directory under \
+                         namespace directory {ns_dir} matches '{requested}' (matched on the name \
+                         before '.', case-insensitive). Found {} directories: [{}]",
+                        ns_listing.len(),
+                        ns_listing.join(", ")
+                    )));
+                }
+                Some(many) => {
+                    return Err(QueryError::InvalidQuery(format!(
+                        "warehouse-root resolution for table '{table_id}': AMBIGUOUS under \
+                         {ns_dir} — {} directories match: [{}]",
+                        many.len(),
+                        many.iter()
+                            .map(|d| d.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )));
+                }
             }
-        };
+        }
 
         let matched =
             match fluree_db_iceberg::catalog::match_warehouse_table_dir(requested, &listing) {
@@ -2949,24 +4464,210 @@ impl FlureeR2rmlProvider<'_> {
         Ok(format!("{root}/{matched}"))
     }
 
+    /// The child-directory listing of a warehouse directory: one LIST per
+    /// directory per build, session-cached.
+    async fn warehouse_listing(
+        &self,
+        dir: &str,
+        lt_key: &str,
+        plan: &StoragePlan,
+    ) -> QueryResult<Arc<Vec<String>>> {
+        if let Some(listing) = self.session.cached_warehouse_listing(dir) {
+            return Ok(listing);
+        }
+        let storage = session_storage(&self.session, lt_key, plan, &CatalogGrant::direct()).await?;
+        let dirs = storage
+            .list_dir(dir)
+            .await
+            .map_err(|e| storage_query_error(&format!("Failed to LIST warehouse root {dir}"), e))?;
+        info!(
+            warehouse_root = %dir,
+            tables_found = dirs.len(),
+            "Listed catalog-less warehouse root (direct mode)"
+        );
+        Ok(self.session.store_warehouse_listing(dir.to_string(), dirs))
+    }
+
+    /// The directory under `root` for `namespace`, descending one directory per
+    /// dot-separated level. `None` when any level has no directory — the root
+    /// is not laid out by namespace.
+    async fn resolve_namespace_dir(
+        &self,
+        root: &str,
+        root_listing: &Arc<Vec<String>>,
+        namespace: &str,
+        lt_key: &str,
+        plan: &StoragePlan,
+    ) -> QueryResult<Option<String>> {
+        let mut dir = root.to_string();
+        let mut listing = Arc::clone(root_listing);
+        let levels: Vec<&str> = namespace
+            .split('.')
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .collect();
+        if levels.is_empty() {
+            return Ok(None);
+        }
+        for (i, level) in levels.iter().enumerate() {
+            let Some(child) =
+                fluree_db_iceberg::catalog::match_warehouse_namespace_dir(level, &listing)
+                    .map_err(|e| {
+                        QueryError::InvalidQuery(format!(
+                            "warehouse-root resolution for namespace '{namespace}' under {dir}: {e}"
+                        ))
+                    })?
+            else {
+                return Ok(None);
+            };
+            dir = format!("{dir}/{child}");
+            if i + 1 < levels.len() {
+                listing = self.warehouse_listing(&dir, lt_key, plan).await?;
+            }
+        }
+        Ok(Some(dir))
+    }
+
+    /// Plan a scan of `snapshot` from its kept file list, the one path every
+    /// plan of a snapshot goes through (a scan's, and a keyed read's file
+    /// counts): the in-memory scan-files cache, then the disk catalog cache
+    /// (promoted into memory), else the manifests, read once and kept in both.
+    /// Whatever the planner's filter, the list kept is the whole unfiltered
+    /// one; `plan_from_files` prunes it with the same file test the manifest
+    /// walk uses, and re-applies the merge-on-read refusal.
+    async fn plan_from_kept_files<S: SendIcebergStorage>(
+        &self,
+        planner: &SendScanPlanner<'_, S>,
+        snapshot: &fluree_db_iceberg::metadata::Snapshot,
+        scope: &StorageScope,
+        cache_key: &str,
+        metadata_location: &str,
+    ) -> QueryResult<ScanPlan> {
+        let cache = self.fluree.r2rml_cache();
+        let plan = if let Some(cached) = cache.get_scan_files(scope, cache_key).await {
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = cached.data_files.len(),
+                "Iceberg scan-files cache hit"
+            );
+            planner
+                .plan_from_files(snapshot, cached.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?
+        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(scope, cache_key) {
+            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
+            // cache has this snapshot's file list — a warm-catalog cold process
+            // skips the manifest read. The plan re-applies the merge-on-read
+            // refusal (F-AUD-1, the cross-process case: an entry written under
+            // the override by an earlier process) before the list is promoted
+            // into the in-memory cache.
+            debug!(
+                metadata_location = %metadata_location,
+                cached_files = disk.data_files.len(),
+                "Iceberg scan-files disk-cache hit"
+            );
+            let plan = planner
+                .plan_from_files(snapshot, disk.kept())
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            cache.put_scan_files(scope, cache_key, disk).await;
+            plan
+        } else {
+            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
+            let (plan, files) = planner
+                .plan_scan_for_snapshot_retaining_files(snapshot)
+                .await
+                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
+            let cached = Arc::new(CachedScanFiles::new(files, plan.has_delete_manifests));
+            // Persist to the disk catalog cache (content-addressed, immutable),
+            // also when the list is too large for the in-memory cache. Written
+            // off this query's path: thousands of files are megabytes of JSON.
+            self.catalog_disk_cache().put_scan_files_in_background(
+                scope.clone(),
+                cache_key.to_string(),
+                Arc::clone(&cached),
+            );
+            cache.put_scan_files(scope, cache_key, cached).await;
+            plan
+        };
+        Ok(plan)
+    }
+
+    /// Build (or find cached) the shared catalog client a source's table loads
+    /// use, so loads issued together share one. A Direct source has none.
+    async fn warm_catalog_client(
+        &self,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+    ) -> QueryResult<()> {
+        shared_catalog_client(self.fluree, graph_source_id, config.json, config.iceberg)
+            .await
+            .map(drop)
+    }
+
+    /// Resolve `table_name` of `graph_source_id`: its metadata, the snapshot
+    /// pin, and its store. A table this provider resolved under the same pin
+    /// within [`RECENT_CONTEXT_REUSE`] is served from that resolution: within
+    /// one query every touch of a table reads one snapshot anyway, and
+    /// resolving repeats the catalog bookkeeping (a pointer write to the disk
+    /// cache, local path checks) for each scan, count, file count and key
+    /// check of the table.
     async fn load_table_context(
         &self,
         graph_source_id: &str,
         table_name: &str,
-    ) -> QueryResult<(Arc<LazyS3Storage<'static>>, Arc<TableMetadata>, String)> {
-        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
-            return Err(QueryError::InvalidQuery(format!(
-                "Graph source '{graph_source_id}': rr:sqlQuery logical tables are only \
-                 supported by SQL graph sources"
-            )));
+    ) -> QueryResult<TableContext> {
+        let key = (graph_source_id.to_string(), table_name.to_string());
+        let pin = self.source_time(graph_source_id);
+        {
+            let recent = self
+                .recent_contexts
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(r) = recent.get(&key) {
+                if recent_context_serves(r.at, r.pin, pin, std::time::Instant::now()) {
+                    return Ok(r.context.clone());
+                }
+            }
         }
+        let context = self
+            .resolve_table_context(graph_source_id, table_name)
+            .await?;
+        self.remember_context(graph_source_id, table_name, &context);
+        Ok(context)
+    }
+
+    /// Keep `context`, just resolved for `table_name` of `graph_source_id`,
+    /// for [`Self::load_table_context`] to serve within
+    /// [`RECENT_CONTEXT_REUSE`].
+    fn remember_context(&self, graph_source_id: &str, table_name: &str, context: &TableContext) {
+        self.recent_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(
+                (graph_source_id.to_string(), table_name.to_string()),
+                RecentContext {
+                    at: std::time::Instant::now(),
+                    pin: self.source_time(graph_source_id),
+                    context: context.clone(),
+                },
+            );
+    }
+
+    /// [`Self::load_table_context`] without the reuse: resolve the table now,
+    /// from the source's published record.
+    async fn resolve_table_context(
+        &self,
+        graph_source_id: &str,
+        table_name: &str,
+    ) -> QueryResult<TableContext> {
         // Look up the graph source record to get Iceberg connection info
         let record = self
             .fluree
             .nameservice()
             .lookup_graph_source(graph_source_id)
             .await
-            .map_err(|e| QueryError::Internal(format!("Nameservice error: {e}")))?
+            .map_err(|e| QueryError::Nameservice(e.to_string()))?
+            // A drop leaves the record as a tombstone.
+            .filter(|record| !record.retracted)
             .ok_or_else(|| {
                 QueryError::InvalidQuery(format!("Graph source '{graph_source_id}' not found"))
             })?;
@@ -2978,6 +4679,32 @@ impl FlureeR2rmlProvider<'_> {
                 "Failed to parse Iceberg graph source config for '{graph_source_id}': {e}"
             ))
         })?;
+        let config = SourceConfig {
+            json: &record.config,
+            iceberg: &iceberg_config,
+        };
+        self.load_table_context_in(graph_source_id, config, table_name)
+            .await
+    }
+
+    /// [`Self::resolve_table_context`] for a source whose configuration is
+    /// `config`, published or not: registration loads a source's tables
+    /// before publishing it, the way its queries will.
+    async fn load_table_context_in(
+        &self,
+        graph_source_id: &str,
+        config: SourceConfig<'_>,
+        table_name: &str,
+    ) -> QueryResult<TableContext> {
+        // Callers resolve a logical table first (`logical_scan`): an alias here
+        // would read the table without the map's row filter.
+        if fluree_db_r2rml::mapping::LogicalTable::is_sql_query_alias(table_name) {
+            return Err(QueryError::Internal(format!(
+                "Graph source '{graph_source_id}': rr:sqlQuery logical table '{table_name}' \
+                 reached the table loader unresolved"
+            )));
+        }
+        let (record_config, iceberg_config) = (config.json, config.iceberg);
 
         // Validate the config
         iceberg_config.validate().map_err(|e| {
@@ -3011,34 +4738,40 @@ impl FlureeR2rmlProvider<'_> {
         // thus the GET + its OAuth token exchange) is DEFERRED behind a
         // `LazyS3Storage` and never forced if every Parquet file is also disk-
         // cached → the deterministic gate's `load_table.n=0` AND `oauth_token.n=0`.
-        // REST only; Direct mode has its own metadata-location cache.
+        // Catalog-backed sources only (REST, Glue, S3 Tables); Direct mode has its
+        // own metadata-location cache.
         let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
             graph_source_id,
             &table_id.namespace,
             &table_id.table,
         );
+        let xq_key = cross_query_key(&lt_key, record_config, self.fluree.identity_context());
         let disk = self.catalog_disk_cache();
-        if let CatalogConfig::Rest {
-            uri,
-            warehouse,
-            auth,
-            ..
-        } = &iceberg_config.catalog
-        {
+        let source_time = self.source_time(graph_source_id);
+        let catalog_label = iceberg_config.catalog.catalog_label().to_string();
+        let catalog_vends = iceberg_config.catalog.vends_credentials();
+        if !matches!(iceberg_config.catalog, CatalogConfig::Direct { .. }) {
             // A snapshot pin from an EARLIER touch of this table THIS query wins
             // unconditionally over the disk pointer (correlated re-loads must read
             // ONE snapshot). Only when unpinned do we consult the disk pointer.
-            // `None` = a latest-snapshot read. GREP: r2rml-as-of-t — when Iceberg
-            // snapshot time-travel lands, the requested snapshot's `timestamp_ms`
-            // MUST be threaded here as `min_snapshot_ms` so bounded staleness can
-            // never downgrade a time-travel request (the guard + hermetic already
-            // exist in `disk_catalog_cache::pointer_is_usable`).
-            let candidate = self
-                .session
-                .pinned_metadata_location(&lt_key)
-                .or_else(|| disk.get_metadata_location(&lt_key, None));
+            // GREP: r2rml-as-of-t — a time-pinned query only takes the pointer
+            // when its metadata can answer the pin, so bounded staleness never
+            // downgrades a time-travel request; otherwise it falls through to a
+            // fresh `loadTable`.
+            let session_loc = self.session.pinned_metadata_location(&lt_key);
+            let from_session = session_loc.is_some();
+            let candidate = session_loc
+                .or_else(|| disk.get_metadata_location(&xq_key, pin_min_snapshot_ms(source_time)));
             if let Some(loc) = candidate {
-                if let Some(md) = self.metadata_from_caches(&loc).await {
+                // The storage decision comes first: the policy applies and a
+                // Google identity is proven before anything cached is served, and
+                // its scope is what every cache below is keyed by.
+                let plan = plan_for(self.fluree, iceberg_config, &loc).await?;
+                let cached = self
+                    .metadata_from_caches(plan.scope(), &loc)
+                    .await
+                    .filter(|md| from_session || cached_metadata_serves_pin(source_time, md));
+                if let Some(md) = cached {
                     // Pin the location BEFORE serving: a later touch whose disk
                     // pointer has since expired (TTL boundary mid-query) then still
                     // resolves THIS snapshot via `pinned_metadata_location` — the
@@ -3047,101 +4780,39 @@ impl FlureeR2rmlProvider<'_> {
                     // in one query (the pin contract, `catalog_session.rs`).
                     self.session
                         .pin_metadata_location(lt_key.clone(), loc.clone());
-                    // Build/get the process-wide REST client. Client construction
-                    // does NO network; the OAuth token exchange rides the first
+                    // Build/get the process-wide catalog client. Client construction
+                    // does NO network; the REST OAuth token exchange rides the first
                     // catalog op (the loadTable GET, deferred) — a property ENFORCED
                     // by the cache gate's `oauth_token.n=0`, which fails forever if
                     // construction ever starts doing the token exchange.
-                    let cache = self.fluree.r2rml_cache();
-                    let client_fp = rest_client_cache_key(graph_source_id, &record.config);
-                    let catalog = match cache.rest_client(&client_fp) {
-                        Some(c) => c,
-                        None => {
-                            // ORDERING TRAP (§3): hydration happens ONLY here, inside
-                            // the cache-miss arm, strictly AFTER `client_fp` was
-                            // computed above over the RAW, reference-bearing config.
-                            let auth_provider =
-                                hydrated_auth_provider(auth, self.fluree.secret_resolver()).await?;
-                            let client = Arc::new(
-                                RestCatalogClient::new(
-                                    RestCatalogConfig {
-                                        uri: uri.clone(),
-                                        warehouse: warehouse.clone(),
-                                        ..Default::default()
-                                    },
-                                    auth_provider,
-                                )
-                                .map_err(|e| {
-                                    QueryError::Internal(format!(
-                                        "Failed to create catalog client: {e}"
-                                    ))
-                                })?,
-                            );
-                            cache.put_rest_client(client_fp, Arc::clone(&client));
-                            client
-                        }
-                    };
+                    let catalog = shared_catalog_client(
+                        self.fluree,
+                        graph_source_id,
+                        record_config,
+                        iceberg_config,
+                    )
+                    .await?
+                    .expect("a non-Direct source has a catalog client");
                     // Owned captures for the `'static` deferred builder (the
                     // provider's `fluree: &'a` borrow can't cross the Parquet
-                    // `tokio::spawn`). The builder runs the SAME session-pin ladder
-                    // as the eager path (`resolve_rest_load_and_storage`), deferred.
-                    let cache = Arc::clone(cache);
-                    let session = Arc::clone(&self.session);
-                    let io = iceberg_config.io.clone();
-                    let table_id = table_id.clone();
-                    let lt_key_b = lt_key.clone();
-                    let uri_b = uri.clone();
-                    let builder: super::lazy_storage::StorageBuilder<
-                        'static,
-                        IcebergStorageBackend,
-                    > = Arc::new(move || {
-                        let catalog = Arc::clone(&catalog);
-                        let cache = Arc::clone(&cache);
-                        let session = Arc::clone(&session);
-                        let io = io.clone();
-                        let table_id = table_id.clone();
-                        let lt_key = lt_key_b.clone();
-                        let catalog_uri = uri_b.clone();
-                        Box::pin(async move {
-                            resolve_rest_load_and_storage(
-                                catalog,
-                                cache,
-                                session,
-                                table_id,
-                                io,
-                                lt_key,
-                                catalog_uri,
-                            )
-                            .await
-                            .map(|(storage, _)| storage)
-                            // Preserve the TYPED errors across the builder's
-                            // `IcebergError` channel: `storage_query_error` lifts
-                            // these two straight back to their `QueryError`
-                            // counterparts, so a lazy-forced build reports the same
-                            // 403 + wire code (`err:storage/AccessDenied` /
-                            // `err:catalog/CredentialsNotVended`) as the eager path.
-                            // A blanket `to_string()` here would flatten them into
-                            // an opaque string and put hosts back to regex-guessing.
-                            .map_err(|e| match e {
-                                QueryError::StorageAccessDenied {
-                                    bucket,
-                                    key,
-                                    region,
-                                    message,
-                                } => IcebergError::StorageAccessDenied {
-                                    bucket,
-                                    key,
-                                    region,
-                                    message,
-                                },
-                                QueryError::CatalogCredentialsNotVended { catalog_uri } => {
-                                    IcebergError::CatalogCredentialsNotVended { catalog_uri }
-                                }
-                                other => IcebergError::Catalog(other.to_string()),
-                            })
-                        })
+                    // `tokio::spawn`).
+                    let builder = deferred_storage_builder(
+                        catalog,
+                        catalog_vends,
+                        Arc::clone(self.fluree.r2rml_cache()),
+                        Arc::clone(&self.session),
+                        table_id.clone(),
+                        lt_key.clone(),
+                        xq_key.clone(),
+                        plan.clone(),
+                        loc.clone(),
+                    );
+                    return Ok(TableContext {
+                        storage: Arc::new(LazyS3Storage::deferred(builder)),
+                        metadata: md,
+                        metadata_location: loc,
+                        scope: plan.scope().clone(),
                     });
-                    return Ok((Arc::new(LazyS3Storage::deferred(builder)), md, loc));
                 }
             }
         }
@@ -3150,47 +4821,26 @@ impl FlureeR2rmlProvider<'_> {
         // `mut` so we can move the REST catalog's inline metadata out of the
         // response below (see the metadata resolution) without cloning it.
         let mut direct_location: Option<String> = None;
-        let (mut load_response, storage) = match &iceberg_config.catalog {
-            CatalogConfig::Rest {
-                uri,
-                warehouse,
-                auth,
-                ..
-            } => {
+        let (mut load_response, storage, plan) = match &iceberg_config.catalog {
+            CatalogConfig::Rest { .. }
+            | CatalogConfig::Glue { .. }
+            | CatalogConfig::S3Tables { .. } => {
                 let cache = self.fluree.r2rml_cache();
 
-                // Process-wide REST client keyed by the source config fingerprint:
-                // its OAuth `CachedToken` and HTTPS connection pool are reused
-                // across queries, so a warm server does one token exchange per
-                // ~hour instead of one per query. The fingerprint hashes the full
-                // source config, so a rotated PAT (or any config change) builds a
-                // fresh client.
-                let client_fp = rest_client_cache_key(graph_source_id, &record.config);
-                let catalog = match cache.rest_client(&client_fp) {
-                    Some(c) => c,
-                    None => {
-                        // ORDERING TRAP (§3): hydration happens ONLY here, inside the
-                        // cache-miss arm, strictly AFTER `client_fp` was computed above
-                        // over the RAW, reference-bearing config. The fingerprint-
-                        // stability test pins this.
-                        let auth_provider =
-                            hydrated_auth_provider(auth, self.fluree.secret_resolver()).await?;
-                        let catalog_config = RestCatalogConfig {
-                            uri: uri.clone(),
-                            warehouse: warehouse.clone(),
-                            ..Default::default()
-                        };
-                        let client = Arc::new(
-                            RestCatalogClient::new(catalog_config, auth_provider).map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to create catalog client: {e}"
-                                ))
-                            })?,
-                        );
-                        cache.put_rest_client(client_fp, Arc::clone(&client));
-                        client
-                    }
-                };
+                // Process-wide catalog client keyed by the source config
+                // fingerprint: a REST client's OAuth `CachedToken` and every
+                // client's HTTPS connection pool are reused across queries, so a
+                // warm server does one token exchange per ~hour instead of one per
+                // query. The fingerprint hashes the full source config, so a
+                // rotated PAT (or any config change) builds a fresh client.
+                let catalog = shared_catalog_client(
+                    self.fluree,
+                    graph_source_id,
+                    record_config,
+                    iceberg_config,
+                )
+                .await?
+                .expect("a non-Direct source has a catalog client");
 
                 let lt_key = super::catalog_session::IcebergCatalogSession::load_table_key(
                     graph_source_id,
@@ -3200,7 +4850,7 @@ impl FlureeR2rmlProvider<'_> {
 
                 // Resolve `loadTable`, cheapest first: (1) the per-query pin (one
                 // snapshot for the whole query); (2) the cross-query cache (skips
-                // the ~1.3–3s catalog GET, TTL + creds gated); (3) a real REST
+                // the ~1.3–3s catalog GET, TTL + creds gated); (3) a real catalog
                 // load, which populates both caches.
                 let load_response = if let Some(cached) = self.session.cached_load_table(&lt_key) {
                     debug!(namespace = %table_id.namespace, table = %table_id.table,
@@ -3210,9 +4860,11 @@ impl FlureeR2rmlProvider<'_> {
                     let pinned = self.session.pinned_metadata_location(&lt_key);
                     // A cross-query hit applies only on the FIRST resolution of
                     // this table in the query. Once pinned, a reload is a creds
-                    // refresh that must keep the pinned snapshot.
-                    let cross_query = if pinned.is_none() {
-                        cache.get_rest_load_table(&lt_key)
+                    // refresh that must keep the pinned snapshot. A time-pinned
+                    // query skips it too: the entry carries only a location, so
+                    // whether it is new enough for the pin can't be checked.
+                    let cross_query = if pinned.is_none() && source_time.is_none() {
+                        cache.get_rest_load_table(&xq_key)
                     } else {
                         None
                     };
@@ -3221,13 +4873,18 @@ impl FlureeR2rmlProvider<'_> {
                             "loadTable cache hit (cross-query)");
                         cq.to_response()
                     } else {
-                        info!(catalog_uri = %uri, namespace = %table_id.namespace,
-                            table = %table_id.table, "Loading table from REST catalog");
+                        info!(catalog = %catalog_label, namespace = %table_id.namespace,
+                            table = %table_id.table, "Loading table from catalog");
                         // The cold REST/OAuth catalog round-trip (~1-3s) — the
                         // highest-value span for attributing a slow virtual-dataset
                         // query to cold-remote-retrieval vs. caching vs. decode.
                         let actual = catalog
-                            .load_table(&table_id, iceberg_config.io.vended_credentials)
+                            .load_table(
+                                &table_id,
+                                iceberg_config
+                                    .io
+                                    .requests_vended_credentials(&iceberg_config.catalog),
+                            )
                             .instrument(tracing::debug_span!(
                                 "r2rml.load_table",
                                 namespace = %table_id.namespace,
@@ -3235,15 +4892,13 @@ impl FlureeR2rmlProvider<'_> {
                             ))
                             .await
                             .map_err(|e| {
-                                QueryError::Internal(format!(
-                                    "Failed to load table from catalog: {e}"
-                                ))
+                                storage_query_error("Failed to load table from catalog", e)
                             })?;
                         // The cross-query cache reflects the CURRENT catalog state
                         // (never this query's pin), so other queries see the newest
                         // snapshot within the TTL.
                         cache.put_rest_load_table(
-                            lt_key.clone(),
+                            xq_key.clone(),
                             Arc::new(super::catalog_session::CachedLoadTable::from_response(
                                 &actual,
                             )),
@@ -3279,20 +4934,21 @@ impl FlureeR2rmlProvider<'_> {
                     resp
                 };
 
-                // §2 fail-closed + query-session reuse + vended/ambient construction,
-                // shared verbatim with the deferred `LazyS3Storage` builder's path so
-                // the two can never make different credential decisions for the same
-                // table (see `rest_session_storage`).
-                let storage = rest_session_storage(
-                    &self.session,
-                    &lt_key,
-                    &iceberg_config.io,
-                    &load_response,
-                    uri,
+                // The source's storage decision for the table, then §2 fail-closed +
+                // query-session reuse + construction, shared verbatim with the
+                // deferred `LazyS3Storage` builder's path so the two can never make
+                // different credential decisions for the same table (see
+                // `session_storage`).
+                let plan = plan_for(
+                    self.fluree,
+                    iceberg_config,
+                    &load_response.metadata_location,
                 )
                 .await?;
+                let grant = CatalogGrant::from_load(&load_response, Some((&catalog, &table_id)));
+                let storage = session_storage(&self.session, &lt_key, &plan, &grant).await?;
 
-                (load_response, storage)
+                (load_response, storage, plan)
             }
             CatalogConfig::Direct { table_location } => {
                 // Session cache key for this table's storage client — the same
@@ -3306,18 +4962,17 @@ impl FlureeR2rmlProvider<'_> {
                     &table_id.table,
                 );
 
+                // One storage decision for the whole Direct table (the root and the
+                // table beneath it share a scheme and bucket).
+                let plan = plan_for(self.fluree, iceberg_config, table_location).await?;
+
                 // Warehouse-root resolution: when `table_location` is a warehouse
                 // ROOT (a catalog-less multi-table copy) rather than a single
                 // table dir, resolve THIS table's own directory beneath it via one
                 // session-cached LIST. Single-table direct returns `table_location`
                 // unchanged, so its behavior below is byte-identical.
                 let effective_location = self
-                    .resolve_direct_table_location(
-                        table_location,
-                        &table_id,
-                        &lt_key,
-                        &iceberg_config,
-                    )
+                    .resolve_direct_table_location(table_location, &table_id, &lt_key, &plan)
                     .await?;
                 let table_location = &effective_location;
                 direct_location = Some(effective_location.clone());
@@ -3329,29 +4984,24 @@ impl FlureeR2rmlProvider<'_> {
 
                 let cache = self.fluree.r2rml_cache();
                 // Storage construction sits BELOW the metadata-location check so a
-                // hit resolves through `direct_session_storage`, which serves the
+                // hit resolves through `session_storage`, which serves the
                 // session-cached client when this table was already resolved this
-                // query and skips `from_default_chain` entirely. Both arms still
+                // query and skips the client build entirely. Both arms still
                 // need storage (the scan reads data files; the miss arm also reads
                 // version-hint/metadata via the direct catalog), so this is a
                 // reordering — the session cache covers it, not an elision.
-                let (load_response, storage) = if let Some(metadata_location) =
-                    cache.get_direct_metadata_location(table_location).await
+                let (load_response, storage) = if let Some(metadata_location) = cache
+                    .get_direct_metadata_location(plan.scope(), table_location)
+                    .await
                 {
                     debug!(
                         table_location = %table_location,
                         metadata_location = %metadata_location,
                         "Direct metadata-location cache hit"
                     );
-                    let storage = direct_session_storage(
-                        &self.session,
-                        &lt_key,
-                        table_location,
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await?;
+                    let storage =
+                        session_storage(&self.session, &lt_key, &plan, &CatalogGrant::direct())
+                            .await?;
                     let load_response = fluree_db_iceberg::catalog::LoadTableResponse {
                         metadata_location,
                         config: std::collections::HashMap::default(),
@@ -3363,16 +5013,10 @@ impl FlureeR2rmlProvider<'_> {
                     debug!(table_location = %table_location, "Direct metadata-location cache miss");
 
                     // The direct catalog reads version-hint.text + metadata from
-                    // S3, so it needs the storage client up front.
-                    let storage = direct_session_storage(
-                        &self.session,
-                        &lt_key,
-                        table_location,
-                        iceberg_config.io.s3_region.as_deref(),
-                        iceberg_config.io.s3_endpoint.as_deref(),
-                        iceberg_config.io.s3_path_style,
-                    )
-                    .await?;
+                    // storage, so it needs the storage client up front.
+                    let storage =
+                        session_storage(&self.session, &lt_key, &plan, &CatalogGrant::direct())
+                            .await?;
 
                     let direct_catalog =
                         SendDirectCatalogClient::new(table_location.clone(), Arc::clone(&storage));
@@ -3391,7 +5035,8 @@ impl FlureeR2rmlProvider<'_> {
                             })?;
                     cache
                         .put_direct_metadata_location(
-                            table_location.clone(),
+                            plan.scope(),
+                            table_location,
                             load_response.metadata_location.clone(),
                         )
                         .await;
@@ -3403,7 +5048,7 @@ impl FlureeR2rmlProvider<'_> {
                     "Resolved table metadata via version-hint.text"
                 );
 
-                (load_response, storage)
+                (load_response, storage, plan)
             }
         };
 
@@ -3425,6 +5070,7 @@ impl FlureeR2rmlProvider<'_> {
             &load_response.metadata_location,
             inline_metadata,
             &disk,
+            plan.scope(),
         )
         .await?;
         // Persist the credential-free pointer so the NEXT process resolves this
@@ -3432,7 +5078,7 @@ impl FlureeR2rmlProvider<'_> {
         // the as_of_t rider (grep r2rml-as-of-t). The eager `storage` is already
         // built (a pointer/metadata miss forced the GET), so it wraps in `ready`.
         disk.put_metadata_location(
-            &lt_key,
+            &xq_key,
             &load_response.metadata_location,
             metadata
                 .current_snapshot()
@@ -3442,11 +5088,12 @@ impl FlureeR2rmlProvider<'_> {
         // Relocated local table: remap manifest file references (no-op for
         // REST/S3 and locally-written tables) BEFORE the ready-wrap.
         let storage = remap_local_storage(storage, &metadata, direct_location.as_deref());
-        Ok((
-            Arc::new(LazyS3Storage::ready(storage)),
+        Ok(TableContext {
+            storage: Arc::new(LazyS3Storage::ready(storage)),
             metadata,
-            load_response.metadata_location.clone(),
-        ))
+            metadata_location: load_response.metadata_location.clone(),
+            scope: plan.scope().clone(),
+        })
     }
 
     /// Inner implementation of [`R2rmlTableProvider::scan_table`], split out so the
@@ -3456,6 +5103,7 @@ impl FlureeR2rmlProvider<'_> {
     /// resolution (and its per-query snapshot pin) lives in
     /// [`Self::load_table_context`]; this adds the scan-only concerns — the
     /// scan-start log and the Parquet disk cache — and the streaming scan plan.
+    #[allow(clippy::too_many_arguments)]
     async fn scan_table_inner(
         &self,
         graph_source_id: &str,
@@ -3464,30 +5112,63 @@ impl FlureeR2rmlProvider<'_> {
         filters: &[ScanFilter],
         topk: Option<&ScanTopK>,
         _as_of_t: Option<i64>,
+        order: ScanOrder,
     ) -> QueryResult<ColumnBatchStream> {
-        // GREP: r2rml-as-of-t — time-travel is not implemented for Iceberg scans;
-        // `_as_of_t` is deliberately ignored. If as-of semantics ever land here,
-        // `table_row_count_inner` MUST honor them identically (matching breadcrumb
-        // there): a COUNT and a scan in one query must read the same snapshot.
+        // GREP: r2rml-as-of-t — `_as_of_t` is a Fluree `t`, which names no Iceberg
+        // state; it is ignored. A time-pinned read arrives as this query's
+        // `SourceTime` pin instead, and `select_snapshot` resolves it for BOTH this
+        // scan and `table_row_count_inner`, so a COUNT and a scan in one query
+        // read the same snapshot.
         #[cfg(feature = "sql")]
         if let Some(sql) = self.sql_source(graph_source_id).await? {
+            self.refuse_pin_on_sql_source(graph_source_id)?;
             let mapping = self.compiled_mapping(graph_source_id, None).await?;
             return sql
                 .scan(&self.session, &mapping, table_name, projection, filters)
                 .await;
         }
+        // `filters` are applied where the reader can state them exactly and
+        // `topk` is ignored; the operator above enforces both.
+        #[cfg(feature = "delta")]
+        if let Some(delta) = self.delta_source(graph_source_id).await? {
+            return delta
+                .scan(
+                    self.fluree,
+                    &self.session,
+                    table_name,
+                    projection,
+                    filters,
+                    self.source_time(graph_source_id),
+                )
+                .await;
+        }
+        // An `rr:sqlQuery` logical table scans its FROM table, narrowed by its
+        // WHERE. From here on `table_name` is the real table, so the snapshot
+        // pin, the caches and the build watermark are keyed by it: two maps
+        // over one table read one snapshot.
+        let logical = self.logical_scan(graph_source_id, table_name).await?;
+        let table_name = logical.table.as_str();
         info!(
             graph_source_id = %graph_source_id,
             table_name = %table_name,
             projection = ?projection,
+            filtered = logical.is_filtered(),
             "Starting Iceberg table scan"
         );
 
         // Resolve the pinned table context (S3 storage + the snapshot-pinned
         // metadata) shared with the COUNT(*) manifest shortcut, so a count and a
         // scan in one query read the same pinned Iceberg snapshot.
-        let (storage, metadata, metadata_location) =
-            self.load_table_context(graph_source_id, table_name).await?;
+        let TableContext {
+            storage,
+            metadata,
+            metadata_location,
+            scope,
+        } = self.load_table_context(graph_source_id, table_name).await?;
+
+        // The snapshot this query reads: the source's time pin, else current.
+        let selected = self.select_snapshot(graph_source_id, table_name, &metadata)?;
+        let snapshot = selected.map(|s| s.snapshot);
 
         // Capture this table's pinned snapshot into the build watermark (DEC-003).
         // The single caller of `load_table_context` records here (first-writer-wins),
@@ -3501,10 +5182,28 @@ impl FlureeR2rmlProvider<'_> {
             ),
             fluree_db_query::r2rml::TableWatermark {
                 metadata_location: metadata_location.clone(),
-                snapshot_id: metadata.current_snapshot_id,
-                sequence_number: metadata.current_snapshot().map(|s| s.sequence_number),
+                snapshot_id: snapshot.map(|s| s.snapshot_id),
+                sequence_number: snapshot.map(|s| s.sequence_number),
             },
         );
+
+        // A table that has never committed has no files to read. Its map's
+        // row filter still has to type against the table, as registration
+        // and the validate dry-run checked it: an empty table is no reason to
+        // accept a filter that every later read would refuse.
+        let Some(selected) = selected else {
+            if let Some(schema) = metadata.current_schema() {
+                logical.row_filter(schema).map_err(|e| {
+                    QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+                })?;
+            }
+            info!("Table has no snapshots - returning empty result");
+            return Ok(empty_batch_stream());
+        };
+        let snapshot = selected.snapshot;
+        // The scan-files caches describe one snapshot's live file set, so a
+        // historical pin gets its own key and warms like the current snapshot.
+        let cache_key = snapshot_cache_key(&metadata_location, selected);
 
         // Shared on-disk cache for data files (one global byte budget, deduped per
         // directory). Threaded into the Parquet readers, which apply a
@@ -3515,9 +5214,12 @@ impl FlureeR2rmlProvider<'_> {
 
         let cache = self.fluree.r2rml_cache();
 
+        // The schema at the snapshot being read (current for an unpinned read),
+        // under current column names.
         let schema = metadata
-            .current_schema()
+            .read_schema_for_snapshot(snapshot)
             .ok_or_else(|| QueryError::Internal("Table has no current schema".to_string()))?;
+        let schema = schema.as_ref();
 
         info!(
             format_version = metadata.format_version,
@@ -3526,8 +5228,15 @@ impl FlureeR2rmlProvider<'_> {
             "Parsed table metadata"
         );
 
+        // The map's row filter, typed against the schema of the snapshot being
+        // read. A column or literal it cannot decide exactly is refused, never
+        // skipped: unlike a pushed query FILTER, nothing re-checks these rows.
+        let row_filter = logical.row_filter(schema).map_err(|e| {
+            QueryError::InvalidQuery(format!("Graph source '{graph_source_id}': {e}"))
+        })?;
+
         // Resolve column names to field IDs for projection
-        let projected_field_ids: Vec<i32> = if projection.is_empty() {
+        let mut projected_field_ids: Vec<i32> = if projection.is_empty() {
             schema
                 .fields
                 .iter()
@@ -3548,141 +5257,46 @@ impl FlureeR2rmlProvider<'_> {
                 schema.field_names()
             )));
         }
-
-        let schema_arc = Arc::new(schema.clone());
+        // The reader enforces the row filter on decoded columns, so it decodes
+        // every column the filter tests, whether or not a term map reads it.
+        if let Some(filter) = &row_filter {
+            for id in filter.field_ids() {
+                if !projected_field_ids.contains(&id) {
+                    projected_field_ids.push(id);
+                }
+            }
+        }
 
         // Build an Iceberg pushdown predicate for file pruning. Filters resolve
         // to fields by name; unknown fields are skipped (conservative).
         let filter_expr = build_iceberg_filter(filters, schema);
+        let mut scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
+        if let Some(filter) = filter_expr {
+            scan_config = scan_config.with_filter(filter);
+        }
+        let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
 
-        // Reuse manifest-derived file selections across repeated scans of the
-        // same snapshot. Projection still varies per scan, so we rebuild tasks.
-        // The scan-files cache is keyed only by metadata location, so it is
-        // bypassed when a pushdown filter is present (different filter → a
-        // different pruned file set).
-        let (tasks, files_selected, files_pruned, estimated_row_count) = if let Some(filter) =
-            &filter_expr
-        {
-            let scan_config = ScanConfig::new()
-                .with_projection(projected_field_ids.clone())
-                .with_filter(filter.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan()
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-            (
-                plan.tasks,
-                plan.files_selected,
-                plan.files_pruned,
-                plan.estimated_row_count,
-            )
-        } else if let Some(cached) = cache.get_scan_files(&metadata_location).await {
-            // F-AUD-1 cache-arm guard: an in-memory scan-files HIT rebuilds tasks
-            // without calling the guarded plan_scan, so re-check the delete flag.
-            guard_cached_scan_files(cached.has_delete_manifests, &metadata_location)?;
-            debug!(
-                metadata_location = %metadata_location,
-                cached_files = cached.data_files.len(),
-                "Iceberg scan-files cache hit"
-            );
+        // A snapshot's live file list never changes, so it is read from the
+        // manifests once and kept, and every scan of the snapshot plans from it
+        // (see `plan_from_kept_files`).
+        let plan = self
+            .plan_from_kept_files(&planner, snapshot, &scope, &cache_key, &metadata_location)
+            .await?;
+        let ScanPlan {
+            tasks,
+            files_selected,
+            files_pruned,
+            estimated_row_count,
+            ..
+        } = plan;
 
-            let tasks = cached
-                .data_files
-                .iter()
-                .cloned()
-                .map(|data_file| {
-                    FileScanTask::for_whole_file_with_schema(
-                        data_file,
-                        projected_field_ids.clone(),
-                        None,
-                        Arc::clone(&schema_arc),
-                    )
-                })
-                .collect::<Vec<_>>();
-
-            (
-                tasks,
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
-        } else if let Some(disk) = self.catalog_disk_cache().get_scan_files(&metadata_location) {
-            // F-AUD-1 cache-arm guard (the cross-process case): a persistent-disk
-            // scan-files entry survives restarts, so a delete-bearing list cached
-            // under the override by an earlier process must be re-checked before it
-            // is served or promoted into the in-memory cache. Pre-guard (v2) entries
-            // are already excluded by the CACHE_FORMAT_VERSION bump; this covers a v3
-            // entry written under the override.
-            guard_cached_scan_files(disk.has_delete_manifests, &metadata_location)?;
-            // PR-8 slice 2: in-memory miss, but the persistent disk catalog
-            // cache has this snapshot's (unfiltered) file list — a warm-catalog
-            // cold process skips the manifest read (`iceberg.scan_plan`). Rebuild
-            // tasks from the file list exactly as the in-memory-hit arm does, and
-            // populate the in-memory cache for the rest of the process.
-            debug!(
-                metadata_location = %metadata_location,
-                cached_files = disk.data_files.len(),
-                "Iceberg scan-files disk-cache hit"
-            );
-            cache
-                .put_scan_files(metadata_location.clone(), Arc::clone(&disk))
-                .await;
-            let tasks = disk
-                .data_files
-                .iter()
-                .cloned()
-                .map(|data_file| {
-                    FileScanTask::for_whole_file_with_schema(
-                        data_file,
-                        projected_field_ids.clone(),
-                        None,
-                        Arc::clone(&schema_arc),
-                    )
-                })
-                .collect::<Vec<_>>();
-            (
-                tasks,
-                disk.files_selected,
-                disk.files_pruned,
-                disk.estimated_row_count,
-            )
-        } else {
-            debug!(metadata_location = %metadata_location, "Iceberg scan-files cache miss");
-
-            // Create scan configuration with projection for the first plan.
-            let scan_config = ScanConfig::new().with_projection(projected_field_ids.clone());
-            let planner = SendScanPlanner::new(storage.as_ref(), &metadata, scan_config);
-            let plan = planner
-                .plan_scan()
-                .await
-                .map_err(|e| storage_query_error("Failed to plan scan", e))?;
-
-            let cached = Arc::new(CachedScanFiles {
-                data_files: Arc::new(
-                    plan.tasks
-                        .iter()
-                        .map(|task| task.data_file.clone())
-                        .collect(),
-                ),
-                estimated_row_count: plan.estimated_row_count,
-                files_selected: plan.files_selected,
-                files_pruned: plan.files_pruned,
-                has_delete_manifests: plan.has_delete_manifests,
-            });
-            cache
-                .put_scan_files(metadata_location.clone(), Arc::clone(&cached))
-                .await;
-            // Persist to the disk catalog cache (content-addressed, immutable).
-            self.catalog_disk_cache()
-                .put_scan_files(&metadata_location, &cached);
-
-            (
-                plan.tasks,
-                cached.files_selected,
-                cached.files_pruned,
-                cached.estimated_row_count,
-            )
+        let (tasks, files_selected, files_pruned) = match &row_filter {
+            None => (tasks, files_selected, files_pruned),
+            Some(filter) => {
+                let tasks = narrow_to_row_filter(tasks, filter, schema);
+                let pruned = files_selected - tasks.len();
+                (tasks, files_selected - pruned, files_pruned + pruned)
+            }
         };
 
         info!(
@@ -3698,7 +5312,9 @@ impl FlureeR2rmlProvider<'_> {
         }
 
         // Read data files with bounded parallelism, streaming each file's batches
-        // to the consumer as the worker completes. Concurrency is capped (see
+        // to the consumer in a fixed order (`read_files_in_order`: an unordered
+        // query answers the same rows in the same order every time, so LIMIT /
+        // OFFSET pages partition its answer). Concurrency is capped (see
         // `iceberg_scan_concurrency`) so only O(concurrency) file decodes are
         // resident — the consumer (R2rmlScanOperator) materializes and aggregates
         // incrementally instead of the whole table being collected here.
@@ -3724,10 +5340,22 @@ impl FlureeR2rmlProvider<'_> {
             // DESC is sound for any column (unbound sorts last). A declined directive
             // simply falls through to the normal parallel scan below (ignoring a
             // top-k is always correct — the `SortOperator` above is authoritative).
+            // The bounds must sort as the terms do: a string column's "9" bound
+            // sits above its "100", an integer column's 10 above its 9.
+            // The bound counts only rows that yield a solution: a row with a
+            // NULL in a column the solution needs is dropped after the scan.
+            // A required column this table lacks declines the directive.
+            let required_ids: Option<Vec<i32>> = tk
+                .required_columns
+                .iter()
+                .map(|name| schema.field_by_name(name).map(|f| f.id))
+                .collect();
             let admitted = schema
                 .field_by_name(&tk.sort_column)
-                .filter(|field| !tk.ascending || field.required);
-            if let Some(field) = admitted {
+                .filter(|field| !tk.ascending || field.required)
+                .filter(|field| bound_order(field.type_string()) == Some(tk.order))
+                .zip(required_ids);
+            if let Some((field, required_ids)) = admitted {
                 let sort_field_id = field.id;
                 let sort_type = field.type_string().map(str::to_string);
                 let order = plan_topk_read(
@@ -3762,6 +5390,7 @@ impl FlureeR2rmlProvider<'_> {
                         footers.as_ref(),
                         &disk_cache,
                         &cache_dir,
+                        &scope,
                     )
                     .read_task(&tasks[orig])
                     .instrument(read_span)
@@ -3776,15 +5405,19 @@ impl FlureeR2rmlProvider<'_> {
                         )
                     })?;
                     // SOUNDNESS INVARIANT: the heap is fed the sort values of the
-                    // rows this scan EMITS — which are the QUALIFYING result rows
-                    // (post any pushed row filter). The directive is declined
-                    // upstream (`resolve_topk_directive`) whenever a RESIDUAL filter
-                    // the operator enforces after this scan is present, because
-                    // feeding pre-filter values would ride the k-th bound too high
-                    // and prune files whose qualifying rows belong in the true
-                    // top-k. Never feed a superset of the qualifying rows here.
+                    // rows this scan EMITS that yield a result row, which must be
+                    // exactly the QUALIFYING result rows, one per solution. Rows
+                    // with a NULL in a `required_columns` column mint no solution
+                    // and are not fed. The directive is declined upstream
+                    // whenever a row could still be dropped otherwise (a residual
+                    // filter, a join with the child on a shared variable, any
+                    // pushed filter, which this reader may apply only partly, or
+                    // a star member no column decides), and where the map's rows
+                    // can repeat a solution, which deduplication emits once.
+                    // Feeding those rows would ride the k-th bound too high and
+                    // prune files whose qualifying rows belong in the true top-k.
                     for b in &batches {
-                        bound.observe_all(batch_sort_values(b, sort_field_id));
+                        bound.observe_all(batch_sort_values_where(b, sort_field_id, &required_ids));
                     }
                     collected.extend(batches);
                     reads += 1;
@@ -3825,53 +5458,44 @@ impl FlureeR2rmlProvider<'_> {
                     return Ok(Box::pin(prefix));
                 }
                 // Parallel fallback tail (same bounded-parallel read as the normal
-                // path). The bound still holds; we just stop paying sequentiality.
+                // path, still in best-first order). The bound still holds; we just
+                // stop paying sequentiality.
                 let concurrency = iceberg_scan_concurrency(tail.len());
                 let tail_stream =
-                    futures::stream::iter(tail)
-                        .map(move |task| {
-                            let storage = Arc::clone(&storage);
-                            let footers = Arc::clone(&footers);
-                            let disk_cache = Arc::clone(&disk_cache);
-                            let cache_dir = cache_dir.clone();
-                            let read_span = tracing::debug_span!(
-                                "iceberg.parquet_read",
-                                path = %task.data_file.file_path,
-                                file_size = task.data_file.file_size_in_bytes,
+                    read_files_in_order(tail, EmitOrder::AsListed, concurrency, move |task| {
+                        let storage = Arc::clone(&storage);
+                        let footers = Arc::clone(&footers);
+                        let disk_cache = Arc::clone(&disk_cache);
+                        let cache_dir = cache_dir.clone();
+                        let scope = scope.clone();
+                        let read_span = tracing::debug_span!(
+                            "iceberg.parquet_read",
+                            path = %task.data_file.file_path,
+                            file_size = task.data_file.file_size_in_bytes,
+                        );
+                        async move {
+                            let reader = SendParquetReader::with_caches(
+                                storage.as_ref(),
+                                footers.as_ref(),
+                                &disk_cache,
+                                &cache_dir,
+                                &scope,
                             );
-                            async move {
-                                tokio::spawn(async move {
-                                    let reader = SendParquetReader::with_caches(
-                                        storage.as_ref(),
-                                        footers.as_ref(),
-                                        &disk_cache,
-                                        &cache_dir,
-                                    );
-                                    reader.read_task(&task).instrument(read_span).await.map_err(
-                                        |e| {
-                                            storage_query_error(
-                                                &format!(
-                                                    "Failed to read Parquet file '{}'",
-                                                    task.data_file.file_path
-                                                ),
-                                                e,
-                                            )
-                                        },
-                                    )
-                                })
+                            reader
+                                .read_task(&task)
+                                .instrument(read_span)
                                 .await
                                 .map_err(|e| {
-                                    QueryError::Internal(format!("Parquet read worker failed: {e}"))
-                                })?
-                            }
-                        })
-                        .buffer_unordered(concurrency)
-                        .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                            Ok(batches) => futures::stream::iter(
-                                batches.into_iter().map(Ok).collect::<Vec<_>>(),
-                            ),
-                            Err(e) => futures::stream::iter(vec![Err(e)]),
-                        });
+                                    storage_query_error(
+                                        &format!(
+                                            "Failed to read Parquet file '{}'",
+                                            task.data_file.file_path
+                                        ),
+                                        e,
+                                    )
+                                })
+                        }
+                    });
                 return Ok(Box::pin(prefix.chain(tail_stream)));
             }
         }
@@ -3891,63 +5515,79 @@ impl FlureeR2rmlProvider<'_> {
             concurrency, rowgroup_concurrency, "streaming Parquet files (bounded parallel)"
         );
 
-        let stream = futures::stream::iter(tasks)
-            .map(move |task| {
+        Ok(read_files_in_order(
+            tasks,
+            EmitOrder::for_query(order),
+            concurrency,
+            move |task| {
                 let storage = Arc::clone(&storage);
                 let footers = Arc::clone(&footers);
                 let disk_cache = Arc::clone(&disk_cache);
                 let cache_dir = cache_dir.clone();
-                // Create the per-file span HERE, before `tokio::spawn`, so it is
+                let scope = scope.clone();
+                // Create the per-file span HERE, before the read is spawned, so it is
                 // parented under the consumer's current span: `tokio::spawn` does
                 // NOT propagate the current span into the spawned task, but a span
                 // records its parent at creation time. Instrumenting the read
                 // future inside the task then times the actual read+decode while
                 // keeping the correct parent (and gives each concurrent read a
-                // distinct span, respecting the `buffer_unordered` fan-out).
+                // distinct span).
                 let read_span = tracing::debug_span!(
                     "iceberg.parquet_read",
                     path = %task.data_file.file_path,
                     file_size = task.data_file.file_size_in_bytes,
                 );
                 async move {
-                    tokio::spawn(async move {
-                        let reader = SendParquetReader::with_caches(
-                            storage.as_ref(),
-                            footers.as_ref(),
-                            &disk_cache,
-                            &cache_dir,
-                        )
-                        .with_rowgroup_concurrency(rowgroup_concurrency);
-                        reader
-                            .read_task(&task)
-                            .instrument(read_span)
-                            .await
-                            .map_err(|e| {
-                                storage_query_error(
-                                    &format!(
-                                        "Failed to read Parquet file '{}'",
-                                        task.data_file.file_path
-                                    ),
-                                    e,
-                                )
-                            })
-                    })
-                    .await
-                    .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+                    let reader = SendParquetReader::with_caches(
+                        storage.as_ref(),
+                        footers.as_ref(),
+                        &disk_cache,
+                        &cache_dir,
+                        &scope,
+                    )
+                    .with_rowgroup_concurrency(rowgroup_concurrency);
+                    reader
+                        .read_task(&task)
+                        .instrument(read_span)
+                        .await
+                        .map_err(|e| {
+                            storage_query_error(
+                                &format!(
+                                    "Failed to read Parquet file '{}'",
+                                    task.data_file.file_path
+                                ),
+                                e,
+                            )
+                        })
                 }
-            })
-            .buffer_unordered(concurrency)
-            // Flatten each file's `Result<Vec<ColumnBatch>>` into individual
-            // `Result<ColumnBatch>` items; a read error becomes one error item.
-            .flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
-                Ok(batches) => {
-                    futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>())
-                }
-                Err(e) => futures::stream::iter(vec![Err(e)]),
-            });
-
-        Ok(Box::pin(stream))
+            },
+        ))
     }
+}
+
+/// Narrow a planned scan to a triples map's row filter: drop each file whose
+/// statistics prove no row passes, and make the reader enforce the filter on
+/// every row of the rest.
+///
+/// Applied to whatever the planning arms produced, the scan-files cache hits
+/// included, so a filtered map keeps the cached file list (the filter is fixed
+/// per map; re-planning from manifests on every query would cost a manifest
+/// read for no change in the answer).
+pub(crate) fn narrow_to_row_filter(
+    tasks: Vec<FileScanTask>,
+    filter: &fluree_db_iceberg::scan::ExactRowFilter,
+    schema: &fluree_db_iceberg::metadata::Schema,
+) -> Vec<FileScanTask> {
+    let expr = filter.pruning_expression();
+    tasks
+        .into_iter()
+        .filter(|task| {
+            expr.as_ref().is_none_or(|expr| {
+                fluree_db_iceberg::scan::can_contain_file(expr, &task.data_file, schema)
+            })
+        })
+        .map(|task| task.with_exact_filter(Some(filter.clone())))
+        .collect()
 }
 
 /// An empty [`ColumnBatchStream`], used when a scan plan selects no files.
@@ -3955,21 +5595,100 @@ fn empty_batch_stream() -> ColumnBatchStream {
     Box::pin(futures::stream::empty())
 }
 
-/// Re-apply the fail-closed merge-on-read guard (audit F-AUD-1) to a cached
-/// scan-files selection. A scan-files cache HIT (in-memory or persistent disk)
-/// rebuilds tasks WITHOUT calling the guarded `plan_scan`, so a delete-bearing
-/// file list — which is only ever cacheable when the guard was overridden at plan
-/// time — must be re-checked here in case the override is now off. Cheap: the flag
-/// rides on the cache entry, no manifest re-read. Shared by both hit arms so the
-/// check cannot drift between them.
-fn guard_cached_scan_files(has_delete_manifests: bool, metadata_location: &str) -> QueryResult<()> {
-    let allow_mor = fluree_db_iceberg::mor_deletes_allowed();
-    fluree_db_iceberg::ensure_no_delete_manifests(
-        usize::from(has_delete_manifests),
-        metadata_location,
-        allow_mor,
+/// The order a scan emits its data files in.
+///
+/// `AsListed` and `SmallestFirst` are total orders over one snapshot's plan, so
+/// two executions of one query emit the same rows in the same order whatever
+/// order the reads finish in: a client paging an unordered answer with
+/// LIMIT/OFFSET neither skips nor repeats a row. `Completion` is for a query
+/// with no slice, which cannot observe the order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmitOrder {
+    /// The order the caller lists the files in: the planner's (commit
+    /// sequence, then path), which a resumable materialize read depends on, or
+    /// the top-k read's best-first order.
+    AsListed,
+    /// Smallest data file first (the manifest's `file_size_in_bytes`), ties in
+    /// listed order: a deterministic query scan. The file at the head of the
+    /// read window is the cheapest to read, so a LIMIT is answered from small
+    /// files and a large file never holds back the files behind it for long.
+    SmallestFirst,
+    /// Each file as its read finishes. Varies from run to run with I/O timing;
+    /// only for a query with no LIMIT or OFFSET (`ScanOrder::Any`).
+    Completion,
+}
+
+impl EmitOrder {
+    /// The order a query scan emits in for the `ScanOrder` the query owes it.
+    pub(crate) fn for_query(order: ScanOrder) -> Self {
+        match order {
+            ScanOrder::Deterministic => Self::SmallestFirst,
+            ScanOrder::Any => Self::Completion,
+        }
+    }
+}
+
+/// Read a scan's data files with up to `concurrency` reads in flight, and emit
+/// each file's batches in `order`.
+///
+/// Every Iceberg scan that emits rows reads its files through here. In a fixed
+/// order (`AsListed`, `SmallestFirst`), a read that finishes ahead of the
+/// earliest pending one holds its slot until that one is emitted (head-of-line
+/// blocking), so resident decodes stay bounded by `concurrency` either way.
+///
+/// `read` builds one file's read; it runs on its own task, so up to
+/// `concurrency` reads progress in parallel while the consumer drains them.
+/// Each read's task is held by an `AbortOnDropHandle`, so dropping the stream
+/// aborts the reads in flight: a scan dropped early (its LIMIT is met, or the
+/// query is cancelled) leaves no read running to the end of its file.
+pub(crate) fn read_files_in_order<R, Fut>(
+    mut tasks: Vec<FileScanTask>,
+    order: EmitOrder,
+    concurrency: usize,
+    read: R,
+) -> ColumnBatchStream
+where
+    R: Fn(FileScanTask) -> Fut + Send + Sync + 'static,
+    Fut: std::future::Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + 'static,
+{
+    match order {
+        EmitOrder::AsListed | EmitOrder::Completion => {}
+        // Stable: equal sizes keep the listed order.
+        EmitOrder::SmallestFirst => tasks.sort_by_key(|t| t.data_file.file_size_in_bytes),
+    }
+    // Each file's read is built here, when the window admits the file (so its
+    // span is parented under the consumer's), and spawned on its first poll;
+    // both combinators below poll every admitted file, so the reads behind the
+    // earliest one run meanwhile. This is the shape the scan had before it
+    // took an order. (Spawning eagerly as the stream is pulled raised peak RSS
+    // under glibc malloc on a decode-bound COUNT.) The mutex only makes the
+    // pending read `Sync`, as the stream must be; it is never contended.
+    let reads = futures::stream::iter(tasks).map(move |task| {
+        let read = std::sync::Mutex::new(read(task));
+        async move {
+            let read = read
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            AbortOnDropHandle::new(tokio::spawn(read))
+                .await
+                .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
+        }
+    });
+    let concurrency = concurrency.max(1);
+    let files: std::pin::Pin<
+        Box<dyn futures::Stream<Item = QueryResult<Vec<ColumnBatch>>> + Send + Sync>,
+    > = match order {
+        EmitOrder::AsListed | EmitOrder::SmallestFirst => Box::pin(reads.buffered(concurrency)),
+        EmitOrder::Completion => Box::pin(reads.buffer_unordered(concurrency)),
+    };
+    // One file's `Result<Vec<ColumnBatch>>` becomes individual
+    // `Result<ColumnBatch>` items; a read error becomes one error item.
+    Box::pin(
+        files.flat_map(|res: QueryResult<Vec<ColumnBatch>>| match res {
+            Ok(batches) => futures::stream::iter(batches.into_iter().map(Ok).collect::<Vec<_>>()),
+            Err(e) => futures::stream::iter(vec![Err(e)]),
+        }),
     )
-    .map_err(|e| storage_query_error("Refusing cached Iceberg scan", e))
 }
 
 /// Decide whether a pinned snapshot's manifest `record_count` sum is a sound
@@ -4050,14 +5769,164 @@ fn sound_manifest_row_count(
 /// regression visible only in the cache gate's `load_table.n` counter. Seeding from
 /// the free inline copy is strictly better than the pre-§1 behaviour, where this
 /// layer could only be populated by first paying an S3 GET.
+/// The table metadata a catalog `loadTable` named, for a reader outside the query
+/// path (the `/info` row counts): the inline copy (a REST catalog's), else the
+/// in-memory and disk caches the query path fills, and only on a full miss an S3
+/// read, through storage built with the source's own §2 decision and seeding both
+/// caches as a query would. AWS Glue and S3 Tables return no inline copy, so this
+/// is how they are counted at all.
+pub(crate) async fn catalog_table_metadata(
+    fluree: &crate::Fluree,
+    cfg: &IcebergGsConfig,
+    load: &mut LoadTableResponse,
+) -> QueryResult<Arc<TableMetadata>> {
+    if let Some(inline) = load.metadata.take() {
+        return Ok(Arc::new(inline));
+    }
+    // The decision (policy, scheme, a Google identity's proof) before any
+    // cache: a cached copy is served only under the identity that read it.
+    let plan = plan_for(fluree, cfg, &load.metadata_location).await?;
+    let scope = plan.scope();
+    let cache = fluree.r2rml_cache();
+    if let Some(cached) = cache.get_metadata(scope, &load.metadata_location).await {
+        return Ok(cached);
+    }
+    let disk = super::disk_catalog_cache::DiskCatalogCache::for_dir(
+        &super::disk_catalog_cache::catalog_cache_dir(&fluree.binary_store_cache_dir()),
+    );
+    if let Some(cached) = disk.get_metadata(scope, &load.metadata_location) {
+        cache
+            .put_metadata(scope, &load.metadata_location, Arc::clone(&cached))
+            .await;
+        return Ok(cached);
+    }
+    let storage = fresh_storage(&plan, &CatalogGrant::from_load(load, None)).await?;
+    resolve_table_metadata(
+        cache,
+        storage.as_ref(),
+        &load.metadata_location,
+        None,
+        &disk,
+        scope,
+    )
+    .await
+}
+
+/// The storage plan a reader outside the query path (the `/info` row counts)
+/// reads a catalog-loaded table's files under: the source's own decision for
+/// its metadata location, under the instance's identity context, as
+/// [`catalog_table_metadata`] makes it. Its scope keys every cache that reader
+/// consults; a Google identity is proven here (its token is cached
+/// process-wide, so a warm plan makes no remote call).
+pub(crate) async fn catalog_read_plan(
+    fluree: &crate::Fluree,
+    cfg: &IcebergGsConfig,
+    load: &LoadTableResponse,
+) -> QueryResult<StoragePlan> {
+    plan_for(fluree, cfg, &load.metadata_location).await
+}
+
+/// The store `plan` decided, built from what the catalog granted.
+pub(crate) async fn catalog_read_storage(
+    plan: &StoragePlan,
+    grant: &CatalogGrant,
+) -> QueryResult<Arc<IcebergStorageBackend>> {
+    fresh_storage(plan, grant).await
+}
+
+/// The totals a snapshot's manifest list states ([`ManifestListTotals`]), for
+/// a reader that needs a table's size when its snapshot summary leaves the
+/// totals out: virtual `/info` and the Schema-tier preview.
+///
+/// Served from `cache` when it holds them, keyed by the manifest-list
+/// location under `scope`, the identity the caller's storage plan reads with:
+/// a total read under one identity is never served to another. A manifest list
+/// never changes once written, so a hit is always current. Otherwise
+/// `open_storage` builds the storage for one read of the list (never a
+/// manifest) and the result is cached for the next caller under the same
+/// scope. `None` when the snapshot has no manifest list (v1) or the storage or
+/// read fails. A failure is logged at debug and caches nothing.
+///
+/// [`ManifestListTotals`]: fluree_db_iceberg::ManifestListTotals
+pub(crate) async fn cached_manifest_list_totals<S, E, F, Fut>(
+    cache: Option<&R2rmlCache>,
+    scope: &StorageScope,
+    table: &str,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+    open_storage: F,
+) -> Option<fluree_db_iceberg::ManifestListTotals>
+where
+    S: SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    if let Some(hit) = cached_manifest_list_totals_hit(cache, scope, snapshot) {
+        return Some(hit);
+    }
+    read_manifest_list_totals(cache, scope, table, snapshot, open_storage).await
+}
+
+/// The cache half of [`cached_manifest_list_totals`]: the totals `cache`
+/// holds for the snapshot's manifest list, with no I/O. A caller that bounds
+/// only the read (virtual `/info`) looks here first and times only
+/// [`read_manifest_list_totals`].
+pub(crate) fn cached_manifest_list_totals_hit(
+    cache: Option<&R2rmlCache>,
+    scope: &StorageScope,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+) -> Option<fluree_db_iceberg::ManifestListTotals> {
+    cache?.get_manifest_list_totals(scope, snapshot.manifest_list_location()?)
+}
+
+/// The read half of [`cached_manifest_list_totals`]: build the storage, read
+/// the snapshot's manifest list once and cache the totals. Does not consult
+/// the cache first.
+pub(crate) async fn read_manifest_list_totals<S, E, F, Fut>(
+    cache: Option<&R2rmlCache>,
+    scope: &StorageScope,
+    table: &str,
+    snapshot: &fluree_db_iceberg::metadata::Snapshot,
+    open_storage: F,
+) -> Option<fluree_db_iceberg::ManifestListTotals>
+where
+    S: SendIcebergStorage + ?Sized,
+    E: std::fmt::Display,
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<Arc<S>, E>>,
+{
+    let list = snapshot.manifest_list_location()?;
+    let storage = match open_storage().await {
+        Ok(storage) => storage,
+        Err(e) => {
+            debug!(table, error = %e, "manifest-list totals: no storage to read the list");
+            return None;
+        }
+    };
+    match fluree_db_iceberg::stats::send_read_manifest_list_totals(storage.as_ref(), snapshot).await
+    {
+        Ok(totals) => {
+            if let Some(cache) = cache {
+                cache.put_manifest_list_totals(scope, list, totals);
+            }
+            Some(totals)
+        }
+        Err(e) => {
+            debug!(table, manifest_list = list, error = %e, "manifest-list totals: list unreadable");
+            None
+        }
+    }
+}
+
 async fn resolve_table_metadata<S: SendIcebergStorage>(
     cache: &R2rmlCache,
     storage: &S,
     metadata_location: &str,
     inline_metadata: Option<TableMetadata>,
     disk: &super::disk_catalog_cache::DiskCatalogCache,
+    scope: &StorageScope,
 ) -> QueryResult<Arc<TableMetadata>> {
-    if let Some(cached) = cache.get_metadata(metadata_location).await {
+    if let Some(cached) = cache.get_metadata(scope, metadata_location).await {
         debug!(metadata_location = %metadata_location, "Table metadata cache hit");
         return Ok(cached);
     }
@@ -4071,9 +5940,9 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
         // Seed the disk layer too: this is what the next process's pointer rung
         // reads (see the fn doc). Content-addressed by `metadata_location`, so the
         // entry is immutable and always current for that snapshot.
-        disk.put_metadata(metadata_location, metadata.as_ref());
+        disk.put_metadata(scope, metadata_location, metadata.as_ref());
         cache
-            .put_metadata(metadata_location.to_string(), Arc::clone(&metadata))
+            .put_metadata(scope, metadata_location, Arc::clone(&metadata))
             .await;
         return Ok(metadata);
     }
@@ -4085,7 +5954,7 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
     // always current for that snapshot. A cold process with a warm catalog dir
     // serves the parsed metadata from local disk (no S3 GET, no
     // `r2rml.read_metadata` span).
-    let metadata = if let Some(cached) = disk.get_metadata(metadata_location) {
+    let metadata = if let Some(cached) = disk.get_metadata(scope, metadata_location) {
         debug!(metadata_location = %metadata_location, "Table metadata disk-cache hit");
         cached
     } else {
@@ -4108,11 +5977,11 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
             metadata_location = %metadata_location,
         ))
         .await?;
-        disk.put_metadata(metadata_location, metadata.as_ref());
+        disk.put_metadata(scope, metadata_location, metadata.as_ref());
         metadata
     };
     cache
-        .put_metadata(metadata_location.to_string(), Arc::clone(&metadata))
+        .put_metadata(scope, metadata_location, Arc::clone(&metadata))
         .await;
 
     info!(
@@ -4124,20 +5993,6 @@ async fn resolve_table_metadata<S: SendIcebergStorage>(
     Ok(metadata)
 }
 
-/// Acquire the S3 storage client for a Direct-mode table, reusing the query
-/// session's cached client when one is present.
-///
-/// Direct mode builds from the ambient AWS credential chain
-/// (`from_default_chain`: env → `~/.aws` → IMDS/ECS network round-trips) and
-/// stands up a fresh connection pool — not free, and repeated for every scan of
-/// a table that a correlated join (or the slice-1 prefetch→scan) re-resolves.
-/// This mirrors the REST branch's `cached_storage`/`store_storage` reuse
-/// (fluree/db#1498). Unlike REST, Direct never calls `store_load_table` (it has
-/// no vended credentials to rotate), so the cached client is never invalidated
-/// mid-query: the first build is stored and every later resolution of the same
-/// table returns that Arc. `cached_storage`/`store_storage` are gated on
-/// `cache_enabled()`, so with caching disabled this still builds per call
-/// (matching REST and the pre-#1498 behavior).
 /// Infer the location remap for a RELOCATED local Direct table — one copied or
 /// moved after being written, so its metadata/manifests reference the ORIGINAL
 /// root. Both ends of the mapping are already known: the metadata's own
@@ -4179,39 +6034,6 @@ fn remap_local_storage(
     )))
 }
 
-async fn direct_session_storage(
-    session: &super::catalog_session::IcebergCatalogSession,
-    lt_key: &str,
-    table_location: &str,
-    region: Option<&str>,
-    endpoint: Option<&str>,
-    path_style: bool,
-) -> QueryResult<Arc<IcebergStorageBackend>> {
-    if let Some(cached) = session.cached_storage(lt_key) {
-        debug!("storage client reused (query-scoped, direct)");
-        return Ok(cached);
-    }
-    // Backend by location scheme: a local (`file://` / absolute-path) table
-    // reads the filesystem directly — no SDK client, no credential-chain
-    // resolution. Cached in the session like the S3 client for uniformity
-    // (the build is nearly free, but callers treat the cache as authoritative).
-    if FileIcebergStorage::is_local_location(table_location) {
-        let built = Arc::new(IcebergStorageBackend::File(FileIcebergStorage::new()));
-        session.store_storage(lt_key.to_string(), Arc::clone(&built));
-        return Ok(built);
-    }
-    // gs://-backed tables (GCS S3-interop endpoint) are read through this same S3
-    // SDK path; the client is pinned to HTTP/1.1 to avoid the AWS-SDK HTTP/2
-    // range-read bug against that endpoint.
-    let built = Arc::new(IcebergStorageBackend::S3(
-        S3IcebergStorage::from_default_chain(region, endpoint, path_style)
-            .await
-            .map_err(|e| QueryError::Internal(format!("Failed to create S3 storage: {e}")))?,
-    ));
-    session.store_storage(lt_key.to_string(), Arc::clone(&built));
-    Ok(built)
-}
-
 /// MAJOR-3 (#1529 review): whether a listing of immediate child directory names
 /// denotes a SINGLE Iceberg table rather than a warehouse root. Every Iceberg
 /// table directory carries a `metadata/` child (its table metadata); a warehouse
@@ -4229,29 +6051,93 @@ fn listing_is_single_table(listing: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_recent_table_resolution_serves_only_its_own_pin_and_window() {
+        use std::time::{Duration, Instant};
+        let at = Instant::now();
+        let pin = Some(SourceTime::SnapshotId(7));
+        assert!(recent_context_serves(at, None, None, at));
+        assert!(recent_context_serves(
+            at,
+            pin,
+            pin,
+            at + Duration::from_secs(9)
+        ));
+        // A pin set after an unpinned resolution, or a different pin, resolves again.
+        assert!(!recent_context_serves(at, None, pin, at));
+        assert!(!recent_context_serves(at, pin, None, at));
+        assert!(!recent_context_serves(
+            at,
+            pin,
+            Some(SourceTime::SnapshotId(8)),
+            at
+        ));
+        // Past the window a provider that outlives a query resolves afresh.
+        assert!(!recent_context_serves(
+            at,
+            None,
+            None,
+            at + RECENT_CONTEXT_REUSE
+        ));
+        assert!(!recent_context_serves(
+            at,
+            None,
+            None,
+            at + Duration::from_secs(60)
+        ));
+    }
+
     use super::*;
+    use fluree_db_iceberg::config::IoConfig;
+
+    /// A failed table load counts as answered by the catalog only with
+    /// evidence of an answer, as the real conversions render it: not-found,
+    /// any other REST status, and the typed refusals. A connection-level
+    /// failure (refused, DNS, TLS, timeout) and an untyped AWS failure are
+    /// not.
+    #[test]
+    fn catalog_answer_classification() {
+        use fluree_db_iceberg::IcebergError as E;
+        let via = |e: E| storage_query_error("Failed to load table from catalog", e);
+        let answered = [
+            via(E::TableNotFound(
+                "Resource not found at v1/ns/tables/t: {}".into(),
+            )),
+            via(E::TableNotFound(
+                "Glue table ns.t not found: EntityNotFoundException".into(),
+            )),
+            via(E::Catalog(
+                "Catalog request failed (500 Internal Server Error): boom".into(),
+            )),
+            via(E::CatalogAccessDenied {
+                table: "ns.t".into(),
+                message: "Catalog request failed (403 Forbidden): no".into(),
+            }),
+            via(E::CatalogCredentialsNotVended {
+                catalog_uri: "https://c".into(),
+            }),
+        ];
+        for error in &answered {
+            assert!(catalog_answered(error), "answered: {error}");
+        }
+        let unanswered = [
+            via(E::Http(
+                "Connection error: error sending request: connection refused".into(),
+            )),
+            via(E::Http("Request timeout: operation timed out".into())),
+            via(E::Http("HTTP error: invalid peer certificate".into())),
+            via(E::Catalog(
+                "GetTable on Glue table ns.t failed: dispatch failure".into(),
+            )),
+            QueryError::Nameservice("down".into()),
+        ];
+        for error in &unanswered {
+            assert!(!catalog_answered(error), "not answered: {error}");
+        }
+    }
     use fluree_db_iceberg::metadata::{Schema, SchemaField};
     use fluree_db_query::r2rml::{ScanCmpOp, ScanFilter, ScanValue};
     use serde_json::json;
-
-    /// F-AUD-1 cache-arm follow-up: the shared guard both scan-files hit arms call
-    /// must refuse a delete-bearing cached entry (guard active by default in the
-    /// test env) and pass a delete-free one — so a cache HIT can never silently
-    /// serve a merge-on-read file list around the plan-time guard.
-    #[test]
-    fn cached_scan_files_guard_refuses_delete_bearing_entry() {
-        assert!(
-            guard_cached_scan_files(false, "s3://b/t/metadata/00001.json").is_ok(),
-            "a delete-free cached entry is served"
-        );
-        let err = guard_cached_scan_files(true, "s3://b/dw.fact_orders/metadata/00007.json")
-            .expect_err("a delete-bearing cached entry must be refused with the guard active");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("FLUREE_ICEBERG_ALLOW_MOR_DELETES"),
-            "the refusal names the override switch: {msg}"
-        );
-    }
 
     fn field(id: i32, name: &str, ty: serde_json::Value) -> SchemaField {
         SchemaField {
@@ -4276,6 +6162,123 @@ mod tests {
                 field(6, "double_key", json!("double")),
                 field(7, "float_key", json!("float")),
             ],
+        }
+    }
+
+    /// A customers table whose identifier field is `customer_id`.
+    fn identified_schema(identifier_field_ids: Vec<i32>) -> Schema {
+        Schema {
+            schema_id: 0,
+            identifier_field_ids,
+            fields: vec![
+                field(1, "customer_id", json!("long")),
+                field(2, "name", json!("string")),
+                field(3, "score", json!("double")),
+                field(
+                    4,
+                    "address",
+                    json!({"type": "struct", "fields": [
+                        {"id": 5, "name": "city", "required": false, "type": "string"}
+                    ]}),
+                ),
+                field(6, "valid_from", json!("date")),
+            ],
+        }
+    }
+
+    fn reported(format_version: i32, ids: Vec<i32>) -> Option<Vec<Vec<String>>> {
+        iceberg_table_keys(
+            format_version,
+            &identified_schema(ids),
+            "sets.customers_current",
+            &fluree_db_r2rml::TableKeys::none(),
+            |_| true,
+        )
+        .expect("no declared key to refuse")
+    }
+
+    #[test]
+    fn identifier_fields_are_a_key_through_format_version_3() {
+        let one = Some(vec![vec!["customer_id".to_string()]]);
+        for v in [1, 2, 3] {
+            assert_eq!(reported(v, vec![1]), one, "format version {v}");
+        }
+        // A version-4 reader must ignore identifier fields.
+        assert_eq!(reported(4, vec![1]), None);
+        // None declared, none reported.
+        assert_eq!(reported(2, vec![]), None);
+        // A composite identifier is one key.
+        assert_eq!(
+            reported(2, vec![6, 1]),
+            Some(vec![vec![
+                "customer_id".to_string(),
+                "valid_from".to_string()
+            ]])
+        );
+    }
+
+    #[test]
+    fn an_identifier_that_cannot_identify_a_row_is_not_reported() {
+        // A floating-point field (the spec forbids it; a writer may not).
+        assert_eq!(reported(2, vec![1, 3]), None);
+        // A field nested in a struct is no column a template can read.
+        assert_eq!(reported(2, vec![5]), None);
+        // An id the schema does not hold.
+        assert_eq!(reported(2, vec![1, 99]), None);
+    }
+
+    #[test]
+    fn a_key_over_a_column_the_query_does_not_select_is_no_key() {
+        let selects = |column: &str| column != "customer_id";
+        let declared = iceberg_table_keys(
+            2,
+            &identified_schema(vec![]),
+            "SELECT name FROM sets.customers_current",
+            &fluree_db_r2rml::TableKeys::new([vec!["customer_id"]]),
+            selects,
+        )
+        .expect_err("a declared key the query does not select is refused")
+        .to_string();
+        assert!(
+            declared.contains("\"customer_id\", which the query does not select")
+                && declared.contains("SELECT name FROM sets.customers_current"),
+            "{declared}"
+        );
+        // An identifier field the query does not select is not reported.
+        let reported = iceberg_table_keys(
+            2,
+            &identified_schema(vec![1]),
+            "SELECT name FROM sets.customers_current",
+            &fluree_db_r2rml::TableKeys::none(),
+            selects,
+        )
+        .expect("nothing declared");
+        assert_eq!(reported, None);
+    }
+
+    #[test]
+    fn a_declared_key_is_checked_against_the_snapshot_schema() {
+        let check = |cols: &[&str]| {
+            iceberg_table_keys(
+                2,
+                &identified_schema(vec![]),
+                "sets.customers_current",
+                &fluree_db_r2rml::TableKeys::new([cols.to_vec()]),
+                |_| true,
+            )
+        };
+        assert_eq!(check(&["customer_id", "valid_from"]).unwrap(), None);
+        for (cols, says) in [
+            (&["customer_idx"][..], "which the table does not have"),
+            (&["Customer_ID"][..], "which the table does not have"),
+            (&["customer_id", "score"][..], "floating-point"),
+            (&["address"][..], "nested"),
+        ] {
+            let err = check(cols).expect_err("refused").to_string();
+            assert!(
+                err.contains(says) && err.contains("sets.customers_current"),
+                "{cols:?}: {err}"
+            );
         }
     }
 
@@ -4471,6 +6474,191 @@ mod tests {
         assert!(matches!(
             only_literal(&[key_filter("str_key", "west/5")], &s),
             Some(LiteralValue::String(v)) if v == "west/5"
+        ));
+    }
+
+    fn cmp_filter(col: &str, op: ScanCmpOp, value: ScanValue) -> ScanFilter {
+        ScanFilter {
+            column: col.to_string(),
+            op,
+            value,
+        }
+    }
+
+    /// A string literal compares as a string, so it pushes to a string column,
+    /// and to another column only by equality with a cell that renders as
+    /// exactly that string. An un-annotated integer column's literal is "10",
+    /// and "10" < "5": casting the literal to the column's type and comparing
+    /// values would prune rows the FILTER keeps.
+    #[test]
+    fn string_literal_pushes_only_where_it_compares_as_a_string() {
+        let s = key_schema();
+        let str_lit = |v: &str| ScanValue::Str(v.to_string());
+        assert!(matches!(
+            only_literal(&[cmp_filter("str_key", ScanCmpOp::Lt, str_lit("5"))], &s),
+            Some(LiteralValue::String(v)) if v == "5"
+        ));
+        for col in [
+            "int_key",
+            "long_key",
+            "dec_key",
+            "date_key",
+            "double_key",
+            "float_key",
+        ] {
+            for op in [ScanCmpOp::Lt, ScanCmpOp::GtEq, ScanCmpOp::NotEq] {
+                assert!(
+                    build_iceberg_filter(&[cmp_filter(col, op, str_lit("5"))], &s).is_none(),
+                    "{col} {op:?}"
+                );
+            }
+        }
+        // Equality with an integer's own rendering is equality with the integer.
+        assert!(matches!(
+            only_literal(&[cmp_filter("int_key", ScanCmpOp::Eq, str_lit("10"))], &s),
+            Some(LiteralValue::Int32(10))
+        ));
+        assert!(matches!(
+            only_literal(&[cmp_filter("long_key", ScanCmpOp::Eq, str_lit("-3"))], &s),
+            Some(LiteralValue::Int64(-3))
+        ));
+        assert!(matches!(
+            only_literal(
+                &[cmp_filter("date_key", ScanCmpOp::Eq, str_lit("1969-12-31"))],
+                &s
+            ),
+            Some(LiteralValue::Date(-1))
+        ));
+        // No cell renders as these, so there is no value to push.
+        for (col, v) in [
+            ("int_key", "010"),
+            ("int_key", "+10"),
+            ("long_key", "1e3"),
+            ("date_key", "2024-01-15Z"),
+            ("double_key", "1.50"),
+            ("double_key", "1e1"),
+            ("dec_key", "5.0"),
+            ("dec_key", "05"),
+        ] {
+            assert!(
+                build_iceberg_filter(&[cmp_filter(col, ScanCmpOp::Eq, str_lit(v))], &s).is_none(),
+                "{col} = {v:?}"
+            );
+        }
+        // A set pushes whole only when every member does.
+        let set = |vs: &[&str]| ScanValue::Set(vs.iter().map(|v| str_lit(v)).collect());
+        assert!(matches!(
+            build_iceberg_filter(&[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "10"]))], &s),
+            Some(Expression::In { values, .. })
+                if values.values() == [LiteralValue::Int64(9), LiteralValue::Int64(10)]
+        ));
+        assert!(build_iceberg_filter(
+            &[cmp_filter("long_key", ScanCmpOp::In, set(&["9", "09"]))],
+            &s
+        )
+        .is_none());
+    }
+
+    /// A scan-side top-k prunes by bounds only when the column's type sorts its
+    /// bounds as the engine sorts the terms.
+    #[test]
+    fn bound_order_by_iceberg_type() {
+        for (ty, order) in [
+            ("string", Some(TermOrder::Lexical)),
+            ("int", Some(TermOrder::Numeric)),
+            ("long", Some(TermOrder::Numeric)),
+            ("double", Some(TermOrder::Numeric)),
+            ("decimal(38,9)", Some(TermOrder::Numeric)),
+            ("date", Some(TermOrder::Date)),
+            ("timestamp", Some(TermOrder::Instant)),
+            ("timestamptz", Some(TermOrder::Instant)),
+            ("boolean", Some(TermOrder::Boolean)),
+            ("timestamp_ns", None),
+            ("binary", None),
+            ("uuid", None),
+        ] {
+            assert_eq!(bound_order(Some(ty)), order, "{ty}");
+        }
+        assert_eq!(bound_order(None), None);
+    }
+
+    /// Equality with a cell's own rendering pushes as that cell's value for
+    /// every type with an exact round trip; a float only when finite and
+    /// non-zero.
+    #[test]
+    fn string_equality_round_trips_through_the_rendering() {
+        let s = Schema {
+            schema_id: 0,
+            identifier_field_ids: vec![],
+            fields: vec![
+                field(1, "flag", json!("boolean")),
+                field(2, "amt", json!("decimal(38,9)")),
+                field(3, "at", json!("timestamp")),
+                field(4, "at_tz", json!("timestamptz")),
+                field(5, "d", json!("double")),
+                field(6, "f", json!("float")),
+            ],
+        };
+        let eq = |col: &str, v: &str| {
+            only_literal(
+                &[cmp_filter(
+                    col,
+                    ScanCmpOp::Eq,
+                    ScanValue::Str(v.to_string()),
+                )],
+                &s,
+            )
+        };
+        assert_eq!(eq("flag", "true"), Some(LiteralValue::Boolean(true)));
+        assert_eq!(eq("flag", "1"), None);
+        assert_eq!(
+            eq("amt", "-0.050000000"),
+            Some(LiteralValue::Decimal {
+                unscaled: -50_000_000,
+                scale: 9
+            })
+        );
+        assert_eq!(eq("amt", "0.05"), None);
+        assert_eq!(
+            eq("at", "1969-12-31T23:59:59.999999Z"),
+            Some(LiteralValue::Timestamp(-1))
+        );
+        assert_eq!(
+            eq("at_tz", "1970-01-01T00:00:00Z"),
+            Some(LiteralValue::TimestampTz(0))
+        );
+        assert_eq!(eq("at", "1970-01-01T00:00:00.000000Z"), None);
+        assert_eq!(eq("at", "1970-01-01T00:00:00+00:00"), None);
+        assert_eq!(
+            eq("d", "1000000000000000000000"),
+            Some(LiteralValue::Float64(1e21))
+        );
+        assert_eq!(eq("f", "0.1"), Some(LiteralValue::Float32(0.1)));
+        for v in ["0", "-0", "NaN", "INF", "-INF"] {
+            assert_eq!(eq("d", v), None, "{v}");
+        }
+        // Ordering by a string never pushes to these columns.
+        for col in ["flag", "amt", "at", "d"] {
+            let lt = cmp_filter(col, ScanCmpOp::Lt, ScanValue::Str("5".into()));
+            assert!(build_iceberg_filter(&[lt], &s).is_none(), "{col}");
+        }
+    }
+
+    /// A boolean or integer constant is matched loosely by the operator (`"1"`
+    /// is true, `"010"` is 10), which the cast text compared against a string
+    /// column would miss.
+    #[test]
+    fn typed_scalar_skips_a_string_column() {
+        let s = key_schema();
+        for v in [ScanValue::Bool(true), ScanValue::Int(10)] {
+            assert!(build_iceberg_filter(&[cmp_filter("str_key", ScanCmpOp::Eq, v)], &s).is_none());
+        }
+        assert!(matches!(
+            only_literal(
+                &[cmp_filter("long_key", ScanCmpOp::Eq, ScanValue::Int(10))],
+                &s
+            ),
+            Some(LiteralValue::Int64(10))
         ));
     }
 
@@ -4702,7 +6890,6 @@ mod tests {
             op: ScanCmpOp::Lt,
             value: ScanValue::Decimal {
                 unscaled: 999,
-                precision: 3,
                 scale: 2,
             },
         };
@@ -4970,15 +7157,17 @@ mod tests {
         // panics on any access, so a green result proves S3 was never touched —
         // without §1's inline branch this would fall through to the disk miss and
         // then a storage read, which panics here.
-        let out = resolve_table_metadata(&cache, &NeverReadStorage, loc, Some(inline), &disk)
-            .await
-            .expect("inline metadata resolves without any storage read");
+        let shared = StorageScope::shared();
+        let out =
+            resolve_table_metadata(&cache, &NeverReadStorage, loc, Some(inline), &disk, &shared)
+                .await
+                .expect("inline metadata resolves without any storage read");
         assert_eq!(out.location, "s3://bucket/warehouse/t");
 
         // The inline result seeds the in-memory cache so a later cache-reconstructed
         // load (which carries `metadata: None`) hits it instead of re-fetching.
         assert!(
-            cache.get_metadata(loc).await.is_some(),
+            cache.get_metadata(&shared, loc).await.is_some(),
             "inline metadata must be cached in-memory for later loads"
         );
 
@@ -4990,7 +7179,7 @@ mod tests {
         // caching is enabled; `put_metadata` is a no-op when the env switch is off.
         if crate::graph_source::disk_catalog_cache::disk_catalog_cache_enabled() {
             assert!(
-                disk.get_metadata(loc).is_some(),
+                disk.get_metadata(&shared, loc).is_some(),
                 "inline metadata must seed the disk layer for the pointer rung"
             );
         }
@@ -5009,24 +7198,41 @@ mod tests {
         LoadTableResponse {
             metadata_location: loc.to_string(),
             config: std::collections::HashMap::default(),
-            credentials: with_creds.then(|| fluree_db_iceberg::credential::VendedCredentials {
-                access_key_id: "AKIAEXAMPLE".to_string(),
-                secret_access_key: "secret".to_string(),
-                session_token: None,
-                expires_at: None,
-                endpoint: None,
-                region: Some("us-east-2".to_string()),
-                path_style: false,
+            credentials: with_creds.then(|| {
+                fluree_db_iceberg::credential::VendedCredentials::S3(
+                    fluree_db_iceberg::credential::S3Credentials {
+                        access_key_id: "AKIAEXAMPLE".to_string(),
+                        secret_access_key: "secret".to_string(),
+                        session_token: None,
+                        expires_at: None,
+                        endpoint: None,
+                        region: Some("us-east-2".to_string()),
+                        path_style: false,
+                    },
+                )
             }),
             metadata: None,
         }
     }
 
+    /// The plan a REST source at `uri` reading `io` makes for `loc`, under the
+    /// default identity context.
+    async fn rest_plan(uri: &str, io: &IoConfig, loc: &str) -> StoragePlan {
+        plan_storage(
+            &fluree_db_iceberg::config::CatalogConfig::rest(uri),
+            io,
+            loc,
+            &fluree_db_iceberg::IdentityContext::default(),
+        )
+        .await
+        .expect("a plan")
+    }
+
     /// §2 on the LAZY path: a REST source configured to require vended credentials
     /// whose catalog vends none must FAIL CLOSED — never silently read under the
-    /// process's ambient AWS identity. `rest_session_storage` is the one decision
-    /// point the eager arm AND the deferred `LazyS3Storage` builder share, so this
-    /// covers both; a second, unguarded copy is exactly the fail-open this pins.
+    /// process's ambient AWS identity. `session_storage` is the one decision point
+    /// the eager arm AND the deferred `LazyS3Storage` builder share, so this covers
+    /// both; a second, unguarded copy is exactly the fail-open this pins.
     #[tokio::test]
     async fn rest_storage_fails_closed_when_catalog_vends_nothing() {
         let session = super::super::catalog_session::IcebergCatalogSession::default();
@@ -5039,11 +7245,18 @@ mod tests {
             vended_credentials: true, // the default
             ..Default::default()
         };
-        let resp = vended_response("s3://b/t/metadata/v1.metadata.json", false);
+        let loc = "s3://b/t/metadata/v1.metadata.json";
+        let resp = vended_response(loc, false);
+        let plan = rest_plan("https://cat.example/v1", &io, loc).await;
 
-        let err = rest_session_storage(&session, &lt_key, &io, &resp, "https://cat.example/v1")
-            .await
-            .expect_err("vended-configured source with no vended creds must fail closed");
+        let err = session_storage(
+            &session,
+            &lt_key,
+            &plan,
+            &CatalogGrant::from_load(&resp, None),
+        )
+        .await
+        .expect_err("vended-configured source with no vended creds must fail closed");
         match err {
             QueryError::CatalogCredentialsNotVended { catalog_uri } => {
                 assert_eq!(catalog_uri, "https://cat.example/v1");
@@ -5072,60 +7285,466 @@ mod tests {
             s3_region: Some("us-east-2".to_string()),
             ..Default::default()
         };
-        let resp = vended_response("s3://b/t/metadata/v1.metadata.json", false);
-        rest_session_storage(&session, &lt_key, &io, &resp, "https://cat.example/v1")
-            .await
-            .expect("explicit vended_credentials=false must use the ambient chain");
+        let loc = "s3://b/t/metadata/v1.metadata.json";
+        let resp = vended_response(loc, false);
+        let plan = rest_plan("https://cat.example/v1", &io, loc).await;
+        session_storage(
+            &session,
+            &lt_key,
+            &plan,
+            &CatalogGrant::from_load(&resp, None),
+        )
+        .await
+        .expect("explicit vended_credentials=false must use the ambient chain");
+        assert_eq!(
+            plan.decision(),
+            crate::graph_source::storage::StorageDecision::Ambient
+        );
     }
 
-    /// §5 across the deferred builder's `IcebergError` channel: the typed errors must
-    /// round-trip back to their `QueryError` counterparts (and thus their 403 wire
-    /// codes) instead of being flattened to an opaque string by a blanket
-    /// `to_string()`. Mirrors the `map_err` the `LazyS3Storage` builder applies.
+    /// A source dropped and re-created under the same name with another catalog
+    /// must not answer from the old one's pointer: the caches that outlive a query
+    /// key on the config, while the per-query key (the session pin) does not.
     #[test]
-    fn typed_storage_errors_survive_the_lazy_builder_channel() {
-        let denied = QueryError::StorageAccessDenied {
-            bucket: "b".to_string(),
-            key: "k".to_string(),
-            region: Some("us-east-2".to_string()),
-            message: "AccessDenied ... no identity-based policy allows".to_string(),
+    fn cross_query_keys_follow_the_catalog_config() {
+        let lt = super::super::catalog_session::IcebergCatalogSession::load_table_key(
+            "orders:main",
+            "sales",
+            "orders",
+        );
+        let glue_east =
+            r#"{"catalog":{"type":"glue","region":"us-east-1"},"table":"sales.orders"}"#;
+        let glue_west =
+            r#"{"catalog":{"type":"glue","region":"us-west-2"},"table":"sales.orders"}"#;
+        let open = fluree_db_iceberg::IdentityContext::default();
+        assert_eq!(
+            cross_query_key(&lt, glue_east, &open),
+            cross_query_key(&lt, glue_east, &open)
+        );
+        assert_ne!(
+            cross_query_key(&lt, glue_east, &open),
+            cross_query_key(&lt, glue_west, &open)
+        );
+        assert!(cross_query_key(&lt, glue_east, &open).starts_with(&lt));
+        // The default context keeps the key the persisted pointers were written
+        // under; a stricter one gets its own (the in-memory layer holds vended
+        // credentials, and every clone of a `Fluree` shares it).
+        assert_eq!(
+            cross_query_key(&lt, glue_east, &open),
+            format!("{lt}\u{1f}{:016x}", config_fingerprint(glue_east))
+        );
+        let strict = fluree_db_iceberg::IdentityContext {
+            policy: fluree_db_iceberg::HostIdentityPolicy::deny_all(),
+            ..fluree_db_iceberg::IdentityContext::default()
         };
-        let ferried = match denied {
-            QueryError::StorageAccessDenied {
-                bucket,
-                key,
-                region,
-                message,
-            } => IcebergError::StorageAccessDenied {
-                bucket,
-                key,
-                region,
-                message,
-            },
-            other => IcebergError::Catalog(other.to_string()),
-        };
-        match super::super::iceberg_catalog::storage_query_error("ctx", ferried) {
-            QueryError::StorageAccessDenied { bucket, key, .. } => {
-                assert_eq!((bucket.as_str(), key.as_str()), ("b", "k"));
-            }
-            other => panic!("StorageAccessDenied must survive the builder: {other:?}"),
-        }
+        assert_ne!(
+            cross_query_key(&lt, glue_east, &open),
+            cross_query_key(&lt, glue_east, &strict)
+        );
+    }
 
-        let not_vended = QueryError::CatalogCredentialsNotVended {
-            catalog_uri: "https://cat.example/v1".to_string(),
+    /// The incremental / materialize scans make the query path's §2 decision too
+    /// (they used to build ambient storage regardless): a source that requires
+    /// vended credentials, whose catalog vended none, is refused before any client
+    /// is built; a catalog that never vends (Glue, S3 Tables) reads ambient.
+    #[tokio::test]
+    async fn materialize_storage_fails_closed_when_catalog_vends_nothing() {
+        let required = IoConfig {
+            vended_credentials: true,
+            ..Default::default()
         };
-        let ferried = match not_vended {
-            QueryError::CatalogCredentialsNotVended { catalog_uri } => {
-                IcebergError::CatalogCredentialsNotVended { catalog_uri }
-            }
-            other => IcebergError::Catalog(other.to_string()),
-        };
-        match super::super::iceberg_catalog::storage_query_error("ctx", ferried) {
-            QueryError::CatalogCredentialsNotVended { catalog_uri } => {
+        let loc = "s3://b/t/metadata/v1.metadata.json";
+        let plan = rest_plan("https://cat.example/v1", &required, loc).await;
+        match fresh_storage(&plan, &CatalogGrant::unvended(loc)).await {
+            Err(QueryError::CatalogCredentialsNotVended { catalog_uri }) => {
                 assert_eq!(catalog_uri, "https://cat.example/v1");
             }
-            other => panic!("CatalogCredentialsNotVended must survive the builder: {other:?}"),
+            Err(other) => panic!("expected CatalogCredentialsNotVended, got: {other:?}"),
+            Ok(_) => panic!("a vended-required source must not be read ambient"),
         }
+        let ambient = IoConfig {
+            vended_credentials: false,
+            s3_region: Some("us-east-1".to_string()),
+            ..Default::default()
+        };
+        let glue = plan_storage(
+            &fluree_db_iceberg::config::CatalogConfig::glue(None, None),
+            &ambient,
+            loc,
+            &fluree_db_iceberg::IdentityContext::default(),
+        )
+        .await
+        .unwrap();
+        fresh_storage(&glue, &CatalogGrant::unvended(loc))
+            .await
+            .expect("a non-vending catalog reads with the ambient chain");
+    }
+
+    /// A catalog whose `loadTable` fails with `error`.
+    #[derive(Debug)]
+    struct RefusingCatalog(IcebergError);
+
+    #[async_trait]
+    impl SendCatalogClient for RefusingCatalog {
+        async fn list_namespaces(&self) -> fluree_db_iceberg::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn list_tables(&self, _namespace: &str) -> fluree_db_iceberg::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+        async fn load_table(
+            &self,
+            _table_id: &TableIdentifier,
+            _request_credentials: bool,
+        ) -> fluree_db_iceberg::Result<LoadTableResponse> {
+            Err(self.0.clone())
+        }
+    }
+
+    /// Every typed refusal a storage step can raise, as the store raises it.
+    fn typed_storage_refusals() -> Vec<IcebergError> {
+        use fluree_db_iceberg::HostIdentityKind as K;
+        vec![
+            IcebergError::StorageAccessDenied {
+                scheme: "s3",
+                bucket: "lake".to_string(),
+                key: "wh/t/data/f.parquet".to_string(),
+                region: Some("us-east-2".to_string()),
+                message: "AccessDenied ... no identity-based policy allows".to_string(),
+            },
+            IcebergError::StorageAccessDenied {
+                scheme: "gs",
+                bucket: "lake".to_string(),
+                key: "wh/t/data/f.parquet".to_string(),
+                region: None,
+                message: "403 Forbidden".to_string(),
+            },
+            IcebergError::CatalogCredentialsNotVended {
+                catalog_uri: "https://cat.example/v1".to_string(),
+            },
+            IcebergError::CatalogAccessDenied {
+                table: "Glue table demo.orders".to_string(),
+                message: "Glue GetTable: AccessDeniedException".to_string(),
+            },
+            IcebergError::CatalogQuotaProjectRequired {
+                table: "db.events".to_string(),
+            },
+            IcebergError::GoogleTokenExchange {
+                stage: fluree_db_iceberg::GoogleTokenStage::Impersonation,
+                status: Some(403),
+                reason: Some("PERMISSION_DENIED".to_string()),
+            },
+            IcebergError::GoogleCredentialsInvalid("external_account.config.token_url".to_string()),
+            IcebergError::HostIdentityRefused {
+                kind: K::GoogleApplicationDefault,
+            },
+            IcebergError::GoogleTokenHostRefused {
+                kind: K::GoogleMetadata,
+                host: "attacker.example".to_string(),
+            },
+            IcebergError::AmbientBucketRefused {
+                bucket: "stack-internal".to_string(),
+            },
+            IcebergError::AmbientEndpointRefused {
+                endpoint: "https://stack-internal.s3.us-east-1.amazonaws.com".to_string(),
+            },
+            IcebergError::SchemeNotServed {
+                path: "gs://lake/wh/t/data/f.parquet".to_string(),
+                scheme: "gs".to_string(),
+                identity: "the host's ambient AWS identity".to_string(),
+                served: "s3:// and s3a://".to_string(),
+            },
+            IcebergError::LocalLocationFromCatalog {
+                location: "file:///etc/wh/t/metadata/v1.metadata.json".to_string(),
+            },
+        ]
+    }
+
+    /// The deferred builder hands the read that forced it the store's own
+    /// error, so a lazy read reports every typed refusal exactly as the eager
+    /// arm does: the same message, wire code and status. Run through the real
+    /// builder and `LazyS3Storage`, from both of its failure points (the
+    /// catalog's `loadTable`, and the storage step when the catalog vends
+    /// nothing), and converted where a scan converts a read's error.
+    #[tokio::test]
+    async fn every_typed_refusal_reads_the_same_on_the_lazy_path_as_the_eager() {
+        let loc = "s3://lake/wh/t/metadata/v1.metadata.json";
+        let io = IoConfig::default();
+        let plan = rest_plan("https://cat.example/v1", &io, loc).await;
+        let lazy_read = |catalog: Arc<dyn SendCatalogClient>, catalog_vends: bool| {
+            let builder = deferred_storage_builder(
+                catalog,
+                catalog_vends,
+                Arc::new(R2rmlCache::new(4, 4)),
+                Arc::new(super::super::catalog_session::IcebergCatalogSession::default()),
+                TableIdentifier::new("ns", "t"),
+                "lt".to_string(),
+                "xq".to_string(),
+                plan.clone(),
+                loc.to_string(),
+            );
+            async move {
+                let storage = LazyS3Storage::deferred(builder);
+                let error = SendIcebergStorage::read(&storage, "s3://lake/wh/t/data/f.parquet")
+                    .await
+                    .expect_err("the build fails");
+                storage_query_error("Failed to read Parquet file 'f.parquet'", error)
+            }
+        };
+        let shown = |error: QueryError| {
+            let api = crate::ApiError::Query(error);
+            (api.to_string(), api.error_type(), api.status_code())
+        };
+
+        let mut cases: Vec<(IcebergError, QueryError)> = Vec::new();
+        for refusal in typed_storage_refusals() {
+            let lazy = lazy_read(Arc::new(RefusingCatalog(refusal.clone())), true).await;
+            cases.push((refusal, lazy));
+        }
+        // A catalog that never vends, read by a plan that needs vended
+        // credentials: the storage step itself refuses.
+        let never_vends = lazy_read(
+            Arc::new(RefusingCatalog(IcebergError::Catalog("unused".to_string()))),
+            false,
+        )
+        .await;
+        cases.push((
+            IcebergError::CatalogCredentialsNotVended {
+                catalog_uri: "https://cat.example/v1".to_string(),
+            },
+            never_vends,
+        ));
+
+        // An error of no type of its own is internal on both paths, and the
+        // lazy one still names the step that failed.
+        let unreachable = IcebergError::Http("connection refused".to_string());
+        let (message, _, status) =
+            shown(lazy_read(Arc::new(RefusingCatalog(unreachable.clone())), true).await);
+        assert_eq!(status, 500);
+        assert!(
+            message.contains("Failed to load table from catalog"),
+            "{message}"
+        );
+        assert!(message.contains("connection refused"), "{message}");
+        assert!(!super::super::iceberg_catalog::is_typed_storage_error(
+            &unreachable
+        ));
+
+        for (refusal, lazy) in cases {
+            assert!(
+                super::super::iceberg_catalog::is_typed_storage_error(&refusal),
+                "{refusal:?}"
+            );
+            let what = format!("{refusal:?}");
+            let eager = shown(storage_query_error(
+                "Failed to load table from catalog",
+                refusal,
+            ));
+            let lazy = shown(lazy);
+            assert_eq!(lazy, eager, "{what}");
+            assert_ne!(lazy.2, 500, "{what} was flattened to an internal error");
+        }
+        // The ambient-AWS restrictions name what they refused.
+        for (refusal, named) in [
+            (
+                IcebergError::AmbientBucketRefused {
+                    bucket: "stack-internal".to_string(),
+                },
+                "stack-internal",
+            ),
+            (
+                IcebergError::AmbientEndpointRefused {
+                    endpoint: "https://stack-internal.s3.us-east-1.amazonaws.com".to_string(),
+                },
+                "https://stack-internal.s3.us-east-1.amazonaws.com",
+            ),
+        ] {
+            let (message, code, status) =
+                shown(lazy_read(Arc::new(RefusingCatalog(refusal)), true).await);
+            assert!(message.contains(named), "{message}");
+            assert_eq!(code, fluree_vocab::errors::HOST_IDENTITY_REFUSED);
+            assert_eq!(status, 403);
+        }
+    }
+
+    /// An R2RML mapping for the registration tests below, which are about the
+    /// source's storage, not its mapping.
+    const STORAGE_TEST_MAPPING: &str = r#"
+        @prefix rr: <http://www.w3.org/ns/r2rml#> .
+        @prefix ex: <http://example.org/> .
+        <http://example.org/mapping#T>
+            a rr:TriplesMap ;
+            rr:logicalTable [ rr:tableName "t" ] ;
+            rr:subjectMap [ rr:template "http://example.org/t/{id}" ] ;
+            rr:predicateObjectMap [ rr:predicate ex:v ; rr:objectMap [ rr:column "v" ] ] .
+    "#;
+
+    /// `iceberg` registered with [`STORAGE_TEST_MAPPING`].
+    fn mapped(iceberg: crate::graph_source::config::IcebergCreateConfig) -> R2rmlCreateConfig {
+        R2rmlCreateConfig {
+            iceberg,
+            mapping: crate::graph_source::config::R2rmlMappingInput::Content(
+                STORAGE_TEST_MAPPING.to_string(),
+            ),
+            mapping_media_type: Some("text/turtle".to_string()),
+        }
+    }
+
+    /// A Direct source's storage is decided at registration: one the
+    /// instance's policy refuses (or its identity cannot serve) fails to
+    /// register with the typed error a query would report, and nothing is
+    /// published, the mapping included. Storage the policy allows registers.
+    #[tokio::test]
+    async fn a_direct_source_whose_storage_is_refused_is_not_registered() {
+        use crate::graph_source::config::{
+            IcebergConnectionConfig, IcebergCreateConfig, R2rmlCreateConfig,
+        };
+        use fluree_db_iceberg::HostIdentityPolicy;
+        let direct = |name: &str, location: &str| IcebergCreateConfig::new_direct(name, location);
+        let redirected = {
+            let mut config = direct("gs-redirected", "s3://lake/wh/t");
+            config.connection = IcebergConnectionConfig::direct("s3://lake/wh/t")
+                .with_s3_endpoint("https://stack-internal.s3.us-east-1.amazonaws.com")
+                .with_s3_path_style(true);
+            config
+        };
+        // A Google identity serves gs:// only.
+        let google_on_s3 = {
+            let mut config = direct("gs-unserved", "s3://lake/wh/t");
+            config.connection = IcebergConnectionConfig::direct("s3://lake/wh/t")
+                .with_storage_auth(fluree_db_iceberg::StorageAuth::Google {
+                    credentials: fluree_db_iceberg::auth::GoogleCredentials::Metadata,
+                    quota_project: None,
+                });
+            config
+        };
+        let lake_only = || HostIdentityPolicy::parse(None, Some("lake")).unwrap();
+        let cases = [
+            (
+                HostIdentityPolicy::deny_all(),
+                direct("gs-no-aws", "s3://lake/wh/t"),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+                "aws",
+            ),
+            (
+                lake_only(),
+                direct("gs-off-allowlist", "s3://stack-internal/wh/t"),
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+                "stack-internal",
+            ),
+            (
+                lake_only(),
+                redirected,
+                fluree_vocab::errors::HOST_IDENTITY_REFUSED,
+                "stack-internal.s3.us-east-1.amazonaws.com",
+            ),
+            (
+                HostIdentityPolicy::allow_all(),
+                google_on_s3,
+                fluree_vocab::errors::STORAGE_SCHEME_NOT_SERVED,
+                "s3://lake/wh/t",
+            ),
+        ];
+        for (policy, config, code, named) in cases {
+            let fluree = crate::FlureeBuilder::memory()
+                .build_memory()
+                .with_host_identity_policy(policy);
+            let id = config.graph_source_id();
+            let err = fluree
+                .create_r2rml_graph_source(mapped(config))
+                .await
+                .map(|_| ())
+                .expect_err("the source's storage is refused");
+            assert_eq!(err.error_type(), code, "{id}: {err}");
+            assert!(err.to_string().contains(named), "{id}: {err}");
+            assert!(
+                fluree
+                    .nameservice()
+                    .lookup_graph_source(&id)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{id} was published"
+            );
+        }
+
+        // The refusal is a 403, and nothing is published.
+        let mapping = STORAGE_TEST_MAPPING;
+        let closed = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(HostIdentityPolicy::deny_all());
+        let mut r2rml = R2rmlCreateConfig::new_direct("gs-r2rml-no-aws", "s3://lake/wh/t", mapping);
+        r2rml.mapping_media_type = Some("text/turtle".to_string());
+        let err = closed
+            .create_r2rml_graph_source(r2rml)
+            .await
+            .map(|_| ())
+            .expect_err("the policy refuses ambient AWS");
+        assert_eq!(err.status_code(), 403, "{err}");
+        assert_eq!(
+            err.error_type(),
+            fluree_vocab::errors::HOST_IDENTITY_REFUSED
+        );
+        assert!(closed
+            .nameservice()
+            .lookup_graph_source("gs-r2rml-no-aws:main")
+            .await
+            .unwrap()
+            .is_none());
+
+        // Storage the policy allows registers.
+        let open = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(lake_only());
+        open.create_r2rml_graph_source(mapped(direct("gs-allowed", "s3://lake/wh/t")))
+            .await
+            .expect("the policy allows the bucket");
+        assert!(open
+            .nameservice()
+            .lookup_graph_source("gs-allowed:main")
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// A Direct table on `gs://` registers when its storage identity reads
+    /// `gs://` (a Google identity of its own), by the engine's one location
+    /// rule; one whose identity cannot read it is refused at registration.
+    #[tokio::test]
+    async fn a_direct_gcs_source_registers_when_its_identity_reads_gcs() {
+        use crate::graph_source::config::{IcebergConnectionConfig, IcebergCreateConfig};
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let on_gcs = |name: &str| {
+            let mut config = IcebergCreateConfig::new_direct(name, "gs://lake/wh/t");
+            config.connection = IcebergConnectionConfig::direct("gs://lake/wh/t");
+            config
+        };
+        // A key in a variable that is never set: nothing to mint at
+        // registration, so the identity is proven at query time.
+        let mut google = on_gcs("gs-gcs-google");
+        google.connection =
+            google
+                .connection
+                .with_storage_auth(fluree_db_iceberg::StorageAuth::Google {
+                    credentials: fluree_db_iceberg::auth::GoogleCredentials::ServiceAccount {
+                        key: fluree_db_iceberg::ConfigValue::from_env(
+                            "FLUREE_TEST_GCS_SA_KEY_NEVER_SET",
+                        ),
+                    },
+                    quota_project: None,
+                });
+        fluree
+            .create_r2rml_graph_source(mapped(google))
+            .await
+            .expect("a Google identity reads gs://");
+        // The host's AWS identity reads gs:// only through the GCS interop
+        // endpoint.
+        let err = fluree
+            .create_r2rml_graph_source(mapped(on_gcs("gs-gcs-ambient")))
+            .await
+            .map(|_| ())
+            .expect_err("ambient AWS does not read gs://");
+        assert!(err.to_string().contains("io.storage_auth"), "{err}");
     }
 
     #[tokio::test]
@@ -5143,9 +7762,10 @@ mod tests {
         // no-op when disk caching is disabled), so the resolution proceeds to the
         // object read regardless of the ambient disk-cache setting.
         let (disk, dir) = tmp_disk_cache("fallback");
-        let out = resolve_table_metadata(&cache, &storage, loc, None, &disk)
-            .await
-            .expect("fallback resolves via the storage read");
+        let out =
+            resolve_table_metadata(&cache, &storage, loc, None, &disk, &StorageScope::shared())
+                .await
+                .expect("fallback resolves via the storage read");
         assert_eq!(out.location, "s3://bucket/warehouse/u");
         assert_eq!(
             reads.load(Ordering::SeqCst),
@@ -5155,7 +7775,113 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── ORDERING-TRAP GUARD: rest_client_cache_key must fingerprint the RAW,
+    /// The registration probe stops at its budget, reporting how far it got,
+    /// rather than holding the map request open; given room, the same catalog
+    /// answers and the table loads, so the budget is what stopped it.
+    #[tokio::test]
+    async fn the_registration_probe_stops_at_its_budget() {
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        // How long the catalog takes to answer. The probe's budget is far
+        // below it, and the margin is wide on purpose: building the catalog
+        // client runs before the budget's timer can fire, and on a loaded
+        // machine that alone has taken over a second.
+        const CATALOG_DELAY: Duration = Duration::from_secs(5);
+
+        let metadata_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/iceberg/silver/people/metadata");
+        let current = std::fs::read_dir(&metadata_dir)
+            .expect("people metadata dir")
+            .map(|e| e.expect("entry").path())
+            .filter(|p| p.to_string_lossy().ends_with(".metadata.json"))
+            .max()
+            .expect("a metadata file");
+        let metadata: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&current).expect("read")).expect("parse");
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v1/config"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/v1/namespaces/silver/tables/people"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(CATALOG_DELAY)
+                    .set_body_json(json!({
+                        "metadata-location": format!(
+                            "s3://fixture-bucket/silver/people/metadata/{}",
+                            current.file_name().unwrap().to_string_lossy()
+                        ),
+                        "metadata": metadata,
+                    })),
+            )
+            .mount(&server)
+            .await;
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        // Registration probes before it publishes: no record is needed.
+        let iceberg = R2rmlCreateConfig::new("slow-catalog", server.uri(), "silver.people", "")
+            .with_vended_credentials(false)
+            .with_s3_region("us-east-1")
+            .to_iceberg_gs_config("unused-mapping-address");
+        let json = iceberg.to_json().expect("serialize");
+        let config = SourceConfig {
+            json: &json,
+            iceberg: &iceberg,
+        };
+        let tables = vec!["silver.people".to_string()];
+
+        let started = Instant::now();
+        let probe = fluree
+            .probe_tables_within(
+                "slow-catalog:main",
+                config,
+                &tables,
+                false,
+                Duration::from_millis(100),
+            )
+            .await;
+        assert!(
+            matches!(
+                probe.check,
+                ConnectionCheck::TimedOut {
+                    loaded: 0,
+                    total: 1,
+                    ..
+                }
+            ),
+            "{:?}",
+            probe.check
+        );
+        assert!(probe.loaded.is_empty());
+        assert!(
+            started.elapsed() < CATALOG_DELAY / 2,
+            "the probe returned at its budget, not at the catalog's answer: {:?}",
+            started.elapsed()
+        );
+
+        let probe = fluree
+            .probe_tables_within(
+                "slow-catalog:main",
+                config,
+                &tables,
+                false,
+                Duration::from_secs(10),
+            )
+            .await;
+        assert!(
+            matches!(probe.check, ConnectionCheck::Verified),
+            "{:?}",
+            probe.check
+        );
+        // What loaded is kept for the checks that need its schema.
+        assert!(probe.loaded.contains_key("silver.people"));
+    }
+
+    // ── ORDERING-TRAP GUARD: catalog_client_cache_key must fingerprint the RAW,
     //    reference-bearing config, NOT a hydrated one. ──
 
     #[derive(Debug)]
@@ -5206,6 +7932,156 @@ mod tests {
         .unwrap()
     }
 
+    /// The client cache is shared by every clone of a `Fluree`, so a client built
+    /// under one identity context (AWS subject, host-identity policy) must never
+    /// be handed to another.
+    #[test]
+    fn the_client_cache_key_is_scoped_by_identity_context() {
+        #[derive(Debug)]
+        struct Subject(&'static str);
+        #[async_trait]
+        impl fluree_db_iceberg::AwsSubjectCredentials for Subject {
+            fn principal_key(&self) -> String {
+                self.0.to_string()
+            }
+            async fn credentials(
+                &self,
+            ) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
+                Err(IcebergError::Credential("unused".to_string()))
+            }
+            fn region(&self) -> Option<String> {
+                None
+            }
+        }
+        let raw = gs_config_json(oauth2_auth(fluree_db_iceberg::ConfigValue::literal("s")));
+        let subject = |key: &'static str| fluree_db_iceberg::IdentityContext {
+            aws_subject: Some(Arc::new(Subject(key))),
+            ..Default::default()
+        };
+        let keys = [
+            fluree_db_iceberg::IdentityContext::default(),
+            fluree_db_iceberg::IdentityContext {
+                policy: fluree_db_iceberg::HostIdentityPolicy::deny_all(),
+                ..Default::default()
+            },
+            subject("tenant-a"),
+            subject("tenant-b"),
+        ]
+        .map(|identity| catalog_client_cache_key("gs-1", &raw, &identity));
+        for (i, a) in keys.iter().enumerate() {
+            for b in &keys[i + 1..] {
+                assert_ne!(a, b);
+            }
+        }
+        assert_eq!(
+            catalog_client_cache_key("gs-1", &raw, &subject("tenant-a")),
+            keys[2],
+            "the same context keys the same client"
+        );
+    }
+
+    /// Two clones of one `Fluree` share its client cache, so a clone with
+    /// another AWS subject, or another host-identity policy, must get a client
+    /// of its own; the same context gets the cached one back.
+    #[tokio::test]
+    async fn clones_with_other_identity_contexts_never_share_a_catalog_client() {
+        use fluree_db_iceberg::auth::AuthConfig;
+        use fluree_db_iceberg::HostIdentityPolicy;
+        #[derive(Debug)]
+        struct Subject(&'static str);
+        #[async_trait]
+        impl fluree_db_iceberg::AwsSubjectCredentials for Subject {
+            fn principal_key(&self) -> String {
+                self.0.to_string()
+            }
+            async fn credentials(
+                &self,
+            ) -> fluree_db_iceberg::Result<fluree_db_iceberg::AwsCredentials> {
+                Err(IcebergError::Credential("unused".to_string()))
+            }
+            fn region(&self) -> Option<String> {
+                None
+            }
+        }
+
+        let raw = gs_config_json(AuthConfig::None);
+        let config = IcebergGsConfig::from_json(&raw).unwrap();
+        let client = |fluree: &crate::Fluree| {
+            let fluree = fluree.clone();
+            let (raw, config) = (raw.clone(), config.clone());
+            async move {
+                shared_catalog_client(&fluree, "gs-shared", &raw, &config)
+                    .await
+                    .unwrap()
+                    .expect("a REST source has a catalog client")
+            }
+        };
+        let same = |a: &Arc<dyn SendCatalogClient>, b: &Arc<dyn SendCatalogClient>| {
+            std::ptr::addr_eq(Arc::as_ptr(a), Arc::as_ptr(b))
+        };
+
+        let base = crate::FlureeBuilder::memory().build_memory();
+        let tenant_a = base.with_aws_subject_credentials(Arc::new(Subject("tenant-a")));
+        let tenant_b = base.with_aws_subject_credentials(Arc::new(Subject("tenant-b")));
+        let metadata_only = base.with_host_identity_policy(
+            HostIdentityPolicy::parse(Some("google-metadata"), None).unwrap(),
+        );
+        let closed = base.with_host_identity_policy(HostIdentityPolicy::deny_all());
+
+        let from_a = client(&tenant_a).await;
+        assert!(
+            same(&from_a, &client(&tenant_a).await),
+            "the same context is served the cached client"
+        );
+        assert!(
+            !same(&from_a, &client(&tenant_b).await),
+            "another AWS subject"
+        );
+        assert!(
+            !same(&from_a, &client(&base).await),
+            "the host's own subject"
+        );
+        let from_metadata_only = client(&metadata_only).await;
+        assert!(
+            !same(&client(&base).await, &from_metadata_only),
+            "another policy"
+        );
+        assert!(
+            !same(&from_metadata_only, &client(&closed).await),
+            "another policy"
+        );
+    }
+
+    /// The query path builds its catalog client under the instance's identity
+    /// context: a host identity the policy refuses is a typed 403, not an
+    /// internal error, and nothing is cached for it.
+    #[tokio::test]
+    async fn the_query_path_builds_catalog_auth_under_the_instance_policy() {
+        use fluree_db_iceberg::auth::AuthConfig;
+        let fluree = crate::FlureeBuilder::memory()
+            .build_memory()
+            .with_host_identity_policy(fluree_db_iceberg::HostIdentityPolicy::deny_all());
+        let raw = gs_config_json(AuthConfig::GoogleMetadata {
+            scopes: None,
+            metadata_url: None,
+        });
+        let config = IcebergGsConfig::from_json(&raw).unwrap();
+        let err = shared_catalog_client(&fluree, "gs-policy", &raw, &config)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, QueryError::HostIdentityRefused { kind, .. } if kind == "google-metadata"),
+            "{err:?}"
+        );
+        // The same source on an instance that allows it builds (no network
+        // until the first catalog request).
+        let open = crate::FlureeBuilder::memory().build_memory();
+        assert!(shared_catalog_client(&open, "gs-policy", &raw, &config)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     /// The fingerprint keys the process-wide REST client cache. It MUST be stable
     /// across secret rotations (so a warm server does one OAuth exchange per client
     /// lifetime, not one per query) — which holds ONLY because it is computed over
@@ -5223,9 +8099,10 @@ mod tests {
         let raw = gs_config_json(oauth2_auth(fluree_db_iceberg::ConfigValue::SecretRef {
             secret_ref: "vault://cs".to_string(),
         }));
-        let key_raw = rest_client_cache_key(gsid, &raw);
+        let identity = fluree_db_iceberg::IdentityContext::default();
+        let key_raw = catalog_client_cache_key(gsid, &raw, &identity);
         assert_eq!(
-            rest_client_cache_key(gsid, &raw),
+            catalog_client_cache_key(gsid, &raw, &identity),
             key_raw,
             "the ref-bearing fingerprint must be stable across rotations"
         );
@@ -5241,8 +8118,8 @@ mod tests {
         let r2: Arc<dyn fluree_db_iceberg::SecretResolver> = Arc::new(FixedResolver("secret-v2"));
         let hydrated_v1 = gs_config_json(auth.hydrate(Some(&r1)).await.unwrap());
         let hydrated_v2 = gs_config_json(auth.hydrate(Some(&r2)).await.unwrap());
-        let key_h1 = rest_client_cache_key(gsid, &hydrated_v1);
-        let key_h2 = rest_client_cache_key(gsid, &hydrated_v2);
+        let key_h1 = catalog_client_cache_key(gsid, &hydrated_v1, &identity);
+        let key_h2 = catalog_client_cache_key(gsid, &hydrated_v2, &identity);
         assert_ne!(
             key_h1, key_h2,
             "hydrated configs with rotated secrets differ → hydrating before the \
@@ -5269,27 +8146,27 @@ mod tests {
         use crate::graph_source::catalog_session::IcebergCatalogSession;
         let session = IcebergCatalogSession::default();
         let key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_STORE");
+        let io = IoConfig {
+            vended_credentials: false,
+            s3_region: Some("us-east-2".to_string()),
+            ..Default::default()
+        };
+        let plan = plan_storage(
+            &fluree_db_iceberg::config::CatalogConfig::direct("s3://bucket/t"),
+            &io,
+            "s3://bucket/t",
+            &fluree_db_iceberg::IdentityContext::default(),
+        )
+        .await
+        .unwrap();
+        let direct = CatalogGrant::direct();
 
-        let first = direct_session_storage(
-            &session,
-            &key,
-            "s3://bucket/t",
-            Some("us-east-2"),
-            None,
-            false,
-        )
-        .await
-        .expect("offline SDK client construction");
-        let second = direct_session_storage(
-            &session,
-            &key,
-            "s3://bucket/t",
-            Some("us-east-2"),
-            None,
-            false,
-        )
-        .await
-        .expect("offline SDK client construction");
+        let first = session_storage(&session, &key, &plan, &direct)
+            .await
+            .expect("offline SDK client construction");
+        let second = session_storage(&session, &key, &plan, &direct)
+            .await
+            .expect("offline SDK client construction");
         assert!(
             Arc::ptr_eq(&first, &second),
             "the second Direct-mode acquisition must reuse the session-cached S3 client"
@@ -5298,16 +8175,9 @@ mod tests {
         // A different table (different key) is a distinct client — the cache keys
         // per (source, table), so unrelated tables never alias one client.
         let other_key = IcebergCatalogSession::load_table_key("gs:main", "DW", "DIM_GEOGRAPHY");
-        let other = direct_session_storage(
-            &session,
-            &other_key,
-            "s3://bucket/t",
-            Some("us-east-2"),
-            None,
-            false,
-        )
-        .await
-        .expect("offline SDK client construction");
+        let other = session_storage(&session, &other_key, &plan, &direct)
+            .await
+            .expect("offline SDK client construction");
         assert!(
             !Arc::ptr_eq(&first, &other),
             "a different table must not reuse another table's cached client"
@@ -5648,5 +8518,562 @@ mod tests {
             "a builder-configured ceiling must move the budget; a fixed default \
              would mean the env var is still the only route that counts"
         );
+    }
+
+    /// A time pin must not be answered from REST cross-query caches that predate
+    /// it. Both layers are seeded with metadata whose current snapshot is 1
+    /// (committed at 1000 ms) and the catalog is unreachable, so reaching the
+    /// catalog surfaces as a load error: a pin the cached metadata cannot answer
+    /// has to go there, while an unpinned read and a pin it can answer are
+    /// served from cache.
+    #[tokio::test]
+    async fn time_pinned_rest_read_bypasses_caches_too_stale_for_the_pin() {
+        use crate::graph_source::catalog_session::{CachedLoadTable, IcebergCatalogSession};
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config = fluree_db_iceberg::IcebergGsConfig {
+            catalog: CatalogConfig::Rest {
+                catalog_type: "rest".to_string(),
+                uri: "http://127.0.0.1:1".to_string(),
+                auth: fluree_db_iceberg::auth::AuthConfig::None,
+                warehouse: None,
+            },
+            table: TableConfig::Identifier("ns.t".to_string()),
+            io: IoConfig::default(),
+            mapping: None,
+            delete: None,
+            order_by: None,
+            model: None,
+            default_allow: None,
+        }
+        .to_json()
+        .unwrap();
+
+        let old_loc = format!("s3://b/t-{nanos}/metadata/00001.metadata.json");
+        let old_metadata = TableMetadata::from_json_str(
+            &json!({
+                "format-version": 2,
+                "location": "s3://b/t",
+                "last-sequence-number": 1,
+                "last-updated-ms": 1000,
+                "last-column-id": 1,
+                "current-schema-id": 0,
+                "schemas": [],
+                "current-snapshot-id": 1,
+                "snapshots": [{
+                    "snapshot-id": 1,
+                    "sequence-number": 1,
+                    "timestamp-ms": 1000,
+                    "manifest-list": "s3://b/t/snap-1.avro",
+                    "summary": {"operation": "append"},
+                }],
+                "snapshot-log": [{"snapshot-id": 1, "timestamp-ms": 1000}],
+                "default-spec-id": 0,
+                "partition-specs": [],
+                "last-partition-id": 0,
+                "sort-orders": [],
+                "default-sort-order-id": 0,
+                "properties": {}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        // The scope a vended read of this REST source plans (what the pointer
+        // rung keys the metadata layer by).
+        let plan = plan_storage(
+            &IcebergGsConfig::from_json(&config).unwrap().catalog,
+            &IcebergGsConfig::from_json(&config).unwrap().storage_io(),
+            &old_loc,
+            fluree.identity_context(),
+        )
+        .await
+        .unwrap();
+        fluree
+            .r2rml_cache()
+            .put_metadata(plan.scope(), &old_loc, Arc::new(old_metadata))
+            .await;
+
+        let mut sources = Vec::new();
+        for layer in ["pointer", "loadtable"] {
+            let name = format!("pin-rider-{layer}-{}-{nanos}", std::process::id());
+            fluree
+                .publisher()
+                .unwrap()
+                .publish_graph_source(&name, "main", GraphSourceType::Iceberg, &config, &[])
+                .await
+                .unwrap();
+            let gs_id = format!("{name}:main");
+            // The caches that outlive a query are keyed by the source's config too.
+            let lt_key = cross_query_key(
+                &IcebergCatalogSession::load_table_key(&gs_id, "ns", "t"),
+                &config,
+                fluree.identity_context(),
+            );
+            sources.push((layer, gs_id, lt_key));
+        }
+        let (_, pointer_gs, pointer_key) = &sources[0];
+        let (_, loadtable_gs, loadtable_key) = &sources[1];
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        provider
+            .catalog_disk_cache()
+            .put_metadata_location(pointer_key, &old_loc, 1000);
+        fluree.r2rml_cache().put_rest_load_table(
+            loadtable_key.clone(),
+            Arc::new(CachedLoadTable::from_response(&vended_response(
+                &old_loc, true,
+            ))),
+        );
+
+        // One provider per read, as per query: the session pin must not carry.
+        let read = |gs_id: String, pin: Option<SourceTime>| {
+            let fluree = &fluree;
+            async move {
+                let provider = FlureeR2rmlProvider::new(fluree);
+                if let Some(pin) = pin {
+                    provider.pin_source_time(&gs_id, pin).unwrap();
+                }
+                provider
+                    .load_table_context(&gs_id, "ns.t")
+                    .await
+                    .map(|ctx| ctx.metadata_location)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        let went_to_catalog =
+            |outcome: std::result::Result<String, String>, what: &str| match outcome {
+                Err(e) => assert!(
+                    e.contains("Failed to load table from catalog"),
+                    "{what}: expected a catalog load, got {e}"
+                ),
+                Ok(loc) => panic!("{what}: served {loc} from a cache too stale for the pin"),
+            };
+
+        for (pin, what) in [
+            (
+                SourceTime::AsOfTimestampMs(2500),
+                "pointer, as-of past cached",
+            ),
+            (SourceTime::SnapshotId(2), "pointer, snapshot id not cached"),
+        ] {
+            went_to_catalog(read(pointer_gs.clone(), Some(pin)).await, what);
+        }
+        for pin in [SourceTime::AsOfTimestampMs(500), SourceTime::SnapshotId(1)] {
+            assert_eq!(
+                read(pointer_gs.clone(), Some(pin)).await,
+                Ok(old_loc.clone()),
+                "pointer: {pin:?} is answerable from the cached metadata"
+            );
+        }
+        assert_eq!(read(pointer_gs.clone(), None).await, Ok(old_loc.clone()));
+
+        for pin in [SourceTime::AsOfTimestampMs(500), SourceTime::SnapshotId(1)] {
+            went_to_catalog(
+                read(loadtable_gs.clone(), Some(pin)).await,
+                &format!("loadTable cache, {pin:?}"),
+            );
+        }
+        assert_eq!(read(loadtable_gs.clone(), None).await, Ok(old_loc.clone()));
+    }
+
+    /// Two sources whose catalogs grant different identities, naming one table
+    /// location, never share what the query path cached for it: the pointer
+    /// rung serves the metadata, and the COUNT(*) shortcut its manifest stats,
+    /// only to the identity that read them. (The catalog is unreachable, so a
+    /// miss is a catalog load that fails, and a hit needs no network.)
+    #[tokio::test]
+    async fn two_identities_naming_one_table_never_share_its_cached_metadata_or_count() {
+        use crate::graph_source::catalog_session::IcebergCatalogSession;
+        use fluree_db_iceberg::config::{CatalogConfig, IoConfig, TableConfig};
+
+        let fluree = crate::FlureeBuilder::memory().build_memory();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let config_as = |token: &str| {
+            fluree_db_iceberg::IcebergGsConfig {
+                catalog: CatalogConfig::Rest {
+                    catalog_type: "rest".to_string(),
+                    uri: "http://127.0.0.1:1".to_string(),
+                    auth: fluree_db_iceberg::auth::AuthConfig::Bearer {
+                        token: fluree_db_iceberg::ConfigValue::literal(token),
+                    },
+                    warehouse: None,
+                },
+                table: TableConfig::Identifier("ns.t".to_string()),
+                io: IoConfig::default(),
+                mapping: None,
+                delete: None,
+                order_by: None,
+                model: None,
+                default_allow: None,
+            }
+            .to_json()
+            .unwrap()
+        };
+        let loc = format!("s3://b/shared-{nanos}/metadata/00001.metadata.json");
+        let metadata = Arc::new(
+            TableMetadata::from_json_str(
+                &json!({
+                    "format-version": 2,
+                    "location": "s3://b/shared",
+                    "last-sequence-number": 1,
+                    "last-updated-ms": 1000,
+                    "last-column-id": 1,
+                    "current-schema-id": 0,
+                    "schemas": [{"type": "struct", "schema-id": 0, "fields": [
+                        {"id": 1, "name": "id", "required": true, "type": "long"}
+                    ]}],
+                    "current-snapshot-id": 1,
+                    "snapshots": [{
+                        "snapshot-id": 1,
+                        "sequence-number": 1,
+                        "timestamp-ms": 1000,
+                        "manifest-list": "s3://b/shared/snap-1.avro",
+                        "summary": {"operation": "append"},
+                    }],
+                    "snapshot-log": [{"snapshot-id": 1, "timestamp-ms": 1000}],
+                    "default-spec-id": 0,
+                    "partition-specs": [],
+                    "last-partition-id": 0,
+                    "sort-orders": [],
+                    "default-sort-order-id": 0,
+                    "properties": {}
+                })
+                .to_string(),
+            )
+            .unwrap(),
+        );
+
+        let provider = FlureeR2rmlProvider::new(&fluree);
+        let mut sources = Vec::new();
+        for who in ["alice", "bob"] {
+            let config = config_as(who);
+            let name = format!("shared-{who}-{}-{nanos}", std::process::id());
+            fluree
+                .publisher()
+                .unwrap()
+                .publish_graph_source(&name, "main", GraphSourceType::Iceberg, &config, &[])
+                .await
+                .unwrap();
+            let gs_id = format!("{name}:main");
+            let xq_key = cross_query_key(
+                &IcebergCatalogSession::load_table_key(&gs_id, "ns", "t"),
+                &config,
+                fluree.identity_context(),
+            );
+            // Both catalogs point at the same metadata.
+            provider
+                .catalog_disk_cache()
+                .put_metadata_location(&xq_key, &loc, 1000);
+            let parsed = IcebergGsConfig::from_json(&config).unwrap();
+            let plan = plan_storage(
+                &parsed.catalog,
+                &parsed.storage_io(),
+                &loc,
+                fluree.identity_context(),
+            )
+            .await
+            .unwrap();
+            sources.push((gs_id, plan));
+        }
+        let (alice, alice_plan) = &sources[0];
+        let (bob, bob_plan) = &sources[1];
+        assert_ne!(alice_plan.scope(), bob_plan.scope());
+
+        // Alice read the table: its metadata and manifest stats are cached under
+        // her identity.
+        fluree
+            .r2rml_cache()
+            .put_metadata(alice_plan.scope(), &loc, Arc::clone(&metadata))
+            .await;
+        provider.catalog_disk_cache().put_count_stats(
+            alice_plan.scope(),
+            &loc,
+            &[count_data_file(7, None)],
+            false,
+        );
+
+        let resolve = |gs_id: &str| {
+            let fluree = &fluree;
+            let gs_id = gs_id.to_string();
+            async move {
+                FlureeR2rmlProvider::new(fluree)
+                    .load_table_context(&gs_id, "ns.t")
+                    .await
+                    .map(|ctx| ctx.metadata_location)
+                    .map_err(|e| e.to_string())
+            }
+        };
+        assert_eq!(resolve(alice).await, Ok(loc.clone()));
+        let bobs = resolve(bob)
+            .await
+            .expect_err("Bob is not served Alice's metadata");
+        assert!(bobs.contains("Failed to load table from catalog"), "{bobs}");
+
+        // Bob's own metadata read, but not the manifests: his COUNT(*) must read
+        // them himself rather than take Alice's stats.
+        fluree
+            .r2rml_cache()
+            .put_metadata(bob_plan.scope(), &loc, Arc::clone(&metadata))
+            .await;
+        let count = |gs_id: &str| {
+            let fluree = &fluree;
+            let gs_id = gs_id.to_string();
+            async move {
+                FlureeR2rmlProvider::new(fluree)
+                    .table_row_count_inner(&gs_id, "ns.t", &[], None)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
+        };
+        if crate::graph_source::disk_catalog_cache::disk_catalog_cache_enabled() {
+            assert_eq!(count(alice).await, Ok(Some(7)));
+        }
+        let bobs = count(bob)
+            .await
+            .expect_err("Bob is not served Alice's count");
+        assert!(bobs.contains("Failed to load table from catalog"), "{bobs}");
+    }
+}
+
+#[cfg(test)]
+mod emit_order_tests {
+    use super::*;
+    use fluree_db_iceberg::io::batch::{BatchSchema, Column, FieldInfo, FieldType};
+    use fluree_db_iceberg::manifest::{DataFile, FileFormat, PartitionData};
+    use futures::TryStreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn task(i: usize) -> FileScanTask {
+        sized_task(i, 1000)
+    }
+
+    fn sized_task(i: usize, file_size_in_bytes: i64) -> FileScanTask {
+        FileScanTask::for_whole_file(
+            DataFile {
+                file_path: format!("file:///t/data/{i:05}.parquet"),
+                file_format: FileFormat::Parquet,
+                record_count: 1,
+                file_size_in_bytes,
+                partition: PartitionData::default(),
+                column_sizes: None,
+                value_counts: None,
+                null_value_counts: None,
+                nan_value_counts: None,
+                lower_bounds: None,
+                upper_bounds: None,
+                split_offsets: None,
+                sort_order_id: None,
+            },
+            vec![1],
+            None,
+        )
+    }
+
+    /// One batch holding the file's index, so the output names its file.
+    fn batch_of(i: usize) -> ColumnBatch {
+        let schema = BatchSchema::new(vec![FieldInfo {
+            name: "file".to_string(),
+            field_type: FieldType::Int64,
+            nullable: false,
+            field_id: 1,
+        }]);
+        ColumnBatch::new(
+            Arc::new(schema),
+            vec![Column::Int64(vec![Some(i64::try_from(i).unwrap())])],
+        )
+        .unwrap()
+    }
+
+    fn file_of(batch: &ColumnBatch) -> i64 {
+        match batch.column_by_id(1) {
+            Some(Column::Int64(v)) => v[0].unwrap(),
+            other => panic!("unexpected column {other:?}"),
+        }
+    }
+
+    /// The first listed file finishes LAST (its read waits until the last
+    /// file's read is done), and the files are still emitted in listed order.
+    /// Completion-order emission yields 1, 2, 3, 0 here, every time.
+    #[tokio::test]
+    async fn files_are_emitted_in_listed_order_whatever_order_they_finish_in() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::AsListed, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order, vec![0, 1, 2, 3]);
+    }
+
+    /// Smallest file first, equal sizes in listed order: files 0..4 of 3000,
+    /// 1000, 2000 and 1000 bytes are emitted 1, 3, 2, 0. The first to emit
+    /// finishes LAST (file 1's read waits until file 0's is done), so
+    /// completion order would put it at the end, and listed order would start
+    /// with file 0.
+    #[tokio::test]
+    async fn smallest_first_emits_by_size_then_listed_order() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let sizes = [3000, 1000, 2000, 1000];
+        let tasks = (0..4).map(|i| sized_task(i, sizes[i])).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::SmallestFirst, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        1 => last_done.notified().await,
+                        0 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order, vec![1, 3, 2, 0]);
+    }
+
+    /// Completion order: the first listed file's read waits until file 3's is
+    /// done, so it is emitted last; the others come as they finish.
+    #[tokio::test]
+    async fn completion_emits_each_file_as_its_read_finishes() {
+        let last_done = Arc::new(tokio::sync::Notify::new());
+        let tasks = (0..4).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::Completion, 4, {
+            let last_done = Arc::clone(&last_done);
+            move |task| {
+                let last_done = Arc::clone(&last_done);
+                async move {
+                    let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+                    match i {
+                        0 => last_done.notified().await,
+                        3 => last_done.notify_one(),
+                        _ => {}
+                    }
+                    Ok(vec![batch_of(i)])
+                }
+            }
+        });
+        let batches: Vec<ColumnBatch> = stream.try_collect().await.unwrap();
+        let order: Vec<i64> = batches.iter().map(file_of).collect();
+        assert_eq!(order.len(), 4, "{order:?}");
+        assert_eq!(order[3], 0, "the held-back file comes last: {order:?}");
+    }
+
+    /// A query owes its scan a `ScanOrder`; both providers emit by it.
+    #[test]
+    fn a_query_scan_emits_by_its_scan_order() {
+        assert_eq!(
+            EmitOrder::for_query(ScanOrder::Deterministic),
+            EmitOrder::SmallestFirst
+        );
+        assert_eq!(EmitOrder::for_query(ScanOrder::Any), EmitOrder::Completion);
+    }
+
+    /// Counts the reads whose future was dropped before it finished.
+    struct CountOnDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A read that never finishes on its own, counting itself when started and
+    /// when dropped.
+    fn endless_read(
+        started: &Arc<AtomicUsize>,
+        dropped: &Arc<AtomicUsize>,
+    ) -> impl std::future::Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + 'static {
+        let started = Arc::clone(started);
+        let dropped = CountOnDrop(Arc::clone(dropped));
+        async move {
+            let _dropped = dropped;
+            started.fetch_add(1, Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+            unreachable!("an endless read never finishes")
+        }
+    }
+
+    /// Wait (up to 10 s) until `count` reaches `n`.
+    async fn wait_for(count: &AtomicUsize, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while count.load(Ordering::SeqCst) < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("count stayed at {}", count.load(Ordering::SeqCst)));
+    }
+
+    /// Dropping a scan's stream aborts the reads it has in flight and starts
+    /// no more, in every emit order: `buffered` and `buffer_unordered` alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_scan_stream_aborts_the_reads_in_flight() {
+        for order in [
+            EmitOrder::AsListed,
+            EmitOrder::SmallestFirst,
+            EmitOrder::Completion,
+        ] {
+            let (started, dropped) = (Arc::<AtomicUsize>::default(), Arc::default());
+            let tasks = (0..16).map(task).collect();
+            let mut stream = read_files_in_order(tasks, order, 4, {
+                let (started, dropped) = (Arc::clone(&started), Arc::clone(&dropped));
+                move |_task| endless_read(&started, &dropped)
+            });
+            assert!(futures::poll!(stream.next()).is_pending(), "{order:?}");
+            wait_for(&started, 4).await;
+
+            drop(stream);
+            wait_for(&dropped, 4).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                4,
+                "{order:?}: no read starts after the drop"
+            );
+        }
+    }
+
+    /// A read error is emitted at its file's place in the emit order, after
+    /// the earlier files' rows.
+    #[tokio::test]
+    async fn a_read_error_surfaces_in_emit_order() {
+        let tasks = (0..3).map(task).collect();
+        let stream = read_files_in_order(tasks, EmitOrder::AsListed, 3, |task| async move {
+            let i: usize = task.data_file.file_path[15..20].parse().unwrap();
+            if i == 1 {
+                Err(QueryError::Internal("file 1 is unreadable".to_string()))
+            } else {
+                Ok(vec![batch_of(i)])
+            }
+        });
+        let items: Vec<QueryResult<ColumnBatch>> = stream.collect().await;
+        assert_eq!(items.len(), 3);
+        assert_eq!(file_of(items[0].as_ref().unwrap()), 0);
+        assert!(items[1].is_err());
+        assert_eq!(file_of(items[2].as_ref().unwrap()), 2);
     }
 }

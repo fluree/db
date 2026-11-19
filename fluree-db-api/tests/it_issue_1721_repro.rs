@@ -559,3 +559,55 @@ async fn subject_pairs(fluree: &fluree_db_api::Fluree, sparql: &str) -> Vec<serd
         .collect();
     normalize_rows(&json!(pairs))
 }
+
+/// A transaction's reads plan from the stats of the state it began on
+/// (estimates only): an operation that gives a predicate the index licenses
+/// as ref-only its first literal must not leave that licence readable, or
+/// `FILTER(?x = ?y)` folds into a join, and the join unifies a `NaN` with
+/// itself where `=` holds it unequal.
+#[tokio::test]
+async fn a_transaction_read_after_a_predicate_gains_literals_keeps_value_equality() {
+    use fluree_db_api::{TransactionOptions, TxnOperation};
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/1721-txn-pin:main";
+    fluree.create_ledger(id).await.expect("create");
+    fluree
+        .graph(id)
+        .transact()
+        .sparql_update(
+            "PREFIX ex: <http://example.org/ns/>
+             INSERT DATA { ex:s3 ex:p ex:n1 . ex:s4 ex:p ex:n2 }",
+        )
+        .commit()
+        .await
+        .expect("seed refs");
+    // The index's stats license `ex:p` as ref-only.
+    support::build_and_publish_index(&fluree, id).await;
+
+    let mut txn = fluree
+        .begin_transaction(id, TransactionOptions::default())
+        .await
+        .expect("begin");
+    txn.stage(TxnOperation::SparqlUpdate(
+        r#"PREFIX ex: <http://example.org/ns/>
+           PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+           INSERT DATA { ex:s1 ex:p "NaN"^^xsd:double }"#
+            .to_string(),
+        None,
+    ))
+    .await
+    .expect("stage a literal");
+
+    let db = txn.db().await.expect("transaction view");
+    let got = normalize_rows(
+        &fluree
+            .query(&db, Q)
+            .await
+            .expect("query")
+            .to_jsonld(&db.snapshot)
+            .expect("jsonld"),
+    );
+    let want = normalize_rows(&json!([["ex:s3", "ex:s3"], ["ex:s4", "ex:s4"]]));
+    assert_eq!(got, want);
+}

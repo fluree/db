@@ -5,12 +5,18 @@ pub(crate) mod admin_auth;
 mod bm25;
 mod commits;
 mod context;
+#[cfg(feature = "delta")]
+mod delta;
+mod encryption;
 mod events;
+pub(crate) use encryption::rotation_holder;
 mod export;
+mod graph_store;
 #[cfg(feature = "graphql")]
 pub mod graphql;
 #[cfg(feature = "iceberg")]
 mod iceberg;
+#[cfg(feature = "iceberg")]
 mod iceberg_ssrf;
 mod import;
 mod ledger;
@@ -22,6 +28,7 @@ mod push;
 pub(crate) mod query;
 pub(crate) mod serving;
 mod show;
+mod sparql_protocol;
 #[cfg(feature = "sql")]
 mod sql;
 mod storage_proxy;
@@ -35,11 +42,37 @@ mod validate;
 use crate::state::AppState;
 use axum::{
     middleware,
-    routing::{get, post},
+    routing::{get, post, put, MethodRouter},
     Router,
 };
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
+
+/// On a query peer, send the request to the transaction server, as the
+/// transaction routes do; elsewhere, serve it here. For routes whose handlers
+/// read the request through typed extractors, so cannot forward it
+/// themselves.
+async fn forward_on_peer(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if state.config.server_role == crate::config::ServerRole::Peer {
+        return transact::forward_write_request(&state, request).await;
+    }
+    next.run(request).await
+}
+
+/// [`forward_on_peer`] for one route's method router.
+fn forwarded_on_peer<S>(methods: MethodRouter<S>, state: &Arc<AppState>) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    methods.layer(middleware::from_fn_with_state(
+        Arc::clone(state),
+        forward_on_peer,
+    ))
+}
 
 /// Apply the Raft follower-forward middleware to a leader-only
 /// subrouter when the server was constructed with a Raft handle.
@@ -60,6 +93,36 @@ where
     } else {
         router
     }
+}
+
+/// [`apply_leader_forward`] for one route's method router.
+#[cfg(feature = "raft")]
+fn apply_leader_forward_methods<S>(
+    methods: MethodRouter<S>,
+    state: &Arc<AppState>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    if let Some(integration) = &state.raft {
+        methods.layer(middleware::from_fn_with_state(
+            Arc::clone(&integration.forwarder),
+            fluree_db_consensus::raft::forward::forward_to_leader,
+        ))
+    } else {
+        methods
+    }
+}
+
+#[cfg(not(feature = "raft"))]
+fn apply_leader_forward_methods<S>(
+    methods: MethodRouter<S>,
+    _state: &Arc<AppState>,
+) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    methods
 }
 
 #[cfg(not(feature = "raft"))]
@@ -90,6 +153,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // runs where the indexer does.
         .route("/sweep", post(ledger::sweep))
         .route("/sweep/plan", post(ledger::sweep_plan))
+        // Encryption key rotation: rewrites storage and holds the sweep on
+        // one node, so it is admin-gated and runs where the indexer does.
+        .route("/encryption/rotate", post(encryption::rotate))
+        .route("/encryption/rotate/pause", post(encryption::rotate_pause))
+        .route("/encryption/rotate/cancel", post(encryption::rotate_cancel))
+        .route("/encryption/rotate/verify", post(encryption::rotate_verify))
         .route("/branch", post(ledger::create_branch))
         .route("/drop-branch", post(ledger::drop_branch))
         .route("/drop-graph", post(ledger::drop_named_graph))
@@ -124,6 +193,9 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     #[cfg(feature = "sql")]
     let v1_admin_protected_writes = v1_admin_protected_writes.route("/sql/map", post(sql::sql_map));
+    #[cfg(feature = "delta")]
+    let v1_admin_protected_writes =
+        v1_admin_protected_writes.route("/delta/map", post(delta::delta_map));
 
     // Admin auth runs BEFORE leader-forward. Axum runs the
     // last-applied layer outermost, so `require_admin_token`
@@ -158,7 +230,11 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/export/*ledger", post(export::export_ledger_tail))
         // Status of a negotiated upload — reads this node's
         // `state.import_jobs` map (each node owns the jobs it minted).
-        .route("/import-upload/:import_id", get(import::import_status));
+        .route("/import-upload/:import_id", get(import::import_status))
+        // Held encryption key ids and the rotation record; the record is
+        // storage-resident, so any node answers.
+        .route("/encryption", get(encryption::encryption))
+        .route("/encryption/rotate/status", get(encryption::rotate_status));
 
     // Read-only Iceberg catalog browse / metadata preview. POSTs (the inline
     // connection carries a secret in the body) but they mutate nothing and
@@ -185,6 +261,14 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/iceberg/r2rml/validate",
             post(iceberg::iceberg_r2rml_validate),
         );
+    // The same for a Delta source on Unity Catalog.
+    #[cfg(feature = "delta")]
+    let v1_admin_protected_reads = v1_admin_protected_reads
+        .route("/delta/catalog/browse", post(delta::delta_catalog_browse))
+        .route("/delta/catalog/preview", post(delta::delta_catalog_preview))
+        .route("/delta/catalog/verify", post(delta::delta_catalog_verify))
+        .route("/delta/r2rml/generate", post(delta::delta_r2rml_generate))
+        .route("/delta/r2rml/validate", post(delta::delta_r2rml_validate));
     // Materialization tracking-worker status — reads this node's worker state.
     #[cfg(feature = "iceberg")]
     let v1_admin_protected_reads =
@@ -212,22 +296,34 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/sync", post(transact::sync))
         .route("/upsert/*ledger", post(transact::upsert_ledger_tail))
         .route("/sync/*ledger", post(transact::sync_ledger))
-        // Commit-push endpoint (precomputed commits)
+        // Commit-push endpoints (precomputed commits). The second takes a
+        // push whose commits include a merge; see `routes::push`.
         .route("/push/*ledger", post(push::push_ledger_tail))
-        // Nameservice ref endpoints (for remote sync)
+        .route("/push-merges/*ledger", post(push::push_merges_ledger_tail))
+        // Nameservice ref endpoints (for remote sync). A peer sends them to
+        // the transaction server, whose nameservice they advance.
         .route(
             "/nameservice/refs/:alias/commit",
-            post(nameservice_refs::push_commit_head),
+            forwarded_on_peer(post(nameservice_refs::push_commit_head), &state),
         )
         .route(
             "/nameservice/refs/:alias/index",
-            post(nameservice_refs::push_index_head),
+            forwarded_on_peer(post(nameservice_refs::push_index_head), &state),
         )
         .route(
             "/nameservice/refs/:alias/init",
-            post(nameservice_refs::init_ledger),
+            forwarded_on_peer(post(nameservice_refs::init_ledger), &state),
         );
     let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
+
+    // Graph Store Protocol: reads run locally like `/query`; writes are
+    // leader-only like `/sync`. One path, so one method router (axum refuses
+    // a path registered in two merged routers).
+    let graph_store_writes = put(graph_store::put)
+        .post(graph_store::post)
+        .delete(graph_store::delete);
+    let graph_store =
+        get(graph_store::get).merge(apply_leader_forward_methods(graph_store_writes, &state));
 
     // Read-only routes that nonetheless need leader-forward because
     // their backing state lives in the leader's per-process caches.
@@ -266,12 +362,13 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // Merge leader-only routes (Raft-forwarded when applicable)
         .merge(v1_leader_only_routes)
         // Query endpoints
-        .route("/query", get(query::query).post(query::query))
+        .route("/query", get(query::query_get).post(query::query))
         .route(
             "/query/*ledger",
-            get(query::query_ledger_tail).post(query::query_ledger_tail),
+            get(query::query_ledger_get).post(query::query_ledger_tail),
         )
         .route("/multi-query", post(query::multi_query))
+        .route("/data/*ledger", graph_store)
         // Streaming SELECT results as NDJSON. Separate route family so the
         // standard /query path is untouched. Connection-scoped (no path ledger)
         // and ledger-scoped (greedy tail) forms.
@@ -323,7 +420,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/storage/objects/:cid",
             get(storage_proxy::get_object_by_cid),
         )
-        .route("/nameservice/snapshot", get(nameservice_refs::snapshot))
+        .route(
+            "/nameservice/snapshot",
+            forwarded_on_peer(get(nameservice_refs::snapshot), &state),
+        )
         // Stub endpoints (not yet implemented)
         .route("/subscribe", get(stubs::subscribe))
         .route("/remote/:path", get(stubs::remote).post(stubs::remote));
@@ -437,6 +537,7 @@ fn cors_layer() -> CorsLayer {
             HeaderName::from_static("x-fdb-policy-enforcement"),
             HeaderName::from_static("x-fdb-reasoning"),
             HeaderName::from_static("x-fdb-warning"),
+            HeaderName::from_static("x-fdb-cache"),
         ])
         .max_age(std::time::Duration::from_secs(86400))
 }

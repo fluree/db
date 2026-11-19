@@ -19,6 +19,7 @@
 //! This ensures uncommitted changes override persisted state.
 
 use crate::cell_index::CellEntry;
+use fluree_db_core::same_t::supersedes;
 use std::cmp::Ordering;
 
 /// Merge two sorted iterators of CellEntry.
@@ -81,11 +82,32 @@ where
     }
 }
 
+/// The entry that holds among `first` and the entries after it at the same
+/// `(cell_id, subject_id)` and `t`, which it consumes: at one `t` an assert
+/// holds over a retract ([`fluree_db_core::same_t`]), whatever the order
+/// the entries are stored in. A subject whose geometry changes within one
+/// cell writes both at one `t`, as does a commit that retracts and asserts
+/// one fact.
+fn holding_at<I: Iterator<Item = CellEntry>>(
+    first: CellEntry,
+    rest: &mut std::iter::Peekable<I>,
+) -> CellEntry {
+    let mut holder = first;
+    while let Some(next) = rest
+        .next_if(|e| (e.cell_id, e.subject_id, e.t) == (first.cell_id, first.subject_id, first.t))
+    {
+        if supersedes((next.t, next.is_assert()), (holder.t, holder.is_assert())) {
+            holder = next;
+        }
+    }
+    holder
+}
+
 /// Replay resolver: collapses entries to the latest state at `to_t`.
 ///
-/// For each `(cell_id, subject_id)` key, emits only the first entry
-/// with `t <= to_t`. If that entry is a retract, it's filtered out
-/// (subject is not present at `to_t`).
+/// For each `(cell_id, subject_id)` key, emits only the entry that holds
+/// at the newest `t <= to_t` ([`holding_at`]). If that entry is a retract,
+/// it's filtered out (subject is not present at `to_t`).
 pub struct ReplayResolver<I>
 where
     I: Iterator<Item = CellEntry>,
@@ -135,6 +157,7 @@ where
 
             // This is the first entry for this key with t <= to_t
             self.current_key = Some(key);
+            let entry = holding_at(entry, &mut self.inner);
 
             // Skip retracts (subject not present at to_t)
             if entry.is_retract() {
@@ -197,7 +220,7 @@ where
             // This is the first entry for this key with t <= to_t
             self.current_key = Some(key);
 
-            return Some(entry);
+            return Some(holding_at(entry, &mut self.inner));
         }
     }
 }
@@ -267,6 +290,33 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].t, 10);
         assert!(result[0].is_assert());
+    }
+
+    /// A retract and an assert of one `(cell, subject)` at one `t` (a
+    /// geometry changed within the cell) resolve to the assert, in either
+    /// stored order, and time travel below that `t` sees the older assert.
+    #[test]
+    fn test_replay_resolver_same_t_pair_holds_the_assert() {
+        for pair in [
+            [entry(100, 1, 20, 0), entry(100, 1, 20, 1)],
+            [entry(100, 1, 20, 1), entry(100, 1, 20, 0)],
+        ] {
+            let mut entries = pair.to_vec();
+            entries.push(entry(100, 1, 10, 1));
+            entries.push(entry(100, 2, 20, 1));
+
+            let result: Vec<_> = ReplayResolver::new(entries.clone().into_iter(), 25).collect();
+            let at: Vec<_> = result.iter().map(|e| (e.subject_id, e.t, e.op)).collect();
+            assert_eq!(at, vec![(1, 20, 1), (2, 20, 1)]);
+
+            let result: Vec<_> = ReplayResolver::new(entries.clone().into_iter(), 15).collect();
+            let at: Vec<_> = result.iter().map(|e| (e.subject_id, e.t, e.op)).collect();
+            assert_eq!(at, vec![(1, 10, 1)]);
+
+            let result: Vec<_> = ReplayResolverWithRetracts::new(entries.into_iter(), 25).collect();
+            let at: Vec<_> = result.iter().map(|e| (e.subject_id, e.t, e.op)).collect();
+            assert_eq!(at, vec![(1, 20, 1), (2, 20, 1)]);
+        }
     }
 
     #[test]

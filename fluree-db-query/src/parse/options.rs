@@ -41,6 +41,15 @@ fn validate_var_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// An `orderBy` term's variable. An expression in its place (`(count ?e)`) is
+/// [`ParseError::InvalidOrderBy`], whose message says how to sort on one.
+fn validate_order_var(name: &str) -> Result<()> {
+    if name.trim_start().starts_with('(') {
+        return Err(ParseError::InvalidOrderBy);
+    }
+    validate_var_name(name)
+}
+
 /// Parse depth option for graph select auto-expansion
 ///
 /// Default is 0 (no auto-expansion).
@@ -190,7 +199,7 @@ fn parse_order_term_object(map: &serde_json::Map<String, JsonValue>) -> Result<U
         .get("var")
         .and_then(|v| v.as_str())
         .ok_or(ParseError::InvalidOrderBy)?;
-    validate_var_name(var)?;
+    validate_order_var(var)?;
 
     // Accept both "direction" and "order" as synonyms (clients vary)
     let dir_val = map
@@ -222,7 +231,7 @@ fn parse_order_term_string(s: &str) -> Result<UnresolvedSortSpec> {
         }
         let direction = parse_sort_direction(parts[0])?;
         let var = parts[1];
-        validate_var_name(var)?;
+        validate_order_var(var)?;
         return Ok(UnresolvedSortSpec {
             var: Arc::from(var),
             direction,
@@ -230,7 +239,7 @@ fn parse_order_term_string(s: &str) -> Result<UnresolvedSortSpec> {
     }
 
     // Plain var string (defaults to ascending)
-    validate_var_name(trimmed)?;
+    validate_order_var(trimmed)?;
     Ok(UnresolvedSortSpec {
         var: Arc::from(trimmed),
         direction: UnresolvedSortDirection::Asc,
@@ -245,7 +254,7 @@ fn parse_order_term_array(arr: &[JsonValue]) -> Result<UnresolvedSortSpec> {
     let dir = arr[0].as_str().ok_or(ParseError::InvalidOrderBy)?;
     let var = arr[1].as_str().ok_or(ParseError::InvalidOrderBy)?;
     let direction = parse_sort_direction(dir)?;
-    validate_var_name(var)?;
+    validate_order_var(var)?;
     Ok(UnresolvedSortSpec {
         var: Arc::from(var),
         direction,
@@ -296,7 +305,7 @@ pub fn parse_group_by(obj: &serde_json::Map<String, JsonValue>) -> Result<Vec<Ar
 /// - allow `"having": "(>= (count ?x) 2)"` and `"having": "(>= (avg ?x) 10)"`
 /// - aggregate forms inside HAVING are rewritten into real query aggregates,
 ///   and the HAVING expression is rewritten to reference the aggregate output var.
-fn parse_having_with_aggregates(
+pub(crate) fn parse_having_with_aggregates(
     obj: &serde_json::Map<String, JsonValue>,
     parse_filter_expr: impl Fn(&JsonValue) -> Result<UnresolvedExpression>,
 ) -> Result<(Option<UnresolvedExpression>, Vec<UnresolvedAggregateSpec>)> {
@@ -444,8 +453,8 @@ fn rewrite_having_aggregates(
 /// - No key present - no reasoning (reasoning is opt-in)
 ///
 /// These keys are canonical at the **top level** of the query object, and are
-/// also accepted inside `opts` as an alias. The top level wins: when it
-/// carries any of them, `opts` is not consulted at all.
+/// also accepted inside `opts` as an alias. The top level wins key by key: a
+/// key it carries is read from there, and `opts` supplies the rest.
 ///
 /// # Example
 ///
@@ -467,35 +476,18 @@ fn rewrite_having_aggregates(
 pub fn parse_reasoning(
     obj: &serde_json::Map<String, JsonValue>,
 ) -> Result<Option<crate::ir::ReasoningModes>> {
-    // The top level is canonical. When it carries any reasoning key it is the
-    // sole source, and this costs exactly what it did before the `opts` alias
-    // below existed: four map probes and one clone.
+    // Each key comes from the top level when it is there, else from `opts`,
+    // so a request reads as if every key were written at the top level. A
+    // modifier at the top level (`reasoningBudget`, `reasoningTime`) beside a
+    // mode in `opts` runs that mode under it; letting any top-level key make
+    // the top level the only source dropped the `opts` mode in silence
+    // (fluree/db#1883). A budget or time alone enables no mode, but it is
+    // still carried, so a ledger-config default mode runs under it.
     //
-    // A budget alone enables no mode, but it must be carried so a
-    // ledger-config default mode runs under it — hence it counts as present.
-    //
-    // PRECEDENCE IS ALL-OR-NOTHING, NOT PER KEY. Any one top-level reasoning
-    // key makes the top level the whole source, so
-    // `{"reasoningBudget": {…}, "opts": {"reasoning": "datalog"}}` runs with no
-    // reasoning at all: the budget is a modifier rather than a mode, but it
-    // still wins the source election and the `opts` mode is dropped in silence.
-    // That is deliberate — a per-key merge would let one request draw modes
-    // from two places at once, which is harder to predict than one source
-    // winning outright — and it is pinned by
-    // `opts_ignored_when_any_top_level_reasoning_key_present`.
-    //
-    // It is, however, the same silently-ignored shape as the defect that
-    // motivated this alias (fluree/db#1863), one level down. Changing it to a
-    // per-key merge is a behavior change with its own compatibility surface,
-    // so it is tracked separately rather than folded in here.
-    if REASONING_KEYS.iter().any(|k| obj.contains_key(*k)) {
-        return reasoning_from(obj);
-    }
-
-    // Otherwise accept the same keys from `opts`. Users reasonably guess that
-    // query-level knobs live there, because several genuinely do
-    // (`objectVarParsing`, `includeSystemFacts`, `t`, `maxFuel`, ...), and
-    // until now `{"opts": {"reasoning": "datalog"}}` was silently ignored: no
+    // `opts` is accepted because users reasonably guess that query-level knobs
+    // live there, since several genuinely do (`objectVarParsing`,
+    // `includeSystemFacts`, `t`, `maxFuel`, ...), and
+    // `{"opts": {"reasoning": "datalog"}}` used to be silently ignored: no
     // error, no reasoning, an empty result set (fluree/db#1863).
     //
     // Honoring it grants no privilege a top-level key does not already grant —
@@ -506,24 +498,34 @@ pub fn parse_reasoning(
     // deliberately open bag, and the server injects into it (`identity`,
     // `policy-values`, `policyClass`), so a whitelist would break forward
     // compatibility with its own writers.
-    let Some(opts) = obj.get("opts").and_then(JsonValue::as_object) else {
-        return Ok(None);
-    };
-    if !REASONING_KEYS.iter().any(|k| opts.contains_key(*k)) {
+    let opts = obj.get("opts").and_then(JsonValue::as_object);
+    let from_opts: Vec<(&str, &JsonValue)> = REASONING_KEYS
+        .iter()
+        .filter(|key| !obj.contains_key(**key))
+        .filter_map(|&key| Some((key, opts?.get(key)?)))
+        .collect();
+    if from_opts.is_empty() {
+        if REASONING_KEYS.iter().any(|key| obj.contains_key(*key)) {
+            return reasoning_from(obj);
+        }
         return Ok(None);
     }
     let mut merged = obj.clone();
-    for &key in REASONING_KEYS {
-        if let Some(value) = opts.get(key) {
-            merged.insert(key.to_string(), value.clone());
-        }
+    for (key, value) in from_opts {
+        merged.insert(key.to_string(), value.clone());
     }
     reasoning_from(&merged)
 }
 
 /// Keys [`crate::ir::ReasoningModes::from_query_json`] consumes. Canonical at
 /// the top level of the query object; also accepted inside `opts`.
-const REASONING_KEYS: &[&str] = &["reasoning", "rules", "ontology", "reasoningBudget"];
+const REASONING_KEYS: &[&str] = &[
+    "reasoning",
+    "rules",
+    "ontology",
+    "reasoningBudget",
+    "reasoningTime",
+];
 
 fn reasoning_from(
     obj: &serde_json::Map<String, JsonValue>,
@@ -567,6 +569,7 @@ pub fn parse_options(
         reasoning: parse_reasoning(obj)?,
         object_var_parsing: parse_object_var_parsing(obj),
         include_system_facts: parse_include_system_facts(obj),
+        union_default_graph: parse_union_default_graph(obj)?,
     })
 }
 
@@ -611,10 +614,44 @@ pub fn parse_include_system_facts(obj: &serde_json::Map<String, JsonValue>) -> b
         .unwrap_or(false)
 }
 
+/// Parse `opts.unionDefaultGraph` from the top-level query object: the
+/// request's own union default graph switch, `None` when absent. A value that
+/// is not a boolean is an error, never a silently ignored option.
+pub fn parse_union_default_graph(obj: &serde_json::Map<String, JsonValue>) -> Result<Option<bool>> {
+    let Some(opts) = obj.get("opts").and_then(|v| v.as_object()) else {
+        return Ok(None);
+    };
+    let Some(value) = opts.get("unionDefaultGraph") else {
+        return Ok(None);
+    };
+    value.as_bool().map(Some).ok_or_else(|| {
+        ParseError::InvalidOption(format!(
+            "opts.unionDefaultGraph must be true or false, got {value}"
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn union_default_graph_opt() {
+        let parse = |v: JsonValue| parse_union_default_graph(v.as_object().unwrap());
+        assert_eq!(parse(json!({})).unwrap(), None);
+        assert_eq!(parse(json!({"opts": {}})).unwrap(), None);
+        assert_eq!(
+            parse(json!({"opts": {"unionDefaultGraph": true}})).unwrap(),
+            Some(true)
+        );
+        assert_eq!(
+            parse(json!({"opts": {"unionDefaultGraph": false}})).unwrap(),
+            Some(false)
+        );
+        let err = parse(json!({"opts": {"unionDefaultGraph": "yes"}})).unwrap_err();
+        assert!(err.to_string().contains("unionDefaultGraph"), "{err}");
+    }
 
     fn reasoning_of(v: &JsonValue) -> Option<crate::ir::ReasoningModes> {
         parse_reasoning(v.as_object().unwrap()).unwrap()
@@ -640,16 +677,51 @@ mod tests {
         assert!(!modes.owl2rl, "opts must not be consulted, got {modes:?}");
     }
 
-    /// The top level is the sole source whenever it carries ANY reasoning key,
-    /// so a stray `opts` twin cannot half-apply.
+    /// `opts` supplies every key the top level leaves out, so a top-level
+    /// modifier beside an `opts` mode runs that mode under it (fluree/db#1883).
     #[test]
-    fn opts_ignored_when_any_top_level_reasoning_key_present() {
+    fn opts_fills_keys_the_top_level_omits() {
         let modes = reasoning_of(&json!({
             "rules": [],
             "opts": {"reasoning": "owl2rl"}
         }))
         .expect("a top-level rules key is a reasoning key");
-        assert!(!modes.owl2rl, "opts must not be consulted, got {modes:?}");
+        assert!(modes.owl2rl, "opts.reasoning must apply, got {modes:?}");
+
+        let modes = reasoning_of(&json!({
+            "reasoningBudget": {"maxFacts": 42},
+            "opts": {"reasoning": "datalog"}
+        }))
+        .expect("reasoning");
+        assert!(modes.datalog, "opts.reasoning must apply, got {modes:?}");
+        assert_eq!(modes.max_facts, Some(42));
+
+        let modes = reasoning_of(&json!({
+            "reasoningTime": "2026-01-01T00:00:00Z",
+            "opts": {"reasoning": "datalog"}
+        }))
+        .expect("reasoning");
+        assert!(modes.datalog, "opts.reasoning must apply, got {modes:?}");
+        assert!(modes.evaluation_time.is_some(), "time dropped: {modes:?}");
+    }
+
+    /// A key both carry is read from the top level; the others still come
+    /// from `opts`.
+    #[test]
+    fn the_top_level_wins_key_by_key() {
+        let modes = reasoning_of(&json!({
+            "reasoning": "datalog",
+            "reasoningBudget": {"maxFacts": 1},
+            "opts": {
+                "reasoning": "owl2rl",
+                "reasoningBudget": {"maxFacts": 2},
+                "reasoningTime": "2026-01-01T00:00:00Z"
+            }
+        }))
+        .expect("reasoning");
+        assert!(modes.datalog && !modes.owl2rl, "got {modes:?}");
+        assert_eq!(modes.max_facts, Some(1));
+        assert!(modes.evaluation_time.is_some(), "time dropped: {modes:?}");
     }
 
     #[test]
@@ -770,6 +842,32 @@ mod tests {
         assert_eq!(specs.len(), 1);
         assert_eq!(specs[0].var.as_ref(), "?x");
         assert_eq!(specs[0].direction, UnresolvedSortDirection::Desc);
+    }
+
+    #[test]
+    fn test_parse_order_by_expression_names_the_alias_route() {
+        // An expression or aggregate where a variable belongs gets the message
+        // that says how to sort on one, in every term form.
+        for val in [
+            json!("(desc (count ?e))"),
+            json!(["(desc (count ?e))"]),
+            json!([["desc", "(count ?e)"]]),
+            json!([{"var": "(count ?e)", "direction": "desc"}]),
+        ] {
+            let obj = json!({ "orderBy": val });
+            let err = parse_order_by(obj.as_object().unwrap()).unwrap_err();
+            assert!(matches!(err, ParseError::InvalidOrderBy), "{val}: {err:?}");
+            assert!(
+                err.to_string().contains("select it under an alias"),
+                "{val}: {err}"
+            );
+        }
+        // A bare word is still a malformed variable.
+        let obj = json!({ "orderBy": ["name"] });
+        assert!(matches!(
+            parse_order_by(obj.as_object().unwrap()).unwrap_err(),
+            ParseError::InvalidVariable(_)
+        ));
     }
 
     #[test]

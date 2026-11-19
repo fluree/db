@@ -18,11 +18,10 @@
 //! ```
 
 // Re-export query parameter types from their canonical home.
-pub use crate::query_bounds::{ObjectBounds, RangeMatch, RangeOptions, RangeTest};
+pub use crate::query_bounds::{ObjectBounds, RangeMatch, RangeOptions, RangeTest, StringDatatype};
 
 use crate::comparator::IndexType;
 use crate::db::LedgerSnapshot;
-use crate::dt_compatible;
 use crate::error::Result;
 use crate::flake::{Flake, FlakeMeta};
 use crate::ids::GraphId;
@@ -145,7 +144,7 @@ where
             apply_range_filter(&mut flakes, test, &match_val);
             // Apply RangeOptions semantics for overlay-only path (object bounds, offset, limits).
             //
-            // This matters for time resolution (`@iso:`), which uses `object_bounds`
+            // This matters for time resolution (`@time:`), which uses `object_bounds`
             // and `flake_limit(1)` to efficiently resolve the first flake after a target.
             apply_overlay_only_options(&mut flakes, &opts);
             Ok(flakes)
@@ -224,6 +223,10 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
         self.0.epoch()
     }
 
+    fn list_predicates(&self) -> Option<std::sync::Arc<std::collections::HashSet<Sid>>> {
+        self.0.list_predicates()
+    }
+
     fn is_effectively_empty(&self) -> bool {
         self.0.is_effectively_empty()
     }
@@ -248,6 +251,18 @@ impl<O: OverlayProvider + ?Sized> OverlayProvider for SizedOverlayRef<'_, O> {
 
     fn overlay_flake_count(&self, g_id: GraphId) -> Option<usize> {
         self.0.overlay_flake_count(g_id)
+    }
+
+    fn overlay_range_flake_count(
+        &self,
+        g_id: GraphId,
+        index: IndexType,
+        first: Option<&Flake>,
+        rhs: Option<&Flake>,
+        leftmost: bool,
+    ) -> Option<usize> {
+        self.0
+            .overlay_range_flake_count(g_id, index, first, rhs, leftmost)
     }
 
     fn overlay_segments(&self, g_id: GraphId) -> Vec<crate::overlay::OverlaySegmentMeta> {
@@ -290,7 +305,7 @@ pub fn flake_matches_range_eq(f: &Flake, match_val: &RangeMatch) -> bool {
         }
     }
     if let Some(ref dt) = match_val.dt {
-        if !dt_compatible(dt, &f.dt) {
+        if *dt != f.dt {
             return false;
         }
     }
@@ -324,7 +339,8 @@ fn apply_range_filter(flakes: &mut Vec<Flake>, test: RangeTest, match_val: &Rang
 fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
     // Object bounds (post-filter) — used by datetime resolution (`ledger#time > target`).
     if let Some(bounds) = opts.object_bounds.as_ref() {
-        flakes.retain(|f| bounds.matches(&f.o));
+        let bounds = bounds.prepare();
+        flakes.retain(|f| bounds.matches(&f.o, &f.dt));
     }
 
     // Offset (flake-wise for overlay-only path).
@@ -364,7 +380,7 @@ fn apply_overlay_only_options(flakes: &mut Vec<Flake>, opts: &RangeOptions) {
 /// OPST bounds stop at the object: `cmp_object` orders by value THEN
 /// datatype, and the predicate compares after both — so with the datatype
 /// unmatched, an `o+p` bound covers exactly the same span as `o` alone.
-fn overlay_eq_bounds(
+pub fn overlay_eq_bounds(
     index: IndexType,
     test: RangeTest,
     match_val: &RangeMatch,
@@ -445,20 +461,11 @@ fn collect_overlay_only<O: OverlayProvider + ?Sized>(
 /// applies; callers that merge base rows with a raw overlay walk themselves
 /// use it to get identical results to [`range_with_overlay`].
 ///
-/// At equal `t` a retraction beats an assert, so an assert and a retract of
-/// the same fact at one `t` resolve to absent. That matches
-/// `fluree_db_binary_index::read::types::resolve_overlay_ops`, which the
-/// cursor path uses, and the per-commit apply path. The transaction
-/// accumulator dedups within a commit so the tie is not reachable through a
-/// single transaction, but the segment-aware overlay assembly merges runs
-/// across segments — the rule is here so every path lands on the same answer
-/// rather than on whichever flake sorted last.
-///
-/// The merge and revert fold used to produce these pairs as well, by
-/// concatenating a source range's flakes into a single commit at a single
-/// `t`. It nets per fact now, so new commits carry no such pair, but merge
-/// commits written by the older code still do. The tie-break is what keeps
-/// those readable.
+/// An assert and a retract of the same fact at one `t` resolve to present:
+/// the one rule every lane applies ([`crate::same_t`]), so this path, the
+/// cursor's `resolve_overlay_ops`, novelty's fact state and every index build
+/// give the same answer. Commits written before the staging fix can hold
+/// such pairs.
 pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<Flake> {
     flakes.sort_by(index.comparator());
     remove_stale_flakes(flakes)
@@ -485,10 +492,9 @@ pub fn resolve_current_flakes(mut flakes: Vec<Flake>, index: IndexType) -> Vec<F
 /// correct — it never leaned on `Ord` in the first place — so the hashed
 /// fact key stays, and the #1273 collapse it prevents is unrelated to #1711.
 ///
-/// The winner is chosen explicitly rather than by taking the first hit of a
-/// reverse scan, so the equal-`t` tie resolves to the retraction (see
-/// [`resolve_current_flakes`]) instead of to whichever op the comparator
-/// happened to sort last.
+/// The winner is chosen explicitly ([`crate::same_t::supersedes`]) rather than
+/// by taking the first hit of a reverse scan, so the answer does not depend
+/// on the input's order.
 fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
     use std::collections::HashMap;
 
@@ -517,8 +523,7 @@ fn remove_stale_flakes(flakes: Vec<Flake>) -> Vec<Flake> {
             }
             Some(&cur_idx) => {
                 let cur = &flakes[cur_idx];
-                // Newest op wins; at equal `t` the retraction does.
-                if f.t > cur.t || (f.t == cur.t && !f.op && cur.op) {
+                if crate::same_t::supersedes((f.t, f.op), (cur.t, cur.op)) {
                     winner.insert(key, idx);
                 }
             }
@@ -596,31 +601,25 @@ mod tests {
     }
 
     /// An assert and a retract of the same fact at the SAME `t` resolve to
-    /// absent. The comparator orders `op` ascending, so a reverse scan that
-    /// took its first hit picked the assert and the fact survived — which
-    /// disagreed with `resolve_overlay_ops` on the cursor path, and so with
-    /// this function's own documented promise of "identical results to
-    /// `range_with_overlay`".
+    /// present ([`crate::same_t`]), as `resolve_overlay_ops` on the cursor
+    /// path and every index build resolve them, whatever the input's order.
     #[test]
-    fn resolve_current_flakes_retraction_wins_at_equal_t() {
-        let out = resolve_current_flakes(
+    fn resolve_current_flakes_assertion_holds_at_equal_t() {
+        for flakes in [
             vec![
                 fact("a", "x", 2, true, None),
                 fact("a", "x", 2, false, None),
             ],
-            IndexType::Spot,
-        );
-        assert!(out.is_empty(), "same-t assert+retract resolves to absent");
-
-        // Order of the input must not change the answer.
-        let out = resolve_current_flakes(
             vec![
                 fact("a", "x", 2, false, None),
                 fact("a", "x", 2, true, None),
             ],
-            IndexType::Spot,
-        );
-        assert!(out.is_empty());
+        ] {
+            let out = resolve_current_flakes(flakes, IndexType::Spot);
+            assert_eq!(out.len(), 1, "same-t assert+retract resolves to present");
+            assert!(out[0].op);
+            assert_eq!(out[0].t, 2);
+        }
     }
 
     /// Metadata siblings: the comparators order `t` before `m`, so a
@@ -843,27 +842,38 @@ mod tests {
         assert_eq!(m2.p, Some(p));
     }
 
+    /// `bounds.matches` for `value` under its natural datatype: `xsd:string`
+    /// for a string, `xsd:integer` / `xsd:double` for a number.
+    fn natural(bounds: &ObjectBounds, value: &FlakeValue) -> bool {
+        let dt = match value {
+            FlakeValue::String(_) => Sid::xsd_string(),
+            FlakeValue::Double(_) => Sid::xsd_double(),
+            _ => Sid::xsd_integer(),
+        };
+        bounds.matches(value, &dt)
+    }
+
     #[test]
     fn test_object_bounds_matches() {
         let bounds = ObjectBounds::new().with_lower(FlakeValue::Long(10), true);
-        assert!(!bounds.matches(&FlakeValue::Long(9)));
-        assert!(bounds.matches(&FlakeValue::Long(10)));
-        assert!(bounds.matches(&FlakeValue::Long(11)));
+        assert!(!natural(&bounds, &FlakeValue::Long(9)));
+        assert!(natural(&bounds, &FlakeValue::Long(10)));
+        assert!(natural(&bounds, &FlakeValue::Long(11)));
 
         let bounds = ObjectBounds::new().with_lower(FlakeValue::Long(10), false);
-        assert!(!bounds.matches(&FlakeValue::Long(9)));
-        assert!(!bounds.matches(&FlakeValue::Long(10)));
-        assert!(bounds.matches(&FlakeValue::Long(11)));
+        assert!(!natural(&bounds, &FlakeValue::Long(9)));
+        assert!(!natural(&bounds, &FlakeValue::Long(10)));
+        assert!(natural(&bounds, &FlakeValue::Long(11)));
 
         let bounds = ObjectBounds::new().with_upper(FlakeValue::Long(100), true);
-        assert!(bounds.matches(&FlakeValue::Long(99)));
-        assert!(bounds.matches(&FlakeValue::Long(100)));
-        assert!(!bounds.matches(&FlakeValue::Long(101)));
+        assert!(natural(&bounds, &FlakeValue::Long(99)));
+        assert!(natural(&bounds, &FlakeValue::Long(100)));
+        assert!(!natural(&bounds, &FlakeValue::Long(101)));
 
         let bounds = ObjectBounds::new().with_upper(FlakeValue::Long(100), false);
-        assert!(bounds.matches(&FlakeValue::Long(99)));
-        assert!(!bounds.matches(&FlakeValue::Long(100)));
-        assert!(!bounds.matches(&FlakeValue::Long(101)));
+        assert!(natural(&bounds, &FlakeValue::Long(99)));
+        assert!(!natural(&bounds, &FlakeValue::Long(100)));
+        assert!(!natural(&bounds, &FlakeValue::Long(101)));
     }
 
     #[test]
@@ -871,19 +881,19 @@ mod tests {
         let bounds = ObjectBounds::new()
             .with_lower(FlakeValue::Long(10), false)
             .with_upper(FlakeValue::Long(100), false);
-        assert!(!bounds.matches(&FlakeValue::Long(10)));
-        assert!(bounds.matches(&FlakeValue::Long(11)));
-        assert!(bounds.matches(&FlakeValue::Long(50)));
-        assert!(bounds.matches(&FlakeValue::Long(99)));
-        assert!(!bounds.matches(&FlakeValue::Long(100)));
+        assert!(!natural(&bounds, &FlakeValue::Long(10)));
+        assert!(natural(&bounds, &FlakeValue::Long(11)));
+        assert!(natural(&bounds, &FlakeValue::Long(50)));
+        assert!(natural(&bounds, &FlakeValue::Long(99)));
+        assert!(!natural(&bounds, &FlakeValue::Long(100)));
 
         let bounds = ObjectBounds::new()
             .with_lower(FlakeValue::Long(10), true)
             .with_upper(FlakeValue::Long(100), true);
-        assert!(!bounds.matches(&FlakeValue::Long(9)));
-        assert!(bounds.matches(&FlakeValue::Long(10)));
-        assert!(bounds.matches(&FlakeValue::Long(100)));
-        assert!(!bounds.matches(&FlakeValue::Long(101)));
+        assert!(!natural(&bounds, &FlakeValue::Long(9)));
+        assert!(natural(&bounds, &FlakeValue::Long(10)));
+        assert!(natural(&bounds, &FlakeValue::Long(100)));
+        assert!(!natural(&bounds, &FlakeValue::Long(101)));
     }
 
     #[test]
@@ -892,25 +902,25 @@ mod tests {
             .with_lower(FlakeValue::Double(0.0), true)
             .with_upper(FlakeValue::Double(1.0), false);
 
-        assert!(!bounds.matches(&FlakeValue::Double(-0.1)));
-        assert!(bounds.matches(&FlakeValue::Double(0.0)));
-        assert!(bounds.matches(&FlakeValue::Double(0.5)));
-        assert!(bounds.matches(&FlakeValue::Double(0.99)));
-        assert!(!bounds.matches(&FlakeValue::Double(1.0)));
+        assert!(!natural(&bounds, &FlakeValue::Double(-0.1)));
+        assert!(natural(&bounds, &FlakeValue::Double(0.0)));
+        assert!(natural(&bounds, &FlakeValue::Double(0.5)));
+        assert!(natural(&bounds, &FlakeValue::Double(0.99)));
+        assert!(!natural(&bounds, &FlakeValue::Double(1.0)));
     }
 
     #[test]
     fn test_object_bounds_type_mismatch() {
         let bounds = ObjectBounds::new().with_lower(FlakeValue::Long(10), true);
-        assert!(!bounds.matches(&FlakeValue::String("hello".to_string())));
+        assert!(!natural(&bounds, &FlakeValue::String("hello".to_string())));
 
         let bounds = ObjectBounds::new()
             .with_lower(FlakeValue::String("b".to_string()), true)
             .with_upper(FlakeValue::String("d".to_string()), false);
-        assert!(!bounds.matches(&FlakeValue::String("a".to_string())));
-        assert!(bounds.matches(&FlakeValue::String("b".to_string())));
-        assert!(bounds.matches(&FlakeValue::String("c".to_string())));
-        assert!(!bounds.matches(&FlakeValue::String("d".to_string())));
+        assert!(!natural(&bounds, &FlakeValue::String("a".to_string())));
+        assert!(natural(&bounds, &FlakeValue::String("b".to_string())));
+        assert!(natural(&bounds, &FlakeValue::String("c".to_string())));
+        assert!(!natural(&bounds, &FlakeValue::String("d".to_string())));
     }
 
     #[test]
@@ -919,33 +929,181 @@ mod tests {
             .with_lower(FlakeValue::Long(10), true)
             .with_upper(FlakeValue::Long(100), false);
 
-        assert!(bounds.matches(&FlakeValue::Double(15.5)));
-        assert!(!bounds.matches(&FlakeValue::Double(9.9)));
-        assert!(!bounds.matches(&FlakeValue::Double(100.0)));
+        assert!(natural(&bounds, &FlakeValue::Double(15.5)));
+        assert!(!natural(&bounds, &FlakeValue::Double(9.9)));
+        assert!(!natural(&bounds, &FlakeValue::Double(100.0)));
 
         let bounds = ObjectBounds::new().with_lower(FlakeValue::Double(3.5), true);
-        assert!(bounds.matches(&FlakeValue::Long(4)));
-        assert!(!bounds.matches(&FlakeValue::Long(3)));
+        assert!(natural(&bounds, &FlakeValue::Long(4)));
+        assert!(!natural(&bounds, &FlakeValue::Long(3)));
     }
 
     #[test]
     fn test_object_bounds_mixed_numeric_range() {
         let bounds = ObjectBounds::new().with_lower(FlakeValue::Long(3), false);
 
-        assert!(bounds.matches(&FlakeValue::Double(3.5)));
-        assert!(bounds.matches(&FlakeValue::Long(4)));
-        assert!(!bounds.matches(&FlakeValue::Long(3)));
-        assert!(!bounds.matches(&FlakeValue::Double(3.0)));
-        assert!(!bounds.matches(&FlakeValue::Double(2.9)));
+        assert!(natural(&bounds, &FlakeValue::Double(3.5)));
+        assert!(natural(&bounds, &FlakeValue::Long(4)));
+        assert!(!natural(&bounds, &FlakeValue::Long(3)));
+        assert!(!natural(&bounds, &FlakeValue::Double(3.0)));
+        assert!(!natural(&bounds, &FlakeValue::Double(2.9)));
     }
 
     #[test]
     fn test_object_bounds_empty() {
         let bounds = ObjectBounds::new();
         assert!(bounds.is_empty());
-        assert!(bounds.matches(&FlakeValue::Long(0)));
-        assert!(bounds.matches(&FlakeValue::Long(i64::MAX)));
-        assert!(bounds.matches(&FlakeValue::String("anything".to_string())));
+        assert!(natural(&bounds, &FlakeValue::Long(0)));
+        assert!(natural(&bounds, &FlakeValue::Long(i64::MAX)));
+        assert!(natural(
+            &bounds,
+            &FlakeValue::String("anything".to_string())
+        ));
+    }
+
+    /// A string bound is the `xsd:string` term: a language-tagged or
+    /// otherwise-typed string with the same text is a different term, which
+    /// SPARQL's `=` finds unequal and `<` incomparable. Every form a datatype
+    /// `Sid` takes counts, and a binary-index row is judged by its `o_type`.
+    #[test]
+    fn test_object_bounds_string_is_the_xsd_string_term() {
+        use crate::o_type::OType;
+        let a = FlakeValue::String("a".to_string());
+        let eq = ObjectBounds::new()
+            .with_lower(a.clone(), true)
+            .with_upper(a.clone(), true);
+        let below_b = ObjectBounds::new().with_upper(FlakeValue::String("b".to_string()), false);
+        let lang = Sid::new(fluree_vocab::namespaces::RDF, "langString");
+        let custom = Sid::new(fluree_vocab::namespaces::USER_START, "T");
+        let any_uri = Sid::new(fluree_vocab::namespaces::XSD, "anyURI");
+        let full_iri = Sid::new(
+            fluree_vocab::namespaces::EMPTY,
+            "http://www.w3.org/2001/XMLSchema#string",
+        );
+        for bounds in [&eq, &below_b] {
+            assert!(bounds.matches(&a, &Sid::xsd_string()));
+            assert!(bounds.matches(&a, &full_iri));
+            for dt in [&lang, &custom, &any_uri] {
+                assert!(!bounds.matches(&a, dt), "{dt}");
+            }
+            assert!(bounds.matches_encoded(&a, OType::XSD_STRING));
+            for ot in [OType::lang_string(1), OType::XSD_ANY_URI, OType::FULLTEXT] {
+                assert!(!bounds.matches_encoded(&a, ot));
+            }
+        }
+        assert_eq!(eq.string_bound_otypes(), Some(vec![OType::XSD_STRING]));
+        assert_eq!(
+            ObjectBounds::new()
+                .with_lower(FlakeValue::Long(1), true)
+                .string_bound_otypes(),
+            None
+        );
+    }
+
+    /// A string orders against a temporal by parsing it (`<`, `<=`, `>`,
+    /// `>=`), but never equals one (`=`), so the parse applies only with
+    /// `temporal_string_ordering` set. With it, the slices to seek include
+    /// the temporal types every string bound parses as.
+    #[test]
+    fn test_object_bounds_temporal_string_ordering() {
+        use crate::o_type::OType;
+        let day = FlakeValue::String("2026-01-01".to_string());
+        let date = FlakeValue::Date(Box::new(
+            crate::temporal::Date::parse("2026-01-01").unwrap(),
+        ));
+        let date_dt = Sid::new(fluree_vocab::namespaces::XSD, "date");
+        let eq = ObjectBounds::new()
+            .with_lower(day.clone(), true)
+            .with_upper(day.clone(), true);
+        assert!(!eq.matches(&date, &date_dt));
+        assert_eq!(eq.string_bound_otypes(), Some(vec![OType::XSD_STRING]));
+
+        let ordered = ObjectBounds {
+            temporal_string_ordering: true,
+            ..eq.clone()
+        };
+        assert!(ordered.matches(&date, &date_dt));
+        assert!(ordered.matches(&day, &Sid::xsd_string()));
+        assert_eq!(
+            ordered.string_bound_otypes(),
+            Some(vec![OType::XSD_STRING, OType::XSD_DATE])
+        );
+        let words = ObjectBounds {
+            temporal_string_ordering: true,
+            ..ObjectBounds::new().with_upper(FlakeValue::String("b".to_string()), false)
+        };
+        assert_eq!(words.string_bound_otypes(), Some(vec![OType::XSD_STRING]));
+
+        // And the other way round: a temporal bound against a stored string.
+        let after = ObjectBounds::new().with_lower(date, true);
+        assert!(!after.matches(&day, &Sid::xsd_string()));
+        let after = ObjectBounds {
+            temporal_string_ordering: true,
+            ..after
+        };
+        assert!(after.matches(&day, &Sid::xsd_string()));
+    }
+
+    /// Prepared bounds answer exactly as the bounds do: the string bound is
+    /// read as each temporal kind once and reused, including for a second
+    /// object of one kind and for objects of several kinds.
+    #[test]
+    fn test_prepared_bounds_answer_as_the_bounds_do() {
+        use crate::temporal::{Date, DateTime, Time};
+        let s = |v: &str| FlakeValue::String(v.to_string());
+        let dt = |v: &str| FlakeValue::DateTime(Box::new(DateTime::parse(v).unwrap()));
+        let values: Vec<(FlakeValue, Sid)> = vec![
+            (
+                dt("2026-01-01T10:00:00Z"),
+                Sid::new(fluree_vocab::namespaces::XSD, "dateTime"),
+            ),
+            (
+                dt("2026-03-01T10:00:00Z"),
+                Sid::new(fluree_vocab::namespaces::XSD, "dateTime"),
+            ),
+            (
+                FlakeValue::Date(Box::new(Date::parse("2026-01-01").unwrap())),
+                Sid::new(fluree_vocab::namespaces::XSD, "date"),
+            ),
+            (
+                FlakeValue::Time(Box::new(Time::parse("10:00:00").unwrap())),
+                Sid::new(fluree_vocab::namespaces::XSD, "time"),
+            ),
+            (s("2026-01-01T10:00:00Z"), Sid::xsd_string()),
+            (
+                s("2026-01-01"),
+                Sid::new(fluree_vocab::namespaces::RDF, "langString"),
+            ),
+            (FlakeValue::Long(5), Sid::xsd_integer()),
+        ];
+        let ordered = |b: ObjectBounds| ObjectBounds {
+            temporal_string_ordering: true,
+            ..b
+        };
+        for bounds in [
+            ordered(ObjectBounds::new().with_upper(s("2026-02-01T00:00:00Z"), false)),
+            ordered(ObjectBounds::new().with_lower(s("2026-01-01"), true)),
+            ordered(
+                ObjectBounds::new()
+                    .with_lower(s("09:00:00"), false)
+                    .with_upper(s("11:00:00"), true),
+            ),
+            ordered(ObjectBounds::new().with_upper(dt("2026-02-01T00:00:00Z"), false)),
+            ObjectBounds::new()
+                .with_lower(s("2026-01-01T10:00:00Z"), true)
+                .with_upper(s("2026-01-01T10:00:00Z"), true),
+        ] {
+            let prepared = bounds.prepare();
+            for _ in 0..2 {
+                for (value, dt) in &values {
+                    assert_eq!(
+                        prepared.matches(value, dt),
+                        bounds.matches(value, dt),
+                        "{bounds:?} on {value:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// Sorted-vec overlay that records the bounds each walk received and
@@ -1041,7 +1199,7 @@ mod tests {
             yielded: Default::default(),
         };
 
-        let snapshot = crate::LedgerSnapshot::genesis("test/main");
+        let snapshot = crate::LedgerSnapshot::genesis("test:main");
         let out = range_with_overlay(
             &snapshot,
             0,

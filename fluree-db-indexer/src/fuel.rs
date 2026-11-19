@@ -149,6 +149,18 @@ impl ContentStore for MeteredContentStore {
         self.inner.resolve_local_path(id)
     }
 
+    fn resolve_cached_bytes(&self, id: &ContentId) -> Option<std::sync::Arc<[u8]>> {
+        self.inner.resolve_cached_bytes(id)
+    }
+
+    fn permits_plaintext_cache(&self) -> bool {
+        self.inner.permits_plaintext_cache()
+    }
+
+    fn is_remote(&self) -> bool {
+        self.inner.is_remote()
+    }
+
     async fn release(&self, id: &ContentId) -> StorageResult<()> {
         self.inner.release(id).await
     }

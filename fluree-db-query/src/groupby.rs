@@ -25,6 +25,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::Result;
+use crate::group_aggregate::TryCollectVec;
 use crate::object_binding::{equality_norm, normalize_for_key, EqualityNorm};
 use crate::operator::{
     compute_trimmed_vars, effective_schema, trim_batch, BoxedOperator, Operator, OperatorState,
@@ -32,7 +33,7 @@ use crate::operator::{
 use crate::var_registry::VarId;
 use async_trait::async_trait;
 use fluree_db_core::clock::Instant;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::Arc;
 use tracing::Instrument;
 
@@ -52,8 +53,13 @@ pub struct GroupByOperator {
     in_schema: Arc<[VarId]>,
     /// Operator state
     state: OperatorState,
-    /// Accumulated groups: group_key -> list of complete rows
-    groups: HashMap<Vec<Binding>, Vec<Vec<Binding>>>,
+    /// Accumulated groups: group_key -> list of complete rows.
+    ///
+    /// Fx-hashed, so the groups are emitted in an order fixed by the input
+    /// rows: a query with no ORDER BY pages its groups with LIMIT/OFFSET
+    /// without skipping or repeating one. A std `HashMap` seeds each instance
+    /// at random and emitted them in a different order on every execution.
+    groups: FxHashMap<Vec<Binding>, Vec<Vec<Binding>>>,
     /// Iterator for emitting grouped results
     emit_iter: Option<std::vec::IntoIter<GroupEntry>>,
     /// Indices of group key columns in the schema
@@ -95,7 +101,7 @@ impl GroupByOperator {
             child,
             in_schema: schema,
             state: OperatorState::Created,
-            groups: HashMap::new(),
+            groups: FxHashMap::default(),
             emit_iter: None,
             group_key_indices,
             out_schema: None,
@@ -110,14 +116,15 @@ impl GroupByOperator {
     }
 
     /// Extract group key from a row
-    fn extract_group_key(&self, row: &[Binding]) -> Vec<Binding> {
+    fn extract_group_key(&self, row: &[Binding]) -> Result<Vec<Binding>> {
         self.group_key_indices
             .iter()
             .map(|&idx| {
-                let (store, gv) = EqualityNorm::parts(&self.norm);
-                normalize_for_key(&row[idx], store, gv)
+                let (dicts, gv) = EqualityNorm::parts(&self.norm);
+                normalize_for_key(&row[idx], dicts, gv)
             })
-            .collect()
+            .try_collect_vec()
+            .map_err(Into::into)
     }
 
     /// Transform accumulated groups into output rows.
@@ -125,21 +132,25 @@ impl GroupByOperator {
     /// For each group:
     /// - Group key columns keep their single value
     /// - Non-grouped columns become Grouped(Vec<Binding>)
-    fn transform_groups(&self) -> Vec<(Vec<Binding>, Vec<Vec<Binding>>)> {
-        self.groups
-            .iter()
-            .map(|(key, rows)| (key.clone(), rows.clone()))
-            .collect()
+    fn transform_groups(&mut self) -> Vec<(Vec<Binding>, Vec<Vec<Binding>>)> {
+        std::mem::take(&mut self.groups).into_iter().collect()
     }
 
-    /// Build an output row from a group
+    /// Build an output row from a group.
+    ///
+    /// `group_key` is the normalized key, which is the encoded form wherever
+    /// one exists. With `keys_as_bound` a key column carries the binding the
+    /// child gave the group's first row instead: an eager caller is owed
+    /// decoded bindings, and the child's are.
     fn build_output_row(
         schema_len: usize,
         group_key_indices: &[usize],
         group_key: &[Binding],
         group_rows: &[Vec<Binding>],
+        keys_as_bound: bool,
     ) -> Vec<Binding> {
         let mut output = Vec::with_capacity(schema_len);
+        let first_row = group_rows.first().filter(|_| keys_as_bound);
 
         for col_idx in 0..schema_len {
             if group_key_indices.contains(&col_idx) {
@@ -148,7 +159,10 @@ impl GroupByOperator {
                     .iter()
                     .position(|&idx| idx == col_idx)
                     .unwrap();
-                output.push(group_key[key_pos].clone());
+                output.push(match first_row {
+                    Some(row) => row[col_idx].clone(),
+                    None => group_key[key_pos].clone(),
+                });
             } else {
                 // Non-grouped column - collect all values into Grouped
                 let values: Vec<Binding> =
@@ -244,7 +258,7 @@ impl Operator for GroupByOperator {
                             .map(|col| batch.get_by_col(row_idx, col).clone())
                             .collect();
 
-                        let group_key = self.extract_group_key(&row);
+                        let group_key = self.extract_group_key(&row)?;
                         self.groups.entry(group_key).or_default().push(row);
                     }
                     process_rows_ms += (proc_start.elapsed().as_secs_f64() * 1000.0) as u64;
@@ -298,6 +312,7 @@ impl Operator for GroupByOperator {
                             &group_key_indices,
                             &group_key,
                             &group_rows,
+                            ctx.eager_materialization,
                         );
                         for (col, val) in output_row.into_iter().enumerate() {
                             output_columns[col].push(val);
@@ -350,7 +365,7 @@ mod tests {
     }
 
     fn make_test_snapshot() -> LedgerSnapshot {
-        LedgerSnapshot::genesis("test/main")
+        LedgerSnapshot::genesis("test:main")
     }
 
     #[test]
@@ -414,7 +429,7 @@ mod tests {
             Binding::lit(FlakeValue::Long(30), xsd_long()),
         ];
 
-        let key = op.extract_group_key(&row);
+        let key = op.extract_group_key(&row).unwrap();
         assert_eq!(key.len(), 1);
         assert_eq!(
             key[0],

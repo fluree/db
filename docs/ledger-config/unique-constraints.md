@@ -147,7 +147,9 @@ Re-asserting the same `(subject, property, value)` triple that already exists is
 In addition to constraints stored in the ledger, a transaction can
 supply **inline unique-property declarations** via the
 `opts.uniqueProperties` field. The properties are enforced only for
-that one transaction; the list itself never persists.
+that one transaction; the list itself never persists. The field is read
+wherever the transaction is sent: over HTTP, through the embedded API,
+and by the CLI in local mode. It must be an array of IRI strings.
 
 ```json
 {
@@ -162,10 +164,15 @@ that one transaction; the list itself never persists.
 }
 ```
 
-Each entry must be a **full IRI** (not a compact prefix form). IRIs
-that the ledger's namespace map has never seen are dropped silently
-— no instance of the property exists, so the constraint cannot be
-violated either way; this matches the same-ledger contract.
+Each entry must be a **full IRI** (not a compact prefix form). An IRI
+the ledger has never seen fails the transaction with an error naming
+it, rather than leaving a misspelled constraint silently unenforced:
+declare the property first, or correct the IRI.
+
+A SPARQL UPDATE supplies the same list with
+`# PRAGMA unique-properties: ex:email, <http://example.org/ns/ssn>`, where a
+prefixed name expands against the request's own `PREFIX` declarations (see
+[Request options](../query/sparql.md#request-options--pragma)).
 
 Semantics:
 

@@ -1,14 +1,5 @@
 //! Application state management
 //!
-//! # Thread Safety Note
-//!
-//! The HTTP server requires `Send + Sync` for state shared across handlers.
-//! This server currently only supports **file-based storage** for production use.
-//!
-//! Memory storage support would require either:
-//! - A single-threaded runtime with `LocalSet`
-//! - Or refactoring `MemoryNameService` to use `Arc<RwLock<...>>`
-//!
 //! # Storage Access Modes
 //!
 //! Peers can operate in two storage access modes:
@@ -22,7 +13,6 @@ use crate::telemetry::TelemetryConfig;
 use dashmap::DashMap;
 use fluree_db_api::{Fluree, FlureeBuilder, IndexConfig, NameServiceMode};
 use fluree_db_consensus::{CachingCommitter, SubmittingCommitter};
-use fluree_db_core::ledger_id::normalize_ledger_id;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
@@ -87,7 +77,7 @@ pub struct AppState {
     /// This gates optional DynamoDB nameservice checks on long-running query
     /// servers. It stores attempts, not successes, to prevent bursty failures
     /// from stampeding the nameservice.
-    query_refresh_last_checked: DashMap<String, Instant>,
+    query_refresh_last_checked: DashMap<fluree_db_api::LedgerId, Instant>,
 
     /// Serving posture memo, keyed by ledger id with value `(t, posture)`.
     ///
@@ -131,6 +121,8 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
     // Keep logging lightweight and periodic: one line per minute.
     let cache = Arc::clone(fluree.leaflet_cache());
     let budget_mb = fluree.cache_budget_mb();
+    let results = Arc::downgrade(fluree);
+    let result_budget_mb = fluree.result_cache_budget_mb();
     let budget_bytes = (budget_mb as u64).saturating_mul(1024 * 1024);
 
     tokio::spawn(async move {
@@ -139,6 +131,7 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
             interval.tick().await;
             let used = cache.weighted_size_bytes();
             let entries = cache.entry_count();
+            let shards = cache.shard_count();
 
             let used_gib = (used as f64) / (1024.0 * 1024.0 * 1024.0);
             let budget_gib = (budget_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
@@ -150,6 +143,7 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
 
             tracing::info!(
                 cache_entries = entries,
+                cache_shards = shards,
                 cache_weighted_bytes = used,
                 cache_weighted_gib = used_gib,
                 cache_budget_mb = budget_mb,
@@ -157,6 +151,15 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
                 cache_budget_pct = pct,
                 "LeafletCache stats"
             );
+            // Logged once a request has opted in; until then there is no pool.
+            if let Some((entries, bytes)) = results.upgrade().and_then(|f| f.result_cache_usage()) {
+                tracing::info!(
+                    result_cache_entries = entries,
+                    result_cache_weighted_bytes = bytes,
+                    result_cache_budget_mb = result_budget_mb,
+                    "Query result cache stats"
+                );
+            }
         }
     })
 }
@@ -342,7 +345,10 @@ impl AppState {
             return false;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
+        // An id that does not parse names no ledger to refresh.
+        let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) else {
+            return false;
+        };
         let now = Instant::now();
         let ttl = Duration::from_millis(self.config.query_refresh_ttl_ms);
 
@@ -368,9 +374,10 @@ impl AppState {
             return;
         }
 
-        let canonical = normalize_ledger_id(ledger_id).unwrap_or_else(|_| ledger_id.to_string());
-        self.query_refresh_last_checked
-            .insert(canonical, Instant::now());
+        if let Ok(canonical) = fluree_db_api::LedgerId::parse(ledger_id) {
+            self.query_refresh_last_checked
+                .insert(canonical, Instant::now());
+        }
     }
 
     /// Get server uptime in seconds
@@ -405,8 +412,8 @@ impl Drop for AppState {
 //
 // Two paths:
 //
-// - [`build_default_fluree`] — backend-implied nameservice (file /
-//   S3 / proxy). The convenience path for single-node and peer
+// - [`build_default_fluree`] — backend-implied nameservice (memory /
+//   file / S3 / proxy). The convenience path for single-node and peer
 //   deployments.
 // - [`build_fluree_with_nameservice`] — explicit nameservice, for
 //   the Raft startup path where every node's reads must observe
@@ -486,7 +493,7 @@ pub async fn build_fluree_with_nameservice(
     .await
 }
 
-/// Build a direct-storage `Fluree` (file, S3, DynamoDB, etc.) from
+/// Build a direct-storage `Fluree` (memory, file, S3, DynamoDB, etc.) from
 /// config. When `nameservice` is `Some`, it replaces the
 /// backend-implied nameservice. When `event_bus` is `Some`, it
 /// replaces Fluree's default per-instance bus.
@@ -499,7 +506,9 @@ async fn build_direct_fluree(
     catchup_sweeps: CatchupSweeps,
     wal_owner: Option<String>,
 ) -> Result<(Arc<Fluree>, tokio::task::JoinHandle<()>), fluree_db_api::ApiError> {
-    let mut builder = if let Some(ref path) = config.connection_config {
+    let mut builder = if config.memory {
+        FlureeBuilder::memory()
+    } else if let Some(ref path) = config.connection_config {
         // Connection config: build from JSON-LD (supports S3,
         // DynamoDB, split storage, etc.)
         let json_str = std::fs::read_to_string(path).map_err(|e| {
@@ -527,6 +536,21 @@ async fn build_direct_fluree(
         FlureeBuilder::file(&path_str)
     };
 
+    if config.storage_lock && config.owns_storage_root() && wal_owner.is_none() {
+        builder = builder.with_storage_lock();
+    }
+    // A shared-storage peer reads its transaction server's root: the
+    // nameservice, WAL, staging files and indexes are the writer's.
+    let reader = config.is_peer_mode();
+    if reader {
+        builder = builder.read_only();
+    }
+    // Which host identities graph sources may borrow is the operator's call
+    // (FLUREE_GRAPH_SOURCE_HOST_IDENTITIES / _AMBIENT_BUCKETS).
+    #[cfg(feature = "iceberg")]
+    {
+        builder = builder.with_host_identity_policy(fluree_db_api::HostIdentityPolicy::from_env());
+    }
     // Server-level overrides take precedence over connection config defaults.
     if let Some(owner) = wal_owner {
         // Voters share one payload root, so each node journals it under a
@@ -540,10 +564,13 @@ async fn build_direct_fluree(
     if let Some(max_mb) = config.disk_cache_max_mb {
         builder = builder.disk_cache_max_mb(max_mb);
     }
+    if let Some(max_mb) = config.query_result_cache_max_mb {
+        builder = builder.query_result_cache_max_mb(max_mb);
+    }
     if let Some(bus) = event_bus {
         builder = builder.with_event_bus(bus);
     }
-    if config.indexing_enabled {
+    if config.indexing_enabled && !reader {
         let max_bytes = config
             .reindex_max_bytes
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);
@@ -670,7 +697,13 @@ fn build_proxy_fluree(
     let nameservice = ProxyNameService::new(tx_url, token);
 
     let ns_mode = NameServiceMode::ReadOnly(Arc::new(nameservice));
-    let fluree = FlureeBuilder::memory().build_with(storage, ns_mode);
+    let mut builder = FlureeBuilder::memory();
+    if let Some(max_mb) = config.query_result_cache_max_mb {
+        builder = builder.query_result_cache_max_mb(max_mb);
+    }
+    #[cfg(feature = "iceberg")]
+    let builder = builder.with_host_identity_policy(fluree_db_api::HostIdentityPolicy::from_env());
+    let fluree = builder.build_with(storage, ns_mode);
 
     tracing::info!("Initialized peer with proxy storage mode");
     let fluree = Arc::new(fluree);

@@ -255,3 +255,218 @@ async fn trig_named_graph_literals_are_canonical() {
     };
     assert_eq!(stored, r#"{"a":1,"b":2}"#);
 }
+
+/// A `@json`-typed term writes its value as one JSON literal, a string
+/// included, and a `where` pattern under the same context finds it and
+/// reads it back.
+#[tokio::test]
+async fn json_typed_term_values_round_trip_through_where() {
+    let coerced = json!({
+        "ex": "http://example.org/ns/",
+        "doc": {"@id": "ex:doc", "@type": "@json"}
+    });
+    let values = [
+        json!("hello"),
+        json!("5"),
+        json!("{\"a\":1}"),
+        json!(5),
+        json!(true),
+        json!([1, {"b": 2, "a": "x"}]),
+        json!({"k": [1, 2]}),
+    ];
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let graph: Vec<_> = values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| json!({"@id": format!("ex:s{i}"), "doc": v}))
+        .collect();
+    let ledger = fluree
+        .insert(ledger, &json!({"@context": coerced, "@graph": graph}))
+        .await
+        .unwrap()
+        .ledger;
+
+    for (i, value) in values.iter().enumerate() {
+        let q = json!({
+            "@context": coerced,
+            "select": ["?s", "?v"],
+            "where": [{"@id": "?s", "doc": value}, {"@id": "?s", "doc": "?v"}]
+        });
+        let result = support::query_jsonld(&fluree, &ledger, &q).await.unwrap();
+        let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+        assert_eq!(rows, json!([[format!("ex:s{i}"), value]]), "{value}");
+    }
+}
+
+/// A variable under a `@json`-typed term in an update template is a
+/// variable, not the JSON string of its name.
+#[tokio::test]
+async fn json_typed_term_binds_a_template_variable() {
+    let coerced = json!({
+        "ex": "http://example.org/ns/",
+        "doc": {"@id": "ex:doc", "@type": "@json"}
+    });
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree.create_ledger("mydb").await.unwrap();
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({"@context": coerced, "@id": "ex:a", "doc": {"k": 1}}),
+        )
+        .await
+        .unwrap()
+        .ledger;
+    let ledger = fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": coerced,
+                "where": {"@id": "ex:a", "doc": "?v"},
+                "delete": {"@id": "ex:a", "doc": "?v"},
+                "insert": {"@id": "ex:b", "doc": "?v"}
+            }),
+        )
+        .await
+        .unwrap()
+        .ledger;
+
+    let q = json!({
+        "@context": coerced,
+        "select": ["?s", "?v"],
+        "where": {"@id": "?s", "doc": "?v"}
+    });
+    let result = support::query_jsonld(&fluree, &ledger, &q).await.unwrap();
+    let rows = result.to_jsonld(&ledger.snapshot).unwrap();
+    assert_eq!(rows, json!([["ex:b", {"k": 1}]]));
+}
+
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+
+/// The rows of a SPARQL query under the `ex:` and `rdf:` prefixes.
+async fn sparql_rows(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    body: &str,
+) -> serde_json::Value {
+    let q = format!("PREFIX ex: <http://example.org/ns/> PREFIX rdf: <{RDF}> {body}");
+    support::query_sparql_formatted(fluree, ledger, &q)
+        .await
+        .unwrap_or_else(|e| panic!("{body}: {e}"))
+}
+
+/// The `?s` a JSON-LD query's `where` finds, under the `ex:` and `rdf:`
+/// prefixes.
+async fn jsonld_subjects(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+    wheres: &serde_json::Value,
+) -> serde_json::Value {
+    let q = json!({
+        "@context": {"ex": "http://example.org/ns/", "rdf": RDF},
+        "select": "?s",
+        "where": wheres
+    });
+    support::query_jsonld_formatted(fluree, ledger, &q)
+        .await
+        .unwrap_or_else(|e| panic!("{q}: {e}"))
+}
+
+/// A JSON literal a query names is canonicalized before it is compared, as a
+/// write canonicalizes it, so each spelling of the stored value names that
+/// one term: SPARQL's typed literal and `STRDT`, and JSON-LD's `str-dt`,
+/// under `sameTerm` and `=`, as a triple-pattern object and a VALUES row,
+/// and bound by BIND into a join and a `DISTINCT`. On novelty and on the
+/// index. A plain string is not a JSON value.
+#[tokio::test]
+async fn every_spelling_of_a_json_constant_names_the_stored_value() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/json-constant-spellings:main";
+    let ledger = fluree.create_ledger(id).await.unwrap();
+    fluree.insert(ledger, &items(json!([1, 2]))).await.unwrap();
+    let mut failures = Vec::new();
+    for phase in ["novelty", "index"] {
+        if phase == "index" {
+            support::rebuild_and_publish_index(&fluree, id).await;
+        }
+        let ledger = fluree.ledger(id).await.unwrap();
+        let config = json!([["ex:config"]]);
+        for spelling in ["[1,2]", "[1, 2]"] {
+            let typed = format!(r#""{spelling}"^^rdf:JSON"#);
+            let strdt = format!(r#"STRDT("{spelling}", rdf:JSON)"#);
+            for (body, want) in [
+                (
+                    format!("SELECT ?s WHERE {{ ?s ex:items ?v FILTER(sameTerm(?v, {typed})) }}"),
+                    &config,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ ?s ex:items ?v FILTER(?v = {typed}) }}"),
+                    &config,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ ?s ex:items ?v FILTER(sameTerm(?v, {strdt})) }}"),
+                    &config,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ ?s ex:items ?v FILTER(?v = {strdt}) }}"),
+                    &config,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ ?s ex:items {typed} }}"),
+                    &config,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ VALUES ?v {{ {typed} }} ?s ex:items ?v }}"),
+                    &config,
+                ),
+                (
+                    format!("SELECT ?s WHERE {{ BIND({strdt} AS ?v) ?s ex:items ?v }}"),
+                    &config,
+                ),
+                (
+                    format!(
+                        "SELECT (COUNT(DISTINCT ?v) AS ?n) \
+                         WHERE {{ {{ ex:config ex:items ?v }} UNION {{ BIND({strdt} AS ?v) }} }}"
+                    ),
+                    &json!([[1]]),
+                ),
+                (
+                    format!("SELECT (STR({strdt}) AS ?lex) WHERE {{}}"),
+                    &json!([["[1,2]"]]),
+                ),
+            ] {
+                let got = sparql_rows(&fluree, &ledger, &body).await;
+                if &got != want {
+                    failures.push(format!("{phase}: {body}: got {got}, want {want}"));
+                }
+            }
+
+            let str_dt = format!(r#"(str-dt "{spelling}" rdf:JSON)"#);
+            for wheres in [
+                json!([{"@id": "?s", "ex:items": "?v"},
+                       ["filter", format!("(sameTerm ?v {str_dt})")]]),
+                json!([{"@id": "?s", "ex:items": "?v"}, ["filter", format!("(= ?v {str_dt})")]]),
+                json!([["bind", "?v", str_dt], {"@id": "?s", "ex:items": "?v"}]),
+            ] {
+                let got = jsonld_subjects(&fluree, &ledger, &wheres).await;
+                if got != json!(["ex:config"]) {
+                    failures.push(format!("{phase}: JSON-LD {wheres}: got {got}"));
+                }
+            }
+        }
+
+        // A plain string of the same text is a different term, and `=`
+        // against it is a type error.
+        for body in [
+            r#"SELECT ?s WHERE { ?s ex:items ?v FILTER(sameTerm(?v, "[1,2]")) }"#,
+            r#"SELECT ?s WHERE { ?s ex:items ?v FILTER(?v = "[1,2]") }"#,
+        ] {
+            let got = sparql_rows(&fluree, &ledger, body).await;
+            if got != json!([]) {
+                failures.push(format!("{phase}: {body}: got {got}, want []"));
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}

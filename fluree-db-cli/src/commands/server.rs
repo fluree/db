@@ -33,6 +33,9 @@ struct ServerMeta {
     started_at: String,
     /// The raw args passed to the `_child` process (for `restart`).
     args: Vec<String>,
+    /// The storage root the server locks, if it locks one.
+    #[serde(default)]
+    locked_root: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,6 +64,7 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             listen_addr,
             storage_path,
             connection_config,
+            memory,
             log_level,
             bolt_listen_addr,
             bolt_default_db,
@@ -72,6 +76,7 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 listen_addr,
                 storage_path,
                 connection_config,
+                memory,
                 log_level,
                 bolt_listen_addr,
                 bolt_default_db,
@@ -85,6 +90,7 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             listen_addr,
             storage_path,
             connection_config,
+            memory,
             log_level,
             bolt_listen_addr,
             bolt_default_db,
@@ -97,6 +103,7 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
                 listen_addr,
                 storage_path,
                 connection_config,
+                memory,
                 log_level,
                 bolt_listen_addr,
                 bolt_default_db,
@@ -114,12 +121,16 @@ pub async fn run(action: ServerAction, config_override: Option<&Path>) -> CliRes
             listen_addr,
             storage_path,
             connection_config,
+            memory,
             log_level,
             bolt_listen_addr,
             bolt_default_db,
             profile,
             extra_args,
         } => {
+            if memory {
+                return Err(memory_needs_foreground());
+            }
             run_restart(
                 config_override,
                 listen_addr,
@@ -150,26 +161,35 @@ async fn run_foreground(
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
+    memory: bool,
     log_level: Option<String>,
     bolt_listen_addr: Option<SocketAddr>,
     bolt_default_db: Option<String>,
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
-    let dirs = config::require_fluree_dir(config_override)?;
-    let data_dir = dirs.data_dir();
-
-    let server_config = build_server_config(
+    let mut server_config = build_server_config(
         config_override,
         listen_addr,
-        storage_path.clone(),
+        storage_path,
         connection_config,
+        memory,
         log_level,
         bolt_listen_addr,
         bolt_default_db,
         profile,
         extra_args,
     )?;
+    server_config.storage_lock = true;
+
+    // A memory server keeps nothing in a project, so it needs no `.fluree/`
+    // and writes no server.meta.json (so no CLI auto-routing either).
+    let meta_file = if server_config.memory {
+        None
+    } else {
+        let dirs = config::require_fluree_dir(config_override)?;
+        Some(meta_path(dirs.data_dir()))
+    };
 
     let telemetry_config = TelemetryConfig::with_server_config(&server_config);
     init_logging(&telemetry_config);
@@ -181,9 +201,34 @@ async fn run_foreground(
         "Starting Fluree server (foreground)"
     );
 
+    let meta = meta_file
+        .as_ref()
+        .map(|_| foreground_meta(&server_config, config_override));
+    // Init takes the storage lock. A server refused it must not touch the
+    // server.meta.json of the one that holds it.
+    let server = FlureeServer::new(server_config)
+        .await
+        .map_err(|e| CliError::Server(format!("failed to initialize server: {e}")))?;
+
     // Write server.meta.json so CLI auto-routing works for foreground servers too.
-    let meta_file = meta_path(data_dir);
-    let meta = ServerMeta {
+    if let (Some(meta_file), Some(meta)) = (&meta_file, &meta) {
+        write_meta(meta_file, meta);
+    }
+    let result = server.run().await;
+
+    // Clean up meta file on exit (normal shutdown or error).
+    if let Some(meta_file) = &meta_file {
+        remove_meta(meta_file, "on shutdown");
+    }
+
+    result.map_err(|e| CliError::Server(format!("server error: {e}")))?;
+
+    shutdown_tracer().await;
+    Ok(())
+}
+
+fn foreground_meta(server_config: &ServerConfig, config_override: Option<&Path>) -> ServerMeta {
+    ServerMeta {
         pid: std::process::id(),
         listen_addr: server_config.listen_addr.to_string(),
         storage_path: server_config
@@ -199,28 +244,20 @@ async fn run_foreground(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: Vec::new(),
-    };
-    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(&meta_file, json);
+        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
     }
+}
 
-    let server = FlureeServer::new(server_config).await.map_err(|e| {
-        if let Err(rm_err) = fs::remove_file(&meta_file) {
-            tracing::warn!(path = %meta_file.display(), error = %rm_err, "failed to remove meta file after server init failure");
-        }
-        CliError::Server(format!("failed to initialize server: {e}"))
-    })?;
-    let result = server.run().await;
-
-    // Clean up meta file on exit (normal shutdown or error).
-    if let Err(rm_err) = fs::remove_file(&meta_file) {
-        tracing::warn!(path = %meta_file.display(), error = %rm_err, "failed to remove meta file on shutdown");
+fn write_meta(meta_file: &Path, meta: &ServerMeta) {
+    if let Ok(json) = serde_json::to_string_pretty(meta) {
+        let _ = fs::write(meta_file, json);
     }
+}
 
-    result.map_err(|e| CliError::Server(format!("server error: {e}")))?;
-
-    shutdown_tracer().await;
-    Ok(())
+fn remove_meta(meta_file: &Path, when: &str) {
+    if let Err(rm_err) = fs::remove_file(meta_file) {
+        tracing::warn!(path = %meta_file.display(), error = %rm_err, "failed to remove meta file {when}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +270,7 @@ async fn run_start(
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
+    memory: bool,
     log_level: Option<String>,
     bolt_listen_addr: Option<SocketAddr>,
     bolt_default_db: Option<String>,
@@ -240,18 +278,23 @@ async fn run_start(
     dry_run: bool,
     extra_args: &[String],
 ) -> CliResult<()> {
-    let dirs = config::require_fluree_dir(config_override)?;
     let server_config = build_server_config(
         config_override,
         listen_addr,
         storage_path.clone(),
         connection_config,
+        memory,
         log_level.clone(),
         bolt_listen_addr,
         bolt_default_db,
         profile.clone(),
         extra_args,
     )?;
+    // Checked after resolving, so `FLUREE_MEMORY_STORAGE` and `-- --memory` are caught too.
+    if server_config.memory {
+        return Err(memory_needs_foreground());
+    }
+    let dirs = config::require_fluree_dir(config_override)?;
 
     if dry_run {
         print_resolved_config(&server_config, &dirs);
@@ -261,17 +304,13 @@ async fn run_start(
     // Check for existing server
     let data_dir = dirs.data_dir();
     let pid_file = pid_path(data_dir);
+    if let Some(running) = already_running(&server_config, recorded_server(data_dir).as_ref()) {
+        return Err(CliError::Server(running));
+    }
     if pid_file.exists() {
-        if let Some(pid) = read_pid(&pid_file) {
-            if is_process_alive(pid) {
-                return Err(CliError::Server(format!(
-                    "server already running (pid {pid}). Use 'fluree server stop' first."
-                )));
-            }
-            // Stale PID file — clean up
-            let _ = fs::remove_file(&pid_file);
-            let _ = fs::remove_file(meta_path(data_dir));
-        }
+        // Stale PID file — clean up
+        let _ = fs::remove_file(&pid_file);
+        let _ = fs::remove_file(meta_path(data_dir));
     }
 
     // Build child args: resolved server flags for the _child subcommand
@@ -339,6 +378,7 @@ async fn run_start(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args,
+        locked_root: server_config.owned_storage_path().map(Path::to_path_buf),
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| CliError::Server(format!("failed to serialize metadata: {e}")))?;
@@ -366,6 +406,73 @@ async fn run_start(
     }
 
     Ok(())
+}
+
+/// The server `start` last recorded in this project.
+struct Recorded {
+    pid: u32,
+    /// The storage root it locks, from its metadata.
+    locked_root: Option<PathBuf>,
+}
+
+fn recorded_server(data_dir: &Path) -> Option<Recorded> {
+    let pid = read_pid(&pid_path(data_dir))?;
+    let locked_root = fs::read_to_string(meta_path(data_dir))
+        .ok()
+        .and_then(|s| serde_json::from_str::<ServerMeta>(&s).ok())
+        .filter(|meta| meta.pid == pid)
+        .and_then(|meta| meta.locked_root);
+    Some(Recorded { pid, locked_root })
+}
+
+/// Why `start` must not launch a server, if it must not.
+///
+/// A server that will lock its file storage is answered by that lock, which
+/// a crash cannot leave behind and which also catches a foreground server or
+/// another program using the storage. When the root is free, a recorded
+/// server that locked it is gone, and a live pid of its was reused. Any
+/// other recorded server (a shared-storage peer, a Raft node, a connection
+/// config) is answered by its pid.
+fn already_running(server_config: &ServerConfig, recorded: Option<&Recorded>) -> Option<String> {
+    let running =
+        |pid| format!("server already running (pid {pid}). Use 'fluree server stop' first.");
+    let Some(root) = server_config.owned_storage_path() else {
+        return recorded
+            .filter(|r| is_process_alive(r.pid))
+            .map(|r| running(r.pid));
+    };
+    match fluree_db_core::RootLock::acquire(root) {
+        Ok(_probe) => recorded
+            .filter(|r| r.locked_root.as_deref() != Some(root) && is_process_alive(r.pid))
+            .map(|r| running(r.pid)),
+        Err(fluree_db_core::RootLockError::Unsupported(error)) => Some(format!(
+            "storage {} is on a filesystem that cannot lock it ({error}); set {}=true to \
+             start a server on it without protection from a second process",
+            root.display(),
+            fluree_db_core::ALLOW_UNLOCKED_ENV_VAR,
+        )),
+        Err(error @ fluree_db_core::RootLockError::Io(_)) => {
+            Some(format!("storage {}: {error}", root.display()))
+        }
+        Err(fluree_db_core::RootLockError::Held { holder }) => match holder {
+            Some(pid) if Some(pid) == recorded.map(|r| r.pid) => Some(running(pid)),
+            _ => Some(format!(
+                "storage {} is in use by another Fluree process{}; stop it before starting a server on it",
+                root.display(),
+                holder.map(|pid| format!(" (pid {pid})")).unwrap_or_default(),
+            )),
+        },
+    }
+}
+
+/// A background server keeps its pid, log and metadata in `.fluree/`, which
+/// memory mode promises not to need.
+fn memory_needs_foreground() -> CliError {
+    CliError::Server(
+        "memory storage (--memory / FLUREE_MEMORY_STORAGE) is only available in the foreground; \
+         use 'fluree server run --memory'"
+            .into(),
+    )
 }
 
 /// Start the server using pre-built child args (used by `restart` to replay
@@ -452,6 +559,8 @@ async fn run_start_with_child_args(
         config_path: config_override.map(|p| p.display().to_string()),
         started_at: now_iso8601(),
         args: child_args.to_vec(),
+        // Replayed args are not resolved here, so a later `start` trusts the pid.
+        locked_root: None,
     };
     let meta_json = serde_json::to_string_pretty(&meta)
         .map_err(|e| CliError::Server(format!("failed to serialize metadata: {e}")))?;
@@ -641,6 +750,26 @@ async fn run_restart(
     profile: Option<String>,
     extra_args: &[String],
 ) -> CliResult<()> {
+    // Resolved and refused before anything stops, as `start` does, so
+    // `FLUREE_MEMORY_STORAGE` and `-- --memory` are caught too. Checked on
+    // this command's own arguments: the replayed ones always name a storage
+    // path, which would quietly outrank the environment.
+    let resolved = build_server_config(
+        config_override,
+        listen_addr,
+        storage_path.clone(),
+        connection_config.clone(),
+        false,
+        log_level.clone(),
+        bolt_listen_addr,
+        bolt_default_db.clone(),
+        profile.clone(),
+        extra_args,
+    )?;
+    if resolved.memory {
+        return Err(memory_needs_foreground());
+    }
+
     let dirs = config::require_fluree_dir(config_override)?;
     let data_dir = dirs.data_dir();
 
@@ -679,6 +808,7 @@ async fn run_restart(
         listen_addr,
         storage_path,
         connection_config,
+        false,
         log_level,
         bolt_listen_addr,
         bolt_default_db,
@@ -744,6 +874,7 @@ async fn run_child(args: &[String]) -> CliResult<()> {
 
     let mut server_config = ServerConfig::from_arg_matches(&matches)
         .map_err(|e| CliError::Server(format!("failed to build server config: {e}")))?;
+    server_config.storage_lock = true;
 
     // Merge config file values (the child inherits --config-file if present)
     if let Err(e) = load_and_merge_config(&mut server_config, &matches) {
@@ -784,6 +915,7 @@ fn build_server_config(
     listen_addr: Option<SocketAddr>,
     storage_path: Option<PathBuf>,
     connection_config: Option<PathBuf>,
+    memory: bool,
     log_level: Option<String>,
     bolt_listen_addr: Option<SocketAddr>,
     bolt_default_db: Option<String>,
@@ -801,19 +933,18 @@ fn build_server_config(
         args.push(addr.to_string());
     }
 
-    if let Some(ref path) = connection_config {
-        // Connection config takes precedence — don't set a default storage path
+    // Connection config takes precedence over a storage path. With neither
+    // flag, the storage path is left to the server's own precedence
+    // (`FLUREE_STORAGE_PATH`, then the profile and config file) and only
+    // defaulted after that, below.
+    if memory {
+        args.push("--memory".into());
+    } else if let Some(ref path) = connection_config {
         args.push("--connection-config".into());
         args.push(path.display().to_string());
     } else if let Some(ref path) = storage_path {
         args.push("--storage-path".into());
         args.push(path.display().to_string());
-    } else {
-        // Default: use the CLI's resolved storage path
-        let dirs = config::require_fluree_dir(config_override)?;
-        let resolved = config::resolve_storage_path(&dirs);
-        args.push("--storage-path".into());
-        args.push(resolved.display().to_string());
     }
 
     if let Some(ref level) = log_level {
@@ -869,6 +1000,15 @@ fn build_server_config(
             return Err(CliError::Server(format!("config file error: {e}")));
         }
         eprintln!("{} config file: {e}", "warning:".yellow().bold());
+    }
+
+    // Nothing named a storage location: use the project's `.fluree/storage`.
+    if !server_config.memory
+        && server_config.storage_path.is_none()
+        && server_config.connection_config.is_none()
+    {
+        let dirs = config::require_fluree_dir(config_override)?;
+        server_config.storage_path = Some(config::default_storage_path(&dirs));
     }
 
     Ok(server_config)
@@ -1153,6 +1293,13 @@ fn print_resolved_config(config: &ServerConfig, dirs: &FlureeDir) {
             .map(|v| v.to_string())
             .unwrap_or_else(|| "(default: tiered by RAM: <4GB 30%, 4-8GB 40%, >=8GB 35%)".into())
     );
+    eprintln!(
+        "  query_result_cache_max_mb: {}",
+        config
+            .query_result_cache_max_mb
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "(default: 10% of cache_max_mb, in addition to it)".into())
+    );
     eprintln!("  server_role:  {:?}", config.server_role);
     eprintln!("  pid_file:     {}", pid_path(dirs.data_dir()).display());
     eprintln!("  log_file:     {}", log_path(dirs.data_dir()).display());
@@ -1408,4 +1555,228 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> i64 {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
     era * 146_097 + doe as i64 - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, PoisonError};
+
+    /// Tests here set the server's env vars; hold this while they do.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    const ENV_VARS: [&str; 2] = ["FLUREE_STORAGE_PATH", "FLUREE_MEMORY_STORAGE"];
+
+    fn project(config: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("config.toml"), config).unwrap();
+        dir
+    }
+
+    fn resolve(
+        dir: &tempfile::TempDir,
+        flag: Option<&str>,
+        memory: bool,
+        profile: Option<&str>,
+        env: &[(&str, &str)],
+    ) -> ServerConfig {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        // SAFETY: holding ENV_LOCK, no concurrent mutation of these variables.
+        for var in ENV_VARS {
+            std::env::remove_var(var);
+        }
+        for (var, value) in env {
+            std::env::set_var(var, value);
+        }
+        let config = build_server_config(
+            Some(dir.path()),
+            None,
+            flag.map(PathBuf::from),
+            None,
+            memory,
+            None,
+            None,
+            None,
+            profile.map(String::from),
+            &[],
+        );
+        for var in ENV_VARS {
+            std::env::remove_var(var);
+        }
+        config.unwrap()
+    }
+
+    fn storage_path(
+        dir: &tempfile::TempDir,
+        flag: Option<&str>,
+        profile: Option<&str>,
+        env: Option<&str>,
+    ) -> Option<PathBuf> {
+        let env: Vec<_> = env
+            .map(|v| ("FLUREE_STORAGE_PATH", v))
+            .into_iter()
+            .collect();
+        resolve(dir, flag, false, profile, &env).storage_path
+    }
+
+    /// Flag, then `FLUREE_STORAGE_PATH`, then profile, then config file,
+    /// then the project default, as `docs/operations/configuration.md` says.
+    #[test]
+    fn storage_path_precedence() {
+        let dir = project(
+            "[server]\nstorage_path = \"/from/file\"\n\n\
+             [profiles.prod.server]\nstorage_path = \"/from/profile\"\n",
+        );
+        let path = |flag, profile, env| storage_path(&dir, flag, profile, env);
+        let p = |s: &str| Some(PathBuf::from(s));
+
+        assert_eq!(
+            path(Some("/from/flag"), Some("prod"), Some("/from/env")),
+            p("/from/flag")
+        );
+        assert_eq!(path(None, Some("prod"), Some("/from/env")), p("/from/env"));
+        assert_eq!(path(None, Some("prod"), None), p("/from/profile"));
+        assert_eq!(path(None, None, None), p("/from/file"));
+
+        let bare = project("");
+        assert_eq!(
+            storage_path(&bare, None, None, None),
+            Some(bare.path().join("storage"))
+        );
+    }
+
+    /// `--memory` beats a storage path from `FLUREE_STORAGE_PATH`, a profile
+    /// or the config file, and the project default is not filled in.
+    #[test]
+    fn memory_flag_beats_every_other_storage_path() {
+        let dir = project(
+            "[server]\nstorage_path = \"/from/file\"\n\n\
+             [profiles.prod.server]\nstorage_path = \"/from/profile\"\n",
+        );
+        let bare = project("");
+        for (dir, profile, env) in [
+            (&dir, Some("prod"), Some("/from/env")),
+            (&dir, Some("prod"), None),
+            (&dir, None, None),
+            (&bare, None, None),
+        ] {
+            let env: Vec<_> = env
+                .map(|v| ("FLUREE_STORAGE_PATH", v))
+                .into_iter()
+                .collect();
+            let config = resolve(dir, None, true, profile, &env);
+            assert!(config.memory, "profile={profile:?} env={env:?}");
+            assert_eq!(config.storage_path, None, "profile={profile:?} env={env:?}");
+            assert_eq!(config.storage_type_str(), "memory");
+        }
+    }
+
+    /// `FLUREE_MEMORY_STORAGE` ranks as an environment setting: a `--storage-path`
+    /// flag beats it, and it beats a path from the config file.
+    #[test]
+    fn memory_env_yields_to_a_storage_path_flag() {
+        let dir = project("[server]\nstorage_path = \"/from/file\"\n");
+        let env = [("FLUREE_MEMORY_STORAGE", "true")];
+
+        let flagged = resolve(&dir, Some("/from/flag"), false, None, &env);
+        assert!(!flagged.memory);
+        assert_eq!(flagged.storage_path, Some(PathBuf::from("/from/flag")));
+
+        let unflagged = resolve(&dir, None, false, None, &env);
+        assert!(unflagged.memory);
+        assert_eq!(unflagged.storage_path, None);
+    }
+
+    fn file_backed(root: &Path) -> ServerConfig {
+        ServerConfig {
+            storage_path: Some(root.to_path_buf()),
+            ..Default::default()
+        }
+    }
+
+    /// A live pid: this process's.
+    fn recorded(locked_root: Option<&Path>) -> Recorded {
+        Recorded {
+            pid: std::process::id(),
+            locked_root: locked_root.map(Path::to_path_buf),
+        }
+    }
+
+    #[test]
+    fn start_refuses_a_held_storage_root_and_names_its_server() {
+        let dir = tempfile::tempdir().unwrap();
+        let _held = fluree_db_core::RootLock::acquire(dir.path()).unwrap();
+
+        let elsewhere = already_running(&file_backed(dir.path()), None).unwrap();
+        assert!(
+            elsewhere.contains("in use by another Fluree process"),
+            "{elsewhere}"
+        );
+
+        let ours = recorded(Some(dir.path()));
+        let server = already_running(&file_backed(dir.path()), Some(&ours)).unwrap();
+        assert!(server.contains("server already running"), "{server}");
+    }
+
+    #[test]
+    fn start_lets_a_peer_share_a_held_storage_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let _transactor = fluree_db_core::RootLock::acquire(dir.path()).unwrap();
+        let peer = ServerConfig {
+            server_role: fluree_db_server::config::ServerRole::Peer,
+            ..file_backed(dir.path())
+        };
+
+        assert_eq!(already_running(&peer, None), None);
+    }
+
+    #[test]
+    fn start_ignores_a_live_pid_recorded_for_the_free_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let reused = recorded(Some(dir.path()));
+
+        assert_eq!(
+            already_running(&file_backed(dir.path()), Some(&reused)),
+            None
+        );
+    }
+
+    /// A connection-config server, or one on other storage, leaves this
+    /// root free while it runs.
+    #[test]
+    fn start_refuses_while_a_recorded_server_that_does_not_lock_the_root_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+
+        for running in [recorded(None), recorded(Some(other.path()))] {
+            let refused = already_running(&file_backed(dir.path()), Some(&running)).unwrap();
+            assert!(refused.contains("server already running"), "{refused}");
+        }
+    }
+
+    #[test]
+    fn the_recorded_root_comes_from_the_recorded_servers_metadata() {
+        let data = tempfile::tempdir().unwrap();
+        let root = PathBuf::from("/srv/fluree");
+        let meta = |pid| ServerMeta {
+            pid,
+            listen_addr: String::new(),
+            storage_path: String::new(),
+            connection_config: None,
+            bolt_listen_addr: None,
+            config_path: None,
+            started_at: String::new(),
+            args: Vec::new(),
+            locked_root: Some(root.clone()),
+        };
+        fs::write(pid_path(data.path()), "41").unwrap();
+
+        write_meta(&meta_path(data.path()), &meta(41));
+        let same = recorded_server(data.path()).unwrap();
+        assert_eq!((same.pid, same.locked_root), (41, Some(root.clone())));
+
+        write_meta(&meta_path(data.path()), &meta(42));
+        let other = recorded_server(data.path()).unwrap();
+        assert_eq!((other.pid, other.locked_root), (41, None));
+    }
 }

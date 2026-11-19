@@ -92,18 +92,11 @@ async fn bm25_create_local(state: Arc<AppState>, request: Request) -> Result<imp
         );
 
         let config = build_bm25_config(req);
-        let source_ledger = config.ledger.clone();
         let result = state
             .fluree
             .create_full_text_index(config)
             .await
-            .map_err(|e| {
-                if e.is_not_found() {
-                    ServerError::not_found(format!("Ledger not found: {source_ledger}"))
-                } else {
-                    ServerError::Api(e)
-                }
-            })?;
+            .map_err(ServerError::Api)?;
 
         let response = Bm25CreateResponse {
             graph_source_id: result.graph_source_id,

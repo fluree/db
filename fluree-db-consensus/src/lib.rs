@@ -194,14 +194,60 @@ pub enum TransactionBody {
         /// object map, matching `fluree_db_cypher::ParamMap`.
         params: Option<serde_json::Map<String, JsonValue>>,
     },
-    /// JSON-LD document staged as a graph sync: `graph_iri`'s contents
+    /// JSON-LD document staged as a graph sync: the graph's contents
     /// become exactly the document, committing only the delta (whole-graph
-    /// retraction wave + accumulator cancellation).
+    /// retraction wave + accumulator cancellation). `graph_iri: None` is the
+    /// default graph; entries written before it could be `None` hold a
+    /// plain string, which decodes as `Some`.
     ///
     /// Appended last: the queue envelope and its [`BodyKind`] discriminator
     /// are postcard-encoded in persisted Raft state, where variant ordinals
     /// are positional — never insert a variant mid-enum.
-    JsonLdGraphSync { graph_iri: String, body: JsonValue },
+    JsonLdGraphSync {
+        graph_iri: Option<String>,
+        body: JsonValue,
+    },
+    /// Turtle, N-Triples or TriG text staged as a graph sync (see
+    /// `fluree_db_api::GraphPayload::Rdf`). `allow_empty` travels with the
+    /// text because an RDF body's emptiness is only known once staging
+    /// parses it.
+    ///
+    /// Appended last, for the same postcard-ordinal reason as
+    /// `JsonLdGraphSync`.
+    RdfGraphSync {
+        graph_iri: Option<String>,
+        text: String,
+        allow_empty: bool,
+    },
+    /// A graph insert: the payload's triples are added to the graph
+    /// (`graph_iri: None` is the default graph). Appended last, as above.
+    GraphInsert {
+        graph_iri: Option<String>,
+        payload: GraphBody,
+    },
+}
+
+/// The triples of a [`TransactionBody::GraphInsert`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum GraphBody {
+    /// Insert-shaped JSON-LD.
+    JsonLd(JsonValue),
+    /// Turtle, N-Triples or TriG text.
+    Rdf(String),
+}
+
+/// The target graph of a graph-scoped body: `None` is the default graph.
+pub fn graph_sel(graph_iri: &Option<String>) -> fluree_db_api::GraphSel {
+    match graph_iri {
+        Some(iri) => fluree_db_api::GraphSel::Graph(iri.clone()),
+        None => fluree_db_api::GraphSel::Default,
+    }
+}
+
+/// A graph target's bytes for [`TransactionBody::body_hash`]. `@default`
+/// cannot collide with a named graph, whose IRI is absolute.
+fn graph_key(graph_iri: &Option<String>) -> &str {
+    graph_iri.as_deref().unwrap_or("@default")
 }
 
 impl TransactionBody {
@@ -213,7 +259,8 @@ impl TransactionBody {
             Self::JsonLdInsert(_) | Self::TurtleInsert(_) => "insert",
             Self::JsonLdUpsert(_) | Self::TurtleUpsert(_) | Self::TrigUpsert(_) => "upsert",
             Self::JsonLdUpdate(_) => "update",
-            Self::JsonLdGraphSync { .. } => "graph-sync",
+            Self::JsonLdGraphSync { .. } | Self::RdfGraphSync { .. } => "graph-sync",
+            Self::GraphInsert { .. } => "graph-insert",
             Self::Sparql(_) => "sparql-update",
             Self::Cypher { .. } => "cypher",
         }
@@ -248,9 +295,34 @@ impl TransactionBody {
             }
             Self::JsonLdGraphSync { graph_iri, body } => {
                 hasher.update(b"jsonld-graph-sync");
-                hasher.update(graph_iri.as_bytes());
+                hasher.update(graph_key(graph_iri).as_bytes());
                 hasher.update([0u8]);
                 hasher.update(body.to_string().as_bytes());
+            }
+            Self::RdfGraphSync {
+                graph_iri,
+                text,
+                allow_empty,
+            } => {
+                hasher.update(b"rdf-graph-sync");
+                hasher.update(graph_key(graph_iri).as_bytes());
+                hasher.update([0u8, u8::from(*allow_empty)]);
+                hasher.update(text.as_bytes());
+            }
+            Self::GraphInsert { graph_iri, payload } => {
+                hasher.update(b"graph-insert");
+                hasher.update(graph_key(graph_iri).as_bytes());
+                hasher.update([0u8]);
+                match payload {
+                    GraphBody::JsonLd(json) => {
+                        hasher.update(b"jsonld");
+                        hasher.update(json.to_string().as_bytes());
+                    }
+                    GraphBody::Rdf(text) => {
+                        hasher.update(b"rdf");
+                        hasher.update(text.as_bytes());
+                    }
+                }
             }
             Self::TurtleInsert(text) => {
                 hasher.update(b"turtle-insert");
@@ -288,7 +360,7 @@ impl TransactionBody {
 /// surface it on [`SubmissionState::Committed`] so clients can tell
 /// what kind of submission they're confirming.
 ///
-/// The eight transact variants mirror [`TransactionBody`]'s
+/// The transact variants mirror [`TransactionBody`]'s
 /// discriminators (and convert via [`From<&TransactionBody>`]).
 /// The remaining four match the non-transact `Committer` methods.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -325,6 +397,10 @@ pub enum BodyKind {
     /// inserting mid-enum would make existing snapshots and mixed-version
     /// nodes decode every later variant as the wrong operation.
     JsonLdGraphSync,
+    /// RDF-text graph sync. Appended last (see `JsonLdGraphSync`).
+    RdfGraphSync,
+    /// Graph insert. Appended last (see `JsonLdGraphSync`).
+    GraphInsert,
 }
 
 impl From<&TransactionBody> for BodyKind {
@@ -334,6 +410,8 @@ impl From<&TransactionBody> for BodyKind {
             TransactionBody::JsonLdUpsert(_) => BodyKind::JsonLdUpsert,
             TransactionBody::JsonLdUpdate(_) => BodyKind::JsonLdUpdate,
             TransactionBody::JsonLdGraphSync { .. } => BodyKind::JsonLdGraphSync,
+            TransactionBody::RdfGraphSync { .. } => BodyKind::RdfGraphSync,
+            TransactionBody::GraphInsert { .. } => BodyKind::GraphInsert,
             TransactionBody::TurtleInsert(_) => BodyKind::TurtleInsert,
             TransactionBody::TurtleUpsert(_) => BodyKind::TurtleUpsert,
             TransactionBody::TrigUpsert(_) => BodyKind::TrigUpsert,
@@ -370,6 +448,10 @@ pub enum QueuedRequest {
     /// worker decodes via `Fluree::prepare_push`, advances the head
     /// to the chain's final commit.
     Push(Box<QueuedPush>),
+    /// `push` carrying the commits its merges brought in. Handled like
+    /// [`Self::Push`], and separate so that a worker that cannot store
+    /// those commits refuses the entry.
+    PushWithMerges(Box<QueuedPushWithMerges>),
     /// `revert` — selection + conflict strategy. The worker
     /// re-runs `Fluree::prepare_revert` and advances the head to
     /// the resulting inverse commit (or NoOp short-circuits when
@@ -385,6 +467,21 @@ pub enum QueuedRequest {
 }
 
 impl QueuedRequest {
+    /// The envelope for a push.
+    ///
+    /// A push that brought in no merged commits keeps [`Self::Push`]. A
+    /// worker predating [`Self::PushWithMerges`] still applies that one.
+    pub fn for_push(push: QueuedPush, merged_commit_cids: Vec<CommitId>) -> Self {
+        if merged_commit_cids.is_empty() {
+            Self::Push(Box::new(push))
+        } else {
+            Self::PushWithMerges(Box::new(QueuedPushWithMerges {
+                push,
+                merged_commit_cids,
+            }))
+        }
+    }
+
     /// Encode the envelope for content-addressed storage. The leader
     /// writes these bytes to CAS; the resulting `ContentId` becomes
     /// the `request_cid` in `QueueSubmission`.
@@ -405,12 +502,34 @@ impl QueuedRequest {
         Ok(serde_json::from_slice(bytes)?)
     }
 
+    /// Tie the envelope to one submission, so that its address is that
+    /// submission's alone. See [`QueuedTransact::submission`].
+    pub fn stamp_submission(&mut self, submission: String) {
+        *self.submission_slot() = Some(submission);
+    }
+
+    /// Where each variant keeps its submission stamp. The one place that
+    /// knows, so that stamping and [`Self::canonical_body_bytes`] cannot
+    /// disagree about it: a new variant has to choose its slot here to
+    /// compile.
+    fn submission_slot(&mut self) -> &mut Option<String> {
+        match self {
+            Self::Transact(t) => &mut t.submission,
+            Self::Push(p) => &mut p.submission,
+            Self::PushWithMerges(p) => &mut p.push.submission,
+            Self::Revert(r) => &mut r.submission,
+            Self::Merge(m) => &mut m.submission,
+            Self::Rebase(r) => &mut r.submission,
+        }
+    }
+
     /// Canonical bytes used to derive the idempotency body CID. Skips
     /// per-request transient context (commit-opts timestamp, tracking
-    /// flags, governance metadata) so a retry of the same logical
-    /// request produces the same body CID even when the client recomputes
-    /// those fields between attempts. The full envelope still carries
-    /// them — only the idempotency comparison is normalized.
+    /// flags, governance metadata) and the submission stamp, so a retry
+    /// of the same logical request produces the same body CID even when
+    /// the client recomputes those fields between attempts. The full
+    /// envelope still carries them — only the idempotency comparison is
+    /// normalized.
     ///
     /// The bytes are order-canonical: the payload is projected through
     /// [`CanonicalValue`](crate::raft::state_machine::CanonicalValue),
@@ -422,21 +541,30 @@ impl QueuedRequest {
     /// silently defeating idempotency dedup.
     #[cfg(feature = "raft")]
     pub fn canonical_body_bytes(&self) -> Result<Vec<u8>, QueuedRequestCodecError> {
-        match self {
-            // Transact: the transaction body is the only semantically
-            // identifying field. txn_opts / commit_opts / tracking /
-            // governance can drift between retries (timestamps, request
-            // IDs, observability toggles) without changing what the
-            // commit means.
-            QueuedRequest::Transact(t) => canonical_json_bytes(&t.body),
-            // Push / Revert / Merge / Rebase envelopes carry only stable
-            // fields (content-addressed commit ids, selection / strategy
-            // descriptors, branch names), so hashing the full envelope is
-            // equivalent to hashing the canonical body.
-            QueuedRequest::Push(p) => canonical_json_bytes(p),
-            QueuedRequest::Revert(r) => canonical_json_bytes(r),
-            QueuedRequest::Merge(m) => canonical_json_bytes(m),
-            QueuedRequest::Rebase(r) => canonical_json_bytes(r),
+        // Transact: the transaction body is the only semantically
+        // identifying field. txn_opts / commit_opts / tracking /
+        // governance can drift between retries (timestamps, request
+        // IDs, observability toggles) without changing what the
+        // commit means. The body never holds the stamp, so the largest
+        // payload is hashed without a copy.
+        if let Self::Transact(t) = self {
+            return canonical_json_bytes(&t.body);
+        }
+        // Push / Revert / Merge / Rebase envelopes carry only stable
+        // fields (content-addressed commit ids, selection / strategy
+        // descriptors, branch names) besides the stamp, so hashing the
+        // envelope with its stamp cleared is equivalent to hashing the
+        // canonical body. These envelopes are small, so the copy is
+        // cheap.
+        let mut unstamped = self.clone();
+        *unstamped.submission_slot() = None;
+        match &unstamped {
+            Self::Transact(t) => canonical_json_bytes(&t.body),
+            Self::Push(p) => canonical_json_bytes(p),
+            Self::PushWithMerges(p) => canonical_json_bytes(p),
+            Self::Revert(r) => canonical_json_bytes(r),
+            Self::Merge(m) => canonical_json_bytes(m),
+            Self::Rebase(r) => canonical_json_bytes(r),
         }
     }
 }
@@ -464,6 +592,13 @@ pub struct QueuedTransact {
     pub commit_opts: CommitOptsRequest,
     pub tracking: Option<TrackingOptions>,
     pub governance: GovernanceOptions,
+    /// The submission this envelope belongs to. An envelope's address is
+    /// the hash of its bytes, so without it two submissions of one request
+    /// share a blob, and the first to release it deletes it from under the
+    /// other. Not part of the request: [`QueuedRequest::canonical_body_bytes`]
+    /// leaves it out. `None` in an envelope from a node that predates it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Push-side envelope payload.
@@ -486,6 +621,24 @@ pub struct QueuedPush {
     pub commit_cids: Vec<CommitId>,
     pub blobs: HashMap<String, Vec<u8>>,
     pub governance: GovernanceOptions,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
+}
+
+/// Push-side envelope payload for a push whose commits include a merge.
+///
+/// A separate variant rather than a field on [`QueuedPush`]. A worker
+/// predating this release would ignore an unknown field and store the
+/// merge commits' parents nowhere. It fails to decode an unknown variant
+/// instead, which is what a rolling upgrade needs: the entry is refused
+/// rather than half applied.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueuedPushWithMerges {
+    pub push: QueuedPush,
+    /// CIDs of the commits the push's merges brought in, parents before
+    /// children.
+    pub merged_commit_cids: Vec<CommitId>,
 }
 
 /// Revert-side envelope payload. Mirrors the fields of
@@ -496,6 +649,9 @@ pub struct QueuedPush {
 pub struct QueuedRevert {
     pub selection: RevertSelection,
     pub strategy: ConflictStrategy,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Merge-side envelope payload. The queue entry rides on the target
@@ -508,6 +664,9 @@ pub struct QueuedMerge {
     pub source_branch: String,
     pub target_branch: Option<String>,
     pub strategy: ConflictStrategy,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Rebase-side envelope payload. The queue entry rides on the branch
@@ -516,6 +675,9 @@ pub struct QueuedMerge {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedRebase {
     pub strategy: ConflictStrategy,
+    /// See [`QueuedTransact::submission`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// Error encoding or decoding a [`QueuedRequest`].
@@ -662,6 +824,9 @@ pub struct PushRequest {
     pub ledger_id: String,
     pub commits: Vec<Vec<u8>>,
     pub blobs: HashMap<String, Vec<u8>>,
+    /// Commit blobs that merges in `commits` brought in, parents before
+    /// children. See [`fluree_db_api::PushCommitsRequest::merged_commits`].
+    pub merged_commits: Vec<Vec<u8>>,
     pub governance: GovernanceOptions,
 }
 
@@ -798,6 +963,42 @@ pub enum SubmissionError {
     #[error("{message}")]
     NoveltyDeltaTooLarge { message: String },
 
+    /// The transaction would bring the ledger past the number of distinct
+    /// datatypes its index can store (HTTP 422,
+    /// `err:db/DatatypeLimitExceeded`). Permanent, because datatype IDs are
+    /// never released. Typed so the HTTP layer can surface the dedicated
+    /// code; an `Execution` status alone cannot carry it.
+    #[error("{message}")]
+    DatatypeLimitExceeded { message: String },
+
+    /// A commit reference in the submission (a revert's commits) names no
+    /// commit of the ledger (HTTP 404, `err:db/CommitNotFound`). Typed so the
+    /// HTTP layer can tell it from a missing ledger; an `Execution` status
+    /// alone cannot.
+    #[error("{message}")]
+    CommitNotFound { message: String },
+
+    /// The ledger config could not be read while executing the submission
+    /// (HTTP 500, `err:storage/ReadFailure`): a storage failure, not
+    /// anything in the request, and not capacity pressure. Typed so the HTTP
+    /// layer can surface the storage code; an `Execution` status alone
+    /// cannot carry it.
+    #[error("{message}")]
+    ConfigUnavailable { message: String },
+
+    /// Every commit attempt lost its race with other writers to the ledger
+    /// (HTTP 503, `err:db/CommitContention`, `Retry-After`). Retryable, and
+    /// typed because a 503 `Execution` status reads as unsettled.
+    #[error("{message}")]
+    CommitContention { message: String },
+
+    /// This node has not loaded the ledger's index, so the submission was
+    /// refused before it read or committed anything (HTTP 503,
+    /// `err:db/IndexNotLoaded`, `Retry-After`). Retryable once the index
+    /// loads. Typed because a 503 `Execution` status reads as unsettled.
+    #[error("{message}")]
+    IndexNotLoaded { message: String },
+
     /// The consensus implementation has reached its in-flight operation
     /// cap and refused the submission without executing it. Callers
     /// should retry with backoff.
@@ -836,6 +1037,17 @@ impl SubmissionError {
             // pinning the slot so every keyed retry gets
             // `AlreadyInFlight` (409) for the full cache TTL.
             Self::NoveltyBackpressure { .. } | Self::NoveltyDeltaTooLarge { .. } => true,
+            // Decided before commit construction, like the novelty refusals.
+            Self::DatatypeLimitExceeded { .. } | Self::CommitNotFound { .. } => true,
+            // Read before commit construction: the submission did not commit,
+            // and a keyed retry re-executes it.
+            Self::ConfigUnavailable { .. } => true,
+            // Every attempt's commit failed its head check, so nothing
+            // committed; settled, like the novelty refusals, so a keyed retry
+            // re-executes.
+            Self::CommitContention { .. } => true,
+            // Refused before staging read anything, like the novelty refusals.
+            Self::IndexNotLoaded { .. } => true,
             Self::Execution { status, .. } => !(502..=504).contains(status),
         }
     }
@@ -916,6 +1128,88 @@ impl<T> SubmittingCommitter for T where T: Committer + SubmissionLookup + ?Sized
 mod tests {
     use super::*;
 
+    /// Two submissions of one request write different envelopes, so that
+    /// neither shares the other's address, and one idempotency body, so
+    /// that a retry is still the same request. An unstamped envelope encodes
+    /// as it did before the stamp, and a node predating the stamp still
+    /// reads a stamped one.
+    #[cfg(feature = "raft")]
+    #[test]
+    fn a_submission_stamp_separates_envelopes_but_not_requests() {
+        use fluree_db_api::CommitRef;
+        use fluree_db_core::{ContentId, ContentKind};
+
+        #[derive(Deserialize)]
+        enum PriorRequest {
+            Merge(PriorMerge),
+        }
+        #[derive(Deserialize)]
+        #[expect(dead_code, reason = "the shape a prior node decodes")]
+        struct PriorMerge {
+            source_branch: String,
+            target_branch: Option<String>,
+            strategy: ConflictStrategy,
+        }
+
+        let commit = ContentId::new(ContentKind::Commit, b"c");
+        let push = QueuedPush {
+            commit_cids: vec![commit.clone()],
+            blobs: HashMap::new(),
+            governance: GovernanceOptions::default(),
+            submission: None,
+        };
+        let merge = QueuedRequest::Merge(QueuedMerge {
+            source_branch: "dev".into(),
+            target_branch: Some("main".into()),
+            strategy: ConflictStrategy::default(),
+            submission: None,
+        });
+        let requests = [
+            QueuedRequest::Transact(Box::new(QueuedTransact {
+                body: TransactionBody::JsonLdInsert(serde_json::json!({"@id": "ex:s"})),
+                txn_opts: TxnOpts::default(),
+                commit_opts: CommitOptsRequest::default(),
+                tracking: None,
+                governance: GovernanceOptions::default(),
+                submission: None,
+            })),
+            QueuedRequest::for_push(push.clone(), Vec::new()),
+            QueuedRequest::for_push(push, vec![commit.clone()]),
+            QueuedRequest::Revert(QueuedRevert {
+                selection: RevertSelection::single(CommitRef::Exact(commit)),
+                strategy: ConflictStrategy::default(),
+                submission: None,
+            }),
+            merge.clone(),
+            QueuedRequest::Rebase(QueuedRebase {
+                strategy: ConflictStrategy::default(),
+                submission: None,
+            }),
+        ];
+        for request in requests {
+            let unstamped = request.to_bytes().unwrap();
+            let body = request.canonical_body_bytes().unwrap();
+            let stamped = |submission: &str| {
+                let mut request = request.clone();
+                request.stamp_submission(submission.into());
+                request
+            };
+            let (a, b) = (stamped("a"), stamped("b"));
+            assert!(!String::from_utf8_lossy(&unstamped).contains("submission"));
+            assert_ne!(a.to_bytes().unwrap(), b.to_bytes().unwrap(), "{request:?}");
+            assert_eq!(a.canonical_body_bytes().unwrap(), body, "{request:?}");
+            assert_eq!(b.canonical_body_bytes().unwrap(), body, "{request:?}");
+            let decoded = QueuedRequest::from_bytes(&a.to_bytes().unwrap()).unwrap();
+            assert_eq!(decoded.to_bytes().unwrap(), a.to_bytes().unwrap());
+        }
+
+        let mut merge = merge;
+        merge.stamp_submission("a".into());
+        let PriorRequest::Merge(prior) =
+            serde_json::from_slice(&merge.to_bytes().unwrap()).expect("decodes without the stamp");
+        assert_eq!(prior.source_branch, "dev");
+    }
+
     /// The idempotency body CID must be identical for two logically
     /// equal payloads regardless of object-key order — otherwise a
     /// retry that rebuilds the body with different key ordering (or a
@@ -944,6 +1238,138 @@ mod tests {
             canonical_json_bytes(&a).unwrap(),
             canonical_json_bytes(&b).unwrap(),
         );
+    }
+
+    /// A push carrying merged-in commits must not decode as a plain
+    /// push on a worker that predates the variant. That worker would
+    /// store the merge commits without their parents.
+    #[test]
+    fn a_push_with_merges_does_not_decode_as_a_plain_push() {
+        // The variants of `QueuedRequest` as that release knew them.
+        // Payloads are ignored: the variant name is what decides.
+        #[derive(serde::Deserialize)]
+        enum PriorRelease {
+            Transact(serde::de::IgnoredAny),
+            Push(serde::de::IgnoredAny),
+            Revert(serde::de::IgnoredAny),
+            Merge(serde::de::IgnoredAny),
+            Rebase(serde::de::IgnoredAny),
+        }
+
+        use fluree_db_core::{ContentId, ContentKind};
+        let commit_cid = ContentId::new(ContentKind::Commit, b"line");
+        let merged_cid = ContentId::new(ContentKind::Commit, b"merged");
+        let push = QueuedPush {
+            commit_cids: vec![commit_cid.clone()],
+            blobs: HashMap::new(),
+            governance: GovernanceOptions::default(),
+            submission: None,
+        };
+        let bytes = QueuedRequest::for_push(push.clone(), vec![merged_cid.clone()])
+            .to_bytes()
+            .expect("encode");
+
+        assert!(serde_json::from_slice::<PriorRelease>(&bytes).is_err());
+
+        match QueuedRequest::from_bytes(&bytes).expect("decode") {
+            QueuedRequest::PushWithMerges(decoded) => {
+                assert_eq!(decoded.push.commit_cids, vec![commit_cid]);
+                assert_eq!(decoded.merged_commit_cids, vec![merged_cid]);
+            }
+            other => panic!("expected PushWithMerges, got {other:?}"),
+        }
+
+        // A push without merges keeps the original variant, which that
+        // worker still accepts.
+        let bytes = QueuedRequest::for_push(push, Vec::new())
+            .to_bytes()
+            .expect("encode");
+        assert!(serde_json::from_slice::<PriorRelease>(&bytes).is_ok());
+    }
+
+    #[test]
+    fn rdf_graph_sync_round_trips_and_hashes_every_field() {
+        let body = |graph: &str, allow_empty: bool| TransactionBody::RdfGraphSync {
+            graph_iri: Some(graph.to_string()),
+            text: "<urn:s> <urn:p> <urn:o> .".to_string(),
+            allow_empty,
+        };
+        let queued = QueuedRequest::Transact(Box::new(QueuedTransact {
+            body: body("urn:g", true),
+            txn_opts: fluree_db_transact::TxnOpts::default(),
+            commit_opts: CommitOptsRequest::default(),
+            tracking: None,
+            governance: GovernanceOptions::default(),
+            submission: None,
+        }));
+        let decoded = QueuedRequest::from_bytes(&queued.to_bytes().expect("encode"));
+        match decoded.expect("decode") {
+            QueuedRequest::Transact(t) => {
+                assert!(matches!(
+                    &t.body,
+                    TransactionBody::RdfGraphSync { graph_iri: Some(g), allow_empty: true, .. }
+                        if g == "urn:g"
+                ));
+                assert_eq!(BodyKind::from(&t.body), BodyKind::RdfGraphSync);
+            }
+            other => panic!("expected Transact, got {other:?}"),
+        }
+
+        // A retry that changes the target graph or the empty opt-in is a
+        // different request, not a replay.
+        let hash = body("urn:g", true).body_hash();
+        assert_ne!(hash, body("urn:g", false).body_hash());
+        assert_ne!(hash, body("urn:h", true).body_hash());
+    }
+
+    /// A graph-sync body written before the default graph could be a target
+    /// carries a plain string; it must still decode, as that named graph.
+    #[test]
+    fn graph_sync_bodies_from_before_default_graph_targets_still_decode() {
+        let old: TransactionBody =
+            serde_json::from_str(r#"{"JsonLdGraphSync":{"graph_iri":"urn:g","body":{}}}"#)
+                .expect("decode a string graph_iri");
+        assert!(matches!(
+            old,
+            TransactionBody::JsonLdGraphSync { graph_iri: Some(ref g), .. } if g == "urn:g"
+        ));
+
+        let default = TransactionBody::JsonLdGraphSync {
+            graph_iri: None,
+            body: serde_json::json!({}),
+        };
+        let bytes = serde_json::to_vec(&default).expect("encode");
+        let decoded: TransactionBody = serde_json::from_slice(&bytes).expect("decode");
+        assert!(matches!(
+            decoded,
+            TransactionBody::JsonLdGraphSync {
+                graph_iri: None,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn graph_insert_round_trips_and_hashes_apart_from_sync() {
+        let insert = TransactionBody::GraphInsert {
+            graph_iri: None,
+            payload: GraphBody::Rdf("<urn:s> <urn:p> <urn:o> .".to_string()),
+        };
+        let bytes = serde_json::to_vec(&insert).expect("encode");
+        let decoded: TransactionBody = serde_json::from_slice(&bytes).expect("decode");
+        assert_eq!(BodyKind::from(&decoded), BodyKind::GraphInsert);
+
+        let sync = TransactionBody::RdfGraphSync {
+            graph_iri: None,
+            text: "<urn:s> <urn:p> <urn:o> .".to_string(),
+            allow_empty: false,
+        };
+        assert_ne!(insert.body_hash(), sync.body_hash());
+        let named = TransactionBody::GraphInsert {
+            graph_iri: Some("urn:g".to_string()),
+            payload: GraphBody::Rdf("<urn:s> <urn:p> <urn:o> .".to_string()),
+        };
+        assert_ne!(insert.body_hash(), named.body_hash());
     }
 
     #[test]
@@ -992,6 +1418,8 @@ mod body_kind_wire_tests {
             (BodyKind::Merge, 10),
             (BodyKind::Rebase, 11),
             (BodyKind::JsonLdGraphSync, 12),
+            (BodyKind::RdfGraphSync, 13),
+            (BodyKind::GraphInsert, 14),
         ];
         for (kind, ordinal) in expected {
             let bytes = postcard::to_allocvec(&kind).expect("encode");

@@ -110,7 +110,7 @@ impl TopKBound {
         Self {
             k,
             ascending,
-            heap: BinaryHeap::with_capacity(k.saturating_add(1)),
+            heap: BinaryHeap::with_capacity(fluree_db_core::topk::initial_capacity(k)),
         }
     }
 
@@ -217,6 +217,32 @@ pub fn plan_topk_read<'a>(
     order
 }
 
+/// [`batch_sort_values`] over only the rows non-null in every column of
+/// `required` (field ids): the rows that yield a result row once the scan's
+/// consumer maps them. A required column missing from the batch keeps no
+/// row, so the bound stays loose and nothing is pruned on its account.
+pub fn batch_sort_values_where(
+    batch: &ColumnBatch,
+    field_id: i32,
+    required: &[i32],
+) -> Vec<TypedValue> {
+    if required.is_empty() {
+        return batch_sort_values(batch, field_id);
+    }
+    let required: Option<Vec<&Column>> =
+        required.iter().map(|id| batch.column_by_id(*id)).collect();
+    let Some(required) = required else {
+        return Vec::new();
+    };
+    let keep: Vec<usize> = (0..batch.num_rows)
+        .filter(|&row| required.iter().all(|col| !col.is_null(row)))
+        .collect();
+    if keep.len() == batch.num_rows {
+        return batch_sort_values(batch, field_id);
+    }
+    batch_sort_values(&batch.filter_by_indices(&keep), field_id)
+}
+
 /// The non-null values of column `field_id` in a batch, as `TypedValue`s, to fold
 /// into a [`TopKBound`]. NULLs are skipped (they never form the DESC bound; they
 /// sort last and only matter when the heap can't fill). `Bytes` is not an ordered
@@ -259,16 +285,11 @@ pub fn batch_sort_values(batch: &ColumnBatch, field_id: i32) -> Vec<TypedValue> 
             .flatten()
             .map(|&x| TypedValue::TimestampTz(x))
             .collect(),
-        Column::Decimal {
-            values,
-            precision,
-            scale,
-        } => values
+        Column::Decimal { values, scale, .. } => values
             .iter()
             .flatten()
             .map(|&unscaled| TypedValue::Decimal {
                 unscaled,
-                precision: *precision,
                 scale: *scale,
             })
             .collect(),
@@ -329,6 +350,22 @@ mod tests {
         assert!(!b.can_stop(Some(&f(11.0))));
         // no bound (all-null column) → never stop (must read).
         assert!(!b.can_stop(None));
+    }
+
+    /// `k` is the query's `LIMIT + OFFSET`, which may be far larger than any
+    /// table: the heap starts at the shared cap and grows as values arrive.
+    #[test]
+    fn large_k_starts_at_the_capped_capacity() {
+        for k in [i64::MAX as usize, usize::MAX] {
+            let mut b = TopKBound::new(k, false);
+            assert_eq!(
+                b.heap.capacity(),
+                fluree_db_core::topk::MAX_INITIAL_CAPACITY
+            );
+            b.observe_all([f(10.0), f(30.0), f(20.0)]);
+            assert!(!b.is_full(), "3 values never fill k={k}");
+            assert!(!b.can_stop(Some(&f(1.0))));
+        }
     }
 
     #[test]
@@ -394,6 +431,47 @@ mod tests {
         // DESC by upper_bound: 30(1), 20(3), 10(0); the no-bound file (2) LAST.
         assert_eq!(idxs, vec![1, 3, 0, 2]);
         assert_eq!(order.last().unwrap().1, None, "all-null file has no bound");
+    }
+
+    #[test]
+    fn values_where_keep_only_rows_non_null_in_every_required_column() {
+        use crate::io::batch::{BatchSchema, FieldInfo, FieldType};
+        use std::sync::Arc;
+        let field = |name: &str, id: i32| FieldInfo {
+            name: name.to_string(),
+            field_type: FieldType::Int64,
+            nullable: true,
+            field_id: id,
+        };
+        let schema = Arc::new(BatchSchema::new(vec![
+            field("v", 1),
+            field("s", 2),
+            field("m", 3),
+        ]));
+        let batch = ColumnBatch::new(
+            schema,
+            vec![
+                Column::Int64(vec![Some(10), Some(20), Some(30), None]),
+                Column::Int64(vec![Some(1), None, Some(3), Some(4)]),
+                Column::Int64(vec![Some(1), Some(2), None, Some(4)]),
+            ],
+        )
+        .unwrap();
+        let ints = |vals: Vec<TypedValue>| -> Vec<i64> {
+            vals.into_iter()
+                .map(|v| match v {
+                    TypedValue::Int64(n) => n,
+                    other => panic!("not a long: {other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(ints(batch_sort_values_where(&batch, 1, &[])), [10, 20, 30]);
+        assert_eq!(ints(batch_sort_values_where(&batch, 1, &[2])), [10, 30]);
+        assert_eq!(ints(batch_sort_values_where(&batch, 1, &[2, 3])), [10]);
+        assert!(
+            batch_sort_values_where(&batch, 1, &[9]).is_empty(),
+            "a required column the batch lacks keeps no row"
+        );
     }
 
     #[test]

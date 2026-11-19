@@ -357,6 +357,44 @@ impl PredicateDict {
         self.inner.find(s)
     }
 
+    /// The dict id of the graph `prefix` + `name` (its `g_id` less one),
+    /// assigning one to a new graph. Any ledger's config graph IRI is the
+    /// config graph (dict id 1, `g_id` 2), as in the query-time registry.
+    pub fn graph_dict_id_or_insert_parts(&mut self, prefix: &str, name: &str) -> u32 {
+        let total_len = prefix.len() + name.len();
+        if total_len <= 256 {
+            let mut buf = [0u8; 256];
+            buf[..prefix.len()].copy_from_slice(prefix.as_bytes());
+            buf[prefix.len()..total_len].copy_from_slice(name.as_bytes());
+            // SAFETY: buf[..total_len] is copied from two valid UTF-8 &str slices.
+            let iri = unsafe { std::str::from_utf8_unchecked(&buf[..total_len]) };
+            if let Some(id) = self.inner.find(iri) {
+                return id;
+            }
+        }
+        let mut full_iri = String::with_capacity(total_len);
+        full_iri.push_str(prefix);
+        full_iri.push_str(name);
+        self.graph_dict_id_or_insert(&full_iri)
+    }
+
+    /// [`Self::graph_dict_id_or_insert_parts`] for a whole IRI.
+    pub fn graph_dict_id_or_insert(&mut self, iri: &str) -> u32 {
+        match self.graph_dict_id(iri) {
+            Some(id) => id,
+            None => self.inner.assign_or_lookup(iri),
+        }
+    }
+
+    /// The dict id of the graph `iri`, if it has one: any ledger's config
+    /// graph IRI is the config graph.
+    pub fn graph_dict_id(&self, iri: &str) -> Option<u32> {
+        self.inner.find(iri).or_else(|| {
+            fluree_db_core::graph_registry::names_config_graph(iri)
+                .then_some(u32::from(fluree_db_core::graph_registry::CONFIG_GRAPH_ID) - 1)
+        })
+    }
+
     /// Get the string for a given ID.
     pub fn resolve(&self, id: u32) -> Option<&str> {
         self.inner.resolve(id)
@@ -1022,38 +1060,20 @@ impl Default for LanguageTagDict {
 // Datatype dict constants (dt_ids)
 // ============================================================================
 
-/// Reserved datatype dictionary IDs.
+/// Create a new datatype dict with the reserved entries pre-inserted.
 ///
-/// These constants are defined in `fluree_db_core::DatatypeDictId`.
-/// Only types with special encoding/coercion rules get reserved IDs.
-/// Everything else is dynamically assigned (ID 14+).
-///
-/// Type is `u16` to match `RunRecord.dt` — most datasets use ≤255 types
-/// (encoded as u8 in leaf Region 2), but u16 supports up to 65535 distinct
-/// datatype IRIs in a single import.
-///
-/// Create a new datatype dict with reserved entries pre-inserted.
-///
-/// Order matters: `get_or_insert` returns sequential IDs starting at 0.
-/// Only types with special encoding/coercion rules are reserved.
+/// The reserved entries come from `DatatypeDictId::RESERVED_IRIS`, in ID
+/// order. Every other datatype is assigned the next ID the first time it
+/// is seen, from `RESERVED_COUNT` up to `DatatypeDictId::MAX`.
 pub(crate) fn new_datatype_dict() -> PredicateDict {
     let mut d = PredicateDict::new();
-    d.get_or_insert("@id"); // 0
-    d.get_or_insert(fluree_vocab::xsd::STRING); // 1
-    d.get_or_insert(fluree_vocab::xsd::BOOLEAN); // 2
-    d.get_or_insert(fluree_vocab::xsd::INTEGER); // 3
-    d.get_or_insert(fluree_vocab::xsd::LONG); // 4
-    d.get_or_insert(fluree_vocab::xsd::DECIMAL); // 5
-    d.get_or_insert(fluree_vocab::xsd::DOUBLE); // 6
-    d.get_or_insert(fluree_vocab::xsd::FLOAT); // 7
-    d.get_or_insert(fluree_vocab::xsd::DATE_TIME); // 8
-    d.get_or_insert(fluree_vocab::xsd::DATE); // 9
-    d.get_or_insert(fluree_vocab::xsd::TIME); // 10
-    d.get_or_insert(fluree_vocab::rdf::LANG_STRING); // 11
-    d.get_or_insert(fluree_vocab::rdf::JSON); // 12
-    d.get_or_insert(fluree_vocab::fluree::EMBEDDING_VECTOR); // 13
-    d.get_or_insert(fluree_vocab::fluree::FULL_TEXT); // 14
-    debug_assert_eq!(d.len(), 15);
+    for iri in fluree_db_core::DatatypeDictId::RESERVED_IRIS {
+        d.get_or_insert(iri);
+    }
+    debug_assert_eq!(
+        d.len(),
+        u32::from(fluree_db_core::DatatypeDictId::RESERVED_COUNT)
+    );
     d
 }
 

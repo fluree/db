@@ -309,7 +309,7 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
 
         // String → Double/Float
         (FlakeValue::String(s), dt) if dt == xsd::DOUBLE || dt == xsd::FLOAT => {
-            parse_string_to_double(s)
+            parse_string_to_double(s, dt)
         }
 
         // String → DateTime
@@ -389,6 +389,10 @@ pub fn coerce_value(value: FlakeValue, datatype_iri: &str) -> CoercionResult<Fla
         // Already JSON → rdf:JSON
         (FlakeValue::Json(j), dt) if dt == rdf::JSON => Ok(FlakeValue::Json(j.clone())),
 
+        // String → geo:wktLiteral: a POINT becomes the GeoPoint it is stored
+        // as, so a constant matches it; other WKT stays a string.
+        (FlakeValue::String(s), geo::WKT_LITERAL) => coerce_string_value(s, geo::WKT_LITERAL),
+
         // ====================================================================
         // Pass-through: already correct type or unknown datatype
         // ====================================================================
@@ -465,7 +469,7 @@ pub fn coerce_string_value(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
             .map_err(|_| CoercionError::parse_failed(s, "xsd:decimal", None)),
 
         // Double/Float
-        xsd::DOUBLE | xsd::FLOAT => parse_string_to_double(s),
+        xsd::DOUBLE | xsd::FLOAT => parse_string_to_double(s, datatype_iri),
 
         // Boolean
         xsd::BOOLEAN => match s {
@@ -782,17 +786,27 @@ fn parse_string_to_integer(s: &str, datatype_iri: &str) -> CoercionResult<FlakeV
     ))
 }
 
-/// Parse a string to a double value
-fn parse_string_to_double(s: &str) -> CoercionResult<FlakeValue> {
-    let parsed = match s {
-        "INF" | "+INF" => Ok(f64::INFINITY),
-        "-INF" => Ok(f64::NEG_INFINITY),
-        "NaN" => Ok(f64::NAN),
-        _ => s.parse::<f64>(),
-    };
-    parsed
+/// Parse an `xsd:double` or `xsd:float` lexical form to a double value.
+///
+/// Only the XSD lexical space is accepted ([`fluree_graph_ir::parse_xsd_double`]):
+/// numerals plus `INF`, `+INF`, `-INF` and `NaN`. Other spellings such as `inf`,
+/// `Infinity` or `nan` are not lexical forms of either datatype.
+/// What an `xsd:double` or `xsd:float` lexical form looks like, for errors
+/// that refuse one.
+pub const XSD_DOUBLE_LEXICAL_HINT: &str =
+    "expected a numeral such as 1.5 or 1.5E3, or INF, +INF, -INF or NaN";
+
+fn parse_string_to_double(s: &str, datatype_iri: &str) -> CoercionResult<FlakeValue> {
+    fluree_graph_ir::parse_xsd_double(s)
         .map(FlakeValue::Double)
-        .map_err(|_| CoercionError::parse_failed(s, "xsd:double", None))
+        .ok_or_else(|| {
+            let target = if datatype_iri == xsd::FLOAT {
+                "xsd:float"
+            } else {
+                "xsd:double"
+            };
+            CoercionError::parse_failed(s, target, Some(XSD_DOUBLE_LEXICAL_HINT))
+        })
 }
 
 /// Validate that an i64 value is within range for the target integer datatype
@@ -852,6 +866,25 @@ fn validate_bigint_range(value: &BigInt, datatype_iri: &str) -> CoercionResult<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Query constants and STRDT go through `coerce_value`; a WKT POINT must
+    /// become the GeoPoint a write stores, or it matches nothing.
+    #[test]
+    fn test_coerce_wkt_point_as_written() {
+        let point = "POINT(-0.1278 51.5074)";
+        let coerced = coerce_value(FlakeValue::String(point.to_string()), geo::WKT_LITERAL);
+        let written = coerce_string_value(point, geo::WKT_LITERAL);
+        assert!(
+            matches!(coerced, Ok(FlakeValue::GeoPoint(_))),
+            "{coerced:?}"
+        );
+        assert_eq!(coerced.unwrap(), written.unwrap());
+        let line = "LINESTRING(0 0, 1 1)";
+        assert_eq!(
+            coerce_value(FlakeValue::String(line.to_string()), geo::WKT_LITERAL).unwrap(),
+            FlakeValue::String(line.to_string())
+        );
+    }
 
     #[test]
     fn test_coerce_long_to_integer() {
@@ -931,6 +964,22 @@ mod tests {
         ));
     }
 
+    /// A number of 16 or more significant digits reads as the nearest double,
+    /// not its neighbour, and as a decimal keeps the digits written
+    /// (serde_json's default parser read this one as `…224`).
+    #[test]
+    fn a_full_precision_number_reads_as_the_nearest_double() {
+        let json: serde_json::Value = serde_json::from_str("0.9452706955539223").unwrap();
+        let Ok(FlakeValue::Double(d)) = coerce_json_value(&json, xsd::DOUBLE) else {
+            panic!("expected a double");
+        };
+        assert_eq!(d.to_bits(), 0.945_270_695_553_922_3_f64.to_bits());
+        let Ok(FlakeValue::Decimal(dec)) = coerce_json_value(&json, xsd::DECIMAL) else {
+            panic!("expected a decimal");
+        };
+        assert_eq!(dec.to_string(), "0.9452706955539223");
+    }
+
     #[test]
     fn test_coerce_json_number_to_integer() {
         let json = serde_json::json!(42);
@@ -978,6 +1027,40 @@ mod tests {
         let result = coerce_value(FlakeValue::BigInt(Box::new(big)), xsd::DOUBLE);
         assert!(result.is_ok());
         assert!(matches!(result.unwrap(), FlakeValue::Double(_)));
+    }
+
+    #[test]
+    fn test_coerce_double_special_spellings() {
+        for dt in [xsd::DOUBLE, xsd::FLOAT] {
+            for (lexical, expected) in [
+                ("INF", f64::INFINITY),
+                ("+INF", f64::INFINITY),
+                ("-INF", f64::NEG_INFINITY),
+                ("1e400", f64::INFINITY),
+                ("-1e400", f64::NEG_INFINITY),
+            ] {
+                assert!(
+                    matches!(coerce_string_value(lexical, dt), Ok(FlakeValue::Double(d)) if d == expected),
+                    "{lexical}^^{dt}"
+                );
+            }
+            assert!(matches!(
+                coerce_string_value("NaN", dt),
+                Ok(FlakeValue::Double(d)) if d.is_nan()
+            ));
+        }
+    }
+
+    #[test]
+    fn test_coerce_double_refuses_non_xsd_spellings() {
+        for dt in [xsd::DOUBLE, xsd::FLOAT] {
+            for lexical in ["inf", "-inf", "Infinity", "-Infinity", "nan", "NAN", "-NaN"] {
+                let err = coerce_string_value(lexical, dt).expect_err(lexical);
+                assert!(err.message.contains("Cannot parse"), "{}", err.message);
+                let via_value = coerce_value(FlakeValue::String(lexical.to_string()), dt);
+                assert!(via_value.is_err(), "{lexical}^^{dt}");
+            }
+        }
     }
 
     // -------------------------------------------------------------------

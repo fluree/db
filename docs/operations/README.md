@@ -37,7 +37,7 @@ Storage backend options:
 - Memory storage (development)
 - File system storage (single server)
 - AWS S3/DynamoDB (distributed)
-- IPFS / Kubo (decentralized)
+- IPFS / Kubo (experimental, Rust API only)
 - Storage selection criteria
 - Switching between storage modes
 
@@ -58,9 +58,9 @@ A worked benchmark (SPARQLoscope on ~574 M-triple DBLP) showing how hardware map
 
 ### [IPFS Storage](ipfs-storage.md)
 
-IPFS-specific setup and configuration:
+Experimental IPFS storage for programs embedding Fluree through the Rust API:
 - Kubo node installation and setup
-- JSON-LD configuration fields
+- Using `FlureeBuilder::build_ipfs`, and its in-memory nameservice
 - Content addressing and CID mapping
 - Pinning strategies
 - Operational considerations
@@ -95,7 +95,7 @@ Administrative operations:
 
 ### [Query peers and replication](query-peers.md)
 
-Run `fluree-server` as a read-only query peer:
+Run the Fluree server as a read-only query peer:
 - SSE nameservice events (`GET /v1/fluree/events`)
 - Peer mode (refresh on stale + write forwarding)
 - Storage proxy endpoints (`/v1/fluree/storage/*`) for private-storage deployments
@@ -104,10 +104,10 @@ Run `fluree-server` as a read-only query peer:
 
 ### Development
 
-Single-process, memory storage:
+Single process, file storage in `.fluree/storage` under the working directory (the default):
 
 ```bash
-./fluree-db-server --storage memory --log-level debug
+fluree server run --log-level debug
 ```
 
 ### Single Server Production
@@ -115,60 +115,57 @@ Single-process, memory storage:
 File-based storage:
 
 ```bash
-./fluree-db-server \
-  --storage file \
-  --data-dir /var/lib/fluree \
-  --port 8090 \
+fluree server run \
+  --storage-path /var/lib/fluree \
+  --listen-addr 0.0.0.0:8090 \
   --log-level info
 ```
 
 ### Distributed Production
 
-AWS-backed distributed deployment:
+AWS-backed distributed deployment. S3 buckets, DynamoDB table, and region are set in a
+JSON-LD connection config file (see [Storage Modes](storage.md) and the
+[connection config reference](../reference/connection-config-jsonld.md)); requires a build
+with the `aws` feature:
 
 ```bash
-./fluree-db-server \
-  --storage aws \
-  --s3-bucket fluree-prod-data \
-  --s3-region us-east-1 \
-  --dynamodb-table fluree-nameservice \
-  --port 8090
+fluree server run \
+  --connection-config /etc/fluree/connection.jsonld \
+  --listen-addr 0.0.0.0:8090
 ```
 
 ## Key Configuration Areas
 
 ### Server Settings
 
-- Port and host binding
-- TLS/SSL certificates
-- Request size limits
+- Listen address (host and port)
+- Request body size limit
 - Timeout values
-- CORS configuration
+- CORS (on/off)
+
+TLS is not terminated by the server; put a reverse proxy or load balancer in front of it.
 
 ### Storage Configuration
 
 - Storage mode selection
-- Data directory (file mode)
+- Storage path (file mode)
 - AWS credentials (S3 mode)
-- IPFS / Kubo connection (IPFS mode)
-- Connection pooling
 - Cache settings
 
 ### Indexing Configuration
 
-- Index interval
-- Batch size
-- Memory allocation
-- Number of threads
-- Index retention
+- Novelty thresholds (soft reindex trigger, hard write backpressure)
+- Stalled-indexing catch-up sweep interval
+- Index retention (GC)
 
 ### Security Configuration
 
-- Authentication mode
-- API key requirements
+- Authentication mode per endpoint group (data, events, admin)
+- Trusted token issuers
 - Signed request validation
 - Policy enforcement
-- Rate limiting
+
+The server has no built-in rate limiting; apply it at a reverse proxy or API gateway.
 
 ## Monitoring
 
@@ -181,10 +178,8 @@ curl http://localhost:8090/health
 Response:
 ```json
 {
-  "status": "healthy",
-  "version": "0.1.0",
-  "storage": "file",
-  "uptime_ms": 3600000
+  "status": "ok",
+  "version": "0.1.0"
 }
 ```
 
@@ -197,23 +192,11 @@ curl http://localhost:8090/v1/fluree/stats
 Response:
 ```json
 {
-  "version": "0.1.0",
-  "uptime_ms": 3600000,
-  "ledgers": 5,
-  "queries": {
-    "total": 12345,
-    "active": 3,
-    "avg_duration_ms": 45
-  },
-  "transactions": {
-    "total": 567,
-    "avg_duration_ms": 89
-  },
-  "indexing": {
-    "active": true,
-    "pending_ledgers": 1,
-    "avg_lag_ms": 1500
-  }
+  "uptime_secs": 3600,
+  "storage_type": "file",
+  "indexing_enabled": true,
+  "cached_ledgers": 3,
+  "version": "0.1.0"
 }
 ```
 
@@ -276,16 +259,16 @@ artifacts when you need to force a full refresh.
 
 ### Memory Settings
 
+The in-memory cache budget is global (there is no per-query memory setting):
+
 ```bash
-./fluree-db-server \
-  --query-memory-mb 2048 \
-  --cache-size-mb 1024
+fluree server run -- --cache-max-mb 1024
 ```
 
 ### Indexing Tuning
 
 ```bash
-fluree-server \
+fluree server run -- \
   --indexing-enabled \
   --reindex-min-bytes 100000 \
   --reindex-max-bytes 1000000
@@ -294,11 +277,13 @@ fluree-server \
 ### Query Tuning
 
 ```bash
-./fluree-db-server \
+fluree server run -- \
   --query-timeout-ms 30000 \
-  --max-query-size 1048576 \
-  --query-threads 8
+  --body-limit 1048576
 ```
+
+`--body-limit` caps every request body (queries and transactions alike). There is no
+query thread-count setting.
 
 ## High Availability
 
@@ -347,29 +332,26 @@ health_check:
 
 ### TLS/SSL
 
-```bash
-./fluree-db-server \
-  --tls-cert /path/to/cert.pem \
-  --tls-key /path/to/key.pem \
-  --tls-ca /path/to/ca.pem
-```
+The server listens on plain HTTP only. Terminate TLS at a reverse proxy or load balancer
+in front of it.
 
 ### Require Authentication
 
 ```bash
-./fluree-db-server \
-  --require-auth \
-  --require-signed-requests
+fluree server run -- \
+  --data-auth-mode required \
+  --data-auth-trusted-issuer did:key:z6Mk... \
+  --admin-auth-mode required \
+  --events-auth-mode required
 ```
+
+With `--data-auth-mode required`, data endpoints accept either a Bearer token or a signed
+request. See [Configuration](configuration.md) for issuer and audience options.
 
 ### Rate Limiting
 
-```bash
-./fluree-db-server \
-  --rate-limit-queries 100 \
-  --rate-limit-transactions 10 \
-  --rate-limit-window 60
-```
+The server has no built-in rate limiting. Apply it at a reverse proxy, API gateway, or load
+balancer.
 
 ## Best Practices
 
@@ -378,7 +360,6 @@ health_check:
 - Development: memory
 - Single server: file
 - Production/Distributed: AWS
-- Decentralized: IPFS
 
 ### 2. Enable Monitoring
 
@@ -408,9 +389,9 @@ Monitor growth:
 
 ### 5. Security Best Practices
 
-- Use TLS in production
+- Use TLS in production (terminated at a reverse proxy)
 - Require authentication
-- Enable rate limiting
+- Rate-limit at a reverse proxy or API gateway
 - Regular security audits
 
 ### 6. Log Management

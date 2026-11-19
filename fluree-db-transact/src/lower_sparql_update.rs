@@ -32,9 +32,10 @@
 //! by deferring WHERE lowering to staging time (when a ledger snapshot is available
 //! for IRI encoding) and reusing the shared query engine.
 //!
-//! Additional restrictions:
-//! - WITH/USING clauses are rejected
+//! `WITH`, `USING`, and `USING NAMED` scope the WHERE clause (and, for `WITH`,
+//! the templates) as SPARQL 1.1 Update §3.1.3 describes.
 
+use std::collections::BTreeSet;
 use std::mem;
 use std::sync::Arc;
 
@@ -46,19 +47,18 @@ use fluree_db_query::parse::{
 };
 use fluree_db_query::VarRegistry;
 use fluree_db_sparql::ast::{
-    AnnotationUnit, AnnotationVerb, BlankNode, BlankNodeValue, GraphMgmtRef, GraphOrDefault,
-    GraphPattern, GraphRefAll, GraphTransfer, Iri, IriValue, Literal,
-    LiteralValue as SparqlLiteralValue, Load, Modify, PredicateTerm, Prologue, PropertyPath,
-    QuadData, QuadPattern, QuadPatternElement, QueryBody, ReifierId, SparqlAst, SubjectTerm, Term,
-    TriplePattern, UpdateOperation,
+    AnnotationUnit, AnnotationVerb, BlankNode, GraphMgmtRef, GraphOrDefault, GraphPattern,
+    GraphRefAll, GraphTransfer, Iri, IriValue, Literal, LiteralValue as SparqlLiteralValue, Load,
+    Modify, PredicateTerm, Prologue, PropertyPath, QuadData, QuadPattern, QuadPatternElement,
+    QueryBody, ReifierId, SparqlAst, SubjectTerm, Term, TriplePattern, UpdateOperation,
 };
 use fluree_db_sparql::SourceSpan;
-use rustc_hash::FxHashMap;
+use fluree_graph_ir::syntax::reserved_blank_label;
 use thiserror::Error;
 
 use crate::ir::{
-    GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateTerm, TripleTemplate, Txn,
-    TxnOpts, TxnType,
+    GraphMgmtOp, GraphSel, GraphTarget, SparqlWhereClause, TemplateGraph, TemplateTerm,
+    TripleTemplate, Txn, TxnOpts, TxnType,
 };
 use crate::namespace::NamespaceRegistry;
 use fluree_vocab::{fluree, xsd};
@@ -99,9 +99,15 @@ pub enum LowerError {
         context: &'static str,
         span: SourceSpan,
     },
+
+    /// Typed literal whose lexical form is not a value of its datatype. A
+    /// parse error of the request, worded as JSON-LD's refusal of the same
+    /// literal is.
+    #[error("Parse error: {message}")]
+    InvalidLiteral { message: String, span: SourceSpan },
 }
 
-/// Counter for generating anonymous blank node labels.
+/// Counter for the reifier labels annotation expansion mints.
 struct BlankNodeCounter {
     next: u32,
 }
@@ -111,12 +117,10 @@ impl BlankNodeCounter {
         Self { next: 0 }
     }
 
-    fn next(&mut self) -> String {
-        // `[` is outside PN_CHARS, so no hand-written `_:label` can collide
-        // with a minted anonymous label (a user's `_:b0` next to a template
-        // `[]` used to fuse into one node — the same forgeability class as
-        // the query-side `_:[]{N}` scheme this matches).
-        let label = format!("_:[]{}", self.next);
+    /// The label of the reifier an annotation without `~` gets, in its own
+    /// `-ann` space so it can't meet the parser's `-anon` labels for `[]`.
+    fn next_annotation(&mut self) -> String {
+        let label = reserved_blank_label("ann", self.next);
         self.next += 1;
         label
     }
@@ -212,23 +216,12 @@ fn resolve_reifier(
             }
             // Mint a fresh labeled blank node so it round-trips through
             // the existing template lowering exactly like a user-supplied
-            // `~ _:foo` would.
-            //
-            // **Reserved label space.** `BlankNodeCounter::next()`
-            // yields plain `_:b{N}` which can collide with
-            // user-authored `_:b0` — both would skolemize to the
-            // same SID (via `FlakeGenerator::skolemize_blank_node`
-            // keying on `(txn_id, label)`), silently fusing two
-            // distinct subjects. Prefix the synthesized label with
-            // `__fluree_ann_` so it can't conflict with any
-            // hand-written blank-node label. The prefix matches the
-            // by-selector retract's `?_fluree_del_ann_N` convention
-            // and surfaces clearly in any diagnostic output.
-            let raw = bnodes.next();
-            let stripped = raw.strip_prefix("_:").unwrap_or(&raw);
-            let reserved = format!("__fluree_ann_{stripped}");
+            // `~ _:foo` would. Its label can't be written by hand, so it
+            // never fuses with a user's blank node, which would skolemize
+            // to the same SID (`FlakeGenerator::skolemize_blank_node` keys
+            // on `(txn_id, label)`).
             Ok(SubjectTerm::BlankNode(BlankNode::labeled(
-                reserved,
+                bnodes.next_annotation(),
                 annotation.span,
             )))
         }
@@ -488,7 +481,7 @@ fn expand_annotated_triples_in_quad_pattern(
 }
 
 /// Reject any user-authored `f:reifies*` predicate in a triple list.
-/// Mirrors the JSON-LD path's `run_user_authored_reifies_firewall`. The
+/// Mirrors the JSON-LD path's `refuse_reserved_predicate`. The
 /// expansion pass synthesizes legitimate `f:reifies*` triples; this
 /// firewall rejects ones the user wrote directly.
 ///
@@ -585,7 +578,7 @@ fn reject_user_authored_reifies(
 ///   existing stored node (see `it_stable_blank_nodes.rs`).
 /// - DELETE WHERE is NOT routed through this check at lowering: its blank
 ///   nodes keep Fluree's documented existential-variable semantics
-///   ([`BlankNodeVarNamer`]); the strict SPARQL surface rejects them in
+///   ([`bnode_var_name`]); the strict SPARQL surface rejects them in
 ///   `validate()`, and the api seam waives exactly that rejection via
 ///   `Capabilities::with_delete_where_extensions`.
 fn reject_blank_nodes_in_delete_quad_pattern(
@@ -593,10 +586,8 @@ fn reject_blank_nodes_in_delete_quad_pattern(
     context: &'static str,
 ) -> Result<(), LowerError> {
     fn check_blank_node(bn: &BlankNode, context: &'static str) -> Result<(), LowerError> {
-        if let BlankNodeValue::Labeled(l) = &bn.value {
-            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                return Ok(());
-            }
+        if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+            return Ok(());
         }
         Err(LowerError::BlankNodeInDelete {
             context,
@@ -672,81 +663,22 @@ fn reject_with_scoped_annotations(pattern: &QuadPattern) -> Result<(), LowerErro
     Ok(())
 }
 
-/// Assign stable variable names for SPARQL blank nodes when lowering
-/// DELETE WHERE forms — the triple-only fast path directly, and the
-/// GRAPH-bearing path via [`rewrite_blank_nodes_to_vars`].
+/// The variable a SPARQL blank node stands for when lowering DELETE WHERE
+/// forms — the triple-only fast path directly, and the GRAPH-bearing path
+/// via [`rewrite_blank_nodes_to_vars`].
 ///
 /// In SPARQL graph patterns, blank node labels behave like locally-scoped
 /// existential variables; lowering rewrites them to query variables with
-/// reserved names. Two invariants keep the reserved namespace airtight:
+/// reserved names. Every name starts with `_:`, which can never be lexed as
+/// a SPARQL variable (`?`/`$` names cannot contain `:`), so no user-written
+/// variable can unify with a rewritten existential. The names live only as
+/// opaque registry keys; nothing re-lexes them.
 ///
-/// - Every name starts with `_:`, which can never be lexed as a SPARQL
-///   variable (`?`/`$` names cannot contain `:`), so no user-written
-///   variable can unify with a rewritten existential. The names live only
-///   as opaque registry keys; nothing re-lexes them.
-/// - The anonymous arm mints `_:[]{N}`: `[` is illegal in a
-///   BLANK_NODE_LABEL, so anonymous names are disjoint from the labeled
-///   arm's `_:{label}` for every possible label. (Plain `_:b{N}` collided
-///   with a user-written `_:b0`, silently unifying two distinct
-///   existentials — the same label-space hazard the annotation expansion
-///   avoids with its `__fluree_ann_` prefix.)
-///
-/// Same label ⇒ same name, per SPARQL's blank-node label scoping within a
-/// request.
-struct BlankNodeVarNamer {
-    anon_counter: u32,
-}
-
-struct TemplateGraphIds {
-    next: u16,
-    iri_to_local: std::collections::HashMap<String, u16>,
-    delta: FxHashMap<u16, String>,
-}
-
-impl TemplateGraphIds {
-    fn new() -> Self {
-        // 0=default, 1=txn-meta, 2=config, 3+=user graphs (txn-local ids)
-        Self {
-            next: 3,
-            iri_to_local: std::collections::HashMap::new(),
-            delta: FxHashMap::default(),
-        }
-    }
-
-    fn get_or_assign(&mut self, iri: String) -> u16 {
-        if let Some(id) = self.iri_to_local.get(&iri) {
-            return *id;
-        }
-        let id = self.next;
-        self.next = self
-            .next
-            .checked_add(1)
-            .expect("txn-local graph id overflow");
-        self.iri_to_local.insert(iri.clone(), id);
-        self.delta.insert(id, iri);
-        id
-    }
-
-    fn delta(&self) -> FxHashMap<u16, String> {
-        self.delta.clone()
-    }
-}
-
-impl BlankNodeVarNamer {
-    fn new() -> Self {
-        Self { anon_counter: 0 }
-    }
-
-    fn var_name(&mut self, bn: &BlankNodeValue) -> Arc<str> {
-        match bn {
-            BlankNodeValue::Labeled(label) => Arc::from(format!("_:{label}")),
-            BlankNodeValue::Anon => {
-                let name: Arc<str> = Arc::from(format!("_:[]{}", self.anon_counter));
-                self.anon_counter += 1;
-                name
-            }
-        }
-    }
+/// Every blank node has a label (the parser reserves `-anon<N>` for each
+/// `[]`, which no user label can spell), so same label ⇒ same name, per
+/// SPARQL's blank-node label scoping within a request.
+fn bnode_var_name(bn: &BlankNode) -> Arc<str> {
+    Arc::from(format!("_:{}", bn.label))
 }
 
 /// Result of converting a literal to template form.
@@ -765,11 +697,16 @@ struct LiteralResult {
 /// committed as ONE atomic commit (roadmap decision D-10). An empty vector
 /// (empty or prologue-only request) is a valid no-op.
 ///
+/// The request's `validation-mode` and `unique-properties` pragmas fill the
+/// matching `opts` fields the caller left unset. The other update pragmas
+/// (`event-time`, `max-fuel`, `meta`, policy) govern the commit, tracking and
+/// authorization around the lowered `Txn`s, so they ride `ast.pragmas` for
+/// the caller to apply.
+///
 /// # Errors
 ///
 /// Returns `LowerError` if:
 /// - The AST body is not an UPDATE request (is a query)
-/// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
 pub fn lower_sparql_update_request(
@@ -783,6 +720,7 @@ pub fn lower_sparql_update_request(
             return Err(LowerError::NotAnUpdate { span: ast.span });
         }
     };
+    let opts = with_pragma_txn_opts(ast, opts);
     let mut txns = Vec::with_capacity(request.operations.len());
     for op in &request.operations {
         txns.push(lower_sparql_update(
@@ -791,6 +729,18 @@ pub fn lower_sparql_update_request(
             ns,
             opts.clone(),
         )?);
+    }
+    // Every operation is lowered before the first one stages, and staging
+    // can register a namespace (an IRI bound in WHERE and then written).
+    // Each operation carries the whole request's lowered namespaces, so the
+    // first to stage takes every code the lowering gave out, and a namespace
+    // registered while staging gets the next free code instead of one a
+    // later operation already holds.
+    if txns.len() > 1 {
+        let request_delta = ns.delta();
+        for txn in &mut txns {
+            txn.namespace_delta.clone_from(request_delta);
+        }
     }
     Ok(txns)
 }
@@ -801,14 +751,14 @@ pub fn lower_sparql_update_request(
 /// the common one-operation request. It fails loudly on a request with
 /// zero or multiple operations — callers that accept the full request
 /// grammar (the API transaction seam) must use
-/// [`lower_sparql_update_request`] and stage the sequence.
+/// [`lower_sparql_update_request`] and stage the sequence. Pragmas apply as
+/// they do there.
 ///
 /// # Errors
 ///
 /// Returns `LowerError` if:
 /// - The AST body is not an UPDATE request (is a query)
 /// - The request does not contain exactly one operation
-/// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
 pub fn lower_sparql_update_ast(
@@ -823,7 +773,12 @@ pub fn lower_sparql_update_ast(
         }
     };
     match request.operations.as_slice() {
-        [op] => lower_sparql_update(&op.operation, &op.prologue, ns, opts),
+        [op] => lower_sparql_update(
+            &op.operation,
+            &op.prologue,
+            ns,
+            with_pragma_txn_opts(ast, opts),
+        ),
         [] => Err(LowerError::UnsupportedFeature {
             feature: "empty update request (no operation) in single-operation lowering; \
                       use lower_sparql_update_request",
@@ -837,7 +792,27 @@ pub fn lower_sparql_update_ast(
     }
 }
 
+/// `opts` with the transaction options a `# PRAGMA` names, under the same
+/// precedence as their JSON-LD `opts` twins: a value the caller set wins.
+fn with_pragma_txn_opts(ast: &SparqlAst, mut opts: TxnOpts) -> TxnOpts {
+    if opts.validation_mode.is_none() {
+        opts.validation_mode = ast
+            .pragmas
+            .validation_mode
+            .as_deref()
+            .and_then(fluree_db_core::ledger_config::ValidationMode::parse_opt);
+    }
+    if opts.unique_properties.is_none() {
+        opts.unique_properties = ast.pragmas.unique_properties.clone();
+    }
+    opts
+}
+
 /// Lower a SPARQL UPDATE operation to the Transaction IR.
+///
+/// A single operation carries no pragmas; lower the whole request with
+/// [`lower_sparql_update_request`] or [`lower_sparql_update_ast`] to have them
+/// applied.
 ///
 /// # Arguments
 ///
@@ -853,7 +828,6 @@ pub fn lower_sparql_update_ast(
 /// # Errors
 ///
 /// Returns `LowerError` if:
-/// - WITH or USING clauses are present
 /// - Blank nodes appear in WHERE patterns
 /// - RDF-star quoted triples are used
 pub fn lower_sparql_update(
@@ -879,29 +853,26 @@ pub fn lower_sparql_update(
             lower_modify(modify, prologue, ns, &mut vars, &mut bnodes, opts)?
         }
         // Graph-management verbs. CLEAR/DROP/ADD/COPY/MOVE lower to a
-        // graph-management directive executed by whole-graph scan at staging
-        // time; CREATE and SILENT LOAD lower to an empty no-op transaction;
-        // non-SILENT remote LOAD is a documented divergence (D-5).
-        UpdateOperation::Clear(gm) | UpdateOperation::Drop(gm) => {
-            lower_clear_drop(gm, prologue, opts)?
-        }
+        // graph-management directive executed at staging time; CREATE and
+        // SILENT LOAD lower to a transaction that writes no flake; non-SILENT
+        // remote LOAD is a documented divergence (D-5).
+        UpdateOperation::Clear(gm) => lower_clear(gm, prologue, opts)?,
+        UpdateOperation::Drop(gm) => lower_drop(gm, prologue, opts)?,
         UpdateOperation::Create(create) => {
-            // Fluree cannot represent an empty named graph (roadmap D-6), so
-            // CREATE stages no flakes — but it DOES register the graph IRI in
-            // the additive registry (same `graph_delta` mechanism as a
-            // transfer destination). Registration is what O3's source-existence
-            // check consults, so `CREATE GRAPH <g>` followed by a non-SILENT
-            // `COPY <g> TO <h>` is a legitimate empty source rather than the
-            // contradictory "source graph does not exist" error. CREATE of an
-            // ALREADY-registered graph stays a no-op rather than the spec's
-            // §3.2.2 error (D-6: the registry can't distinguish an
-            // intentionally-created empty graph from an emptied one), so
+            // CREATE stages no flakes, but it DOES register the graph IRI
+            // (same `write_graphs` mechanism as a transfer destination), or
+            // brings a dropped graph back. Registration is what O3's
+            // source-existence check consults, so `CREATE GRAPH <g>` followed
+            // by a non-SILENT `COPY <g> TO <h>` is a legitimate empty source
+            // rather than the contradictory "source graph does not exist"
+            // error. CREATE of a graph that exists stays a no-op rather than
+            // the spec's §3.2.2 error (D-6: an intentionally-created empty
+            // graph and an emptied one are the same to the registry), so
             // `silent` has nothing to suppress; the graph remains
             // non-enumerable until a flake lands in it.
             let iri = expand_iri(&create.graph, prologue)?;
             let mut txn = Txn::update().with_opts(opts);
-            txn.graph_delta
-                .insert(fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID, iri);
+            txn.write_graphs.insert(iri);
             txn
         }
         UpdateOperation::Add(t) => lower_transfer(t, prologue, TransferMode::Add, opts)?,
@@ -956,30 +927,35 @@ fn graph_or_default_to_sel(
     })
 }
 
-/// Lower `CLEAR`/`DROP` to a graph-management retract-all directive.
+/// Lower `CLEAR` to a graph-management retract-all directive.
 ///
-/// `DROP ≡ CLEAR` in Fluree's model (roadmap D-6): the graph registry is
-/// additive-only and an emptied graph is indistinguishable from a dropped one.
-///
-/// The parsed `SILENT` flag is deliberately not consulted: in the D-6 model a
-/// CLEAR/DROP of an unregistered graph is a no-op rather than the spec's
-/// "graph does not exist" error, so there is no error for SILENT to suppress —
-/// a documented divergence, symmetric with CREATE-of-existing staying a no-op.
-fn lower_clear_drop(
-    gm: &GraphMgmtRef,
-    prologue: &Prologue,
-    opts: TxnOpts,
-) -> Result<Txn, LowerError> {
+/// The parsed `SILENT` flag is deliberately not consulted: a CLEAR of an
+/// unregistered graph is a no-op rather than the spec's "graph does not exist"
+/// error, so there is no error for SILENT to suppress — a documented
+/// divergence, symmetric with CREATE-of-existing staying a no-op.
+fn lower_clear(gm: &GraphMgmtRef, prologue: &Prologue, opts: TxnOpts) -> Result<Txn, LowerError> {
     let target = graph_ref_all_to_target(&gm.target, prologue)?;
     Ok(Txn::graph_mgmt(GraphMgmtOp::Clear(target)).with_opts(opts))
 }
 
+/// Lower `DROP` to a graph-management drop directive
+/// ([`GraphMgmtOp::Drop`]). Dropping a named graph that does not exist is an
+/// error unless `SILENT`, as the spec has it.
+fn lower_drop(gm: &GraphMgmtRef, prologue: &Prologue, opts: TxnOpts) -> Result<Txn, LowerError> {
+    let target = graph_ref_all_to_target(&gm.target, prologue)?;
+    Ok(Txn::graph_mgmt(GraphMgmtOp::Drop {
+        target,
+        silent: gm.silent,
+    })
+    .with_opts(opts))
+}
+
 /// Lower `ADD`/`COPY`/`MOVE` to a graph-management transfer directive.
 ///
-/// Composes over the CLEAR primitive: COPY/MOVE clear the destination first,
-/// MOVE additionally clears the source afterward. A destination named graph is
-/// recorded in `graph_delta` so the commit envelope registers it even when it
-/// did not previously exist (COPY/ADD into a fresh graph).
+/// COPY/MOVE clear the destination first, keeping its history, and MOVE
+/// drops the source afterward. A destination named graph is recorded in
+/// `write_graphs` so the commit registers it even when it did not previously
+/// exist (COPY/ADD into a fresh graph).
 fn lower_transfer(
     t: &GraphTransfer,
     prologue: &Prologue,
@@ -988,7 +964,7 @@ fn lower_transfer(
 ) -> Result<Txn, LowerError> {
     let from = graph_or_default_to_sel(&t.from, prologue)?;
     let to = graph_or_default_to_sel(&t.to, prologue)?;
-    let (clear_dest, clear_src) = match mode {
+    let (clear_dest, drop_src) = match mode {
         TransferMode::Add => (false, false),
         TransferMode::Copy => (true, false),
         TransferMode::Move => (true, true),
@@ -997,22 +973,16 @@ fn lower_transfer(
         from,
         to: to.clone(),
         clear_dest,
-        clear_src,
+        drop_src,
         // Thread SILENT through so staging can suppress the missing-source
         // error (SPARQL §3.2 / roadmap O3) exactly when the user opted in.
         silent: t.silent,
     })
     .with_opts(opts);
-    // Register a (possibly-new) destination named graph so the commit envelope
-    // persists its g_id. `apply_delta` skips already-registered IRIs, so this
-    // is harmless when the destination already exists. The txn-local key is
-    // arbitrary — `apply_delta`/`provisional_ids` re-derive the ledger g_id
-    // deterministically from the IRI.
+    // A (possibly-new) destination named graph is a write target, so the
+    // commit registers it; an already-registered one is left as is.
     if let GraphSel::Graph(iri) = &to {
-        txn.graph_delta.insert(
-            fluree_db_core::graph_registry::FIRST_USER_GRAPH_ID,
-            iri.clone(),
-        );
+        txn.write_graphs.insert(iri.clone());
     }
     Ok(txn)
 }
@@ -1040,7 +1010,7 @@ fn lower_load(load: &Load, opts: TxnOpts) -> Result<Txn, LowerError> {
 ///
 /// INSERT DATA contains ground quads (no variables) that are directly inserted.
 /// `GRAPH <iri> { ... }` blocks route their triples into the named graph,
-/// registering it via `graph_delta` (same machinery as DELETE/INSERT ... WHERE).
+/// listing it in `write_graphs` (same machinery as DELETE/INSERT ... WHERE).
 fn lower_insert_data(
     data: &QuadData,
     prologue: &Prologue,
@@ -1060,14 +1030,13 @@ fn lower_insert_data(
         AnnotationExpansionMode::InsertData,
         bnodes,
     )?;
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     let insert_templates = lower_quad_pattern_to_templates(
         &pattern.patterns,
         prologue,
         ns,
         vars,
-        bnodes,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
     )?;
 
@@ -1078,12 +1047,14 @@ fn lower_insert_data(
         delete_templates: Vec::new(),
         insert_templates,
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
+        update_where_names_ledger_default: false,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1113,14 +1084,13 @@ fn lower_delete_data(
         AnnotationExpansionMode::DeleteData,
         bnodes,
     )?;
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     let delete_templates = lower_quad_pattern_to_templates(
         &pattern.patterns,
         prologue,
         ns,
         vars,
-        bnodes,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
     )?;
 
@@ -1131,12 +1101,14 @@ fn lower_delete_data(
         delete_templates,
         insert_templates: Vec::new(),
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
+        update_where_names_ledger_default: false,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1199,15 +1171,14 @@ fn lower_delete_where(
         })
         .collect();
 
-    let mut bnode_vars = BlankNodeVarNamer::new();
     let mut where_patterns: Vec<UnresolvedPattern> = Vec::with_capacity(triples.len());
     let mut delete_templates: Vec<TripleTemplate> = Vec::with_capacity(triples.len());
 
     for tp in triples {
         // WHERE side: lower to UnresolvedPattern::Triple with bnodes rewritten as vars
-        let s = subject_to_unresolved_delete_where(&tp.subject, prologue, &mut bnode_vars)?;
+        let s = subject_to_unresolved_delete_where(&tp.subject, prologue)?;
         let p = predicate_to_unresolved(&tp.predicate, prologue)?;
-        let obj = object_to_unresolved_delete_where(&tp.object, prologue, &mut bnode_vars)?;
+        let obj = object_to_unresolved_delete_where(&tp.object, prologue)?;
 
         where_patterns.push(UnresolvedPattern::Triple(UnresolvedTriplePattern {
             s,
@@ -1218,11 +1189,7 @@ fn lower_delete_where(
 
         // DELETE side: lower to TripleTemplate with the same bnode->var mapping
         delete_templates.push(lower_triple_to_delete_template_delete_where(
-            tp,
-            prologue,
-            ns,
-            vars,
-            &mut bnode_vars,
+            tp, prologue, ns, vars,
         )?);
     }
 
@@ -1233,12 +1200,14 @@ fn lower_delete_where(
         delete_templates,
         insert_templates: Vec::new(),
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
+        update_where_names_ledger_default: false,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: FxHashMap::default(),
+        write_graphs: BTreeSet::new(),
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1275,17 +1244,13 @@ fn lower_delete_where_with_graphs(
         pattern: quad_pattern_to_graph_pattern(&rewritten),
     };
 
-    let mut graph_ids = TemplateGraphIds::new();
-    // Blank nodes were rewritten to variables above, so the counter is only a
-    // signature requirement here — the template lowering never mints from it.
-    let mut bnodes = BlankNodeCounter::new();
+    let mut write_graphs = BTreeSet::new();
     let delete_templates = lower_quad_pattern_to_templates(
         &rewritten.patterns,
         prologue,
         ns,
         vars,
-        &mut bnodes,
-        &mut graph_ids,
+        &mut write_graphs,
         None,
     )?;
 
@@ -1296,12 +1261,14 @@ fn lower_delete_where_with_graphs(
         delete_templates,
         insert_templates: Vec::new(),
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
+        update_where_names_ledger_default: false,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1313,8 +1280,8 @@ fn lower_delete_where_with_graphs(
 /// SPARQL blank nodes in a graph pattern are locally-scoped existential
 /// variables. Because a DELETE WHERE pattern is used as both the WHERE clause
 /// and the DELETE template, the same variable must appear on both sides, so
-/// the rewrite happens once on the shared AST. Naming comes from the shared
-/// [`BlankNodeVarNamer`] — the same scheme the triple-only DELETE WHERE path
+/// the rewrite happens once on the shared AST. Naming comes from
+/// [`bnode_var_name`] — the same scheme the triple-only DELETE WHERE path
 /// ships — whose `_:`-prefixed names cannot be lexed as user variables (the
 /// previous lexable `_fluree_bn_{label}` names let a user-written
 /// `?_fluree_bn_x` in the same request unify with the rewritten existential,
@@ -1326,14 +1293,11 @@ fn lower_delete_where_with_graphs(
 fn rewrite_blank_nodes_to_vars(pattern: &QuadPattern) -> QuadPattern {
     use fluree_db_sparql::ast::Var;
 
-    let mut namer = BlankNodeVarNamer::new();
-    let mut rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
-        if let BlankNodeValue::Labeled(l) = &bn.value {
-            if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                return None;
-            }
+    let rewrite_bnode = |bn: &BlankNode| -> Option<Var> {
+        if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+            return None;
         }
-        Some(Var::new(namer.var_name(&bn.value), bn.span))
+        Some(Var::new(bnode_var_name(bn), bn.span))
     };
 
     let mut rewrite_triple = |tp: &TriplePattern| -> TriplePattern {
@@ -1440,7 +1404,7 @@ fn lower_modify(
     //
     // Note: `lower_sparql_update` takes `&UpdateOperation`, so we can't move out of the AST here.
     // Cloning keeps the lowering interface simple and ensures the transaction IR owns its WHERE.
-    let mut graph_ids = TemplateGraphIds::new();
+    let mut write_graphs = BTreeSet::new();
     let with_graph_iri: Option<String> = if let Some(iri) = modify.with_iri.as_ref() {
         Some(expand_iri(iri, prologue)?)
     } else {
@@ -1467,9 +1431,17 @@ fn lower_modify(
         Vec::new()
     };
 
-    let default_template_graph_id: Option<u16> = with_graph_iri
-        .as_ref()
-        .map(|iri| graph_ids.get_or_assign(iri.clone()));
+    // `WITH <urn:default>` names the default graph, which templates write
+    // without naming a graph; any other `WITH` IRI is their graph.
+    let default_template_graph: Option<Arc<str>> = with_graph_iri
+        .as_deref()
+        .filter(|iri| {
+            fluree_db_core::GraphSel::keyword(iri) != Some(fluree_db_core::GraphSel::Default)
+        })
+        .map(|iri| {
+            write_graphs.insert(iri.to_string());
+            Arc::from(iri)
+        });
 
     let sparql_where = SparqlWhereClause {
         prologue: prologue.clone(),
@@ -1486,7 +1458,7 @@ fn lower_modify(
     let delete_templates = if let Some(delete_clause) = &modify.delete_clause {
         reject_blank_nodes_in_delete_quad_pattern(delete_clause, "DELETE templates")?;
         reject_user_authored_reifies_in_quad_pattern(delete_clause, prologue)?;
-        if default_template_graph_id.is_some() {
+        if default_template_graph.is_some() {
             reject_with_scoped_annotations(delete_clause)?;
         }
         let mut expanded = delete_clause.clone();
@@ -1500,9 +1472,8 @@ fn lower_modify(
             prologue,
             ns,
             vars,
-            bnodes,
-            &mut graph_ids,
-            default_template_graph_id,
+            &mut write_graphs,
+            default_template_graph.clone(),
         )?
     } else {
         Vec::new()
@@ -1510,7 +1481,7 @@ fn lower_modify(
 
     let insert_templates = if let Some(insert_clause) = &modify.insert_clause {
         reject_user_authored_reifies_in_quad_pattern(insert_clause, prologue)?;
-        if default_template_graph_id.is_some() {
+        if default_template_graph.is_some() {
             reject_with_scoped_annotations(insert_clause)?;
         }
         let mut expanded = insert_clause.clone();
@@ -1524,9 +1495,8 @@ fn lower_modify(
             prologue,
             ns,
             vars,
-            bnodes,
-            &mut graph_ids,
-            default_template_graph_id,
+            &mut write_graphs,
+            default_template_graph.clone(),
         )?
     } else {
         Vec::new()
@@ -1539,12 +1509,14 @@ fn lower_modify(
         delete_templates,
         insert_templates,
         values: None,
+        unmatched_optional: Default::default(),
         update_where_default_graph_iris: None,
         update_where_named_graphs: None,
+        update_where_names_ledger_default: false,
         opts,
         vars: mem::take(vars),
         txn_meta: Vec::new(),
-        graph_delta: graph_ids.delta(),
+        write_graphs,
         namespace_delta: std::collections::HashMap::new(),
         graph_mgmt: None,
         sync_graph: None,
@@ -1556,40 +1528,43 @@ fn lower_quad_pattern_to_templates(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
-    graph_ids: &mut TemplateGraphIds,
-    default_graph_id: Option<u16>,
+    write_graphs: &mut BTreeSet<String>,
+    default_graph: Option<Arc<str>>,
 ) -> Result<Vec<TripleTemplate>, LowerError> {
     let mut out: Vec<TripleTemplate> = Vec::new();
     for el in elements {
         match el {
             QuadPatternElement::Triple(tp) => {
-                let mut t = lower_triple_to_template(tp, prologue, ns, vars, bnodes)?;
-                if let Some(g_id) = default_graph_id {
-                    t = t.with_graph_id(g_id);
+                let mut t = lower_triple_to_template(tp, prologue, ns, vars)?;
+                if let Some(iri) = &default_graph {
+                    t = t.in_graph(Arc::clone(iri));
                 }
                 out.push(t);
             }
-            QuadPatternElement::Graph { name, triples, .. } => {
-                let graph_iri = match name {
-                    fluree_db_sparql::ast::pattern::GraphName::Iri(iri) => {
-                        expand_iri(iri, prologue)?
+            QuadPatternElement::Graph { name, triples, .. } => match name {
+                fluree_db_sparql::ast::pattern::GraphName::Iri(iri) => {
+                    let iri = expand_iri(iri, prologue)?;
+                    write_graphs.insert(iri.clone());
+                    let iri: Arc<str> = Arc::from(iri);
+                    for tp in triples {
+                        out.push(
+                            lower_triple_to_template(tp, prologue, ns, vars)?
+                                .in_graph(Arc::clone(&iri)),
+                        );
                     }
-                    fluree_db_sparql::ast::pattern::GraphName::Var(v) => {
-                        return Err(LowerError::UnsupportedFeature {
-                            feature: "GRAPH variables in UPDATE templates",
-                            span: v.span,
-                        });
-                    }
-                };
-                let txn_local_g_id = graph_ids.get_or_assign(graph_iri);
-                for tp in triples {
-                    out.push(
-                        lower_triple_to_template(tp, prologue, ns, vars, bnodes)?
-                            .with_graph_id(txn_local_g_id),
-                    );
                 }
-            }
+                fluree_db_sparql::ast::pattern::GraphName::Var(v) => {
+                    // Same registry key as the WHERE lowering, so the template
+                    // reads the column the WHERE's `GRAPH ?g` binds.
+                    let graph_var = vars.get_or_insert(&format!("?{}", v.name));
+                    for tp in triples {
+                        out.push(
+                            lower_triple_to_template(tp, prologue, ns, vars)?
+                                .with_graph_var(graph_var),
+                        );
+                    }
+                }
+            },
         }
     }
     Ok(out)
@@ -1601,9 +1576,8 @@ fn lower_triple_to_template(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
 ) -> Result<TripleTemplate, LowerError> {
-    let subject = subject_to_template(&triple.subject, prologue, ns, vars, bnodes)?;
+    let subject = subject_to_template(&triple.subject, prologue, ns, vars)?;
     let predicate = predicate_to_template(&triple.predicate, prologue, ns, vars)?;
 
     // Object needs special handling for literal metadata
@@ -1612,7 +1586,7 @@ fn lower_triple_to_template(
             let result = literal_to_template(lit, prologue, ns)?;
             (result.term, result.dtc)
         }
-        other => (object_to_template(other, prologue, ns, vars, bnodes)?, None),
+        other => (object_to_template(other, prologue, ns, vars)?, None),
     };
 
     Ok(TripleTemplate {
@@ -1621,7 +1595,8 @@ fn lower_triple_to_template(
         object,
         dtc,
         list_index: None, // Always None for SPARQL UPDATE
-        graph_id: None,   // Default graph
+        list_id: None,
+        graph: TemplateGraph::Default,
     })
 }
 
@@ -1632,7 +1607,6 @@ fn lower_triple_to_template(
 fn subject_to_unresolved_delete_where(
     term: &SubjectTerm,
     prologue: &Prologue,
-    bnodes: &mut BlankNodeVarNamer,
 ) -> Result<UnresolvedTerm, LowerError> {
     match term {
         SubjectTerm::Var(v) => Ok(UnresolvedTerm::Var(Arc::from(format!("?{}", v.name)))),
@@ -1640,12 +1614,10 @@ fn subject_to_unresolved_delete_where(
         SubjectTerm::BlankNode(bn) => {
             // Stable Fluree blank-node ids match the stored node as a
             // constant; other labels act as existential variables (§3.1).
-            if let BlankNodeValue::Labeled(l) = &bn.value {
-                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                    return Ok(UnresolvedTerm::Iri(Arc::from(format!("_:{l}"))));
-                }
+            if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+                return Ok(UnresolvedTerm::Iri(Arc::from(format!("_:{}", bn.label))));
             }
-            Ok(UnresolvedTerm::Var(bnodes.var_name(&bn.value)))
+            Ok(UnresolvedTerm::Var(bnode_var_name(bn)))
         }
         SubjectTerm::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF-star quoted triple",
@@ -1672,7 +1644,6 @@ fn predicate_to_unresolved(
 fn object_to_unresolved_delete_where(
     term: &Term,
     prologue: &Prologue,
-    bnodes: &mut BlankNodeVarNamer,
 ) -> Result<UnresolvedTermWithMeta, LowerError> {
     match term {
         Term::Var(v) => Ok(UnresolvedTermWithMeta {
@@ -1687,16 +1658,14 @@ fn object_to_unresolved_delete_where(
         Term::BlankNode(bn) => {
             // Stable Fluree blank-node ids match as constants
             // (see subject_to_unresolved_delete_where).
-            if let BlankNodeValue::Labeled(l) = &bn.value {
-                if crate::namespace::stable_blank_node_sid_from_label(l).is_some() {
-                    return Ok(UnresolvedTermWithMeta {
-                        term: UnresolvedTerm::Iri(Arc::from(format!("_:{l}"))),
-                        dtc: None,
-                    });
-                }
+            if crate::namespace::stable_blank_node_sid_from_label(&bn.label).is_some() {
+                return Ok(UnresolvedTermWithMeta {
+                    term: UnresolvedTerm::Iri(Arc::from(format!("_:{}", bn.label))),
+                    dtc: None,
+                });
             }
             Ok(UnresolvedTermWithMeta {
-                term: UnresolvedTerm::Var(bnodes.var_name(&bn.value)),
+                term: UnresolvedTerm::Var(bnode_var_name(bn)),
                 dtc: None,
             })
         }
@@ -1716,7 +1685,6 @@ fn lower_triple_to_delete_template_delete_where(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeVarNamer,
 ) -> Result<TripleTemplate, LowerError> {
     // Subject
     let subject = match &triple.subject {
@@ -1726,17 +1694,10 @@ fn lower_triple_to_delete_template_delete_where(
             TemplateTerm::Sid(ns.sid_for_iri(&expanded))
         }
         SubjectTerm::BlankNode(bn) => {
-            let stable = match &bn.value {
-                BlankNodeValue::Labeled(l) => crate::namespace::stable_blank_node_sid_from_label(l),
-                BlankNodeValue::Anon => None,
-            };
-            match stable {
+            match crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
                 // Stable Fluree blank-node ids retract from the stored node.
                 Some(sid) => TemplateTerm::Sid(sid),
-                None => {
-                    let name = bnodes.var_name(&bn.value);
-                    TemplateTerm::Var(vars.get_or_insert(&name))
-                }
+                None => TemplateTerm::Var(vars.get_or_insert(&bnode_var_name(bn))),
             }
         }
         SubjectTerm::QuotedTriple(qt) => {
@@ -1778,16 +1739,12 @@ fn lower_triple_to_delete_template_delete_where(
             (r.term, r.dtc)
         }
         Term::BlankNode(bn) => {
-            let stable = match &bn.value {
-                BlankNodeValue::Labeled(l) => crate::namespace::stable_blank_node_sid_from_label(l),
-                BlankNodeValue::Anon => None,
-            };
-            match stable {
+            match crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
                 Some(sid) => (TemplateTerm::Sid(sid), None),
-                None => {
-                    let name = bnodes.var_name(&bn.value);
-                    (TemplateTerm::Var(vars.get_or_insert(&name)), None)
-                }
+                None => (
+                    TemplateTerm::Var(vars.get_or_insert(&bnode_var_name(bn))),
+                    None,
+                ),
             }
         }
         Term::QuotedTriple(qt) => {
@@ -1811,7 +1768,8 @@ fn lower_triple_to_delete_template_delete_where(
         object,
         dtc,
         list_index: None,
-        graph_id: None,
+        list_id: None,
+        graph: TemplateGraph::Default,
     })
 }
 
@@ -1895,7 +1853,6 @@ fn subject_to_template(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
 ) -> Result<TemplateTerm, LowerError> {
     match term {
         SubjectTerm::Var(v) => {
@@ -1907,19 +1864,13 @@ fn subject_to_template(
             Ok(TemplateTerm::Sid(ns.sid_for_iri(&expanded)))
         }
         SubjectTerm::BlankNode(bn) => {
-            let label = match &bn.value {
-                BlankNodeValue::Labeled(l) => {
-                    // Stable Fluree blank-node ids address the existing
-                    // stored node instead of skolemizing a fresh one, which
-                    // makes DELETE templates on them meaningful.
-                    if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(l) {
-                        return Ok(TemplateTerm::Sid(sid));
-                    }
-                    format!("_:{l}")
-                }
-                BlankNodeValue::Anon => bnodes.next(),
-            };
-            Ok(TemplateTerm::BlankNode(label))
+            // Stable Fluree blank-node ids address the existing stored node
+            // instead of skolemizing a fresh one, which makes DELETE
+            // templates on them meaningful.
+            if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
+                return Ok(TemplateTerm::Sid(sid));
+            }
+            Ok(TemplateTerm::BlankNode(format!("_:{}", bn.label)))
         }
         SubjectTerm::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF-star quoted triple",
@@ -1960,7 +1911,6 @@ fn object_to_template(
     prologue: &Prologue,
     ns: &mut NamespaceRegistry,
     vars: &mut VarRegistry,
-    bnodes: &mut BlankNodeCounter,
 ) -> Result<TemplateTerm, LowerError> {
     match term {
         Term::Var(v) => {
@@ -1974,18 +1924,12 @@ fn object_to_template(
         // Literals should go through literal_to_template for metadata; this is a fallback
         Term::Literal(lit) => Ok(literal_to_template(lit, prologue, ns)?.term),
         Term::BlankNode(bn) => {
-            let label = match &bn.value {
-                BlankNodeValue::Labeled(l) => {
-                    // Stable Fluree blank-node ids resolve to the stored node
-                    // (see subject_to_template).
-                    if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(l) {
-                        return Ok(TemplateTerm::Sid(sid));
-                    }
-                    format!("_:{l}")
-                }
-                BlankNodeValue::Anon => bnodes.next(),
-            };
-            Ok(TemplateTerm::BlankNode(label))
+            // Stable Fluree blank-node ids resolve to the stored node
+            // (see subject_to_template).
+            if let Some(sid) = crate::namespace::stable_blank_node_sid_from_label(&bn.label) {
+                return Ok(TemplateTerm::Sid(sid));
+            }
+            Ok(TemplateTerm::BlankNode(format!("_:{}", bn.label)))
         }
         Term::QuotedTriple(qt) => Err(LowerError::UnsupportedFeature {
             feature: "RDF 1.2 reified triple (`<< s p o >>`) in SPARQL UPDATE (deferred)",
@@ -2016,7 +1960,7 @@ fn literal_to_template(
         SparqlLiteralValue::Typed { value, datatype } => {
             let dt_iri = expand_iri(datatype, prologue)?;
             let dt_sid = ns.sid_for_iri(&dt_iri);
-            let coerced = coerce_typed_flake_value(value, &dt_iri);
+            let coerced = coerce_typed_flake_value(value, &dt_iri, lit.span)?;
             Ok(LiteralResult {
                 term: TemplateTerm::Value(coerced),
                 dtc: Some(DatatypeConstraint::Explicit(dt_sid)),
@@ -2131,7 +2075,7 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
             }
         }
         xsd::DOUBLE => {
-            if let Ok(d) = lexical.parse::<f64>() {
+            if let Some(d) = fluree_graph_ir::parse_xsd_double(lexical) {
                 return UnresolvedTerm::Literal(LiteralValue::Double(d));
             }
         }
@@ -2164,49 +2108,22 @@ fn coerce_typed_value(lexical: &str, datatype_iri: &str) -> UnresolvedTerm {
     UnresolvedTerm::Literal(LiteralValue::String(Arc::from(lexical)))
 }
 
-/// Coerce a typed literal lexical value to FlakeValue.
-fn coerce_typed_flake_value(lexical: &str, datatype_iri: &str) -> FlakeValue {
-    // MVP: basic coercion for common types
-    match datatype_iri {
-        xsd::INTEGER => {
-            // xsd:integer is unbounded: promote past i64 instead of falling
-            // back to a string-valued literal.
-            if let Ok(i) = lexical.parse::<i64>() {
-                return FlakeValue::Long(i);
-            }
-            if let Ok(n) = lexical.parse::<num_bigint::BigInt>() {
-                return FlakeValue::BigInt(Box::new(n));
-            }
+/// Coerce a typed literal to the value every write surface commits for it.
+///
+/// Shares `coerce_string_value` with JSON-LD so `"2026-09-08"^^xsd:date`
+/// commits a date, not a string carrying the date datatype — which no query
+/// for the date matches and which the index used to decode as a date (#1987).
+fn coerce_typed_flake_value(
+    lexical: &str,
+    datatype_iri: &str,
+    span: SourceSpan,
+) -> Result<FlakeValue, LowerError> {
+    fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri).map_err(|e| {
+        LowerError::InvalidLiteral {
+            message: e.message,
+            span,
         }
-        xsd::DOUBLE => {
-            if let Ok(d) = lexical.parse::<f64>() {
-                return FlakeValue::Double(d);
-            }
-        }
-        xsd::DECIMAL => {
-            if let Ok(d) = lexical.parse::<bigdecimal::BigDecimal>() {
-                return FlakeValue::Decimal(Box::new(d));
-            }
-        }
-        xsd::BOOLEAN => {
-            if lexical == "true" || lexical == "1" {
-                return FlakeValue::Boolean(true);
-            } else if lexical == "false" || lexical == "0" {
-                return FlakeValue::Boolean(false);
-            }
-        }
-        // See `coerce_typed_value` — share core's parser for f:embeddingVector.
-        fluree::EMBEDDING_VECTOR => {
-            if let Ok(fv @ FlakeValue::Vector(_)) =
-                fluree_db_core::coerce::coerce_string_value(lexical, datatype_iri)
-            {
-                return fv;
-            }
-        }
-        _ => {}
-    }
-    // Fall back to string
-    FlakeValue::String(lexical.to_string())
+    })
 }
 
 #[cfg(test)]
@@ -2342,9 +2259,8 @@ mod tests {
         let var = Var::new("name", test_span());
         let prologue = test_prologue();
         let subject = SubjectTerm::Var(var);
-        let mut namer = BlankNodeVarNamer::new();
 
-        let result = subject_to_unresolved_delete_where(&subject, &prologue, &mut namer).unwrap();
+        let result = subject_to_unresolved_delete_where(&subject, &prologue).unwrap();
         match result {
             UnresolvedTerm::Var(name) => assert_eq!(name.as_ref(), "?name"),
             _ => panic!("Expected variable term"),
@@ -2358,9 +2274,8 @@ mod tests {
         let bn = BlankNode::labeled("b1", test_span());
         let prologue = test_prologue();
         let subject = SubjectTerm::BlankNode(bn);
-        let mut namer = BlankNodeVarNamer::new();
 
-        let result = subject_to_unresolved_delete_where(&subject, &prologue, &mut namer).unwrap();
+        let result = subject_to_unresolved_delete_where(&subject, &prologue).unwrap();
         assert_eq!(result, UnresolvedTerm::Var(Arc::from("_:b1")));
     }
 
@@ -2385,15 +2300,14 @@ mod tests {
     #[test]
     fn test_blank_node_counter() {
         let mut counter = BlankNodeCounter::new();
-        assert_eq!(counter.next(), "_:[]0");
-        assert_eq!(counter.next(), "_:[]1");
-        assert_eq!(counter.next(), "_:[]2");
+        assert_eq!(counter.next_annotation(), "-ann0");
+        assert_eq!(counter.next_annotation(), "-ann1");
     }
 
     #[test]
     fn test_lower_insert_data_graph_block_registers_named_graph() {
         // Issue #1288: INSERT DATA { GRAPH <g> { ... } } must lower into
-        // graph-tagged templates plus a graph_delta registering the named graph.
+        // graph-tagged templates plus a write_graphs entry for the named graph.
         let parsed = fluree_db_sparql::parse_sparql(
             "INSERT DATA { GRAPH <urn:g1> { <http://example.org/s> <http://example.org/p> \"v\" } }",
         );
@@ -2410,14 +2324,14 @@ mod tests {
         assert_eq!(txn.txn_type, TxnType::Insert);
         assert_eq!(txn.insert_templates.len(), 1);
         assert!(
-            txn.insert_templates[0].graph_id.is_some(),
-            "template should carry a txn-local graph id"
+            txn.insert_templates[0].graph == TemplateGraph::Iri("urn:g1".into()),
+            "template should carry the graph IRI"
         );
-        // The named graph IRI must be registered in graph_delta.
+        // The named graph IRI must be listed in write_graphs.
         assert!(
-            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
-            "graph_delta must register <urn:g1>, got {:?}",
-            txn.graph_delta
+            txn.write_graphs.contains("urn:g1"),
+            "write_graphs must list <urn:g1>, got {:?}",
+            txn.write_graphs
         );
     }
 
@@ -2447,13 +2361,46 @@ mod tests {
         assert!(txn.where_patterns.is_empty());
         assert_eq!(txn.delete_templates.len(), 1);
         assert!(
-            txn.delete_templates[0].graph_id.is_some(),
-            "delete template should carry a txn-local graph id"
+            txn.delete_templates[0].graph == TemplateGraph::Iri("urn:g1".into()),
+            "delete template should carry the graph IRI"
         );
         assert!(
-            txn.graph_delta.values().any(|iri| iri == "urn:g1"),
-            "graph_delta must register <urn:g1>, got {:?}",
-            txn.graph_delta
+            txn.write_graphs.contains("urn:g1"),
+            "write_graphs must list <urn:g1>, got {:?}",
+            txn.write_graphs
+        );
+    }
+
+    #[test]
+    fn test_lower_graph_variable_templates() {
+        // `GRAPH ?g` templates carry the WHERE's `?g` variable, not a graph
+        // IRI, and list nothing in `write_graphs` until staging resolves it.
+        let parsed = fluree_db_sparql::parse_sparql(
+            "DELETE { GRAPH ?g { ?s <http://example.org/status> \"old\" } } \
+             INSERT { GRAPH ?g { ?s <http://example.org/status> \"new\" } } \
+             WHERE  { GRAPH ?g { ?s <http://example.org/status> \"old\" } }",
+        );
+        assert!(
+            !parsed.has_errors(),
+            "parse errors: {:?}",
+            parsed.diagnostics
+        );
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+
+        let g = txn.vars.get("?g").expect("?g registered");
+        for t in txn.delete_templates.iter().chain(&txn.insert_templates) {
+            assert_eq!(t.graph, TemplateGraph::Var(g));
+        }
+        assert!(txn.write_graphs.is_empty(), "{:?}", txn.write_graphs);
+
+        let parsed = fluree_db_sparql::parse_sparql("DELETE WHERE { GRAPH ?g { ?s ?p ?o } }");
+        let ast = parsed.ast.expect("AST");
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        assert_eq!(
+            txn.delete_templates[0].graph,
+            TemplateGraph::Var(txn.vars.get("?g").expect("?g registered"))
         );
     }
 
@@ -2477,7 +2424,7 @@ mod tests {
         assert!(txn.sparql_where.is_none());
         assert_eq!(txn.where_patterns.len(), 1);
         assert_eq!(txn.delete_templates.len(), 1);
-        assert!(txn.delete_templates[0].graph_id.is_none());
+        assert_eq!(txn.delete_templates[0].graph, TemplateGraph::Default);
     }
 
     #[test]
@@ -2543,16 +2490,17 @@ mod tests {
 
     #[test]
     fn test_delete_where_anon_bnode_vars_disjoint_from_labels() {
-        // A user-written label `_:b0` and an anonymous `[]` are distinct
-        // existentials. The old `_:b{N}` anonymous names lived inside the
-        // label namespace, so `[]` unified with a user's `_:b0` — deleting
-        // by the JOIN of two patterns that the spec treats independently.
-        // The `_:[]{N}` anonymous namespace cannot be produced by any
-        // BLANK_NODE_LABEL. Pin both DELETE WHERE paths.
+        // A user-written label and an anonymous `[]` are distinct
+        // existentials. Anonymous names once lived inside the label
+        // namespace (`_:b{N}`), so `[]` unified with a user's `_:b0` —
+        // deleting by the JOIN of two patterns that the spec treats
+        // independently. The parser's `-anon<N>` labels cannot be spelled as
+        // a BLANK_NODE_LABEL. Pin both DELETE WHERE paths.
         for input in [
-            // Triple-only fast path (BlankNodeVarNamer used directly).
+            // Triple-only fast path.
             "DELETE WHERE { _:b0 <http://example.org/p> ?o . [] <http://example.org/q> ?r }",
-            // GRAPH path (rewrite_blank_nodes_to_vars, shared namer).
+            "DELETE WHERE { _:anon0 <http://example.org/p> ?o . [] <http://example.org/q> ?r }",
+            // GRAPH path (rewrite_blank_nodes_to_vars).
             "DELETE WHERE { GRAPH <urn:g1> { _:b0 <http://example.org/p> ?o . \
              [] <http://example.org/q> ?r } }",
         ] {
@@ -2576,6 +2524,49 @@ mod tests {
                 "a user label _:b0 must not unify with an anonymous [] existential ({input})"
             );
         }
+    }
+
+    #[test]
+    fn test_delete_where_anon_bnode_names_one_var_on_both_sides() {
+        // Each `[]` of a triple-only DELETE WHERE is one existential: its
+        // template must read the variable its WHERE pattern binds, as subject,
+        // as object, with several in one pattern, and across the copies a `;`
+        // list makes of its subject.
+        let input = "DELETE WHERE { [] <http://example.org/p> ?o . \
+                     <http://example.org/s> <http://example.org/q> [] . \
+                     [] <http://example.org/r> [] . \
+                     [] <http://example.org/t> ?x ; <http://example.org/u> ?y }";
+        let parsed = fluree_db_sparql::parse_sparql(input);
+        assert!(!parsed.has_errors(), "{:?}", parsed.diagnostics);
+        let ast = parsed.ast.expect("AST");
+        let mut ns = NamespaceRegistry::new();
+        let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        assert!(txn.sparql_where.is_none(), "the triple-only path");
+        let var_of = |term: &UnresolvedTerm| match term {
+            UnresolvedTerm::Var(name) => txn.vars.get(name),
+            _ => None,
+        };
+        let mut anon = Vec::new();
+        for (pattern, template) in txn.where_patterns.iter().zip(&txn.delete_templates) {
+            let UnresolvedPattern::Triple(tp) = pattern else {
+                panic!("a triple pattern: {pattern:?}");
+            };
+            for (where_term, template_term) in
+                [(&tp.s, &template.subject), (&tp.o, &template.object)]
+            {
+                if let TemplateTerm::Var(v) = template_term {
+                    assert_eq!(var_of(where_term), Some(*v), "{where_term:?}");
+                    anon.push(*v);
+                }
+            }
+        }
+        anon.retain(|v| txn.vars.name(*v).starts_with("_:-anon"));
+        let distinct: std::collections::HashSet<_> = anon.iter().collect();
+        assert_eq!(
+            (anon.len(), distinct.len()),
+            (6, 5),
+            "five `[]`, the `;` copy reading its subject's existential"
+        );
     }
 
     #[test]
@@ -2683,7 +2674,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lower_insert_data_default_graph_has_no_graph_delta() {
+    fn test_lower_insert_data_default_graph_has_no_write_graphs() {
         // A plain INSERT DATA (no GRAPH block) lowers with no named-graph delta.
         let parsed = fluree_db_sparql::parse_sparql(
             "INSERT DATA { <http://example.org/s> <http://example.org/p> \"v\" }",
@@ -2699,8 +2690,8 @@ mod tests {
         let txn = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
 
         assert_eq!(txn.insert_templates.len(), 1);
-        assert!(txn.insert_templates[0].graph_id.is_none());
-        assert!(txn.graph_delta.is_empty());
+        assert_eq!(txn.insert_templates[0].graph, TemplateGraph::Default);
+        assert!(txn.write_graphs.is_empty());
     }
 
     #[test]
@@ -2710,7 +2701,12 @@ mod tests {
         // FlakeValue::String — otherwise downstream flake gen pairs a String
         // value with the embeddingVector datatype and the index decodes
         // garbage.
-        let result = coerce_typed_flake_value("[0.1, 0.2, 0.3, 0.4]", fluree::EMBEDDING_VECTOR);
+        let result = coerce_typed_flake_value(
+            "[0.1, 0.2, 0.3, 0.4]",
+            fluree::EMBEDDING_VECTOR,
+            SourceSpan::default(),
+        )
+        .unwrap();
         match result {
             FlakeValue::Vector(v) => assert_eq!(v.len(), 4),
             other => panic!("expected FlakeValue::Vector, got {other:?}"),
@@ -2798,5 +2794,42 @@ mod tests {
             ),
             "expected a clean quoted-triple-subject UnsupportedFeature, got {result:?}"
         );
+    }
+
+    /// Every request-level entry applies the transaction pragmas, so an
+    /// embedder that lowers the AST itself enforces what the request asked for.
+    #[test]
+    fn request_entries_apply_txn_pragmas_unless_caller_set_them() {
+        use fluree_db_core::ledger_config::ValidationMode;
+
+        let parsed = fluree_db_sparql::parse_sparql(
+            "# PRAGMA unique-properties: ex:email\n\
+             # PRAGMA validation-mode: warn\n\
+             PREFIX ex: <http://example.org/ns/>\n\
+             INSERT DATA { ex:bob ex:email \"bob@example.org\" }",
+        );
+        let ast = parsed.ast.expect("AST");
+        let email = Some(vec!["http://example.org/ns/email".to_string()]);
+
+        let mut ns = NamespaceRegistry::new();
+        let single = lower_sparql_update_ast(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        let request =
+            lower_sparql_update_request(&ast, &mut ns, TxnOpts::default()).expect("lower");
+        for opts in [&single.opts, &request[0].opts] {
+            assert_eq!(opts.unique_properties, email);
+            assert_eq!(opts.validation_mode, Some(ValidationMode::Warn));
+        }
+
+        let caller = TxnOpts {
+            unique_properties: Some(vec!["http://example.org/ns/handle".to_string()]),
+            validation_mode: Some(ValidationMode::Reject),
+            ..TxnOpts::default()
+        };
+        let txn = lower_sparql_update_ast(&ast, &mut ns, caller).expect("lower");
+        assert_eq!(
+            txn.opts.unique_properties,
+            Some(vec!["http://example.org/ns/handle".to_string()])
+        );
+        assert_eq!(txn.opts.validation_mode, Some(ValidationMode::Reject));
     }
 }

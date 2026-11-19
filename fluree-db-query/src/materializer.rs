@@ -51,9 +51,6 @@ pub enum JoinKey<'a> {
     Lit {
         o_kind: u8,
         o_key: u64,
-        /// `p_id` is only required for NUM_BIG decoding (per-predicate numbig arena).
-        /// For all other literal kinds, it must not affect join-key identity.
-        p_id_for_numbig: Option<u32>,
         dt_id: u16,
         lang_id: u16,
     },
@@ -80,7 +77,11 @@ impl Hash for FlakeValueKey {
         match &self.0 {
             FlakeValue::String(s) => s.hash(state),
             FlakeValue::Long(n) => n.hash(state),
-            FlakeValue::Double(d) => d.to_bits().hash(state),
+            // The bits `FlakeValue`'s equality compares: every NaN equal,
+            // -0.0 equal to 0.0.
+            FlakeValue::Double(d) => {
+                fluree_db_core::value_id::canonical_f64_bits(*d).hash(state);
+            }
             FlakeValue::Boolean(b) => b.hash(state),
             FlakeValue::Ref(sid) => {
                 sid.namespace_code.hash(state);
@@ -93,9 +94,7 @@ impl Hash for FlakeValueKey {
             FlakeValue::Time(t) => t.hash(state),
             FlakeValue::Json(s) => s.hash(state),
             FlakeValue::Vector(v) => {
-                for f in v.iter() {
-                    f.to_bits().hash(state);
-                }
+                fluree_db_core::value::vector_value_hash(v).hash(state);
             }
             FlakeValue::Null => {}
             FlakeValue::GYear(v) => v.hash(state),
@@ -134,18 +133,16 @@ impl PartialEq for JoinKey<'_> {
                 JoinKey::Lit {
                     o_kind: k1,
                     o_key: ok1,
-                    p_id_for_numbig: p1,
                     dt_id: d1,
                     lang_id: l1,
                 },
                 JoinKey::Lit {
                     o_kind: k2,
                     o_key: ok2,
-                    p_id_for_numbig: p2,
                     dt_id: d2,
                     lang_id: l2,
                 },
-            ) => k1 == k2 && ok1 == ok2 && p1 == p2 && d1 == d2 && l1 == l2,
+            ) => k1 == k2 && ok1 == ok2 && d1 == d2 && l1 == l2,
             (JoinKey::MaterializedSid(ns1, n1), JoinKey::MaterializedSid(ns2, n2)) => {
                 ns1 == ns2 && n1 == n2
             }
@@ -180,13 +177,11 @@ impl Hash for JoinKey<'_> {
             JoinKey::Lit {
                 o_kind,
                 o_key,
-                p_id_for_numbig,
                 dt_id,
                 lang_id,
             } => {
                 o_kind.hash(state);
                 o_key.hash(state);
-                p_id_for_numbig.hash(state);
                 dt_id.hash(state);
                 lang_id.hash(state);
             }
@@ -258,7 +253,7 @@ pub struct Materializer {
     /// Graph-scoped view (store + graph ID) for decoding.
     ///
     /// When constructed with a novelty-aware `BinaryGraphView` (via
-    /// `ExecutionContext::graph_view()`), all decode methods automatically
+    /// `ExecutionContext::one_graph_view()`), all decode methods automatically
     /// handle watermark routing for novelty-only subject/string IDs.
     graph_view: BinaryGraphView,
     /// Cache: s_id -> Sid (for terminal output)
@@ -353,21 +348,46 @@ impl Materializer {
                 dtc: dtc.clone(),
             }),
 
+            // An arena handle (NUM_BIG, VECTOR_ID) is not a term identity: it is
+            // scoped per (graph, predicate), and the vector arena does not
+            // deduplicate. Key it by its decoded value, read through the graph
+            // the literal carries.
             Binding::EncodedLit {
                 o_kind,
                 o_key,
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
+                ..
+            } if crate::binding::is_arena_kind(*o_kind) => {
+                match crate::group_aggregate::materialize_encoded(
+                    binding,
+                    Some(self.graph_view.terms()),
+                )? {
+                    Binding::Lit { val, dtc, .. } => JoinKey::MaterializedLit(MaterializedLitKey {
+                        val: FlakeValueKey(val),
+                        dtc,
+                    }),
+                    _ => {
+                        return Err(decode_error(
+                            "decode arena literal",
+                            format!("o_kind={o_kind} o_key={o_key} p_id={p_id} g_id={arena_g_id}"),
+                            format!("dt_id={dt_id} lang_id={lang_id}"),
+                        ))
+                    }
+                }
+            }
+
+            Binding::EncodedLit {
+                o_kind,
+                o_key,
+                dt_id,
+                lang_id,
                 ..
             } => JoinKey::Lit {
                 o_kind: *o_kind,
                 o_key: *o_key,
-                p_id_for_numbig: if *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                    Some(*p_id)
-                } else {
-                    None
-                },
                 dt_id: *dt_id,
                 lang_id: *lang_id,
             },
@@ -420,10 +440,16 @@ impl Materializer {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
-            } => flake_value_to_comparable(
-                &self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?,
-            ),
+            } => flake_value_to_comparable(&self.decode_lit(
+                *o_kind,
+                *o_key,
+                *p_id,
+                *dt_id,
+                *lang_id,
+                *arena_g_id,
+            )?),
 
             Binding::Grouped(_) => None,
 
@@ -464,9 +490,10 @@ impl Materializer {
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             } => Some(Arc::from(
-                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)?
+                self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)?
                     .to_string(),
             )),
 
@@ -519,26 +546,19 @@ impl Materializer {
                 lang_id,
                 i_val,
                 t,
-            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id)? {
+                arena_g_id,
+            } => match self.decode_lit(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)? {
                 FlakeValue::Ref(sid) => Binding::sid(sid),
                 val => {
-                    // NUM_BIG arena values share one EncodedLit whose dt_id is
-                    // hardcoded to decimal — recover xsd:integer vs xsd:decimal
-                    // from the decoded value, not dt_id (issue #1329).
-                    let dt_sid = match val.overflow_numeric_datatype_sid() {
-                        Some(sid) => sid,
-                        None => self
-                            .graph_view
-                            .store()
-                            .dt_sids()
-                            .get(*dt_id as usize)
-                            .cloned()
-                            .ok_or_else(|| {
-                                QueryError::dictionary_lookup(format!(
-                                    "materialize literal: unknown dt_id {dt_id}"
-                                ))
-                            })?,
-                    };
+                    let dt_sid = self
+                        .graph_view
+                        .store()
+                        .resolve_dt_id_sid_for_value(*dt_id, &val)
+                        .ok_or_else(|| {
+                            QueryError::dictionary_lookup(format!(
+                                "materialize literal: unknown dt_id {dt_id}"
+                            ))
+                        })?;
                     let meta = self.graph_view.store().decode_meta(*lang_id, *i_val);
                     let dtc = match meta.and_then(|m| m.lang.map(Arc::from)) {
                         Some(lang) => DatatypeConstraint::LangTag(lang),
@@ -630,9 +650,10 @@ impl Materializer {
         p_id: u32,
         dt_id: u16,
         lang_id: u16,
+        arena_g_id: fluree_db_core::GraphId,
     ) -> Result<FlakeValue> {
         self.graph_view
-            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id)
+            .decode_value_from_kind(o_kind, o_key, p_id, dt_id, lang_id, arena_g_id)
             .map_err(|e| {
                 decode_error(
                     "decode literal",
@@ -720,5 +741,65 @@ mod tests {
         let double_val = ComparableValue::Double(3.5);
         assert_eq!(double_val.as_f64(), Some(3.5));
         assert_eq!(double_val.as_i64(), None); // Has fractional part
+    }
+
+    /// Double bit patterns whose identity differs from their bits: NaNs with
+    /// every sign and a spread of payloads (quiet and signalling), both zeros,
+    /// both infinities, and a few ordinary values to compare them against.
+    fn special_double_bits() -> Vec<u64> {
+        let mut bits = vec![
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            0x7FF0_0000_0000_0001,
+            0xFFF0_0000_0000_0001,
+            0x7FFF_FFFF_FFFF_FFFF,
+            0xFFFF_FFFF_FFFF_FFFF,
+            0.0f64.to_bits(),
+            (-0.0f64).to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            1.5f64.to_bits(),
+            (-1.5f64).to_bits(),
+            f64::MAX.to_bits(),
+            f64::MIN_POSITIVE.to_bits(),
+        ];
+        for shift in 0..51 {
+            bits.push(0x7FF0_0000_0000_0000 | (1u64 << shift));
+            bits.push(0xFFF0_0000_0000_0000 | (1u64 << shift));
+        }
+        bits
+    }
+
+    /// A hash join keys rows by `FlakeValueKey`, whose equality is
+    /// `FlakeValue`'s: every NaN equals every NaN, and -0.0 equals 0.0. Equal
+    /// keys must hash equally, or a join drops rows that match.
+    #[test]
+    fn equal_double_keys_hash_equally() {
+        use std::collections::hash_map::DefaultHasher;
+        let hash = |k: &FlakeValueKey| {
+            let mut h = DefaultHasher::new();
+            k.hash(&mut h);
+            h.finish()
+        };
+        let keys: Vec<FlakeValueKey> = special_double_bits()
+            .into_iter()
+            .map(|b| FlakeValueKey(FlakeValue::Double(f64::from_bits(b))))
+            .collect();
+        let mut equal_pairs = 0;
+        for a in &keys {
+            for b in &keys {
+                if a == b {
+                    equal_pairs += 1;
+                    assert_eq!(hash(a), hash(b), "{a:?} == {b:?}");
+                }
+            }
+        }
+        // Every NaN with every NaN, each zero with both zeros, the rest only
+        // with themselves.
+        let nans = keys
+            .iter()
+            .filter(|k| matches!(k.0, FlakeValue::Double(d) if d.is_nan()))
+            .count();
+        assert_eq!(equal_pairs, nans * nans + 4 + (keys.len() - nans - 2));
     }
 }

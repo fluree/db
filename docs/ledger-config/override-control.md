@@ -135,7 +135,8 @@ For each setting group independently:
 | `mode: warn`, OverrideAll | `mode: reject` | **reject** | Per-graph overrides |
 
 Transactions can also request a validation mode for themselves via
-`opts.validationMode` (`"warn"` / `"reject"`). Gating is **asymmetric**:
+`opts.validationMode` (`"warn"` / `"reject"`), or `# PRAGMA validation-mode: warn`
+on a SPARQL UPDATE. Gating is **asymmetric**:
 strengthening (`warn` → `reject`) is always honored, while softening
 (`reject` → `warn`) is granted only when the SHACL group's
 `f:overrideControl` permits it for the request's verified identity. A denied
@@ -178,7 +179,7 @@ Not all fields in a setting group are overridable. Source pointers (where rules/
 | Subsystem | Overridable fields | Non-overridable (config-only) |
 |-----------|-------------------|-------------------------------|
 | `f:policyDefaults` | `f:defaultAllow`, `f:policyClass` | `f:policySource` |
-| `f:shaclDefaults` | `f:validationMode`, `f:shaclEnabled` | `f:shapesSource` |
+| `f:shaclDefaults` | `f:validationMode`, `f:shaclEnabled` | `f:shapesSource`, `f:additionalDataSource` |
 | `f:reasoningDefaults` | `f:reasoningModes` | `f:schemaSource` |
 | `f:datalogDefaults` | `f:datalogEnabled`, `f:allowQueryTimeRules` | `f:rulesSource` |
 
