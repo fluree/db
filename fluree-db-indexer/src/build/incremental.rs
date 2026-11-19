@@ -1999,7 +1999,11 @@ pub(crate) async fn index_novelty(
         .collect();
     root_builder.set_namespace_codes(new_ns_codes.clone());
 
-    let new_pred_sids = build_predicate_sids(&novelty.shared, &new_ns_codes);
+    let new_pred_sids = build_predicate_sids(
+        &novelty.shared,
+        &new_ns_codes,
+        novelty.base_root.ns_split_mode,
+    );
     root_builder.set_predicate_sids(new_pred_sids);
     root_builder.note_list_meta(novelty.shared.saw_list_meta);
 
@@ -2841,7 +2845,10 @@ pub(crate) async fn index_novelty(
         ) = stats_hook.finalize_into_parts();
 
         // Build IndexStats with per-graph and aggregate properties.
-        let trie = fluree_db_core::PrefixTrie::from_namespace_codes(&novelty.shared.ns_prefixes);
+        let stats_encoder = fluree_db_core::StatsIriEncoder::from_namespace_codes(
+            &novelty.shared.ns_prefixes,
+            novelty.base_root.ns_split_mode,
+        );
         let db_stats = {
             use fluree_db_core::index_stats as is;
 
@@ -2881,7 +2888,7 @@ pub(crate) async fn index_novelty(
             // import so incremental NDV merging includes the imported data.
             let properties = crate::stats::aggregate_property_entries_from_graphs(
                 &final_graphs,
-                &trie,
+                &stats_encoder,
                 |p_id| {
                     novelty
                         .shared
@@ -4033,10 +4040,7 @@ pub(crate) async fn index_novelty(
                         let mut last_class_property_log = Instant::now();
                         for &cp_id in &prop_set {
                             let iri = novelty.shared.predicates.resolve(cp_id).unwrap_or("");
-                            let p_sid = match trie.longest_match(iri) {
-                                Some((code, plen)) => fluree_db_core::Sid::new(code, &iri[plen..]),
-                                None => fluree_db_core::Sid::new(0, iri),
-                            };
+                            let p_sid = stats_encoder.encode(iri);
                             let base_pu = base_prop_by_pid.get(&cp_id).copied();
 
                             // Merge base + novelty datatypes.
@@ -4280,10 +4284,7 @@ pub(crate) async fn index_novelty(
             let links = links_known.then(|| {
                 crate::stats::link_stat_entries(&id_stats_result.term_rows, reifies_p_id, |p_id| {
                     let iri = novelty.shared.predicates.resolve(p_id).unwrap_or("");
-                    match trie.longest_match(iri) {
-                        Some((code, prefix_len)) => (code, iri[prefix_len..].to_string()),
-                        None => (0u16, iri.to_string()),
-                    }
+                    stats_encoder.encode_parts(iri)
                 })
             });
 
@@ -6521,37 +6522,27 @@ fn check_base_facts_agree(outputs: &[Phase2TaskOutput]) -> Result<()> {
 fn build_predicate_sids(
     shared: &crate::run_index::resolve::resolver::SharedResolverState,
     namespace_codes: &std::collections::BTreeMap<u16, String>,
+    split_mode: fluree_db_core::NsSplitMode,
 ) -> Vec<(u16, String)> {
     predicate_sids(
         (0..shared.predicates.len()).map(|p_id| shared.predicates.resolve(p_id).unwrap_or("")),
         namespace_codes,
+        split_mode,
     )
 }
 
-/// An index root's `predicate_sids`: each predicate IRI, in p_id order,
-/// split at its longest namespace prefix (whole, under code 0, when none
-/// matches).
+/// An index root's `predicate_sids`: each predicate IRI, in p_id order, as
+/// the ledger encodes it under `split_mode` (whole, under code 0, when its
+/// prefix has no code).
 pub fn predicate_sids<'a>(
     iris: impl IntoIterator<Item = &'a str>,
     namespace_codes: &std::collections::BTreeMap<u16, String>,
+    split_mode: fluree_db_core::NsSplitMode,
 ) -> Vec<(u16, String)> {
-    use fluree_db_core::PrefixTrie;
-
-    let ns_map: std::collections::HashMap<u16, String> = namespace_codes
-        .iter()
-        .map(|(&k, v)| (k, v.clone()))
-        .collect();
-    let trie = PrefixTrie::from_namespace_codes(&ns_map);
-
+    let encoder =
+        fluree_db_core::StatsIriEncoder::from_namespace_codes(namespace_codes, split_mode);
     iris.into_iter()
-        .map(|iri| {
-            if let Some((ns_code, prefix_len)) = trie.longest_match(iri) {
-                let suffix = &iri[prefix_len..];
-                (ns_code, suffix.to_string())
-            } else {
-                (0, iri.to_string())
-            }
-        })
+        .map(|iri| encoder.encode_parts(iri))
         .collect()
 }
 

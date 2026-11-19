@@ -226,16 +226,47 @@ pub fn encode_envelope_fields(
     // ns_split_mode (trailing optional extension)
     if let Some(mode) = envelope.ns_split_mode {
         buf.push(1);
-        buf.push(
-            mode.to_byte().map_err(|e| {
-                CommitCodecError::EnvelopeDecode(format!("ns_split_mode encode: {e}"))
-            })?,
-        );
+        encode_split_mode(mode, buf)?;
     } else {
         buf.push(0);
     }
 
     Ok(())
+}
+
+/// In the envelope's split-mode field, an escape: the mode is the extended id
+/// in the next byte. A 4.x decoder reads the escape as `HostPlusN(254)` and
+/// refuses the byte after it as trailing, so a commit declaring an extended
+/// mode is refused rather than replayed under a split the ledger never used.
+const SPLIT_MODE_EXTENDED: u8 = 0xFF;
+
+/// Extended split-mode id of [`NsSplitMode::NamedLocal`].
+const EXTENDED_NAMED_LOCAL: u8 = 0;
+
+fn encode_split_mode(mode: NsSplitMode, buf: &mut Vec<u8>) -> Result<(), CommitCodecError> {
+    match mode {
+        NsSplitMode::NamedLocal => {
+            buf.extend_from_slice(&[SPLIT_MODE_EXTENDED, EXTENDED_NAMED_LOCAL]);
+        }
+        NsSplitMode::MostGranular | NsSplitMode::HostPlusN(_) => {
+            buf.push(mode.to_byte().map_err(|e| {
+                CommitCodecError::EnvelopeDecode(format!("ns_split_mode encode: {e}"))
+            })?);
+        }
+    }
+    Ok(())
+}
+
+fn decode_split_mode(data: &[u8], pos: &mut usize) -> Result<NsSplitMode, CommitCodecError> {
+    match read_u8(data, pos)? {
+        SPLIT_MODE_EXTENDED => match read_u8(data, pos)? {
+            EXTENDED_NAMED_LOCAL => Ok(NsSplitMode::NamedLocal),
+            id => Err(CommitCodecError::EnvelopeDecode(format!(
+                "unknown extended ns_split_mode {id}"
+            ))),
+        },
+        byte => Ok(NsSplitMode::from_byte(byte)),
+    }
 }
 
 /// Encode the envelope fields of a commit into `buf`.
@@ -373,8 +404,7 @@ pub fn decode_envelope(data: &[u8]) -> Result<CodecEnvelope, CommitCodecError> {
     let ns_split_mode = if pos < data.len() {
         let has_mode = read_u8(data, &mut pos)? != 0;
         if has_mode {
-            let mode_byte = read_u8(data, &mut pos)?;
-            Some(NsSplitMode::from_byte(mode_byte))
+            Some(decode_split_mode(data, &mut pos)?)
         } else {
             None
         }
@@ -910,6 +940,53 @@ mod tests {
         buf.push(0); // no ns_split_mode
         let err = decode_envelope(&buf).unwrap_err();
         assert!(err.to_string().contains("ascending"), "{err}");
+    }
+
+    #[test]
+    fn test_named_local_is_an_extended_split_mode() {
+        let mut commit = make_minimal_commit();
+        commit.ns_split_mode = Some(NsSplitMode::NamedLocal);
+        let mut buf = Vec::new();
+        encode_envelope(&commit, &mut buf).unwrap();
+        // A 4.x decoder reads 0xFF as the mode and refuses the id after it as
+        // a trailing byte.
+        assert_eq!(
+            buf[buf.len() - 3..],
+            [1, SPLIT_MODE_EXTENDED, EXTENDED_NAMED_LOCAL]
+        );
+        assert_eq!(
+            decode_envelope(&buf).unwrap().ns_split_mode,
+            Some(NsSplitMode::NamedLocal)
+        );
+    }
+
+    #[test]
+    fn test_earlier_split_modes_keep_their_byte() {
+        for (mode, byte) in [
+            (NsSplitMode::MostGranular, 0),
+            (NsSplitMode::HostPlusN(1), 2),
+        ] {
+            let mut commit = make_minimal_commit();
+            commit.ns_split_mode = Some(mode);
+            let mut buf = Vec::new();
+            encode_envelope(&commit, &mut buf).unwrap();
+            assert_eq!(buf[buf.len() - 2..], [1, byte], "{mode:?}");
+            assert_eq!(decode_envelope(&buf).unwrap().ns_split_mode, Some(mode));
+        }
+    }
+
+    #[test]
+    fn test_unknown_extended_split_mode_rejected() {
+        let mut commit = make_minimal_commit();
+        commit.ns_split_mode = Some(NsSplitMode::NamedLocal);
+        let mut buf = Vec::new();
+        encode_envelope(&commit, &mut buf).unwrap();
+        *buf.last_mut().unwrap() = 1;
+        let err = decode_envelope(&buf).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown extended ns_split_mode 1"),
+            "{err}"
+        );
     }
 
     #[test]

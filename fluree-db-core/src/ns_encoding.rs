@@ -45,11 +45,15 @@ use std::sync::LazyLock;
 /// Once a ledger allocates its first user namespace code, the split mode is
 /// fixed forever. All encoding paths must use the same mode to guarantee
 /// deterministic SID assignment.
+///
+/// The `Default` is the mode of a ledger that declares none, which only a
+/// ledger from before split modes were declared can be; a new ledger takes
+/// [`NsSplitMode::FOR_NEW_LEDGERS`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NsSplitMode {
     /// Split at the last `/` or `#` (for hierarchical IRIs) or last
-    /// `/ | # | :` (for opaque IRIs). This is the finest-grained mode
-    /// and the default for new ledgers.
+    /// `/ | # | :` (for opaque IRIs). An IRI ending in one of those is the
+    /// whole prefix of a namespace of its own, with an empty local name.
     #[default]
     MostGranular,
 
@@ -60,21 +64,35 @@ pub enum NsSplitMode {
     /// - `HostPlusN(0)` ≈ host-only splitting
     /// - `HostPlusN(1)` ≈ host + one path segment
     HostPlusN(u8),
+
+    /// [`MostGranular`](Self::MostGranular), except that an IRI ending in a
+    /// delimiter splits at the delimiter before it: `…/Offer12/` is
+    /// `(…/, Offer12/)`, so no local name is empty and an IRI used as a page
+    /// address takes no namespace of its own. A built-in namespace's own IRI
+    /// keeps its code.
+    NamedLocal,
 }
 
-/// Maximum `n` value for `HostPlusN(n)` that can be persisted without
-/// wrapping. `HostPlusN(254)` encodes as byte `0xFF`; values above 254
-/// would wrap to `0x00` (MostGranular) on round-trip.
-pub const HOST_PLUS_N_MAX: u8 = 254;
+/// Maximum `n` value for `HostPlusN(n)` that can be persisted. Byte `0xFF`,
+/// which once meant `HostPlusN(254)`, is [`NsSplitMode::NamedLocal`]: no
+/// release ever wrote a `HostPlusN` above 1.
+pub const HOST_PLUS_N_MAX: u8 = 253;
+
+const NAMED_LOCAL_BYTE: u8 = 0xFF;
 
 impl NsSplitMode {
+    /// The mode a ledger created by this release declares in its first commit.
+    pub const FOR_NEW_LEDGERS: Self = Self::NamedLocal;
+
     /// Encode to a single byte for binary persistence.
     ///
-    /// Layout: `0x00` = MostGranular, `0x01..=0xFF` = HostPlusN(n-1).
+    /// Layout: `0x00` = MostGranular, `0x01..=0xFE` = HostPlusN(n-1),
+    /// `0xFF` = NamedLocal.
     ///
-    /// # Panics
+    /// Returns `Err` if `n > 253` (its byte would read back as another mode).
     ///
-    /// Returns `Err` if `n > 254` (would wrap to `MostGranular` on decode).
+    /// A commit envelope writes `NamedLocal` as `0xFF` followed by an
+    /// extended mode id, so that a 4.x decoder refuses the commit.
     pub fn to_byte(self) -> Result<u8, NsAllocError> {
         match self {
             Self::MostGranular => Ok(0),
@@ -84,6 +102,7 @@ impl NsSplitMode {
                 }
                 Ok(n + 1)
             }
+            Self::NamedLocal => Ok(NAMED_LOCAL_BYTE),
         }
     }
 
@@ -91,6 +110,7 @@ impl NsSplitMode {
     pub fn from_byte(b: u8) -> Self {
         match b {
             0 => Self::MostGranular,
+            NAMED_LOCAL_BYTE => Self::NamedLocal,
             n => Self::HostPlusN(n - 1),
         }
     }
@@ -199,6 +219,15 @@ pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
         }
     }
 
+    // Every built-in prefix but `@` (handled above) ends in one of these, so
+    // only such an IRI can be one: the check skips the trie for the rest.
+    if mode == NsSplitMode::NamedLocal
+        && matches!(iri.as_bytes().last(), Some(b'/' | b'#' | b':'))
+        && is_builtin_namespace_iri(iri)
+    {
+        return (iri, "");
+    }
+
     // Determine if hierarchical (has "://") or opaque
     if let Some(authority_start) = find_authority_start(iri) {
         split_hierarchical(iri, mode, authority_start)
@@ -265,6 +294,32 @@ fn query_cut(iri: &str) -> Option<usize> {
     }
 }
 
+/// The last delimiter in `no_query`; under `NamedLocal`, the one before it
+/// when the IRI (`iri_len` bytes) ends at the last, so the local name is not
+/// empty. An IRI with no earlier delimiter keeps the last.
+fn granular_split_pos(
+    no_query: &[u8],
+    iri_len: usize,
+    mode: NsSplitMode,
+    is_delimiter: impl Fn(u8) -> bool,
+) -> Option<usize> {
+    let last = no_query.iter().rposition(|&b| is_delimiter(b))?;
+    if mode != NsSplitMode::NamedLocal || last + 1 < iri_len {
+        return Some(last);
+    }
+    no_query[..last]
+        .iter()
+        .rposition(|&b| is_delimiter(b))
+        .or(Some(last))
+}
+
+/// Whether `iri` is exactly the prefix of a built-in namespace.
+fn is_builtin_namespace_iri(iri: &str) -> bool {
+    BUILTIN_TRIE
+        .longest_match(iri)
+        .is_some_and(|(_code, prefix_len)| prefix_len == iri.len())
+}
+
 /// Split a hierarchical IRI (`scheme://authority/path...`).
 fn split_hierarchical(iri: &str, mode: NsSplitMode, authority_start: usize) -> (&str, &str) {
     let bytes = iri.as_bytes();
@@ -285,10 +340,11 @@ fn split_hierarchical(iri: &str, mode: NsSplitMode, authority_start: usize) -> (
     };
 
     match mode {
-        NsSplitMode::MostGranular => {
+        NsSplitMode::MostGranular | NsSplitMode::NamedLocal => {
             // Find last `/` or `#` in no_query portion
             let no_query = &bytes[..no_query_end];
-            let split_pos = no_query.iter().rposition(|&b| b == b'/' || b == b'#');
+            let split_pos =
+                granular_split_pos(no_query, iri.len(), mode, |b| b == b'/' || b == b'#');
             match split_pos {
                 Some(pos) => (&iri[..=pos], &iri[pos + 1..]),
                 None => ("", iri),
@@ -367,12 +423,12 @@ fn split_opaque(iri: &str, mode: NsSplitMode) -> (&str, &str) {
     };
 
     match mode {
-        NsSplitMode::MostGranular => {
+        NsSplitMode::MostGranular | NsSplitMode::NamedLocal => {
             // Find last `/ | # | :` in no_query
             let no_query = &bytes[..no_query_end];
-            let split_pos = no_query
-                .iter()
-                .rposition(|&b| b == b'/' || b == b'#' || b == b':');
+            let split_pos = granular_split_pos(no_query, iri.len(), mode, |b| {
+                b == b'/' || b == b'#' || b == b':'
+            });
             match split_pos {
                 Some(pos) => (&iri[..=pos], &iri[pos + 1..]),
                 None => ("", iri),
@@ -915,11 +971,90 @@ mod tests {
             NsSplitMode::from_byte(NsSplitMode::HostPlusN(HOST_PLUS_N_MAX).to_byte().unwrap()),
             NsSplitMode::HostPlusN(HOST_PLUS_N_MAX)
         );
+        assert_eq!(
+            NsSplitMode::from_byte(NsSplitMode::NamedLocal.to_byte().unwrap()),
+            NsSplitMode::NamedLocal
+        );
+    }
+
+    #[test]
+    fn the_bytes_a_release_wrote_keep_their_modes() {
+        assert_eq!(NsSplitMode::from_byte(0), NsSplitMode::MostGranular);
+        assert_eq!(NsSplitMode::from_byte(2), NsSplitMode::HostPlusN(1));
     }
 
     #[test]
     fn test_split_mode_host_plus_255_returns_err() {
         assert!(NsSplitMode::HostPlusN(255).to_byte().is_err());
+        assert!(NsSplitMode::HostPlusN(254).to_byte().is_err());
+    }
+
+    // ---- NamedLocal ----
+
+    fn named(iri: &str) -> (&str, &str) {
+        canonical_split(iri, NsSplitMode::NamedLocal)
+    }
+
+    #[test]
+    fn named_local_splits_as_most_granular_where_the_local_name_is_not_empty() {
+        for iri in [
+            "http://example.com/vendor7/Offer12",
+            "http://example.com/a#b",
+            "http://example.com/a/?page=2",
+            "urn:isbn:0451450523",
+            "_:b1",
+            "@type",
+        ] {
+            assert_eq!(
+                named(iri),
+                canonical_split(iri, NsSplitMode::MostGranular),
+                "{iri}"
+            );
+        }
+    }
+
+    #[test]
+    fn named_local_splits_an_iri_ending_in_a_delimiter_at_the_one_before() {
+        assert_eq!(
+            named("http://example.com/vendor7/Offer12/"),
+            ("http://example.com/vendor7/", "Offer12/")
+        );
+        assert_eq!(
+            named("http://example.com/onto#"),
+            ("http://example.com/", "onto#")
+        );
+        assert_eq!(named("http://example.com/"), ("http://", "example.com/"));
+        assert_eq!(
+            named("http://example.com/a//"),
+            ("http://example.com/a/", "/")
+        );
+        assert_eq!(named("urn:example:record:"), ("urn:example:", "record:"));
+    }
+
+    #[test]
+    fn named_local_keeps_an_iri_with_no_earlier_delimiter_whole() {
+        assert_eq!(named("urn:"), ("urn:", ""));
+    }
+
+    #[test]
+    fn named_local_keeps_a_builtin_namespace_iri_as_its_namespace() {
+        let xsd = "http://www.w3.org/2001/XMLSchema#";
+        assert_eq!(named(xsd), (xsd, ""));
+        assert_eq!(
+            named("http://www.w3.org/2001/XMLSchema#string/"),
+            ("http://www.w3.org/2001/XMLSchema#", "string/")
+        );
+    }
+
+    /// `canonical_split` looks a built-in namespace's own IRI up only when it
+    /// ends in a delimiter, so a built-in prefix ending otherwise would split.
+    #[test]
+    fn named_local_keeps_every_builtin_namespace_iri_as_its_namespace() {
+        for prefix in default_namespace_codes().into_values() {
+            if !prefix.is_empty() {
+                assert_eq!(named(&prefix), (prefix.as_str(), ""));
+            }
+        }
     }
 
     // ---- canonical_split: normative test table ----

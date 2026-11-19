@@ -246,6 +246,11 @@ impl LedgerSnapshot {
     /// Used when a nameservice has a commit but no index yet.
     /// The database starts at t=0 with no base data.  Queries against
     /// a genesis LedgerSnapshot return overlay (novelty) flakes only.
+    ///
+    /// Its split mode is [`NsSplitMode::FOR_NEW_LEDGERS`], which a new
+    /// ledger's first commit declares. Replaying an existing ledger's commits
+    /// takes the mode its first commit declared instead: every first commit
+    /// has declared one since 4.0.
     pub fn genesis(ledger_id: impl IntoLedgerId) -> Self {
         let ledger_id = ledger_id.into_ledger_id();
         let namespace_codes = default_namespace_codes();
@@ -258,7 +263,7 @@ impl LedgerSnapshot {
             version: 3,
             namespace_codes: Arc::new(namespace_codes),
             namespace_reverse,
-            ns_split_mode: NsSplitMode::default(),
+            ns_split_mode: NsSplitMode::FOR_NEW_LEDGERS,
             stats: None,
             schema: None,
             schema_hierarchy_cache: OnceCell::new(),
@@ -272,6 +277,15 @@ impl LedgerSnapshot {
             has_list_meta: Some(false),
             prev_index: None,
             index_root_id: None,
+        }
+    }
+
+    /// An empty snapshot that encodes IRIs as a ledger under `mode` does: one
+    /// standing in for an existing ledger's, over data already encoded there.
+    pub fn genesis_with_split_mode(ledger_id: impl IntoLedgerId, mode: NsSplitMode) -> Self {
+        Self {
+            ns_split_mode: mode,
+            ..Self::genesis(ledger_id)
         }
     }
 

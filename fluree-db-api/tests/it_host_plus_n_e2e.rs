@@ -5,9 +5,9 @@
 //! consistent across persist/reload cycles and that queries return
 //! correct results under the non-default split strategy.
 //!
-//! All existing integration tests use `MostGranular` (default), so
-//! this test covers the alternate path that the import pipeline enables
-//! for high-cardinality namespace datasets.
+//! New ledgers split under `NamedLocal`, so this test covers the alternate
+//! path that the import pipeline enables for high-cardinality namespace
+//! datasets.
 //!
 //! Run with:
 //!   cargo test -p fluree-db-api --test grp_misc it_host_plus_n_e2e --features native
