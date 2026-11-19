@@ -9,7 +9,7 @@ use crate::telemetry::{
     create_request_span, extract_request_id, extract_trace_id, set_span_error_code,
 };
 use axum::extract::{Path, Query, Request, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use fluree_db_api::wire::{
@@ -934,32 +934,13 @@ pub async fn list_ledgers(
 // Info
 // =============================================================================
 
-/// Ledger info response (simplified, used in proxy storage mode fallback)
-#[derive(Serialize)]
-pub struct LedgerInfoResponse {
-    /// Ledger identifier
-    pub ledger_id: String,
-    /// Current transaction time
-    pub t: i64,
-    /// Head commit ContentId (storage-agnostic identity), if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub commit_head_id: Option<fluree_db_core::ContentId>,
-    /// Head index ContentId (storage-agnostic identity), if known.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub index_head_id: Option<fluree_db_core::ContentId>,
-}
-
 /// Get ledger information
 ///
 /// GET /fluree/ledger-info?ledger=<alias>
 /// or with fluree-ledger header
 ///
-/// In non-proxy mode (transaction server or peer with shared storage), returns
-/// comprehensive ledger metadata including commit info, namespace codes, and
-/// statistics (properties, classes with counts and hierarchy).
-///
-/// In proxy storage mode, returns simplified nameservice-only response since
-/// the peer doesn't have local ledger state to compute stats from.
+/// Returns comprehensive ledger metadata including commit info, namespace
+/// codes, and statistics (properties, classes with counts and hierarchy).
 pub async fn info(
     State(state): State<Arc<AppState>>,
     headers: FlureeHeaders,
@@ -1015,13 +996,7 @@ pub async fn info(
             }
         }
 
-        // In proxy storage mode, return simplified nameservice-only response
-        // (peer doesn't have local ledger state to compute full stats)
-        if state.config.is_proxy_storage_mode() {
-            return info_simplified(&state, alias, &span).await;
-        }
-
-        // Non-proxy mode: load ledger and return comprehensive info.
+        // Load the ledger and return comprehensive info.
         // If ledger is not found, fall back to graph source lookup.
         let ledger_state = match super::query::load_ledger_or_missing(&state, alias, &span).await {
             Ok(ls) => ls,
@@ -1043,7 +1018,9 @@ pub async fn info(
             Err(e) => return Err(e),
         };
 
-        let t = ledger_state.snapshot.t;
+        // The commit head's `t`, novelty included: clients compare it with
+        // their own head.
+        let t = ledger_state.t();
 
         // Build comprehensive ledger info
         //
@@ -1185,6 +1162,7 @@ pub async fn erase_occurrences_tail(
 pub async fn retention_status_tail(
     State(state): State<Arc<AppState>>,
     Path(ledger): Path<String>,
+    headers: HeaderMap,
     bearer: MaybeDataBearer,
 ) -> Result<Response> {
     let data_auth = state.config.data_auth();
@@ -1205,56 +1183,13 @@ pub async fn retention_status_tail(
         .retention_status(&ledger)
         .await
         .map_err(ServerError::Api)?;
-    let audits = bearer.0.as_ref().is_some_and(|p| p.can_audit(&scope));
+    let audits = crate::routes::audit::may_audit(&state, &headers, bearer.0.as_ref(), &scope).await;
     let status = if audits {
         status
     } else {
         status.without_audit_data()
     };
     Ok(Json(status).into_response())
-}
-
-/// Simplified ledger info for proxy storage mode (nameservice lookup only).
-/// Falls back to graph source lookup if ledger is not found.
-async fn info_simplified(state: &AppState, alias: &str, span: &tracing::Span) -> Result<Response> {
-    // Lookup ledger in nameservice
-    match state.fluree.nameservice().lookup(alias).await {
-        Ok(Some(record)) => {
-            tracing::info!(
-                status = "success",
-                commit_t = record.commit_t,
-                "ledger info retrieved (simplified)"
-            );
-            return Ok(Json(LedgerInfoResponse {
-                ledger_id: record.ledger_id.clone().to_string(),
-                t: record.commit_t,
-                commit_head_id: record.commit_head_id.clone(),
-                index_head_id: record.index_head_id.clone(),
-            })
-            .into_response());
-        }
-        Ok(None) => { /* fall through to graph source lookup */ }
-        Err(e) => {
-            let server_error = ServerError::Api(ApiError::NameService(e));
-            set_span_error_code(span, "error:InternalError");
-            tracing::error!(error = %server_error, "nameservice lookup failed");
-            return Err(server_error);
-        }
-    }
-
-    // Try graph source lookup (shared builder: redacted, virtual-aware).
-    if let Ok(Some(gs)) = state.fluree.nameservice().lookup_graph_source(alias).await {
-        let info = fluree_db_api::ledger_info::build_graph_source_info(&state.fluree, &gs)
-            .await
-            .map_err(ServerError::Api)?;
-        tracing::info!(status = "success", "graph source info retrieved");
-        return Ok(Json(info).into_response());
-    }
-
-    let server_error = ServerError::Api(ApiError::NotFound(alias.to_string()));
-    set_span_error_code(span, "error:NotFound");
-    tracing::warn!(error = %server_error, "not found as ledger or graph source");
-    Err(server_error)
 }
 
 /// Query parameters for ledger-info

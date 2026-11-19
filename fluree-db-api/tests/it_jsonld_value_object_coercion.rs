@@ -1,11 +1,10 @@
-//! A value object under a term whose context coerces values to IRIs.
+//! A value object under a term whose context coerces values.
 //!
-//! A context term with `"@type": "@id"` (or `"@vocab"`) turns a string value
-//! into an IRI. JSON-LD 1.1 applies that coercion only to strings (Value
-//! Expansion); a value object such as `{"@value": "TWD"}` is a literal. The
-//! expander used to read it as the relative IRI `<TWD>`, so an insert or
-//! upsert of such a document stored a reference where the same data in
-//! Turtle or TriG stores the string "TWD".
+//! JSON-LD 1.1 applies a term's `@type` and `@language`, and the default
+//! language, only to bare values (Value Expansion); a value object such as
+//! `{"@value": "TWD"}` is taken as written. The expander used to read it
+//! under an `@id` or `@vocab` term as the relative IRI `<TWD>`, and to give
+//! it the default language and its term's datatype.
 
 use crate::support;
 use crate::support::normalize_rows;
@@ -112,6 +111,166 @@ async fn a_value_object_typed_id_with_a_non_string_value_is_refused() {
         assert_eq!(err.status_code(), 400, "{value}: {err}");
         assert!(
             err.to_string().contains("@value must be a string"),
+            "{value}: {err}"
+        );
+    }
+}
+
+/// The default language and a term's datatype reach a bare value, not a
+/// value object, and a `where` written with the document's context matches
+/// what it stored.
+#[tokio::test]
+async fn value_object_takes_neither_the_default_language_nor_its_terms_datatype() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let context = json!({
+        "ex": "http://example.org/",
+        "@language": "en",
+        "n": {"@id": "ex:n", "@type": "http://www.w3.org/2001/XMLSchema#integer"}
+    });
+    let ledger = fluree
+        .create_ledger("tx/value-object-as-written:main")
+        .await
+        .expect("genesis");
+    let document = json!({
+        "@context": context,
+        "@id": "ex:s",
+        "ex:t": ["plain", {"@value": "obj"}],
+        "n": [{"@value": "5"}, "6"]
+    });
+    let ledger = fluree
+        .insert(ledger, &document)
+        .await
+        .expect("insert")
+        .ledger;
+
+    let query = r"PREFIX ex: <http://example.org/>
+        SELECT ?v (STR(DATATYPE(?o)) AS ?dt) (LANG(?o) AS ?lang)
+        WHERE { VALUES ?p { ex:t ex:n } ex:s ?p ?o BIND(STR(?o) AS ?v) }
+        ORDER BY ?v";
+    let out = support::query_sparql(&fluree, &ledger, query)
+        .await
+        .expect("sparql query")
+        .to_jsonld(&ledger.snapshot)
+        .expect("to_jsonld");
+    let xsd = "http://www.w3.org/2001/XMLSchema#";
+    let lang_string = "http://www.w3.org/1999/02/22-rdf-syntax-ns#langString";
+    assert_eq!(
+        normalize_rows(&out),
+        vec![
+            json!(["5", format!("{xsd}string"), ""]),
+            json!(["6", format!("{xsd}integer"), ""]),
+            json!(["obj", format!("{xsd}string"), ""]),
+            json!(["plain", lang_string, "en"]),
+        ]
+    );
+
+    for (property, value) in [
+        ("n", json!({"@value": "5"})),
+        ("n", json!("6")),
+        ("ex:t", json!({"@value": "obj"})),
+    ] {
+        let query = json!({
+            "@context": context,
+            "select": "?s",
+            "where": {"@id": "?s", property: value}
+        });
+        let rows = support::query_jsonld(&fluree, &ledger, &query)
+            .await
+            .expect("jsonld query")
+            .to_jsonld(&ledger.snapshot)
+            .expect("to_jsonld");
+        assert_eq!(rows, json!(["ex:s"]), "{property}: {value}");
+    }
+}
+
+/// A value object takes no datatype from a `@vector` term, so an array
+/// `@value` under it needs its own `@type`. Every JSON-LD reader refuses one
+/// without it: the adapter readers used to drop the value with no error.
+#[tokio::test]
+async fn an_array_value_object_with_no_type_is_refused() {
+    let doc = json!({
+        "@context": {
+            "ex": "http://example.org/",
+            "v": {"@id": "ex:v", "@type": "@vector"}
+        },
+        "@id": "ex:s",
+        "v": {"@value": [0.5, 0.25]}
+    });
+
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = fluree
+        .create_ledger("tx/value-object-array-no-type:main")
+        .await
+        .expect("genesis");
+    let err = fluree
+        .insert(ledger, &doc)
+        .await
+        .expect_err("an untyped array @value");
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(err.to_string().contains("needs its own"), "{err}");
+
+    let err = fluree_db_api::rdf::parse(
+        &doc.to_string(),
+        fluree_db_api::rdf::RdfFormat::JsonLd,
+        None,
+    )
+    .expect_err("rdf::parse of an untyped array @value");
+    assert!(err.to_string().contains("needs its own"), "{err}");
+}
+
+/// An array or map `@value` with no `@json` or `@vector` type has no literal
+/// to stand for, and neither has a map typed as a vector, which only an array
+/// can be. A transaction and a bulk import both refuse each: the import used
+/// to drop the value with no error.
+#[tokio::test]
+async fn an_untyped_structured_value_object_is_refused() {
+    for (i, value) in [
+        json!({"@value": [0.5, 0.25]}),
+        json!({"@value": {"a": 1}}),
+        json!({"@value": {"a": 1}, "@type": "@vector"}),
+        json!({"@value": {"a": 1}, "@type": "f:embeddingVector"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let doc = json!({
+            "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+            "@id": "ex:s",
+            "ex:v": value
+        });
+
+        let fluree = FlureeBuilder::memory().build_memory();
+        let ledger = fluree
+            .create_ledger(&format!("tx/value-object-structured-{i}:main"))
+            .await
+            .expect("genesis");
+        let err = fluree
+            .insert(ledger, &doc)
+            .await
+            .expect_err("an untyped structured @value");
+        assert_eq!(err.status_code(), 400, "{value}: {err}");
+        assert!(
+            err.to_string().contains(r#""@type": "@json""#),
+            "{value}: {err}"
+        );
+
+        let data = tempfile::tempdir().unwrap();
+        let file = data.path().join("doc.jsonld");
+        std::fs::write(&file, doc.to_string()).unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let err = FlureeBuilder::file(root.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .expect("file fluree")
+            .create(&format!("import/value-object-structured-{i}:main"))
+            .import(&file)
+            .threads(1)
+            .memory_budget_mb(256)
+            .execute()
+            .await
+            .expect_err("a bulk import of an untyped structured @value");
+        assert!(
+            err.to_string().contains(r#""@type": "@json""#),
             "{value}: {err}"
         );
     }

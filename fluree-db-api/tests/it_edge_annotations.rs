@@ -821,6 +821,50 @@ async fn annotation_rooted_query_finds_matching_edge() {
     assert!(iri_matches(&row[1], "ex:acme", "http://example.org/acme"));
 }
 
+/// An annotated edge whose key `@vocab` resolves links to its annotation:
+/// the reifier names the predicate the edge is written under, not the key
+/// as written. An annotation-rooted query finds the edge, and a delete of
+/// the annotated edge retracts the annotation with it.
+#[tokio::test]
+async fn an_annotation_on_a_vocab_key_links_to_its_edge() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/edge-annotations:vocab-key";
+    let ledger0 = genesis_ledger(&fluree, ledger_id).await;
+    let vocab = json!({"@vocab": "http://example.org/"});
+    let txn = json!({
+        "@context": vocab,
+        "@id": "http://example.org/alice",
+        "knows": {
+            "@id": "http://example.org/bob",
+            "@annotation": {"confidence": 0.9}
+        }
+    });
+    let ledger = fluree.insert(ledger0, &txn).await.expect("insert").ledger;
+
+    let rooted = json!({
+        "@context": vocab,
+        "select": ["?s", "?o"],
+        "where": {"confidence": 0.9, "@reifies": {"@id": "?s", "knows": {"@id": "?o"}}}
+    });
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &rooted)
+        .await
+        .expect("@reifies query");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+
+    let delete = json!({
+        "@context": vocab,
+        "delete": {
+            "@id": "http://example.org/alice",
+            "knows": {"@id": "http://example.org/bob", "@annotation": {"confidence": 0.9}}
+        }
+    });
+    let ledger = fluree.update(ledger, &delete).await.expect("delete").ledger;
+    let rows = support::query_jsonld_formatted(&fluree, &ledger, &rooted)
+        .await
+        .expect("@reifies query after delete");
+    assert_eq!(rows.as_array().map(Vec::len), Some(0), "{rows}");
+}
+
 #[tokio::test]
 async fn annotation_rooted_query_returns_no_rows_when_metadata_doesnt_match() {
     // Negative case: filtering by a role that no annotation carries
@@ -3438,6 +3482,25 @@ async fn edgekey_roundtrip_for_literal(
     literal_value: JsonValue,
     test_label: &str,
 ) {
+    edgekey_roundtrip_in(
+        ctx(),
+        predicate_compact,
+        predicate_full,
+        literal_value,
+        test_label,
+    )
+    .await;
+}
+
+/// [`edgekey_roundtrip_for_literal`] under `context`; returns the base
+/// edge's key.
+async fn edgekey_roundtrip_in(
+    context: JsonValue,
+    predicate_compact: &str,
+    predicate_full: &str,
+    literal_value: JsonValue,
+    test_label: &str,
+) -> fluree_db_core::edge::EdgeKey {
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::edge::EdgeKey;
     use fluree_db_core::range::{range_with_overlay, RangeMatch, RangeOptions, RangeTest};
@@ -3455,7 +3518,7 @@ async fn edgekey_roundtrip_for_literal(
         json!({ "ex:source": "hr-system" }),
     );
     let txn = json!({
-        "@context": ctx(),
+        "@context": context,
         "@id": "ex:alice",
         predicate_compact: JsonValue::Object(literal_with_ann),
     });
@@ -3509,6 +3572,7 @@ async fn edgekey_roundtrip_for_literal(
         "[{test_label}] decoded EdgeKey diverges from base-edge EdgeKey; \
          base_flake: {base_flake:?}, bundle: {bundle:#?}"
     );
+    base_edge_key
 }
 
 #[tokio::test]
@@ -3546,6 +3610,34 @@ async fn edgekey_roundtrip_language_tagged_literal_annotation() {
         "lang-tagged",
     )
     .await;
+}
+
+/// An annotated value object is taken as written under a typed term or a
+/// default language, as an unannotated one is: the edge holds a plain string
+/// and its annotation names that edge.
+#[tokio::test]
+async fn edgekey_roundtrip_value_object_under_term_coercion() {
+    let typed = json!({
+        "ex": "http://example.org/",
+        "joinedAt": {"@id": "ex:joinedAt", "@type": "http://www.w3.org/2001/XMLSchema#date"}
+    });
+    let tagged = json!({"ex": "http://example.org/", "@language": "fr", "joinedAt": "ex:joinedAt"});
+    for (label, context) in [("typed-term", typed), ("default-language", tagged)] {
+        let key = edgekey_roundtrip_in(
+            context,
+            "joinedAt",
+            "http://example.org/joinedAt",
+            json!({"@value": "2024-01-01"}),
+            label,
+        )
+        .await;
+        assert_eq!(
+            key.dt,
+            fluree_db_core::edge::xsd_string_datatype_sid(),
+            "[{label}]"
+        );
+        assert_eq!(key.lang, None, "[{label}]");
+    }
 }
 
 // =====================================================================

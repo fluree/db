@@ -162,7 +162,7 @@ Once you've bound the annotation — by `@id` or by selector — it's an ordinar
     "@id": "ex:alice",
     "ex:worksFor": {
       "@id": "ex:acme",
-      "@annotation": { "@id": "?edge", "ex:role": "Engineer" }
+      "@annotation": { "@id": "?edge", "ex:role": "Engineer", "ex:confidence": "?old" }
     }
   },
   "delete": { "@id": "?edge", "ex:confidence": "?old" },

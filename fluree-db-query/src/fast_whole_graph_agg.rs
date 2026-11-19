@@ -410,8 +410,12 @@ fn compute_clean(
                 return Ok(None);
             }
             // Distinct subjects from SPOT leaflet groups.
-            let Some(subjects) =
-                count_distinct_lead_groups(store, ctx.binary_g_id, RunSortOrder::Spot)?
+            let Some(subjects) = count_distinct_lead_groups(
+                store,
+                ctx.binary_g_id,
+                RunSortOrder::Spot,
+                &ctx.tracker,
+            )?
             else {
                 return Ok(None);
             };
@@ -459,7 +463,7 @@ fn compute_clean(
                 }
             }
             let Some(with_prop) =
-                count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id)?
+                count_distinct_subjects_for_predicate(store, ctx.binary_g_id, p_id, &ctx.tracker)?
             else {
                 return Ok(None);
             };
@@ -477,8 +481,14 @@ fn compute_clean(
         FoldKind::Scalars(tasks) => {
             let mut row = Vec::with_capacity(tasks.len());
             for task in tasks {
-                let Some(binding) =
-                    compute_task(*task, store, ctx.binary_g_id, subjects, accessor.as_ref())?
+                let Some(binding) = compute_task(
+                    *task,
+                    store,
+                    ctx.binary_g_id,
+                    subjects,
+                    accessor.as_ref(),
+                    &ctx.tracker,
+                )?
                 else {
                     return Ok(None);
                 };
@@ -527,8 +537,8 @@ fn compute_clean(
 // overlay's net subject delta, and every predicate-scoped fold via an
 // overlay-merging cursor (linear in the *predicate's* rows, not the graph's).
 
-/// Whether the overlay-aware lane may run: a single-ledger, policy-cleared read
-/// carrying novelty, **at or after the persisted index** (`to_t >= max_t`) — the
+/// Whether the overlay-aware lane may run: a policy-cleared read of one graph
+/// ([`ExecutionContext::reads_exactly_one_graph`]) carrying novelty, **at or after the persisted index** (`to_t >= max_t`) — the
 /// exact condition that makes the directory-only [`compute_clean`] lane stale
 /// while keeping its `max_t` base counts valid. A read below the index
 /// (`to_t < max_t`, e.g. `GraphDb::as_of(t)` composed onto a live-overlay view)
@@ -541,7 +551,7 @@ fn overlay_lane_eligible(ctx: &crate::context::ExecutionContext<'_>) -> bool {
     ctx.binary_store
         .as_ref()
         .is_some_and(|store| ctx.to_t >= store.max_t())
-        && !ctx.is_multi_ledger()
+        && ctx.reads_exactly_one_graph()
         && !ctx.is_history_range()
         && ctx.allow_unfiltered()
         && crate::fast_path_common::overlay_has_novelty(ctx)
@@ -613,7 +623,8 @@ fn overlay_all_subjects_count(
         return Ok(None);
     }
     let g_id = ctx.binary_g_id;
-    let Some(base) = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot)? else {
+    let Some(base) = count_distinct_lead_groups(store, g_id, RunSortOrder::Spot, &ctx.tracker)?
+    else {
         return Ok(None);
     };
 
@@ -683,8 +694,9 @@ fn overlay_all_subjects_count(
         g_id,
         &touched,
         store.max_t(),
+        &ctx.tracker,
     )
-    .map_err(|e| QueryError::Internal(format!("subject-existence lookup: {e}")))?;
+    .map_err(|e| QueryError::from_io("subject-existence lookup", e))?;
 
     let mut delta: i64 = 0;
     for (s_id, assert) in &has_assert {
@@ -746,7 +758,7 @@ fn overlay_accessor_counts(
     let mut prev: Option<u64> = None;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("accessor PSOT cursor: {e}")))?
+        .map_err(|e| QueryError::from_io("accessor PSOT cursor", e))?
     {
         for row in 0..batch.row_count {
             let s_id = batch.s_id.get(row);
@@ -861,7 +873,7 @@ fn overlay_minmax_numeric(
     let mut best: Option<(u16, u64)> = None;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("minmax POST cursor: {e}")))?
+        .map_err(|e| QueryError::from_io("minmax POST cursor", e))?
     {
         for row in 0..batch.row_count {
             let o_type = batch.o_type.get_or(row, 0);
@@ -926,7 +938,8 @@ fn compute_histogram(
 ) -> Result<Option<Batch>> {
     // Bound the output (one batch) and guarantee the top-K walk keeps every
     // group: the directory-level distinct-object count must fit the cap.
-    match count_distinct_objects_for_predicate(store, ctx.binary_g_id, accessor.p_id)? {
+    match count_distinct_objects_for_predicate(store, ctx.binary_g_id, accessor.p_id, &ctx.tracker)?
+    {
         Some(distinct) if (distinct as usize) <= HISTOGRAM_MAX_GROUPS => {}
         _ => return Ok(None),
     }
@@ -936,6 +949,7 @@ fn compute_histogram(
         &accessor.pred,
         HISTOGRAM_MAX_GROUPS,
         &ctx.cancellation,
+        &ctx.tracker,
     ) else {
         return Ok(None);
     };
@@ -1015,6 +1029,7 @@ fn compute_task(
     g_id: GraphId,
     subjects: u64,
     accessor: Option<&AccessorCounts>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Binding>> {
     if task.needs_accessor() && accessor.is_none() {
         return Ok(None);
@@ -1037,7 +1052,12 @@ fn compute_task(
         AggTask::CountSubjects => int(subjects),
         AggTask::CountProp => int(accessor.unwrap().rows),
         AggTask::CountDistinctProp => {
-            match count_distinct_objects_for_predicate(store, g_id, accessor.unwrap().p_id)? {
+            match count_distinct_objects_for_predicate(
+                store,
+                g_id,
+                accessor.unwrap().p_id,
+                tracker,
+            )? {
                 Some(distinct) => int(distinct),
                 None => Ok(None),
             }
@@ -1049,10 +1069,10 @@ fn compute_task(
                 MinMaxMode::Max
             };
             let p_id = accessor.unwrap().p_id;
-            if let Some(b) = minmax_numeric_post(store, g_id, p_id, mode)? {
+            if let Some(b) = minmax_numeric_post(store, g_id, p_id, mode, tracker)? {
                 return Ok(Some(b));
             }
-            minmax_string_dict_post(store, g_id, p_id, mode)
+            minmax_string_dict_post(store, g_id, p_id, mode, tracker)
         }
         AggTask::AvgProp | AggTask::SumProp => {
             let kind = if task == AggTask::AvgProp {
@@ -1060,7 +1080,7 @@ fn compute_task(
             } else {
                 ScalarAggKind::Sum(SumExprI64::Identity)
             };
-            match scan_predicate_scalar_agg(store, g_id, &accessor.unwrap().pred, kind)? {
+            match scan_predicate_scalar_agg(store, g_id, &accessor.unwrap().pred, kind, tracker)? {
                 Some(output) => Ok(Some(output.into_binding())),
                 None => Ok(None),
             }

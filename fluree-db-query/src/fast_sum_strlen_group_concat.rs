@@ -64,6 +64,7 @@ pub fn sum_strlen_group_concat_operator(
                 &predicate,
                 &separator,
                 &ctx.cancellation,
+                &ctx.tracker,
             )?;
             match outcome {
                 FastSumStrlenGroupConcat::Supported(sum) => {
@@ -99,6 +100,7 @@ fn sum_strlen_group_concat_fold(
     predicate: &Ref,
     separator: &str,
     cancellation: &fluree_db_core::QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<FastSumStrlenGroupConcat> {
     let p_sid = normalize_pred_sid(store, predicate)?;
     let Some(p_id) = store.sid_to_p_id(&p_sid) else {
@@ -110,10 +112,11 @@ fn sum_strlen_group_concat_fold(
     if total_rows == 0 {
         return Ok(FastSumStrlenGroupConcat::Supported(None));
     }
-    let Some(subjects) = count_distinct_subjects_for_predicate(store, g_id, p_id)? else {
+    let Some(subjects) = count_distinct_subjects_for_predicate(store, g_id, p_id, tracker)? else {
         return Ok(FastSumStrlenGroupConcat::Unsupported);
     };
-    let Some(strlen_sum) = sum_strlen_any_string_dict(store, g_id, p_id, cancellation)? else {
+    let Some(strlen_sum) = sum_strlen_any_string_dict(store, g_id, p_id, cancellation, tracker)?
+    else {
         return Ok(FastSumStrlenGroupConcat::Unsupported);
     };
 

@@ -37,12 +37,15 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 /// subject set in-memory.
 ///
 /// For sparse subject ranges, chunks the scan to avoid scanning large gaps.
+///
+/// Each leaflet read is charged to `tracker` (a no-op when it is disabled).
 pub fn batched_lookup_predicate_refs(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     p_id: u32,
     subjects: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> io::Result<HashMap<u64, Vec<u64>>> {
     if subjects.is_empty() {
         return Ok(HashMap::new());
@@ -217,6 +220,7 @@ pub fn batched_lookup_predicate_refs(
         );
         cursor.set_to_t(to_t);
         cursor.set_wanted_keys(Arc::from(*chunk));
+        let mut cursor = cursor.with_tracker(tracker.clone());
 
         // The cursor's p_id filter pins PSOT's leading key, so s_id is
         // non-decreasing across the returned rows — gallop the chunk's
@@ -277,11 +281,14 @@ pub type SubjectPropertyFlakes = HashMap<u64, Vec<(u32, u16, u64)>>;
 /// add/remove a type, or delete) from the classes it left onto the classes it
 /// joined (issue #1266). Mirrors [`batched_lookup_predicate_refs`] but scans
 /// SPOT (subject-major) across all predicates instead of one PSOT predicate.
+///
+/// Each leaflet read is charged to `tracker` (a no-op when it is disabled).
 pub fn batched_lookup_subject_properties(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     subjects: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> io::Result<SubjectPropertyFlakes> {
     let mut out: SubjectPropertyFlakes = HashMap::new();
     let mut cursor = BatchedWildcardCursor::new(
@@ -291,7 +298,8 @@ pub fn batched_lookup_subject_properties(
         to_t,
         WildcardDirection::Outgoing,
         property_projection(),
-    );
+    )
+    .with_tracker(tracker.clone());
     while let Some(matches) = cursor.next_batch()? {
         for (s_id, i) in matches.rows {
             let batch = &matches.batch;
@@ -392,11 +400,14 @@ fn o_type_run(batch: &super::column_types::ColumnBatch, ot: u16) -> (usize, usiz
 /// o_type check is required. Used by the incremental class-stat merge to move a
 /// re-typed object's inbound ref-class edges from its old class bucket to its
 /// new one (issue #1266).
+///
+/// Each leaflet read is charged to `tracker` (a no-op when it is disabled).
 pub fn batched_lookup_inbound_refs(
     store: &Arc<BinaryIndexStore>,
     g_id: GraphId,
     objects: &[u64],
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> io::Result<HashMap<u64, Vec<(u32, u64)>>> {
     let mut out: HashMap<u64, Vec<(u32, u64)>> = HashMap::new();
     let mut cursor = BatchedWildcardCursor::new(
@@ -406,7 +417,8 @@ pub fn batched_lookup_inbound_refs(
         to_t,
         WildcardDirection::IncomingRefs,
         property_projection(),
-    );
+    )
+    .with_tracker(tracker.clone());
     while let Some(matches) = cursor.next_batch()? {
         for (o_key, i) in matches.rows {
             out.entry(o_key)
@@ -474,6 +486,7 @@ pub struct BatchedWildcardCursor {
     chunks: Vec<Arc<[u64]>>,
     chunk_idx: usize,
     cursor: Option<BinaryCursor>,
+    tracker: fluree_db_core::Tracker,
 }
 
 impl BatchedWildcardCursor {
@@ -517,7 +530,14 @@ impl BatchedWildcardCursor {
             chunks,
             chunk_idx: 0,
             cursor: None,
+            tracker: fluree_db_core::Tracker::disabled(),
         }
+    }
+
+    /// Charge each leaflet read to `tracker` (a no-op when it is disabled).
+    pub fn with_tracker(mut self, tracker: fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker;
+        self
     }
 
     fn bounds(
@@ -579,7 +599,7 @@ impl BatchedWildcardCursor {
                 );
                 cursor.set_to_t(self.to_t);
                 cursor.set_wanted_keys(Arc::clone(chunk));
-                self.cursor = Some(cursor);
+                self.cursor = Some(cursor.with_tracker(self.tracker.clone()));
             }
             if let Some(batch) = self.cursor.as_mut().unwrap().next_batch()? {
                 let mut rows = Vec::new();

@@ -180,6 +180,7 @@ pub(crate) fn distinct_lead_walk<R>(
     store: &BinaryIndexStore,
     order: RunSortOrder,
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
     role: R,
 ) -> Result<Option<LeadWalk>>
 where
@@ -189,7 +190,7 @@ where
         return Ok(Some(LeadWalk { count: 0, tally: 0 }));
     }
 
-    let read = |(leaf, idx): At| read_row_groups(store, order, &leaves[leaf], idx);
+    let read = |(leaf, idx): At| read_row_groups(store, order, &leaves[leaf], idx, tracker);
     let map = |start: usize, chunk: &[LeafEntry]| -> Result<Option<Partial>> {
         let mut partial = Partial::new();
         let mut read = read;
@@ -295,6 +296,7 @@ pub(crate) fn leaflet_row_group(
     idx: usize,
     entry: &LeafletDirEntryV3,
     last: bool,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<LiveGroup>> {
     match entry.live_edges {
         LiveEdges::Exact { first, last: l } => Ok(Some(if last { l } else { first })),
@@ -308,7 +310,7 @@ pub(crate) fn leaflet_row_group(
                 &entry.first_key
             },
         ))),
-        LiveEdges::Legacy => read_row_groups(store, order, leaf, idx)
+        LiveEdges::Legacy => read_row_groups(store, order, leaf, idx, tracker)
             .map(|(first, l)| Some(if last { l } else { first })),
     }
 }
@@ -331,6 +333,7 @@ fn read_row_groups(
     order: RunSortOrder,
     leaf: &LeafEntry,
     idx: usize,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<(LiveGroup, LiveGroup)> {
     let handle = store
         .open_leaf_handle_ranged(&leaf.leaf_cid)
@@ -340,8 +343,14 @@ fn read_row_groups(
         .entries
         .get(idx)
         .ok_or_else(|| QueryError::Internal(format!("leaflet {idx} not in its leaf")))?;
-    let batch =
-        load_leaflet_projection(store, handle.as_ref(), idx, &group_projection(order), order)?;
+    let batch = load_leaflet_projection(
+        store,
+        handle.as_ref(),
+        idx,
+        &group_projection(order),
+        order,
+        tracker,
+    )?;
     if batch.row_count == 0 {
         return Err(QueryError::Internal(
             "a leaflet with rows decoded to none".to_string(),

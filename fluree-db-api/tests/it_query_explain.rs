@@ -708,3 +708,348 @@ async fn explain_dedup_only_grouped_select_expression() {
         "WHERE-level early dedup below the grouping: {physical}"
     );
 }
+
+async fn about_lang_ledger(fluree: &support::MemoryFluree, id: &str) -> support::MemoryLedger {
+    let ledger0 = genesis_ledger(fluree, id).await;
+    fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","ex:about":{"@id":"ex:T1"},"ex:lang":"fr"},
+                    {"@id":"ex:a2","ex:about":{"@id":"ex:T2"},"ex:lang":"en"},
+                    {"@id":"ex:a3","ex:about":{"@id":"ex:T1"},"ex:lang":"de"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger
+}
+
+async fn sparql_rows(
+    fluree: &support::MemoryFluree,
+    ledger: &support::MemoryLedger,
+    body: &str,
+) -> Vec<serde_json::Value> {
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+    let result = fluree
+        .query(&graphdb_from_ledger(ledger), sparql.as_str())
+        .await
+        .unwrap_or_else(|e| panic!("query {body}: {e}"));
+    support::normalize_sparql_bindings(&result.to_sparql_json(&ledger.snapshot).unwrap())
+}
+
+/// The planner costs every triple after a variable-free BIND with its variable
+/// bound, so the BIND has to run first: held back, it only checked `?o` after a
+/// scan that read every `ex:about` triple.
+fn assert_bind_seeds_every_scan(physical: &serde_json::Value, shape: &str) {
+    assert!(
+        physical.get("error").is_none(),
+        "{shape}: physical build errored: {physical}"
+    );
+    assert!(
+        physical_contains_op(physical, "BindOperator"),
+        "{shape}: the BIND runs as its own operator: {physical}"
+    );
+    assert!(
+        !physical_contains_op(physical, "DatasetOperator"),
+        "{shape}: every triple probes off the BIND row, none scans: {physical}"
+    );
+}
+
+#[tokio::test]
+async fn sparql_constant_iri_bind_seeds_the_triples_that_read_it() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = about_lang_ledger(&fluree, "bind-seed-sparql:main").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, bind, values, expect_rows) in [
+        (
+            "object",
+            r#"BIND(ex:T1 AS ?o) ?s ex:about ?o . ?s ex:lang "fr""#,
+            r#"VALUES ?o { ex:T1 } ?s ex:about ?o . ?s ex:lang "fr""#,
+            1,
+        ),
+        (
+            "subject",
+            "BIND(ex:a1 AS ?s) ?s ex:about ?o",
+            "VALUES ?s { ex:a1 } ?s ex:about ?o",
+            1,
+        ),
+        (
+            "predicate",
+            "BIND(ex:about AS ?p) ?s ?p ex:T1",
+            "VALUES ?p { ex:about } ?s ?p ex:T1",
+            2,
+        ),
+        (
+            "after a literal BIND",
+            r#"BIND("fr" AS ?l) BIND(ex:T1 AS ?o) ?s ex:about ?o . ?s ex:lang ?l"#,
+            r#"VALUES ?l { "fr" } VALUES ?o { ex:T1 } ?s ex:about ?o . ?s ex:lang ?l"#,
+            1,
+        ),
+        (
+            "after an unread IRI BIND",
+            "BIND(ex:T2 AS ?t) BIND(ex:T1 AS ?o) ?s ex:about ?o",
+            "VALUES ?t { ex:T2 } VALUES ?o { ex:T1 } ?s ex:about ?o",
+            2,
+        ),
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {bind} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        assert_bind_seeds_every_scan(&resp["plan"]["physical"], shape);
+
+        let got = sparql_rows(&fluree, &ledger, bind).await;
+        assert_eq!(got.len(), expect_rows, "{shape}: {got:?}");
+        assert_eq!(got, sparql_rows(&fluree, &ledger, values).await, "{shape}");
+    }
+}
+
+#[tokio::test]
+async fn jsonld_constant_iri_bind_seeds_the_triples_that_read_it() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = about_lang_ledger(&fluree, "bind-seed-jsonld:main").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, q) in [
+        (
+            "object",
+            json!({
+                "@context": {"ex":"http://example.org/"},
+                "select": ["?s"],
+                "where": [["bind", "?o", ["iri", "http://example.org/T1"]], {"@id":"?s","ex:about":"?o","ex:lang":"fr"}]
+            }),
+        ),
+        (
+            "after a literal BIND",
+            json!({
+                "@context": {"ex":"http://example.org/"},
+                "select": ["?s"],
+                "where": [["bind", "?l", "fr"], ["bind", "?o", ["iri", "http://example.org/T1"]], {"@id":"?s","ex:about":"?o","ex:lang":"?l"}]
+            }),
+        ),
+    ] {
+        let resp = fluree.explain(&db, &q).await.expect("explain");
+        assert_bind_seeds_every_scan(&resp["plan"]["physical"], shape);
+
+        let rows = fluree
+            .query(&db, &q)
+            .await
+            .expect("query")
+            .to_jsonld(&ledger.snapshot)
+            .unwrap();
+        assert_eq!(rows, json!([["ex:a1"]]), "{shape}");
+    }
+}
+
+/// A literal BIND ahead of a constant-IRI one stays a term check: the IRI seeds
+/// the triples, and `1` matches only the `xsd:integer` the scan reads. Seeded as
+/// a probe it would also match the `xsd:int`, `xsd:long`, `xsd:decimal` and
+/// `xsd:double` ones, as `VALUES ?n { 1 }` does.
+#[tokio::test]
+async fn literal_bind_ahead_of_a_constant_iri_bind_still_compares_terms() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-literal-first:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/","xsd":"http://www.w3.org/2001/XMLSchema#"},
+                "@graph": [
+                    {"@id":"ex:a1","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1","@type":"xsd:int"}},
+                    {"@id":"ex:a2","ex:about":{"@id":"ex:T1"},"ex:n":1},
+                    {"@id":"ex:a3","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1.0","@type":"xsd:decimal"}},
+                    {"@id":"ex:a4","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1","@type":"xsd:long"}},
+                    {"@id":"ex:a5","ex:about":{"@id":"ex:T1"},"ex:n":{"@value":"1.0E0","@type":"xsd:double"}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+    let subjects = |rows: Vec<serde_json::Value>| -> Vec<String> {
+        rows.iter()
+            .map(|r| r["s"]["value"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+
+    let held_back = subjects(sparql_rows(&fluree, &ledger, "BIND(1 AS ?n) ?s ex:n ?n").await);
+    assert_eq!(held_back, ["http://example.org/a2"]);
+
+    for body in [
+        "BIND(1 AS ?n) BIND(ex:T1 AS ?o) ?s ex:about ?o . ?s ex:n ?n",
+        "BIND(1 AS ?n) BIND(ex:T1 AS ?o) ?s ex:n ?n . ?s ex:about ?o",
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {body} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        assert_bind_seeds_every_scan(&resp["plan"]["physical"], body);
+        assert_eq!(
+            subjects(sparql_rows(&fluree, &ledger, body).await),
+            held_back,
+            "{body}"
+        );
+    }
+}
+
+/// Seeding changes when the BIND runs, never which rows survive: an IRI the
+/// ledger has never seen matches nothing, a JSON-LD BIND into a variable a
+/// triple binds still checks it, and an OPTIONAL body's BIND still runs per
+/// outer row.
+#[tokio::test]
+async fn constant_iri_bind_seed_keeps_bind_results() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger = about_lang_ledger(&fluree, "bind-seed-results:main").await;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (body, expect_rows) in [
+        ("BIND(ex:T9 AS ?o) ?s ex:about ?o", 0),
+        ("BIND(<http://nowhere.example/x> AS ?o) ?s ex:about ?o", 0),
+        ("BIND(<http://nowhere.example/x> AS ?s) ?s ex:about ?o", 0),
+    ] {
+        let got = sparql_rows(&fluree, &ledger, body).await;
+        assert_eq!(got.len(), expect_rows, "{body}: {got:?}");
+    }
+
+    let optional = sparql_rows(
+        &fluree,
+        &ledger,
+        "?s ex:lang ?l OPTIONAL { BIND(ex:T1 AS ?o) ?s ex:about ?o }",
+    )
+    .await;
+    assert_eq!(optional.len(), 3, "{optional:?}");
+    assert_eq!(
+        optional,
+        sparql_rows(
+            &fluree,
+            &ledger,
+            "?s ex:lang ?l OPTIONAL { VALUES ?o { ex:T1 } ?s ex:about ?o }",
+        )
+        .await
+    );
+
+    let rebind = json!({
+        "@context": {"ex":"http://example.org/"},
+        "select": ["?s"],
+        "where": [{"@id":"?s","ex:about":"?o"}, ["bind", "?o", ["iri", "http://example.org/T1"]]]
+    });
+    let rows = fluree
+        .query(&db, &rebind)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(
+        support::normalize_rows(&rows),
+        vec![json!(["ex:a1"]), json!(["ex:a3"])]
+    );
+}
+
+/// A seed would take a star off the `PropertyJoinOperator` it plans as without
+/// one, which starts from the star's other bound object. Seeded, the chain
+/// starts at the triple reading the BIND's variable instead, which the planner
+/// prices as rare whatever the IRI: here `ex:Common` is on most subjects and
+/// `ex:lang "fr"` on one. A seed into the star's subject pins it to one subject,
+/// so that one stays.
+#[tokio::test]
+async fn constant_iri_bind_leaves_a_star_its_property_join() {
+    let _env = HashJoinEnv::acquire();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "bind-seed-star:main").await;
+    let ledger = fluree
+        .insert(
+            ledger0,
+            &json!({
+                "@context": {"ex":"http://example.org/"},
+                "@graph": [
+                    {"@id":"ex:a1","@type":"ex:Thing","ex:about":{"@id":"ex:Common"},"ex:lang":"fr","ex:p1":"x1","ex:p2":"y1"},
+                    {"@id":"ex:a2","@type":"ex:Thing","ex:about":{"@id":"ex:Common"},"ex:lang":"en","ex:p1":"x2","ex:p2":"y2"},
+                    {"@id":"ex:a3","@type":"ex:Other","ex:about":{"@id":"ex:Common"},"ex:lang":"en","ex:p1":"x3","ex:p2":"y3"},
+                    {"@id":"ex:a4","@type":"ex:Thing","ex:about":{"@id":"ex:T1"},"ex:lang":"fr","ex:p1":"x4","ex:p2":"y4"}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let db = graphdb_from_ledger(&ledger);
+
+    for (shape, bind, values, expect_rows) in [
+        (
+            "object, with a bound object to start from",
+            r#"BIND(ex:Common AS ?c) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            r#"VALUES ?c { ex:Common } ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            1,
+        ),
+        (
+            "object, after a literal BIND",
+            r#"BIND("x" AS ?k) BIND(ex:Common AS ?c) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            r#"VALUES ?k { "x" } VALUES ?c { ex:Common } ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?c"#,
+            1,
+        ),
+        (
+            "class",
+            r#"BIND("fr" AS ?l) BIND(ex:Thing AS ?c) ?s a ?c ; ex:lang ?l ; ex:about ex:T1"#,
+            r#"VALUES ?l { "fr" } VALUES ?c { ex:Thing } ?s a ?c ; ex:lang ?l ; ex:about ex:T1"#,
+            1,
+        ),
+    ] {
+        let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {bind} }}");
+        let resp = fluree
+            .explain_sparql(&db, &sparql)
+            .await
+            .expect("explain_sparql");
+        let physical = &resp["plan"]["physical"];
+        assert!(
+            physical_contains_op(physical, "PropertyJoinOperator"),
+            "{shape}: the star keeps its property join: {physical}"
+        );
+        let got = sparql_rows(&fluree, &ledger, bind).await;
+        assert_eq!(got.len(), expect_rows, "{shape}: {got:?}");
+        assert_eq!(got, sparql_rows(&fluree, &ledger, values).await, "{shape}");
+    }
+
+    let jsonld = json!({
+        "@context": {"ex":"http://example.org/"},
+        "select": ["?s"],
+        "where": [
+            ["bind", "?c", ["iri", "http://example.org/Common"]],
+            {"@id":"?s","ex:lang":"fr","ex:p1":"?a","ex:p2":"?b","ex:about":"?c"}
+        ]
+    });
+    let resp = fluree.explain(&db, &jsonld).await.expect("explain");
+    assert!(
+        physical_contains_op(&resp["plan"]["physical"], "PropertyJoinOperator"),
+        "JSON-LD: the star keeps its property join: {}",
+        resp["plan"]["physical"]
+    );
+    let rows = fluree
+        .query(&db, &jsonld)
+        .await
+        .expect("query")
+        .to_jsonld(&ledger.snapshot)
+        .unwrap();
+    assert_eq!(rows, json!([["ex:a1"]]));
+
+    let subject = r#"BIND(ex:a1 AS ?s) ?s ex:lang "fr" ; ex:p1 ?a ; ex:p2 ?b ; ex:about ?o"#;
+    let sparql = format!("PREFIX ex: <http://example.org/>\nSELECT * WHERE {{ {subject} }}");
+    let resp = fluree
+        .explain_sparql(&db, &sparql)
+        .await
+        .expect("explain_sparql");
+    assert_bind_seeds_every_scan(&resp["plan"]["physical"], "subject of a star");
+    let got = sparql_rows(&fluree, &ledger, subject).await;
+    assert_eq!(got.len(), 1, "subject of a star: {got:?}");
+}

@@ -3473,9 +3473,11 @@ dependencies = [
  "testcontainers",
  "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
  "tracing",
  "tracing-subscriber 0.3.22",
  "ulid",
+ "uuid",
  "wasm-bindgen-futures",
  "wiremock",
  "xxhash-rust",
@@ -3542,6 +3544,8 @@ dependencies = [
  "gloo-timers",
  "http 1.4.0",
  "js-sys",
+ "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -3550,6 +3554,7 @@ dependencies = [
  "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -4208,6 +4213,7 @@ dependencies = [
  "serde_json",
  "sha1",
  "sha2",
+ "smallvec",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
@@ -4535,8 +4541,11 @@ version = "5.0.0-alpha.3"
 dependencies = [
  "console_error_panic_hook",
  "fluree-db-api",
+ "fluree-db-browser",
  "fluree-db-core",
  "fluree-db-query",
+ "futures",
+ "gloo-timers",
  "js-sys",
  "serde_json",
  "wasm-bindgen",

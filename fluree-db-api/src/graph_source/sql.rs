@@ -376,7 +376,7 @@ impl crate::Fluree {
         let graph_source_id = config.graph_source_id();
         info!(graph_source_id = %graph_source_id, "Creating SQL graph source");
         config.validate()?;
-        let (model_instance, model_warnings) =
+        let (model_instance, mut model_warnings) =
             self.validate_source_model(config.model.as_deref()).await?;
 
         let registered = self
@@ -387,6 +387,11 @@ impl crate::Fluree {
                 super::r2rml::SqlQueryPolicy::Execute,
             )
             .await?;
+        if config.model.is_some() {
+            if let Some(compiled) = &registered.compiled {
+                model_warnings.extend(fluree_db_query::r2rml::class_overlap_warnings(compiled));
+            }
+        }
         let (triples_map_count, table_names, mapping_validated) = registered.summary();
         let mapping_address = registered.address;
         let compiled_for_probe = registered.compiled;

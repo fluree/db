@@ -143,6 +143,10 @@ pub struct ParsedContext {
     pub type_key: String,
     /// Default vocabulary (@vocab)
     pub vocab: Option<String>,
+    /// Whether this context sets `@vocab` to `null`, which `vocab` alone
+    /// cannot tell from no `@vocab`. A scoped context that does clears the
+    /// vocabulary where it applies.
+    pub vocab_null: bool,
     /// Base IRI (@base)
     pub base: Option<String>,
     /// Default language (@language)
@@ -188,6 +192,7 @@ impl ParsedContext {
     pub fn to_json(&self) -> JsonValue {
         if self.terms.is_empty()
             && self.vocab.is_none()
+            && !self.vocab_null
             && self.base.is_none()
             && self.language.is_none()
         {
@@ -198,6 +203,8 @@ impl ParsedContext {
 
         if let Some(ref vocab) = self.vocab {
             ctx.insert("@vocab".to_string(), JsonValue::String(vocab.clone()));
+        } else if self.vocab_null {
+            ctx.insert("@vocab".to_string(), JsonValue::Null);
         }
         if let Some(ref base) = self.base {
             ctx.insert("@base".to_string(), JsonValue::String(base.clone()));
@@ -295,27 +302,55 @@ impl ParsedContext {
     }
 }
 
-/// Compute @vocab value, handling empty string and relative IRIs
-fn compute_vocab(document_base: Option<&str>, value: &JsonValue) -> Result<Option<String>> {
+/// The vocabulary mapping a `@vocab` value sets, expanded as JSON-LD 1.1
+/// expands it (Context Processing 5.8.3): a term or compact IRI expands, a
+/// relative IRI joins the vocabulary already in effect or, with none,
+/// resolves against the base, and an absolute IRI is taken as written.
+/// `active` is the context before this one's term definitions.
+fn compute_vocab(active: &ParsedContext, value: &JsonValue) -> Result<Option<String>> {
     match value {
-        JsonValue::String(s) => {
-            if s.is_empty() {
-                // Empty string means use @base as @vocab
-                Ok(document_base.map(iri::add_trailing_slash))
-            } else if !iri::is_absolute(s) {
-                match document_base {
-                    Some(base) => Ok(Some(resolve_iri(base, s))),
-                    None => Ok(Some(iri::add_trailing_slash(s))),
-                }
-            } else {
-                Ok(Some(iri::add_trailing_slash(s)))
-            }
-        }
+        JsonValue::String(s) => Ok(resolve_vocab(active, s)),
         JsonValue::Null => Ok(None),
         _ => Err(JsonLdError::InvalidContext {
             message: format!("@vocab must be a string, got: {value:?}"),
         }),
     }
+}
+
+/// The vocabulary a `@vocab` string `s` sets, under `active`.
+pub(crate) fn resolve_vocab(active: &ParsedContext, s: &str) -> Option<String> {
+    let expanded = crate::expand::iri(s, active, true);
+    let relative = !iri::is_absolute(&expanded) && !expanded.starts_with("_:");
+    let vocab = match active.base.as_deref() {
+        Some(base) if relative => Some(resolve_iri(base, &expanded)),
+        _ if expanded.is_empty() => None,
+        _ => Some(expanded),
+    };
+    if vocab.as_deref().is_some_and(has_no_path) {
+        note_pathless_vocab();
+    }
+    vocab
+}
+
+/// An IRI with an authority and nothing after it, such as
+/// `https://schema.org`: a term joined to it names another host.
+fn has_no_path(iri: &str) -> bool {
+    iri.split_once("://")
+        .is_some_and(|(_, rest)| !rest.is_empty() && !rest.contains(['/', '?', '#']))
+}
+
+/// Log, once per process, a `@vocab` with no path. Before 5.0 a `/` was
+/// added to it, so `"@vocab": "https://schema.org"` named
+/// `https://schema.org/name`; joined as written, it names
+/// `https://schema.orgname`.
+fn note_pathless_vocab() {
+    static NOTED: std::sync::Once = std::sync::Once::new();
+    NOTED.call_once(|| {
+        tracing::warn!(
+            "a JSON-LD @vocab is an IRI with no path: since 5.0 a term joins the @vocab as \
+             written, so it names another host; end the @vocab in / to keep the earlier IRIs"
+        );
+    });
 }
 
 /// Parse a context object (map)
@@ -352,7 +387,8 @@ fn parse_context_map(
         if let Some(keyword) = key.strip_prefix('@') {
             match keyword {
                 "vocab" => {
-                    result.vocab = compute_vocab(result.base.as_deref(), value)?;
+                    result.vocab = compute_vocab(&result, value)?;
+                    result.vocab_null = value.is_null();
                 }
                 "language" => {
                     result.language = value.as_str().map(std::string::ToString::to_string);
@@ -830,6 +866,89 @@ mod tests {
         assert_eq!(
             ctx.vocab,
             Some("https://hub.flur.ee/some/ledger/".to_string())
+        );
+    }
+
+    fn vocab_of(context: JsonValue) -> Option<String> {
+        ParsedContext::parse(None, &context).unwrap().vocab
+    }
+
+    #[test]
+    fn an_absolute_vocab_is_taken_as_written() {
+        for vocab in [
+            "urn:ex:",
+            "http://example.org/ns",
+            "ex:",
+            "http://example.org/ns#",
+        ] {
+            assert_eq!(
+                vocab_of(json!({"@vocab": vocab})).as_deref(),
+                Some(vocab),
+                "{vocab}"
+            );
+        }
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.org/doc", "@vocab": ""})).as_deref(),
+            Some("http://example.org/doc")
+        );
+    }
+
+    #[test]
+    fn a_vocab_expands_as_a_vocabulary_relative_iri() {
+        let prefix = json!({"ex": {"@id": "http://example.org/", "@prefix": true}});
+        // A compact IRI and a term expand against the context before it.
+        assert_eq!(
+            vocab_of(json!([prefix, {"@vocab": "ex:ns/"}])).as_deref(),
+            Some("http://example.org/ns/")
+        );
+        assert_eq!(
+            vocab_of(json!([prefix, {"@vocab": "ex"}])).as_deref(),
+            Some("http://example.org/")
+        );
+        // A relative IRI joins the vocabulary in effect, and with none
+        // resolves against the base.
+        assert_eq!(
+            vocab_of(json!([{"@vocab": "http://example.com/vocabulary/"}, {"@vocab": "./rel2#"}]))
+                .as_deref(),
+            Some("http://example.com/vocabulary/./rel2#")
+        );
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.com/a/b/", "@vocab": "/relative"})).as_deref(),
+            Some("http://example.com/relative")
+        );
+        // An empty @vocab is the base without its fragment.
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.org/ns#", "@vocab": ""})).as_deref(),
+            Some("http://example.org/ns")
+        );
+    }
+
+    #[test]
+    fn a_vocab_with_no_path_is_noted() {
+        for iri in ["https://schema.org", "http://example.org:8080"] {
+            assert!(has_no_path(iri), "{iri}");
+        }
+        for iri in [
+            "https://schema.org/",
+            "http://example.org/ns",
+            "http://example.org#",
+            "urn:ex:",
+            "file:///x",
+        ] {
+            assert!(!has_no_path(iri), "{iri}");
+        }
+    }
+
+    #[test]
+    fn a_string_context_keeps_its_slash() {
+        assert_eq!(
+            vocab_of(json!("https://schema.org")).as_deref(),
+            Some("https://schema.org/")
+        );
+        // An explicit @vocab beside a base is taken as written.
+        assert_eq!(
+            vocab_of(json!({"@base": "http://example.org/", "@vocab": "urn:ex:"})).as_deref(),
+            Some("urn:ex:")
         );
     }
 

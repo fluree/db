@@ -613,6 +613,9 @@ pub struct FileStorage {
     /// Which log this handle owns when the root is shared by several
     /// processes. See [`Self::with_wal_owner`].
     wal_owner: Option<Arc<str>>,
+    /// Whether this handle applies logs the root's writers left. See
+    /// [`Self::without_wal_replay`].
+    replays_wal: bool,
     /// Derived content written since the last [`StorageWrite::sync`], as
     /// root-relative keys. Shared across clones. Empty under
     /// [`Durability::PageCache`], where nothing is ever flushed.
@@ -716,6 +719,7 @@ impl FileStorage {
             wal: Arc::new(parking_lot::Mutex::new(WalAttach::Unattached)),
             operation_gate: Arc::new(OnceLock::new()),
             wal_owner: None,
+            replays_wal: true,
             unflushed: Arc::new(std::sync::Mutex::new(Vec::new())),
             flushing: Arc::new(tokio::sync::Mutex::new(())),
             #[cfg(test)]
@@ -970,6 +974,14 @@ impl FileStorage {
         self
     }
 
+    /// Never apply a log this root's writers left, at recovery or on a miss,
+    /// for a handle that reads a root another process writes: applying a log
+    /// writes the files it holds, and the writer applies its own.
+    pub fn without_wal_replay(mut self) -> Self {
+        self.replays_wal = false;
+        self
+    }
+
     /// Flush calls issued by this storage since it was constructed, counting
     /// both the staged file and its parent directory, and under
     /// [`Durability::Wal`] every flush of the root's WAL, including the
@@ -1038,6 +1050,9 @@ impl FileStorage {
         &self,
         _root_gate: &tokio::sync::OwnedRwLockWriteGuard<()>,
     ) -> Result<()> {
+        if !self.replays_wal {
+            return Ok(());
+        }
         if self.durability == Durability::Wal {
             self.attach_wal_locked(false)?;
         } else {
@@ -1057,6 +1072,9 @@ impl FileStorage {
     /// so a standalone root pays one directory probe per miss and no more.
     /// Returns whether anything was applied, so the caller can retry.
     async fn replay_foreign_logs(&self) -> Result<bool> {
+        if !self.replays_wal {
+            return Ok(false);
+        }
         let storage = self.clone();
         tokio::task::spawn_blocking(move || {
             let _root = futures::executor::block_on(storage.root_gate()?.write_owned());
@@ -1588,6 +1606,9 @@ impl StorageRead for FileStorage {
         let file = match std::fs::File::open(&path) {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if !self.replays_wal {
+                    return Ok(None);
+                }
                 // On a shared root a stopped owner's log may still hold this
                 // file. Applying it blocks, but only on a miss, and only when
                 // the root has owned logs at all.
@@ -4187,6 +4208,35 @@ mod wal_tests {
             1,
             "only the lock file is left"
         );
+    }
+
+    /// A handle without replay reads a stopped owner's file as missing and
+    /// leaves the owner's log in place.
+    #[tokio::test]
+    async fn a_handle_without_replay_leaves_a_stopped_owners_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = owned(dir.path(), "node-1");
+        a.hold_wal_segments_for_test().unwrap();
+        a.write_bytes(COMMIT, b"c").await.unwrap();
+        a.simulate_crash_for_test();
+        drop(a);
+        std::fs::remove_file(dir.path().join("ledger/commit/bbbb.bin")).unwrap();
+        let log_entries = || {
+            std::fs::read_dir(dir.path().join(WAL_DIR).join("owners").join("node-1"))
+                .unwrap()
+                .count()
+        };
+        let before = log_entries();
+
+        let reader = FileStorage::new(dir.path())
+            .with_durability(Durability::Sync)
+            .without_wal_replay();
+        reader.recover_wal().unwrap();
+        assert!(!reader.exists(COMMIT).await.unwrap());
+        assert!(reader.read_bytes(COMMIT).await.is_err());
+        assert!(reader.get_local(COMMIT).unwrap().is_none());
+        assert!(!dir.path().join("ledger/commit/bbbb.bin").exists());
+        assert_eq!(log_entries(), before, "the owner's log is left in place");
     }
 
     /// Opening the root applies stopped owners' logs too, under any

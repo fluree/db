@@ -660,6 +660,8 @@ impl TermComponentsOperator {
                     dt_id: 0,
                     lang_id: 0,
                     i_val: fluree_db_core::list_index::NONE,
+                    // The triple-term dictionary is the store's, not a graph's.
+                    arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
                     t,
                 },
                 // As a scan binds a link object novelty holds.

@@ -424,6 +424,12 @@ where
                         ));
                     };
                     for (property, values) in properties {
+                        // As the transaction parser refuses it.
+                        if property.starts_with('@') {
+                            return Err(AdapterError::Unsupported(format!(
+                                "@reverse may hold only property IRIs, not {property:?}"
+                            )));
+                        }
                         let predicate_id = self.sink.term_iri(property);
                         for node in node_items(values, "a reverse property's value")? {
                             let mut nested = Vec::new();
@@ -907,8 +913,13 @@ fn process_literal<S: GraphSink>(
                     None,
                 )))
             } else {
-                // Non-JSON object/array in @value - shouldn't happen
-                Ok(ProcessedValue::None)
+                // The expander refuses any other array or map `@value`. One
+                // that reaches here anyway is refused too, not dropped.
+                Err(AdapterError::InvalidStructure(format!(
+                    "an array or map @value typed {} has no literal form; \
+                     it needs \"@type\": \"@json\" (or \"@vector\" for an array)",
+                    datatype.as_iri()
+                )))
             }
         }
         Value::Null => Ok(ProcessedValue::None),
@@ -965,6 +976,29 @@ mod tests {
                 ),
                 "{:?}",
                 triple.o
+            );
+        }
+    }
+
+    /// A structured `@value` the adapter has no literal for is refused, not
+    /// dropped, even in expanded input that never passed the expander.
+    #[test]
+    fn a_structured_value_with_no_literal_form_is_refused() {
+        for (value, ty) in [
+            (json!({"a": 1}), fluree_vocab::fluree::EMBEDDING_VECTOR),
+            (json!([0.5]), "http://www.w3.org/2001/XMLSchema#integer"),
+        ] {
+            let expanded = json!([{
+                "@id": "http://example.org/s",
+                "http://example.org/p": [{"@value": value, "@type": ty}]
+            }]);
+            let mut sink = GraphCollectorSink::new();
+            let err = to_graph_events(&expanded, &mut sink)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains(r#""@type": "@json""#) && err.contains(ty),
+                "{err}"
             );
         }
     }
@@ -1798,6 +1832,25 @@ mod tests {
         assert!(graph
             .iter()
             .any(|t| iri(&t.s) == "http://example.org/other"));
+    }
+
+    /// A key starting with `@` inside `@reverse` is refused, as the
+    /// transaction parser refuses it; it used to be written as a predicate.
+    #[test]
+    fn an_at_key_in_reverse_is_refused() {
+        for key in ["@ignoreMe", "@foo.bar"] {
+            let expanded = json!([{
+                "@id": "http://example.org/s",
+                "@reverse": {key: [{"@id": "http://example.org/o"}]}
+            }]);
+            let err = to_graph_events(&expanded, &mut GraphCollectorSink::new())
+                .expect_err(key)
+                .to_string();
+            assert!(
+                err.contains("@reverse may hold only property IRIs"),
+                "{key}: {err}"
+            );
+        }
     }
 
     /// Records each statement as `graph s p o` (`s p o [i]` for a list

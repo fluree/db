@@ -9,6 +9,11 @@ pub enum JsonLdError {
     #[error("Invalid IRI: {iri}")]
     InvalidIri { iri: String },
 
+    #[error(
+        "{value:?} has the form of a JSON-LD keyword, so it names no node; write it as an IRI"
+    )]
+    KeywordAsNodeReference { value: String },
+
     #[error("Invalid IRI mapping for term '{term}'")]
     InvalidIriMapping { term: String, context: JsonValue },
 
@@ -33,6 +38,14 @@ pub enum JsonLdError {
     #[error("invalid {keyword} value: {reason}")]
     InvalidKeywordValue {
         keyword: &'static str,
+        reason: &'static str,
+    },
+
+    #[error("invalid @value at {at}: {reason}")]
+    InvalidValueObject {
+        /// Where the value object is: the keys, as written, and array
+        /// indexes from the document's root, as a JSON array.
+        at: String,
         reason: &'static str,
     },
 

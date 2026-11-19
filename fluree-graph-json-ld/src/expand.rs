@@ -157,6 +157,18 @@ pub fn iri_checked(compact_iri: &str, context: &ParsedContext, vocab: bool) -> R
 
 // ── Internal dispatch: strict=true → checked, strict=false → unchecked ──
 
+/// A string that names a node: an `@id`, or a value coerced to one. One in
+/// keyword form (`"@ignoreMe"`) names none: JSON-LD drops it, and Fluree
+/// refuses it, as it refuses such a key on a node.
+fn node_reference(s: &str, ctx: &ParsedContext, strict: bool) -> Result<String> {
+    if crate::is_keyword_form(s) {
+        return Err(JsonLdError::KeywordAsNodeReference {
+            value: s.to_string(),
+        });
+    }
+    iri_dispatch(s, ctx, false, strict)
+}
+
 fn iri_dispatch(s: &str, ctx: &ParsedContext, vocab: bool, strict: bool) -> Result<String> {
     if strict {
         iri_checked(s, ctx, vocab)
@@ -178,21 +190,46 @@ fn details_dispatch(
     }
 }
 
-/// A string a `"@type": "@vocab"` term coerces: a term or compact IRI, else
-/// relative to `@vocab`, else to `@base`. `None` for a term defined as
-/// `null`, which names no IRI.
-fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+/// `s` resolved as JSON-LD resolves a `@type` value: a term or compact IRI,
+/// else relative to `@vocab`, else to `@base`, as an `@id` is.
+pub(crate) fn vocab_or_base(
+    s: &str,
+    ctx: &ParsedContext,
+    strict: bool,
+) -> Result<(String, Option<ContextEntry>)> {
     match details(s, ctx, true) {
-        (_, Some(entry)) if entry.null_mapping => Ok(None),
-        (expanded, Some(_)) => Ok(Some(expanded)),
-        (_, None) => iri_dispatch(s, ctx, false, strict).map(Some),
+        // No term, prefix or `@vocab` matched, so only `@base` can.
+        (expanded, None) => match match_default(s, ctx, false) {
+            Some((iri, entry)) => Ok((iri, Some(entry))),
+            None => {
+                if strict {
+                    guard_unresolved(&expanded)?;
+                }
+                Ok((expanded, None))
+            }
+        },
+        found => Ok(found),
     }
 }
 
-/// A `@type` value's IRI; `None` for a term defined as `null`.
-fn type_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
-    let (expanded, entry) = details_dispatch(s, ctx, true, strict)?;
-    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(expanded))
+/// A `@type` value's IRI, or a string a `"@type": "@vocab"` term coerces;
+/// `None` for a term defined as `null`, which names no IRI.
+fn vocab_value_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let (iri, entry) = vocab_or_base(s, ctx, strict)?;
+    Ok((!entry.is_some_and(|e| e.null_mapping)).then_some(iri))
+}
+
+/// [`vocab_value_iri`] for a value that names a node: a class, or a string
+/// a `"@type": "@vocab"` term coerces. One in keyword form names none, so it
+/// is refused, as in `node_reference`.
+fn vocab_node_iri(s: &str, ctx: &ParsedContext, strict: bool) -> Result<Option<String>> {
+    let iri = vocab_value_iri(s, ctx, strict)?;
+    match iri {
+        Some(iri) if crate::is_keyword_form(&iri) => {
+            Err(JsonLdError::KeywordAsNodeReference { value: iri })
+        }
+        iri => Ok(iri),
+    }
 }
 
 /// Detect a context-coerced `@vector` declaration (long or shorthand form).
@@ -271,7 +308,10 @@ fn parse_node_value(
 
         JsonValue::String(s) => {
             // Check for @id or @type expansion
-            if id_val == Some("@id") || id_val == Some("@type") {
+            if id_val == Some("@id") {
+                return Ok(vec![json!(node_reference(s, context, strict)?)]);
+            }
+            if id_val == Some("@type") {
                 return Ok(vec![json!(iri_dispatch(s, context, false, strict)?)]);
             }
 
@@ -280,13 +320,13 @@ fn parse_node_value(
                 let mut obj = Map::new();
                 obj.insert(
                     "@id".to_string(),
-                    json!(iri_dispatch(s, context, false, strict)?),
+                    json!(node_reference(s, context, strict)?),
                 );
                 return Ok(vec![JsonValue::Object(obj)]);
             }
 
             if type_val == Some(&TypeValue::Vocab) {
-                return Ok(vocab_value_iri(s, context, strict)?
+                return Ok(vocab_node_iri(s, context, strict)?
                     .map(|iri| json!({"@id": iri}))
                     .into_iter()
                     .collect());
@@ -395,7 +435,7 @@ fn parse_node_value(
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, nodes, path, strict);
+                return parse_value_object(map, context, nodes, path, strict);
             }
 
             // Check for @container: @language
@@ -512,7 +552,6 @@ fn expand_nested_node(
 /// Parse a @value object
 fn parse_value_object(
     map: &Map<String, JsonValue>,
-    entry: Option<&ContextEntry>,
     context: &ParsedContext,
     nodes: &ParsedContext,
     path: &Path<'_>,
@@ -526,7 +565,7 @@ fn parse_value_object(
         .or_else(|| map.get("type"))
         .and_then(|t| t.as_str())
     {
-        Some(t) => Some(iri_dispatch(t, context, true, strict)?),
+        Some(t) => Some(vocab_or_base(t, context, strict)?.0),
         None => None,
     };
 
@@ -535,27 +574,26 @@ fn parse_value_object(
         .or_else(|| map.get("language"))
         .and_then(|l| l.as_str());
 
-    // The object's own `@type` and `@language` exclude each other. Its own
-    // language overrides the datatype its term would give, and a datatype
-    // excludes the default language. A term's `@id` or `@vocab` coercion
-    // never applies here: JSON-LD 1.1 coerces only a string value to an IRI
-    // (Value Expansion), and a value object is a literal. Only an explicit
-    // `"@type": "@id"` on the object makes it a reference.
-    let type_iri = match explicit_type {
-        Some(_) if explicit_language.is_some() => return Err(JsonLdError::LanguageWithType),
-        Some(t) => Some(t),
-        None if explicit_language.is_some() => None,
-        None => entry.as_ref().and_then(|e| match &e.type_ {
-            Some(TypeValue::Iri(t)) => Some(t.clone()),
-            _ => None,
-        }),
+    // A value object is taken as written: JSON-LD 1.1 gives a term's `@type`
+    // and `@language`, and the default language, only to a bare value (Value
+    // Expansion). Only an explicit `"@type": "@id"` makes it a reference.
+    let (type_iri, lang) = match (explicit_type, explicit_language) {
+        (Some(_), Some(_)) => return Err(JsonLdError::LanguageWithType),
+        (t, l) => (t, l.map(std::string::ToString::to_string)),
     };
-    let lang = match type_iri {
-        Some(_) => None,
-        None => explicit_language
-            .map(std::string::ToString::to_string)
-            .or_else(|| context.language.clone()),
-    };
+    // A value object typed `@id` gets its own message below, which names
+    // its fix: a string IRI.
+    if (val.is_array() || val.is_object())
+        && type_iri.as_deref() != Some("@id")
+        && !holds_structured_value(type_iri.as_deref(), val)
+    {
+        return Err(JsonLdError::InvalidValueObject {
+            at: path.to_json(),
+            reason: "a value object whose @value is an array or a map needs its own \
+                     \"@type\": \"@json\" (or \"@vector\" for an array); a value object \
+                     takes no datatype from its term",
+        });
+    }
     let direction = base_direction(map)?;
 
     // Build result
@@ -563,12 +601,12 @@ fn parse_value_object(
 
     if type_iri.as_deref() == Some("@id") {
         let Some(iri) = val.as_str() else {
-            return Err(JsonLdError::InvalidKeywordValue {
-                keyword: "@value",
+            return Err(JsonLdError::InvalidValueObject {
+                at: path.to_json(),
                 reason: "a value object typed @id names an IRI, so its @value must be a string",
             });
         };
-        let iri_val = iri_dispatch(iri, context, false, strict)?;
+        let iri_val = node_reference(iri, context, strict)?;
         obj.insert("@id".to_string(), json!(iri_val));
     } else {
         obj.insert("@value".to_string(), val.clone());
@@ -586,16 +624,44 @@ fn parse_value_object(
 
     // `{"@value": …, "@annotation": {…}}`: the annotation describes a
     // reifier of the triple this value completes, and expands as a node does.
-    if let Some(annotation) = map.get("@annotation") {
-        let expanded =
-            match expand_node_internal(annotation, nodes, &path.key("@annotation"), strict)? {
+    // `@edge` is a transaction's alias for it, kept under its own name as it
+    // is on a node reference.
+    for key in ["@annotation", "@edge"] {
+        if let Some(annotation) = map.get(key) {
+            let expanded = match expand_node_internal(annotation, nodes, &path.key(key), strict)? {
                 JsonValue::Array(nodes) => nodes,
                 node => vec![node],
             };
-        obj.insert("@annotation".to_string(), JsonValue::Array(expanded));
+            obj.insert(key.to_string(), JsonValue::Array(expanded));
+        }
     }
+    keep_lifetime_shorthand(map, &mut obj);
 
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// `@ttl` / `@expiresAt`: a transaction's shorthand for the lifetime of the
+/// value they are on, kept as written for the transaction to read.
+const LIFETIME_KEYS: [&str; 2] = ["@ttl", "@expiresAt"];
+
+fn keep_lifetime_shorthand(map: &Map<String, JsonValue>, result: &mut Map<String, JsonValue>) {
+    for key in LIFETIME_KEYS {
+        if let Some(value) = map.get(key) {
+            result.insert(key.to_string(), value.clone());
+        }
+    }
+}
+
+/// Whether a value object typed `type_iri` may hold `val`, an array or a map:
+/// a JSON literal holds either, a vector only an array. Refused here, a map
+/// under a vector type fails every reader alike; a bulk import reaches no
+/// vector parser to refuse it.
+fn holds_structured_value(type_iri: Option<&str>, val: &JsonValue) -> bool {
+    match type_iri {
+        Some("@json" | fluree_vocab::rdf::JSON) => true,
+        Some("@vector" | fluree_vocab::fluree::EMBEDDING_VECTOR) => val.is_array(),
+        _ => false,
+    }
 }
 
 /// A value object's `@direction`, which Fluree joins to its language tag as
@@ -628,13 +694,20 @@ fn parse_type<'c>(
         .or_else(|| type_id.as_ref().and_then(|id| node_map.get(id)));
 
     if let Some(type_val) = type_val {
+        // A value object where a node goes is refused later, as no node; its
+        // `@type` is a datatype, not a class.
+        let resolve = if node_map.contains_key("@value") {
+            vocab_value_iri
+        } else {
+            vocab_node_iri
+        };
         let types: Vec<String> = match type_val {
-            JsonValue::String(s) => type_iri(s, context, strict)?.into_iter().collect(),
+            JsonValue::String(s) => resolve(s, context, strict)?.into_iter().collect(),
             JsonValue::Array(arr) => {
                 let mut result = Vec::with_capacity(arr.len());
                 for v in arr {
                     if let Some(s) = v.as_str() {
-                        result.extend(type_iri(s, context, strict)?);
+                        result.extend(resolve(s, context, strict)?);
                     }
                 }
                 result
@@ -670,15 +743,37 @@ fn parse_type<'c>(
 /// Apply a scoped (property- or type-scoped) context's terms to the active
 /// context. A scoped context is parsed on its own, when its term is defined,
 /// so a term IRI it writes as a compact IRI over a prefix it does not define
-/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there. It
-/// is expanded here, against the active context the scoped context applies
-/// to, before the scoped terms take effect; left compact, it would expand a
-/// key to the compact string and store that as an IRI.
+/// (`{"b": {"@id": "ex:b"}}` under an outer `ex`) is still compact there, and
+/// one with no `:` (a relative `@id`, or none, so the term itself) has not
+/// met an outer `@vocab`. Its own `@vocab`, if relative, has not either, nor
+/// have the terms it named. All are expanded here, against the active context
+/// the scoped context applies to, before the scoped terms take effect, as at
+/// the top level: left as they are, a key would expand to the compact string,
+/// to a relative IRI, or to a plain name under a context that declares a
+/// vocabulary.
 fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
+    // The scoped `@vocab` as written, and as it reads here.
+    let own_vocab = scoped
+        .vocab
+        .as_deref()
+        .map(|written| (written, crate::context::resolve_vocab(active, written)));
     let resolve = |iri: &str| -> Option<String> {
-        let (prefix, suffix) = iri::parse_prefix(iri)?;
-        let prefix_iri = active.get(&prefix)?.id.as_deref()?;
-        (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+        match iri::parse_prefix(iri) {
+            Some((prefix, suffix)) => {
+                let prefix_iri = active.get(&prefix)?.id.as_deref()?;
+                (!prefix_iri.starts_with('@')).then(|| format!("{prefix_iri}{suffix}"))
+            }
+            None if !iri.starts_with('@') && !iri::any_iri(iri) => match &own_vocab {
+                // Parsing joined the term to the scoped `@vocab` as written.
+                Some((written, vocab)) => {
+                    let term = iri.strip_prefix(written)?;
+                    vocab.as_ref().map(|vocab| format!("{vocab}{term}"))
+                }
+                None if scoped.vocab_null => None,
+                None => active.vocab.as_ref().map(|vocab| format!("{vocab}{iri}")),
+            },
+            None => None,
+        }
     };
     let resolved: Vec<(String, ContextEntry)> = scoped
         .terms
@@ -700,14 +795,16 @@ fn apply_scoped_context(active: &mut ParsedContext, scoped: &ParsedContext) {
         })
         .collect();
     active.terms.extend(resolved);
-    if scoped.vocab.is_some() {
-        active.vocab = scoped.vocab.clone();
+    if let Some((_, vocab)) = own_vocab {
+        active.vocab = vocab;
+    } else if scoped.vocab_null {
+        active.vocab = None;
     }
 }
 
 /// Get context from node map
 fn get_context(node_map: &Map<String, JsonValue>) -> Option<&JsonValue> {
-    node_map.get("@context").or_else(|| node_map.get("context"))
+    node_map.get("@context")
 }
 
 /// Maximum expansion depth for nested JSON-LD values. Expansion recurses
@@ -745,8 +842,7 @@ fn guard_depth(path: &Path<'_>) -> Result<()> {
 
 /// Where expansion is in the document: the array indexes and property keys
 /// from the root. Each step borrows its parent, so descending costs no
-/// allocation; the steps are collected only to report a
-/// [`JsonLdError::NestedSequence`].
+/// allocation; the steps are collected only to report an error.
 struct Path<'a> {
     depth: usize,
     last: Option<(&'a Path<'a>, Step<'a>)>,
@@ -794,6 +890,11 @@ impl<'a> Path<'a> {
         steps.reverse();
         steps
     }
+
+    /// The steps from the root as a JSON array's text, for a message.
+    fn to_json(&self) -> String {
+        JsonValue::Array(self.to_vec()).to_string()
+    }
 }
 
 /// Internal node expansion
@@ -815,46 +916,53 @@ fn expand_node_internal(
         }
 
         JsonValue::Object(map) => {
-            // Parse local context if present
-            let local_context = get_context(map);
-            let merged_context = if let Some(lc) = local_context {
-                Cow::Owned(ParsedContext::parse(Some(context), lc)?)
-            } else {
-                Cow::Borrowed(context)
+            let merged_context = match get_context(map) {
+                Some(lc) => Cow::Owned(ParsedContext::parse(Some(context), lc)?),
+                None => Cow::Borrowed(context),
             };
-
-            // Parse @type and get updated context
-            let (types, context_with_types, propagates) = parse_type(map, &merged_context, strict)?;
-
-            // Build result
-            let mut result = Map::new();
-
-            // Add @type if present
-            if !types.is_empty() {
-                result.insert("@type".to_string(), json!(types));
-            }
-
-            // Process other keys
-            let type_key = merged_context.type_key.clone();
-            let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
-            let keys = NodeKeys {
-                context: &context_with_types,
-                nodes: if propagates {
-                    &context_with_types
-                } else {
-                    &merged_context
-                },
-                type_key: &type_key,
-                type_id: type_id.as_deref(),
-                strict,
-            };
-            expand_node_entries(map, &keys, path, false, &mut result)?;
-
-            Ok(JsonValue::Object(result))
+            expand_object(map, &merged_context, path, strict)
         }
 
         _ => Ok(node_map.clone()),
     }
+}
+
+/// Expand node object `map` against `merged_context`, which already holds the
+/// node's own `@context`.
+fn expand_object(
+    map: &Map<String, JsonValue>,
+    merged_context: &ParsedContext,
+    path: &Path<'_>,
+    strict: bool,
+) -> Result<JsonValue> {
+    // Parse @type and get updated context
+    let (types, context_with_types, propagates) = parse_type(map, merged_context, strict)?;
+
+    // Build result
+    let mut result = Map::new();
+
+    // Add @type if present
+    if !types.is_empty() {
+        result.insert("@type".to_string(), json!(types));
+    }
+
+    // Process other keys
+    let type_key = merged_context.type_key.clone();
+    let type_id = merged_context.get(&type_key).and_then(|e| e.id.clone());
+    let keys = NodeKeys {
+        context: &context_with_types,
+        nodes: if propagates {
+            &context_with_types
+        } else {
+            merged_context
+        },
+        type_key: &type_key,
+        type_id: type_id.as_deref(),
+        strict,
+    };
+    expand_node_entries(map, &keys, path, false, &mut result)?;
+
+    Ok(JsonValue::Object(result))
 }
 
 /// What a node object's entries expand against.
@@ -884,10 +992,14 @@ fn expand_node_entries(
     let strict = keys.strict;
     for (k, v) in map {
         // Skip context and type keys
-        if k == "@context" || k == "context" {
+        if k == "@context" {
             continue;
         }
         if k == keys.type_key || Some(k.as_str()) == keys.type_id {
+            continue;
+        }
+        if LIFETIME_KEYS.contains(&k.as_str()) {
+            result.insert(k.clone(), v.clone());
             continue;
         }
 
@@ -925,7 +1037,7 @@ fn expand_node_entries(
                 JsonValue::String(s) => {
                     result.insert(
                         "@id".to_string(),
-                        json!(iri_dispatch(s, context, false, strict)?),
+                        json!(node_reference(s, context, strict)?),
                     );
                 }
                 // A triple term, `{"@id": {"@id": s, p: o}}`: the embedded
@@ -1112,6 +1224,20 @@ pub(crate) fn node_impl(
 
         _ => Ok(node_map.clone()),
     }
+}
+
+/// Expand a document whose root context the caller has already parsed:
+/// `root` holds the root object's own `@context`, which is not applied again.
+/// An array has no root object, so each item applies its own `@context`.
+pub(crate) fn root_impl(doc: &JsonValue, root: &ParsedContext, strict: bool) -> Result<JsonValue> {
+    let JsonValue::Object(map) = doc else {
+        return node_impl(doc, root, strict);
+    };
+    if let Some(key) = crate::graph_shape::envelope_graph_key(map)? {
+        return expand_node_internal(&map[key], root, &Path::ROOT.key(key), strict);
+    }
+    guard_depth(&Path::ROOT)?;
+    expand_object(map, root, &Path::ROOT, strict)
 }
 
 /// Expand the contents of an envelope's `@graph` under the envelope's own
@@ -1304,6 +1430,103 @@ mod tests {
         assert_eq!(nicks.len(), 3);
         // @set should be flattened (no @set wrapper)
         assert!(nicks[0].get("@value").is_some());
+    }
+
+    /// A document whose root context the caller already parsed is expanded
+    /// against it without applying its `@context` again: a relative `@base`
+    /// applied twice would resolve against itself.
+    #[test]
+    fn a_parsed_root_context_is_not_applied_again() {
+        let initial = ParsedContext {
+            base: Some("http://example.org/a/".to_string()),
+            ..ParsedContext::new()
+        };
+        let doc = json!({"@context": {"@base": "b/"}, "@id": "x", "http://example.org/p": 1});
+        let root = ParsedContext::parse(Some(&initial), &doc["@context"]).unwrap();
+        let once =
+            json!({"@id": "http://example.org/a/b/x", "http://example.org/p": [{"@value": 1}]});
+        assert_eq!(
+            crate::expand_with_root_context(&doc, &root, false).unwrap(),
+            once
+        );
+        assert_eq!(node(&doc, &initial).unwrap(), once);
+
+        let envelope = json!({"@context": {"@base": "b/"}, "@graph": [{"@id": "x", "http://example.org/p": 1}]});
+        assert_eq!(
+            crate::expand_with_root_context(&envelope, &root, false).unwrap(),
+            json!([once])
+        );
+    }
+
+    /// A `@type` resolves as JSON-LD resolves one: against `@vocab`, else
+    /// against `@base` as an `@id` does, else it stays a plain name. A value
+    /// object's datatype resolves the same way.
+    #[test]
+    fn a_type_resolves_against_the_base_without_a_vocab() {
+        let doc = json!({
+            "@context": {"@base": "http://example.org/doc"},
+            "@id": "#alice",
+            "@type": ["#Person", "Agent"],
+            "http://example.org/p": {"@value": "x", "@type": "#dt"}
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/doc#alice",
+                "@type": ["http://example.org/doc#Person", "http://example.org/Agent"],
+                "http://example.org/p": [{"@value": "x", "@type": "http://example.org/doc#dt"}]
+            })
+        );
+
+        let vocab = json!({
+            "@context": {"@base": "http://example.org/doc", "@vocab": "http://v.example/"},
+            "@type": "Person"
+        });
+        assert_eq!(
+            node(&vocab, &ParsedContext::new()).unwrap()["@type"],
+            json!(["http://v.example/Person"])
+        );
+
+        let plain = json!({"@type": "Person", "name": "Ann"});
+        assert_eq!(
+            node(&plain, &ParsedContext::new()).unwrap(),
+            json!({"@type": ["Person"], "name": [{"@value": "Ann"}]})
+        );
+    }
+
+    /// Only `@context` is a context. A `context` key is a property like any
+    /// other, a plain name with no `@vocab`; it used to be read as the node's
+    /// context, which dropped it and could rewrite every other key.
+    #[test]
+    fn a_context_key_is_data() {
+        let doc = json!({
+            "@id": "http://example.org/n1",
+            "context": "meeting notes",
+            "title": "Q3 plan"
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/n1",
+                "context": [{"@value": "meeting notes"}],
+                "title": [{"@value": "Q3 plan"}]
+            })
+        );
+
+        let doc = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:n1",
+            "ex:title": "Q3 plan",
+            "context": {"topic": "budget"}
+        });
+        assert_eq!(
+            node(&doc, &ParsedContext::new()).unwrap(),
+            json!({
+                "@id": "http://example.org/n1",
+                "http://example.org/title": [{"@value": "Q3 plan"}],
+                "context": [{"topic": [{"@value": "budget"}]}]
+            })
+        );
     }
 
     #[test]
@@ -2085,14 +2308,63 @@ mod tests {
         ));
     }
 
-    /// A value object's own language overrides the datatype its term gives.
+    /// A value object is taken as written: its term's `@type` and
+    /// `@language`, and the default language, apply only to bare values.
     #[test]
-    fn value_object_language_overrides_the_term_datatype() {
-        let ctx = json!({"p": {"@id": EX.to_owned() + "p", "@type": XSD_INTEGER}});
+    fn value_object_is_taken_as_written() {
+        let p = EX.to_owned() + "p";
+        let typed = json!({"@language": "en", "p": {"@id": p, "@type": XSD_INTEGER}});
         assert_eq!(
-            values_of_p(json!({"@context": ctx, "p": {"@value": "cinq", "@language": "fr"}})),
+            values_of_p(json!({"@context": typed, "p": ["5", {"@value": "5"}, {"@value": 6}]})),
+            json!([
+                {"@value": "5", "@type": XSD_INTEGER},
+                {"@value": "5"},
+                {"@value": 6}
+            ])
+        );
+        assert_eq!(
+            values_of_p(json!({"@context": typed, "p": {"@value": "cinq", "@language": "fr"}})),
             json!([{"@value": "cinq", "@language": "fr"}])
         );
+
+        for term in [json!(p), json!({"@id": p, "@language": "de"})] {
+            let ctx = json!({"@language": "en", "p": term});
+            assert_eq!(
+                values_of_p(json!({"@context": ctx, "p": {"@value": "obj"}})),
+                json!([{"@value": "obj"}]),
+                "{ctx}"
+            );
+        }
+    }
+
+    /// An array or map `@value` needs its own `@json` or `@vector` type: a
+    /// value object takes none from its term, and an untyped one has no
+    /// literal to stand for.
+    #[test]
+    fn structured_value_object_needs_its_own_type() {
+        let p = EX.to_owned() + "p";
+        let vector = json!({"f": "https://ns.flur.ee/db#", "p": {"@id": p, "@type": "@vector"}});
+        for value in [
+            json!({"@value": [0.5]}),
+            json!({"@value": {"a": 1}}),
+            json!({"@value": [0.5], "@type": XSD_INTEGER}),
+        ] {
+            let err = crate::expand(&json!({"@context": vector, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("needs its own \"@type\""), "{value}: {err}");
+        }
+
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": vector, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
     }
 
     #[test]
@@ -2215,5 +2487,232 @@ mod tests {
                 json!([{"@value": document, "@type": "@json"}])
             );
         }
+    }
+
+    /// A term a scoped context defines with no `@id` joins the vocabulary in
+    /// effect where the context applies, as a term of the enclosing context
+    /// does; with no vocabulary it stays a plain name.
+    #[test]
+    fn a_scoped_term_takes_the_vocabulary_in_effect() {
+        let doc = |context: JsonValue| {
+            crate::expand(&json!({"@context": context, "foo": {"bar": "v"}})).unwrap()
+        };
+        let scoped =
+            json!({"foo": {"@id": "http://example/foo", "@context": {"bar": {"@language": "en"}}}});
+        let mut with_vocab = scoped.clone();
+        with_vocab["@vocab"] = json!("http://example/");
+        assert_eq!(
+            doc(with_vocab),
+            json!({"http://example/foo": [{"http://example/bar": [{"@value": "v", "@language": "en"}]}]})
+        );
+        // The scoped context's own `@vocab` wins.
+        assert_eq!(
+            doc(
+                json!({"@vocab": "http://example/", "foo": {"@context": {"@vocab": "http://inner/", "bar": {"@language": "en"}}}})
+            ),
+            json!({"http://example/foo": [{"http://inner/bar": [{"@value": "v", "@language": "en"}]}]})
+        );
+        assert_eq!(
+            doc(scoped),
+            json!({"http://example/foo": [{"bar": [{"@value": "v", "@language": "en"}]}]})
+        );
+        // A type-scoped context's terms do too.
+        let typed = crate::expand(&json!({
+            "@context": {"@vocab": "http://example/", "T": {"@context": {"baz": {"@type": "@vocab"}}}},
+            "@type": "T",
+            "baz": "buzz"
+        }))
+        .unwrap();
+        assert_eq!(
+            typed["http://example/baz"],
+            json!([{"@id": "http://example/buzz"}])
+        );
+    }
+
+    /// A scoped context's own `@vocab`, relative or a compact IRI, expands
+    /// against the context where it applies, as at the top level, and so do
+    /// the scoped terms it names and the keys it covers.
+    #[test]
+    fn a_scoped_vocab_expands_where_it_applies() {
+        for (vocab, expected) in [
+            ("rel/", "http://example/rel/"),
+            ("ex:ns/", "http://example/ns/"),
+        ] {
+            let expanded = crate::expand(&json!({
+                "@context": {
+                    "@vocab": "http://example/",
+                    "ex": "http://example/",
+                    "foo": {"@context": {"@vocab": vocab, "bar": {"@type": "@id"}}}
+                },
+                "foo": {"bar": "http://o/1", "baz": "v"}
+            }))
+            .unwrap();
+            let node = &expanded["http://example/foo"][0];
+            assert_eq!(node.as_object().map(Map::len), Some(2), "{vocab}: {node}");
+            assert_eq!(
+                node[format!("{expected}bar")],
+                json!([{"@id": "http://o/1"}]),
+                "{vocab}: {node}"
+            );
+            assert_eq!(
+                node[format!("{expected}baz")],
+                json!([{"@value": "v"}]),
+                "{vocab}: {node}"
+            );
+        }
+    }
+
+    /// A scoped term's `@reverse` and `@type` datatype take the vocabulary in
+    /// effect too, and a relative `@id` joins it to that `@id`, not to the
+    /// term.
+    #[test]
+    fn a_scoped_terms_other_iris_take_the_vocabulary() {
+        let expanded = crate::expand(&json!({
+            "@context": {"@vocab": "http://example/", "foo": {"@context": {
+                "bar": {"@type": "myType"},
+                "up": {"@reverse": "rel"},
+                "qux": {"@id": "baz"}
+            }}},
+            "foo": {"@id": "http://example/n", "bar": "x", "up": {"@id": "http://example/o"}, "qux": "y"}
+        }))
+        .unwrap();
+        let node = &expanded["http://example/foo"][0];
+        assert_eq!(
+            node["http://example/bar"],
+            json!([{"@value": "x", "@type": "http://example/myType"}]),
+            "{node}"
+        );
+        assert_eq!(
+            node["@reverse"]["http://example/rel"],
+            json!([{"@id": "http://example/o"}]),
+            "{node}"
+        );
+        assert_eq!(
+            node["http://example/baz"],
+            json!([{"@value": "y"}]),
+            "{node}"
+        );
+    }
+
+    /// A scoped `"@vocab": null` clears the vocabulary where it applies, so
+    /// its terms with no `@id`, and the keys it covers, are plain names.
+    #[test]
+    fn a_scoped_null_vocab_clears_the_vocabulary() {
+        let expanded = crate::expand(&json!({
+            "@context": {
+                "@vocab": "http://example/",
+                "foo": {"@context": {"@vocab": null, "bar": {"@type": "@id"}}}
+            },
+            "foo": {"bar": "http://o/1", "baz": "v"}
+        }))
+        .unwrap();
+        assert_eq!(
+            expanded,
+            json!({"http://example/foo": [{"bar": [{"@id": "http://o/1"}], "baz": [{"@value": "v"}]}]})
+        );
+        // The parsed context keeps the `null`, so it reads back the same.
+        let scoped = ParsedContext::parse(None, &json!({"@vocab": null})).unwrap();
+        assert_eq!(scoped.to_json(), json!({"@vocab": null}));
+    }
+
+    /// A string in keyword form names no node, so where one would become an
+    /// `@id` it is refused, as such a key on a node is.
+    #[test]
+    fn a_keyword_form_node_reference_is_refused() {
+        let ctx = json!({"@vocab": EX, "r": {"@type": "@id"}, "v": {"@type": "@vocab"}, "k": "@ignoreMe"});
+        for doc in [
+            json!({"@context": ctx, "@id": "@ignoreMe", "p": 1}),
+            json!({"@context": ctx, "p": {"@id": "@ignoreMe"}}),
+            json!({"@context": ctx, "r": "@ignoreMe"}),
+            json!({"@context": ctx, "v": "k"}),
+            json!({"@context": ctx, "p": {"@value": "@ignoreMe", "@type": "@id"}}),
+            // A node's `@type` names a class, a node too.
+            json!({"@context": ctx, "@type": "@ignoreMe", "p": 1}),
+            json!({"@context": ctx, "@type": ["T", "k"], "p": 1}),
+        ] {
+            let err = crate::expand(&doc).expect_err(&doc.to_string());
+            assert!(
+                matches!(err, JsonLdError::KeywordAsNodeReference { ref value } if value == "@ignoreMe"),
+                "{doc}: {err}"
+            );
+        }
+        // `@` and `@foo.bar` are not in keyword form.
+        crate::expand(&json!({"@context": ctx, "p": [{"@id": "@"}, {"@id": "@foo.bar"}]})).unwrap();
+    }
+
+    /// An array or map `@value` needs a `@json` type, or `@vector` for an
+    /// array: without one it has no literal to stand for.
+    #[test]
+    fn structured_value_object_needs_a_json_or_vector_type() {
+        let p = EX.to_owned() + "p";
+        for (term, value) in [
+            (json!(p), json!({"@value": [0.5]})),
+            (json!(p), json!({"@value": {"a": 1}})),
+            (json!(p), json!({"@value": [0.5], "@type": XSD_INTEGER})),
+            (
+                json!({"@id": p, "@type": XSD_INTEGER}),
+                json!({"@value": [0.5]}),
+            ),
+            // A vector holds an array only.
+            (json!(p), json!({"@value": {"a": 1}, "@type": "@vector"})),
+            (
+                json!(p),
+                json!({"@value": {"a": 1}, "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}),
+            ),
+            (
+                json!({"@id": p, "@type": "@vector"}),
+                json!({"@value": {"a": 1}}),
+            ),
+        ] {
+            let ctx = json!({"p": term});
+            let err = crate::expand(&json!({"@context": ctx, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(r#""@type": "@json""#), "{ctx} {value}: {err}");
+        }
+
+        let ctx = json!({"f": "https://ns.flur.ee/db#", "p": p});
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": ctx, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
+
+        // Typed `@id`, an array or a map is told the IRI must be a string.
+        for value in [json!(["ex:a"]), json!({"@id": "ex:a"})] {
+            let doc = json!({"@context": {"p": p}, "p": {"@value": value, "@type": "@id"}});
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "{value}: {err}");
+        }
+    }
+
+    /// A value object the expander refuses is named by where it is: the keys
+    /// and indexes from the root, so a refusal in one node of many, as in a
+    /// bulk import's chunk, points at that node.
+    #[test]
+    fn a_refused_value_object_names_where_it_is() {
+        let refused = |doc: JsonValue| match crate::expand(&doc) {
+            Err(JsonLdError::InvalidValueObject { at, .. }) => at,
+            other => panic!("{doc}: {other:?}"),
+        };
+        let structured = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:a", "ex:p": 1},
+                {"@id": "ex:b", "ex:p": {"@value": [1, 2]}}
+            ]
+        });
+        assert_eq!(refused(structured), r#"["@graph",1,"ex:p"]"#);
+        let typed_id = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:q": ["ex:o", {"@value": 3, "@type": "@id"}]
+        });
+        assert_eq!(refused(typed_id), r#"["ex:q",1]"#);
     }
 }

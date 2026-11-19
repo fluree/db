@@ -19,12 +19,20 @@ mod it_delete_stored_facts;
 mod it_enforce_unique_upsert_indexed;
 #[path = "it_export_lists.rs"]
 mod it_export_lists;
+#[path = "it_ill_typed_json_reads.rs"]
+mod it_ill_typed_json_reads;
+#[path = "it_ill_typed_literals.rs"]
+mod it_ill_typed_literals;
 #[path = "it_jsonld_empty_list.rs"]
 mod it_jsonld_empty_list;
 #[path = "it_jsonld_number_by_value.rs"]
 mod it_jsonld_number_by_value;
+#[path = "it_jsonld_scoped_term_vocab.rs"]
+mod it_jsonld_scoped_term_vocab;
 #[path = "it_jsonld_value_object_coercion.rs"]
 mod it_jsonld_value_object_coercion;
+#[path = "it_jsonld_vocab_as_written.rs"]
+mod it_jsonld_vocab_as_written;
 #[path = "it_list_cell_edits.rs"]
 mod it_list_cell_edits;
 #[path = "it_list_identity.rs"]

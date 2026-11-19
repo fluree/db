@@ -349,17 +349,15 @@ fn schema_cache() -> &'static SchemaCache {
 /// `@vocab` that shorten IRIs to the names this ledger's users already write.
 fn namer_for(db: &GraphDb) -> Namer {
     let mut prefixes = Vec::new();
-    let mut vocab = None;
     if let Some(obj) = db.default_context.as_ref().and_then(JsonValue::as_object) {
         for (key, value) in obj {
             let Some(iri) = value.as_str() else { continue };
-            if key == "@vocab" {
-                vocab = Some(iri.to_string());
-            } else if !key.starts_with('@') {
+            if !key.starts_with('@') {
                 prefixes.push((key.clone(), iri.to_string()));
             }
         }
     }
+    let vocab = crate::query::helpers::default_context_vocab(db.default_context.as_ref());
     Namer::new(prefixes, vocab)
 }
 
@@ -489,9 +487,10 @@ async fn curated_schema(db: &GraphDb) -> Option<CuratedSchema> {
     }
     let (schema_subject, mut curated) = schemas.into_iter().next().expect("len checked");
 
-    // Scalar settings on the schema node itself.
+    // Scalar settings on the schema node itself, read without the
+    // Fluree-vocabulary filter: configuration predicates are in that namespace.
     for flake in subject_flakes(db, &schema_subject).await {
-        let Some(iri) = user_iri_unfiltered(&flake.p, snapshot) else {
+        let Some(iri) = snapshot.decode_sid(&flake.p) else {
             continue;
         };
         match iri.as_str() {
@@ -629,13 +628,6 @@ async fn subject_flakes(db: &GraphDb, subject: &Sid) -> Vec<fluree_db_core::Flak
         )
         .await
         .unwrap_or_default()
-}
-
-/// A SID's IRI without the Fluree-vocabulary filter, for reading configuration
-/// predicates (which are deliberately in Fluree's own namespace).
-fn user_iri_unfiltered(sid: &Sid, snapshot: &LedgerSnapshot) -> Option<String> {
-    let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
-    Some(format!("{}{}", prefix, sid.name))
 }
 
 // =============================================================================
@@ -913,9 +905,9 @@ fn shape_cache_key(db: &GraphDb) -> Option<ShapeCacheKey> {
 /// A SID's IRI, or `None` for Fluree's own vocabulary — commit metadata and
 /// edge-annotation reifiers are not part of anyone's data model.
 fn user_iri(sid: &Sid, snapshot: &LedgerSnapshot) -> Option<String> {
-    let prefix = snapshot.namespaces().get(&sid.namespace_code)?;
-    let iri = format!("{}{}", prefix, sid.name);
-    (!iri.starts_with("https://ns.flur.ee/")).then_some(iri)
+    snapshot
+        .decode_sid(sid)
+        .filter(|iri| !iri.starts_with("https://ns.flur.ee/"))
 }
 
 /// HEAD-index stats merged with the overlay up to `to_t`.

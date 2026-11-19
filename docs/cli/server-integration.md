@@ -150,7 +150,6 @@ The `commit` query parameter accepts the same identifiers as the local `fluree s
 **Error responses:**
 - `400 Bad Request` — missing or invalid `commit` parameter
 - `404 Not Found` — ledger or commit not found
-- `501 Not Implemented` — proxy storage mode (no local index available for decoding)
 
 ### `fluree create <ledger> --remote <name>` (admin-protected)
 
