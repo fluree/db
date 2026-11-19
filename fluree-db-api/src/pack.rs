@@ -307,7 +307,7 @@ pub async fn stream_pack(
         Ok(journal) => journal,
         Err(e) => {
             let mut buf = Vec::new();
-            encode_error_frame(&e.to_string(), &mut buf);
+            encode_error_frame_or_short(&e.to_string(), &mut buf);
             encode_end_frame(&mut buf);
             let _ = frame_tx.send(Ok(buf)).await;
             return PackStreamResult {
@@ -341,7 +341,7 @@ pub async fn stream_pack(
             // Send Error frame + End frame.
             warn!(error = %err_msg, "pack stream error");
             let mut buf = Vec::new();
-            encode_error_frame(&err_msg, &mut buf);
+            encode_error_frame_or_short(&err_msg, &mut buf);
             encode_end_frame(&mut buf);
             let _ = frame_tx.send(Ok(buf)).await;
             PackStreamResult {
@@ -413,7 +413,7 @@ pub async fn stream_archive(
                     .await
                     .map_err(|e| format!("failed to read default context blob {cid}: {e}"))?;
                 let mut buf = Vec::with_capacity(bytes.len() + 64);
-                encode_data_frame(&cid, &bytes, &mut buf);
+                encode_data_frame(&cid, &bytes, &mut buf).map_err(|e| e.to_string())?;
                 frame_tx
                     .send(Ok(buf))
                     .await
@@ -421,7 +421,8 @@ pub async fn stream_archive(
             }
 
             let mut manifest_buf = Vec::with_capacity(512);
-            encode_manifest_frame(&nameservice_manifest, &mut manifest_buf);
+            encode_manifest_frame(&nameservice_manifest, &mut manifest_buf)
+                .map_err(|e| e.to_string())?;
             frame_tx
                 .send(Ok(manifest_buf))
                 .await
@@ -442,6 +443,16 @@ pub async fn stream_archive(
             // are emitted so we never persist a partial archive.
             Err(err_msg)
         }
+    }
+}
+
+/// An Error frame for `message`, or for a short fixed message when `message`
+/// is too long for a frame: a failed stream must end in an Error frame, never
+/// a bare End that reads as success.
+fn encode_error_frame_or_short(message: &str, out: &mut Vec<u8>) {
+    if encode_error_frame(message, out).is_err() {
+        encode_error_frame("pack stream failed; its error was too long to send", out)
+            .expect("a short message fits in a frame");
     }
 }
 
@@ -553,10 +564,10 @@ async fn stream_pack_inner(
 
     let mut preamble_buf = Vec::with_capacity(256);
     write_stream_preamble(&mut preamble_buf);
-    encode_header_frame(&header, &mut preamble_buf);
+    encode_header_frame(&header, &mut preamble_buf).map_err(|e| e.to_string())?;
     if let Some(mut journal) = journal {
         journal["phase"] = serde_json::Value::from("retention");
-        encode_manifest_frame(&journal, &mut preamble_buf);
+        encode_manifest_frame(&journal, &mut preamble_buf).map_err(|e| e.to_string())?;
     }
     frame_tx
         .send(Ok(preamble_buf))
@@ -599,7 +610,7 @@ async fn stream_pack_inner(
 
         // Encode and send commit data frame.
         let mut buf = Vec::with_capacity(raw_bytes.len() + 64);
-        encode_data_frame(commit_cid, &raw_bytes, &mut buf);
+        encode_data_frame(commit_cid, &raw_bytes, &mut buf).map_err(|e| e.to_string())?;
         frame_tx
             .send(Ok(buf))
             .await
@@ -637,7 +648,8 @@ async fn stream_pack_inner(
                         };
 
                         let mut txn_buf = Vec::with_capacity(txn_bytes.len() + 64);
-                        encode_data_frame(txn_cid, &txn_bytes, &mut txn_buf);
+                        encode_data_frame(txn_cid, &txn_bytes, &mut txn_buf)
+                            .map_err(|e| e.to_string())?;
                         frame_tx
                             .send(Ok(txn_buf))
                             .await
@@ -662,7 +674,7 @@ async fn stream_pack_inner(
             "artifact_count": artifacts.len(),
         });
         let mut manifest_buf = Vec::with_capacity(256);
-        encode_manifest_frame(&manifest, &mut manifest_buf);
+        encode_manifest_frame(&manifest, &mut manifest_buf).map_err(|e| e.to_string())?;
         frame_tx
             .send(Ok(manifest_buf))
             .await
@@ -676,7 +688,8 @@ async fn stream_pack_inner(
                 .map_err(|e| format!("failed to read index artifact {artifact_cid}: {e}"))?;
 
             let mut buf = Vec::with_capacity(artifact_bytes.len() + 64);
-            encode_data_frame(artifact_cid, &artifact_bytes, &mut buf);
+            encode_data_frame(artifact_cid, &artifact_bytes, &mut buf)
+                .map_err(|e| e.to_string())?;
             frame_tx
                 .send(Ok(buf))
                 .await

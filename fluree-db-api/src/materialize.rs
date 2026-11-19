@@ -2118,9 +2118,9 @@ fn escape_nt_literal(value: &str) -> String {
 /// Canonicalize a typed object literal of an N-Triple so two value-equal but
 /// lexically-different forms compare equal — e.g. the source's `"5.00"^^decimal`
 /// vs the twin's `"5"^^decimal`, or `"…T…:42.000000Z"^^dateTime` vs `"…T…:42Z"`.
-/// Only a typed NUMERIC or TEMPORAL object is touched; IRIs, plain/lang literals,
-/// and other typed literals pass through byte-for-byte. Applied to BOTH sides, so
-/// whichever canonical form each produces, they agree.
+/// Only a typed NUMERIC, TEMPORAL or `xsd:boolean` object is touched; IRIs,
+/// plain/lang literals, and other typed literals pass through byte-for-byte.
+/// Applied to BOTH sides, so whichever canonical form each produces, they agree.
 fn canonicalize_value_nt(triple: &str) -> String {
     // `<s> <p> OBJ .` — subject/predicate are `<…>`/`_:…` with no spaces, so the
     // first two spaces delimit them; OBJ (which may contain spaces inside quotes)
@@ -2143,6 +2143,8 @@ fn canonicalize_value_nt(triple: &str) -> String {
         normalize_numeric_lexical(lex, local)
     } else if is_temporal_datatype(local) {
         normalize_temporal_lexical(lex)
+    } else if dt == fluree_vocab::xsd::BOOLEAN {
+        normalize_boolean_lexical(lex).to_string()
     } else {
         return triple.to_string();
     };
@@ -2212,6 +2214,25 @@ fn trim_decimal_lexical(lex: &str) -> String {
             }
         }
         None => lex.to_string(),
+    }
+}
+
+/// Canonical lexical form of an `xsd:boolean`: `1` reads as `true` and `0` as
+/// `false`. A 0/1 column typed `xsd:boolean` renders `"1"` on the source side,
+/// while the twin stores the boolean and answers `"true"`, so without this every
+/// such triple was a missing/extra pair.
+///
+/// The parse is the write path's own (`coerce_string_value`, which an import
+/// runs on every typed literal), so the gate and the import can't drift apart:
+/// only the forms it reads as a boolean collapse (today `true`, `false`, `1`
+/// and `0`, untrimmed). Any other form (`" 1"`, `"TRUE"`, `"yes"`) is kept as
+/// text under the declared datatype by an import, so it passes through here
+/// unchanged and still has to match byte for byte. Applied to BOTH sides.
+fn normalize_boolean_lexical(lex: &str) -> &str {
+    match fluree_db_core::coerce::coerce_string_value(lex, fluree_vocab::xsd::BOOLEAN) {
+        Ok(fluree_db_core::FlakeValue::Boolean(true)) => "true",
+        Ok(fluree_db_core::FlakeValue::Boolean(false)) => "false",
+        _ => lex,
     }
 }
 
@@ -2713,6 +2734,34 @@ mod tests {
             as_float, other,
             "distinct float values must stay distinct after the fold"
         );
+    }
+
+    #[test]
+    fn boolean_one_and_zero_canonicalize_to_true_and_false() {
+        // #2386: a 0/1 column typed xsd:boolean renders "1" on the source side;
+        // the twin stores the boolean and answers "true".
+        let dt = fluree_vocab::xsd::BOOLEAN;
+        let nt = |lex: &str| super::canonicalize_value_nt(&format!("<s> <p> \"{lex}\"^^<{dt}> ."));
+        assert_eq!(nt("1"), nt("true"));
+        assert_eq!(nt("0"), nt("false"));
+        assert_eq!(nt("1"), format!("<s> <p> \"true\"^^<{dt}> ."));
+        assert_ne!(nt("1"), nt("false"), "1 and false are different values");
+        assert_ne!(nt("0"), nt("true"), "0 and true are different values");
+
+        // A form the write path doesn't parse as a boolean is kept as text by an
+        // import, so it stays as written and can't match a stored boolean.
+        for lex in ["2", " 1", "1 ", "TRUE", "yes", "1.0", ""] {
+            let line = format!("<s> <p> \"{lex}\"^^<{dt}> .");
+            assert_eq!(super::canonicalize_value_nt(&line), line, "{lex:?}");
+            assert_ne!(nt(lex), nt("true"), "{lex:?}");
+            assert_ne!(nt(lex), nt("false"), "{lex:?}");
+        }
+
+        // Only xsd:boolean collapses: a "1" of any other datatype is untouched.
+        let other = "<s> <p> \"1\"^^<http://example.org/dt#boolean> .";
+        assert_eq!(super::canonicalize_value_nt(other), other);
+        let plain = "<s> <p> \"1\" .";
+        assert_eq!(super::canonicalize_value_nt(plain), plain);
     }
 
     #[test]
