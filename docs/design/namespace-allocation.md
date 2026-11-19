@@ -101,7 +101,8 @@ For large Turtle streaming imports, Fluree attempts to detect “namespace explo
 an extra I/O pass:
 
 1. `StreamingTurtleReader` samples bounded byte windows (`NS_PREFLIGHT_WINDOW_SIZE`, 8 MiB) within
-   the first chunk region and counts distinct prefixes under the `MostGranular` split.
+   the first chunk region and counts distinct prefixes under the `NamedLocal` split: the preflight
+   chooses only a new ledger's mode, and a new ledger splits under `NamedLocal`.
 2. If the sample exceeds `NS_PREFLIGHT_BUDGET` (currently 255), the reader publishes a
    `NamespaceSuggestion::CoarseHeuristic` preflight result recommending mitigation.
 3. The import forwarder sets `NsSplitMode::HostPlusN(1)` on the shared allocator **before parsing
