@@ -593,6 +593,48 @@ explanation with an error, and a fuel tracker. Premises appear whatever a
 policy would hide, so a view under a non-root policy is refused, the ledger's
 configured default policy included. The shape of the result is experimental.
 
+## Recording a rule run
+
+Derived facts live in the query's overlay and are never committed. To keep
+what a run concluded, with a record of what produced it, a runner reads the
+conclusions with a query and writes them, and the record, itself:
+
+1. **Pin the data.** Query the ledger at a fixed state: `"from":
+   "data:main@commit:<cid>"`, or `@t:` for a ledger that is never rebuilt (a
+   ledger rebuilt under the same name reuses its `t` values; a commit names
+   one state).
+2. **Run the rules, tracked.** A `construct` query with `"reasoning":
+   "datalog"` and `"opts": {"meta": true}` returns the derived triples; a
+   `select` with aggregates returns per-rule counts. The tracked
+   [`reasoning` block](reasoning.md) says what ran: `rule_set`, each rule's
+   name and text digest (`rules`), where stored rules were read
+   (`rules_source`, with the rules ledger's `t` and `commit_id`),
+   `rules_fired`, `evaluation_time`, and whether a budget cut the run
+   (`capped`). Don't record a capped run as complete: a positive program
+   answers capped and incomplete (a negating or aggregating one fails
+   instead).
+3. **Write the conclusions elsewhere.** Insert them into a ledger, or a named
+   graph of one, that the rules don't read, never back into the queried
+   ledger: a stored copy of a derived fact outlives the premises that derived
+   it, and the next run would read it as input.
+4. **Write the record last.** The two requests are not one transaction, so a
+   record written after the conclusions marks the run complete. Key it by
+   the rule set and the data's commit (`rule_set`, `data:main@commit:<cid>`),
+   so a run that finds its key already recorded can stop.
+
+```json
+{
+  "@context": {"ex": "http://example.org/runs/"},
+  "@id": "ex:run-9f2c-bafy",
+  "ex:ruleSet": "9f2c…e41a",
+  "ex:data": "data:main@commit:bafy…",
+  "ex:rulesSource": "rules:main@commit:bafy…",
+  "ex:evaluationTime": "2026-12-09T00:00:00Z",
+  "ex:derivedFacts": 1250,
+  "ex:outputGraph": "http://example.org/runs/9f2c-bafy"
+}
+```
+
 ## Examples
 
 ### Sibling inference
