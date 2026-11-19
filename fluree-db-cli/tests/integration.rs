@@ -2782,54 +2782,6 @@ fn export_without_annotations_is_unchanged() {
         .stdout(predicate::str::contains("~").not());
 }
 
-/// An annotation written inside a named graph is not represented in the
-/// output today: the forward lookup export uses is blind to named graphs,
-/// though the rows are in the ledger and SPARQL reads them. Export must say
-/// so — suppressing the `f:reifies*` rows and then emitting no marker is
-/// exactly the silent truncation this work exists to remove.
-#[test]
-fn export_reports_annotations_it_could_not_resolve() {
-    let tmp = TempDir::new().unwrap();
-    fluree_cmd(&tmp).arg("init").assert().success();
-    let src = tmp.path().join("gann-src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("a.trig"),
-        "@prefix ex: <http://example.org/> .\n\
-         GRAPH <http://example.org/g1> { \
-             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
-    )
-    .unwrap();
-    fluree_cmd(&tmp)
-        .args(["create", "gann", "--from"])
-        .arg(&src)
-        .assert()
-        .success();
-
-    fluree_cmd(&tmp)
-        .args(["export", "gann", "--format", "trig", "--all-graphs"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ))
-        .stderr(predicate::str::contains("--raw-reifies"));
-
-    // And the named remedy works: the bundle comes out verbatim.
-    fluree_cmd(&tmp)
-        .args([
-            "export",
-            "gann",
-            "--format",
-            "trig",
-            "--all-graphs",
-            "--raw-reifies",
-        ])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("reifiesSubject"));
-}
-
 /// Two exports of the same ledger must produce the same bytes.
 ///
 /// They did not. Untranslated rows reach the writers through
@@ -2963,51 +2915,6 @@ fn an_untranslated_annotation_exports_with_its_marker() {
         .assert()
         .success()
         .stdout(predicate::str::contains("<http://example.org/src>"));
-}
-
-/// The counter still fires when an annotation genuinely cannot be resolved.
-///
-/// Paired with the test above on purpose. "No warning" is satisfied by a
-/// counter that has stopped working, so a `MustNotFire` assertion alone
-/// cannot distinguish "nothing was dropped" from "the accounting is dead".
-///
-/// The fixture is an annotation inside a named graph, which the base-index
-/// seal scan cannot key on this branch.
-///
-/// **This canary has a known expiry**, recorded here so the next person does
-/// not mistake its retirement for a regression: the stacked seal fix makes
-/// named-graph annotations resolve, at which point this stops firing and
-/// must be replaced rather than deleted. The replacement wanted is a bundle
-/// the decoder rejects outright — a `GraphMismatch` or a malformed bundle —
-/// which is a corruption state rather than a defect, and which no supported
-/// write surface can produce, since every write path rejects hand-written
-/// `f:reifies*`.
-#[test]
-fn the_unresolved_counter_still_fires_when_it_should() {
-    let tmp = TempDir::new().unwrap();
-    fluree_cmd(&tmp).arg("init").assert().success();
-    let src = tmp.path().join("mf-src");
-    std::fs::create_dir_all(&src).unwrap();
-    std::fs::write(
-        src.join("a.trig"),
-        "@prefix ex: <http://example.org/> .\n\
-         GRAPH <http://example.org/g1> { \
-             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
-    )
-    .unwrap();
-    fluree_cmd(&tmp)
-        .args(["create", "mf", "--from"])
-        .arg(&src)
-        .assert()
-        .success();
-
-    fluree_cmd(&tmp)
-        .args(["export", "mf", "--format", "trig", "--all-graphs"])
-        .assert()
-        .success()
-        .stderr(predicate::str::contains(
-            "1 edge annotations could not be resolved",
-        ));
 }
 
 /// Every object shape keeps its annotation, including the big-numeric ones.
@@ -3157,6 +3064,59 @@ fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
         .success()
         .stdout(predicate::str::contains("~ <http://example.org/c1>"))
         .stdout(predicate::str::contains("<http://example.org/knows>"));
+}
+
+/// An annotation written inside a named graph exports like any other.
+///
+/// It did not (#1859): the seal scan reads bundles out of the base index,
+/// and the base-index reader does not put a graph on the rows it decodes —
+/// the graph rides on the query's `g_id`, not the row. The decoder
+/// cross-checks `f:reifiesGraph` against the flake-level graph and read the
+/// disagreement as a forged bundle, so every named-graph annotation was
+/// dropped with no marker emitted.
+#[test]
+fn a_named_graph_annotation_exports_with_its_marker() {
+    let tmp = TempDir::new().unwrap();
+    fluree_cmd(&tmp).arg("init").assert().success();
+    let src = tmp.path().join("gann-src");
+    std::fs::create_dir_all(&src).unwrap();
+    std::fs::write(
+        src.join("a.trig"),
+        "@prefix ex: <http://example.org/> .\n\
+         GRAPH <http://example.org/g1> { \
+             ex:x ex:p ex:y ~ ex:cG {| ex:src ex:d |} . }\n",
+    )
+    .unwrap();
+    fluree_cmd(&tmp)
+        .args(["create", "gann", "--from"])
+        .arg(&src)
+        .assert()
+        .success();
+
+    fluree_cmd(&tmp)
+        .args(["export", "gann", "--format", "trig", "--all-graphs"])
+        .assert()
+        .success()
+        // The marker, inline on the edge it annotates.
+        .stdout(predicate::str::contains("ex:p ex:y ~ ex:cG"))
+        // And the reifier's own description, so the annotation is usable.
+        .stdout(predicate::str::contains("ex:src ex:d"))
+        // Nothing was dropped, so nothing is reported.
+        .stderr(predicate::str::contains("could not be resolved").not());
+
+    // `--raw-reifies` still emits the bundle verbatim for pinned consumers.
+    fluree_cmd(&tmp)
+        .args([
+            "export",
+            "gann",
+            "--format",
+            "trig",
+            "--all-graphs",
+            "--raw-reifies",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("reifiesSubject"));
 }
 
 // ============================================================================

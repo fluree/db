@@ -1097,7 +1097,9 @@ class Ledger:
     def archive(self, path: str | os.PathLike[str], *, include_indexes: bool = True) -> None:
         """Write the whole ledger, every commit, to a ``.flpack`` archive that
         :meth:`Connection.restore` loads back. Without indexes the archive is
-        smaller but the restored ledger must reindex before it is fast."""
+        smaller but the restored ledger must reindex before it is fast. The
+        file appears at ``path`` only once it is complete: a failed archive
+        leaves nothing there, or the file that was already there."""
         self._require_unrestricted("archive")
         self._connection._native.archive(self._id, Path(path), include_indexes)
 
