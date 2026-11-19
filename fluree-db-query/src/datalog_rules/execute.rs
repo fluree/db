@@ -71,18 +71,23 @@ pub async fn execute_datalog_rules(
     .await
 }
 
-/// Load the stored rules (from `rules_source_g_id`, or the query graph) and
-/// the query-time rules into one ordered rule set.
+/// Load the stored rules (from `rules_source_g_id`, or the query graph), the
+/// rules another ledger's `f:rulesSource` supplies (`imported`), and the
+/// query-time rules into one ordered rule set.
 pub async fn load_rule_set(
     db: GraphDbRef<'_>,
     query_time_rules: &[serde_json::Value],
     rules_source_g_id: Option<GraphId>,
+    imported: Option<&super::ImportedRules>,
 ) -> Result<DatalogRuleSet> {
     let rules_db = match rules_source_g_id {
         Some(rg) if rg != db.g_id => GraphDbRef::new(db.snapshot, rg, db.overlay, db.t),
         _ => db,
     };
     let mut rule_set = extract_datalog_rules(rules_db).await?;
+    if let Some(imported) = imported {
+        imported.add_to(&mut rule_set, db.snapshot)?;
+    }
     for (idx, rule_json) in query_time_rules.iter().enumerate() {
         rule_set.add_rule(parse_query_time_rule(rule_json, db.snapshot, idx)?)?;
     }
@@ -102,7 +107,7 @@ pub async fn execute_datalog_rules_with_query_rules(
     budget: &ReasoningBudget,
     env: RuleExecutionEnv<'_>,
 ) -> Result<DatalogExecutionResult> {
-    let rule_set = load_rule_set(db, query_time_rules, rules_source_g_id).await?;
+    let rule_set = load_rule_set(db, query_time_rules, rules_source_g_id, None).await?;
     run_fixpoint(db, &rule_set, max_iterations, budget, env).await
 }
 

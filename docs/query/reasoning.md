@@ -351,7 +351,9 @@ just logged:
   }
   ```
 
-- The same JSON rides the `x-fdb-reasoning` response header.
+- The same JSON rides the `x-fdb-reasoning` response header, without
+  `rules_fired` (which can name every rule of a program; it stays in the
+  body).
 - `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
   `"iterations"` (the fixpoint hit its round limit before converging).
 - `rules_fired` breaks the tally down per rule. It counts derived **facts**
@@ -361,6 +363,33 @@ just logged:
   running when the cap fired and `pending_rules` the rules it kept from
   running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
   time they returned (see [Datalog rules](datalog-rules.md)).
+- When datalog runs, `rule_set` names the rule set that ran by content: 16 hex
+  digits hashing every rule's id and text, the same value an
+  [explanation](datalog-rules.md#explaining-a-derived-fact) of a derived fact
+  reports. It changes whenever a rule is added, removed or edited, wherever it
+  is stored. When the stored rules come from somewhere other than the graph
+  the query reads, `rules_source` says where: another ledger's graph
+  (`f:rulesSource` with `f:ledger`) and the `t` that ledger was read at, or
+  this ledger's own `f:rulesSource` graph at the query's `t`. Together with
+  the query's own `t`, that is the record of a run: "rule set `rule_set`, read
+  from `rules_source.ledger` at `rules_source.t`, over this ledger at `t`".
+
+  ```json
+  "reasoning": {
+    "capped": false,
+    "derived_facts": 2,
+    "iterations": 2,
+    "duration_ms": 3,
+    "rules_fired": {"http://example.org/r1": 1, "http://example.org/r2": 1},
+    "rule_set": "5d41402abc4b2a76",
+    "rules_source": {
+      "ledger": "rules:main",
+      "graph": "http://example.org/rules",
+      "t": 12
+    }
+  }
+  ```
+
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):

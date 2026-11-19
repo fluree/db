@@ -1821,10 +1821,9 @@ impl Fluree {
 
         // Cross-ledger `f:rulesSource`: when M is referenced via
         // `f:ledger`, resolve M's rules graph through the
-        // cross-ledger resolver and merge the JSON rule bodies into
-        // `executable.reasoning.rules` so they pass through the
-        // existing query-time rule code path. Same-ledger references
-        // are handled above via `rules_source_g_id`.
+        // cross-ledger resolver into `executable.reasoning.imported_rules`,
+        // which load as stored rules beside D's own. Same-ledger
+        // references are handled above via `rules_source_g_id`.
         self.attach_cross_ledger_rules(db, executable, &mut ctx)
             .await?;
 
@@ -1836,8 +1835,11 @@ impl Fluree {
 
     /// If the resolved datalog config carries a cross-ledger
     /// `f:rulesSource`, dispatch through the cross-ledger resolver
-    /// and append the parsed JSON rules to
-    /// `executable.reasoning.rules`. Short-circuits when:
+    /// and attach M's rules, with the ledger, graph and `t` they were
+    /// read at, as `executable.reasoning.imported_rules`. They are not
+    /// query-time rules: the policy gate that strips caller-supplied
+    /// rules does not apply to them, and they parse as stored rules.
+    /// Short-circuits when:
     /// - the view has no resolved config,
     /// - no `f:rulesSource` is configured,
     /// - `f:rulesSource` is purely local (`f:ledger` unset — handled
@@ -1886,11 +1888,7 @@ impl Fluree {
                 },
             ));
         };
-        executable
-            .reasoning
-            .modes
-            .rules
-            .extend(wire.parsed_rules()?);
+        executable.reasoning.imported_rules = Some(std::sync::Arc::new(wire.imported_rules()?));
         Ok(())
     }
 

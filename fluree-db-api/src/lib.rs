@@ -173,7 +173,7 @@ pub use fluree_db_core::RemoteObject;
 pub use fluree_db_core::VerifiedIdentity;
 pub use fluree_db_core::{
     commit_to_summary, find_common_ancestor, walk_commit_summaries, CommitSummary, CommonAncestor,
-    ConflictKey, QueryCancellation, QueryCancellationReason,
+    ConflictKey, QueryCancellation, QueryCancellationReason, ReasoningTally, RulesSourceTally,
 };
 pub use fluree_db_core::{
     CommitId, ContentId, LedgerId, LedgerIdParseError, LedgerName, LedgerRef,

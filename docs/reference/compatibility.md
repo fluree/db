@@ -547,6 +547,13 @@ Earlier data:
 - Under `rdfs` or `owl2ql` without `owl2rl`, a program with a rule that negates or aggregates is refused with an error naming the rule, also when the modes come from `f:reasoningDefaults`. Add `owl2rl`, or drop the negation or aggregate.
 - Reasoning keys are read one by one, each from the top level when it is there, else from `opts`. A top-level `reasoningBudget` or `reasoningTime` beside `opts.reasoning` used to make the top level the only source and drop the mode without a word.
 
+#### Rules read from another ledger run as they do in their own (breaking)
+
+- An `f:sparql` rule in the graph a cross-ledger `f:rulesSource` reads used to be skipped without a word; it now runs, as it does stored in the data ledger, so a query reasoning with those rules derives what it says. An `f:rule` value there that is neither `@json` nor `f:sparql` fails the request naming the rule (it used to be skipped too).
+- Rules read from another ledger are checked as stored rules rather than query-time ones, and errors name them by their IRI and ledger (they ran as `_:query_rule_N`).
+- The tracked `reasoning` block (body, `x-fdb-reasoning` header, Python `QueryProfile.reasoning`) gains `rule_set`, the rule set's content hash, and `rules_source`, where the stored rules were read and at which `t`. `rules_fired`, which the documentation described, is now reported in the body. See [Reasoning](../query/reasoning.md).
+- Rust API: `RulesArtifactWire::rules` carries each rule's IRI, language and source (`ImportedRule`), `parsed_rules` became `imported_rules`, and `compute_derived_facts`, `explain_derived_facts` and `load_rule_set` take the query's `ReasoningConfig` (or its imported rules) rather than its modes and rules graph.
+
 #### Materialization and property paths are charged fuel
 
 A query that materializes (OWL 2 RL or datalog) now pays fuel for it; a query served from the reasoning cache doesn't. A query with a fuel limit can therefore fail while materializing, and a cancelled or out-of-fuel run caches nothing. Every property-path query pays fuel for the edges it reads and the rows it emits. A client disconnect or a query timeout now fails a query that is still materializing. Raise the fuel limit of queries that start failing. See [What Is Fuel?](../query/tracking-and-fuel.md#what-is-fuel).

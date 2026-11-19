@@ -198,6 +198,10 @@ pub struct ReasoningDiagnostics {
     /// The time datalog rule bodies evaluated `NOW()` and `TODAY()` at, when
     /// a rule called either.
     pub evaluation_time: Option<String>,
+    /// The datalog rule set that ran, as the 16-hex-digit content hash the
+    /// reasoning cache keys on. `None` when no datalog ran. Part of the cache
+    /// key, so a cached result reports it as the run that cached it did.
+    pub rule_set: Option<String>,
 }
 
 impl ReasoningDiagnostics {

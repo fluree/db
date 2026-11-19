@@ -389,7 +389,8 @@ class GraphSource:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
-        """Run :meth:`query` and report the fuel and time it took."""
+        """Run :meth:`query` and report the fuel and time it took, and what
+        reasoning ran (see :class:`QueryProfile`)."""
         from fluree._connection import _profile
         from fluree._params import _params
 

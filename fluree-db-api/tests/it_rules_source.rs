@@ -277,3 +277,81 @@ async fn rule_in_named_graph_without_rules_source_is_ignored() {
          discovered; got an unexpected derived charlie: {results:?}"
     );
 }
+
+/// The tracked `reasoning` block of a grandparent query over `ledger`.
+async fn grandparent_tally(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> fluree_db_api::ReasoningTally {
+    let view = fluree_db_api::GraphDb::from_ledger_state(ledger);
+    view.query(fluree)
+        .jsonld(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?grandparent",
+            "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+            "reasoning": "datalog",
+            "opts": {"meta": true}
+        }))
+        .execute_tracked()
+        .await
+        .expect("tracked query")
+        .reasoning
+        .expect("a reasoning query reports its reasoning")
+}
+
+/// A tracked response says what ran: the rule set by content, the facts each
+/// rule derived, and, for rules read from a configured `f:rulesSource` graph
+/// rather than the graph the query reads, that graph and the `t` it was read
+/// at. Rules stored in the queried graph itself report no source.
+#[tokio::test]
+async fn the_tally_names_the_rule_set_and_a_rules_source_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let rules_iri = "http://example.org/governance/rules";
+    let ledger_id = "rules-src/tally:main";
+    let ledger = seed_rules_in_named_graph(&fluree, ledger_id, rules_iri).await;
+    let ledger = insert_family_data(&fluree, ledger).await;
+
+    let tally = grandparent_tally(&fluree, &ledger).await;
+    let source = tally
+        .rules_source
+        .expect("a rules source graph is reported");
+    assert_eq!(source.ledger, ledger_id);
+    assert_eq!(source.graph, rules_iri);
+    assert_eq!(source.t, ledger.t());
+    let configured = tally.rule_set.expect("rule set reported");
+    assert_eq!(configured.len(), 16, "{configured}");
+    assert_eq!(
+        tally.rules_fired.get("http://example.org/grandparentRule"),
+        Some(&1),
+        "{:?}",
+        tally.rules_fired
+    );
+
+    // The same rule stored in the default graph, which the query reads.
+    let local_id = "rules-src/tally-local:main";
+    let local = genesis_ledger(&fluree, local_id);
+    let local = fluree
+        .insert(
+            local,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:grandparentRule",
+                "f:rule": {"@type": "@json", "@value": {
+                    "@context": {"ex": "http://example.org/"},
+                    "where":    {"@id": "?p", "ex:parent": {"ex:parent": "?g"}},
+                    "insert":   {"@id": "?p", "ex:grandparent": {"@id": "?g"}}
+                }}
+            }),
+        )
+        .await
+        .expect("store rule")
+        .ledger;
+    let local = insert_family_data(&fluree, local).await;
+    let tally = grandparent_tally(&fluree, &local).await;
+    assert_eq!(tally.rules_source, None);
+    assert_eq!(
+        tally.rule_set.as_deref(),
+        Some(configured.as_str()),
+        "the same rule, by id and text, is the same rule set wherever it is stored"
+    );
+}

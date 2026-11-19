@@ -117,6 +117,26 @@ def test_stored_rules_in_json_ld_and_sparql(family):
     assert family.query(elders).value("a") == [IRI(EX + "eve")]
 
 
+def test_profile_reports_which_rules_ran(family):
+    """A profiled reasoning query says what ran: the rule set by content (it
+    changes when a rule does), and the facts each rule derived."""
+    assert family.profile(GRANDPARENTS).reasoning is None
+
+    first = family.profile({**GRANDPARENTS, "reasoning": "datalog", "rules": [GRANDPARENT_RULE]})
+    assert first.result == ["ex:eve"]
+    assert len(first.reasoning["rule_set"]) == 16
+    assert sum(first.reasoning["rules_fired"].values()) >= 1
+    assert "rules_source" not in first.reasoning
+
+    elder = {
+        "@context": {"ex": EX},
+        "where": {"@id": "?p", "ex:grandparent": "?a"},
+        "insert": {"@id": "?p", "ex:elder": {"@id": "?a"}},
+    }
+    second = family.profile({**GRANDPARENTS, "reasoning": "datalog", "rules": [GRANDPARENT_RULE, elder]})
+    assert second.reasoning["rule_set"] != first.reasoning["rule_set"]
+
+
 def test_an_invalid_rule_is_an_error_not_a_silent_skip(family):
     bad = {**GRANDPARENT_RULE, "where": [["optional", {"@id": "?person", "ex:parent": "?p"}]]}
     with pytest.raises(fluree.InvalidRequestError):

@@ -71,11 +71,16 @@ pub fn tracking_headers(tally: &TrackingTally) -> HeaderMap {
     }
 
     // Add reasoning header if a materialization ran. Plain JSON (not base64):
-    // the payload is short, has no user data, and `capped` should be greppable
-    // straight off the wire.
+    // the payload is short, and `capped` should be greppable straight off the
+    // wire. `rules_fired` stays in the body: it names every rule that derived
+    // a fact, which for a large program would grow the header past what
+    // proxies accept.
     if let Some(ref reasoning) = tally.reasoning {
-        if let Ok(json) = serde_json::to_string(reasoning) {
-            if let Ok(value) = HeaderValue::from_str(&json) {
+        if let Ok(mut json) = serde_json::to_value(reasoning) {
+            if let Some(fields) = json.as_object_mut() {
+                fields.remove("rules_fired");
+            }
+            if let Ok(value) = HeaderValue::from_str(&json.to_string()) {
                 headers.insert(HeaderName::from_static(X_FDB_REASONING), value);
             }
         }
@@ -91,5 +96,59 @@ fn format_fuel(fuel: f64) -> String {
         "0".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fluree_db_api::{ReasoningTally, RulesSourceTally};
+
+    /// The reasoning header says what ran (the rule set and its source) but
+    /// leaves the per-rule breakdown, which grows with the program, to the
+    /// body.
+    #[test]
+    fn the_reasoning_header_names_the_rule_set_without_per_rule_counts() {
+        let tally = TrackingTally {
+            time: None,
+            fuel: None,
+            policy: None,
+            policy_enforcement: None,
+            reasoning: Some(ReasoningTally {
+                capped: false,
+                capped_reason: None,
+                derived_facts: 2,
+                iterations: 1,
+                duration_ms: 3,
+                capped_rules: Vec::new(),
+                pending_rules: Vec::new(),
+                evaluation_time: None,
+                rules_fired: std::collections::BTreeMap::from([(
+                    "http://example.org/r1".to_string(),
+                    2,
+                )]),
+                rule_set: Some("00000000000000ab".to_string()),
+                rules_source: Some(RulesSourceTally {
+                    ledger: "rules:main".to_string(),
+                    graph: "http://example.org/rules".to_string(),
+                    t: 12,
+                }),
+            }),
+            sql: None,
+            sql_elided: None,
+        };
+        let headers = tracking_headers(&tally);
+        let header: serde_json::Value = serde_json::from_str(
+            headers
+                .get(X_FDB_REASONING)
+                .expect("reasoning header")
+                .to_str()
+                .expect("ascii"),
+        )
+        .expect("json");
+        assert_eq!(header["rule_set"], "00000000000000ab");
+        assert_eq!(header["rules_source"]["ledger"], "rules:main");
+        assert_eq!(header["rules_source"]["t"], 12);
+        assert!(header.get("rules_fired").is_none(), "{header}");
     }
 }

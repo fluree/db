@@ -1,23 +1,24 @@
 //! Cross-ledger datalog rules materialization.
 //!
-//! Reads M's rules graph at `resolved_t` and projects every
-//! `f:rule` flake whose object is `FlakeValue::Json` into the
-//! cross-ledger wire form. Unlike the schema / shapes / constraints
-//! paths, rules need no term-space translation: the JSON body
-//! references IRIs that
-//! [`fluree_db_query::datalog_rules::parse_query_time_rule`] resolves
-//! against the data ledger's snapshot at query time, the same way
-//! `opts.rules` are handled.
+//! Reads M's rules graph at `resolved_t` and projects every `f:rule`
+//! value into the cross-ledger wire form: the IRI of the subject it is
+//! on, its language and its source text. Rules need no term-space
+//! translation: their text names terms by IRI, and the query crate
+//! parses it against the data ledger's snapshot when the rule set loads.
 //!
-//! Non-JSON values on `f:rule` are silently skipped — the local
-//! extractor (`fluree_db_query::datalog_rules::extract_datalog_rules`)
-//! does the same. A future variant could surface these as a warn
-//! when authors mistype the rule literal.
+//! Each value is read by
+//! [`fluree_db_query::datalog_rules::stored_rule_source`], the one
+//! reading the data ledger's own extractor
+//! (`fluree_db_query::datalog_rules::extract_datalog_rules`) uses: an
+//! `@json` value is a JSON-LD rule, an `f:sparql`-typed string a SPARQL
+//! rule, and any other datatype fails the request naming the rule, as it
+//! fails a query over the ledger that stores it.
 
 use super::types::{ModelHead, RulesArtifactWire, WireOrigin};
 use super::CrossLedgerError;
 use super::ResolveCtx;
-use fluree_db_core::{FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest};
+use fluree_db_core::{IndexType, RangeMatch, RangeOptions, RangeTest};
+use fluree_db_query::datalog_rules::{stored_rule_source, unsupported_rule_datatype, ImportedRule};
 use fluree_vocab::fluree::RULE;
 
 #[tracing::instrument(
@@ -87,14 +88,31 @@ pub(super) async fn materialize_rules(
         detail: format!("f:rule predicate scan failed: {e}"),
     })?;
 
-    let mut rules: Vec<String> = Vec::new();
+    let mut rules: Vec<ImportedRule> = Vec::new();
     for f in flakes.into_iter().filter(|f| f.op) {
-        if let FlakeValue::Json(json_str) = &f.o {
-            rules.push(json_str.clone());
-        }
-        // Non-Json values are silently skipped, mirroring the
-        // same-ledger extractor's `if let FlakeValue::Json(...)`
-        // guard.
+        let id = m_db
+            .snapshot
+            .decode_sid(&f.s)
+            .unwrap_or_else(|| f.s.to_string());
+        let Some((language, source)) = stored_rule_source(&f.o, &f.dt) else {
+            let datatype = m_db
+                .snapshot
+                .decode_sid(&f.dt)
+                .unwrap_or_else(|| f.dt.to_string());
+            return Err(CrossLedgerError::TranslationFailed {
+                ledger_id: canonical_model_ledger_id.to_string(),
+                graph_iri: graph_iri.to_string(),
+                detail: format!(
+                    "datalog rule <{id}> {}",
+                    unsupported_rule_datatype(&datatype)
+                ),
+            });
+        };
+        rules.push(ImportedRule {
+            id,
+            language,
+            source: source.to_string(),
+        });
     }
 
     Ok(RulesArtifactWire {

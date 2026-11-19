@@ -10,7 +10,7 @@
 use crate::clock::Instant;
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -635,11 +635,16 @@ pub struct PushedStatement {
     pub sql: String,
 }
 
-/// Outcome of an OWL2-RL materialization, reported per request.
+/// Outcome of a reasoning materialization (OWL2-RL and/or datalog rules),
+/// reported per request: how it ended, and which rules it ran.
 ///
 /// `capped: true` means the closure hit its budget before reaching fixpoint —
 /// query results may be missing entailments. Clients should treat capped
 /// results as incomplete, not merely slow.
+///
+/// `rule_set` and `rules_source` together say what a datalog run read, so a
+/// caller can record "these rules, as of the rules' `t`, over this data as of
+/// its `t`" from the response rather than its own bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningTally {
     /// Whether materialization was capped before reaching fixpoint.
@@ -665,6 +670,33 @@ pub struct ReasoningTally {
     /// a rule called either.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub evaluation_time: Option<String>,
+    /// Facts derived per rule (datalog rules by name, OWL2-RL rules by their
+    /// rule id). It counts derived facts, not rule applications.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub rules_fired: BTreeMap<String, u64>,
+    /// The datalog rule set that ran, by content: a hash (16 hex digits) of
+    /// every rule's id and source text, the one the reasoning cache keys on
+    /// and an explanation of a derived fact reports. It changes whenever a
+    /// rule is added, removed or edited, wherever the rules came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule_set: Option<String>,
+    /// Where the stored datalog rules were read from, when not the graph the
+    /// query reads: another ledger's graph (`f:rulesSource` with `f:ledger`)
+    /// at the `t` it resolved to, or this ledger's own `f:rulesSource` graph
+    /// at the query's `t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rules_source: Option<RulesSourceTally>,
+}
+
+/// Where a datalog run read its stored rules ([`ReasoningTally::rules_source`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RulesSourceTally {
+    /// The ledger the rules were read from.
+    pub ledger: String,
+    /// The graph of that ledger holding them.
+    pub graph: String,
+    /// The `t` of that ledger they were read at.
+    pub t: i64,
 }
 
 fn format_time_ms(duration: Duration) -> String {

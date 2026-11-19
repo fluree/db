@@ -494,10 +494,15 @@ pub struct ReasoningConfig {
     /// extraction defaults to `db.g_id` — the legacy behaviour.
     ///
     /// Cross-ledger rules (where `f:rulesSource` carries
-    /// `f:ledger`) surface as resolved JSON-LD rule definitions
-    /// in [`ReasoningModes::rules`] before query execution; this
+    /// `f:ledger`) arrive in [`Self::imported_rules`] instead; this
     /// field stays `None` in that case.
     pub rules_source_g_id: Option<fluree_db_core::GraphId>,
+    /// Rules another ledger supplies through `f:rulesSource` with
+    /// `f:ledger`, read upstream (in `fluree-db-api`) at the `t` the
+    /// request resolved that ledger to. They run as stored rules,
+    /// beside this ledger's own and the query's, and the tally reports
+    /// where they came from.
+    pub imported_rules: Option<Arc<crate::datalog_rules::ImportedRules>>,
 }
 
 impl ReasoningConfig {

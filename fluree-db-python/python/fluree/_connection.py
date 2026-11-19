@@ -233,7 +233,8 @@ class Connection:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
-        """Run :meth:`query` and report the fuel and time it took."""
+        """Run :meth:`query` and report the fuel and time it took, and what
+        reasoning ran (see :class:`QueryProfile`)."""
         return _profile(
             self._run, query, max_fuel, timeout,
             language=language, params=_params(parameters, kwparameters),
@@ -723,7 +724,8 @@ class Ledger:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
-        """Run :meth:`query` and report the fuel and time it took."""
+        """Run :meth:`query` and report the fuel and time it took, and what
+        reasoning ran (see :class:`QueryProfile`)."""
         return _profile(
             self._run, query, max_fuel, timeout,
             language=language, params=_params(parameters, kwparameters),
@@ -1396,7 +1398,8 @@ class Snapshot:
         timeout: float | None = None,
         **kwparameters: Any,
     ) -> QueryProfile:
-        """Run :meth:`query` and report the fuel and time it took."""
+        """Run :meth:`query` and report the fuel and time it took, and what
+        reasoning ran (see :class:`QueryProfile`)."""
         return _profile(
             self._run, query, max_fuel, timeout,
             language=language, params=_params(parameters, kwparameters),
@@ -1610,11 +1613,20 @@ class Transaction:
 @dataclass(frozen=True, slots=True)
 class QueryProfile:
     """A query's result with what it cost: ``fuel`` (the engine's unit of
-    work, the unit ``max_fuel`` limits) and wall-clock ``time``."""
+    work, the unit ``max_fuel`` limits) and wall-clock ``time``.
+
+    ``reasoning`` is the server's tracked ``reasoning`` block when a
+    reasoning mode ran, else ``None``: whether the materialization was
+    ``capped``, ``derived_facts``, ``rules_fired`` per rule, and for datalog
+    the ``rule_set`` that ran (a content hash that changes whenever a rule
+    does) and, when the stored rules came from another graph or ledger,
+    ``rules_source`` (``ledger``, ``graph`` and the ``t`` they were read at).
+    """
 
     result: Any
     fuel: float | None
     time: _dt.timedelta | None
+    reasoning: dict[str, Any] | None = None
 
 
 def _controls(
@@ -1692,7 +1704,7 @@ def _profile(
     elapsed = None
     if time is not None and time.endswith("ms"):
         elapsed = _dt.timedelta(milliseconds=float(time[:-2]))
-    return QueryProfile(result, stats["fuel"], elapsed)
+    return QueryProfile(result, stats["fuel"], elapsed, stats.get("reasoning"))
 
 
 def _explainable(

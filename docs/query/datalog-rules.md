@@ -254,14 +254,18 @@ full configuration options and [Writing config data](../ledger-config/writing-co
 for the other ways to write the config graph.
 
 `f:rulesSource` also supports cross-ledger references — set
-`f:ledger` on the inner `f:graphSource` to pull `f:rule` JSON
-bodies from another ledger at query time. See
+`f:ledger` on the inner `f:graphSource` to read the `f:rule`
+values (JSON-LD or SPARQL, as stored locally) from another ledger
+at query time. See
 [Cross-ledger governance — Cross-ledger datalog rules](../security/cross-ledger-policy.md#cross-ledger-datalog-rules)
 for the end-to-end pattern and failure modes.
 
 When stored rules, cross-ledger rules, and query-time rules are
 present, they are all **merged** and execute together in the
-same fixpoint loop.
+same fixpoint loop. A tracked query reports the merged set by
+content (`rule_set`) and where its stored rules were read
+(`rules_source`, with the `t` they were read at); see
+[Reasoning](reasoning.md) for the `reasoning` block.
 
 ## SPARQL rules
 

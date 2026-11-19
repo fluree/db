@@ -223,6 +223,138 @@ pub(crate) fn rule_iri(snapshot: &fluree_db_core::LedgerSnapshot, id: &Sid) -> S
     snapshot.decode_sid(id).unwrap_or_else(|| id.to_string())
 }
 
+/// The language a stored `f:rule` value is written in, which its datatype
+/// selects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleLanguage {
+    /// An `@json` value: a JSON-LD rule `{"where": …, "insert": …}`.
+    JsonLd,
+    /// An `f:sparql`-typed string: a SPARQL `CONSTRUCT … WHERE …`.
+    Sparql,
+}
+
+/// Read a stored `f:rule` value by its datatype: the rule's language and
+/// source text, or `None` for any other datatype. A reader refuses that
+/// ([`unsupported_rule_datatype`]) rather than skipping it: a rule set that
+/// quietly lost a rule answers wrong.
+///
+/// This is the one reading of an `f:rule` value, shared by the extractor for
+/// a ledger's own rules and the reader of another ledger's (`f:rulesSource`
+/// with `f:ledger`), so a rule runs the same wherever it is stored. The two
+/// used to read it separately, and the cross-ledger one went on keeping only
+/// `@json` values after this one learned `f:sparql`.
+pub fn stored_rule_source<'v>(
+    value: &'v FlakeValue,
+    datatype: &Sid,
+) -> Option<(RuleLanguage, &'v str)> {
+    match value {
+        FlakeValue::Json(source) => Some((RuleLanguage::JsonLd, source)),
+        FlakeValue::String(source)
+            if datatype.namespace_code == FLUREE_DB
+                && datatype.name.as_ref() == fluree_vocab::db::SPARQL =>
+        {
+            Some((RuleLanguage::Sparql, source))
+        }
+        _ => None,
+    }
+}
+
+/// Why an `f:rule` value of `datatype` is refused: the clause that follows
+/// the rule's name.
+pub fn unsupported_rule_datatype(datatype: &str) -> String {
+    format!(
+        "has datatype {datatype}; expected an @json rule body ({{\"@type\": \"@json\", \
+         \"@value\": {{\"where\": …, \"insert\": …}}}}) or an f:sparql-typed CONSTRUCT \
+         query. Retract the f:rule value or re-store it in one of those shapes"
+    )
+}
+
+/// Parse a stored rule, read by [`stored_rule_source`], against the snapshot
+/// its rules run over. `label` names it in errors.
+fn parse_stored_rule(
+    rule_id: &Sid,
+    label: &str,
+    language: RuleLanguage,
+    source: &str,
+    snapshot: &fluree_db_core::LedgerSnapshot,
+) -> Result<DatalogRule> {
+    let parsed = match language {
+        RuleLanguage::JsonLd => {
+            let rule_json: JsonValue = serde_json::from_str(source)
+                .map_err(|e| QueryError::InvalidQuery(format!("{label} is not valid JSON: {e}")))?;
+            parse::parse_jsonld_rule(
+                rule_id,
+                &rule_json,
+                snapshot,
+                source,
+                parse::RuleOrigin::Stored,
+            )
+        }
+        RuleLanguage::Sparql => {
+            parse::parse_sparql_rule(rule_id, source, snapshot, parse::RuleOrigin::Stored)
+        }
+    };
+    parsed.map_err(|e| {
+        QueryError::InvalidQuery(format!("{label} is invalid and was not applied: {e}"))
+    })
+}
+
+/// Datalog rules this ledger's `f:rulesSource` reads from another ledger
+/// (`f:ledger`), as they are stored there, and where they were read.
+///
+/// They join the rule set as stored rules, not query-time ones: their author
+/// is not present, and they are re-read on every query, so a check that
+/// depends on what this ledger holds must not flip them from valid to
+/// invalid (see `parse::RuleOrigin`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedRules {
+    /// The ledger the rules were read from.
+    pub ledger: String,
+    /// The graph of that ledger holding them.
+    pub graph: String,
+    /// The `t` of that ledger they were read at.
+    pub t: i64,
+    pub rules: Vec<ImportedRule>,
+}
+
+/// One rule of [`ImportedRules`]: the IRI of the subject its `f:rule` value
+/// is on, and the value as [`stored_rule_source`] read it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportedRule {
+    pub id: String,
+    pub language: RuleLanguage,
+    pub source: String,
+}
+
+impl ImportedRules {
+    /// Parse each rule against `snapshot`, the ledger the rules run over, and
+    /// add it to `rule_set`. A rule that does not parse fails the query,
+    /// naming the rule and the ledger it came from.
+    pub(crate) fn add_to(
+        &self,
+        rule_set: &mut DatalogRuleSet,
+        snapshot: &fluree_db_core::LedgerSnapshot,
+    ) -> Result<()> {
+        for rule in &self.rules {
+            // Named by its IRI as written in the rules ledger, which this
+            // ledger's namespace table need not hold.
+            let rule_id = Sid::new(0, rule.id.as_str());
+            let label = format!(
+                "datalog rule <{}> from ledger '{}' (graph <{}> at t={})",
+                rule.id, self.ledger, self.graph, self.t
+            );
+            rule_set.add_rule(parse_stored_rule(
+                &rule_id,
+                &label,
+                rule.language,
+                &rule.source,
+                snapshot,
+            )?)?;
+        }
+        Ok(())
+    }
+}
+
 /// Extract the stored datalog rules (`f:rule` assertions) from a graph.
 ///
 /// A rule that fails to parse or validate is an error, not a warning: a
@@ -247,47 +379,22 @@ pub async fn extract_datalog_rules(db: GraphDbRef<'_>) -> Result<DatalogRuleSet>
         .filter(|f| f.op)
         .collect();
 
-    // The literal's datatype selects the rule language: `@json` → JSON-LD
-    // `{"where": …, "insert": …}`; `f:sparql`-typed string → SPARQL
-    // `CONSTRUCT … WHERE …`.
-    let sparql_dt = Sid::new(FLUREE_DB, fluree_vocab::db::SPARQL);
     for flake in &rule_flakes {
         let rule_id = flake.s.clone();
-        let label = rule_iri(db.snapshot, &rule_id);
-        let parsed = match &flake.o {
-            FlakeValue::Json(json_str) => {
-                let rule_json: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                    QueryError::InvalidQuery(format!(
-                        "stored datalog rule <{label}> is not valid JSON: {e}"
-                    ))
-                })?;
-                parse::parse_jsonld_rule(
-                    &rule_id,
-                    &rule_json,
-                    db.snapshot,
-                    json_str.as_str(),
-                    parse::RuleOrigin::Stored,
-                )
-            }
-            FlakeValue::String(source) if flake.dt == sparql_dt => {
-                parse::parse_sparql_rule(&rule_id, source, db.snapshot, parse::RuleOrigin::Stored)
-            }
-            _ => Err(QueryError::InvalidQuery(format!(
-                "stored datalog rule <{label}> has datatype {}; expected an @json rule \
-                 body ({{\"@type\": \"@json\", \"@value\": {{\"where\": …, \"insert\": …}}}}) or an \
-                 f:sparql-typed CONSTRUCT query. Retract the f:rule value or re-store it in \
-                 one of those shapes",
-                rule_iri(db.snapshot, &flake.dt)
-            ))),
+        let label = format!("stored datalog rule <{}>", rule_iri(db.snapshot, &rule_id));
+        let Some((language, source)) = stored_rule_source(&flake.o, &flake.dt) else {
+            return Err(QueryError::InvalidQuery(format!(
+                "{label} {}",
+                unsupported_rule_datatype(&rule_iri(db.snapshot, &flake.dt))
+            )));
         };
-        match parsed {
-            Ok(rule) => rule_set.add_rule(rule)?,
-            Err(e) => {
-                return Err(QueryError::InvalidQuery(format!(
-                    "stored datalog rule <{label}> is invalid and was not applied: {e}"
-                )));
-            }
-        }
+        rule_set.add_rule(parse_stored_rule(
+            &rule_id,
+            &label,
+            language,
+            source,
+            db.snapshot,
+        )?)?;
     }
 
     Ok(rule_set)

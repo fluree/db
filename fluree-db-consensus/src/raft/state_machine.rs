@@ -87,10 +87,13 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             duration_ms: r.duration_ms,
             // Not carried: adding them would change the positional wire form
             // of records already in the log. A retried submission reports the
-            // cap without naming its rules.
+            // cap without naming its rules, or which rule set ran.
             capped_rules: Vec::new(),
             pending_rules: Vec::new(),
             evaluation_time: None,
+            rules_fired: std::collections::BTreeMap::new(),
+            rule_set: None,
+            rules_source: None,
         }
     }
 }

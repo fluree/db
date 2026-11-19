@@ -115,8 +115,7 @@ impl Fluree {
         let base = GraphDbRef::new(db_ref.snapshot, db_ref.g_id, overlay, db_ref.t);
         Ok(explain_derived_facts(
             base,
-            &executable.reasoning.modes,
-            executable.reasoning.rules_source_g_id,
+            &executable.reasoning,
             db.binary_store.as_ref(),
             QueryRequest {
                 tracker,
