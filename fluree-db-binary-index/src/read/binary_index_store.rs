@@ -5420,19 +5420,36 @@ pub(crate) mod tests {
 
     /// [`vector_arena_of`] reading through `cache`.
     fn vector_arena_cached(
-        dir: &std::path::Path,
+        _dir: &std::path::Path,
         capacity: u32,
         dims: u16,
         shards: &[Vec<Vec<f32>>],
         cache: Arc<LeafletCache>,
     ) -> crate::arena::vector::LazyVectorArena {
-        use crate::arena::vector::tests::{test_store, write_test_shard};
+        let store = crate::arena::vector::tests::test_store();
+        vector_arena_in(store, capacity, dims, shards, cache).0
+    }
+
+    /// [`vector_arena_cached`] with its shards in `store`, and their ids.
+    fn vector_arena_in(
+        store: Arc<dyn fluree_db_core::ContentStore>,
+        capacity: u32,
+        dims: u16,
+        shards: &[Vec<Vec<f32>>],
+        cache: Arc<LeafletCache>,
+    ) -> (
+        crate::arena::vector::LazyVectorArena,
+        Vec<fluree_db_core::ContentId>,
+    ) {
+        use crate::arena::vector::tests::write_test_shard_in;
         use crate::arena::vector::{ShardInfo, VectorManifest};
         let mut sources = Vec::new();
         let mut infos = Vec::new();
+        let mut cids = Vec::new();
         for (i, vectors) in shards.iter().enumerate() {
             let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
-            let source = write_test_shard(dir, &format!("s{i}.vas"), dims, &refs);
+            let source = write_test_shard_in(store.as_ref(), dims, &refs);
+            cids.push(source.cid.clone());
             sources.push(source);
             infos.push(ShardInfo {
                 cas: format!("s{i}"),
@@ -5448,7 +5465,9 @@ pub(crate) mod tests {
             total_count: shards.iter().map(|v| v.len() as u32).sum(),
             shards: infos,
         };
-        crate::arena::vector::LazyVectorArena::new(manifest, sources, cache, Some(test_store()))
+        let arena =
+            crate::arena::vector::LazyVectorArena::new(manifest, sources, cache, Some(store));
+        (arena, cids)
     }
 
     /// A view of graph 0 of a store holding `arena` as predicate `p_id`'s
@@ -5636,21 +5655,28 @@ pub(crate) mod tests {
     /// failure surfaces rather than reading as an answer.
     #[test]
     fn vector_keys_read_no_shard_once_the_identity_table_is_built() {
-        let dir = std::env::temp_dir().join("fluree_vector_keys_no_shard_read");
-        std::fs::create_dir_all(&dir).unwrap();
         let values: [[f32; 2]; 5] = [[1.0, 0.0], [0.5, 0.5], [1.0, 0.0], [0.0, 1.0], [0.5, 0.5]];
         let shards: Vec<Vec<Vec<f32>>> = values
             .chunks(2)
             .map(|c| c.iter().map(|v| v.to_vec()).collect())
             .collect();
         let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
-        let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
+        // Shards of their own, so dropping them leaves every other test's.
+        let store = Arc::new(fluree_db_core::MemoryContentStore::new());
+        let (arena, cids) = vector_arena_in(
+            Arc::clone(&store) as Arc<dyn fluree_db_core::ContentStore>,
+            2,
+            2,
+            &shards,
+            Arc::clone(&cache),
+        );
         let view = view_with_vector_arena(7, arena);
         let table = view.store().vector_identity(0, 7).unwrap().unwrap();
 
         cache.invalidate_all();
-        for i in 0..shards.len() {
-            std::fs::remove_file(dir.join(format!("s{i}.vas"))).unwrap();
+        for cid in &cids {
+            use fluree_db_core::ContentStore;
+            futures::executor::block_on(store.release(cid)).unwrap();
         }
         let view = BinaryGraphView::new(view.clone_store(), 0);
         let keys: Vec<ArenaVector> = (0..5)
@@ -5682,7 +5708,6 @@ pub(crate) mod tests {
                 .is_err(),
             "a comparison that needs the components reads them"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Comparisons of table-resolved keys pin the shards they read, shared by

@@ -12,6 +12,11 @@
 //! then overwrites its decimal arena with the bytes a pre-normalization build
 //! wrote for the same three handles. A fresh Fluree over the same directory
 //! loads it as an older index would be loaded.
+//!
+//! A decimal of up to 17 significant digits is stored inline, with no arena,
+//! so the fixtures' decimals, and the legacy arena's scale variants, carry 20:
+//! a lookup of one then goes to the arena, as every decimal's does in a v4
+//! index.
 
 #![cfg(feature = "native")]
 
@@ -26,15 +31,16 @@ use tempfile::TempDir;
 /// Three decimals under `ex:d` (three handles) and a string on every subject
 /// for the star join's filter predicate.
 const FIXTURE: &str = r#"@prefix ex: <http://example.org/> .
-ex:a ex:d 1.5 ; ex:t "x" .
-ex:b ex:d 2.25 ; ex:t "x" .
-ex:c ex:d 19.99 ; ex:t "y" .
+ex:a ex:d 1.5000000000000000001 ; ex:t "x" .
+ex:b ex:d 2.2500000000000000001 ; ex:t "x" .
+ex:c ex:d 19.990000000000000001 ; ex:t "y" .
 "#;
 
-/// The NBA1 bytes of a pre-normalization arena holding `1.50`, `1.5` and
-/// `19.99` under handles 0, 1 and 2: two subjects then hold `1.5`, under two
-/// handles, and one holds `19.99`, whichever subject the import gave which
-/// handle.
+/// The NBA1 bytes of a pre-normalization arena holding
+/// `1.5000000000000000001`, `1.50000000000000000010` and
+/// `19.990000000000000001` under handles 0, 1 and 2: two subjects then hold
+/// one value, under two handles, and one holds another, whichever subject the
+/// import gave which handle.
 fn legacy_arena_bytes() -> Vec<u8> {
     /// One decimal entry as a pre-normalization build wrote it: the unscaled
     /// value's signed little-endian bytes and the scale as given.
@@ -49,9 +55,24 @@ fn legacy_arena_bytes() -> Vec<u8> {
     let mut buf = Vec::new();
     buf.extend_from_slice(b"NBA1");
     buf.extend_from_slice(&3u32.to_le_bytes());
-    bigdec_entry(&mut buf, &[0x96, 0x00], 2); // 150 x 10^-2 = 1.50
-    bigdec_entry(&mut buf, &[0x0f], 1); // 15 x 10^-1 = 1.5
-    bigdec_entry(&mut buf, &[0xcf, 0x07], 2); // 1999 x 10^-2 = 19.99
+    // 15000000000000000001 x 10^-19
+    bigdec_entry(
+        &mut buf,
+        &[0x01, 0x00, 0xdc, 0xce, 0x86, 0xb4, 0x2a, 0xd0, 0x00],
+        19,
+    );
+    // 150000000000000000010 x 10^-20, the same value
+    bigdec_entry(
+        &mut buf,
+        &[0x0a, 0x00, 0x98, 0x14, 0x44, 0x0d, 0xab, 0x21, 0x08],
+        20,
+    );
+    // 19990000000000000001 x 10^-18
+    bigdec_entry(
+        &mut buf,
+        &[0x01, 0x00, 0x0f, 0xa4, 0x16, 0xbf, 0x6a, 0x15, 0x01],
+        18,
+    );
     buf
 }
 
@@ -154,7 +175,7 @@ fn stamped(store: &SpanStore, before: usize, outcome: &str) -> Vec<String> {
 /// One object-keyed lane: its `fast-path outcome` site (`None` for the
 /// partitioned GROUP BY, which folds in place rather than declining), its
 /// query, the variable holding its counts, and the counts on the legacy
-/// arena (`1.5` on two subjects, `19.99` on one) and on the arena as
+/// arena (one value on two subjects, another on one) and on the arena as
 /// imported (three distinct decimals).
 struct Lane {
     site: Option<&'static str>,
@@ -316,15 +337,15 @@ impl Drop for FastPathsGuard {
 /// [`FIXTURE`]'s decimals with every subject linked to the others, for a
 /// cyclic join over one predicate's decimals.
 const CYCLIC_FIXTURE: &str = r"@prefix ex: <http://example.org/> .
-ex:a ex:d 1.5 ; ex:link ex:b , ex:c .
-ex:b ex:d 2.25 ; ex:link ex:a , ex:c .
-ex:c ex:d 19.99 ; ex:link ex:a , ex:b .
+ex:a ex:d 1.5000000000000000001 ; ex:link ex:b , ex:c .
+ex:b ex:d 2.2500000000000000001 ; ex:link ex:a , ex:c .
+ex:c ex:d 19.990000000000000001 ; ex:link ex:a , ex:b .
 ";
 
 /// The cyclic join keys a decimal by its handle only within one predicate of
 /// an arena that holds each value once. On a legacy arena, where `1.5` and
 /// `1.50` are two handles, it declines (`arena-literal-object`) and the
-/// general plan pairs the two subjects that hold `1.5`, both ways. On the
+/// general plan pairs the two subjects that hold one value, both ways. On the
 /// arena as a current build writes it the lane keeps the same query.
 #[tokio::test(flavor = "current_thread")]
 async fn the_cyclic_join_declines_a_legacy_decimal_arena() {

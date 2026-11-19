@@ -1210,14 +1210,22 @@ pub(crate) mod tests {
         dims: u16,
         vectors: &[&[f32]],
     ) -> ShardSource {
-        use fluree_db_core::ContentStore;
+        write_test_shard_in(test_store().as_ref(), dims, vectors)
+    }
+
+    /// [`write_test_shard`] into `store`.
+    pub(crate) fn write_test_shard_in(
+        store: &dyn fluree_db_core::ContentStore,
+        dims: u16,
+        vectors: &[&[f32]],
+    ) -> ShardSource {
         let mut flat: Vec<f32> = Vec::new();
         for v in vectors {
             flat.extend_from_slice(v);
         }
         let mut buf = Vec::new();
         write_vas1_shard(&mut buf, dims, &flat).unwrap();
-        let cid = futures::executor::block_on(test_store().put(
+        let cid = futures::executor::block_on(store.put(
             fluree_db_core::ContentKind::DictBlob {
                 dict: fluree_db_core::DictKind::VectorShard { p_id: 0 },
             },
