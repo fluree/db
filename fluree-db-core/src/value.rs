@@ -912,8 +912,7 @@ impl PartialEq for FlakeValue {
                 (FlakeValue::String(a), FlakeValue::String(b)) => a == b,
                 (FlakeValue::Json(a), FlakeValue::Json(b)) => a == b,
                 (FlakeValue::Vector(a), FlakeValue::Vector(b)) => {
-                    // A decode shares one allocation per distinct value
-                    // (`BinaryGraphView`), so most equal pairs are one `Arc`.
+                    // A cheap identity check before the component compare.
                     Arc::ptr_eq(a, b)
                         || a.len() == b.len()
                             && a.iter()
