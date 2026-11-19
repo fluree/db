@@ -104,7 +104,7 @@ impl From<&TrackingTally> for RecordedTally {
             time: t.time.clone(),
             fuel: t.fuel,
             policy: t.policy.clone(),
-            reasoning: t.reasoning.as_ref().map(RecordedReasoningTally::from),
+            reasoning: t.reasoning.as_deref().map(RecordedReasoningTally::from),
         }
     }
 }
@@ -119,7 +119,7 @@ impl From<RecordedTally> for TrackingTally {
             // transaction tally, so it is deliberately absent from the recorded
             // mirror — adding a field would shift every postcard byte offset.
             policy_enforcement: None,
-            reasoning: r.reasoning.map(Into::into),
+            reasoning: r.reasoning.map(|r| Box::new(r.into())),
             // Likewise read-path only (SQL pushdown statements, and the count
             // of any the response elided).
             sql: None,

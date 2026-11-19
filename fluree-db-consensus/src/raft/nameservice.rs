@@ -2462,7 +2462,7 @@ mod tests {
             // Read-path-only: never set on a transaction tally and deliberately
             // absent from the recorded wire mirror (see `RecordedTally`).
             policy_enforcement: None,
-            reasoning: Some(ReasoningTally {
+            reasoning: Some(Box::new(ReasoningTally {
                 capped: true,
                 capped_reason: Some("budget".to_string()),
                 derived_facts: 42,
@@ -2474,7 +2474,7 @@ mod tests {
                 rules_fired: std::collections::BTreeMap::new(),
                 rule_set: None,
                 rules_source: None,
-            }),
+            })),
             sql: None,
             sql_elided: None,
         }
@@ -2548,7 +2548,7 @@ mod tests {
             fuel: Some(1.0),
             policy: None,
             policy_enforcement: None,
-            reasoning: Some(ReasoningTally {
+            reasoning: Some(Box::new(ReasoningTally {
                 capped: false,
                 capped_reason: None,
                 derived_facts: 10,
@@ -2560,7 +2560,7 @@ mod tests {
                 rules_fired: std::collections::BTreeMap::new(),
                 rule_set: None,
                 rules_source: None,
-            }),
+            })),
             sql: None,
             sql_elided: None,
         };
@@ -2849,7 +2849,7 @@ mod tests {
                 m
             }),
             policy_enforcement: None,
-            reasoning: Some(original_reasoning),
+            reasoning: Some(Box::new(original_reasoning)),
             sql: None,
             sql_elided: None,
         };
@@ -2922,7 +2922,7 @@ mod tests {
             rules_fired: rt_rules_fired,
             rule_set: rt_rule_set,
             rules_source: rt_rules_source,
-        } = rt_reasoning.expect("reasoning Some on round-trip");
+        } = *rt_reasoning.expect("reasoning Some on round-trip");
         // Not carried by the recorded mirror: adding them would change the
         // wire form of records already in the log.
         assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());

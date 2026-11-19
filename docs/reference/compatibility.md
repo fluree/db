@@ -552,7 +552,7 @@ Earlier data:
 - An `f:sparql` rule in the graph a cross-ledger `f:rulesSource` reads used to be skipped without a word; it now runs, as it does stored in the data ledger, so a query reasoning with those rules derives what it says. An `f:rule` value there that is neither `@json` nor `f:sparql` fails the request naming the rule (it used to be skipped too).
 - Rules read from another ledger are checked as stored rules rather than query-time ones, and errors name them by their IRI and ledger (they ran as `_:query_rule_N`).
 - The tracked `reasoning` block (body, `x-fdb-reasoning` header, Python `QueryProfile.reasoning`) gains `rule_set`, the rule set's content hash, and `rules_source`, where the stored rules were read and at which `t`. `rules_fired`, which the documentation described, is now reported in the body. See [Reasoning](../query/reasoning.md).
-- Rust API: `RulesArtifactWire::rules` carries each rule's IRI, language and source (`ImportedRule`), `parsed_rules` became `imported_rules`, and `compute_derived_facts`, `explain_derived_facts` and `load_rule_set` take the query's `ReasoningConfig` (or its imported rules) rather than its modes and rules graph.
+- Rust API: `RulesArtifactWire::rules` carries each rule's IRI, language and source (`ImportedRule`), `parsed_rules` became `imported_rules`, and `compute_derived_facts`, `explain_derived_facts` and `load_rule_set` take the query's `ReasoningConfig` (or its imported rules) rather than its modes and rules graph. `TrackingTally::reasoning` is `Option<Box<ReasoningTally>>` (the JSON is unchanged); `TrackedQueryResponse::reasoning` is still `Option<ReasoningTally>`.
 
 #### Materialization and property paths are charged fuel
 

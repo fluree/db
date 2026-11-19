@@ -578,7 +578,12 @@ impl Tracker {
                 None
             },
             policy_enforcement: inner.policy_enforcement.read().ok().and_then(|p| p.clone()),
-            reasoning: inner.reasoning.read().ok().and_then(|r| r.clone()),
+            reasoning: inner
+                .reasoning
+                .read()
+                .ok()
+                .and_then(|r| r.clone())
+                .map(Box::new),
             sql: inner
                 .statements
                 .read()
@@ -610,9 +615,12 @@ pub struct TrackingTally {
     /// under a non-root policy context; absent means unenforced.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub policy_enforcement: Option<PolicyEnforcement>,
-    /// Reasoning materialization outcome, when a reasoning mode ran.
+    /// Reasoning materialization outcome, when a reasoning mode ran. Boxed:
+    /// only a reasoning query has one, and a tally rides inline in records a
+    /// transaction keeps (a staged receipt), which never reason. The JSON is
+    /// the same.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub reasoning: Option<ReasoningTally>,
+    pub reasoning: Option<Box<ReasoningTally>>,
     /// Statements the SQL pushdown lane sent to graph sources, in the order
     /// they ran. Absent when no block was pushed down.
     #[serde(skip_serializing_if = "Option::is_none")]

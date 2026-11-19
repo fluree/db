@@ -114,7 +114,7 @@ mod tests {
             fuel: None,
             policy: None,
             policy_enforcement: None,
-            reasoning: Some(ReasoningTally {
+            reasoning: Some(Box::new(ReasoningTally {
                 capped: false,
                 capped_reason: None,
                 derived_facts: 2,
@@ -133,7 +133,7 @@ mod tests {
                     graph: "http://example.org/rules".to_string(),
                     t: 12,
                 }),
-            }),
+            })),
             sql: None,
             sql_elided: None,
         };
