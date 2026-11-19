@@ -361,7 +361,7 @@ mod tests {
     async fn cached_ledger_sink() -> (
         PeerHeadSink,
         Arc<RecordingSleeper>,
-        Arc<Mutex<Vec<HeadChange>>>,
+        Arc<Mutex<Vec<(HeadChange, usize)>>>,
     ) {
         let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
         fluree.create_ledger(LEDGER).await.expect("create");
@@ -378,13 +378,18 @@ mod tests {
             .expect("seed");
         fluree.ledger(LEDGER).await.expect("cache");
 
+        let sleeper = Arc::new(RecordingSleeper::default());
         let seen = Arc::new(Mutex::new(Vec::new()));
         let registry = Arc::new(HeadRegistry::default());
         {
             let seen = Arc::clone(&seen);
-            registry.add(Box::new(move |c| seen.lock().unwrap().push(c.clone())));
+            let sleeper = Arc::clone(&sleeper);
+            // Each change, with the retry waits already taken when it fired.
+            registry.add(Box::new(move |c| {
+                let waits = sleeper.0.lock().unwrap().len();
+                seen.lock().unwrap().push((c.clone(), waits));
+            }));
         }
-        let sleeper = Arc::new(RecordingSleeper::default());
         let sink = PeerHeadSink {
             fluree,
             registry,
@@ -429,7 +434,12 @@ mod tests {
         assert_eq!(cached_t(&sink).await, None, "the stale ledger was evicted");
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "callbacks still fire");
-        assert_eq!(seen[0].commit_t, t + 1);
+        assert_eq!(seen[0].0.commit_t, t + 1);
+        assert_eq!(
+            seen[0].1,
+            REFRESH_RETRY_DELAYS.len(),
+            "callbacks fire after the last retry, once the ledger is evicted"
+        );
     }
 
     /// A refresh that succeeds does not wait and keeps the ledger cached.
