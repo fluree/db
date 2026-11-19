@@ -495,8 +495,10 @@ impl LedgerSnapshot {
     /// name: queries for it return empty results rather than erroring.
     ///
     /// Use [`encode_iri_strict`](Self::encode_iri_strict) when unknown IRIs
-    /// should produce an error (e.g., validating datatype IRIs in BIND
-    /// expressions or resolving policy identity IRIs).
+    /// should produce an error (e.g., resolving policy identity IRIs). A
+    /// datatype IRI is never one of those: any IRI names a datatype, so a
+    /// query's datatype (a pattern constraint, `STRDT`, a typed literal in an
+    /// expression) takes this fallback.
     pub fn encode_iri(&self, iri: &str) -> Option<Sid> {
         Some(self.encode_iri_inner(iri))
     }
@@ -506,10 +508,10 @@ impl LedgerSnapshot {
     ///
     /// Unlike [`encode_iri`](Self::encode_iri), this does NOT fall back to
     /// the EMPTY namespace for unknown IRIs. Use this when the caller needs
-    /// to distinguish between known and unknown namespaces (e.g., validating
-    /// user-supplied IRIs in BIND expressions or policy identity resolution).
-    /// Once the table is full, every IRI has a known encoding: its prefix's
-    /// code, or `OVERFLOW`.
+    /// to distinguish between known and unknown namespaces (e.g., `IRI()` in
+    /// an expression, which keeps an unknown IRI as an IRI, or policy
+    /// identity resolution). Once the table is full, every IRI has a known
+    /// encoding: its prefix's code, or `OVERFLOW`.
     ///
     /// Note: bare strings with no scheme (e.g., `"just-a-string"`) canonically
     /// split to the EMPTY prefix `""` and are intentionally rejected here, even

@@ -35,6 +35,7 @@ use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
 use crate::eval::PreparedBoolExpression;
 use crate::filter::filter_batch;
+use crate::group_aggregate::TryCollectVec;
 use crate::group_aggregate::{binding_to_group_key_normalized, GroupKeyOwned};
 use crate::ir::R2rmlPattern;
 use crate::operator::flush::{pull_window, FlushSchedule};
@@ -1480,12 +1481,12 @@ impl R2rmlScanOperator {
         child_schema: &[VarId],
         child_batch: &Batch,
         ctx: &ExecutionContext<'_>,
-    ) -> JoinPlan {
+    ) -> Result<JoinPlan> {
         if join_vars.is_empty() {
-            return JoinPlan::Cross;
+            return Ok(JoinPlan::Cross);
         }
         let dicts = crate::object_binding::TermDicts::of(ctx);
-        let gv = ctx.graph_view();
+        let gv = ctx.term_view();
         let gv = gv.as_ref();
 
         let mut full_index: HashMap<Vec<GroupKeyOwned>, Vec<usize>> = HashMap::new();
@@ -1502,7 +1503,7 @@ impl R2rmlScanOperator {
                     break;
                 }
                 if b.is_bound() {
-                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)));
+                    key.push(Some(binding_to_group_key_normalized(b, dicts, gv)?));
                 } else {
                     all_bound = false;
                     key.push(None);
@@ -1519,11 +1520,11 @@ impl R2rmlScanOperator {
                 partial_rows.push((row_idx, key));
             }
         }
-        JoinPlan::Hash {
+        Ok(JoinPlan::Hash {
             join_vars: join_vars.to_vec(),
             full_index,
             partial_rows,
-        }
+        })
     }
 
     /// Buffer one child batch and set up its streaming scan: resolve the matching
@@ -1970,8 +1971,21 @@ impl R2rmlScanOperator {
             // scan that would have dropped it) — an over-match. Non-scalar
             // constraints keep the shortcut off and take the sound parent-scan
             // path.
-            let ref_template_shortcut =
-                Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
+            // A view policy deciding by the classes a row derives reads them
+            // from its `rdf:type` object maps, a reference's included, so those
+            // maps' parents are resolved whatever the pattern reads; and a
+            // reference's class is its parent's subject, never one rendered
+            // from the child's key (a dangling key mints no class).
+            let row_classes = self
+                .policy_gate
+                .as_ref()
+                .is_some_and(|gate| gate.needs_row_classes(triples_map));
+            let is_derived_type = |pom: &PredicateObjectMap| {
+                pom.predicate_map.as_constant() == Some(fluree_vocab::rdf::TYPE)
+                    && !matches!(pom.object_map, ObjectMap::Constant { .. })
+            };
+            let ref_template_shortcut = !row_classes
+                && Self::ref_template_shortcut_enabled(ctx.trust_fk_refs, &self.pattern);
             // Scoped so `star_preds` (which borrows `self`) is released before the
             // parent-lookup loop mutates `self.parent_lookup_cache` (PR-4).
             let filtered_poms: Vec<_> = {
@@ -1980,7 +1994,9 @@ impl R2rmlScanOperator {
                     .predicate_object_maps
                     .iter()
                     .filter(|pom| {
-                        if self.pattern.predicate_var.is_none() && self.has_star_members() {
+                        if row_classes && is_derived_type(pom) {
+                            true
+                        } else if self.pattern.predicate_var.is_none() && self.has_star_members() {
                             pom.predicate_map
                                 .as_constant()
                                 .is_some_and(|p| star_preds.contains(&p))
@@ -2086,6 +2102,12 @@ impl R2rmlScanOperator {
                     let parent_tm = match mapping.get(&rom.parent_triples_map) {
                         Some(tm) => tm,
                         None => {
+                            if row_classes && is_derived_type(pom) {
+                                return Err(unresolved_class_error(
+                                    &self.pattern.graph_source_id,
+                                    &triples_map.iri,
+                                ));
+                            }
                             tracing::warn!(
                                 parent = %rom.parent_triples_map,
                                 "Parent TriplesMap not found for RefObjectMap, skipping"
@@ -2109,6 +2131,12 @@ impl R2rmlScanOperator {
                     }
 
                     let Some(source) = ParentSource::new(parent_tm, parent_join_cols) else {
+                        if row_classes && is_derived_type(pom) {
+                            return Err(unresolved_class_error(
+                                &self.pattern.graph_source_id,
+                                &triples_map.iri,
+                            ));
+                        }
                         tracing::warn!(
                             parent = %rom.parent_triples_map,
                             "Parent TriplesMap has no logical table, skipping"
@@ -2144,7 +2172,7 @@ impl R2rmlScanOperator {
                 }
             }
 
-            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx);
+            let join = self.build_join_plan(&join_vars, &child_schema, &child_batch, ctx)?;
 
             tms.push(TmStream {
                 tm_iri: triples_map.iri.clone(),
@@ -2713,6 +2741,17 @@ impl R2rmlScanOperator {
     }
 }
 
+/// The refusal for a map whose rows take a class from a reference the scan
+/// cannot resolve, while a view policy decides by class: reading the rows as
+/// classless would decide them on fewer classes than their subjects hold.
+fn unresolved_class_error(graph_source_id: &str, triples_map: &str) -> QueryError {
+    QueryError::InvalidQuery(format!(
+        "Graph source '{graph_source_id}': triples map <{triples_map}> takes its rdf:type \
+         from a reference whose parent cannot be read, so a class-targeted view policy \
+         cannot be decided on its rows"
+    ))
+}
+
 /// Whether the correlated inner-scan cache is enabled. Read once from
 /// `FLUREE_R2RML_SCAN_CACHE` (family falsy spellings,
 /// [`super::env_switch_enabled`]); disabling restores the per-child-batch
@@ -2877,7 +2916,7 @@ fn emit_produced_window(
             partial_rows,
         } => {
             let dicts = crate::object_binding::TermDicts::of(ctx);
-            let gv = ctx.graph_view();
+            let gv = ctx.term_view();
             let gv = gv.as_ref();
             for prod in produced {
                 // A produced row always binds every pattern var, so its join key
@@ -2889,7 +2928,7 @@ fn emit_produced_window(
                             .find(|(v, _)| v == jv)
                             .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
                     })
-                    .collect();
+                    .try_collect_vec()?;
                 if pkey.len() != join_vars.len() {
                     continue;
                 }
@@ -4478,7 +4517,8 @@ impl Operator for R2rmlScanOperator {
             .compiled_mapping(&self.pattern.graph_source_id, as_of_t)
             .await?;
 
-        self.policy_gate = R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id)?;
+        self.policy_gate =
+            R2rmlPolicyGate::build(ctx, &mapping, &self.pattern.graph_source_id).await?;
         self.mapping = Some(mapping);
         self.state = OperatorState::Open;
 

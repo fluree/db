@@ -216,6 +216,14 @@ A key makes a map's subjects unique only when the subject is built from it:
   and `.../{customer_id}{region}` do not (`("1-2", "3")` and `("1", "2-3")`
   mint one IRI).
 
+Two triples maps' subjects count as overlapping unless their templates provably
+mint apart: an `rr:column` subject, or two templates whose constant text before
+the first placeholder can be one a prefix of the other, overlap. Overlap matters
+for deduplication (a subject both maps mint is deduplicated across them) and for
+class-targeted view policies, which decide a row over every class its subject
+could hold (see
+[Iceberg → Class policies over subjects several rows mint](iceberg.md#class-policies-over-subjects-several-rows-mint)).
+
 A history table's natural key, `( "customer_id" "valid_from" )`, does not make
 a subject minted from `customer_id` alone unique, and queries over it still
 remove repeated solutions. Two things are deduplicated whatever the keys say:

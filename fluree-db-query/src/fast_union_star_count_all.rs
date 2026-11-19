@@ -107,8 +107,9 @@ impl Operator for UnionStarCountAllOperator {
         // History mode is filtered at the planner — see
         // `execute::operator_tree::build_operator_tree_inner` — so this gate
         // doesn't duplicate that check.
+        // The counts read one graph's index (`binary_g_id`'s).
         let allow_fast =
-            !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered();
+            ctx.reads_exactly_one_graph() && !ctx.is_history_range() && ctx.allow_unfiltered();
         if allow_fast {
             if let Some(store) = ctx.binary_store.as_ref() {
                 let started = fluree_db_core::clock::Instant::now();
@@ -218,7 +219,7 @@ impl SubjectSelfLoopCountStreamV6 {
                 self.current = self
                     .cursor
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("cursor batch", e))?;
                 self.row = 0;
                 if self.current.is_none() {
                     if let Some(s) = self.cur_s.take() {
@@ -349,12 +350,14 @@ fn sum_union<U: GroupStream>(union_streams: &mut [U]) -> Result<u64> {
 /// Per-partition partial for `(UNION of union_pids) ⋈ (AND of extra_pids)` COUNT(*)
 /// over `[lo, hi)`: `Σ_s (Σ_b count_b(s)) × (Π_e count_e(s))` for subjects in any
 /// union branch AND all extra predicates. BASE index only.
+#[allow(clippy::too_many_arguments)]
 fn merge_union_constraint_count_range(
     store: &fluree_db_binary_index::BinaryIndexStore,
     g_id: fluree_db_core::GraphId,
     union_pids: &[u32],
     extra_pids: &[u32],
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -362,14 +365,16 @@ fn merge_union_constraint_count_range(
     for &p in union_pids {
         u_iters.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
     let mut e_iters: Vec<PsotSubjectCountIter<'_>> = Vec::with_capacity(extra_pids.len());
     for &p in extra_pids {
         e_iters.push(
             PsotSubjectCountIter::new_bounded(store, g_id, p, lo, hi)?
-                .with_cancellation(cancellation),
+                .with_cancellation(cancellation)
+                .with_tracker(tracker),
         );
     }
     count_union_with_extras(&mut u_iters, &mut e_iters, |_| true)
@@ -385,6 +390,7 @@ fn try_union_constraint_parallel(
     union_preds: &[Ref],
     extra_preds: &[Ref],
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let mut union_pids: Vec<u32> = Vec::with_capacity(union_preds.len());
     let mut extra_pids: Vec<u32> = Vec::with_capacity(extra_preds.len());
@@ -431,6 +437,7 @@ fn try_union_constraint_parallel(
                 &union_pids,
                 &extra_pids,
                 cancellation,
+                tracker,
                 lo,
                 hi,
             )
@@ -453,6 +460,7 @@ fn merge_union_constraint_count_range_overlay(
     extra_ops: &[SharedOverlayOps],
     to_t: i64,
     cancellation: &QueryCancellation,
+    tracker: &fluree_db_core::Tracker,
     lo: u64,
     hi: u64,
 ) -> Result<u128> {
@@ -467,6 +475,7 @@ fn merge_union_constraint_count_range_overlay(
             hi,
             sliced,
             to_t,
+            tracker,
         )
         .map(|c| CursorSubjectCountStream::new(c).with_cancellation(cancellation))
     };
@@ -576,6 +585,7 @@ fn try_union_constraint_overlay_parallel(
                 extra_ops,
                 to_t,
                 &ctx.cancellation,
+                &ctx.tracker,
                 lo,
                 hi,
             )
@@ -665,9 +675,14 @@ fn count_union_star(
         && !overlay_has_rows
         && !time_travel
     {
-        if let Some(total) =
-            try_union_constraint_parallel(store, g_id, union_preds, extra_preds, &ctx.cancellation)?
-        {
+        if let Some(total) = try_union_constraint_parallel(
+            store,
+            g_id,
+            union_preds,
+            extra_preds,
+            &ctx.cancellation,
+            &ctx.tracker,
+        )? {
             return Ok(Some(total));
         }
     }

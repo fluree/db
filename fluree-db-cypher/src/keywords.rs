@@ -1,0 +1,106 @@
+//! Reserved JSON-LD keywords, which are not Cypher property keys.
+//!
+//! Fluree's Cypher surface sits on an RDF model whose JSON-LD serialization
+//! uses `@`-prefixed keywords for structure: `@id` is a node's identity,
+//! `@type` its classes, `@value`/`@language` the parts of a literal. None of
+//! them is a property in the Cypher sense — a Cypher node variable *is* the
+//! node, and its labels are `labels(n)`.
+//!
+//! Left unchecked they fail silently in both directions, in two positions.
+//! As a property key they lower as ordinary predicates: a read returns `null`
+//! (the property is simply absent) and a write stores a literal predicate
+//! spelled `@id`, leaving the node's real identity untouched. As a node label
+//! they lower as the object of an `rdf:type` triple: ``MATCH (n:`@id`)`` reads
+//! as zero rows, and ``SET n:`@type` `` commits, after which `labels(n)` reads
+//! back `["Person", "@type"]`. Rejecting is safe because a bare `@id` is not a legal
+//! Cypher identifier — it has to be backticked — so no ordinary property name
+//! can collide with this set.
+//!
+//! Shared by the read lowering (`fluree-db-cypher`) and the write lowering
+//! (`fluree-db-transact`), which resolve predicates independently.
+
+/// The message for a reserved JSON-LD name used where Cypher expects a
+/// property key, label, or relationship type — `None` for any ordinary name.
+///
+/// The rule is the `@` prefix, not a list: every `@`-prefixed name is
+/// rejected, and the known keywords only get more specific advice.
+///
+/// Each message names the working accessor where one exists, which is the
+/// whole point: the accessors are documented, but a user reaching for
+/// `n.`@id`` has no way to discover them from a `null`.
+pub fn reserved_keyword_message(key: &str) -> Option<String> {
+    // Every reserved name starts with `@`, which no ordinary Cypher property
+    // key can. One byte compare keeps this off the lowering path's cost for
+    // the overwhelmingly common case; the match below only runs for a key
+    // that is already unusual.
+    if !key.starts_with('@') {
+        return None;
+    }
+    let advice = match key {
+        "@id" => {
+            "a node variable already *is* the node; read its identity with `id(n)` or \
+             `elementId(n)`"
+        }
+        "@type" => {
+            "read a node's types with `labels(n)`, match on one with `MATCH (n:Label)`, and \
+             add one with `SET n:Label`"
+        }
+        "@value" | "@language" | "@direction" | "@json" => {
+            "a literal's value and language tag are not separately addressable in Cypher — \
+             read the property itself"
+        }
+        "@graph" | "@context" | "@list" | "@set" | "@none" | "@reverse" | "@index" | "@nest"
+        | "@base" | "@vocab" | "@container" | "@included" | "@prefix" | "@propagate"
+        | "@protected" | "@version" => "it describes JSON-LD document structure, not data",
+        // Any other `@` name. The list above carries advice; it is not the
+        // boundary. A list that has to track the JSON-LD spec lets every name
+        // it misses through — `@import` and `@annotation` did, and both
+        // committed a literal predicate — while the safety argument in the
+        // module doc covers the whole prefix: no ordinary Cypher identifier
+        // begins with `@`, so rejecting all of them cannot catch a real name.
+        _ => "names beginning with `@` are reserved by JSON-LD",
+    };
+    Some(format!(
+        "`{key}` is a reserved JSON-LD keyword, not a usable Cypher name (property key, \
+         label, or relationship type) — {advice}."
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::reserved_keyword_message;
+
+    #[test]
+    fn names_the_working_accessor() {
+        let m = reserved_keyword_message("@id").expect("@id is reserved");
+        assert!(m.contains("id(n)"), "{m}");
+        assert!(m.contains("elementId(n)"), "{m}");
+        let m = reserved_keyword_message("@type").expect("@type is reserved");
+        assert!(m.contains("labels(n)"), "{m}");
+    }
+
+    #[test]
+    fn every_at_prefixed_name_is_reserved_not_just_the_listed_ones() {
+        // `@import` and `@annotation` are real JSON-LD 1.1 keywords the list
+        // missed; both committed a literal predicate before the prefix became
+        // the rule. The bare `@` is covered by the same rule.
+        for key in ["@import", "@annotation", "@", "@anything"] {
+            assert!(
+                reserved_keyword_message(key).is_some(),
+                "`{key}` must be reserved"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_names_pass() {
+        // Including names that merely look adjacent — only the exact
+        // keyword set is reserved.
+        for key in ["id", "type", "name", "value", "graph", "atid", "id@"] {
+            assert!(
+                reserved_keyword_message(key).is_none(),
+                "`{key}` must not be treated as reserved"
+            );
+        }
+    }
+}

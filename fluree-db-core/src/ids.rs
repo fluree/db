@@ -72,6 +72,15 @@ impl fmt::Display for RuntimePredicateId {
 /// Using a type alias keeps a single definition for easy future changes.
 pub type GraphId = u16;
 
+/// The graph a literal names when it holds no per-graph arena handle.
+///
+/// An arena-backed literal (a big number or a vector) is a handle numbered
+/// per `(graph, predicate)`, so it names a value only together with its
+/// graph. Every other literal kind is the same term in every graph of a
+/// store and carries this instead. Graph ids are dictionary indices, so no
+/// graph has this one.
+pub const NO_ARENA_GRAPH: GraphId = GraphId::MAX;
+
 // ---------------------------------------------------------------------------
 // TxnT
 // ---------------------------------------------------------------------------

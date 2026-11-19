@@ -48,6 +48,32 @@ use axum::{
 use std::sync::Arc;
 use tower_http::cors::{Any, CorsLayer};
 
+/// On a query peer, send the request to the transaction server, as the
+/// transaction routes do; elsewhere, serve it here. For routes whose handlers
+/// read the request through typed extractors, so cannot forward it
+/// themselves.
+async fn forward_on_peer(
+    axum::extract::State(state): axum::extract::State<Arc<AppState>>,
+    request: axum::extract::Request,
+    next: middleware::Next,
+) -> axum::response::Response {
+    if state.config.server_role == crate::config::ServerRole::Peer {
+        return transact::forward_write_request(&state, request).await;
+    }
+    next.run(request).await
+}
+
+/// [`forward_on_peer`] for one route's method router.
+fn forwarded_on_peer<S>(methods: MethodRouter<S>, state: &Arc<AppState>) -> MethodRouter<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    methods.layer(middleware::from_fn_with_state(
+        Arc::clone(state),
+        forward_on_peer,
+    ))
+}
+
 /// Apply the Raft follower-forward middleware to a leader-only
 /// subrouter when the server was constructed with a Raft handle.
 /// Single-node and peer-mode deployments pass through unchanged.
@@ -274,18 +300,19 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // push whose commits include a merge; see `routes::push`.
         .route("/push/*ledger", post(push::push_ledger_tail))
         .route("/push-merges/*ledger", post(push::push_merges_ledger_tail))
-        // Nameservice ref endpoints (for remote sync)
+        // Nameservice ref endpoints (for remote sync). A peer sends them to
+        // the transaction server, whose nameservice they advance.
         .route(
             "/nameservice/refs/:alias/commit",
-            post(nameservice_refs::push_commit_head),
+            forwarded_on_peer(post(nameservice_refs::push_commit_head), &state),
         )
         .route(
             "/nameservice/refs/:alias/index",
-            post(nameservice_refs::push_index_head),
+            forwarded_on_peer(post(nameservice_refs::push_index_head), &state),
         )
         .route(
             "/nameservice/refs/:alias/init",
-            post(nameservice_refs::init_ledger),
+            forwarded_on_peer(post(nameservice_refs::init_ledger), &state),
         );
     let v1_leader_only_routes = apply_leader_forward(v1_leader_only_routes, &state);
 
@@ -393,7 +420,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
             "/storage/objects/:cid",
             get(storage_proxy::get_object_by_cid),
         )
-        .route("/nameservice/snapshot", get(nameservice_refs::snapshot))
+        .route(
+            "/nameservice/snapshot",
+            forwarded_on_peer(get(nameservice_refs::snapshot), &state),
+        )
         // Stub endpoints (not yet implemented)
         .route("/subscribe", get(stubs::subscribe))
         .route("/remote/:path", get(stubs::remote).post(stubs::remote));

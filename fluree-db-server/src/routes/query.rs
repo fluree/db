@@ -4085,22 +4085,26 @@ async fn execute_sparql_ledger(
             if let Some(max_bytes) = headers.max_bytes() {
                 config = config.with_max_bytes(max_bytes);
             }
-            let result = graph
+            let builder = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(config)
-                .execution_options(execution())
-                .execute_formatted()
-                .await
-                .inspect_err(|_| {
-                    set_span_error_code(&span, "error:QueryFailed");
-                })?;
+                .execution_options(execution());
+            // Agent JSON is never cached; asked, the response says so.
+            let builder = match &result_cache {
+                Some(outcome) => builder.result_cache(outcome),
+                None => builder,
+            };
+            let result = builder.execute_formatted().await.inspect_err(|_| {
+                set_span_error_code(&span, "error:QueryFailed");
+            })?;
             let content_type = "application/vnd.fluree.agent+json; charset=utf-8";
-            return Ok((
+            let response = (
                 [(axum::http::header::CONTENT_TYPE, content_type)],
                 Json(result),
             )
-                .into_response());
+                .into_response();
+            return Ok(with_result_cache_header(response, result_cache.as_ref()));
         }
 
         if let Some(outcome) = &result_cache {

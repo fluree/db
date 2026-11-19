@@ -217,6 +217,7 @@ pub fn count_rows_numeric_compare_operator(
                     p_id,
                     compare,
                     &threshold,
+                    &ctx.tracker,
                 )?;
                 return match count {
                     Some(count) => Ok(Some(build_count_batch(
@@ -309,6 +310,7 @@ pub fn sum_compare_as_count_operator(
                     p_id,
                     compare,
                     &threshold,
+                    &ctx.tracker,
                 )?;
                 return match count {
                     Some(count) => Ok(Some(build_count_batch(
@@ -360,6 +362,7 @@ fn count_rows_for_predicate_numeric_compare_post(
     p_id: u32,
     compare: NumericCompareOp,
     threshold: &FlakeValue,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
 
@@ -410,7 +413,7 @@ fn count_rows_for_predicate_numeric_compare_post(
     // predicate's total row count.
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
     parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk)
+        count_numeric_compare_in_leaf_slice(store, p_id, compare, threshold, chunk, tracker)
     })
 }
 
@@ -512,6 +515,7 @@ fn count_numeric_compare_in_leaf_slice(
     compare: NumericCompareOp,
     threshold: &FlakeValue,
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let projection = projection_okey_only();
     let mut total: u64 = 0;
@@ -553,9 +557,13 @@ fn count_numeric_compare_in_leaf_slice(
                 continue;
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
             total =
                 total.saturating_add(count_matching_rows_in_sorted_batch(&batch, interval) as u64);
         }
@@ -838,7 +846,13 @@ pub fn count_rows_encoded_filters_operator(
                 let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
                 let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
                 let count = parallel_leaf_chunk_count(leaves, total_rows, |chunk| {
-                    count_rows_matching_encoded_filters_in_leaf_slice(store, p_id, &encoded, chunk)
+                    count_rows_matching_encoded_filters_in_leaf_slice(
+                        store,
+                        p_id,
+                        &encoded,
+                        chunk,
+                        &ctx.tracker,
+                    )
                 })?;
                 return match count {
                     Some(c) => Ok(Some(build_count_batch(
@@ -897,6 +911,7 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
     p_id: u32,
     filters: &[EncodedPreFilter],
     leaves: &[LeafEntry],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let projection = projection_sid_otype_okey();
     let mut total: u64 = 0;
@@ -909,9 +924,13 @@ fn count_rows_matching_encoded_filters_in_leaf_slice(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for r in 0..batch.row_count {
                 let s_id = batch.s_id.get(r);
                 let o_type = batch.o_type.get(r);
@@ -962,6 +981,7 @@ pub fn count_rows_lang_filter_operator(
                     ctx.binary_g_id,
                     p_id,
                     required_otype,
+                    &ctx.tracker,
                 )?;
                 return Ok(Some(build_count_batch(
                     out_var,
@@ -1007,6 +1027,7 @@ fn count_rows_for_predicate_lang_psot(
     g_id: GraphId,
     p_id: u32,
     required_otype: u16,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_otype_only();
@@ -1029,9 +1050,13 @@ fn count_rows_for_predicate_lang_psot(
                 continue;
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 if batch.o_type.get(row) == required_otype {
                     total += 1;
@@ -1163,7 +1188,8 @@ pub fn count_distinct_position_operator(
                 // (see `count_distinct_numbig_objects`); declining is reserved
                 // for an inconsistent index or the explicit kill switch.
                 DistinctPosition::Objects => {
-                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id)? else {
+                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id, &ctx.tracker)?
+                    else {
                         return Ok(None);
                     };
                     (count, "COUNT(DISTINCT) objects")
@@ -1278,6 +1304,7 @@ fn numbig_exact_max_entries() -> Option<u64> {
 pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
     else {
@@ -1286,7 +1313,7 @@ pub(crate) fn count_distinct_objects(
     if walk.skipped_non_identifying_rows == 0 {
         return Ok(Some(walk.count));
     }
-    let Some(exact) = count_distinct_numbig_objects(store, g_id)? else {
+    let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
         return Ok(None);
     };
     crate::fast_path_outcome::stamp_fast_path(
@@ -1327,7 +1354,11 @@ pub(crate) fn count_distinct_objects(
 /// entry, including repeated values across predicates. On typical 64-bit targets
 /// each key occupies 48 bytes, plus allocations for wide values and temporary
 /// buffers. Legacy arenas also pay for normalization during key construction.
-fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Result<Option<u64>> {
+fn count_distinct_numbig_objects(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Option<u64>> {
     use rayon::prelude::*;
 
     let arenas: Vec<(u32, &NumBigArena)> = store
@@ -1345,7 +1376,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
     let mut keys: Vec<NumBigDistinctKey> = Vec::new();
     for (p_id, arena) in arenas {
         let normalized = arena.values_are_normalized();
-        let live = count_live_numbig_handles(store, g_id, p_id)?;
+        let live = count_live_numbig_handles(store, g_id, p_id, tracker)?;
         if live == 0 {
             continue;
         }
@@ -1358,7 +1389,7 @@ fn count_distinct_numbig_objects(store: &BinaryIndexStore, g_id: GraphId) -> Res
             );
             continue;
         }
-        let handles = live_numbig_handles(store, g_id, p_id)?;
+        let handles = live_numbig_handles(store, g_id, p_id, tracker)?;
         let mapped: Result<Vec<NumBigDistinctKey>> = handles
             .par_iter()
             .map(|&h| {
@@ -1520,11 +1551,16 @@ fn decode_numbig_handle_run(
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     leaflet_idx: usize,
     o_type_const: Option<u16>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<(u64, u64, u64)>> {
     let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
-    let batch = handle
-        .load_columns(leaflet_idx, &projection_otype_okey(), RunSortOrder::Post)
-        .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+    let batch = crate::fast_path_common::load_leaflet_columns_charged(
+        handle,
+        leaflet_idx,
+        &projection_otype_okey(),
+        RunSortOrder::Post,
+        tracker,
+    )?;
     let o_type_default = o_type_const.unwrap_or(0);
     let mut count = 0u64;
     let mut first = None;
@@ -1548,7 +1584,12 @@ fn decode_numbig_handle_run(
 /// seam dedup on the handle, decoding only a leaflet that straddles the NumBig
 /// range or predates `lead_group_count`. Compared against the arena's size, this
 /// says whether every arena entry is still live without reading a row.
-fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<u64> {
+fn count_live_numbig_handles(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(0);
@@ -1582,9 +1623,12 @@ fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
                                     .map_err(|e| QueryError::from_io("leaf open", e))?,
                             ),
                         };
-                        if let Some((count, first, last)) =
-                            decode_numbig_handle_run(handle.as_ref(), idx, entry.o_type_const)?
-                        {
+                        if let Some((count, first, last)) = decode_numbig_handle_run(
+                            handle.as_ref(),
+                            idx,
+                            entry.o_type_const,
+                            tracker,
+                        )? {
                             partial.push_run(count, first, last);
                         }
                     }
@@ -1605,7 +1649,12 @@ fn count_live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
 /// deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
 /// leaflet) over the predicate's NumBig leaflets only — the fallback for a
 /// predicate whose arena holds retracted values.
-fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Vec<u32>> {
+fn live_numbig_handles(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<Vec<u32>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(Vec::new());
@@ -1635,9 +1684,13 @@ fn live_numbig_handles(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Re
                 .map_err(|e| QueryError::from_io("leaf open", e))?;
             for idx in wanted {
                 let entry = &dir.entries[idx];
-                let batch = handle
-                    .load_columns(idx, &projection_otype_okey(), RunSortOrder::Post)
-                    .map_err(|e| QueryError::Internal(format!("leaflet columns: {e}")))?;
+                let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                    &*handle,
+                    idx,
+                    &projection_otype_okey(),
+                    RunSortOrder::Post,
+                    tracker,
+                )?;
                 let o_type_default = entry.o_type_const.unwrap_or(0);
                 for row in 0..batch.row_count {
                     if batch.o_type.get_or(row, o_type_default) != numbig {
@@ -2015,7 +2068,7 @@ pub fn count_literal_objects_operator(
                     tracing::debug!(count, "literal COUNT answered from datatype stats");
                     count
                 }
-                None => count_literal_rows_psot(store, ctx.binary_g_id)?,
+                None => count_literal_rows_psot(store, ctx.binary_g_id, &ctx.tracker)?,
             };
             let count_i64 = count_to_i64(count, "COUNT literals")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
@@ -2072,7 +2125,11 @@ fn is_literal_otype(ot_u16: u16) -> bool {
     !ot.is_node_ref()
 }
 
-fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+fn count_literal_rows_psot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Psot) else {
         return Ok(0);
     };
@@ -2096,9 +2153,13 @@ fn count_literal_rows_psot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u6
             }
 
             // Mixed types: decode OType column only.
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 if is_literal_otype(batch.o_type.get(row)) {
                     total += 1;
@@ -2121,7 +2182,7 @@ pub fn count_blank_node_subjects_operator(
             let Some(store) = fast_path_store(ctx) else {
                 return Ok(None);
             };
-            let count = count_blank_subject_rows_spot(store, ctx.binary_g_id)?;
+            let count = count_blank_subject_rows_spot(store, ctx.binary_g_id, &ctx.tracker)?;
             let count_i64 = count_to_i64(count, "COUNT blank nodes")?;
             Ok(Some(build_count_batch(out_var, count_i64)?))
         },
@@ -2137,7 +2198,11 @@ fn blank_subject_range() -> (u64, u64) {
     (min, max)
 }
 
-fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Result<u64> {
+fn count_blank_subject_rows_spot(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<u64> {
     let Some(branch) = store.branch_for_order(g_id, RunSortOrder::Spot) else {
         return Ok(0);
     };
@@ -2193,9 +2258,13 @@ fn count_blank_subject_rows_spot(store: &BinaryIndexStore, g_id: GraphId) -> Res
             }
 
             // Boundary leaflet: count exact rows by scanning SId column only.
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Spot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Spot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if (s_min..=s_max).contains(&sid) {

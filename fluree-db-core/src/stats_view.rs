@@ -22,6 +22,10 @@ pub struct StatsIriEncoder {
     /// IRI prefix -> namespace code, shared with the snapshot.
     reverse: Arc<HashMap<String, u16>>,
     split_mode: NsSplitMode,
+    /// Whether an IRI whose prefix has no code encodes under `OVERFLOW`, as
+    /// the snapshot's encoder does on a full table. Only a snapshot's encoder
+    /// sets it: an index root's predicate table never stores `OVERFLOW`, so
+    /// an encoder that keys a root's predicates leaves it `false`.
     table_full: bool,
 }
 

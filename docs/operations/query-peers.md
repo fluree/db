@@ -73,6 +73,7 @@ Peer servers support two storage access modes:
   - The peer reads the same storage backend as the transaction server (shared filesystem, shared bucket credentials, etc.).
   - Requires `--storage-path`.
   - The peer only reads: the nameservice, write-ahead log, staging files and indexes on that storage are the transaction server's. A peer runs no indexer, whatever `--indexing-enabled` says.
+  - **Upgrading from v4.2.7:** a v4.2.7 shared-storage peer writes the transaction server's nameservice record and can move its head back, losing acknowledged commits. Upgrade (or stop) every shared-storage peer before, or together with, the transaction server.
 - **Proxy storage** (`--storage-access-mode proxy`)
   - The peer does **not** need direct storage credentials.
   - The peer fetches all storage reads through the transaction server’s `/v1/fluree/storage/objects/{cid}` endpoint (raw CAS bytes, verified against the CID client-side), including index leaves and dictionary blobs — so queries execute locally on the peer against remotely served index content.

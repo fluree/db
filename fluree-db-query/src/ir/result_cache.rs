@@ -11,8 +11,8 @@ const LOCAL_LEDGER_SERVICE: &str = "fluree:ledger:";
 /// This covers what the query text reads. What the view reads (policy, graph
 /// sources, reasoning) is the caller's to check.
 ///
-/// Exhaustive over `Pattern` and `Expression`, so a new variant must decide
-/// here whether it reads anything beyond the ledger state.
+/// Exhaustive over `Pattern`, `Expression` and `Function`, so a new variant
+/// must decide here whether it reads anything beyond the ledger state.
 pub fn result_cache_bypass(query: &Query) -> Option<&'static str> {
     patterns(&query.patterns)
         .or_else(|| modifiers(query.grouping.as_ref(), &query.order_binds))
@@ -120,6 +120,8 @@ fn expression(e: &Expression) -> Option<&'static str> {
 /// Functions that read the clock or a random source on every call. `BNODE`
 /// with a label is stable for one plan, but its label hashes the binding's
 /// representation, which a different plan over the same state can change.
+/// An unknown (`Custom`) function fails at evaluation, so nothing is cached
+/// for it.
 fn volatile(func: &Function) -> Option<&'static str> {
     match func {
         Function::Rand => Some("RAND()"),
@@ -128,6 +130,118 @@ fn volatile(func: &Function) -> Option<&'static str> {
         Function::Uuid => Some("UUID()"),
         Function::StrUuid => Some("STRUUID()"),
         Function::Bnode => Some("BNODE()"),
-        _ => None,
+        Function::Eq
+        | Function::Ne
+        | Function::Lt
+        | Function::Le
+        | Function::Gt
+        | Function::Ge
+        | Function::Add
+        | Function::Sub
+        | Function::Mul
+        | Function::Div
+        | Function::Mod
+        | Function::Negate
+        | Function::And
+        | Function::Or
+        | Function::Not
+        | Function::Xor
+        | Function::In
+        | Function::NotIn
+        | Function::Strlen
+        | Function::Substr
+        | Function::Ucase
+        | Function::Lcase
+        | Function::Contains
+        | Function::StrStarts
+        | Function::StrEnds
+        | Function::Regex
+        | Function::Concat
+        | Function::StrBefore
+        | Function::StrAfter
+        | Function::Replace
+        | Function::Str
+        | Function::StrDt
+        | Function::StrLang
+        | Function::EncodeForUri
+        | Function::ReplaceAll
+        | Function::Split
+        | Function::Trim
+        | Function::LTrim
+        | Function::RTrim
+        | Function::Left
+        | Function::Right
+        | Function::Abs
+        | Function::Round
+        | Function::Ceil
+        | Function::Floor
+        | Function::Sqrt
+        | Function::Sign
+        | Function::Ln
+        | Function::Pow
+        | Function::Iri
+        | Function::Year
+        | Function::Month
+        | Function::Day
+        | Function::Hours
+        | Function::Minutes
+        | Function::Seconds
+        | Function::Tz
+        | Function::Timezone
+        | Function::IsIri
+        | Function::IsBlank
+        | Function::IsLiteral
+        | Function::IsNumeric
+        | Function::Lang { .. }
+        | Function::Datatype { .. }
+        | Function::LangMatches
+        | Function::SameTerm
+        | Function::T
+        | Function::Op
+        | Function::Md5
+        | Function::Sha1
+        | Function::Sha256
+        | Function::Sha384
+        | Function::Sha512
+        | Function::DotProduct
+        | Function::CosineSimilarity
+        | Function::EuclideanDistance
+        | Function::GeofDistance
+        | Function::Fulltext
+        | Function::Bound
+        | Function::If
+        | Function::Coalesce
+        | Function::XsdBoolean
+        | Function::XsdInteger
+        | Function::XsdFloat
+        | Function::XsdDouble
+        | Function::XsdDecimal
+        | Function::XsdString
+        | Function::XsdDateTime
+        | Function::XsdDate
+        | Function::XsdTime
+        | Function::CypherToFloat
+        | Function::PathLength
+        | Function::Size
+        | Function::Head
+        | Function::Last
+        | Function::Tail
+        | Function::Reverse
+        | Function::MakeList
+        | Function::Nodes
+        | Function::Range
+        | Function::PathPairs
+        | Function::ListIndex
+        | Function::Labels
+        | Function::RelType
+        | Function::StartNode
+        | Function::EndNode
+        | Function::Relationships
+        | Function::MakeRel
+        | Function::MakePath
+        | Function::MakePathHops
+        | Function::Keys
+        | Function::Properties
+        | Function::Custom(_) => None,
     }
 }

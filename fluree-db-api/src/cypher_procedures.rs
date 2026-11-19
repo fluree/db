@@ -632,9 +632,9 @@ pub(crate) fn class_denied(enforcer: &QueryPolicyEnforcer, class_sid: &Sid) -> b
 }
 
 /// True when an unconditional `Deny` restriction targets `p` directly (an
-/// `f:onProperty` restriction, or an `f:onClass` restriction where `p` is
-/// exclusive to that class so no runtime class check is needed — see
-/// [`class_denied`] for why this checks only the unconditional case).
+/// `f:onProperty` restriction with no class check — see [`class_denied`] for
+/// why this checks only the unconditional case). An `f:onClass` deny never
+/// counts: it hides only its members' facts, and any subject may carry `p`.
 pub(crate) fn predicate_denied(enforcer: &QueryPolicyEnforcer, p: &Sid) -> bool {
     let view = enforcer.policy().wrapper().view();
     view.by_property.get(p).is_some_and(|entries| {

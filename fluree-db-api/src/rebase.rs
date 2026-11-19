@@ -715,7 +715,10 @@ impl crate::Fluree {
         // owned through the loop. This install performs no dictionary work.
         // `final_state` is the replay's last state, or the source's when
         // nothing replayed: installed wherever the branch's head moved.
-        if let Some(guard) = write_guard.filter(|_| new_head_id.is_some() || became_source) {
+        if let Some(mut guard) = write_guard.filter(|_| new_head_id.is_some() || became_source) {
+            // The rebased state is another line than the cached one: an index
+            // install planned on that line must not land on this one.
+            guard.start_line();
             let needs_reindex = final_state.should_reindex(&self.index_config);
             let commit_t = final_state.t();
             self.finalize_commit(guard, final_state, commit_t, needs_reindex)

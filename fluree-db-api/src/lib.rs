@@ -103,6 +103,8 @@ pub mod profile;
 pub mod query;
 mod rebase;
 pub mod remote_service;
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+pub(crate) mod residency;
 mod revert;
 mod revert_preview;
 pub(crate) mod runtime_dicts;
@@ -2768,6 +2770,7 @@ impl FlureeBuilder {
     fn open_file_storage(
         &mut self,
     ) -> Result<(FileStorage, Option<Arc<fluree_db_core::RootLock>>)> {
+        self.refuse_read_only("build")?;
         let path = self
             .storage_path
             .take()
@@ -2831,6 +2834,33 @@ impl FlureeBuilder {
     /// backpressure on every build path — what these paths discard is the
     /// in-process background indexer (and any `IndexerConfig` knobs such
     /// as `data_dir` or `incremental_max_commits`).
+    /// Refuse [`read_only`](Self::read_only) on a build path that opens the
+    /// storage as its writer: only [`build_client`](Self::build_client)
+    /// honors it, and a reader that came back a writer would recover,
+    /// sweep and index another process's root.
+    #[cfg(any(feature = "native", feature = "aws", feature = "ipfs"))]
+    fn refuse_read_only(&self, build_path: &'static str) -> Result<()> {
+        if self.read_only {
+            return Err(ApiError::config(format!(
+                "read_only() is honored by build_client(); {build_path}() opens the storage \
+                 as its writer"
+            )));
+        }
+        Ok(())
+    }
+
+    /// [`Self::refuse_read_only`] for a build path that cannot fail: memory
+    /// storage, which no other process writes, or a nameservice mode the
+    /// caller chose.
+    fn warn_if_discarding_read_only(&self, build_path: &'static str) {
+        if self.read_only {
+            tracing::warn!(
+                build_path,
+                "read_only() is ignored: only build_client() honors it"
+            );
+        }
+    }
+
     fn warn_if_discarding_indexer_config(&self, build_path: &'static str) {
         if self.indexer_config_user_set {
             tracing::warn!(
@@ -2846,6 +2876,7 @@ impl FlureeBuilder {
         nameservice: NameServiceMode,
     ) -> Fluree {
         self.warn_if_discarding_indexer_config("build_with");
+        self.warn_if_discarding_read_only("build_with");
         // Wrapping here could double-encrypt a storage the caller already
         // wrapped, so the key is left to the caller — but not silently.
         if self.has_encryption_key() {
@@ -2975,6 +3006,7 @@ impl FlureeBuilder {
     /// A key set on the builder encrypts the storage, as on every build path.
     pub fn build_memory(self) -> Fluree {
         self.warn_if_discarding_indexer_config("build_memory");
+        self.warn_if_discarding_read_only("build_memory");
         let storage = self.encrypt_if_configured(Arc::new(MemoryStorage::new()));
         let nameservice = MemoryNameService::new();
         let event_bus = self.resolve_event_bus();
@@ -3027,6 +3059,7 @@ impl FlureeBuilder {
     #[cfg(feature = "ipfs")]
     pub fn build_ipfs(self, api_url: impl Into<String>) -> Result<Fluree> {
         use fluree_db_storage_ipfs::{IpfsConfig, IpfsStorage};
+        self.refuse_read_only("build_ipfs")?;
         // `IpfsStorage` is a `ContentStore`, not a `Storage`, so
         // `encrypt_if_configured` cannot wrap it.
         if self.has_encryption_key() {
@@ -3083,6 +3116,7 @@ impl FlureeBuilder {
         use fluree_db_connection::aws;
         use fluree_db_connection::config::S3StorageConfig;
         use fluree_db_storage_aws::S3Storage;
+        self.refuse_read_only("build_s3")?;
 
         let s3_cfg: &S3StorageConfig = match &self.config.index_storage.storage_type {
             StorageType::S3(s3) => s3,
@@ -3149,6 +3183,7 @@ impl FlureeBuilder {
         use fluree_db_connection::aws;
         use fluree_db_connection::config::S3StorageConfig;
         use fluree_db_storage_aws::{DynamoDbConfig, DynamoDbNameService, S3Storage};
+        self.refuse_read_only("build_s3_dynamo")?;
 
         let s3_cfg: &S3StorageConfig =
             match &self.config.index_storage.storage_type {
