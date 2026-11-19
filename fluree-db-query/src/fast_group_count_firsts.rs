@@ -1032,7 +1032,7 @@ pub(crate) fn group_count_v6(
     // (`BinaryIndexStore::objects_keyed_by_value`). Callers fall back on the
     // error.
     if !store
-        .objects_keyed_by_value(g_id, p_id)
+        .objects_keyed_by_value(g_id, p_id, cancellation)
         .map_err(|e| QueryError::from_io("vector arena proof", e))?
     {
         return Err(QueryError::Internal(
@@ -1564,7 +1564,7 @@ fn compute_group_by_object_star_topk(
     // Groups key on `(o_type, o_key)`, which names a value only where
     // `BinaryIndexStore::objects_keyed_by_value` holds.
     if !store
-        .objects_keyed_by_value(g_id, p_id)
+        .objects_keyed_by_value(g_id, p_id, &ctx.cancellation)
         .map_err(|e| QueryError::from_io("vector arena proof", e))?
     {
         return Ok(None);

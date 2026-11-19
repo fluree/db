@@ -1135,7 +1135,7 @@ async fn union_tables(fluree: &Fluree, build: bool) -> Vec<bool> {
                 .expect("predicate");
             if build {
                 store
-                    .vector_identity(g_id, p_id)
+                    .vector_identity(g_id, p_id, &fluree_db_core::QueryCancellation::disabled())
                     .expect("read the arena")
                     .expect("an arena");
             }

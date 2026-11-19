@@ -56,6 +56,10 @@ impl QueryCancellationReason {
     }
 }
 
+/// A cancelled read can return its reason inside an `io::Error`, which a
+/// query surface recovers as a cancellation rather than an I/O failure.
+impl std::error::Error for QueryCancellationReason {}
+
 impl fmt::Display for QueryCancellationReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())

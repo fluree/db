@@ -1189,7 +1189,12 @@ pub fn count_distinct_position_operator(
                 // for a graph holding vectors, an inconsistent index or the
                 // explicit kill switch.
                 DistinctPosition::Objects => {
-                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id, &ctx.tracker)?
+                    let Some(count) = count_distinct_objects(
+                        store,
+                        ctx.binary_g_id,
+                        &ctx.tracker,
+                        &ctx.cancellation,
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -1316,6 +1321,7 @@ pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
     tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<u64>> {
     let Some(walk) = count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, 10, true)?
     else {
@@ -1340,7 +1346,7 @@ pub(crate) fn count_distinct_objects(
         0
     };
     let vectors = if store.graph_holds_vectors(g_id) {
-        let Some(exact) = count_distinct_vector_objects(store, g_id, tracker)? else {
+        let Some(exact) = count_distinct_vector_objects(store, g_id, tracker, cancellation)? else {
             return Ok(None);
         };
         crate::fast_path_outcome::stamp_fast_path(
@@ -1371,11 +1377,13 @@ pub(crate) fn count_distinct_objects(
 /// every other vector equality is.
 ///
 /// Builds each vector predicate's identity table on first use (once per
-/// store; see [`BinaryIndexStore::vector_identity`]).
+/// store, stopping on `cancellation`; see
+/// [`BinaryIndexStore::vector_identity`]).
 fn count_distinct_vector_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
     tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<u64>> {
     let vector = OType::VECTOR.as_u16();
     // (value hash, predicate, canonical handle): one per distinct value of an
@@ -1383,7 +1391,7 @@ fn count_distinct_vector_objects(
     let mut keys: Vec<(u64, u32, u32)> = Vec::new();
     for p_id in store.vector_predicates(g_id) {
         let Some(table) = store
-            .vector_identity(g_id, p_id)
+            .vector_identity(g_id, p_id, cancellation)
             .map_err(|e| QueryError::from_io("vector identity table", e))?
         else {
             continue;
@@ -2019,9 +2027,10 @@ pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<u64>> {
     if !store
-        .objects_keyed_by_value(g_id, p_id)
+        .objects_keyed_by_value(g_id, p_id, cancellation)
         .map_err(|e| QueryError::from_io("vector arena proof", e))?
     {
         return Ok(None);
