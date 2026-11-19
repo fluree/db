@@ -2828,6 +2828,7 @@ impl BinaryIndexStore {
     }
 
     /// Subject IRI → id lookups since load that searched a dictionary leaf.
+    #[cfg(feature = "test-counters")]
     pub fn subject_reverse_leaf_lookups(&self) -> u64 {
         self.dicts
             .subject_reverse_tree
