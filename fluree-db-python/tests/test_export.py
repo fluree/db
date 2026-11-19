@@ -70,11 +70,24 @@ def test_archive_and_restore(conn, people, tmp_path):
 
 
 def test_a_failed_archive_leaves_no_file(conn, people, tmp_path):
-    archive = tmp_path / "people.flpack"
+    out = tmp_path / "out"
+    out.mkdir()
+    conn.drop("people")
+    with pytest.raises(fluree.FlureeError):
+        people.archive(out / "people.flpack")
+    assert list(out.iterdir()) == []  # no partial file either
+
+
+def test_a_failed_archive_keeps_the_file_already_there(conn, people, tmp_path):
+    out = tmp_path / "out"
+    out.mkdir()
+    archive = out / "people.flpack"
+    archive.write_bytes(b"an earlier archive")
     conn.drop("people")
     with pytest.raises(fluree.FlureeError):
         people.archive(archive)
-    assert not archive.exists()
+    assert archive.read_bytes() == b"an earlier archive"
+    assert list(out.iterdir()) == [archive]
 
 
 def test_governed_ledger_cannot_export(people, tmp_path):

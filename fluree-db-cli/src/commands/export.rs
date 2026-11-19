@@ -230,11 +230,11 @@ async fn run_ledger_archive(
 
     match output {
         Some(path) => {
-            let path: PathBuf = path.to_path_buf();
-            let file = tokio::fs::File::create(&path).await.map_err(|e| {
-                CliError::Config(format!("failed to create '{}': {e}", path.display()))
-            })?;
-            let stats = archive_into_file(&fluree, &ledger_id, !no_indexes, file, &path).await?;
+            // Lands under `path` only once it's complete; a failed archive
+            // leaves whatever was there before.
+            let stats = fluree
+                .archive_ledger_to_path(&ledger_id, !no_indexes, path)
+                .await?;
             eprintln!(
                 "{} Archived '{}' → {} ({} commits, {} txn blobs, {} index artifacts)",
                 "✓".green(),
@@ -269,29 +269,6 @@ async fn run_ledger_archive(
         }
     }
     Ok(())
-}
-
-/// Archive `ledger_id` into `file`, just created at `path`, and close it.
-/// On an error the partial file is removed: left under the name the user
-/// asked for, it would pass for a finished `.flpack` until a restore failed
-/// on it.
-pub(crate) async fn archive_into_file(
-    fluree: &fluree_db_api::Fluree,
-    ledger_id: &str,
-    include_indexes: bool,
-    file: tokio::fs::File,
-    path: &Path,
-) -> fluree_db_api::Result<fluree_db_api::pack::PackStreamResult> {
-    let mut writer = tokio::io::BufWriter::new(file);
-    let archived = fluree
-        .archive_ledger(ledger_id, include_indexes, &mut writer)
-        .await;
-    // Close the file before touching it again on the error path.
-    drop(writer);
-    if archived.is_err() {
-        let _ = std::fs::remove_file(path);
-    }
-    archived
 }
 
 /// Remote variant of `run_ledger_archive`.
@@ -690,23 +667,7 @@ fn resolve_context_override(
 
 #[cfg(test)]
 mod tests {
-    use super::{archive_into_file, remote_at};
-
-    /// An archive that fails leaves no file behind under the name asked for.
-    #[tokio::test]
-    async fn a_failed_archive_removes_its_file() {
-        let fluree = fluree_db_api::FlureeBuilder::memory().build_memory();
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("missing.flpack");
-        let file = tokio::fs::File::create(&path).await.unwrap();
-        assert!(
-            archive_into_file(&fluree, "missing:main", true, file, &path)
-                .await
-                .is_err(),
-            "no such ledger"
-        );
-        assert!(!path.exists(), "the partial archive was removed");
-    }
+    use super::remote_at;
 
     #[test]
     fn remote_at_sends_the_wire_spelling() {
