@@ -626,21 +626,10 @@ impl GraphOperator {
                 // Batched: the inner output already carries the parent columns
                 // (threaded through the multi-row seed) plus the new vars.
                 None => {
-                    let rows = batch.len();
                     if self.schema.is_empty() {
-                        return Ok(Some(Batch::empty_schema_with_len(rows)));
+                        return Ok(Some(Batch::empty_schema_with_len(batch.len())));
                     }
-                    let columns = self
-                        .schema
-                        .iter()
-                        .enumerate()
-                        .map(|(i, var)| match batch.column(*var) {
-                            Some(col) if i < parent_len => Ok(col.to_vec()),
-                            Some(col) => crossing.leave_column(col, None),
-                            None => Ok(vec![Binding::Unbound; rows]),
-                        })
-                        .collect::<Result<Vec<Vec<Binding>>>>()?;
-                    Batch::new(self.schema.clone(), columns)?
+                    crossing.leave_batch(batch, &self.schema, parent_len)?
                 }
                 // Per row: each inner solution joins the parent row.
                 Some(parent_row) => {
