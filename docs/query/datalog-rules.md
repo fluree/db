@@ -571,6 +571,26 @@ ledger) runs no rules: it fails, naming them, rather than answering over the
 first graph alone while its plain patterns read all of them. A dataset query
 takes its rules, and its reasoning configuration, from its first ledger.
 
+To compare what rules derive with another ledger (outcome labels kept apart
+from the data the rules read, say), keep that ledger out of the default graph:
+name it in `fromNamed` (SPARQL `FROM NAMED`) and read it with `GRAPH` in the
+query. The rules run over the default graph alone, and the query joins their
+conclusions with the other ledger:
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "from": "data:main@t:42",
+  "fromNamed": {"labels": {"@id": "labels:main@t:7"}},
+  "select": "?a",
+  "where": [
+    {"@id": "?a", "@type": "ex:Candidate"},
+    ["graph", "labels", {"@id": "?a", "ex:label": "?label"}]
+  ],
+  "reasoning": "datalog"
+}
+```
+
 A graph a Python job publishes is input like any other: see
 [Custom stages in Python](../guides/custom-stages-python.md) for running
 model calls and versioned decisions outside the engine and publishing their

@@ -413,3 +413,81 @@ async fn sparql_from_several_ledgers_refuses_stored_rules() {
         assert_several_graphs_refused(result.map(|rows| normalize_rows(&rows)), &from);
     }
 }
+
+/// The supported way to compare what rules derive with another ledger: the
+/// rules run over the default graph alone (one ledger, pinned), and the query
+/// reads the other ledger as a named graph of its dataset, outside the rule
+/// bodies. Both pinned with `@t:`, on both surfaces.
+#[tokio::test]
+async fn rules_run_over_the_default_graph_while_the_query_reads_another_ledger_by_name() {
+    let fluree = ledgers().await;
+    let data_t = fluree.ledger(DATA).await.expect("data").t();
+    let other_t = fluree.ledger(OTHER).await.expect("other").t();
+    let data_at = format!("{DATA}@t:{data_t}");
+    let other_at = format!("{OTHER}@t:{other_t}");
+    // Candidates over `data`'s default graph (Carol is excluded there), joined
+    // with the exclusions `other` holds (Bob).
+    let rule = json!([{
+        "@context": {"ex": "http://example.org/"},
+        "@id": "ex:candidate",
+        "where": [
+            {"@id": "?a", "@type": "ex:Account"},
+            ["not-exists", {"@id": "?a", "ex:excluded": "?x"}]
+        ],
+        "insert": {"@id": "?a", "@type": "ex:Candidate"}
+    }]);
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": data_at,
+        "fromNamed": {"labels": {"@id": other_at}},
+        "select": "?a",
+        "where": [
+            {"@id": "?a", "@type": "ex:Candidate"},
+            ["graph", "labels", {"@id": "?a", "ex:excluded": "?flag"}]
+        ],
+        "reasoning": "datalog",
+        "rules": rule
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&query)
+        .execute_formatted()
+        .await
+        .expect("rules over one default graph, another ledger read by name");
+    assert_eq!(normalize_rows(&rows), vec![json!("ex:bob")]);
+
+    // SPARQL: the rule stored in `data`, the other ledger named in the query.
+    let ledger = fluree.ledger(DATA).await.expect("load");
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"f": "https://ns.flur.ee/db#"},
+                "@id": "http://example.org/candidate",
+                "f:rule": {"@type": "f:sparql", "@value":
+                    "PREFIX ex: <http://example.org/> CONSTRUCT { ?a a ex:Candidate } \
+                     WHERE { ?a a ex:Account FILTER NOT EXISTS { ?a ex:excluded ?x } }"}
+            }),
+        )
+        .await
+        .expect("store rule");
+    let data_t = fluree.ledger(DATA).await.expect("data").t();
+    let sparql = format!(
+        "# PRAGMA reasoning: datalog\nPREFIX ex: <http://example.org/>\n\
+         SELECT ?a FROM <{DATA}@t:{data_t}> FROM NAMED <{other_at}> \
+         WHERE {{ ?a a ex:Candidate GRAPH <{other_at}> {{ ?a ex:excluded ?flag }} }}"
+    );
+    let rows = fluree
+        .query_from()
+        .sparql(&sparql)
+        .execute_formatted()
+        .await
+        .expect("SPARQL twin");
+    let bound: Vec<&str> = rows["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .filter_map(|b| b["a"]["value"].as_str())
+        .collect();
+    assert_eq!(bound, ["http://example.org/bob"], "{rows}");
+}
