@@ -30,12 +30,13 @@ keep their object identity, so `React.memo` down the tree keeps working.
 ## Install
 
 ```sh
-npm install @fluree/react                    # remote mode
-npm install @fluree/react @fluree/db-wasm    # peer mode as well
+npm install --save-exact @fluree/react                    # remote mode
+npm install --save-exact @fluree/react @fluree/db-wasm    # peer mode as well
 ```
 
 Both packages are released with the Fluree server, at its version; keep them
-on matching versions.
+on matching versions. While they are pre-release, pin an exact version, as
+above: any release can change the API.
 
 ## Two modes, one API
 
@@ -147,7 +148,7 @@ Everything above, plus:
 | `--storage-proxy-enabled` | The in-browser engine reads ledger heads and index blocks through `/v1/fluree/storage/*`. Off by default; without it every request 401s with *"Token lacks storage proxy permissions"*. |
 | `--storage-proxy-trusted-issuer <did:key>` | The proxy trusts only issuers named here (it falls back to `--events-auth-trusted-issuer`). |
 | A bearer token carrying **`fluree.storage.all`** or **`fluree.storage.ledgers`** | The storage proxy requires `fluree.storage.*` claims specifically; **`fluree.events.*` is not sufficient**. `fluree token create --storage-ledger <alias>` mints one (repeat the flag per ledger). Avoid `--all` for a token a browser holds: it also grants read and write on every ledger. See `docs/cli/token.md`. |
-| `@fluree/db-wasm` | `npm install @fluree/db-wasm`, and pass its `connect` as `peer.connect`. From a checkout: `cd fluree-db-wasm/js && npm install && node scripts/build.mjs` writes `js/pkg/`. |
+| `@fluree/db-wasm` | `npm install --save-exact @fluree/db-wasm`, and pass its `connect` as `peer.connect`. From a checkout: `cd fluree-db-wasm/js && npm install && node scripts/build.mjs` writes `js/pkg/`. |
 | A bundler allowed to read it | In a monorepo, Vite's dev server refuses paths outside the project root: set `server.fs.allow`. The symptom is `engine_crashed` with an **empty page console**, because the failure is inside the worker. |
 
 If your server enforces events auth (`--events-auth-mode` is not `none`,

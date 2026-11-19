@@ -23,11 +23,12 @@ peer.close();
 ## Install & use
 
 ```sh
-npm install @fluree/db-wasm
+npm install --save-exact @fluree/db-wasm
 ```
 
 Released with the Fluree server and at the same version; use a matching
-`@fluree/react` alongside it.
+`@fluree/react` alongside it. While the package is pre-release, pin an exact
+version, as above: any release can change the API.
 
 ```js
 import { playground } from "@fluree/db-wasm";
