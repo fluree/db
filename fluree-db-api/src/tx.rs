@@ -1680,6 +1680,8 @@ pub(crate) async fn apply_shacl_policy_to_staged_view(
     let mut inline_bundle_db = None;
     let inline_cache = match (&inline_policy, &ctx.inline_shape_bundle) {
         (Some(_), Some(bundle)) => {
+            // The ledger's split mode, not `genesis()`'s (a new ledger's): the
+            // stand-in must encode an IRI as the ledger does.
             inline_snapshot = fluree_db_core::LedgerSnapshot::genesis_with_split_mode(
                 base.ledger_id(),
                 base.snapshot.ns_split_mode(),
