@@ -53,6 +53,7 @@ impl StatsIriEncoder {
                     .collect(),
             ),
             split_mode,
+            table_full: false,
         }
     }
 
