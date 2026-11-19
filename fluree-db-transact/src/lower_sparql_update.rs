@@ -481,7 +481,7 @@ fn expand_annotated_triples_in_quad_pattern(
 }
 
 /// Reject any user-authored `f:reifies*` predicate in a triple list.
-/// Mirrors the JSON-LD path's `run_user_authored_reifies_firewall`. The
+/// Mirrors the JSON-LD path's `refuse_reserved_predicate`. The
 /// expansion pass synthesizes legitimate `f:reifies*` triples; this
 /// firewall rejects ones the user wrote directly.
 ///
@@ -729,6 +729,18 @@ pub fn lower_sparql_update_request(
             ns,
             opts.clone(),
         )?);
+    }
+    // Every operation is lowered before the first one stages, and staging
+    // can register a namespace (an IRI bound in WHERE and then written).
+    // Each operation carries the whole request's lowered namespaces, so the
+    // first to stage takes every code the lowering gave out, and a namespace
+    // registered while staging gets the next free code instead of one a
+    // later operation already holds.
+    if txns.len() > 1 {
+        let request_delta = ns.delta();
+        for txn in &mut txns {
+            txn.namespace_delta.clone_from(request_delta);
+        }
     }
     Ok(txns)
 }

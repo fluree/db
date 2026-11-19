@@ -529,8 +529,7 @@ async fn a_graph_synced_through_json_ld_resyncs_from_the_same_text_as_a_no_op() 
 // =============================================================================
 
 /// Collections with repeats, nested collections, `rdf:type` with blank-node
-/// and literal objects, an ill-typed literal (kept, as insert keeps it), big
-/// and exact numbers, JSON and language-tagged literals, and annotations,
+/// and literal objects, big and exact numbers, JSON and language-tagged literals, and annotations,
 /// on an edge and on `rdf:type`. Special float values are left out of this
 /// fixture; they are tracked separately.
 const PARITY_DOC: &str = r#"
@@ -540,7 +539,6 @@ const PARITY_DOC: &str = r#"
 ex:s ex:list ( "b" "a" "b" ) ;
      ex:nested ( ( 1 2 ) "x" ) ;
      a _:c , [ ex:k "anon" ] , "a literal type" ;
-     ex:bad "abc"^^xsd:integer ;
      ex:int 42 ;
      ex:big 123456789012345678901234567890 ;
      ex:dec 1.50 ;

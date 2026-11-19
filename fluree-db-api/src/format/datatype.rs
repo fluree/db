@@ -8,10 +8,29 @@ pub use fluree_vocab::fluree;
 pub use fluree_vocab::rdf;
 pub use fluree_vocab::xsd;
 
+use fluree_db_core::FlakeValue;
+use serde_json::{json, Value as JsonValue};
+
 /// JSON-LD internal types
 pub mod jsonld {
     /// @json - JSON literal
     pub const JSON: &str = "@json";
+}
+
+/// The JSON document an `rdf:JSON` literal stored as `text` holds, for an
+/// output that writes a JSON literal as JSON. `None` when the text is not
+/// JSON: bulk import keeps such a literal as written, and an output writes it
+/// with [`ill_typed_json_literal`] rather than failing on it.
+pub fn json_document(text: &str) -> Option<JsonValue> {
+    serde_json::from_str(text).ok()
+}
+
+/// How a JSON-LD-flavored output writes an `rdf:JSON` literal whose text is
+/// not JSON: as the typed literal it is, `{"@value": text, "@type": <rdf:JSON
+/// IRI>}`, the way it writes any other ill-typed literal. Never `@json`,
+/// which declares the `@value` to be a JSON value.
+pub fn ill_typed_json_literal(text: &str) -> JsonValue {
+    json!({"@value": text, "@type": rdf::JSON})
 }
 
 /// Check if a datatype is "inferable" from the JSON value.
@@ -46,6 +65,20 @@ pub fn is_inferable_datatype(dt_iri: &str) -> bool {
             | "xsd:decimal"
             | "f:embeddingVector"
     )
+}
+
+/// Whether a JSON-LD-flavored output may print `val` bare, without its
+/// `@type`.
+///
+/// [`is_inferable_datatype`] says the datatype can be recovered from the JSON
+/// kind the value prints as, and that holds only when the value really prints
+/// as that kind. A string-backed value prints as a JSON string, which reads
+/// back as `xsd:string`; under any other datatype it is an ill-typed literal
+/// a write stored before writes refused them (`"landed"^^xsd:integer`), and it
+/// keeps its `@type` so it is not read back as a plain string.
+pub fn may_print_bare(dt_iri: &str, val: &FlakeValue) -> bool {
+    is_inferable_datatype(dt_iri)
+        && (!matches!(val, FlakeValue::String(_)) || matches!(dt_iri, xsd::STRING | "xsd:string"))
 }
 
 /// Whether a literal may be serialized without its `datatype`.

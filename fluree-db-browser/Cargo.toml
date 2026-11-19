@@ -75,7 +75,8 @@ web-sys = { version = "0.3", features = [
 wasm-bindgen-test = "0.3"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
-tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync", "time"] }
+tempfile = "3"
 # For the end-to-end proof that the engine's landed retry primitives
 # (RetryBudget / fetch_wants) drive this storage through the real
 # StorageContentStore bridge.

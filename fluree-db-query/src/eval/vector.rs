@@ -111,6 +111,7 @@ fn resolve_vector_arg<'a, R: RowAccess>(
                 p_id,
                 dt_id,
                 lang_id,
+                arena_g_id,
                 ..
             }) => {
                 // Indexed vector fast path: borrow the packed f32 shard data
@@ -128,9 +129,9 @@ fn resolve_vector_arg<'a, R: RowAccess>(
                         }
                     }
                 }
-                let Some(decoded) = ctx
-                    .and_then(|c| c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id))
-                else {
+                let Some(decoded) = ctx.and_then(|c| {
+                    c.decode_encoded_value(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
+                }) else {
                     return Ok(None);
                 };
                 match decoded {

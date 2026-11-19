@@ -44,16 +44,15 @@
 //! - Reifiers attached to triple-term values, list elements, etc. →
 //!   error.
 //!
-//! After lowering, the document additionally goes through a write-
-//! surface firewall pass that rejects any user-authored `f:reifies*`
-//! IRI (full or compact). This pre-lowering scan is run before the
-//! lowering itself, so the firewall doesn't block the IRIs that this
-//! module emits.
+//! A user-authored `f:reifies*` predicate is refused by the IRI the
+//! expander resolves ([`refuse_reserved_iris`]), on the document as
+//! written rather than the lowered copy, so the IRIs this module emits
+//! are not flagged.
 
 use crate::error::{Result, TransactError};
 use fluree_graph_json_ld::{
-    classify_graph_value, expand_iri, is_graph_key, parse_context, GraphValue, ParsedContext,
-    TypeValue,
+    classify_graph_value, expand_with_context_policy, is_graph_key, parse_context, GraphValue,
+    ParsedContext, TypeValue,
 };
 use fluree_vocab::{rdf, reifies_iris};
 use serde_json::{json, Map, Value};
@@ -388,59 +387,26 @@ impl LowerCtx {
 /// labels that start with it.
 const ANN_BLANK_PREFIX: &str = "_:fluree_ann_";
 
-/// Reject any user-authored `f:reifies*` IRI before lowering runs, so
-/// the firewall doesn't fire on the IRIs that this module
-/// synthesizes.
-///
-/// Resolves compact-IRI forms (e.g. `f:reifiesSubject` with
-/// `"f": "https://ns.flur.ee/db#"` in `@context`) through the
-/// document's `@context` before checking. Without this, a user could
-/// bypass the firewall by writing the compact form and having
-/// expansion silently introduce system facts.
-///
-/// The walker maintains a stack of merged contexts so per-node
-/// `@context` overrides are honored. When a key has no `@context`
-/// resolution and isn't already a full IRI, it's left untouched —
-/// downstream JSON-LD expansion will fail or treat it as a plain
-/// string, neither of which can produce a reserved-predicate flake.
-fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Result<()> {
-    match value {
+/// Refuse a statement written under a reserved predicate (`f:reifies*`) in
+/// an expanded document. Every key there is the IRI the parser writes,
+/// resolved by the expander's own rules (scoped contexts included), so the
+/// check reads exactly what would be stored. It runs on the document as
+/// written, before the lowering adds the statements it synthesizes. A
+/// `@json` literal's payload is opaque and is not read. A blank-node label
+/// in the prefix the lowering reserves is refused too: that node would merge
+/// with an annotation node.
+pub(crate) fn refuse_reserved_iris(expanded: &Value) -> Result<()> {
+    match expanded {
         Value::Object(map) => {
-            // Merge any per-node `@context` into the inherited one.
-            let merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
-                Some(
-                    fluree_graph_json_ld::parse_context_with_base(context, local_ctx).map_err(
-                        |e| {
-                            TransactError::Parse(format!(
-                                "failed to parse nested @context during firewall scan: {e}"
-                            ))
-                        },
-                    )?,
-                )
-            } else {
-                None
-            };
-            let effective = merged.as_ref().unwrap_or(context);
-
-            // A `@json` literal's payload never becomes triples — it is
-            // serialized whole into a single `rdf:JSON` flake value — so
-            // no key inside it can carry a system predicate into the
-            // store, and the firewall has nothing to guard there. See
-            // [`opaque_subtree`].
-            let opaque = opaque_subtree(map, Some(effective));
-
+            let json_literal = map
+                .get("@type")
+                .and_then(Value::as_str)
+                .is_some_and(|t| t == "@json" || t == rdf::JSON);
             for (k, v) in map {
-                // `@context` is structural, not a predicate.
-                if k == "@context" {
+                if k == "@value" && json_literal {
                     continue;
                 }
-                if opaque && k == "@value" {
-                    continue;
-                }
-                // The lowering labels anonymous annotation nodes with a
-                // reserved prefix; a user node with such a label would merge
-                // with one of them.
-                if k == "@id" || *k == effective.id_key {
+                if k == "@id" {
                     if let Some(label) = v.as_str().filter(|s| s.starts_with(ANN_BLANK_PREFIX)) {
                         return Err(TransactError::Parse(format!(
                             "blank-node label {label:?} uses the prefix {ANN_BLANK_PREFIX:?}, \
@@ -448,28 +414,49 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
                         )));
                     }
                 }
-                let expanded_key = if k.starts_with('@') {
-                    k.clone()
-                } else {
-                    expand_iri(k, effective)
-                };
-                if reifies_iris::ALL.iter().any(|iri| *iri == expanded_key) {
-                    return Err(TransactError::UnsupportedFeature(format!(
-                        "'{k}' resolves to a system-controlled predicate '{expanded_key}'; \
-                         use @annotation or @reifies instead"
-                    )));
-                }
-                scan_user_authored_reifies_iris(v, effective)?;
+                refuse_reserved_predicate(k)?;
+                refuse_reserved_iris(v)?;
             }
         }
         Value::Array(items) => {
             for item in items {
-                scan_user_authored_reifies_iris(item, context)?;
+                refuse_reserved_iris(item)?;
             }
         }
         _ => {}
     }
     Ok(())
+}
+
+/// Refuse `iri` as a predicate a user writes: the `f:reifies*` predicates
+/// are written only through `@annotation` and `@reifies`.
+pub(crate) fn refuse_reserved_predicate(iri: &str) -> Result<()> {
+    if reifies_iris::ALL.contains(&iri) {
+        return Err(TransactError::UnsupportedFeature(format!(
+            "'{iri}' is a system-controlled predicate; use @annotation or @reifies instead"
+        )));
+    }
+    Ok(())
+}
+
+/// [`refuse_reserved_iris`] over the data a document holds before any
+/// lowering, expanded against `context`, the parser's: an update's `insert`,
+/// `delete` and `upsert` clauses when `clauses` is set (the caller knows the
+/// transaction is an update), and otherwise the whole document.
+pub(crate) fn refuse_reserved_iris_in_document(
+    doc: &Value,
+    context: &ParsedContext,
+    clauses: bool,
+) -> Result<()> {
+    if clauses {
+        for clause in ["insert", "delete", "upsert"] {
+            if let Some(value) = doc.get(clause) {
+                refuse_reserved_iris(&expand_with_context_policy(value, context, false)?)?;
+            }
+        }
+        return Ok(());
+    }
+    refuse_reserved_iris(&expand_with_context_policy(doc, context, false)?)
 }
 
 /// Top-level entry point. Walks `doc` and rewrites all
@@ -482,24 +469,26 @@ fn scan_user_authored_reifies_iris(value: &Value, context: &ParsedContext) -> Re
 /// The document keeps its shape.
 pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
     let top_ctx = top_level_context(doc)?;
-    scan_user_authored_reifies_iris(doc, &top_ctx)?;
     // Test / external callers that don't carry transaction options
     // default to RDF mode (empty `@annotation: {}` is a no-op).
-    lower_edge_annotations_after_firewall(doc, &top_ctx, false)
+    let clauses = doc.as_object().is_some_and(is_transaction_wrapper);
+    if let Err(refused) = refuse_reserved_iris_in_document(doc, &top_ctx, clauses) {
+        lower_edge_annotations_unchecked(doc, &top_ctx, false)?;
+        return Err(refused);
+    }
+    lower_edge_annotations_unchecked(doc, &top_ctx, false)
 }
 
-/// Same as [`lower_edge_annotations`] minus the firewall scan.
-///
-/// Use this when the caller has already run the firewall on the
-/// original (pre-rewritten) document — e.g. when chaining the
-/// `delete`-clause pre-pass before the standard lowering. Both
-/// passes synthesize `f:reifies*` IRIs internally; running the
-/// firewall a second time would falsely flag those.
+/// Same as [`lower_edge_annotations`] without its reserved-predicate check,
+/// for a caller that checks the document as written itself: the transaction
+/// parser and bulk import do, after this lowering, so a document the
+/// lowering refuses keeps the lowering's reason. The lowering synthesizes
+/// `f:reifies*` IRIs, which a check of the lowered copy would flag.
 ///
 /// `lpg_mode` controls the empty-block contract: `false` (RDF
 /// default) makes `@annotation: {}` a no-op; `true` mints a fresh
 /// property-less annotation subject (Cypher relationship identity).
-pub fn lower_edge_annotations_after_firewall(
+pub fn lower_edge_annotations_unchecked(
     doc: &mut Value,
     top_ctx: &ParsedContext,
     lpg_mode: bool,
@@ -523,14 +512,6 @@ pub fn top_level_context(doc: &Value) -> Result<ParsedContext> {
         .transpose()
         .map_err(|e| TransactError::Parse(format!("failed to parse @context: {e}")))?
         .unwrap_or_else(ParsedContext::new))
-}
-
-/// Run the user-authored `f:reifies*` firewall against the ORIGINAL
-/// document, before any lowering pass runs. Exposed for the
-/// transactor's two-pass dispatch (delete-clause pre-pass + standard
-/// lowering) so the firewall fires once on the user's input.
-pub fn run_user_authored_reifies_firewall(doc: &Value, top_ctx: &ParsedContext) -> Result<()> {
-    scan_user_authored_reifies_iris(doc, top_ctx)
 }
 
 /// Cheap read-only check for whether `doc` contains any `@annotation` /
@@ -915,7 +896,7 @@ fn walk_delete_for_annotations(
                             subject: parent_id.as_deref().unwrap_or_default(),
                         },
                         parent_id.is_some(),
-                        &key,
+                        &edge_predicate(&key, effective_ctx),
                         value,
                         effective_ctx,
                         effective_graph,
@@ -951,7 +932,7 @@ fn walk_delete_for_annotations(
                                         object: parent_id.as_deref().unwrap_or_default(),
                                     },
                                     parent_id.is_some(),
-                                    property,
+                                    &edge_predicate(property, effective_ctx),
                                     values,
                                     effective_ctx,
                                     effective_graph,
@@ -1243,8 +1224,8 @@ fn build_annotation_delete(
         // `@reifies` shape because the standard lowering walker
         // rejects `@reifies` outside its query-side context, while
         // `f:reifies*` IRIs are accepted as ordinary IRIs (the
-        // user-authored-reifies firewall has already run against the
-        // original doc, so our synthesized ones aren't re-scanned).
+        // reserved-predicate check reads the document as written, not
+        // this lowered copy, so the synthesized ones aren't flagged).
         // The JSON-LD-Q query parser still resolves `f:reifies*`
         // triple patterns into the same indexed lookups as
         // `@reifies` would.
@@ -1734,9 +1715,8 @@ fn lower_object_with_subject(
     // [`opaque_subtree`]); there is deliberately no `@json` branch
     // here. A wrapper may declare the alias it is typed with, so
     // merge its own `@context` first — the walker's merge below is
-    // past this return. An unparseable one is an error everywhere
-    // else in this module, and the firewall scan has already rejected
-    // it by the time we get here.
+    // past this return. An unparseable one is an error here, as
+    // everywhere else in this module.
     if is_jsonld_value_object(map) {
         let wrapper_ctx: Option<ParsedContext> = match map.get("@context") {
             Some(local_ctx) => Some(
@@ -1787,8 +1767,8 @@ fn lower_object_with_subject(
     // expansion time but be invisible to
     // `reject_context_coercion_on_annotated_literal`, allowing the
     // base flake's `EdgeKey` to diverge from the synthesized
-    // `f:reifies*` bundle. Mirrors the firewall scanner's context
-    // merge logic.
+    // `f:reifies*` bundle. Merged into the inherited context, as the
+    // expander merges a node's own `@context`.
     let local_merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
         Some(
             fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(
@@ -1959,7 +1939,7 @@ fn lower_object_with_subject(
                         let direction = Direction::Reverse { object: &node_id };
                         intercept_annotations_for_edges(
                             direction,
-                            property,
+                            &edge_predicate(property, effective_json_ld),
                             values,
                             &child_walk,
                             ctx,
@@ -1984,7 +1964,7 @@ fn lower_object_with_subject(
                 let direction = Direction::Forward { subject: &node_id };
                 intercept_annotations_for_edges(
                     direction,
-                    &key,
+                    &edge_predicate(&key, effective_json_ld),
                     value,
                     &child_walk,
                     ctx,
@@ -2026,6 +2006,15 @@ enum EdgeKey<'a> {
 
 /// Classify `key` against `ctx`. Shared by the insert and delete walkers, so
 /// both read a key the same way the expander does.
+/// The IRI the expander resolves a property key to (a term, a prefix, then
+/// `@vocab`), for the reifier to name the predicate its edge is written
+/// under: written as the key, a relative key resolved by `@vocab` would
+/// name a relative IRI. A key none of those resolves is left as written,
+/// for the reifier's `@id` to resolve against `@base` as before.
+fn edge_predicate(key: &str, ctx: &ParsedContext) -> String {
+    fluree_graph_json_ld::expand_iri_with_vocab(key, ctx, true)
+}
+
 fn classify_edge_key<'a>(key: &'a str, ctx: &'a ParsedContext) -> EdgeKey<'a> {
     if key.starts_with('@') {
         return EdgeKey::Keyword(key);
@@ -2924,9 +2913,10 @@ mod tests {
             sibling.get(reifies_iris::SUBJECT).unwrap(),
             &json!({"@id": "ex:alice"})
         );
+        // The predicate as the expander resolves the edge's key.
         assert_eq!(
             sibling.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"@id": "ex:worksFor"})
+            &json!({"@id": "http://example.org/worksFor"})
         );
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),

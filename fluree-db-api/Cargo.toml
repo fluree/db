@@ -16,7 +16,7 @@ aws = ["fluree-db-connection/aws", "dep:fluree-db-storage-aws", "dep:aws-sdk-sts
 # Iceberg / R2RML graph source support (pulls in AWS SDK + native deps). The
 # Arrow columnar reader is the single graph-source read path (native predicate
 # pushdown: row-group skipping + exact row filtering).
-iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws"]
+iceberg = ["dep:fluree-db-iceberg", "fluree-db-iceberg/aws", "dep:tokio-util"]
 # SQL graph sources (R2RML over a Trino-protocol endpoint). Stacks on `iceberg`
 # because the graph-source provider dispatch lives there; the crate itself adds
 # only an HTTP client, no database drivers.
@@ -76,6 +76,8 @@ fluree-db-sparql = { path = "../fluree-db-sparql" }
 fluree-db-cypher = { path = "../fluree-db-cypher" }
 fluree-db-graphql = { path = "../fluree-db-graphql", optional = true }
 fluree-db-iceberg = { path = "../fluree-db-iceberg", default-features = false, optional = true, features = ["aws"] }
+# `AbortOnDropHandle` for an Iceberg scan's per-file reads (`r2rml::read_files_in_order`).
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 fluree-db-r2rml = { path = "../fluree-db-r2rml", features = ["turtle"] }
 fluree-db-sql = { path = "../fluree-db-sql", optional = true }
 fluree-db-delta = { path = "../fluree-db-delta", optional = true }
@@ -109,6 +111,9 @@ sha2.workspace = true
 tracing.workspace = true
 # Used for fast xxh3_128 hashing in streaming dictionary merge.
 xxhash-rust.workspace = true
+# The query-result cache seeds its key hash per pool (wasm randomness is
+# unified in fluree-db-core).
+uuid = { version = "1", features = ["v4"] }
 # Base64 for encryption key decoding
 base64 = "0.22"
 hex.workspace = true
@@ -168,7 +173,7 @@ apache-avro = { workspace = true }
 # (it_residency_retry): dev-only feature unification — production native
 # builds keep the feature off and compile the pre-residency read path.
 fluree-db-query = { path = "../fluree-db-query", features = ["residency"] }
-fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency"] }
+fluree-db-binary-index = { path = "../fluree-db-binary-index", features = ["residency", "test-counters"] }
 # WAL background-thread hooks for the flush-count tests (it_wal): dev-only,
 # so production builds do not compile them.
 fluree-db-core = { path = "../fluree-db-core", features = ["test-hooks"] }
@@ -245,6 +250,14 @@ required-features = ["iceberg", "native"]
 [[test]]
 name = "it_iceberg_policy"
 path = "tests/it_iceberg_policy.rs"
+required-features = ["iceberg", "native"]
+
+# A class-targeted view policy over an R2RML source is decided on every class
+# the subject holds, checked against a native ledger under the same policy.
+# Own binary: it flips the process-wide fast-path switch.
+[[test]]
+name = "it_r2rml_class_policy"
+path = "tests/it_r2rml_class_policy.rs"
 required-features = ["iceberg", "native"]
 
 # Patterns over tables whose rows mint the same triple more than once answer
@@ -496,6 +509,19 @@ path = "tests/it_count_star_row_multiplicity.rs"
 name = "it_topk_large_limit_offset"
 path = "tests/it_topk_large_limit_offset.rs"
 
+# Own binary: fixture A and the scope matrix of the multigraph lanes. It
+# toggles the process-global fast-path kill switch and asserts fast-path
+# routing, so it must not share a process with either.
+[[test]]
+name = "it_multigraph_lanes"
+path = "tests/it_multigraph_lanes.rs"
+
+# Own binary: asserts the index-scope stamp through thread-scoped tracing
+# capture, which misses events while other tests set and drop their own.
+[[test]]
+name = "it_index_scope"
+path = "tests/it_index_scope.rs"
+
 # Own binary: toggles the process-global fast-path kill switch AND asserts
 # fast-path routing, so it must not share a process with either.
 [[test]]
@@ -510,6 +536,12 @@ path = "tests/it_grouped_projection_lanes.rs"
 [[test]]
 name = "it_cyclic_bgp_novelty_pred"
 path = "tests/it_cyclic_bgp_novelty_pred.rs"
+
+# Own binary: switches the cyclic lane off through FLUREE_CYCLIC_BGP, a
+# process-global env var, for its oracle runs.
+[[test]]
+name = "it_cyclic_bgp_multiplicity"
+path = "tests/it_cyclic_bgp_multiplicity.rs"
 
 [[test]]
 name = "it_cyclic_bgp_probe"
@@ -892,6 +924,33 @@ required-features = ["native"]
 [[test]]
 name = "it_fast_stats_1391_regression"
 path = "tests/it_fast_stats_1391_regression.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch.
+[[test]]
+name = "it_union_annotation_chain"
+path = "tests/it_union_annotation_chain.rs"
+required-features = ["native"]
+
+# Standalone (NOT in a grp_ bin): toggles the process-global fast-path kill
+# switch AND asserts string-bound seek routing via span capture.
+[[test]]
+name = "it_string_filter_pushdown"
+path = "tests/it_string_filter_pushdown.rs"
+required-features = ["native"]
+
+# Own binary: toggles the process-global fast-path kill switch AND asserts
+# the typed string-bound seek's routing via span capture.
+[[test]]
+name = "it_typed_filter_pushdown"
+path = "tests/it_typed_filter_pushdown.rs"
+required-features = ["native"]
+
+# Own binary: asserts fast-path routing via span capture.
+[[test]]
+name = "it_fast_path_fuel"
+path = "tests/it_fast_path_fuel.rs"
 required-features = ["native"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
