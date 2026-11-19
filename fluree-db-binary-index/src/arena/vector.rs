@@ -564,6 +564,7 @@ pub struct LazyVectorArena {
 /// Holds an `Arc<VectorShard>` to keep the shard alive while the caller
 /// reads the slice. Dropping the `VectorSlice` releases the Arc reference
 /// (the shard stays in cache if still referenced there).
+#[derive(Clone)]
 pub struct VectorSlice {
     shard: Arc<VectorShard>,
     offset: u32,
@@ -579,6 +580,22 @@ impl std::fmt::Debug for VectorSlice {
 }
 
 impl VectorSlice {
+    /// The vector at `offset` of `shard`; `None` past the shard's count.
+    pub fn new(shard: Arc<VectorShard>, offset: u32) -> Option<Self> {
+        shard.get_f32(offset)?;
+        Some(Self { shard, offset })
+    }
+
+    /// Whether `self` and `other` read one loaded copy of a shard.
+    pub fn same_shard(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shard, &other.shard)
+    }
+
+    /// Whether `self` and `other` are one vector of one loaded shard.
+    pub fn same_slot(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shard, &other.shard) && self.offset == other.offset
+    }
+
     /// Borrow the f32 slice for this vector.
     #[inline]
     pub fn as_f32(&self) -> &[f32] {
@@ -652,6 +669,23 @@ impl LazyVectorArena {
     /// Number of shards backing this arena.
     pub fn shard_count(&self) -> usize {
         self.shard_sources.len()
+    }
+
+    /// The shard index holding `handle` and the handle's offset within it,
+    /// without loading anything; `None` out of range. With [`Self::shard`],
+    /// for a caller that keeps shards across many lookups instead of paying
+    /// [`Self::lookup_vector`]'s cache probe per handle.
+    pub fn shard_of(&self, handle: u32) -> Option<(usize, u32)> {
+        if handle >= self.manifest.total_count || self.manifest.shard_capacity == 0 {
+            return None;
+        }
+        let cap = self.manifest.shard_capacity;
+        Some(((handle / cap) as usize, handle % cap))
+    }
+
+    /// Shard `shard_idx`, loaded through the cache.
+    pub fn shard(&self, shard_idx: usize) -> io::Result<Arc<VectorShard>> {
+        self.load_shard_cached(shard_idx)
     }
 
     // ========================================================================
@@ -949,7 +983,7 @@ impl LazyVectorArena {
 // ============================================================================
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -1163,14 +1197,19 @@ mod tests {
 
     /// The store every test arena reads its shards from. Content-addressed,
     /// so tests sharing it never collide.
-    fn test_store() -> Arc<dyn fluree_db_core::ContentStore> {
+    pub(crate) fn test_store() -> Arc<dyn fluree_db_core::ContentStore> {
         static STORE: std::sync::OnceLock<Arc<fluree_db_core::MemoryContentStore>> =
             std::sync::OnceLock::new();
         Arc::clone(STORE.get_or_init(Default::default)) as Arc<dyn fluree_db_core::ContentStore>
     }
 
     /// Helper: store a VAS1 shard and return a ShardSource for it.
-    fn write_test_shard(_dir: &Path, _name: &str, dims: u16, vectors: &[&[f32]]) -> ShardSource {
+    pub(crate) fn write_test_shard(
+        _dir: &Path,
+        _name: &str,
+        dims: u16,
+        vectors: &[&[f32]],
+    ) -> ShardSource {
         use fluree_db_core::ContentStore;
         let mut flat: Vec<f32> = Vec::new();
         for v in vectors {
@@ -1189,7 +1228,7 @@ mod tests {
     }
 
     /// Helper: create a LazyVectorArena from test shards.
-    fn make_lazy_arena(
+    pub(crate) fn make_lazy_arena(
         manifest: VectorManifest,
         shard_sources: Vec<ShardSource>,
     ) -> LazyVectorArena {

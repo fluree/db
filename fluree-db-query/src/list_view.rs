@@ -252,6 +252,23 @@ impl ListView {
         })))
     }
 
+    /// A view of one ledger whose list members are on `predicates`, for
+    /// planning tests.
+    #[cfg(test)]
+    pub(crate) fn of_predicates(predicates: impl IntoIterator<Item = Sid>) -> Arc<Self> {
+        Arc::new(Self {
+            predicate_ids: None,
+            primary: (
+                LedgerId::parse("lists:main").expect("a valid ledger id"),
+                Some(predicates.into_iter().collect()),
+            ),
+            others: Vec::new(),
+            lists: Mutex::new(ListTable::default()),
+            reads: Mutex::new(HashMap::new()),
+            subjects: Mutex::new(HashMap::new()),
+        })
+    }
+
     /// Which ledger of the view `snapshot` is of (see [`Self::primary`]);
     /// past them for a ledger it was not built over, whose predicates are
     /// not known.

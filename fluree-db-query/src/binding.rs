@@ -262,11 +262,11 @@ pub enum Binding {
 }
 
 /// Whether an encoded literal of kind `o_kind` is a handle into a per-graph,
-/// per-predicate arena (a big number or a vector).
+/// per-predicate arena (a big number or a vector):
+/// [`ObjKind::is_arena_handle`](fluree_db_core::ObjKind::is_arena_handle).
 #[inline]
 pub(crate) fn is_arena_kind(o_kind: u8) -> bool {
-    o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8()
-        || o_kind == fluree_db_core::ObjKind::VECTOR_ID.as_u8()
+    fluree_db_core::ObjKind::from_u8(o_kind).is_arena_handle()
 }
 
 // `Binding` is cloned on nearly every join/sort/materialize step, so its size is

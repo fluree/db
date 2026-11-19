@@ -2307,6 +2307,90 @@ async fn cyclic_union_lane_declines_arena_objects() {
     failures.assert_none();
 }
 
+/// On one graph the cyclic join keys a big-number object within its
+/// predicate: the arena holds each value under one handle, so where every
+/// edge binding the object reads that predicate, equal values are equal
+/// keys and the lane runs. Two predicates' handles name no value across
+/// them (each arena numbers its own from 0), so an object two predicates
+/// bind declines the lane under `arena-literal-object`, and the general plan
+/// matches by value: an unequal pair whose handles coincide stays apart, and
+/// an equal pair is found.
+#[tokio::test(flavor = "current_thread")]
+async fn cyclic_lane_keys_big_numbers_within_one_predicate() {
+    let trig = r"
+        @prefix ex: <http://example.org/> .
+        GRAPH <urn:g1> {
+          ex:a ex:p 123456789012345678901234567890 ; ex:link ex:b .
+          ex:b ex:p 123456789012345678901234567890 ;
+               ex:q 999999999999999999999999999999 ;
+               ex:r 123456789012345678901234567890 .
+        }
+    ";
+    let (fluree, handle) = indexed_trig_ledger("it/cyclic-lane-big-number:main", trig).await;
+    let _switch = crate::support::FAST_PATH_SWITCH.read().await;
+    let triangle = |p: &str, q: &str| {
+        format!(
+            "{PREFIXES}SELECT ?a ?b FROM <urn:g1> \
+             WHERE {{ ?a ex:{p} ?v . ?b ex:{q} ?v . ?a ex:link ?b }}"
+        )
+    };
+    // (label, query, the answer, the outcome `cyclic_bgp` stamps, whether the
+    // join bails on the arena literal)
+    let cases = [
+        (
+            "one predicate",
+            triangle("p", "p"),
+            rows(&[&["a", "b"]]),
+            "proceed",
+            false,
+        ),
+        (
+            "two predicates, unequal values under one handle",
+            triangle("p", "q"),
+            rows(&[]),
+            "fallback:gate_declined",
+            true,
+        ),
+        (
+            "two predicates, one value",
+            triangle("p", "r"),
+            rows(&[&["a", "b"]]),
+            "fallback:gate_declined",
+            true,
+        ),
+    ];
+    let mut failures = Failures::default();
+    for (label, query, want, outcome, bails) in cases {
+        let (store, _guard) = init_test_tracing();
+        let before = store.all_events().len();
+        match db(&handle)
+            .await
+            .query(&fluree)
+            .sparql(&query)
+            .execute_formatted()
+            .await
+        {
+            Ok(json) => failures.eq(sparql_rows(&json, &["a", "b"]), want, label),
+            Err(e) => failures.0.push(format!("{label}: query failed: {e}")),
+        }
+        failures.eq(
+            stamps(&store, before, "cyclic_bgp"),
+            vec![outcome.to_string()],
+            &format!("{label}: `cyclic_bgp` stamps"),
+        );
+        let bailed = store.all_events()[before..].iter().any(|e| {
+            e.message() == "cyclic bgp fast path bail"
+                && e.fields.get("reason").map(String::as_str) == Some("arena-literal-object")
+        });
+        failures.eq(
+            bailed,
+            bails,
+            &format!("{label}: arena-literal-object bail"),
+        );
+    }
+    failures.assert_none();
+}
+
 /// The two sites of the EXISTS semijoin cache, and whether each must run.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum ExistsLane {

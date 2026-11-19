@@ -1283,7 +1283,8 @@ pub fn count_distinct_position_operator(
                 // and so is not an object identity for a NumBig arena handle.
                 // Those terms are counted exactly from the in-memory arenas
                 // (see `count_distinct_numbig_objects`); declining is reserved
-                // for an inconsistent index or the explicit kill switch.
+                // for a graph holding vectors, an inconsistent index or the
+                // explicit kill switch.
                 DistinctPosition::Objects => {
                     let Some(count) = count_distinct_objects(store, ctx.binary_g_id, &ctx.tracker)?
                     else {
@@ -1372,14 +1373,23 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// its distinct terms come from [`count_distinct_numbig_objects`], which reads
 /// the arenas rather than the rows.
 ///
-/// The per-predicate distinct-object count is unaffected and stays on its fast
-/// path: its 14-byte POST lead starts with `p_id`, which scopes the handle
-/// correctly. So is the distinct-subject count, whose SPOT lead is `s_id`.
+/// A graph that holds vectors declines: a vector's `o_key` is a handle into a
+/// per-predicate arena that does not deduplicate, so neither the lead nor the
+/// arena's size counts its distinct values
+/// ([`OType::o_key_is_predicate_identifying`]).
+///
+/// The per-predicate distinct-object count stays on its fast path for every
+/// other predicate: its 14-byte POST lead starts with `p_id`, which scopes a
+/// NumBig handle correctly. So is the distinct-subject count, whose SPOT lead
+/// is `s_id`.
 pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
+    if store.graph_holds_vectors(g_id) {
+        return Ok(None);
+    }
     let Some(walk) =
         count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, true, tracker)?
     else {
@@ -1814,12 +1824,24 @@ fn leaflet_may_hold_non_identifying_o_key(
 
 /// Count distinct objects `(o_type, o_key)` for one predicate from POST
 /// leaflet directories only: a POST group is the predicate and the object.
+///
+/// `None` where one value can sit under several keys
+/// ([`BinaryIndexStore::objects_keyed_by_value`]): a vector arena gives every
+/// stored fact its own handle (unless it holds no value twice), and a legacy
+/// decimal arena gives each scale variant one, so the lead groups would count
+/// keys rather than values.
 pub(crate) fn count_distinct_objects_for_predicate(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
+    if !store
+        .objects_keyed_by_value(g_id, p_id)
+        .map_err(|e| QueryError::from_io("vector arena proof", e))?
+    {
+        return Ok(None);
+    }
     count_lead_groups_for_predicate(store, g_id, p_id, RunSortOrder::Post, tracker)
 }
 
