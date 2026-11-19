@@ -9,7 +9,8 @@ name: npm release
 #
 # Publishing uses npm trusted publishing: npm trusts this workflow, run in the
 # `npm` environment, so no token is stored. A package's first publish predates
-# that trust; NPM_TOKEN covers it and is removed afterwards. Only a tag push
+# that trust; NPM_TOKEN covers it and is removed afterwards (the order matters:
+# docs/contributing/releasing.md, "One-time npm setup"). Only a tag push
 # publishes, and only when the tag names the workspace version. Run it by hand
 # (workflow_dispatch) to build and smoke the packages without publishing.
 on:
