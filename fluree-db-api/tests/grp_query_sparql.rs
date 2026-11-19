@@ -28,6 +28,8 @@ mod it_issue_1721_repro;
 mod it_issue_1723_sameterm_fold;
 #[path = "it_issue_1738_scan_narrowing.rs"]
 mod it_issue_1738_scan_narrowing;
+#[path = "it_issue_2385_filter_const_per_branch.rs"]
+mod it_issue_2385_filter_const_per_branch;
 #[path = "it_property_join_filters.rs"]
 mod it_property_join_filters;
 #[path = "it_query_ask.rs"]
