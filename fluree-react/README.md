@@ -146,7 +146,7 @@ Everything above, plus:
 | --- | --- |
 | `--storage-proxy-enabled` | The in-browser engine reads ledger heads and index blocks through `/v1/fluree/storage/*`. Off by default; without it every request 401s with *"Token lacks storage proxy permissions"*. |
 | `--storage-proxy-trusted-issuer <did:key>` | The proxy trusts only issuers named here (it falls back to `--events-auth-trusted-issuer`). |
-| A bearer token carrying **`fluree.storage.all`** or **`fluree.storage.ledgers`** | The storage proxy requires `fluree.storage.*` claims specifically; **`fluree.events.*` is not sufficient**. `fluree token create --storage-ledger <alias>` mints one (`--all` for every ledger) — see `docs/cli/token.md`. |
+| A bearer token carrying **`fluree.storage.all`** or **`fluree.storage.ledgers`** | The storage proxy requires `fluree.storage.*` claims specifically; **`fluree.events.*` is not sufficient**. `fluree token create --storage-ledger <alias>` mints one (repeat the flag per ledger). Avoid `--all` for a token a browser holds: it also grants read and write on every ledger. See `docs/cli/token.md`. |
 | `@fluree/db-wasm` | `npm install @fluree/db-wasm`, and pass its `connect` as `peer.connect`. From a checkout: `cd fluree-db-wasm/js && npm install && node scripts/build.mjs` writes `js/pkg/`. |
 | A bundler allowed to read it | In a monorepo, Vite's dev server refuses paths outside the project root: set `server.fs.allow`. The symptom is `engine_crashed` with an **empty page console**, because the failure is inside the worker. |
 
