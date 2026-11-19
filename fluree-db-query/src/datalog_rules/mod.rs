@@ -24,6 +24,7 @@ mod delta;
 mod dependency;
 mod execute;
 mod explain;
+mod inputs;
 mod parse;
 mod validate;
 
@@ -38,6 +39,7 @@ pub(crate) use explain::{explain_facts, materialized_facts};
 pub use explain::{
     Absence, Derivation, ExplainTarget, ExplainedFact, Explanation, GroupInputs, Premise,
 };
+pub use inputs::{refuse_unreadable_inputs, RuleInputScope};
 pub use parse::parse_query_time_rule;
 
 use crate::error::{QueryError, Result};

@@ -338,9 +338,20 @@ Rejected:
 - **`LIMIT` / `OFFSET`**, on the body or on a subquery inside it: which
   solutions a slice keeps depends on how much the fixpoint has derived so far,
   so the rule would derive different facts depending on round order.
-- **Graph-source patterns** (R2RML, SERVICE, full-text / vector / geo / S2
-  search): they read data the fixpoint does not own and the reasoning cache
-  key does not cover, so a derived fact could outlive the source it came from.
+- **Graph-source reads** (a `GRAPH <iri>` naming a graph source, SERVICE,
+  full-text / vector / geo / S2 search): they read data the fixpoint does not
+  own and the reasoning cache key does not cover, so a derived fact could
+  outlive the source it came from. Naming the source in the query's dataset
+  (`fromNamed`, `FROM NAMED`) does not change this: rule bodies read the
+  ledger the rules run against, not the query's dataset.
+- **A body `GRAPH <iri>` naming a graph the rules cannot read**: a graph the
+  ledger does not have as of the query's `t`, another ledger, a graph source,
+  or a system graph (see [Named graphs](#named-graphs)). The error names the
+  rule and the graph and says which it is.
+- **A default graph of several graphs.** A query whose default graph merges
+  more than one graph (`from` naming two ledgers, or two graphs of one) runs
+  no rules: they would read one of the graphs and derive as if the others'
+  facts were absent (see [Named graphs](#named-graphs)).
 - **A head literal its datatype cannot accept.** Head literals are coerced to
   their declared datatype, the same conversion a transaction applies, so a
   derived `xsd:date` really is a date. A value the datatype rejects fails the
@@ -532,6 +543,33 @@ graph the ledger already has — transact data into it to create it — and not
 the default graph (`urn:default`; leave the graph out instead) or a system
 graph such as the transaction metadata graph. A rule naming any other graph
 fails the query with an error naming the graph.
+
+### What a body can read
+
+A rule body reads the ledger its rules run against, as of the query's `t`:
+its default graph, and with `GRAPH <iri> { … }` (in a negation, a `UNION`
+branch, a subquery or a `FILTER EXISTS` alike) a user named graph that
+ledger has. The ledger's own address, in any spelling, names its default
+graph. `GRAPH ?g { … }` ranges over the ledger's named graphs.
+
+A body naming anything else fails the query, naming the rule and the graph:
+a graph the ledger does not have as of `t` (a typo'd IRI, say), another
+ledger, a graph source, or a system graph. In a plain query such a `GRAPH`
+matches nothing, which is SPARQL's answer for a graph outside the dataset;
+in a rule it would be a wrong one, because under a negation an empty input
+reads as "absent for everyone", so a wiring mistake would derive a full set
+of plausible conclusions. A head naming a missing graph is refused the same
+way.
+
+One consequence: a rule set written before the graph it reads has any data
+fails until the graph exists. Transact into the graph first, or add the rule
+once its input is there.
+
+Rules run over one graph, so a query whose default graph merges several
+(`"from": ["a:main", "b:main"]`, two `FROM` clauses, or two graphs of one
+ledger) runs no rules: it fails, naming them, rather than answering over the
+first graph alone while its plain patterns read all of them. A dataset query
+takes its rules, and its reasoning configuration, from its first ledger.
 
 A graph a Python job publishes is input like any other: see
 [Custom stages in Python](../guides/custom-stages-python.md) for running

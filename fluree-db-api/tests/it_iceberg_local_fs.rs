@@ -1895,6 +1895,119 @@ async fn an_unmapped_graph_source_refuses_a_graph_pattern_in_a_ledger_query() {
     );
 }
 
+/// A datalog rule body runs against the ledger alone, where a graph source
+/// reads as no graph, so a `NOT EXISTS` over one held for every subject. A
+/// rule that names one is refused, naming the rule and the source, while the
+/// same `GRAPH` in a plain query reads the source's rows.
+#[tokio::test]
+async fn a_rule_body_naming_a_graph_source_is_refused() {
+    let location = table_location();
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let config = R2rmlCreateConfig::new_direct("rule-people", &location, PEOPLE_R2RML)
+        .with_mapping_media_type("text/turtle");
+    fluree
+        .create_r2rml_graph_source(config)
+        .await
+        .expect("create graph source");
+    let unmapped = publish_unmapped_source(&fluree, "rule-unmapped").await;
+    let ledger = fluree.create_ledger("crm:main").await.expect("ledger");
+    fluree
+        .insert(
+            ledger,
+            &serde_json::json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "http://example.org/person/1", "@type": "ex:Lead"},
+                    {"@id": "http://example.org/person/99", "@type": "ex:Lead"}
+                ]
+            }),
+        )
+        .await
+        .expect("insert");
+    let graph = fluree.graph("crm:main");
+
+    // Without rules, `GRAPH <source>` reads the source the dataset names.
+    let plain = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "from": "crm:main",
+        "fromNamed": ["rule-people:main"],
+        "select": "?p",
+        "where": [{"@id": "?p", "@type": "ex:Lead"},
+                  ["graph", "rule-people:main", {"@id": "?p", "ex:name": "?n"}]]
+    });
+    let rows = fluree
+        .query_from()
+        .jsonld(&plain)
+        .execute_formatted()
+        .await
+        .expect("plain query");
+    assert_eq!(rows.as_array().map(Vec::len), Some(1), "{rows}");
+
+    let refused = |result: Result<serde_json::Value, ApiError>, gs: &str| {
+        let err = result.expect_err("a rule reading a graph source answered");
+        assert_eq!(err.status_code(), 400, "{err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("datalog rule")
+                && message.contains("unknown")
+                && message.contains(&format!("reads graph <{gs}>, which is a graph source")),
+            "{message}"
+        );
+    };
+    for gs in ["rule-people:main", unmapped.as_str()] {
+        let jsonld = serde_json::json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?p",
+            "where": {"@id": "?p", "@type": "ex:Unknown"},
+            "reasoning": "datalog",
+            "rules": [{
+                "@context": {"ex": "http://example.org/"},
+                "@id": "ex:unknown",
+                "where": [{"@id": "?p", "@type": "ex:Lead"},
+                          ["not-exists", ["graph", gs, {"@id": "?p", "ex:name": "?n"}]]],
+                "insert": {"@id": "?p", "@type": "ex:Unknown"}
+            }]
+        });
+        refused(graph.query().jsonld(&jsonld).execute_formatted().await, gs);
+        // Naming the source in the dataset does not let a rule body read it.
+        // (A dataset naming the unmapped source is refused before any rule
+        // runs, as `an_unmapped_graph_source_refuses_a_query_that_names_it_in_its_dataset`
+        // pins.)
+        if gs == "rule-people:main" {
+            let mut from_named = jsonld.clone();
+            from_named["from"] = serde_json::json!("crm:main");
+            from_named["fromNamed"] = serde_json::json!([gs]);
+            refused(
+                fluree
+                    .query_from()
+                    .jsonld(&from_named)
+                    .execute_formatted()
+                    .await,
+                gs,
+            );
+        }
+        let sparql_rule = serde_json::json!({
+            "@id": "http://example.org/unknown",
+            "@type": "f:sparql",
+            "@value": format!(
+                "PREFIX ex: <http://example.org/> CONSTRUCT {{ ?p a ex:Unknown }} WHERE {{ \
+                 ?p a ex:Lead FILTER NOT EXISTS {{ GRAPH <{gs}> {{ ?p ex:name ?n }} }} }}"
+            )
+        });
+        let mut with_sparql_rule = jsonld.clone();
+        with_sparql_rule["rules"] = serde_json::json!([sparql_rule]);
+        refused(
+            graph
+                .query()
+                .jsonld(&with_sparql_rule)
+                .execute_formatted()
+                .await,
+            gs,
+        );
+    }
+}
+
 /// Registering a Direct source reaches its tables the way its queries do (a
 /// warehouse root's per-table directory included) and reports the outcome as
 /// `connection_tested`, as registering a REST source does. A table that cannot

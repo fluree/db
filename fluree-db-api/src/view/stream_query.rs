@@ -266,10 +266,16 @@ impl Fluree {
 
         let db_ref = db.as_graph_db_ref();
         let union = super::union_default_dataset(db, executable);
+        // Wire R2RML so a graph-source query that routed through the
+        // single-ledger streaming path applies its mapping (parity with the
+        // buffered `execute_view_internal_with_r2rml`); no-op without `iceberg`
+        // and never consulted for plain queries.
+        let r2rml = crate::r2rml_provider!(self);
         let mut prepare_config = PrepareConfig::current(db.binary_store.as_ref());
         prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
-        let prepare_config =
-            prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
+        let prepare_config = prepare_config
+            .with_graph_sources(&r2rml)
+            .for_request(Some(tracker), options.cancellation.as_ref());
         let prepared = fluree_db_query::execute::prepare_execution_with_config(
             db_ref,
             executable,
@@ -278,11 +284,6 @@ impl Fluree {
         .await
         .map_err(|e| e.name_variables(vars))?;
 
-        // Wire R2RML so a graph-source query that routed through the
-        // single-ledger streaming path applies its mapping (parity with the
-        // buffered `execute_view_internal_with_r2rml`); no-op without `iceberg`
-        // and never consulted for plain queries.
-        let r2rml = crate::r2rml_provider!(self);
         crate::graph_source::pin_graph_source_times([db], &r2rml)?;
         view_context_config!(
             config,

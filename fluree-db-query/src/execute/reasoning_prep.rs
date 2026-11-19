@@ -144,15 +144,20 @@ fn refuse_non_monotone_rules_under_rewrites(
 ///
 /// A rule that fails to parse or validate is an error: reasoning over an
 /// incomplete rule set answers silently wrong, which is worse than a query
-/// that fails naming the rule.
+/// that fails naming the rule. So is a rule set that would read something
+/// its bodies cannot see, under `inputs`
+/// ([`refuse_unreadable_inputs`](crate::datalog_rules::refuse_unreadable_inputs)).
 pub async fn compute_derived_facts(
     base_db: GraphDbRef<'_>,
     reasoning: &ReasoningModes,
     rules_source_g_id: Option<GraphId>,
     binary_store: Option<&Arc<BinaryIndexStore>>,
     request: QueryRequest<'_>,
+    inputs: crate::datalog_rules::RuleInputScope<'_>,
 ) -> crate::error::Result<DerivedFactsOutcome> {
-    use crate::datalog_rules::{load_rule_set, run_fixpoint, RuleExecutionEnv};
+    use crate::datalog_rules::{
+        load_rule_set, refuse_unreadable_inputs, run_fixpoint, RuleExecutionEnv,
+    };
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
 
@@ -171,8 +176,10 @@ pub async fn compute_derived_facts(
     // Datalog: load the rule set first so its content can key the cache.
     let (rule_set, datalog_key) = if reasoning.datalog {
         let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
-        // Before the cache: its key leaves out rdfs and owl2ql.
+        // Before the cache: its key leaves out rdfs and owl2ql, and how many
+        // graphs the query's default graph merges.
         refuse_non_monotone_rules_under_rewrites(reasoning, &rule_set)?;
+        refuse_unreadable_inputs(&rule_set, base_db, inputs).await?;
         let key = overlay.content_version().map(|overlay_version| {
             let mut h = DefaultHasher::new();
             "datalog-v3".hash(&mut h);
@@ -466,6 +473,7 @@ pub async fn explain_derived_facts(
     rules_source_g_id: Option<GraphId>,
     binary_store: Option<&Arc<BinaryIndexStore>>,
     request: QueryRequest<'_>,
+    inputs: crate::datalog_rules::RuleInputScope<'_>,
     target: &crate::datalog_rules::ExplainTarget,
 ) -> crate::error::Result<crate::datalog_rules::Explanation> {
     use crate::datalog_rules::{
@@ -483,8 +491,15 @@ pub async fn explain_derived_facts(
     // what materializing leaves of it bounds the replays.
     let deadline =
         fluree_db_core::clock::Instant::now().checked_add(reasoning_budget(reasoning).max_duration);
-    let outcome =
-        compute_derived_facts(base_db, reasoning, rules_source_g_id, binary_store, request).await?;
+    let outcome = compute_derived_facts(
+        base_db,
+        reasoning,
+        rules_source_g_id,
+        binary_store,
+        request,
+        inputs,
+    )
+    .await?;
     let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
     let diagnostics = outcome.diagnostics.unwrap_or_default();
     let evaluation_time = diagnostics
