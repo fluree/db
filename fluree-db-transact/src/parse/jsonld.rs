@@ -144,6 +144,17 @@ fn parse_rooted(
     // anyway, an annotated one as written, before the lowering adds
     // statements of its own.
     let annotated = super::edge_annotations::document_has_annotation_keys(json);
+    // An update's `where` and `values` go to the query parser, not the
+    // expander: they get the check a query's clauses get.
+    if matches!(txn_type, TxnType::Update) {
+        let context = extract_context(json)?;
+        for clause in ["where", "values"] {
+            if let Some(value) = json.get(clause) {
+                fluree_db_query::parse::reject_reserved_iris_in_clause(value, &context)
+                    .map_err(|e| TransactError::UnsupportedFeature(e.to_string()))?;
+            }
+        }
+    }
 
     // Two-pass lowering for UPDATE transactions:
     //
@@ -5062,6 +5073,18 @@ mod tests {
                 TxnType::Insert,
                 json!({"@context": {"@base": ns}, "@id": "http://example.org/a",
                        "http://example.org/p": {"@value": "v", "@annotation": {local: b}}}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"ex": ex},
+                       "where": {"@id": "?r", reserved: {"@id": "?s"}},
+                       "insert": {"@id": "ex:x", "ex:saw": {"@id": "?s"}}}),
+            ),
+            (
+                TxnType::Update,
+                json!({"@context": {"x": reserved},
+                       "where": {"@id": "?s", "x": "?o"},
+                       "insert": {"@id": "http://example.org/a", "http://example.org/saw": "?o"}}),
             ),
             (
                 TxnType::Update,

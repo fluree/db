@@ -135,6 +135,16 @@ fn reject_user_authored_reifies_in_query(json: &JsonValue) -> Result<()> {
     scan_query_for_reifies_iris(json, &top_ctx)
 }
 
+/// The query side's check for reserved predicates over one clause (an
+/// update's `where` or `values`), resolved against `context`, which holds the
+/// document's own `@context`: the check a query's clauses get.
+pub fn reject_reserved_iris_in_clause(
+    value: &JsonValue,
+    context: &fluree_graph_json_ld::ParsedContext,
+) -> Result<()> {
+    scan_query_for_reifies_iris(value, context)
+}
+
 fn scan_query_for_reifies_iris(
     value: &JsonValue,
     context: &fluree_graph_json_ld::ParsedContext,
