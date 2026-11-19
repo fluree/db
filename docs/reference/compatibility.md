@@ -394,6 +394,14 @@ Current API version: v1. Every HTTP endpoint is under `/v1/fluree/`.
 
 Changes within v1 that a client may need to account for.
 
+#### A new ledger files an IRI ending in a delimiter under the namespace before it (breaking)
+
+A ledger created by this release encodes an IRI that ends in `/` or `#` under the namespace before that delimiter: `http://example.com/vendor7/Offer12/` is the name `Offer12/` in the namespace `http://example.com/vendor7/`. Earlier releases gave each such IRI a namespace of its own, so data whose IRIs are page addresses filled the namespace table. IRIs read and write as before; only how the ledger stores them changes.
+
+A ledger created by this release cannot be read by an earlier one, which refuses it rather than reading new IRIs differently from the ledger. A ledger created earlier keeps the encoding it was created with. To move one to the new encoding, export it and import the export into a new ledger.
+
+For Rust embedders: `LedgerSnapshot::genesis()` and `NamespaceRegistry::new()` now split under `NsSplitMode::NamedLocal`, `NsSplitMode` has that new variant, and `HOST_PLUS_N_MAX` is 253.
+
 #### JSON-LD reads `@base` as JSON-LD 1.1 does, and a type's scoped context stops at nested nodes (breaking)
 
 A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, as one in Turtle already did; it used to be joined to `@base` as a string. A base ending in `/` resolves as before. Otherwise the result differs:

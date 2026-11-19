@@ -90,6 +90,9 @@ impl NsSplitMode {
     /// `0xFF` = NamedLocal.
     ///
     /// Returns `Err` if `n > 253` (its byte would read back as another mode).
+    ///
+    /// A commit envelope writes `NamedLocal` as `0xFF` followed by an
+    /// extended mode id, so that a 4.x decoder refuses the commit.
     pub fn to_byte(self) -> Result<u8, NsAllocError> {
         match self {
             Self::MostGranular => Ok(0),
