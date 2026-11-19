@@ -332,6 +332,7 @@ impl PartialParentIndex {
             "R2RML parent: reading the rows of a window's join keys"
         );
         let mut stream = scan_for_lookup(
+            ctx,
             provider,
             graph_source_id,
             &self.source.parent_table,
@@ -396,6 +397,7 @@ fn key_set_filter(column: &str, mut values: Vec<String>) -> crate::r2rml::ScanFi
 /// as its read finishes, even inside a sliced query. The query's own row order
 /// comes from its main scan, never from these reads.
 pub(crate) async fn scan_for_lookup(
+    ctx: &ExecutionContext<'_>,
     provider: &dyn super::R2rmlTableProvider,
     graph_source_id: &str,
     table_name: &str,
@@ -412,6 +414,7 @@ pub(crate) async fn scan_for_lookup(
             None,
             as_of_t,
             ScanOrder::Any,
+            &scan_memory(ctx),
         )
         .await
 }
@@ -637,12 +640,24 @@ fn key_pushdown_enabled() -> bool {
 /// (it has a provable drop point), so a long streaming scan accounts only its
 /// resident window rather than the all-time sum of every freed window — that sum
 /// otherwise false-aborts a bounded-memory long scan (q038). The retained parent-map
-/// build (A2) and the per-file buffers (V2 site B, still excluded) are the remaining
-/// non-released allocations; A2 genuinely persists so its cumulative charge is
-/// correct, and site B needs its own release pairing.
+/// build (A2) is the remaining non-released allocation; it genuinely persists, so its
+/// cumulative charge is correct. The provider's read-ahead file decodes (V2 site B)
+/// are charged by the provider on the handle [`scan_memory`] passes it, and released
+/// as its stream hands each batch on.
 fn scan_mem_accounting_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| super::env_switch_enabled("FLUREE_SCAN_MEM_ACCOUNTING"))
+}
+
+/// The handle a scan's table reads charge their read-ahead to (see
+/// [`R2rmlTableProvider::scan_table_ordered`](super::R2rmlTableProvider::scan_table_ordered)):
+/// the query's own, or a disabled one with scan accounting off.
+pub(crate) fn scan_memory(ctx: &ExecutionContext<'_>) -> fluree_db_core::QueryCancellation {
+    if scan_mem_accounting_enabled() {
+        ctx.cancellation.clone()
+    } else {
+        fluree_db_core::QueryCancellation::disabled()
+    }
 }
 
 /// F-AUD-3: conservative per-entry byte estimate for a `build_parent_lookup`
@@ -1961,6 +1976,7 @@ impl R2rmlScanOperator {
                         main_scan_topk.as_ref(),
                         as_of_t,
                         scan_order,
+                        &scan_memory(ctx),
                     )
                     .await?
             } else if let Some(cached) = self.scan_cache.get(&cache_key) {
@@ -1975,6 +1991,7 @@ impl R2rmlScanOperator {
                         main_scan_topk.as_ref(),
                         as_of_t,
                         scan_order,
+                        &scan_memory(ctx),
                     )
                     .await?;
                 match collect_scan_capped(fresh, materialize_window_rows(), ctx).await? {
@@ -2383,6 +2400,7 @@ impl R2rmlScanOperator {
         lookup_key: &LookupCacheKey,
     ) -> Result<Arc<CompleteParentLookup>> {
         let stream = scan_for_lookup(
+            ctx,
             provider,
             &self.pattern.graph_source_id,
             &source.parent_table,
@@ -6458,6 +6476,7 @@ mod tests {
                 topk: Option<&crate::r2rml::ScanTopK>,
                 as_of_t: Option<i64>,
                 order: crate::r2rml::ScanOrder,
+                _memory: &fluree_db_core::QueryCancellation,
             ) -> Result<ColumnBatchStream> {
                 self.orders
                     .lock()
