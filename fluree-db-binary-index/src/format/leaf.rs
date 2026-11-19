@@ -959,7 +959,15 @@ pub fn build_leaf_blob_raw_keys(
                 buf.extend_from_slice(first.as_bytes());
                 buf.extend_from_slice(last.as_bytes());
             }
-            None => buf.resize(buf.len() + 2 * group_len, 0),
+            None => {
+                // Hard assert: zero groups decode as id 0 at both edges of a
+                // leaflet with rows, and release builds write the leaf.
+                assert_eq!(
+                    leaflet.row_count, 0,
+                    "a leaflet with rows must carry its live groups"
+                );
+                buf.resize(buf.len() + 2 * group_len, 0);
+            }
         }
 
         cumulative_payload_offset += leaflet.payload.len() as u32;
