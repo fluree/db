@@ -184,8 +184,8 @@ async fn jsonld_probes_take_the_row_store_id() {
 
 #[tokio::test]
 async fn probes_answer_from_novelty() {
-    // With live novelty the scans decode their rows, novelty ids being
-    // ephemeral, so no probe has a store id to take and each looks its
+    // With live novelty a scan decodes its rows, novelty ids being
+    // ephemeral, so a probe fed by one has no store id to take and looks its
     // subject up: a retraction and a subject first written there still show.
     let fluree = FlureeBuilder::memory().build_memory();
     let id = "it/correlated-ids/novelty:main";
@@ -212,6 +212,45 @@ async fn probes_answer_from_novelty() {
             ["ex:c", "ex:name", "c"],
             ["ex:n", "ex:name", "n"],
         ])),
+    );
+}
+
+/// Rows from the batched subject probe carry store ids under novelty too,
+/// novelty ids among them. A probe takes a persisted id and looks a novelty
+/// id's subject up: `ex:a` takes its id, `ex:n`, first written in novelty,
+/// does not.
+#[tokio::test]
+async fn a_novelty_id_from_a_batched_probe_is_looked_up() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let id = "it/correlated-ids/batched-novelty:main";
+    let ledger = indexed(&fluree, id, DATA).await;
+    let ledger = update(
+        &fluree,
+        ledger,
+        "INSERT DATA { ex:b ex:knows ex:n . ex:n ex:name \"n\" ; ex:knows ex:c }",
+    )
+    .await;
+
+    let (spans, _guard) = support::span_capture::init_test_tracing();
+    let (rows, _) = sparql(
+        &fluree,
+        &ledger,
+        "SELECT ?y ?p ?o WHERE { ex:a ex:knows ?x . ?x ex:knows ?y . ?y ?p ?o }",
+    )
+    .await;
+    assert_eq!(
+        rows,
+        support::normalize_rows(&json!([
+            ["ex:a", "ex:knows", "ex:b"],
+            ["ex:a", "ex:knows", "ex:c"],
+            ["ex:n", "ex:knows", "ex:c"],
+            ["ex:n", "ex:name", "n"],
+        ])),
+    );
+    assert_eq!(
+        stamps(&spans, "proceed"),
+        1,
+        "only the persisted subject's probe takes its id"
     );
 }
 
