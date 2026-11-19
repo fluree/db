@@ -2222,16 +2222,17 @@ fn trim_decimal_lexical(lex: &str) -> String {
 /// while the twin stores the boolean and answers `"true"`, so without this every
 /// such triple was a missing/extra pair.
 ///
-/// Only the four forms the write path parses as a boolean collapse
-/// (`coerce_string_value` takes `true`, `false`, `1` and `0`, untrimmed). Any
-/// other form (`" 1"`, `"TRUE"`, `"yes"`) is kept as text under the declared
-/// datatype by an import, so it passes through here unchanged and still has to
-/// match byte for byte. Applied to BOTH sides.
+/// The parse is the write path's own (`coerce_string_value`, which an import
+/// runs on every typed literal), so the gate and the import can't drift apart:
+/// only the forms it reads as a boolean collapse (today `true`, `false`, `1`
+/// and `0`, untrimmed). Any other form (`" 1"`, `"TRUE"`, `"yes"`) is kept as
+/// text under the declared datatype by an import, so it passes through here
+/// unchanged and still has to match byte for byte. Applied to BOTH sides.
 fn normalize_boolean_lexical(lex: &str) -> &str {
-    match lex {
-        "1" => "true",
-        "0" => "false",
-        other => other,
+    match fluree_db_core::coerce::coerce_string_value(lex, fluree_vocab::xsd::BOOLEAN) {
+        Ok(fluree_db_core::FlakeValue::Boolean(true)) => "true",
+        Ok(fluree_db_core::FlakeValue::Boolean(false)) => "false",
+        _ => lex,
     }
 }
 
