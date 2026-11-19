@@ -5504,6 +5504,19 @@ pub enum SetContextResult {
 /// Maximum retries for CAS conflict during context update.
 const CONTEXT_CAS_MAX_RETRIES: usize = 3;
 
+/// Where [`Fluree::archive_ledger_to_path`] writes before renaming over
+/// `path`: a hidden `.partial` sibling in the same directory (so the rename
+/// stays on one filesystem), unique per process and call so two archives to
+/// one path never share it. `None` when `path` names no file.
+#[cfg(not(target_arch = "wasm32"))]
+fn partial_archive_path(path: &std::path::Path) -> Option<std::path::PathBuf> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let name = path.file_name()?.to_string_lossy();
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    Some(path.with_file_name(format!(".{name}.{}-{seq}.partial", std::process::id())))
+}
+
 impl Fluree {
     /// Create an export builder for streaming RDF data from a ledger.
     ///
@@ -5633,6 +5646,77 @@ impl Fluree {
             .map_err(|e| ApiError::internal(format!("archive generation failed: {e}")))?;
         consumer_result?;
         Ok(stats)
+    }
+
+    /// [`Self::archive_ledger`] into the file at `path`, which only ever holds
+    /// a finished archive.
+    ///
+    /// The archive goes to a hidden `.partial` file beside `path`, is synced,
+    /// and is renamed over `path` once it's complete. A failed archive removes
+    /// the partial file, so nothing is left under the name asked for (where it
+    /// would pass for a finished `.flpack` until a restore failed on it), and a
+    /// file already at `path` is kept as it was.
+    ///
+    /// A `path` that exists but isn't a regular file is written in place and
+    /// left alone on an error, as a plain create-and-write would: a rename
+    /// can't stand in for writing to `/dev/stdout` or a FIFO, and over a
+    /// symlink it would replace the link instead of writing through it.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn archive_ledger_to_path(
+        &self,
+        ledger_id: &str,
+        include_indexes: bool,
+        path: &std::path::Path,
+    ) -> Result<pack::PackStreamResult> {
+        let io_err = |what: &str, at: &std::path::Path, e: std::io::Error| {
+            ApiError::internal(format!("cannot {what} {}: {e}", at.display()))
+        };
+
+        let existing = tokio::fs::symlink_metadata(path).await.ok();
+        if existing.is_some_and(|meta| !meta.is_file()) {
+            let file = tokio::fs::File::create(path)
+                .await
+                .map_err(|e| io_err("write", path, e))?;
+            let mut out = tokio::io::BufWriter::new(file);
+            return self
+                .archive_ledger(ledger_id, include_indexes, &mut out)
+                .await;
+        }
+
+        let partial = partial_archive_path(path)
+            .ok_or_else(|| ApiError::internal(format!("not a file path: {}", path.display())))?;
+        let file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&partial)
+            .await
+            .map_err(|e| io_err("create", &partial, e))?;
+        let mut out = tokio::io::BufWriter::new(file);
+        let archived = match self
+            .archive_ledger(ledger_id, include_indexes, &mut out)
+            .await
+        {
+            // `archive_ledger` has flushed `out`; sync so the rename can't
+            // publish a file whose bytes a crash would still lose.
+            Ok(stats) => match out.get_mut().sync_all().await {
+                Ok(()) => Ok(stats),
+                Err(e) => Err(io_err("write", &partial, e)),
+            },
+            Err(e) => Err(e),
+        };
+        // Close the file before renaming or removing it.
+        drop(out);
+        let finished = match archived {
+            Ok(stats) => tokio::fs::rename(&partial, path)
+                .await
+                .map(|()| stats)
+                .map_err(|e| io_err("write", path, e)),
+            Err(e) => Err(e),
+        };
+        if finished.is_err() {
+            let _ = tokio::fs::remove_file(&partial).await;
+        }
+        finished
     }
 
     /// Walk the commit chain for a ledger and return per-commit summaries.

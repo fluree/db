@@ -498,7 +498,7 @@ mod tests {
         // our frame encoding matches the expected format.
         let mut buf = Vec::new();
         write_stream_preamble(&mut buf);
-        encode_header_frame(&PackHeader::commits_only(Some(0), true), &mut buf);
+        encode_header_frame(&PackHeader::commits_only(Some(0), true), &mut buf).unwrap();
         encode_end_frame(&mut buf);
 
         // Should be parseable: preamble + at least 2 frames

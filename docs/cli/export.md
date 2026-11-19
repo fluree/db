@@ -39,6 +39,8 @@ Exports the full native ledger — all commits, transaction blobs, indexes, and 
 
 The `.flpack` format uses the `fluree-pack-v1` binary wire protocol (the same format used by `fluree clone` and `fluree pull` for network transfers).
 
+With `-o`, the archive is written to a hidden `.partial` file beside the target and renamed into place only once it's complete, so a failed export leaves no file under that name and keeps any archive already there. (A target that isn't a regular file, such as `/dev/stdout` or a FIFO, is written in place.)
+
 All formats (Turtle, N-Triples, N-Quads, TriG, JSON-LD) read directly from the binary SPOT index with a novelty overlay, so export always includes the latest committed transactions — even those not yet persisted to index. Memory usage stays constant regardless of dataset size. JSON-LD streams one subject at a time, so memory is O(largest subject), not O(dataset).
 
 ### Named graphs
