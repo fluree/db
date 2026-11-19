@@ -229,7 +229,18 @@ where
                         )
                     }
                 };
-                partial.push(count, edges, &mut read)?;
+                // Two exact edges (every v5 seam) settle by one comparison.
+                // Checked here: inside `push` it measured no faster.
+                match partial.last {
+                    Some(prev) if prev.exact && edges.exact => {
+                        partial.count = partial.count.saturating_add(count);
+                        if prev.last == edges.first {
+                            partial.count = partial.count.saturating_sub(1);
+                        }
+                        partial.last = Some(edges);
+                    }
+                    _ => partial.push(count, edges, &mut read)?,
+                }
             }
         }
         Ok(Some(partial))
