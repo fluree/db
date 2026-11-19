@@ -9,7 +9,7 @@
 //! The scan used to be the odd one out: it read named-graph bundles fine but
 //! the decoder rejected them, because the base-index reader does not put a
 //! graph on the rows it decodes and `EdgeKey::from_reifies_facts` read the
-//! resulting disagreement as a forged bundle (#1882). All three sources now
+//! resulting disagreement as a forged bundle (#1859). All three sources now
 //! agree, which is what the kill switch exists to let you check, and this is
 //! the wire-level guard on that. `export_omission_headers` holds the arena
 //! and overlay halves.
@@ -182,8 +182,8 @@ async fn the_base_index_scan_resolves_a_named_graph_annotation() {
         "nothing is dropped, so nothing to report; headers: {headers:?}"
     );
 
-    // `raw_reifies` still emits the bundle verbatim for consumers pinned to
-    // pre-4.2 bytes, and still reports nothing.
+    // `raw_reifies` still emits the bundle verbatim, and still reports
+    // nothing.
     let (status, headers, body) = export(
         &app,
         "scan:main",

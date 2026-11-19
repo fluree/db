@@ -104,7 +104,7 @@ JSON-LD's `@type` holds IRIs only, so an annotated type, like a list of types, i
 
 A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran.
 
-Annotations written *inside a named graph* export like any other. They did not before 4.2: export can resolve annotations from a sealed arena, the novelty overlay, or a base-index scan, and the scan alone dropped them — it reads the bundle correctly, but the base-index reader does not put a graph on the rows it decodes, so the decoder saw the bundle's `f:reifiesGraph` disagree with its flake-level graph and rejected it as forged. All three sources now agree.
+Annotations written *inside a named graph* export like any other.
 
 When export does suppress an annotation it cannot then represent — a bundle the decoder rejects as malformed — it says so rather than dropping it quietly:
 

@@ -3068,13 +3068,12 @@ fn a_point_in_time_export_keeps_an_annotation_retracted_later() {
 
 /// An annotation written inside a named graph exports like any other.
 ///
-/// It did not, until #1882: the seal scan reads bundles out of the base
-/// index, and the base-index reader does not put a graph on the rows it
-/// decodes — the graph rides on the query's `g_id`, not the row. The
-/// decoder cross-checks `f:reifiesGraph` against the flake-level graph and
-/// read the disagreement as a forged bundle, so every named-graph
-/// annotation was dropped on the floor with no marker emitted. This is the
-/// user-facing shape of that fix, and the reason #1859's last gap closed.
+/// It did not (#1859): the seal scan reads bundles out of the base index,
+/// and the base-index reader does not put a graph on the rows it decodes —
+/// the graph rides on the query's `g_id`, not the row. The decoder
+/// cross-checks `f:reifiesGraph` against the flake-level graph and read the
+/// disagreement as a forged bundle, so every named-graph annotation was
+/// dropped with no marker emitted.
 #[test]
 fn a_named_graph_annotation_exports_with_its_marker() {
     let tmp = TempDir::new().unwrap();
