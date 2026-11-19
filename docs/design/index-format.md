@@ -599,7 +599,7 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
 
 ## Integrity, caching, and lifecycle
 
-- Leaf and branch filenames (local) are derived from **SHA-256** content hashes; remote references use ContentId (CIDv1).
+- Every artifact is identified by a ContentId (CIDv1 over **SHA-256**) on every storage backend; storage paths use the hex digest.
 - Content-addressed artifacts are immutable; caches can key by ContentId.
 - `IndexRoot` (FIR6) provides a GC chain (`prev_index`) and an optional garbage manifest pointer to
   support retention-based cleanup of replaced artifacts.

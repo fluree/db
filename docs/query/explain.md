@@ -53,32 +53,29 @@ pattern at each step.
 
 ### Pattern Categories
 
-Every pattern is classified into one of four cardinality categories:
+Every pattern is classified into one of three categories:
 
-| Category     | Meaning                                | Patterns                                                                          |
-| ------------ | -------------------------------------- | --------------------------------------------------------------------------------- |
-| **Source**   | Produces rows (estimated row count)    | Triple, VALUES, UNION, Subquery, IndexSearch, VectorSearch, GeoSearch, S2Search, Graph, PropertyPath, R2rml, Service |
-| **Reducer**  | Shrinks the stream (multiplier < 1.0)  | MINUS, EXISTS, NOT EXISTS                                                         |
-| **Expander** | Grows the stream (multiplier >= 1.0)   | OPTIONAL                                                                          |
-| **Deferred** | No cardinality effect                  | FILTER, BIND                                                                      |
+| Category     | Meaning                                       | Patterns                                                                          |
+| ------------ | --------------------------------------------- | --------------------------------------------------------------------------------- |
+| **Source**   | Produces rows (estimated row count)           | Triple, VALUES, UNION, Subquery, IndexSearch, VectorSearch, GeoSearch, S2Search, Graph, PropertyPath, R2rml, Service |
+| **Expander** | Grows the stream (multiplier >= 1.0)          | OPTIONAL                                                                          |
+| **Deferred** | Placed once the variables it reads are bound  | FILTER, BIND, MINUS, EXISTS, NOT EXISTS, correlated subqueries                    |
 
 ### Placement Priority
 
 The greedy loop places patterns in this priority order:
 
-1. **Eligible reducers** (lowest multiplier first) — shrink the stream as
-   early as possible.
-2. **Sources** (lowest row count first, preferring patterns that join on
+1. **Sources** (lowest row count first, preferring patterns that join on
    already-bound variables) — most selective first.
-3. **Eligible expanders** (lowest multiplier first) — defer row expansion
-   until prerequisite variables are bound.
+2. **Eligible expanders** (lowest multiplier first) — defer row expansion
+   until prerequisite variables are bound. An expander is "eligible" when at
+   least one of its variables is already bound by a previously placed pattern.
 
-A reducer or expander is "eligible" when at least one of its variables is
-already bound by a previously placed pattern.
-
-FILTER and BIND patterns are integrated into the greedy loop: after each
-source, reducer, or expander is placed, any deferred patterns whose input
-variables are now satisfied are drained in original-position order. For BIND
+Deferred patterns are integrated into the greedy loop: after each source or
+expander is placed, any deferred patterns whose input variables are now
+satisfied are drained in original-position order. MINUS, EXISTS and NOT EXISTS
+are order-sensitive, so each also waits until every pattern written before it
+that binds variables has been placed. For BIND
 patterns, only the expression's input variables must be bound — the target
 variable is an output that feeds back into `bound_vars`, potentially enabling
 further deferred patterns to be placed immediately (cascading placement).
@@ -187,10 +184,10 @@ chosen execution order. It is present even when statistics are unavailable
 - `kind`: `triple`, `optional`, `union`, `minus`, `exists`, `not-exists`,
   `subquery`, `filter`, `bind`, `values`, `property-path`, `graph`, `service`,
   or a search kind.
-- `category`: `source` (produces rows), `reducer` (shrinks), `expander`
-  (grows — e.g. `OPTIONAL`), or `deferred` (`FILTER`/`BIND`).
+- `category`: `source` (produces rows), `expander` (grows — e.g. `OPTIONAL`),
+  or `deferred` (`FILTER`, `BIND`, `MINUS`, `EXISTS`, `NOT EXISTS`).
 - `estimate`: `{ "row-count": N }` for sources, `{ "multiplier": M }` for
-  reducers/expanders.
+  expanders; deferred nodes carry none.
 - For triples, a `pattern` object (`subject`/`property`/`object`); for compound
   nodes, a `patterns` array (or `branches` for `UNION`) of child nodes.
 
@@ -215,8 +212,6 @@ Key things to look for:
 
 - **Source `row-count`**: Lower values are placed first. A high row count early
   in the plan may indicate missing statistics or an inherently broad pattern.
-- **Reducer `multiplier`**: Values below 1.0 indicate the fraction of rows that
-  survive. A MINUS with multiplier 0.90 removes ~10% of rows.
 - **Deferred placement**: FILTERs and BINDs appear immediately after all of
   their input variables become bound. BIND outputs cascade — a BIND placed
   early can enable subsequent FILTERs or BINDs that depend on its target
