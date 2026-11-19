@@ -764,6 +764,9 @@ struct ScanProgress {
     /// whole produced side to one child window, so a solution seen in an
     /// earlier pass met other child rows and is not a repeat here.
     seen: Option<SeenSolutions>,
+    /// The materialized window whose join with the child rows is partly
+    /// emitted, resumed by the next pull before another window is read.
+    emitting: Option<EmitWindow>,
 }
 
 impl ScanProgress {
@@ -773,6 +776,49 @@ impl ScanProgress {
             seen.release(ctx);
         }
     }
+}
+
+/// A materialized window whose join with the pass's child rows is emitted one
+/// output batch at a time.
+///
+/// What a window emits is not bounded by the window: each produced row joins
+/// every child row that shares its key, so on a key with few distinct values
+/// one window joins to about `produced × child rows / distinct keys` output
+/// rows, both sides up to a materialize window. Emitting it all at once ran
+/// with no cancellation check and no memory charge until the window was
+/// through (#2462). The window instead stops when the output batch is full
+/// and resumes on the next pull, so every output batch passes the operator's
+/// checkpoint. It stays resident, and charged, until its last row is out.
+struct EmitWindow {
+    /// The map ([`ScanProgress::tms`] index) whose rows these are: its join
+    /// plan and its deduplication apply.
+    tm: usize,
+    produced: Vec<Vec<(VarId, Binding)>>,
+    cursor: JoinCursor,
+    /// The window's charge on the query's memory budget, returned when the
+    /// window drops: through, or with the scan when it stops early.
+    _charge: fluree_db_core::MemoryCharge,
+}
+
+/// Where a window's join emission stopped.
+#[derive(Default)]
+struct JoinCursor {
+    /// The next produced row not yet started.
+    next: usize,
+    /// The produced row the output batch filled in the middle of.
+    row: Option<RowCursor>,
+}
+
+/// A produced row part of whose matches are emitted. It was checked against
+/// the pass's [`SeenSolutions`] when it started, and is not checked again.
+struct RowCursor {
+    /// The row's index in its window.
+    prod: usize,
+    /// Its join key (empty for [`JoinPlan::Cross`]).
+    key: Vec<GroupKeyOwned>,
+    /// The matches emitted: for [`JoinPlan::Hash`] its `full_index` rows,
+    /// then positions in `partial_rows`; for [`JoinPlan::Cross`] child rows.
+    done: usize,
 }
 
 /// Routing stamp for a scan-side top-k directive: `proceed` when a map's scan
@@ -937,10 +983,9 @@ pub struct R2rmlScanOperator {
     out_pos: HashMap<VarId, usize>,
     /// Cached compiled mapping (loaded once in open)
     mapping: Option<Arc<CompiledR2rmlMapping>>,
-    /// Pending output rows that overflowed the current output batch.
-    pending: VecDeque<Vec<Binding>>,
     /// In-flight streaming scan for the current buffered child batch, advanced
-    /// one window per `next_batch` so the whole table is never materialized.
+    /// at most one output batch per `next_batch` so the whole table is never
+    /// materialized and no window's join is emitted ahead of its consumer.
     progress: Option<ScanProgress>,
     /// How many child rows the next table pass joins. Each pass streams the
     /// whole produced side, so a correlated scan under a large child (the rows
@@ -1101,7 +1146,6 @@ impl R2rmlScanOperator {
             schema,
             out_pos,
             mapping: None,
-            pending: VecDeque::new(),
             progress: None,
             child_window: FlushSchedule::fixed(materialize_window_rows()),
             child_pending: None,
@@ -2209,6 +2253,7 @@ impl R2rmlScanOperator {
             tm_idx: 0,
             window_rows,
             seen,
+            emitting: None,
         }))
     }
 
@@ -2464,11 +2509,12 @@ impl R2rmlScanOperator {
     }
 
     /// The `LIMIT` budget is met: no more rows, so the in-flight pass's
-    /// deduplication set is no longer needed.
+    /// deduplication set and any part-emitted window are no longer needed.
     fn exhaust_on_budget(&mut self, ctx: &ExecutionContext<'_>) {
         self.state = OperatorState::Exhausted;
         if let Some(progress) = self.progress.as_mut() {
             progress.release_seen(ctx);
+            progress.emitting = None;
         }
     }
 
@@ -2483,12 +2529,13 @@ impl R2rmlScanOperator {
         }
     }
 
-    /// Pull and materialize the next window from the in-flight scan and emit its
-    /// rows. Each call pulls one bounded window of batches from the current
-    /// TriplesMap's stream (so only O(window + in-flight files) is resident),
-    /// materializes them in parallel, emits, and drops the window. Returns `true`
-    /// while batches remain, `false` once the scan for this child batch is fully
-    /// consumed.
+    /// Emit the in-flight scan's next rows into `columns`, up to one output
+    /// batch. A window whose join is part emitted ([`ScanProgress::emitting`])
+    /// resumes first; otherwise one bounded window of batches is pulled from
+    /// the current TriplesMap's stream (so only O(window + in-flight files) is
+    /// resident), materialized in parallel, and emitted until the output batch
+    /// is full. Returns `true` while rows remain, `false` once the scan for
+    /// this child batch is fully consumed.
     async fn advance_one_window(
         &mut self,
         ctx: &ExecutionContext<'_>,
@@ -2496,6 +2543,36 @@ impl R2rmlScanOperator {
         num_cols: usize,
         columns: &mut [Vec<Binding>],
     ) -> Result<bool> {
+        if columns[0].len() >= ctx.batch_size {
+            // The caller hands this batch on before anything more is emitted.
+            return Ok(true);
+        }
+        if let Some(mut window) = progress.emitting.take() {
+            let tm = &progress.tms[window.tm];
+            let seen = if tm.dedupe {
+                progress.seen.as_mut()
+            } else {
+                None
+            };
+            let through = emit_produced_window(
+                &self.out_pos,
+                &progress.child_schema,
+                &progress.child_batch,
+                &tm.join,
+                &window.produced,
+                &mut window.cursor,
+                ctx.batch_size,
+                columns,
+                seen,
+                ctx,
+            )?;
+            if !through {
+                progress.emitting = Some(window);
+            }
+            // A window that is through drops here, returning its charge.
+            return Ok(true);
+        }
+
         let mapping = self
             .mapping
             .as_ref()
@@ -2595,7 +2672,7 @@ impl R2rmlScanOperator {
             // the budget cannot hold (a single row's fan-out included) fails
             // typed without allocating them. A scan whose parents all map a key
             // to one subject skips this and stays as it was.
-            let mut window_est = 0usize;
+            let mut charge = ctx.memory_charge();
             let mut window_bound = None;
             if progress.tms[i]
                 .parent_joins
@@ -2631,11 +2708,12 @@ impl R2rmlScanOperator {
                 let kept_rows: usize = window.iter().map(|b| b.num_rows).sum();
                 progress.tms[i].fan_out = bound.div_ceil(kept_rows.max(1)).max(1);
                 if scan_mem_accounting_enabled() {
-                    window_est = bound
-                        .saturating_mul(num_cols)
-                        .saturating_mul(crate::context::BINDING_EST_BYTES);
-                    ctx.record_alloc(window_est);
-                    ctx.checkpoint()?;
+                    ctx.charge(
+                        &mut charge,
+                        bound
+                            .saturating_mul(num_cols)
+                            .saturating_mul(crate::context::BINDING_EST_BYTES),
+                    )?;
                 }
                 window_bound = Some(bound);
             }
@@ -2673,50 +2751,57 @@ impl R2rmlScanOperator {
             // path) trips a typed `MemoryBudgetExceeded` instead of OOMing. Charge the
             // resident window and `checkpoint()` BEFORE doing more work, so an oversized
             // window (or this window on top of a retained A2 fact-parent build / an
-            // upstream fold) aborts typed. The window is then RELEASED once emitted
-            // (below) — it has a provable drop point, so a streaming scan of N
-            // sequentially-freed windows accounts only the resident one instead of
-            // their all-time sum. Without the release, ~70 freed 512K-row windows of a
-            // long un-fused-COUNT scan (q038) SUM past the budget and false-abort a
-            // query whose per-window resident memory is bounded and fine.
+            // upstream fold) aborts typed. The window is then RELEASED once its last
+            // joined row is emitted (its charge drops with it) — it has a provable
+            // drop point, so a streaming scan of N sequentially-freed windows
+            // accounts only the resident one instead of their all-time sum. Without
+            // the release, ~70 freed 512K-row windows of a long un-fused-COUNT scan
+            // (q038) SUM past the budget and false-abort a query whose per-window
+            // resident memory is bounded and fine.
             if window_bound.is_none() && scan_mem_accounting_enabled() {
-                window_est = produced
-                    .len()
-                    .saturating_mul(num_cols)
-                    .saturating_mul(crate::context::BINDING_EST_BYTES);
-                ctx.record_alloc(window_est);
-                ctx.checkpoint()?;
+                ctx.charge(
+                    &mut charge,
+                    produced
+                        .len()
+                        .saturating_mul(num_cols)
+                        .saturating_mul(crate::context::BINDING_EST_BYTES),
+                )?;
             }
 
+            // Emit the window's join until the output batch is full. What is left
+            // stays in `progress.emitting`, with the window's charge, and resumes on
+            // the next pull: one window can join to far more rows than it holds
+            // (see `EmitWindow`), so the output is never staged ahead of its
+            // consumer, and each batch of it passes `next_batch`'s checkpoint. The
+            // A2 fact-parent build charge is NOT released — that map genuinely
+            // persists.
             if !produced.is_empty() {
+                let mut window = EmitWindow {
+                    tm: i,
+                    produced,
+                    cursor: JoinCursor::default(),
+                    _charge: charge,
+                };
                 let seen = if progress.tms[i].dedupe {
                     progress.seen.as_mut()
                 } else {
                     None
                 };
-                emit_produced_window(
+                let through = emit_produced_window(
                     &self.out_pos,
                     &progress.child_schema,
                     &progress.child_batch,
                     &progress.tms[i].join,
-                    &produced,
-                    num_cols,
+                    &window.produced,
+                    &mut window.cursor,
                     ctx.batch_size,
                     columns,
-                    &mut self.pending,
                     seen,
                     ctx,
                 )?;
-            }
-
-            // The window has been handed off (its rows copied into `columns` / the
-            // bounded `self.pending` overflow) and `produced` drops at the end of this
-            // iteration — release its charge so only the in-flight window is counted.
-            // The retained overflow is bounded (≤ one window, drained before the next
-            // pull) and intentionally left untracked (minimal per V2 site B). The A2
-            // fact-parent build charge is NOT released — that map genuinely persists.
-            if window_est != 0 {
-                ctx.release(window_est);
+                if !through {
+                    progress.emitting = Some(window);
+                }
             }
             // Geometric window growth. A budgeted (LIMIT) scan starts with a small
             // window (~the remaining budget) so a selective query does not explode
@@ -2815,54 +2900,52 @@ fn replay_stream(batches: Arc<Vec<ColumnBatch>>) -> ColumnBatchStream {
 }
 
 /// Emit one combined output row: the child row's bindings overlaid with a
-/// produced assignment, into `columns` (or `pending` once the batch is full).
+/// produced assignment, into `columns`.
 ///
-/// The common (not-yet-full) path writes straight into the columnar buffers
-/// instead of allocating a per-row `Vec<Binding>` — that per-row allocation was
-/// the single largest heap-allocation site for analytical R2RML scans.
-#[allow(clippy::too_many_arguments)]
+/// Writes straight into the columnar buffers instead of allocating a per-row
+/// `Vec<Binding>` — that per-row allocation was the single largest
+/// heap-allocation site for analytical R2RML scans.
 fn emit_combined_row(
     out_pos: &HashMap<VarId, usize>,
     child_schema: &[VarId],
     child_batch: &Batch,
     child_row_idx: usize,
     prod: &[(VarId, Binding)],
-    num_cols: usize,
-    batch_size: usize,
     columns: &mut [Vec<Binding>],
-    pending: &mut VecDeque<Vec<Binding>>,
 ) {
-    if columns[0].len() < batch_size {
-        // Push an `Unbound` placeholder to every column, then overwrite the
-        // bound positions in place — no per-row temporary vector.
-        for col in columns.iter_mut() {
-            col.push(Binding::Unbound);
-        }
-        for (col_idx, &var) in child_schema.iter().enumerate() {
-            let out_idx = *out_pos.get(&var).unwrap();
-            *columns[out_idx].last_mut().unwrap() =
-                child_batch.column_by_idx(col_idx).unwrap()[child_row_idx].clone();
-        }
-        for (var, binding) in prod {
-            *columns[*out_pos.get(var).unwrap()].last_mut().unwrap() = binding.clone();
-        }
-    } else {
-        // Overflow path: the batch is full, so stage a complete row for `pending`.
-        let mut out_row: Vec<Binding> = vec![Binding::Unbound; num_cols];
-        for (col_idx, &var) in child_schema.iter().enumerate() {
-            out_row[*out_pos.get(&var).unwrap()] =
-                child_batch.column_by_idx(col_idx).unwrap()[child_row_idx].clone();
-        }
-        for (var, binding) in prod {
-            out_row[*out_pos.get(var).unwrap()] = binding.clone();
-        }
-        pending.push_back(out_row);
+    // Push an `Unbound` placeholder to every column, then overwrite the
+    // bound positions in place — no per-row temporary vector.
+    for col in columns.iter_mut() {
+        col.push(Binding::Unbound);
+    }
+    for (col_idx, &var) in child_schema.iter().enumerate() {
+        let out_idx = *out_pos.get(&var).unwrap();
+        *columns[out_idx].last_mut().unwrap() =
+            child_batch.column_by_idx(col_idx).unwrap()[child_row_idx].clone();
+    }
+    for (var, binding) in prod {
+        *columns[*out_pos.get(var).unwrap()].last_mut().unwrap() = binding.clone();
     }
 }
 
+/// Whether a child row's partial join key (`None` where its join var is
+/// unbound) agrees with a produced row's complete key.
+fn partial_key_agrees(partial: &[Option<GroupKeyOwned>], key: &[GroupKeyOwned]) -> bool {
+    partial
+        .iter()
+        .zip(key.iter())
+        .all(|(c, p)| c.as_ref().is_none_or(|c| c == p))
+}
+
 /// Combine a window of produced rows with the buffered child rows per the join
-/// plan, emitting into `columns`/`pending`. The produced side is the streamed
-/// (large) side; the child index was built once in `build_progress`.
+/// plan, emitting into `columns` from where `cursor` stopped until `columns`
+/// holds `batch_size` rows. Returns whether the window is through; if not,
+/// `cursor` records where to resume (see [`EmitWindow`]). The produced side is
+/// the streamed (large) side; the child index was built once in
+/// `build_progress`.
+///
+/// A produced row is checked against `seen` once, when it starts; a row
+/// resumed partway through its matches was admitted then.
 #[allow(clippy::too_many_arguments)]
 fn emit_produced_window(
     out_pos: &HashMap<VarId, usize>,
@@ -2870,14 +2953,17 @@ fn emit_produced_window(
     child_batch: &Batch,
     join: &JoinPlan,
     produced: &[Vec<(VarId, Binding)>],
-    num_cols: usize,
+    cursor: &mut JoinCursor,
     batch_size: usize,
     columns: &mut [Vec<Binding>],
-    pending: &mut VecDeque<Vec<Binding>>,
     mut seen: Option<&mut SeenSolutions>,
     ctx: &ExecutionContext<'_>,
-) -> Result<()> {
-    let mut emit = |child_row_idx: usize, prod: &[(VarId, Binding)]| -> Result<()> {
+) -> Result<bool> {
+    // Emit one row, or report the output batch full.
+    let mut emit = |child_row_idx: usize, prod: &[(VarId, Binding)]| -> Result<bool> {
+        if columns[0].len() >= batch_size {
+            return Ok(false);
+        }
         ctx.tracker.consume_fuel(1)?;
         emit_combined_row(
             out_pos,
@@ -2885,31 +2971,49 @@ fn emit_produced_window(
             child_batch,
             child_row_idx,
             prod,
-            num_cols,
-            batch_size,
             columns,
-            pending,
         );
-        Ok(())
+        Ok(true)
     };
+    let mut next = cursor.next;
+    let mut resume = cursor.row.take();
 
     match join {
-        JoinPlan::Cross => {
+        JoinPlan::Cross => loop {
             // No shared vars: every produced row pairs with every child row
             // (child is usually the single seed row).
-            for prod in produced {
-                // A solution is remembered only once it reaches the output, so
-                // the set holds what the join keeps, not the whole table.
-                if let Some(seen) = seen.as_deref_mut() {
-                    if child_batch.is_empty() || !seen.first_sight(prod, ctx)? {
-                        continue;
+            let (p, mut done) = match resume.take() {
+                Some(row) => (row.prod, row.done),
+                None => {
+                    let Some(prod) = produced.get(next) else {
+                        break;
+                    };
+                    let p = next;
+                    next += 1;
+                    // A solution is remembered only once it reaches the output,
+                    // so the set holds what the join keeps, not the whole table.
+                    if let Some(seen) = seen.as_deref_mut() {
+                        if child_batch.is_empty() || !seen.first_sight(prod, ctx)? {
+                            continue;
+                        }
                     }
+                    (p, 0)
                 }
-                for child_row_idx in 0..child_batch.len() {
-                    emit(child_row_idx, prod)?;
+            };
+            let prod = &produced[p];
+            while done < child_batch.len() {
+                if !emit(done, prod)? {
+                    cursor.next = next;
+                    cursor.row = Some(RowCursor {
+                        prod: p,
+                        key: Vec::new(),
+                        done,
+                    });
+                    return Ok(false);
                 }
+                done += 1;
             }
-        }
+        },
         JoinPlan::Hash {
             join_vars,
             full_index,
@@ -2918,50 +3022,66 @@ fn emit_produced_window(
             let dicts = crate::object_binding::TermDicts::of(ctx);
             let gv = ctx.term_view();
             let gv = gv.as_ref();
-            for prod in produced {
-                // A produced row always binds every pattern var, so its join key
-                // is complete.
-                let pkey: Vec<GroupKeyOwned> = join_vars
-                    .iter()
-                    .filter_map(|jv| {
-                        prod.iter()
-                            .find(|(v, _)| v == jv)
-                            .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
-                    })
-                    .try_collect_vec()?;
-                if pkey.len() != join_vars.len() {
-                    continue;
-                }
-                let agrees = |partial: &[Option<GroupKeyOwned>]| {
-                    partial
-                        .iter()
-                        .zip(pkey.iter())
-                        .all(|(c, p)| c.as_ref().is_none_or(|c| c == p))
+            loop {
+                let (p, key, mut done) = match resume.take() {
+                    Some(row) => (row.prod, row.key, row.done),
+                    None => {
+                        let Some(prod) = produced.get(next) else {
+                            break;
+                        };
+                        let p = next;
+                        next += 1;
+                        // A produced row always binds every pattern var, so its
+                        // join key is complete.
+                        let pkey: Vec<GroupKeyOwned> = join_vars
+                            .iter()
+                            .filter_map(|jv| {
+                                prod.iter()
+                                    .find(|(v, _)| v == jv)
+                                    .map(|(_, b)| binding_to_group_key_normalized(b, dicts, gv))
+                            })
+                            .try_collect_vec()?;
+                        if pkey.len() != join_vars.len() {
+                            continue;
+                        }
+                        if let Some(seen) = seen.as_deref_mut() {
+                            let joins = full_index.get(&pkey).is_some_and(|rows| !rows.is_empty())
+                                || partial_rows
+                                    .iter()
+                                    .any(|(_, partial)| partial_key_agrees(partial, &pkey));
+                            if !joins || !seen.first_sight(prod, ctx)? {
+                                continue;
+                            }
+                        }
+                        (p, pkey, 0)
+                    }
                 };
-                if let Some(seen) = seen.as_deref_mut() {
-                    let joins = full_index.get(&pkey).is_some_and(|rows| !rows.is_empty())
-                        || partial_rows.iter().any(|(_, partial)| agrees(partial));
-                    if !joins || !seen.first_sight(prod, ctx)? {
-                        continue;
-                    }
-                }
+                let prod = &produced[p];
                 // Fully-bound child rows: exact hash probe.
-                if let Some(rows) = full_index.get(&pkey) {
-                    for &child_row_idx in rows {
-                        emit(child_row_idx, prod)?;
+                let full: &[usize] = full_index.get(&key).map_or(&[], Vec::as_slice);
+                while let Some(&child_row_idx) = full.get(done) {
+                    if !emit(child_row_idx, prod)? {
+                        cursor.next = next;
+                        cursor.row = Some(RowCursor { prod: p, key, done });
+                        return Ok(false);
                     }
+                    done += 1;
                 }
-                // Child rows with an unbound (wildcard) join var: match those that
-                // agree on every bound position.
-                for (child_row_idx, partial) in partial_rows {
-                    if agrees(partial) {
-                        emit(*child_row_idx, prod)?;
+                // Child rows with an unbound (wildcard) join var: match those
+                // that agree on every bound position.
+                while let Some((child_row_idx, partial)) = partial_rows.get(done - full.len()) {
+                    if partial_key_agrees(partial, &key) && !emit(*child_row_idx, prod)? {
+                        cursor.next = next;
+                        cursor.row = Some(RowCursor { prod: p, key, done });
+                        return Ok(false);
                     }
+                    done += 1;
                 }
             }
         }
     }
-    Ok(())
+    cursor.next = next;
+    Ok(true)
 }
 
 /// Datatype Sids resolved once per scan instead of per literal cell — the
@@ -4539,20 +4659,15 @@ impl Operator for R2rmlScanOperator {
             // Cancellation + memory checkpoint at the top of the internal loop: this
             // loop can pull many windows / files / child batches before returning a
             // full output batch, so the runner's between-`next_batch` check would
-            // otherwise never run for a whole-table scan. Covers the loop's
-            // non-advancing branches (overflow drain, child pull) that site 2 does
-            // not. Upgraded from `check_cancelled()` to `checkpoint()` (F-AUD-3): it
+            // otherwise never run for a whole-table scan. A window's join emits at
+            // most one output batch per advance (#2462), so this also runs between
+            // every two batches of one window's output, however many rows the
+            // window joins to. Covers the loop's non-advancing branch (child pull)
+            // too. Upgraded from `check_cancelled()` to `checkpoint()` (F-AUD-3): it
             // also enforces the query memory budget against the window bytes recorded
             // by site A1 (a no-op for the budget when scan accounting is off, since
             // nothing on this path records then).
             ctx.checkpoint()?;
-            // 1. Drain overflow from a prior window before doing more work.
-            while !self.pending.is_empty() && columns[0].len() < ctx.batch_size {
-                let row = self.pending.pop_front().unwrap();
-                for (col_idx, binding) in row.into_iter().enumerate() {
-                    columns[col_idx].push(binding);
-                }
-            }
             // Emit once a full batch is accumulated, or once the LIMIT budget is
             // (optimistically) met. With a consumed filter the pre-filter count
             // over-estimates matches, so this only triggers an emit *attempt* —
@@ -4591,9 +4706,10 @@ impl Operator for R2rmlScanOperator {
                 continue;
             }
 
-            // 2. Advance an in-flight scan by one materialization window. The
-            //    window's rows fill `columns` (overflow spills to `pending`), so
-            //    the whole table is never materialized at once.
+            // Advance an in-flight scan by at most one output batch: resume a
+            // part-emitted window, or materialize the next one, so the whole
+            // table is never materialized at once and no window's join runs
+            // ahead of this loop's checkpoint.
             if let Some(mut progress) = self.progress.take() {
                 let more = self
                     .advance_one_window(ctx, &mut progress, num_cols, &mut columns)
@@ -4606,7 +4722,7 @@ impl Operator for R2rmlScanOperator {
                 continue;
             }
 
-            // 3. No scan in flight: pull the next child window and start one.
+            // No scan in flight: pull the next child window and start one.
             let child_rows = if child_window_enabled() {
                 let window = self.child_window.size();
                 let exact = window < materialize_window_rows();
@@ -4650,7 +4766,6 @@ impl Operator for R2rmlScanOperator {
         self.child.close();
         self.mapping = None;
         self.policy_gate = None;
-        self.pending.clear();
         self.progress = None;
         self.child_pending = None;
         self.scan_cache.clear();
@@ -4971,7 +5086,6 @@ mod tests {
             for c in &mut columns {
                 c.clear();
             }
-            op.pending.clear();
             // The window charge is released on hand-off, so live accounted memory
             // never approaches the naive cumulative — it stays within one window.
             assert!(
@@ -5081,7 +5195,6 @@ mod tests {
                     for c in &mut columns {
                         c.clear();
                     }
-                    op.pending.clear();
                     windows += 1;
                 }
                 Err(e) => break e,
@@ -5095,6 +5208,307 @@ mod tests {
         // Releasing the pass returns the set's charge.
         op.retire_progress(&ctx, progress);
         assert!(ctx.mem_used() < 8000, "left charged: {}", ctx.mem_used());
+    }
+
+    /// #2462: a join inside one R2RML scan whose key has few distinct values.
+    /// `?a ex:bucket ?k . ?b ex:bucket ?k` over one table whose `BUCKET`
+    /// column takes `keys` values joins each produced row to every child row
+    /// of its bucket, so one window of `rows` produced rows joins to
+    /// `rows² / keys` output rows.
+    mod many_to_many_join {
+        use super::*;
+        use crate::r2rml::R2rmlTableProvider;
+        use crate::seed::{BatchReplayOperator, EmptyOperator};
+        use crate::var_registry::VarRegistry;
+        use fluree_db_core::{LedgerSnapshot, QueryCancellation, Tracker, TrackingOptions};
+        use fluree_db_r2rml::mapping::{CompiledR2rmlMapping, PredicateMap};
+        use fluree_db_tabular::{BatchSchema, FieldInfo, FieldType};
+
+        const A: VarId = VarId(0);
+        const K: VarId = VarId(1);
+        const B: VarId = VarId(2);
+
+        /// One table, `EVENTS`: `ID` 1..=rows and `BUCKET` = `ID % keys`.
+        #[derive(Debug)]
+        struct Events {
+            rows: i64,
+            keys: i64,
+        }
+
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for Events {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                let field = |name: &str, field_id| FieldInfo {
+                    name: name.to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id,
+                };
+                let schema = Arc::new(BatchSchema::new(vec![field("ID", 1), field("BUCKET", 2)]));
+                let ids = 1..=self.rows;
+                let batch = ColumnBatch::new(
+                    schema,
+                    vec![
+                        Column::Int64(ids.clone().map(Some).collect()),
+                        Column::Int64(ids.map(|id| Some(id % self.keys)).collect()),
+                    ],
+                )
+                .unwrap();
+                Ok(Box::pin(futures::stream::once(async move { Ok(batch) })))
+            }
+        }
+
+        fn mapping() -> Arc<CompiledR2rmlMapping> {
+            Arc::new(CompiledR2rmlMapping::new(vec![TriplesMap::new(
+                "#Event", "EVENTS",
+            )
+            .with_subject_template("http://ex/event/{ID}")
+            .with_predicate_object(PredicateObjectMap {
+                predicate_map: PredicateMap::constant("http://ex/bucket"),
+                object_map: ObjectMap::column("BUCKET"),
+            })]))
+        }
+
+        /// `?subject ex:bucket ?object` over `child`, opened.
+        fn scan(child: BoxedOperator, subject: VarId, object: VarId) -> R2rmlScanOperator {
+            let pattern = R2rmlPattern::new("gs:main", subject, Some(object))
+                .with_predicate("http://ex/bucket");
+            let mut op = R2rmlScanOperator::new(child, pattern);
+            op.mapping = Some(mapping());
+            op.state = OperatorState::Open;
+            op
+        }
+
+        /// The rows of `?a ex:bucket ?k`: the child the join's second scan
+        /// reads, computed without the tracker and budget under test.
+        async fn first_scan(provider: &Events) -> Vec<Batch> {
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            ctx.r2rml_table_provider = Some(provider);
+            let mut seed = EmptyOperator::new();
+            seed.open(&ctx).await.unwrap();
+            let mut op = scan(Box::new(seed), A, K);
+            let mut batches = Vec::new();
+            while let Some(batch) = op.next_batch(&ctx).await.unwrap() {
+                batches.push(batch);
+            }
+            batches
+        }
+
+        /// `?b ex:bucket ?k` joined to `child` (the rows of `?a ex:bucket ?k`).
+        async fn second_scan(child: Vec<Batch>, ctx: &ExecutionContext<'_>) -> R2rmlScanOperator {
+            let schema: Arc<[VarId]> = Arc::from(vec![A, K].into_boxed_slice());
+            let mut child = BatchReplayOperator::new(schema, child);
+            child.open(ctx).await.unwrap();
+            scan(Box::new(child), B, K)
+        }
+
+        /// The joined rows emitted so far: the scan charges one unit of fuel
+        /// (a thousandth of one fuel) per row it emits, and nothing else here
+        /// consumes any.
+        fn emitted(tracker: &Tracker) -> usize {
+            let fuel = tracker.tally().and_then(|t| t.fuel).unwrap_or(0.0);
+            (fuel * 1000.0).round() as usize
+        }
+
+        fn fuel_tracker() -> Tracker {
+            Tracker::new(TrackingOptions {
+                track_fuel: true,
+                ..TrackingOptions::default()
+            })
+        }
+
+        /// A query cancelled after the join's first output batch stops there.
+        /// The window's 64 rows join to 4,096; emitting them all before the
+        /// next checkpoint (staging what did not fit in the batch) is what
+        /// let a timeout run on to an out-of-memory kill.
+        #[tokio::test]
+        async fn a_cancel_between_output_batches_stops_the_join() {
+            let provider = Events { rows: 64, keys: 1 };
+            let child = first_scan(&provider).await;
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let cancel = QueryCancellation::new();
+            let tracker = fuel_tracker();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars)
+                .with_cancellation(cancel.clone())
+                .with_tracker(tracker.clone());
+            ctx.r2rml_table_provider = Some(&provider);
+            ctx.batch_size = 16;
+            let mut op = second_scan(child, &ctx).await;
+
+            let first = op.next_batch(&ctx).await.unwrap().expect("a first batch");
+            assert_eq!(first.len(), 16);
+            assert_eq!(
+                emitted(&tracker),
+                16,
+                "one output batch of the window's 4,096-row join is emitted, not all of it"
+            );
+
+            cancel.cancel();
+            let err = op
+                .next_batch(&ctx)
+                .await
+                .expect_err("the cancel stops the join");
+            assert!(matches!(err, QueryError::Cancelled { .. }), "got {err:?}");
+            assert_eq!(emitted(&tracker), 16, "nothing is emitted after the cancel");
+        }
+
+        /// The memory budget is checked between the join's output batches too:
+        /// once the query is past it (a consumer has retained what the scan
+        /// handed it, say) the scan stops typed, with the rest of the window's
+        /// join unemitted. The window is charged until its last row is out,
+        /// and closing the scan returns that charge.
+        #[tokio::test]
+        async fn the_memory_budget_between_output_batches_stops_the_join() {
+            let provider = Events { rows: 64, keys: 1 };
+            let child = first_scan(&provider).await;
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let cancel = QueryCancellation::new();
+            const BUDGET: usize = 1 << 20;
+            cancel.set_memory_limit(BUDGET);
+            let tracker = fuel_tracker();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars)
+                .with_cancellation(cancel.clone())
+                .with_tracker(tracker.clone());
+            ctx.r2rml_table_provider = Some(&provider);
+            ctx.batch_size = 16;
+            let mut op = second_scan(child, &ctx).await;
+            let num_cols = op.schema().len();
+
+            let first = op.next_batch(&ctx).await.unwrap().expect("a first batch");
+            assert_eq!(first.len(), 16);
+            assert_eq!(emitted(&tracker), 16);
+            let window = 64 * num_cols * crate::context::BINDING_EST_BYTES;
+            let held = cancel.allocated_bytes();
+            assert!(
+                held >= window,
+                "the part-emitted window stays charged: {held} < {window}"
+            );
+
+            cancel.record_alloc(BUDGET);
+            let err = op
+                .next_batch(&ctx)
+                .await
+                .expect_err("the budget stops the join");
+            assert!(
+                matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+                "got {err:?}"
+            );
+            assert_eq!(emitted(&tracker), 16, "nothing is emitted past the budget");
+
+            op.close();
+            assert!(
+                cancel.allocated_bytes() <= held - window + BUDGET,
+                "closing the scan returns the window's charge: {} left",
+                cancel.allocated_bytes()
+            );
+        }
+
+        /// Every joined row once, however the output is cut: the join run one
+        /// output batch at a time over small windows matches the join emitted
+        /// in one go, for a hash join (with a child row whose join var is
+        /// unbound, which joins every produced row) and for a cross product.
+        /// The map has no key, so each produced row also passes the pass's
+        /// set of emitted solutions, once, before its first match.
+        #[tokio::test]
+        async fn a_join_cut_into_batches_emits_every_row_once() {
+            let provider = Events { rows: 12, keys: 3 };
+            let batches = first_scan(&provider).await;
+            let schema = batches[0].schema().to_vec();
+            let mut columns: Vec<Vec<Binding>> = schema
+                .iter()
+                .map(|v| {
+                    batches
+                        .iter()
+                        .flat_map(|b| b.column(*v).unwrap().iter().cloned())
+                        .collect()
+                })
+                .collect();
+            // A child row binding `?a` with `?k` unbound.
+            columns[schema.iter().position(|v| *v == A).unwrap()]
+                .push(Binding::iri("http://ex/event/unbucketed"));
+            columns[schema.iter().position(|v| *v == K).unwrap()].push(Binding::Unbound);
+            let child = Batch::new(Arc::from(schema.into_boxed_slice()), columns).unwrap();
+            assert_eq!(child.len(), 13);
+
+            for (object, expected) in [(K, 12 * 4 + 12), (VarId(3), 12 * 13)] {
+                let once = drive(&provider, &child, object, 1_000_000, 1_000_000).await;
+                assert_eq!(once.len(), expected, "the join in one go");
+                for (batch_size, window_rows) in [(1, 1), (5, 3), (7, 1), (4, 100)] {
+                    let cut = drive(&provider, &child, object, batch_size, window_rows).await;
+                    assert_eq!(
+                        cut, once,
+                        "batch size {batch_size}, windows of {window_rows} rows"
+                    );
+                }
+            }
+        }
+
+        /// `?b ex:bucket ?object` joined to `child`, driven a window at a time
+        /// with each window at most `window_rows` rows and each output batch
+        /// at most `batch_size`, taken from the scan as a consumer would: the
+        /// rows emitted, sorted.
+        async fn drive(
+            provider: &Events,
+            child: &Batch,
+            object: VarId,
+            batch_size: usize,
+            window_rows: usize,
+        ) -> Vec<String> {
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars);
+            ctx.r2rml_table_provider = Some(provider);
+            ctx.batch_size = batch_size;
+            let schema: Arc<[VarId]> = Arc::from(child.schema().to_vec().into_boxed_slice());
+            let mut op = scan(
+                Box::new(BatchReplayOperator::new(schema, Vec::new())),
+                B,
+                object,
+            );
+            let mut progress = op
+                .build_progress(&ctx, child.clone())
+                .await
+                .unwrap()
+                .expect("the events map answers the pattern");
+            assert!(progress.seen.is_some(), "a keyless map deduplicates");
+            let num_cols = op.schema().len();
+            let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            let mut rows = Vec::new();
+            loop {
+                progress.window_rows = window_rows;
+                let more = op
+                    .advance_one_window(&ctx, &mut progress, num_cols, &mut columns)
+                    .await
+                    .unwrap();
+                assert!(columns[0].len() <= batch_size, "one output batch at most");
+                for r in 0..columns[0].len() {
+                    rows.push(format!(
+                        "{:?}",
+                        columns.iter().map(|c| &c[r]).collect::<Vec<_>>()
+                    ));
+                }
+                for c in &mut columns {
+                    c.clear();
+                }
+                if !more {
+                    break;
+                }
+            }
+            rows.sort();
+            rows
+        }
     }
 
     /// F-AUD-3 site A2 — the fact-as-parent build. `build_parent_lookup` transiently
@@ -6445,20 +6859,22 @@ mod tests {
                 .expect("the orders map answers the pattern");
             let num_cols = op.schema().len();
             let mut columns: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
+            // Every row emitted, moved out of `columns` after each advance as a
+            // consumer would take the batch.
+            let mut out: Vec<Vec<Binding>> = (0..num_cols).map(|_| Vec::new()).collect();
             loop {
                 progress.window_rows = window;
                 let more = op
                     .advance_one_window(ctx, &mut progress, num_cols, &mut columns)
                     .await?;
-                while let Some(row) = op.pending.pop_front() {
-                    for (col, binding) in row.into_iter().enumerate() {
-                        columns[col].push(binding);
-                    }
+                for (all, batch) in out.iter_mut().zip(columns.iter_mut()) {
+                    all.append(batch);
                 }
                 if !more {
                     break;
                 }
             }
+            let columns = out;
             let pos = |v: VarId| op.schema().iter().position(|&s| s == v).unwrap();
             let iri = |b: &Binding| match b {
                 Binding::Iri(iri) => iri.to_string(),
