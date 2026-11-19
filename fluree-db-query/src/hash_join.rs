@@ -764,6 +764,8 @@ impl HashJoinOperator {
             }
         }
         build.close();
+        // A key comparison that failed to read split one key in two.
+        ctx.check_key_reads()?;
         Ok(())
     }
 }
@@ -923,6 +925,8 @@ impl Operator for HashJoinOperator {
             if self.cur_probe_row >= pb.len() {
                 self.cur_probe = None;
             }
+            // A probe whose key comparison failed to read missed its matches.
+            ctx.check_key_reads()?;
             if produced == 0 {
                 continue;
             }
@@ -986,6 +990,7 @@ impl Operator for HashJoinOperator {
                 None => break,
             }
         }
+        ctx.check_key_reads()?;
         self.state = OperatorState::Exhausted;
         Ok(Some(count))
     }
