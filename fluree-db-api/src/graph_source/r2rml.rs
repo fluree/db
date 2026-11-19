@@ -43,6 +43,7 @@ use fluree_db_r2rml::mapping::CompiledR2rmlMapping;
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::sync::Arc;
+use tokio_util::task::AbortOnDropHandle;
 use tracing::{debug, info, warn, Instrument};
 
 /// Max files a scan-side top-k (PR-5) reads SEQUENTIALLY (bound-ordered, with
@@ -1360,7 +1361,7 @@ impl crate::Fluree {
         info!(graph_source_id = %graph_source_id, "Creating R2RML graph source");
 
         config.validate()?;
-        let model_warnings = self
+        let mut model_warnings = self
             .validate_source_model(config.iceberg.model.as_deref())
             .await?;
         self.refuse_direct_storage_the_policy_refuses(
@@ -1382,6 +1383,9 @@ impl crate::Fluree {
         // query's alias.
         if let Some(compiled) = &registered.compiled {
             table_names = crate::ledger_info::mapping_source_tables(compiled);
+            if config.iceberg.model.is_some() {
+                model_warnings.extend(fluree_db_query::r2rml::class_overlap_warnings(compiled));
+            }
         }
         let mapping_address = registered.address;
         let table_count = table_names.len();
@@ -5634,6 +5638,9 @@ impl EmitOrder {
 ///
 /// `read` builds one file's read; it runs on its own task, so up to
 /// `concurrency` reads progress in parallel while the consumer drains them.
+/// Each read's task is held by an `AbortOnDropHandle`, so dropping the stream
+/// aborts the reads in flight: a scan dropped early (its LIMIT is met, or the
+/// query is cancelled) leaves no read running to the end of its file.
 pub(crate) fn read_files_in_order<R, Fut>(
     mut tasks: Vec<FileScanTask>,
     order: EmitOrder,
@@ -5662,7 +5669,7 @@ where
             let read = read
                 .into_inner()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            tokio::spawn(read)
+            AbortOnDropHandle::new(tokio::spawn(read))
                 .await
                 .map_err(|e| QueryError::Internal(format!("Parquet read worker failed: {e}")))?
         }
@@ -8841,6 +8848,7 @@ mod emit_order_tests {
     use fluree_db_iceberg::io::batch::{BatchSchema, Column, FieldInfo, FieldType};
     use fluree_db_iceberg::manifest::{DataFile, FileFormat, PartitionData};
     use futures::TryStreamExt;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn task(i: usize) -> FileScanTask {
         sized_task(i, 1000)
@@ -8982,6 +8990,71 @@ mod emit_order_tests {
             EmitOrder::SmallestFirst
         );
         assert_eq!(EmitOrder::for_query(ScanOrder::Any), EmitOrder::Completion);
+    }
+
+    /// Counts the reads whose future was dropped before it finished.
+    struct CountOnDrop(Arc<AtomicUsize>);
+
+    impl Drop for CountOnDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// A read that never finishes on its own, counting itself when started and
+    /// when dropped.
+    fn endless_read(
+        started: &Arc<AtomicUsize>,
+        dropped: &Arc<AtomicUsize>,
+    ) -> impl std::future::Future<Output = QueryResult<Vec<ColumnBatch>>> + Send + 'static {
+        let started = Arc::clone(started);
+        let dropped = CountOnDrop(Arc::clone(dropped));
+        async move {
+            let _dropped = dropped;
+            started.fetch_add(1, Ordering::SeqCst);
+            futures::future::pending::<()>().await;
+            unreachable!("an endless read never finishes")
+        }
+    }
+
+    /// Wait (up to 10 s) until `count` reaches `n`.
+    async fn wait_for(count: &AtomicUsize, n: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while count.load(Ordering::SeqCst) < n {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("count stayed at {}", count.load(Ordering::SeqCst)));
+    }
+
+    /// Dropping a scan's stream aborts the reads it has in flight and starts
+    /// no more, in every emit order: `buffered` and `buffer_unordered` alike.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_dropped_scan_stream_aborts_the_reads_in_flight() {
+        for order in [
+            EmitOrder::AsListed,
+            EmitOrder::SmallestFirst,
+            EmitOrder::Completion,
+        ] {
+            let (started, dropped) = (Arc::<AtomicUsize>::default(), Arc::default());
+            let tasks = (0..16).map(task).collect();
+            let mut stream = read_files_in_order(tasks, order, 4, {
+                let (started, dropped) = (Arc::clone(&started), Arc::clone(&dropped));
+                move |_task| endless_read(&started, &dropped)
+            });
+            assert!(futures::poll!(stream.next()).is_pending(), "{order:?}");
+            wait_for(&started, 4).await;
+
+            drop(stream);
+            wait_for(&dropped, 4).await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert_eq!(
+                started.load(Ordering::SeqCst),
+                4,
+                "{order:?}: no read starts after the drop"
+            );
+        }
     }
 
     /// A read error is emitted at its file's place in the emit order, after

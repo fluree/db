@@ -82,6 +82,16 @@ impl LedgerWriteGuard {
         &self.ledger
     }
 
+    /// Start a new line for the state this guard is about to install, which
+    /// is not a commit on the cached line (a rebase's result): an index
+    /// install planned on the old line is then not made on it.
+    pub(crate) fn start_line(&mut self) {
+        self.ledger
+            .inner
+            .line
+            .store(Line::fresh(), Ordering::Release);
+    }
+
     /// Get reference to current state
     pub fn state(&self) -> &LedgerState {
         &self.guard
@@ -325,6 +335,12 @@ struct LedgerHandleInner {
     /// path, so the publish listener can tell its own commits from others'
     /// without touching the state lock.
     committed_t: std::sync::atomic::AtomicI64,
+    /// Bumped each time a reload swaps in a state it loaded from the
+    /// nameservice, which may be another line than the one it replaces (a
+    /// rebase), and when this process's own rebase installs its result. An
+    /// index install planned before either is not made after it; commits on
+    /// the line leave it alone.
+    line: AtomicU64,
     write_paths: WritePathCounters,
     /// Test hook: the next optimistic stage on this handle parks here after
     /// staging and before taking the lock (see
@@ -478,6 +494,7 @@ impl LedgerHandle {
                 config_cache: RwLock::new(ConfigCacheEntry::default()),
                 recent_commits: parking_lot::Mutex::new(RecentCommits::default()),
                 committed_t: std::sync::atomic::AtomicI64::new(0),
+                line: AtomicU64::new(Line::fresh()),
                 write_paths: WritePathCounters::default(),
                 stage_gate: parking_lot::Mutex::new(None),
                 exclusion_gate: parking_lot::Mutex::new(None),
@@ -829,16 +846,22 @@ impl LedgerHandle {
         cs: Arc<dyn ContentStore>,
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+        planned_on: Line,
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let span = tracing::debug_span!(
             "index_install",
             ledger_id = %self.id(),
             index_t = tracing::field::Empty,
         );
-        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache)
+        self.apply_index_v2_inner(index_id, cs, cache_dir, leaflet_cache, planned_on)
             .instrument(span)
             .await
+    }
+
+    /// The line the cached state is on, for an index install planned now.
+    pub fn line(&self) -> Line {
+        Line(self.inner.line.load(Ordering::Acquire))
     }
 
     async fn apply_index_v2_inner(
@@ -847,7 +870,8 @@ impl LedgerHandle {
         cs: Arc<dyn ContentStore>,
         cache_dir: &std::path::Path,
         leaflet_cache: Option<Arc<LeafletCache>>,
-    ) -> Result<()> {
+        planned_on: Line,
+    ) -> Result<bool> {
         use tracing::Instrument as _;
         let bytes = cs
             .get(index_id)
@@ -921,6 +945,13 @@ impl LedgerHandle {
         let wait_us = wait_started.elapsed().as_micros() as u64;
         let install_started = Instant::now();
         let ledger_id = self.id().to_string();
+        if self.line() != planned_on {
+            tracing::debug!(
+                ledger = %ledger_id,
+                "a reload replaced the state the index was planned for; not installed"
+            );
+            return Ok(false);
+        }
         let install = async move {
             let mut state = state_guard;
             let novelty_flakes_before = state.novelty.len();
@@ -993,7 +1024,23 @@ impl LedgerHandle {
             .instrument(tracing::debug_span!("index_install_lock"))
             .await?;
 
-        Ok(())
+        Ok(true)
+    }
+}
+
+/// A ledger handle's line, as [`LedgerHandle::line`] reads it: an index
+/// install planned on one line is not made on another. Lines are unique
+/// across handles, so one taken from a handle since evicted matches none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Line(u64);
+
+impl Line {
+    /// The line of a ledger not cached when it was taken.
+    pub(crate) const UNCACHED: Line = Line(u64::MAX);
+
+    fn fresh() -> u64 {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed)
     }
 }
 
@@ -1278,7 +1325,8 @@ use fluree_db_query::BinaryRangeProvider;
 
 /// Residency mode (F8): prewarm the reverse-dict leaves that overlay
 /// translation of this snapshot's novelty will touch, in one concurrent
-/// fetch round at load time. Novelty replay stays the load model; its
+/// fetch round after an index apply or a catch-up (a load warms these
+/// leaves before its own probes). Novelty replay stays the load model; its
 /// query-time miss sources (sync `find_subject_id_by_parts` /
 /// `find_string_id` per novelty entry) are prefetched here so a cold
 /// residency peer does not spend a retry round per reverse-tree leaf.
@@ -1295,6 +1343,44 @@ async fn prefetch_novelty_translation(
         .prefetch_novelty_reverse_wants(
             dict_novelty.subjects.iter_entries(),
             dict_novelty.strings.iter_values(),
+            fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
+        )
+        .await;
+    if outcome.wanted > 0 {
+        tracing::debug!(
+            wanted = outcome.wanted,
+            newly_resident = outcome.newly_resident,
+            failures = outcome.failures.len(),
+            "novelty reverse-leaf prefetch"
+        );
+    }
+}
+
+/// Residency mode: fetch the reverse-dict leaves that
+/// `populate_dict_novelty_safe` probes for every novelty subject and string.
+/// Those probes are sync and a load runs in no retry frame, so a cold leaf
+/// fails the load. Covers the leaves [`prefetch_novelty_translation`] warms,
+/// since every DictNovelty entry comes from these flakes.
+#[cfg(any(target_arch = "wasm32", feature = "residency"))]
+async fn prefetch_novelty_dict_probes(
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    novelty: &fluree_db_novelty::Novelty,
+) {
+    use fluree_db_core::FlakeValue;
+    let mut subjects: Vec<(u16, &str)> = Vec::new();
+    let mut strings: Vec<&str> = Vec::new();
+    for f in novelty.iter_flakes(fluree_db_core::IndexType::Post) {
+        subjects.push((f.s.namespace_code, &f.s.name));
+        match &f.o {
+            FlakeValue::Ref(sid) => subjects.push((sid.namespace_code, &sid.name)),
+            FlakeValue::String(s) | FlakeValue::Json(s) => strings.push(s),
+            _ => {}
+        }
+    }
+    let outcome = store
+        .prefetch_novelty_reverse_wants(
+            subjects.into_iter(),
+            strings.into_iter(),
             fluree_db_binary_index::read::need_fetch::DEFAULT_FETCH_WIDTH,
         )
         .await;
@@ -1404,6 +1490,8 @@ pub(crate) async fn load_and_attach_binary_store(
     // This prevents minting a second internal ID for an already-indexed IRI/string.
     if !state.novelty.is_empty() {
         let novelty = state.novelty.as_ref();
+        #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+        prefetch_novelty_dict_probes(&store, novelty).await;
         let dn = Arc::make_mut(&mut state.dict_novelty);
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             dn,
@@ -1439,9 +1527,6 @@ pub(crate) async fn load_and_attach_binary_store(
     // would always be false on snapshots loaded outside the
     // LedgerManager handle path.
     snap.content_store = Some(Arc::clone(&cs));
-
-    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
-    prefetch_novelty_translation(&arc_store, &state.dict_novelty).await;
 
     // Also attach the type-erased store to the state so transaction staging
     // (which clones LedgerState under the write lock) can construct
@@ -2045,7 +2130,15 @@ impl LedgerManager {
     /// - Reloading{h, waiters} → add waiter, await completion
     /// - Loading(waiters) → wait for initial load, then return Ok(())
     /// - None → Ok(()) (not loaded, nothing to reload)
+    ///
+    /// The reloaded state is installed only if it is not behind the cached
+    /// one, so a commit applied meanwhile is never clobbered.
     pub async fn reload(&self, ledger_id: &LedgerId) -> Result<()> {
+        self.reload_installing(ledger_id, Install::UnlessBehind)
+            .await
+    }
+
+    async fn reload_installing(&self, ledger_id: &LedgerId, install: Install) -> Result<()> {
         // Normalize ledger_id to match cache key format
         let canonical_alias = ledger_id.clone();
 
@@ -2193,9 +2286,12 @@ impl LedgerManager {
                             // the fresher novelty — transiently forgoing the newer
                             // index, which the next reload picks up. Never clobber a
                             // newer in-memory commit to adopt a newer index.
-                            if new_state.t() >= write_guard.state().t() {
+                            if install == Install::Always
+                                || new_state.t() >= write_guard.state().t()
+                            {
                                 let mut bs_guard = handle.inner.binary_store.write().await;
                                 write_guard.replace(new_state);
+                                handle.inner.line.store(Line::fresh(), Ordering::Release);
                                 *bs_guard = new_binary_store;
                                 // Out-of-band swap: any resolved-config entry may
                                 // have been cached against a state this swap just
@@ -2372,7 +2468,16 @@ impl LedgerManager {
 /// Maximum number of commits to catch up incrementally before falling back to
 /// full reload. For gaps larger than this, the cost of N individual commit loads
 /// exceeds the cost of a single full reload.
+#[cfg(not(target_arch = "wasm32"))]
 const MAX_INCREMENTAL_COMMITS: i64 = 5;
+/// Browser peers: an SSE reconnect after a tab sleeps routinely wakes tens
+/// of commits behind, and a full re-open drops warm per-store state (the
+/// overlay-translation cache is store-id-keyed) that catch-up preserves.
+/// The parent-chain walk is one sequential fetch per commit, so the cap is
+/// where ~gap × RTT stops beating a re-open's concurrent artifact loads —
+/// past it, reload (which still fires the head-change signal) wins.
+#[cfg(target_arch = "wasm32")]
+const MAX_INCREMENTAL_COMMITS: i64 = 64;
 
 /// Decision from comparing cached state to nameservice record
 ///
@@ -2521,6 +2626,67 @@ pub struct NsNotify {
     pub record: Option<NsRecord>,
 }
 
+/// The head a cached ledger holds, as [`LedgerManager::follow`] compares
+/// records with it.
+struct CachedHead {
+    t: i64,
+    head: Option<ContentId>,
+    index_t: i64,
+    index: Option<ContentId>,
+}
+
+impl CachedHead {
+    async fn of(handle: &LedgerHandle) -> Self {
+        let state = handle.inner.state.read().await;
+        Self {
+            t: state.t(),
+            head: state.head_commit_id.clone(),
+            index_t: state.index_t(),
+            index: state.head_index_id.clone().or_else(|| {
+                state
+                    .ns_record
+                    .as_ref()
+                    .and_then(|r| r.index_head_id.clone())
+            }),
+        }
+    }
+
+    /// Whether `record` moves the cached head forward, or names the cached
+    /// head and index both.
+    fn advanced_or_held_by(&self, record: &NsRecord) -> bool {
+        record.commit_t > self.t
+            || (record.commit_t == self.t
+                && record.commit_head_id == self.head
+                && record.index_head_id == self.index)
+    }
+
+    /// Whether the nameservice's `current` record has replaced the cached
+    /// line: a head at or below the cached `t` other than the cached head,
+    /// or a lower or absent index under the cached head. The nameservice
+    /// only moves a branch back on a reset.
+    fn replaced_by(&self, current: &NsRecord) -> bool {
+        if current.commit_head_id == self.head {
+            self.index_lowered_by(current)
+        } else {
+            current.commit_t <= self.t
+        }
+    }
+
+    fn index_lowered_by(&self, record: &NsRecord) -> bool {
+        self.index.is_some() && (record.index_head_id.is_none() || record.index_t < self.index_t)
+    }
+}
+
+/// Which reloaded state [`LedgerManager::reload_installing`] installs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Install {
+    /// One not behind the cached state on commits.
+    UnlessBehind,
+    /// Any: the nameservice's head replaces the cached line, as a rebase
+    /// that moves a branch's head back requires.
+    Always,
+}
+
 /// Result of notify operation
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NotifyResult {
@@ -2570,6 +2736,18 @@ impl LedgerManager {
     /// - CommitCatchUp: load 1-5 commits, merge into novelty (incremental)
     /// - Reload: full reload from storage (large gaps)
     pub async fn notify(&self, input: NsNotify) -> Result<NotifyResult> {
+        self.notify_planned(input, None).await
+    }
+
+    /// [`Self::notify`] for a record its caller read after taking
+    /// `planned_on` from [`Self::line_of`]: an index install is not made if a
+    /// reload replaced the cached state since. Without one, the line is taken
+    /// here, before this call reads the record.
+    pub(crate) async fn notify_planned(
+        &self,
+        input: NsNotify,
+        planned_on: Option<Line>,
+    ) -> Result<NotifyResult> {
         // Check if ledger is cached
         let handle = {
             let entries = self.entries.read().await;
@@ -2579,6 +2757,7 @@ impl LedgerManager {
                 _ => return Ok(NotifyResult::NotLoaded),
             }
         };
+        let planned_on = planned_on.unwrap_or_else(|| handle.line());
 
         // Get fresh record from nameservice if not provided
         let ns_record = match input.record {
@@ -2637,15 +2816,22 @@ impl LedgerManager {
                     "notify: applying index update (incremental)"
                 );
                 let cs = cs_for_record().await?;
-                handle
-                    .apply_index_v2(
-                        &index_head_id,
-                        cs,
-                        &self.config.cache_dir,
-                        self.config.leaflet_cache.clone(),
-                    )
-                    .await?;
-                Ok(NotifyResult::IndexUpdated)
+                // Boxed: an index install loads the index, and inline it
+                // nests that load in every caller that reaches `notify`,
+                // `get_or_load` among them, past the future layout limit.
+                let installed = Box::pin(handle.apply_index_v2(
+                    &index_head_id,
+                    cs,
+                    &self.config.cache_dir,
+                    self.config.leaflet_cache.clone(),
+                    planned_on,
+                ))
+                .await?;
+                Ok(if installed {
+                    NotifyResult::IndexUpdated
+                } else {
+                    NotifyResult::Current
+                })
             }
 
             UpdatePlan::CommitCatchUp {
@@ -2698,6 +2884,12 @@ impl LedgerManager {
                 }
 
                 commits.reverse(); // oldest → newest
+
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                let translation_prefetch: Option<(
+                    Arc<fluree_db_binary_index::BinaryIndexStore>,
+                    Arc<fluree_db_core::dict_novelty::DictNovelty>,
+                )>;
 
                 // Apply commits under write lock (brief — all sync).
                 // Re-check state.t() under lock to guard against concurrent updates.
@@ -2773,6 +2965,16 @@ impl LedgerManager {
                     // (`apply_single_commit` mutates the dicts in place now that the
                     // provider no longer pins them.) Runs unconditionally — even
                     // after an apply error — so the provider is never left detached.
+                    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                    {
+                        translation_prefetch = provider_store.as_ref().map(|store| {
+                            (
+                                Arc::clone(store),
+                                Arc::clone(&write_guard.state().dict_novelty),
+                            )
+                        });
+                    }
+
                     if let Some(store) = provider_store {
                         let dn = Arc::clone(&write_guard.state().dict_novelty);
                         let runtime_small_dicts =
@@ -2803,14 +3005,28 @@ impl LedgerManager {
                 // Apply index update if present (after commits so novelty has latest flakes).
                 // Reuse the same branch-aware store built above for the commit walk.
                 if let Some((index_head_id, _index_t)) = index_update {
-                    handle
-                        .apply_index_v2(
-                            &index_head_id,
-                            Arc::clone(&cs),
-                            &self.config.cache_dir,
-                            self.config.leaflet_cache.clone(),
-                        )
-                        .await?;
+                    // Boxed, as in the index-only plan above.
+                    Box::pin(handle.apply_index_v2(
+                        &index_head_id,
+                        Arc::clone(&cs),
+                        &self.config.cache_dir,
+                        self.config.leaflet_cache.clone(),
+                        planned_on,
+                    ))
+                    .await?;
+                }
+
+                // Caught-up commits introduced new novelty entries whose
+                // overlay translation reverse-looks-up the persisted dict
+                // trees at query time: prewarm those leaves now (the same F8
+                // treatment the load and index-apply paths get), so a
+                // head-change → re-query is a pure hit instead of a retry
+                // round. Runs outside the write guard; when an index update
+                // swapped the store above, its apply-path prefetch already
+                // covered the new store and this is a resident no-op.
+                #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+                if let Some((store, dict_novelty)) = translation_prefetch {
+                    prefetch_novelty_translation(&store, &dict_novelty).await;
                 }
 
                 Ok(NotifyResult::CommitsApplied { count: gap })
@@ -2821,6 +3037,93 @@ impl LedgerManager {
                 Ok(NotifyResult::Reloaded)
             }
         }
+    }
+
+    /// Apply a record from the writer's own event stream, as a query peer
+    /// does. The stream is authoritative, but it can trail the cached state:
+    /// a load reads the nameservice, which may already be ahead of it.
+    ///
+    /// A record that moves the cached head forward, or names the cached head
+    /// and index, is applied as [`Self::notify`] applies it. Any other record
+    /// is judged by the nameservice's current record: a head below or beside
+    /// the cached one, or another index under it. Such a record is one the
+    /// cache has passed, an index the nameservice may no longer hold (one a
+    /// rebase reset, or a reset read half-written), or a reset itself, such
+    /// as a rebase that moves a branch's head back or lowers its index. A
+    /// reset reloads the ledger, which goes on serving the cached state until
+    /// the reload lands; otherwise the current record is applied.
+    ///
+    /// A record for a ledger that is still loading is followed once the load
+    /// lands, since the load may have read the nameservice before it.
+    pub async fn follow(&self, record: NsRecord) -> Result<NotifyResult> {
+        let ledger_id = record.ledger_id.clone();
+        let cached = match self.entries.read().await.get(&ledger_id) {
+            Some(LoadState::Ready(handle) | LoadState::Reloading { handle, .. }) => {
+                Some(handle.clone())
+            }
+            Some(LoadState::Loading { .. }) => None,
+            Some(LoadState::Failed { .. }) | None => return Ok(NotifyResult::NotLoaded),
+        };
+        let handle = match cached {
+            Some(handle) => handle,
+            // Joins the load in flight.
+            None => self.get_or_load(&ledger_id).await?,
+        };
+        self.follow_cached(&handle, record).await
+    }
+
+    async fn follow_cached(&self, handle: &LedgerHandle, record: NsRecord) -> Result<NotifyResult> {
+        let ledger_id = record.ledger_id.clone();
+        let planned_on = handle.line();
+        if CachedHead::of(handle).await.advanced_or_held_by(&record) {
+            return self.notify_with(record, planned_on).await;
+        }
+        let Some(current) = self.current_record(&ledger_id).await? else {
+            return Ok(NotifyResult::Current);
+        };
+        if !CachedHead::of(handle).await.replaced_by(&current) {
+            // A record the cache has passed.
+            return self.notify_with(current, planned_on).await;
+        }
+        tracing::info!(
+            alias = %ledger_id,
+            commit_t = current.commit_t,
+            index_t = current.index_t,
+            "the nameservice replaced the cached line; reloading"
+        );
+        self.reload_installing(&ledger_id, Install::Always).await?;
+        // A reload already in flight installs only a state not behind the
+        // cached one, so it may have installed nothing.
+        if let Some(current) = self.current_record(&ledger_id).await? {
+            if CachedHead::of(handle).await.replaced_by(&current) {
+                self.reload_installing(&ledger_id, Install::Always).await?;
+            }
+        }
+        Ok(NotifyResult::Reloaded)
+    }
+
+    async fn notify_with(&self, record: NsRecord, planned_on: Line) -> Result<NotifyResult> {
+        self.notify_planned(
+            NsNotify {
+                ledger_id: record.ledger_id.clone(),
+                record: Some(record),
+            },
+            Some(planned_on),
+        )
+        .await
+    }
+
+    async fn current_record(&self, ledger_id: &LedgerId) -> Result<Option<NsRecord>> {
+        Ok(self.nameservice_mode.reader().lookup(ledger_id).await?)
+    }
+
+    /// The line of the cached ledger, for a record its caller is about to
+    /// read and pass to [`Self::notify_planned`]. A ledger not cached now has
+    /// a line no handle has.
+    pub(crate) async fn line_of(&self, ledger_id: &LedgerId) -> Line {
+        self.get_loaded_handle(ledger_id)
+            .await
+            .map_or(Line::UNCACHED, |handle| handle.line())
     }
 
     /// Returns the cached ledger's current `t`, or `None` if not cached.

@@ -89,9 +89,14 @@ pub async fn lookup_subject_classes(
     Ok(result)
 }
 
-/// Look up classes for subjects and populate the policy context's class cache.
+/// Look up classes for subjects and populate the policy context's class cache
+/// under the state `db` reads, with an empty entry for each subject that has
+/// no `rdf:type`.
 ///
-/// This is a convenience function that combines lookup with cache population.
+/// A prefetch for checks that then resolve one subject at a time: without the
+/// empty entry, each check of an untyped subject reads its `rdf:type` again.
+/// Does nothing for an overlay with no content version: no check can take
+/// the state its entries would be cached under.
 ///
 /// # Arguments
 ///
@@ -103,26 +108,62 @@ pub async fn populate_class_cache(
     db: GraphDbRef<'_>,
     policy_ctx: &crate::evaluate::PolicyContext,
 ) -> Result<()> {
+    let state = crate::evaluate::ClassState::of(db);
+    if !state.is_shared() {
+        return Ok(());
+    }
+    populate(state, subjects, db, policy_ctx, true).await
+}
+
+/// Populate the class cache under `state`, the state the caller then reads
+/// with: a state of an overlay with no content version answers only for the
+/// value it was taken as.
+///
+/// Caches only the subjects it finds classes for. A batch filter meets most
+/// subjects once, so an entry for an untyped one would be an insert nobody
+/// reads.
+pub async fn populate_class_cache_in(
+    state: crate::evaluate::ClassState,
+    subjects: &[Sid],
+    db: GraphDbRef<'_>,
+    policy_ctx: &crate::evaluate::PolicyContext,
+) -> Result<()> {
+    populate(state, subjects, db, policy_ctx, false).await
+}
+
+async fn populate(
+    state: crate::evaluate::ClassState,
+    subjects: &[Sid],
+    db: GraphDbRef<'_>,
+    policy_ctx: &crate::evaluate::PolicyContext,
+    cache_untyped: bool,
+) -> Result<()> {
     // Skip if no class policies need checking
     if !policy_ctx.wrapper().has_class_policies() {
         return Ok(());
     }
 
-    // Key on the graph this ref reads, so classes resolved in one graph are never
-    // consulted for a decision about another.
-    let g_id = db.g_id;
-    // Only resolve subjects this context has not already cached: the scan
-    // operator populates per batch and hydration re-asks per subject fetch, so
-    // without this every subject pays the index lookup (a leaflet decode) at
-    // least twice.
-    let uncached = policy_ctx.retain_uncached(g_id, db.t, subjects);
+    // Keyed on the state this ref reads, so classes resolved there are never
+    // consulted for a decision about another graph, time or overlay.
+    // Only resolve subjects this context has not already cached: the enforcer
+    // resolves per batch and hydration re-asks per subject fetch, so without
+    // this every subject pays the index lookup (a leaflet decode) at least
+    // twice.
+    let uncached = policy_ctx.retain_uncached(state, subjects);
     if uncached.is_empty() {
         return Ok(());
     }
     let class_map = lookup_subject_classes(&uncached, db).await?;
 
+    if cache_untyped {
+        for subject in uncached {
+            if !class_map.contains_key(&subject) {
+                policy_ctx.cache_subject_classes(state, subject, Vec::new());
+            }
+        }
+    }
     for (subject, classes) in class_map {
-        policy_ctx.cache_subject_classes(g_id, db.t, subject, classes);
+        policy_ctx.cache_subject_classes(state, subject, classes);
     }
 
     Ok(())

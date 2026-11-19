@@ -41,7 +41,7 @@
 //! that cell rather than dropping the entire row.
 
 use super::config::{FormatterConfig, OutputFormat};
-use super::datatype::is_inferable_datatype;
+use super::datatype::{ill_typed_json_literal, json_document, may_print_bare};
 use super::iri::IriCompactor;
 use super::{FormatError, Result};
 use crate::QueryResult;
@@ -50,7 +50,7 @@ use fluree_db_core::query_bounds::RangeOptions;
 use fluree_db_core::range::{RangeMatch, RangeTest};
 use fluree_db_core::value::FlakeValue;
 use fluree_db_core::{Flake, GraphDbRef, LedgerSnapshot, Sid, Tracker};
-use fluree_db_policy::{is_schema_flake, PolicyContext};
+use fluree_db_policy::PolicyContext;
 use fluree_db_query::binding::Binding;
 use fluree_db_query::ir::{
     Column, ForwardItem, HydrationSpec, NestedModifiers, NestedOrderKey, NestedSelectSpec, Root,
@@ -2086,7 +2086,7 @@ impl<'a> HydrationFormatter<'a> {
         }
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
-        if !is_inferable_datatype(&dt_full) {
+        if !may_print_bare(&dt_full, &flake.o) {
             wrapper.insert("@type".to_string(), json!(dt_compact));
         }
         Ok(JsonValue::Object(wrapper))
@@ -2250,12 +2250,11 @@ impl<'a> HydrationFormatter<'a> {
 
         // Special handling for @json datatype: deserialize the JSON string.
         // Accept both Json and String variants (see jsonld.rs for rationale).
+        // Text that is not JSON is written as the typed literal it is.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })
+                    Ok(json_document(json_str).unwrap_or_else(|| ill_typed_json_literal(json_str)))
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2280,7 +2279,7 @@ impl<'a> HydrationFormatter<'a> {
         }
 
         // Inferable datatypes can omit @type
-        if is_inferable_datatype(&dt_full) {
+        if may_print_bare(&dt_full, &flake.o) {
             return match &flake.o {
                 FlakeValue::String(s) => Ok(JsonValue::String(s.clone())),
                 FlakeValue::Long(n) => Ok(json!(n)),
@@ -2386,17 +2385,18 @@ impl<'a> HydrationFormatter<'a> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
 
-        // @json datatype: deserialize and wrap with @type
+        // @json datatype: deserialize and wrap with @type; text that is not
+        // JSON as the typed literal it is.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    let json_val: JsonValue = serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })?;
-                    Ok(json!({
-                        "@value": json_val,
-                        "@type": "@json"
-                    }))
+                    Ok(match json_document(json_str) {
+                        Some(json_val) => json!({
+                            "@value": json_val,
+                            "@type": "@json"
+                        }),
+                        None => ill_typed_json_literal(json_str),
+                    })
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2541,12 +2541,13 @@ impl<'a> HydrationFormatter<'a> {
         let dt_full = self.compactor.decode_sid(&flake.dt)?;
         let dt_compact = self.compactor.compact_sid(&flake.dt)?;
 
+        // The document, or text that is not JSON as that text; `@type`
+        // beside it names the datatype.
         if dt_full == rdf::JSON || dt_compact == "@json" {
             return match &flake.o {
                 FlakeValue::Json(json_str) | FlakeValue::String(json_str) => {
-                    serde_json::from_str(json_str).map_err(|e| {
-                        FormatError::InvalidBinding(format!("Invalid JSON in @json value: {e}"))
-                    })
+                    Ok(json_document(json_str)
+                        .unwrap_or_else(|| JsonValue::String(json_str.clone())))
                 }
                 _ => Err(FormatError::InvalidBinding(
                     "@json datatype must have FlakeValue::Json".to_string(),
@@ -2766,12 +2767,8 @@ impl<'a> HydrationFormatter<'a> {
     ///
     /// Schema flakes are always allowed. Other flakes are checked against the
     /// policy context's view set via the **async** evaluator, so `f:query`
-    /// policies run (the sync evaluator silently skips them). The subject class
-    /// cache is populated first: hydration-only-fetched subjects (direct-id
-    /// selects, nested-ref expansion) are never scanned, so the cache would
-    /// otherwise be empty and every `f:onClass` restriction would silently drop
-    /// to `default_allow`. Class membership is resolved at this view's `t` via
-    /// the GraphDbRef.
+    /// policies run (the sync evaluator silently skips them). Class membership
+    /// is resolved at this view's `t` via the GraphDbRef.
     async fn filter_flakes_by_policy(
         &self,
         flakes: Vec<Flake>,
@@ -2780,18 +2777,6 @@ impl<'a> HydrationFormatter<'a> {
         // Share the existing class cache (Arc-backed) so populated lookups carry
         // across fetches and the original policy context sees them too.
         let enforcer = QueryPolicyEnforcer::new(Arc::new(policy_ctx.clone()));
-
-        let mut subjects: Vec<Sid> = flakes
-            .iter()
-            .filter(|f| !is_schema_flake(&f.p, &f.o))
-            .map(|f| f.s.clone())
-            .collect();
-        subjects.sort();
-        subjects.dedup();
-        enforcer
-            .populate_class_cache_for_graph(self.db, &subjects)
-            .await
-            .map_err(|e| FormatError::InvalidBinding(format!("policy class lookup failed: {e}")))?;
 
         let disabled = Tracker::disabled();
         let tracker = self.tracker.unwrap_or(&disabled);

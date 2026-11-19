@@ -463,10 +463,9 @@ async fn build_policy_context_from_opts_inner(
     // the assembler prunes zero-count entries before policy sees them, so a
     // spurious `-1` can delete a property from a class's list. In the
     // `f:onClass` Allow direction that fails closed, which is the safe way to
-    // be wrong; in `compute_class_check_needed`'s subset test it could drop a
-    // runtime class check, which is not. Left on the estimate lane anyway —
-    // an uncached per-query builder cannot afford base probes — but the
-    // exposure is a count-drift one, not a no-op.
+    // be wrong; a Deny that loses the property the same way is not. Left on
+    // the estimate lane anyway — an uncached per-query builder cannot afford
+    // base probes — but the exposure is a count-drift one, not a no-op.
     let stats: Option<Arc<IndexStats>> = if restrictions.is_empty() {
         // Empty policy sets never consult stats. Avoid scanning accumulated
         // novelty while preserving the default-allow/root decision below.
@@ -620,8 +619,9 @@ pub async fn identity_has_no_policies(
 /// [`identity_has_no_policies`] exposes the local-assignment distinction for
 /// inspection. It is not an authorization or delegation check.
 enum IdentityLookupResult {
-    /// The identity IRI cannot be resolved (unregistered namespace) or has no subject
-    /// node in this ledger. No identity SID is available to bind `?$identity`.
+    /// The identity IRI is not one this ledger can hold (its prefix has no code while
+    /// the namespace table has room), or has no subject node in this ledger. No
+    /// identity SID is available to bind `?$identity`.
     NotFound,
     /// The identity IRI exists as a subject in the ledger but has no `f:policyClass`
     /// property. No restrictions apply; `default_allow` governs access.
@@ -1613,9 +1613,11 @@ fn resolve_iri_to_sid(snapshot: &LedgerSnapshot, iri: &str) -> Result<Sid> {
 /// Resolve an identity IRI to a SID **strictly**.
 ///
 /// Connection `opts.identity` is used to look up policies via `f:policyClass`.
-/// For parity with the existing API behavior and tests, we treat unknown IRIs
-/// (no registered namespace prefix) as an error rather than silently encoding
-/// them under the EMPTY namespace.
+/// An IRI this ledger cannot hold (its prefix has no code while the namespace
+/// table has room) is an error rather than a Sid under the EMPTY namespace,
+/// which no stored subject has. Once the table is full, every IRI encodes as
+/// the write path stores it, under its prefix's code or `OVERFLOW`, so a
+/// stored identity is found and its policies apply.
 fn resolve_identity_iri_to_sid(snapshot: &LedgerSnapshot, iri: &str) -> Result<Sid> {
     snapshot.encode_iri_strict(iri).ok_or_else(|| {
         ApiError::query(format!("Failed to resolve IRI '{iri}' for identity policy"))
@@ -1626,7 +1628,10 @@ fn resolve_identity_iri_to_sid(snapshot: &LedgerSnapshot, iri: &str) -> Result<S
 ///
 /// Server-level policy defaults (and query `opts.policy-class`) should not silently
 /// fall back to EMPTY namespace encoding, because that would make the class lookup
-/// a no-op and effectively disable policy enforcement.
+/// a no-op and effectively disable policy enforcement. Once the namespace table is
+/// full, every IRI encodes as the write path stores it, so a stored class is found;
+/// a class no stored policy has loads none, as a misspelled class under a prefix
+/// with a code does, and `default-allow` governs.
 fn resolve_policy_class_iri_to_sid(snapshot: &LedgerSnapshot, iri: &str) -> Result<Sid> {
     snapshot
         .encode_iri_strict(iri)

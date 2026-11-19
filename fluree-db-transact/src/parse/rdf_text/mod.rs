@@ -821,18 +821,25 @@ mod tests {
 
     #[test]
     fn literals_convert_as_insert_converts_them() {
-        // An ill-typed lexical form is kept, with its declared datatype, as
-        // `FlakeSink` keeps it: one conversion on every RDF-text lane.
+        // A typed literal parses as its datatype, as an insert parses it, and
+        // an ill-typed lexical form is refused with the insert's error: one
+        // conversion on every RDF-text lane.
         let got = rendered(&format!(
             "{EX}@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
-             ex:s ex:n \"abc\"^^xsd:integer ; ex:m \"12\"^^xsd:integer .\n"
+             ex:s ex:m \"12\"^^xsd:integer .\n"
         ));
-        assert!(
-            got.iter()
-                .any(|t| t.contains("\"abc\"^^<http://www.w3.org/2001/XMLSchema#integer>")),
-            "{got:?}"
-        );
         assert!(got.iter().any(|t| t.contains("Long(12)")), "{got:?}");
+        let refused = err(
+            &format!(
+                "{EX}@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\
+                 ex:s ex:n \"abc\"^^xsd:integer .\n"
+            ),
+            Placement::AsWritten,
+        );
+        assert!(
+            refused.contains("Cannot parse 'abc' as integer"),
+            "{refused}"
+        );
     }
 
     // ---- txn-meta ------------------------------------------------------

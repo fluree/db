@@ -24,11 +24,21 @@
 //! streams it directly. This lets the base edge hash-join the child
 //! instead of replanning + re-executing the inner subplan per parent
 //! row — the latter made an annotated object-join O(parent rows) and
-//! was the cause of IC5's timeout. The per-row, per-source path is
-//! used only when a multi-source dataset is actually attached.
+//! was the cause of IC5's timeout.
+//!
+//! A union of two or more sources in current mode does the same: each
+//! scan of the chain then deduplicates on fact identity across the
+//! sources, so the base edge and its `f:reifies*` facts are each one
+//! fact however many sources hold them, and the chain over the union
+//! answers as over the merged graph, with no cross-product. Run per
+//! source, it would answer each source's copy of an annotated edge. The
+//! per-row, per-source path is left to unions whose scans keep every
+//! member's rows (history mode).
 
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
+use crate::dataset::ActiveGraphs;
+use crate::dataset_operator::union_dedups_on_fact_identity;
 use crate::error::Result;
 use crate::execute::build_where_operators_seeded;
 use crate::ir::{Pattern, Ref};
@@ -281,11 +291,12 @@ pub struct DefaultGraphSourceOperator {
     /// build previously passed `None`, which is what kept the annotated
     /// `HAS_MEMBER` join slow even once it was built once.
     stats: Option<Arc<StatsView>>,
-    /// Single default-graph fast path: when no dataset is attached the
-    /// per-source correlation is unnecessary, so the inner subplan is built
-    /// ONCE seeded by the whole child stream (base edge can hash-join) and
-    /// streamed directly, instead of replanning + re-executing per parent row.
-    single_graph_delegate: Option<BoxedOperator>,
+    /// The inner subplan built ONCE, seeded by the whole child stream (the
+    /// base edge can hash-join) and streamed directly, instead of replanned
+    /// and re-executed per parent row and source. Built when no dataset is
+    /// attached (one graph, nothing to correlate per source), and over a
+    /// union whose scans deduplicate on fact identity (see [`Self::open`]).
+    delegate: Option<BoxedOperator>,
     /// Planner estimate of the wrapped chain's output, with the child's
     /// variables bound — the same figure `reorder_patterns` placed the
     /// wrapper by. Reported through `estimated_rows` so the join above sees
@@ -352,7 +363,7 @@ impl DefaultGraphSourceOperator {
             buffer_pos: 0,
             planning,
             stats,
-            single_graph_delegate: None,
+            delegate: None,
             estimated,
             needed_outside,
         }
@@ -827,12 +838,36 @@ impl Operator for DefaultGraphSourceOperator {
         // as one normal join block — the base edge can hash-join the child — and
         // stream directly, instead of replanning and re-executing per parent row
         // (which made an annotated object-join O(parent rows): IC5's 65s cliff).
-        // Multi-source datasets keep the per-row, per-source path below.
+        // A deduplicating union builds once too; other datasets keep the
+        // per-row, per-source path below.
         if ctx.dataset.is_none() {
             let child = std::mem::replace(&mut self.child, Box::new(EmptyOperator::new()));
             let mut delegate = self.build_single_graph_delegate(child, ctx)?;
             delegate.open(ctx).await?;
-            self.single_graph_delegate = Some(delegate);
+            self.delegate = Some(delegate);
+        } else if union_dedups_on_fact_identity(
+            match ctx.active_graphs() {
+                ActiveGraphs::Many(graphs) => graphs.len(),
+                ActiveGraphs::Single => 1,
+            },
+            self.planning.mode(),
+        ) {
+            // A union whose every scan deduplicates on fact identity answers
+            // as the merged graph: an edge and annotation two sources both
+            // hold are one fact each, so the chain built once over the union
+            // finds them once. Per source it would find each source's copy.
+            // The single-graph lanes read one graph's arena, so the chain
+            // takes the generic plan.
+            let child = std::mem::replace(&mut self.child, Box::new(EmptyOperator::new()));
+            let mut delegate = build_where_operators_seeded(
+                Some(child),
+                &self.inner_patterns,
+                self.stats.clone(),
+                None,
+                &self.planning,
+            )?;
+            delegate.open(ctx).await?;
+            self.delegate = Some(delegate);
         } else {
             self.child.open(ctx).await?;
         }
@@ -847,14 +882,14 @@ impl Operator for DefaultGraphSourceOperator {
             return Ok(None);
         }
 
-        // Single-graph fast path: stream the once-built inner subplan directly.
+        // Stream the once-built inner subplan directly.
         // The delegate's batch column order comes from the REORDERED inner
         // chain (plus whichever probe lane fired), which need not match this
         // operator's declared schema — re-project so positional consumers
         // above (NestedLoopJoin bind instructions read by column index) see
         // the contract they were planned against. Matching layouts pass
         // through untouched.
-        if let Some(delegate) = self.single_graph_delegate.as_mut() {
+        if let Some(delegate) = self.delegate.as_mut() {
             let out = delegate.next_batch(ctx).await?;
             let Some(batch) = out else { return Ok(None) };
             if batch.schema() == self.schema.as_ref() {
@@ -920,7 +955,7 @@ impl Operator for DefaultGraphSourceOperator {
     }
 
     fn close(&mut self) {
-        if let Some(delegate) = self.single_graph_delegate.as_mut() {
+        if let Some(delegate) = self.delegate.as_mut() {
             delegate.close();
         } else {
             self.child.close();
