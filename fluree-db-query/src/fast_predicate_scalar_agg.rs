@@ -402,7 +402,7 @@ pub(crate) fn scan_predicate_scalar_agg(
     // for leaves that predate `lead_group_count` and handles IRI refs only.
     if matches!(kind, ScalarAggKind::CountDistinctObject) {
         if let Some(distinct) =
-            crate::fast_count::count_distinct_objects_for_predicate(store, g_id, p_id)?
+            crate::fast_count::count_distinct_objects_for_predicate(store, g_id, p_id, tracker)?
         {
             return Ok(Some(AggOutput::Integer(count_to_i64(
                 distinct,

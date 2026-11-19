@@ -112,7 +112,7 @@ fn sum_strlen_group_concat_fold(
     if total_rows == 0 {
         return Ok(FastSumStrlenGroupConcat::Supported(None));
     }
-    let Some(subjects) = count_distinct_subjects_for_predicate(store, g_id, p_id)? else {
+    let Some(subjects) = count_distinct_subjects_for_predicate(store, g_id, p_id, tracker)? else {
         return Ok(FastSumStrlenGroupConcat::Unsupported);
     };
     let Some(strlen_sum) = sum_strlen_any_string_dict(store, g_id, p_id, cancellation, tracker)?

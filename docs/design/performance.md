@@ -159,12 +159,16 @@ cache excludes sidecar data. Time-travel support therefore adds no cost to
 current-state queries.
 
 **Leaflet directories.** Each leaf's uncompressed header carries a
-`LeafletDirEntryV3` per leaflet: `row_count`, `lead_group_count`, 26-byte
+`LeafletDirEntryV3` per leaflet: `row_count`, `lead_group_count`, 30-byte
 `first_key` / `last_key` routing keys, the constant `p_const` / `o_type_const`
-values, and the per-column block references. Several optimizations depend on
-this directory. For example, when `first_key(i) == first_key(i+1)` in POST order,
-leaflet `i` contains a single `(p, o)` group and can be counted without
-decompression.
+values, the per-column block references, and the groups of the leaflet's first
+and last rows. Several optimizations depend on this directory. Routing keys
+bound a leaflet's rows (they are widened over the history it holds), so they
+serve bounds arguments: when `first_key(i)` and `first_key(i+1)` share a
+`(p, o)` prefix in POST order, every row of leaflet `i` has it, and the leaflet
+can be counted without decompression. Answers that need a row's own value
+(distinct counts across leaflets, a predicate's MIN/MAX) read the stored groups
+instead ([Index format](index-format.md#leaf-file-fli3-fli)).
 
 The same directory entry also carries the leaflet's history locator
 (`history_offset`, `history_len`, `history_min_t`, `history_max_t`): an offset

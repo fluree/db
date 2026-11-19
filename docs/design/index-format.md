@@ -198,13 +198,13 @@ be accessed without scanning the entire file.
   _pad: [u8; 2]
   leaflet_count: u32
   total_rows: u64
-  first_key: [u8; 26]    (ORDERED_KEY_V2)
-  last_key:  [u8; 26]
+  first_key: [u8; 30]    (ORDERED_KEY_V2; 34 for a pooled order)
+  last_key:  [u8; 30]
 [LeafletDirectory: leaflet_count × variable]
   row_count: u32
   lead_group_count: u32
-  first_key: [u8; 26]
-  last_key:  [u8; 26]
+  first_key: [u8; 30]    routing keys: bound the rows AND the history
+  last_key:  [u8; 30]
   p_const: u32           (u32::MAX = not present)
   o_type_const: u16      (u16::MAX = not present)
   flags: u32             (HAS_O_I | HAS_O_TYPE_COL)
@@ -216,21 +216,46 @@ be accessed without scanning the entire file.
   history_len: u32        │ not into this leaf
   history_min_t: u32      │
   history_max_t: u32     ─┘
+  live_first: [u8; G]    group of the first row ─┐ zero when row_count = 0;
+  live_last:  [u8; G]    group of the last row  ─┘ absent in a v4 leaf
 [LeafletData: concatenated compressed column blocks]
 ```
 
 Directory entries are variable-length because `column_count` varies with the sort
 order and which values were hoisted to constants.
 
-**Leaflet-boundary skip-decoding.** Because each entry carries `first_key` /
-`last_key` uncompressed, adjacent entries can be compared without touching the
-payload. If two adjacent entries share the same `(p_id, o_type, o_key)` prefix in
-POST order, the earlier leaflet is guaranteed to contain only that `(p, o)`
-combination — so fast-path COUNT and GROUP BY operators count rows straight from
-`row_count` without decompressing any column block. `lead_group_count` similarly
-gives the number of distinct leading-key values per leaflet without a decode.
-This is what makes the directory-only aggregates in
+**Routing keys and live groups.** `first_key` / `last_key` are routing bounds. A
+leaflet's history can sort past its rows (a subject's last fact retracted, a fully
+retracted subject between two leaflets), and the writer widens the keys over it so
+that a time-travel read still reaches that history. So the keys bound every row the
+leaflet holds, but they need not be the keys of its first and last rows. They are
+safe for pruning ("no row outside `[first_key, last_key]`") and never safe as a
+value ("the leaflet's minimum is `first_key`") or as proof that a row exists.
+
+`live_first` / `live_last` name the rows themselves: the group, in the sense
+`lead_group_count` counts, of the leaflet's first and last row. `G` is the group's
+length as a prefix of the order's key:
+
+| Order | Group | `G` |
+|---|---|---|
+| SPOT, SPOT-g | subject | 8 |
+| PSOT, PSOT-g | predicate, subject | 12 |
+| POST, POST-g | predicate, object | 14 |
+| OPST, OPST-g | object | 10 |
+| GSPO | graph, subject | 12 |
+
+Every writer derives them from the rows it encodes (`encode_leaflet`), and a leaflet
+copied without re-encoding keeps its rows and so its groups. They make directory-only
+aggregates exact: distinct groups over a run of leaflets are `Σ lead_group_count`,
+less one wherever a leaflet's `live_first` equals the previous leaflet's
+`live_last`; a predicate's numeric minimum in POST is its first leaflet's
+`live_first`. This is what makes the directory-only aggregates in
 [Performance architecture](performance.md) `O(leaflets)` rather than `O(rows)`.
+
+A v4 leaf (version 1) stores no live groups. A reader serving a v4 index takes a
+leaflet's routing keys as its rows' keys only where the leaflet has no history (v4
+writers never drop history, so no history means no widening), and otherwise reads
+the group from the leaflet's lead column.
 
 **History locators.** The four `history_*` fields address a segment inside the
 leaf's [history sidecar](#history-sidecar-fhs1) — the leaf itself never contains
@@ -277,8 +302,9 @@ Per leaflet (see `EncodedLeaflet` in `fluree-db-binary-index/src/format/leaflet.
 ```text
 row_count: u32
 lead_group_count: u32          // distinct values of the leading sort key
-first_key: [u8; 26]            // ORDERED_KEY_V2_SIZE, order-specific routing key
-last_key:  [u8; 26]
+first_key: [u8; 30]            // order-specific routing key (see above)
+last_key:  [u8; 30]
+live_edges: Option<(LiveGroup, LiveGroup)>  // groups of the first and last row
 p_const:      Option<u32>      // POST/PSOT: the leaflet's constant predicate
 o_type_const: Option<u16>      // OPST always; other orders when single-typed
 flags: u32                     // HAS_O_I | HAS_O_TYPE_COL

@@ -4819,7 +4819,7 @@ fn decode_overlay_object(
 
 /// The `o_key` interval a POST key range `[first, last]` leaves to the rows of
 /// `want = (p_id, o_type)`, or `None` when the range holds none.
-fn post_o_key_bounds(
+pub(crate) fn post_o_key_bounds(
     first: &fluree_db_binary_index::format::run_record_v2::RunRecordV2,
     last: &fluree_db_binary_index::format::run_record_v2::RunRecordV2,
     want: (u32, u16),
@@ -6441,6 +6441,7 @@ mod tests {
             lead_group_count: 1,
             first_key: key(first),
             last_key: key(last),
+            live_edges: fluree_db_binary_index::format::leaf::LiveEdges::Legacy,
             p_const,
             o_type_const: None,
             flags: 0,

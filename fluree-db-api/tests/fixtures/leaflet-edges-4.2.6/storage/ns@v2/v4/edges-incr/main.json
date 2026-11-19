@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "@id": "v4/edges-incr:main",
+  "@type": [
+    "f:LedgerSource"
+  ],
+  "f:ledger": {
+    "@id": "v4/edges-incr"
+  },
+  "f:branch": "main",
+  "f:commitCid": "bagaybqabciqognrgskfdwu2lzaeyk4y5nk2yxailo4x7zyamkcmamdiriomviiy",
+  "f:t": 2,
+  "f:status": "ready",
+  "f:statusV": 1,
+  "f:configV": 0
+}
