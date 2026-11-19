@@ -4319,10 +4319,7 @@ impl Fluree {
                 return None;
             }
         };
-        // `false`: `fluree index` resolves coverage for a ledger that has not
-        // been indexed yet, which needs no override. Rebuilding past the
-        // sticky bit is `reindex --rebuild-annotations`, and is acknowledged.
-        crate::indexer_attachment_provider::attachment_events_from_state(&state, false).await
+        crate::indexer_attachment_provider::attachment_events_from_state(&state).await
     }
 
     /// Per-instance cache for cross-ledger governance artifacts.
