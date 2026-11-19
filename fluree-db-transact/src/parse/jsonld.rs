@@ -129,20 +129,17 @@ fn parse_rooted(
     refuse_query_only_opts(json)?;
 
     // M1: lower `@annotation` / `@edge` / `@reifies` into the seven-fact
-    // `f:reifies*` system encoding before JSON-LD expansion, rejecting
-    // user-authored `f:reifies*` IRIs and every deferred shape (literal-
-    // valued annotations, multi-triple reifiers, annotation-of-annotation).
+    // `f:reifies*` system encoding before JSON-LD expansion, refusing every
+    // deferred shape (literal-valued annotations, multi-triple reifiers,
+    // annotation-of-annotation). Only the lowering needs the payload clone,
+    // and only when an `@annotation` / `@edge` / `@reifies` block is
+    // present: a large non-annotated transaction skips the clone and both
+    // rewrite walks entirely.
     //
-    // The firewall always runs on the *original* document (read-only) — it
-    // is the security guard against user-authored system IRIs, so it must
-    // not be gated. Only the mutating lowering passes need the payload
-    // clone, and only when an `@annotation` / `@edge` / `@reifies` block is
-    // actually present: a large non-annotated transaction then skips the
-    // clone and both rewrite walks entirely.
     // Reserved predicates are refused in what the user wrote, by the IRIs the
     // parser resolves: an ordinary document on the expansion the parser makes
-    // anyway, an annotated one as written, before the lowering adds
-    // statements of its own.
+    // anyway, an annotated one as written, not as the lowering rewrites it,
+    // since the lowering adds statements of its own.
     let annotated = super::edge_annotations::document_has_annotation_keys(json);
     // An update's `where` and `values` go to the query parser, not the
     // expander: they get the check a query's clauses get.
@@ -165,7 +162,8 @@ fn parse_rooted(
     //    `delete` key, so it would be a structural no-op anyway.
     // 2. The standard assertion-shaped lowering rewrites the rest. Both
     //    passes synthesize `f:reifies*` IRIs internally, which is why the
-    //    firewall ran first on the un-rewritten input.
+    //    reserved-predicate check reads the document as written, not the
+    //    lowered copy.
     let lowered = if annotated {
         let top_ctx = super::edge_annotations::top_level_context(json)?;
         let mut lowered = json.clone();
@@ -173,7 +171,7 @@ fn parse_rooted(
         if update {
             super::edge_annotations::lower_delete_annotation_blocks(&mut lowered)?;
         }
-        super::edge_annotations::lower_edge_annotations_after_firewall(
+        super::edge_annotations::lower_edge_annotations_unchecked(
             &mut lowered,
             &top_ctx,
             lpg_mode,

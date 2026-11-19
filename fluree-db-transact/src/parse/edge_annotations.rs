@@ -44,11 +44,10 @@
 //! - Reifiers attached to triple-term values, list elements, etc. →
 //!   error.
 //!
-//! After lowering, the document additionally goes through a write-
-//! surface firewall pass that rejects any user-authored `f:reifies*`
-//! IRI (full or compact). This pre-lowering scan is run before the
-//! lowering itself, so the firewall doesn't block the IRIs that this
-//! module emits.
+//! A user-authored `f:reifies*` predicate is refused by the IRI the
+//! expander resolves ([`refuse_reserved_iris`]), on the document as
+//! written rather than the lowered copy, so the IRIs this module emits
+//! are not flagged.
 
 use crate::error::{Result, TransactError};
 use fluree_graph_json_ld::{
@@ -474,24 +473,22 @@ pub fn lower_edge_annotations(doc: &mut Value) -> Result<()> {
     // default to RDF mode (empty `@annotation: {}` is a no-op).
     let clauses = doc.as_object().is_some_and(is_transaction_wrapper);
     if let Err(refused) = refuse_reserved_iris_in_document(doc, &top_ctx, clauses) {
-        lower_edge_annotations_after_firewall(doc, &top_ctx, false)?;
+        lower_edge_annotations_unchecked(doc, &top_ctx, false)?;
         return Err(refused);
     }
-    lower_edge_annotations_after_firewall(doc, &top_ctx, false)
+    lower_edge_annotations_unchecked(doc, &top_ctx, false)
 }
 
-/// Same as [`lower_edge_annotations`] minus the firewall scan.
-///
-/// Use this when the caller has already run the firewall on the
-/// original (pre-rewritten) document — e.g. when chaining the
-/// `delete`-clause pre-pass before the standard lowering. Both
-/// passes synthesize `f:reifies*` IRIs internally; running the
-/// firewall a second time would falsely flag those.
+/// Same as [`lower_edge_annotations`] without its reserved-predicate check,
+/// for a caller that checks the document as written itself: the transaction
+/// parser and bulk import do, after this lowering, so a document the
+/// lowering refuses keeps the lowering's reason. The lowering synthesizes
+/// `f:reifies*` IRIs, which a check of the lowered copy would flag.
 ///
 /// `lpg_mode` controls the empty-block contract: `false` (RDF
 /// default) makes `@annotation: {}` a no-op; `true` mints a fresh
 /// property-less annotation subject (Cypher relationship identity).
-pub fn lower_edge_annotations_after_firewall(
+pub fn lower_edge_annotations_unchecked(
     doc: &mut Value,
     top_ctx: &ParsedContext,
     lpg_mode: bool,
@@ -1227,8 +1224,8 @@ fn build_annotation_delete(
         // `@reifies` shape because the standard lowering walker
         // rejects `@reifies` outside its query-side context, while
         // `f:reifies*` IRIs are accepted as ordinary IRIs (the
-        // user-authored-reifies firewall has already run against the
-        // original doc, so our synthesized ones aren't re-scanned).
+        // reserved-predicate check reads the document as written, not
+        // this lowered copy, so the synthesized ones aren't flagged).
         // The JSON-LD-Q query parser still resolves `f:reifies*`
         // triple patterns into the same indexed lookups as
         // `@reifies` would.
@@ -1718,9 +1715,8 @@ fn lower_object_with_subject(
     // [`opaque_subtree`]); there is deliberately no `@json` branch
     // here. A wrapper may declare the alias it is typed with, so
     // merge its own `@context` first — the walker's merge below is
-    // past this return. An unparseable one is an error everywhere
-    // else in this module, and the firewall scan has already rejected
-    // it by the time we get here.
+    // past this return. An unparseable one is an error here, as
+    // everywhere else in this module.
     if is_jsonld_value_object(map) {
         let wrapper_ctx: Option<ParsedContext> = match map.get("@context") {
             Some(local_ctx) => Some(
@@ -1771,8 +1767,8 @@ fn lower_object_with_subject(
     // expansion time but be invisible to
     // `reject_context_coercion_on_annotated_literal`, allowing the
     // base flake's `EdgeKey` to diverge from the synthesized
-    // `f:reifies*` bundle. Mirrors the firewall scanner's context
-    // merge logic.
+    // `f:reifies*` bundle. Merged into the inherited context, as the
+    // expander merges a node's own `@context`.
     let local_merged: Option<ParsedContext> = if let Some(local_ctx) = map.get("@context") {
         Some(
             fluree_graph_json_ld::parse_context_with_base(walk.json_ld, local_ctx).map_err(

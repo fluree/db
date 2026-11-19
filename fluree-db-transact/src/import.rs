@@ -1596,7 +1596,7 @@ mod inner {
         if needs_lowering {
             let top_ctx = crate::parse::edge_annotations::top_level_context(&doc)?;
             let refused = refuse_reserved_in_chunk(&doc, shared.as_ref());
-            crate::parse::edge_annotations::lower_edge_annotations_after_firewall(
+            crate::parse::edge_annotations::lower_edge_annotations_unchecked(
                 &mut doc, &top_ctx, false,
             )?;
             refused?;
