@@ -196,6 +196,30 @@ impl ConstSidMemo {
             }
         };
     }
+
+    /// The `s_id` memoized in `cache` for `key`, or on a miss the one
+    /// `resolve` returns, memoized before it's handed back. The lock is
+    /// released while `resolve` runs, so a resolver that evaluates an
+    /// expression or reads the dictionary never holds it. An error is
+    /// returned as is and memoizes nothing.
+    pub fn get_or_resolve(
+        cache: &Mutex<Self>,
+        key: ConstSidKey<'_>,
+        resolve: impl FnOnce() -> Result<Option<u64>, QueryError>,
+    ) -> Result<Option<u64>, QueryError> {
+        let lock = || {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let cached = lock().get(key);
+        if let Some(s_id) = cached {
+            return Ok(s_id);
+        }
+        let s_id = resolve()?;
+        lock().insert(key, s_id);
+        Ok(s_id)
+    }
 }
 
 /// Per-query memo for constant subject-id resolution (see [`ConstSidKey`]).

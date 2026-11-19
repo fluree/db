@@ -15,7 +15,7 @@
 
 use crate::binding::Binding;
 use crate::binding::RowAccess;
-use crate::context::{ConstSidKey, ExecutionContext};
+use crate::context::{ConstSidKey, ConstSidMemo, ExecutionContext};
 use crate::error::{QueryError, Result};
 use crate::fast_path_common::subject_ref_to_s_id;
 use crate::ir::{CompareOp, Expression, Function, Ref};
@@ -175,6 +175,32 @@ fn const_operand_key(expr: &Expression) -> Option<ConstSidKey<'_>> {
     }
 }
 
+/// The memo key for an evaluated subject operand: a full IRI by its string, a
+/// SID by its SID. `None` for any other value.
+fn comparable_subject_key(value: &ComparableValue) -> Option<ConstSidKey<'_>> {
+    match value {
+        ComparableValue::Iri(iri) => Some(ConstSidKey::Iri(iri)),
+        ComparableValue::Sid(sid) => Some(ConstSidKey::Sid(sid.namespace_code, &sid.name)),
+        _ => None,
+    }
+}
+
+/// The indexed `s_id` of an evaluated subject operand: `None` when it isn't an
+/// IRI or SID, or isn't an indexed subject. Both memo sites resolve through
+/// this, so they can't map a value to a subject differently.
+fn comparable_subject_s_id(
+    ctx: &ExecutionContext<'_>,
+    store: &fluree_db_binary_index::BinaryIndexStore,
+    value: &ComparableValue,
+) -> Result<Option<u64>> {
+    let subject = match value {
+        ComparableValue::Sid(sid) => Ref::Sid(sid.clone()),
+        ComparableValue::Iri(iri) => Ref::Iri(iri.clone()),
+        _ => return Ok(None),
+    };
+    subject_ref_to_s_id(ctx.active_snapshot, store, &subject)
+}
+
 /// One directional probe of the IRI-binding fast equality: `var_expr` must be
 /// a variable whose binding is resource-flavored (`EncodedSid`, `Sid`, `Iri`/
 /// `IriMatch`, or `EncodedPid`); `other_expr` is the comparand. Returns
@@ -227,30 +253,12 @@ fn fast_eq_iri_binding_directional<R: RowAccess>(
             // (`canonical_split` / namespace lookup). Any other operand takes
             // the value-keyed memo below, after evaluating it.
             if let Some(key) = const_operand_key(other_expr) {
-                let cached = ctx
-                    .const_sid_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(key);
-                let rhs = match cached {
-                    Some(v) => v,
-                    None => {
-                        let v = match other_expr.eval_to_comparable(row, Some(ctx))? {
-                            Some(ComparableValue::Sid(sid)) => {
-                                subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Sid(sid))?
-                            }
-                            Some(ComparableValue::Iri(iri)) => {
-                                subject_ref_to_s_id(ctx.active_snapshot, store, &Ref::Iri(iri))?
-                            }
-                            _ => None,
-                        };
-                        ctx.const_sid_cache
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .insert(key, v);
-                        v
+                let rhs = ConstSidMemo::get_or_resolve(&ctx.const_sid_cache, key, || {
+                    match other_expr.eval_to_comparable(row, Some(ctx))? {
+                        Some(value) => comparable_subject_s_id(ctx, store, &value),
+                        None => Ok(None),
                     }
-                };
+                })?;
                 if let Some(rhs_s_id) = rhs {
                     return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
                 }
@@ -275,37 +283,14 @@ fn fast_eq_iri_binding_directional<R: RowAccess>(
             // an IRI-normalization mismatch) falls through to the IRI-string
             // path below, which stays conservative.
             if !ctx.is_multi_ledger() {
-                let other_ref = match &other {
-                    ComparableValue::Sid(sid) => Some(Ref::Sid(sid.clone())),
-                    ComparableValue::Iri(iri) => Some(Ref::Iri(iri.clone())),
-                    _ => None,
-                };
-                if let Some(r) = other_ref {
+                if let Some(key) = comparable_subject_key(&other) {
                     // The constant operand resolves to the same `s_id` on
                     // every row, so memoize it per query instead of doing a
                     // dictionary reverse-lookup (`find_subject_id_by_parts`)
                     // per row — the dominant cost of this filter at scale.
-                    let key = match &r {
-                        Ref::Iri(iri) => ConstSidKey::Iri(iri),
-                        Ref::Sid(sid) => ConstSidKey::Sid(sid.namespace_code, &sid.name),
-                        Ref::Var(_) => unreachable!("other_ref is never a Var"),
-                    };
-                    let cached = ctx
-                        .const_sid_cache
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .get(key);
-                    let rhs = match cached {
-                        Some(v) => v,
-                        None => {
-                            let v = subject_ref_to_s_id(ctx.active_snapshot, store, &r)?;
-                            ctx.const_sid_cache
-                                .lock()
-                                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                                .insert(key, v);
-                            v
-                        }
-                    };
+                    let rhs = ConstSidMemo::get_or_resolve(&ctx.const_sid_cache, key, || {
+                        comparable_subject_s_id(ctx, store, &other)
+                    })?;
                     if let Some(rhs_s_id) = rhs {
                         return Ok(Some(FastEqOutcome::Eq(*s_id == rhs_s_id)));
                     }
@@ -1015,6 +1000,52 @@ mod tests {
         assert_eq!(get(ConstSidKey::Iri("http://example.org/c")), Some(None));
         assert_eq!(get(ConstSidKey::Sid(5, "a")), Some(Some(2)));
         assert_eq!(get(ConstSidKey::Sid(6, "a")), None);
+    }
+
+    /// A miss resolves once and memoizes the result (a non-subject's `None`
+    /// included), a hit never calls the resolver, and a failed resolve
+    /// memoizes nothing.
+    #[test]
+    fn const_sid_memo_get_or_resolve_resolves_each_key_once() {
+        let cache = std::sync::Mutex::new(crate::context::ConstSidMemo::default());
+        let calls = std::cell::Cell::new(0);
+        let resolve = |s_id: Option<u64>| {
+            let calls = &calls;
+            move || {
+                calls.set(calls.get() + 1);
+                Ok(s_id)
+            }
+        };
+        let a = ConstSidKey::Iri("http://example.org/a");
+        let b = ConstSidKey::Sid(5, "b");
+
+        for _ in 0..3 {
+            assert_eq!(
+                ConstSidMemo::get_or_resolve(&cache, a, resolve(Some(7))).unwrap(),
+                Some(7)
+            );
+            assert_eq!(
+                ConstSidMemo::get_or_resolve(&cache, b, resolve(None)).unwrap(),
+                None
+            );
+        }
+        assert_eq!(calls.get(), 2, "one resolve per key");
+
+        let c = ConstSidKey::IriLiteral("http://example.org/c");
+        let failed = ConstSidMemo::get_or_resolve(&cache, c, || {
+            Err(QueryError::Internal("dictionary read failed".into()))
+        });
+        assert!(failed.is_err());
+        assert_eq!(
+            cache.lock().unwrap().get(c),
+            None,
+            "an error isn't memoized"
+        );
+        assert_eq!(
+            ConstSidMemo::get_or_resolve(&cache, c, resolve(Some(9))).unwrap(),
+            Some(9)
+        );
+        assert_eq!(calls.get(), 3);
     }
 
     /// Only an `IRI("…")` string or a SID constant is keyed before
