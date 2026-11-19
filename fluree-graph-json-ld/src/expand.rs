@@ -513,8 +513,8 @@ fn parse_value_object(
         && type_iri.as_deref() != Some("@id")
         && !holds_structured_value(type_iri.as_deref(), val)
     {
-        return Err(JsonLdError::InvalidKeywordValue {
-            keyword: "@value",
+        return Err(JsonLdError::InvalidValueObject {
+            at: path.to_json(),
             reason: "a value object whose @value is an array or a map needs \"@type\": \
                      \"@json\" (or \"@vector\" for an array)",
         });
@@ -531,8 +531,8 @@ fn parse_value_object(
 
     if type_iri.as_deref() == Some("@id") {
         let Some(iri) = val.as_str() else {
-            return Err(JsonLdError::InvalidKeywordValue {
-                keyword: "@value",
+            return Err(JsonLdError::InvalidValueObject {
+                at: path.to_json(),
                 reason: "a value object typed @id names an IRI, so its @value must be a string",
             });
         };
@@ -707,8 +707,7 @@ fn guard_depth(path: &Path<'_>) -> Result<()> {
 
 /// Where expansion is in the document: the array indexes and property keys
 /// from the root. Each step borrows its parent, so descending costs no
-/// allocation; the steps are collected only to report a
-/// [`JsonLdError::NestedSequence`].
+/// allocation; the steps are collected only to report an error.
 struct Path<'a> {
     depth: usize,
     last: Option<(&'a Path<'a>, Step<'a>)>,
@@ -755,6 +754,11 @@ impl<'a> Path<'a> {
         }
         steps.reverse();
         steps
+    }
+
+    /// The steps from the root as a JSON array's text, for a message.
+    fn to_json(&self) -> String {
+        JsonValue::Array(self.to_vec()).to_string()
     }
 }
 
@@ -2041,5 +2045,30 @@ mod tests {
             values_of_p(json!({"@context": vector, "p": {"@value": [0.5]}}))[0]["@value"],
             json!([0.5])
         );
+    }
+
+    /// A value object the expander refuses is named by where it is: the keys
+    /// and indexes from the root, so a refusal in one node of many, as in a
+    /// bulk import's chunk, points at that node.
+    #[test]
+    fn a_refused_value_object_names_where_it_is() {
+        let refused = |doc: JsonValue| match crate::expand(&doc) {
+            Err(JsonLdError::InvalidValueObject { at, .. }) => at,
+            other => panic!("{doc}: {other:?}"),
+        };
+        let structured = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:a", "ex:p": 1},
+                {"@id": "ex:b", "ex:p": {"@value": [1, 2]}}
+            ]
+        });
+        assert_eq!(refused(structured), r#"["@graph",1,"ex:p"]"#);
+        let typed_id = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:q": ["ex:o", {"@value": 3, "@type": "@id"}]
+        });
+        assert_eq!(refused(typed_id), r#"["ex:q",1]"#);
     }
 }
