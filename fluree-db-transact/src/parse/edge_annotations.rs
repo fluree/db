@@ -896,7 +896,7 @@ fn walk_delete_for_annotations(
                             subject: parent_id.as_deref().unwrap_or_default(),
                         },
                         parent_id.is_some(),
-                        &key,
+                        &edge_predicate(&key, effective_ctx),
                         value,
                         effective_ctx,
                         effective_graph,
@@ -932,7 +932,7 @@ fn walk_delete_for_annotations(
                                         object: parent_id.as_deref().unwrap_or_default(),
                                     },
                                     parent_id.is_some(),
-                                    property,
+                                    &edge_predicate(property, effective_ctx),
                                     values,
                                     effective_ctx,
                                     effective_graph,
@@ -1939,7 +1939,7 @@ fn lower_object_with_subject(
                         let direction = Direction::Reverse { object: &node_id };
                         intercept_annotations_for_edges(
                             direction,
-                            property,
+                            &edge_predicate(property, effective_json_ld),
                             values,
                             &child_walk,
                             ctx,
@@ -1964,7 +1964,7 @@ fn lower_object_with_subject(
                 let direction = Direction::Forward { subject: &node_id };
                 intercept_annotations_for_edges(
                     direction,
-                    &key,
+                    &edge_predicate(&key, effective_json_ld),
                     value,
                     &child_walk,
                     ctx,
@@ -2006,6 +2006,15 @@ enum EdgeKey<'a> {
 
 /// Classify `key` against `ctx`. Shared by the insert and delete walkers, so
 /// both read a key the same way the expander does.
+/// The IRI the expander resolves a property key to (a term, a prefix, then
+/// `@vocab`), for the reifier to name the predicate its edge is written
+/// under: written as the key, a relative key resolved by `@vocab` would
+/// name a relative IRI. A key none of those resolves is left as written,
+/// for the reifier's `@id` to resolve against `@base` as before.
+fn edge_predicate(key: &str, ctx: &ParsedContext) -> String {
+    fluree_graph_json_ld::expand_iri_with_vocab(key, ctx, true)
+}
+
 fn classify_edge_key<'a>(key: &'a str, ctx: &'a ParsedContext) -> EdgeKey<'a> {
     if key.starts_with('@') {
         return EdgeKey::Keyword(key);
@@ -2904,9 +2913,10 @@ mod tests {
             sibling.get(reifies_iris::SUBJECT).unwrap(),
             &json!({"@id": "ex:alice"})
         );
+        // The predicate as the expander resolves the edge's key.
         assert_eq!(
             sibling.get(reifies_iris::PREDICATE).unwrap(),
-            &json!({"@id": "ex:worksFor"})
+            &json!({"@id": "http://example.org/worksFor"})
         );
         assert_eq!(
             sibling.get(reifies_iris::OBJECT).unwrap(),
