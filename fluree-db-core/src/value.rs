@@ -1053,6 +1053,12 @@ pub fn vector_value_hash_f32(components: &[f32]) -> u64 {
     xxhash_rust::xxh3::xxh3_64(f32_bytes(components))
 }
 
+/// Whether two arenas' `f32` vectors are equal: bitwise-equal components,
+/// as [`FlakeValue`]'s vector equality is.
+pub fn vector_eq_f32(x: &[f32], y: &[f32]) -> bool {
+    x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits())
+}
+
 /// Whether an arena's `f32` vector equals a decoded one: every component of
 /// `wide` narrows to `f32` exactly, to the same bits. For every finite `f32`
 /// this is bitwise equality of `narrow` widened with `wide`, and it agrees

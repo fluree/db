@@ -3492,10 +3492,9 @@ impl VectorIdentity {
                 let Some(slice) = arena.lookup_vector(handle)? else {
                     continue;
                 };
-                let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
                 match seen
                     .iter()
-                    .find(|(_, s)| bits(s.as_f32()) == bits(slice.as_f32()))
+                    .find(|(_, s)| fluree_db_core::value::vector_eq_f32(s.as_f32(), slice.as_f32()))
                 {
                     Some(&(canon, _)) => {
                         canonical[handle as usize] = canon;
@@ -3738,8 +3737,7 @@ impl ArenaVector {
         let (Some(x), Some(y)) = (self.components()?, other.components()?) else {
             return Ok(false);
         };
-        let (x, y) = (x.as_f32(), y.as_f32());
-        Ok(x.len() == y.len() && x.iter().zip(y).all(|(p, q)| p.to_bits() == q.to_bits()))
+        Ok(fluree_db_core::value::vector_eq_f32(x.as_f32(), y.as_f32()))
     }
 
     /// Whether `self` holds the decoded vector `wide`
