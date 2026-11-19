@@ -13,34 +13,53 @@ limits; see [Limits and deliberate trade-offs](#limits-and-deliberate-trade-offs
 
 Head-to-head benchmarks against other engines are maintained in a separate
 repository: **[github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db)**.
-Each comparison uses the same hardware and datasets for every engine and can be
-reproduced from pinned S3 snapshots.
+Each comparison runs every engine on the same instance type, dataset and query set,
+and can be reproduced from pinned S3 snapshots. The figures below are for Fluree
+v4.2.8 (WGPB: v4.2.7), measured in November 2026. Each report records the other
+engines' versions and measurement dates.
 
 **SPARQLoscope on DBLP-core** (561 M triples, 105 queries, m7a.4xlarge 16c/64 GB):
 
 | | Fluree | QLever | Virtuoso | MillenniumDB | Jena | Oxigraph | Blazegraph |
 |---|---|---|---|---|---|---|---|
 | Queries passed | 105/105 | 105/105 | 103/105 | 103/105 | 34/105 | 39/105 | 3/105 |
-| Geo mean | **17.5 ms** | 202.4 ms (11.5×) | 299.7 ms (17.1×) | 1,664 ms (95×) | 67.7 s | 87.0 s | 332.9 s |
-| Median (passed) | **26.6 ms** | 310.3 ms (11.7×) | 326.0 ms (12.3×) | 3,894 ms (147×) | 4.5 s | 5.1 s | 23.2 s |
+| Geo mean | **16.1 ms** | 202.4 ms (12.6×) | 299.7 ms (18.6×) | 1,664 ms (103×) | 67.7 s | 87.0 s | 332.9 s |
+| Median (passed) | **25.1 ms** | 310.3 ms (12.3×) | 326.0 ms (13.0×) | 3,894 ms (155×) | 4.5 s | 5.1 s | 23.2 s |
 
-**Wikidata-truthy** (8.19 B triples, r7a.16xlarge 64c/512 GB): Fluree geometric
-mean 367.4 ms. The next engine, QLever, is 10.4× slower.
+The geometric mean is SPARQLoscope's P=2 aggregate, in which a failed query counts
+as twice the 180-second timeout.
 
-**WGPB** (full 21.5 B-triple Wikidata dump, 850 basic graph pattern queries,
-r7a.8xlarge 32c/256 GB): 850/850 passed, 43 ms geometric mean.
+**SPARQLoscope on Wikidata-truthy** (8.18 B triples, 105 queries,
+r7a.16xlarge 64c/512 GB): Fluree completes all 105 queries with a 270.9 ms
+geometric mean. QLever, the next engine, is 14.1× slower and completes 91.
 
-**Pokec / openCypher** (Memgraph's benchgraph suite, 1.6 M nodes / 30.6 M edges,
-r8a.4xlarge 16c/128 GB):
+**WGPB** (full Wikidata dump, 21.1 B distinct triples, 850 basic graph pattern
+queries, r7a.8xlarge 32c/256 GB): 850/850 passed, 14.4 ms geometric mean,
+10.2 ms median.
+
+**Pokec / openCypher** (Memgraph's benchgraph suite, m7a.4xlarge 16c/64 GB).
+Geometric means of per-query medians at the largest scale, 1.6 M nodes and
+30.6 M edges:
 
 | | Fluree | Memgraph | Neo4j | FalkorDB |
 |---|---|---|---|---|
-| Durable writes | **1.73 ms** | 4.46 ms | 4.07 ms | 4.57 ms |
-| Read-only | **1.47 ms** | 4.41 ms | 6.80 ms | 4.57 ms |
+| Durable writes (8 queries) | **2.54 ms** | 5.45 ms | 6.70 ms | 4.94 ms |
+| Reads (27 queries) | **1.81 ms** | 7.22 ms | 10.41 ms | 6.01 ms |
 
-Fluree's write latency is for durable commits, which are committed and
-recoverable when the call returns. The other engines ran with their default
-durability settings, which provide weaker guarantees.
+Every engine commits each write durably, as syscall traces in the report confirm.
+Fluree has the lowest read and write means at all three measured scales. The
+Memgraph and FalkorDB configurations keep the graph in memory; Fluree and Neo4j
+store it on disk.
+
+**BSBM** (Berlin SPARQL Benchmark, throughput at 1 M, 100 M and 200 M triples,
+m7a.4xlarge database with a separate m7a.2xlarge driver): Fluree has the highest
+validated throughput in every multi-client comparison with QLever and Virtuoso. On
+the SELECT-only Explore mix, its peak is 11.4× Virtuoso's and 86× QLever's at
+1 M triples, and 4.5× and 20× at 100 M, where it reaches 796,932 query mixes per
+hour with 32 clients. Single-client results are closer, and one favors another
+engine: at 200 M triples QLever is 59% faster on the Business Intelligence mix.
+With writes acknowledged only after fsync, Fluree's Explore-and-Update throughput
+at 1 M triples is 2.7× Virtuoso's with one client and 3.5× at peak.
 
 > The internal criterion benchmarks documented in
 > [BENCHMARKING.md](../../BENCHMARKING.md) serve a different purpose: they detect
