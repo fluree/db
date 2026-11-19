@@ -4286,40 +4286,20 @@ impl Fluree {
         ))
     }
 
-    /// Resolve attachment-event coverage for `ledger_id` from its loaded
-    /// ledger state, the way [`Fluree::reindex`] does.
+    /// Resolve attachment-event coverage from a loaded ledger state, the way
+    /// [`Fluree::reindex`] does.
     ///
-    /// Exposed for callers that drive the indexer themselves rather than
-    /// going through `reindex` — chiefly `fluree index`. The provider
-    /// returned by [`Fluree::attachment_events_provider`] reads from a
-    /// running `LedgerManager`, so in a one-shot process it resolves
-    /// nothing; without a second chance the indexer receives no coverage,
-    /// seals no arena, and root assembly sets the sticky
-    /// `had_annotation_arena` bit regardless — which then blocks the
-    /// bootstrap that would have recovered it, permanently. That
-    /// asymmetry is why `reindex`-first seals and `index`-first does not.
-    ///
-    /// Returns `None` when the ledger state cannot be loaded; callers
-    /// should treat that as "no coverage resolved" and leave the arena
-    /// unsealed rather than guessing.
+    /// For callers that drive the indexer themselves without a
+    /// `LedgerManager`, chiefly `fluree index`: there
+    /// [`Fluree::attachment_events_provider`] is `None`, and an indexer handed
+    /// no coverage drops the annotation arena while root assembly sets the
+    /// sticky `had_annotation_arena` bit, which then blocks the bootstrap that
+    /// would have sealed one.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn attachment_coverage_from_state(
-        &self,
-        ledger_id: &str,
+        state: &LedgerState,
     ) -> Option<fluree_db_indexer::AttachmentEventCoverage> {
-        let state = match self.ledger(ledger_id).await {
-            Ok(state) => state,
-            Err(e) => {
-                tracing::debug!(
-                    error = %e,
-                    ledger_id,
-                    "attachment coverage: no loadable ledger state; \
-                     annotation arena will not be sealed this pass"
-                );
-                return None;
-            }
-        };
-        crate::indexer_attachment_provider::attachment_events_from_state(&state).await
+        crate::indexer_attachment_provider::attachment_events_from_state(state).await
     }
 
     /// Per-instance cache for cross-ledger governance artifacts.

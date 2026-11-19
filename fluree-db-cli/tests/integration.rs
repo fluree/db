@@ -3120,22 +3120,32 @@ fn a_named_graph_annotation_exports_with_its_marker() {
         .stdout(predicate::str::contains("reifiesSubject"));
 }
 
-/// `fluree index` must seal the annotation arena on the first pass.
+/// Whether the annotation arena of `ledger`, in the CLI's storage under `tmp`,
+/// is sealed in its current index.
+fn annotation_arena_sealed(tmp: &TempDir, ledger: &str) -> bool {
+    let storage = tmp.path().join(".fluree/storage");
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let fluree = fluree_db_api::FlureeBuilder::file(storage.to_string_lossy().to_string())
+            .without_ledger_caching()
+            .build_async()
+            .await
+            .unwrap();
+        let state = fluree.ledger(ledger).await.unwrap();
+        state.snapshot.annotation_index.is_some()
+    })
+}
+
+/// `fluree index` seals an annotated ledger's arena, and a later
+/// `fluree index` keeps it.
 ///
-/// It did not: the attachment-events provider reads from a running
-/// `LedgerManager`, a one-shot CLI process has none, so `index` resolved no
-/// coverage and sealed nothing — while root assembly set the sticky
-/// `had_annotation_arena` bit regardless, permanently blocking the
-/// bootstrap that would have recovered it. `reindex` already had a fallback
-/// for this; `index` now makes the same call (#1882).
-///
-/// What this asserts is that the annotation survives `insert` + `index`
-/// round-trip. It does *not* assert which annotation source answered —
-/// after the named-graph fix above, the arena and the base-index scan
-/// produce identical output, so the remaining difference between sealed and
-/// unsealed is speed, which is measured rather than asserted here.
+/// It did neither (#1882). The attachment-events provider reads a running
+/// `LedgerManager`, and a one-shot CLI process has none, so `index` handed the
+/// indexer no coverage: it sealed nothing on the first pass and dropped a
+/// sealed arena on any later one, while setting the sticky
+/// `had_annotation_arena` bit that blocks the bootstrap from sealing one.
+/// Export reads the same either way, so the arena itself is asserted.
 #[test]
-fn insert_then_index_keeps_annotations_readable() {
+fn fluree_index_seals_and_keeps_the_annotation_arena() {
     let tmp = TempDir::new().unwrap();
     fluree_cmd(&tmp).arg("init").assert().success();
     fluree_cmd(&tmp).args(["create", "iann"]).assert().success();
@@ -3152,6 +3162,27 @@ fn insert_then_index_keeps_annotations_readable() {
         .assert()
         .success();
     fluree_cmd(&tmp).args(["index", "iann"]).assert().success();
+    assert!(
+        annotation_arena_sealed(&tmp, "iann"),
+        "the first index must seal the arena"
+    );
+
+    fluree_cmd(&tmp)
+        .args([
+            "insert",
+            "iann",
+            "--format",
+            "turtle",
+            "-e",
+            "<http://example.org/a> <http://example.org/name> \"a\" .\n",
+        ])
+        .assert()
+        .success();
+    fluree_cmd(&tmp).args(["index", "iann"]).assert().success();
+    assert!(
+        annotation_arena_sealed(&tmp, "iann"),
+        "a later index must keep the arena"
+    );
 
     fluree_cmd(&tmp)
         .args(["export", "iann", "--format", "turtle"])
