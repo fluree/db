@@ -519,7 +519,10 @@ pub fn parse_reasoning(
 
 /// Keys [`crate::ir::ReasoningModes::from_query_json`] consumes. Canonical at
 /// the top level of the query object; also accepted inside `opts`.
-const REASONING_KEYS: &[&str] = &[
+///
+/// The transaction parser refuses the same keys on a write, which evaluates
+/// no reasoning, so a key added here is refused there too.
+pub const REASONING_KEYS: &[&str] = &[
     "reasoning",
     "rules",
     "ontology",

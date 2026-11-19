@@ -65,6 +65,8 @@ Expression format for `filter`/`bind` supports either:
 - **Data expressions** like `["+", "?x", 1]`, `["and", [">=", "?age", 18], ["=", "?status", "pending"]]`
 - **S-expressions** like `"(+ ?x 1)"`
 
+**Reasoning:** a write does not evaluate reasoning. An update's `where` matches stored facts only, never facts that RDFS, OWL or datalog rules derive at query time. The reasoning keys a query accepts (`reasoning`, `rules`, `ontology`, `reasoningBudget`, `reasoningTime`) are refused with a `400` rather than ignored: at the top level of an update, and in `opts` on any write (update, insert, upsert). `"reasoning": "none"`, which asks for what a write does anyway, is accepted. A SPARQL update likewise refuses the `reasoning*` pragmas.
+
 ## Graph scoping (named graphs)
 
 JSON-LD update supports writing into **user-defined named graphs** (ingested via TriG or JSON-LD `@graph`) and scoping the update to a named graph.

@@ -376,6 +376,94 @@ async fn malformed_pragmas_are_rejected() {
     );
 }
 
+/// A write evaluates no reasoning, so a write that asks for it is a 400 that
+/// says so on every write route, rather than a commit whose where silently
+/// matched no derived fact: the SPARQL pragma, and the JSON-LD key at an
+/// update's top level and in `opts` on an update, an insert and an upsert.
+/// `"reasoning": "none"` asks for what a write does anyway and commits.
+#[tokio::test]
+async fn writes_refuse_reasoning() {
+    let ledger = "prag:reason";
+    let (_tmp, app) = seeded(ledger).await;
+
+    let resp = update(
+        &app,
+        ledger,
+        "# PRAGMA reasoning: datalog\nPREFIX ex: <http://example.org/>\n\
+         INSERT { ?s ex:seen true } WHERE { ?s ex:name ?name }",
+        &[],
+    )
+    .await;
+    let (status, json) = body(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "SPARQL pragma: {json}");
+    assert!(
+        json.to_string().contains("does not evaluate reasoning"),
+        "SPARQL pragma: {json}"
+    );
+
+    let ctx = serde_json::json!({ "ex": "http://example.org/" });
+    let where_update = |extra: JsonValue| {
+        let mut doc = serde_json::json!({
+            "@context": ctx,
+            "where": { "@id": "?s", "ex:name": "?name" },
+            "insert": { "@id": "?s", "ex:seen": true }
+        });
+        doc.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        doc
+    };
+    let data = serde_json::json!({
+        "@context": ctx,
+        "opts": { "reasoning": "datalog" },
+        "@id": "ex:carol",
+        "ex:name": "Carol"
+    });
+    for (route, doc) in [
+        (
+            "update",
+            where_update(serde_json::json!({ "reasoning": "datalog" })),
+        ),
+        (
+            "update",
+            where_update(serde_json::json!({ "opts": { "reasoning": "datalog" } })),
+        ),
+        ("insert", data.clone()),
+        ("upsert", data),
+    ] {
+        let (status, json) = send(
+            &app,
+            post(
+                &format!("/v1/fluree/{route}/{ledger}"),
+                "application/json",
+                &[],
+            )
+            .body(Body::from(doc.to_string()))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{route} {doc}: {json}");
+        assert!(
+            json.to_string().contains("does not evaluate reasoning"),
+            "{route} {doc}: {json}"
+        );
+    }
+
+    let none = where_update(serde_json::json!({ "reasoning": "none" }));
+    let (status, json) = send(
+        &app,
+        post(
+            &format!("/v1/fluree/update/{ledger}"),
+            "application/json",
+            &[],
+        )
+        .body(Body::from(none.to_string()))
+        .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "reasoning none: {json}");
+}
+
 /// On SPARQL UPDATE, `max-fuel` and `meta` behave as their headers do.
 #[tokio::test]
 async fn update_fuel_and_meta_pragmas() {
