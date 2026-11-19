@@ -241,16 +241,14 @@ impl ServiceOperator {
         // otherwise copy a requester-encoded `Sid` into a column the boundary
         // stamp then decodes through the target's table.
         //
-        // A target graph other than the parent's also reads other arenas: the
-        // parent row's arena handles (big numbers, vectors) are decoded
-        // through the parent's graph on the way in, and the body's through
-        // the target's on the way out.
-        let crossing = crate::object_binding::ArenaCrossing::between(ctx, ctx_to_use);
+        // A body over another ledger runs with no store: what the parent row
+        // binds encoded is decoded on the way in (see `ScopeCrossing`).
+        let crossing = crate::object_binding::ScopeCrossing::between(ctx, ctx_to_use);
         let mut row: Vec<Binding> = parent_batch
             .row_view(row_idx)
             .expect("row_idx must be valid for parent batch")
             .to_vec();
-        crossing.enter(&mut row);
+        crossing.enter(&mut row)?;
         let schema: Arc<[VarId]> = Arc::from(parent_batch.schema().to_vec().into_boxed_slice());
         let seed = match &cross_ledger {
             Some(_) => {
@@ -350,7 +348,7 @@ impl ServiceOperator {
                             .get(inner_row_idx, *var)
                             .cloned()
                             .unwrap_or(Binding::Unbound);
-                        merged_row.push(crossing.leave(binding));
+                        merged_row.push(crossing.leave(binding)?);
                     }
                 }
 

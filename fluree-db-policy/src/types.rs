@@ -306,47 +306,45 @@ pub struct PolicyRestriction {
 
 /// Entry in the property index
 ///
-/// For class policies, `class_check_needed` indicates whether runtime class
-/// membership checking is required for this specific property. This varies
-/// by property because:
-/// - Exclusive properties (only used by target classes) don't need checks
-/// - Shared properties (used by other classes too) need checks
-/// - Implicit properties (@id, rdf:type) always need checks
+/// `class_check_needed` is set for every class policy's entry: statistics
+/// list the properties a class's typed members use, never which subjects
+/// carry a property, so the subject's classes are always checked.
 #[derive(Debug, Clone, Copy)]
 pub struct PropertyPolicyEntry {
     /// Index into the restrictions vector
     pub idx: usize,
-    /// Whether class membership check is needed for THIS property
-    /// (only meaningful for class policies)
+    /// Whether the subject's classes are checked (only meaningful for class
+    /// policies)
     pub class_check_needed: bool,
 }
 
 /// Indexed policy set
 ///
-/// View-set class policies are indexed INTO by_property (pre-expanded via
-/// class→property stats); modify-set class policies are indexed by class in
-/// `by_class`. This is designed for efficient lookup.
-#[derive(Debug, Default)]
+/// A view set's class policies are indexed INTO by_property (pre-expanded via
+/// class→property stats); a modify set's, and those of the view set a
+/// reasoning query reads ([`Self::selecting_classes_by_subject`]), are indexed
+/// by class in `by_class`. This is designed for efficient lookup.
+#[derive(Debug, Default, Clone)]
 pub struct PolicySet {
     /// All restrictions in parse order (insertion order preserved)
     pub restrictions: Vec<PolicyRestriction>,
     /// Index: subject SID -> restriction indices
     pub by_subject: HashMap<Sid, Vec<usize>>,
-    /// Index: property SID -> property policy entries (includes view-set class policies!)
+    /// Index: property SID -> property policy entries (includes stats-expanded
+    /// view-set class policies!)
     /// Each entry includes whether class check is needed for that specific property
     pub by_property: HashMap<Sid, Vec<PropertyPolicyEntry>>,
-    /// Index: class SID -> restriction indices (modify sets only).
+    /// Index: class SID -> restriction indices.
     ///
     /// Modify-side `f:onClass` policies are selected by the subject's
     /// classes at evaluation time instead of being pre-expanded into
     /// `by_property` via class→property stats. Stats describe committed
     /// data — exactly what a write is about to change: pre-expansion
-    /// misses properties the class has never used, and the
-    /// exclusive-property shortcut (`class_check_needed = false`) would
-    /// let a class allow apply to a non-instance when the staged flake
-    /// itself contradicts the stats. View sets keep the stats expansion
+    /// misses properties the class has never used. View sets keep the stats
+    /// expansion
     /// (committed data matches stats there, and scan volume makes the
-    /// precomputed property index worthwhile); their `by_class` is empty.
+    /// precomputed property index worthwhile), except for a query that
+    /// reads reasoned facts: see [`Self::selecting_classes_by_subject`].
     pub by_class: HashMap<Sid, Vec<usize>>,
     /// Default-bucket policy indices
     pub defaults: Vec<usize>,
@@ -359,8 +357,8 @@ pub struct PolicySet {
 pub struct FlakePolicyEntry {
     /// Index into the restrictions vector
     pub idx: usize,
-    /// Whether class membership check is needed for THIS property
-    /// (only meaningful for class policies)
+    /// Whether the subject's classes are still to be checked: false when the
+    /// entry was selected by them (only meaningful for class policies)
     pub class_check_needed: bool,
 }
 
@@ -370,9 +368,41 @@ impl PolicySet {
         Self::default()
     }
 
+    /// This set with its `f:onClass` policies selected by the subject's
+    /// classes, as modify sets select them, rather than by the properties
+    /// class statistics list. `None` when it has none.
+    ///
+    /// For a view that reads reasoned facts. Statistics describe asserted
+    /// data, so they neither know a subject that is a member only by
+    /// derivation, nor a derived property of an asserted member; a class
+    /// policy expanded through them leaves both ungoverned.
+    pub fn selecting_classes_by_subject(&self) -> Option<PolicySet> {
+        let on_class = |idx: usize| self.restrictions[idx].target_mode == TargetMode::OnClass;
+        if !(0..self.restrictions.len()).any(on_class) {
+            return None;
+        }
+        let mut set = self.clone();
+        set.by_property.retain(|_, entries| {
+            entries.retain(|entry| !on_class(entry.idx));
+            !entries.is_empty()
+        });
+        for (idx, restriction) in self.restrictions.iter().enumerate() {
+            if on_class(idx) {
+                for class in &restriction.for_classes {
+                    let bucket = set.by_class.entry(class.clone()).or_default();
+                    if !bucket.contains(&idx) {
+                        bucket.push(idx);
+                    }
+                }
+            }
+        }
+        Some(set)
+    }
+
     /// Collect the deduplicated class-bucket restriction indices for a
-    /// subject's classes, in insertion order. Empty unless this is a modify
-    /// set with `f:onClass` policies.
+    /// subject's classes, in insertion order. Empty unless this set selects
+    /// `f:onClass` policies by class: a modify set, or a view set for a
+    /// reasoning query.
     fn class_bucket_indices(&self, subject_classes: &[Sid]) -> Vec<usize> {
         if self.by_class.is_empty() {
             return Vec::new();
@@ -402,14 +432,14 @@ impl PolicySet {
     ) -> Vec<&PolicyRestriction> {
         let mut candidates = Vec::new();
 
-        // 1. Property-specific (includes view-set class policies mapped here)
+        // 1. Property-specific (includes stats-expanded view-set class policies)
         if let Some(entries) = self.by_property.get(property) {
             for entry in entries {
                 candidates.push(&self.restrictions[entry.idx]);
             }
         }
 
-        // 2. Class-specific (modify sets)
+        // 2. Class-specific (modify sets, and a reasoning query's view set)
         for idx in self.class_bucket_indices(subject_classes) {
             candidates.push(&self.restrictions[idx]);
         }
@@ -450,7 +480,7 @@ impl PolicySet {
     ) -> Vec<FlakePolicyEntry> {
         let mut candidates = Vec::new();
 
-        // 1. Property-specific (includes view-set class policies mapped here)
+        // 1. Property-specific (includes stats-expanded view-set class policies)
         // Uses per-property class_check_needed
         if let Some(entries) = self.by_property.get(property) {
             for entry in entries {
@@ -461,7 +491,8 @@ impl PolicySet {
             }
         }
 
-        // 2. Class-specific (modify sets): selection by class IS the check
+        // 2. Class-specific (modify sets, and a reasoning query's view set):
+        //    selection by class IS the check
         for idx in self.class_bucket_indices(subject_classes) {
             candidates.push(FlakePolicyEntry {
                 idx,
@@ -526,6 +557,9 @@ impl PolicySet {
 struct PolicyWrapperInner {
     /// View (query) policy set
     view: PolicySet,
+    /// `view` with class policies selected by subject, when it has any.
+    /// Built on first use: a query that does not reason never reads it.
+    reasoned_view: std::sync::OnceLock<Option<PolicySet>>,
     /// Modify (transaction) policy set
     modify: PolicySet,
     /// Root flag - bypasses all policies
@@ -556,6 +590,7 @@ impl PolicyWrapper {
         Self {
             inner: Arc::new(PolicyWrapperInner {
                 view,
+                reasoned_view: std::sync::OnceLock::new(),
                 modify,
                 root,
                 default_allow,
@@ -569,6 +604,7 @@ impl PolicyWrapper {
         Self {
             inner: Arc::new(PolicyWrapperInner {
                 view: PolicySet::default(),
+                reasoned_view: std::sync::OnceLock::new(),
                 modify: PolicySet::default(),
                 root: true,
                 default_allow: true,
@@ -592,6 +628,16 @@ impl PolicyWrapper {
         &self.inner.view
     }
 
+    /// The view policy set for a query that reads reasoned facts
+    /// ([`PolicySet::selecting_classes_by_subject`]).
+    pub fn reasoned_view(&self) -> &PolicySet {
+        self.inner
+            .reasoned_view
+            .get_or_init(|| self.inner.view.selecting_classes_by_subject())
+            .as_ref()
+            .unwrap_or(&self.inner.view)
+    }
+
     /// Get the modify policy set
     pub fn modify(&self) -> &PolicySet {
         &self.inner.modify
@@ -607,9 +653,7 @@ impl PolicyWrapper {
     /// Returns true if there are any class policies (f:onClass).
     /// This is used to decide whether to pre-populate the class cache.
     ///
-    /// Note: With per-property class_check_needed, ANY class policy may need
-    /// class checking for implicit properties (@id, rdf:type) which are always
-    /// indexed with class_check_needed=true. So we check for class_policy alone.
+    /// Every class policy checks the subject's classes, so any one needs them.
     pub fn has_class_policies(&self) -> bool {
         let view_has = self.inner.view.restrictions.iter().any(|r| r.class_policy);
 

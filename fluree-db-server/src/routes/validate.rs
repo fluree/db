@@ -138,14 +138,6 @@ async fn validate_local(
             }
         }
 
-        // Validation reads the local index; proxy storage mode has none.
-        if state.config.is_proxy_storage_mode() {
-            set_span_error_code(&span, "error:NotImplemented");
-            return Err(ServerError::NotImplemented(
-                "SHACL validation is not available in proxy storage mode".to_string(),
-            ));
-        }
-
         // Same execution control the query endpoints use: a request-scoped
         // cancellation carrying the configured timeout and the per-query
         // memory ceiling. `sh:sparql` constraints run one query per focus

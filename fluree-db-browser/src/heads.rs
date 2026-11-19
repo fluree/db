@@ -10,10 +10,12 @@
 //!   job type, and the JS `ReadableStream` stays inside the driver.
 //! - [`DriverSleeper`]: reconnect delays ride the driver's `Sleep` job
 //!   (the engine side has no timer of its own).
-//! - [`PeerHeadSink`]: ledger head changes go to `LedgerManager::notify`
-//!   — the same incremental refresh the native peer applies, so an open
-//!   peer re-opens at the new head on its next `db()`; in-flight queries
-//!   keep their frozen views — and then to the registered callbacks.
+//! - [`PeerHeadSink`]: ledger head changes go to `LedgerManager::follow`
+//!   — as the native peer applies them, so an open peer re-opens at the
+//!   new head on its next `db()`, follows a rebase that moves a head back
+//!   or onto another line, and does not drop a record that arrives while
+//!   the ledger loads; in-flight queries keep their frozen views — and
+//!   then to the registered callbacks.
 //!
 //! Retracted ledgers are evicted from the cache (`disconnect_ledger`);
 //! graph-source events are logged and ignored (no graph sources in the
@@ -23,7 +25,7 @@ use crate::bridge::{IoHandle, TokenCell};
 use crate::protocol::{IoJob, SseHeaders};
 use async_trait::async_trait;
 use bytes::Bytes;
-use fluree_db_api::{Fluree, NotifyResult, NsNotify};
+use fluree_db_api::{Fluree, NotifyResult};
 use fluree_db_nameservice_sync::{
     BoxChunkStream, HeadSink, RemoteEvent, Sleeper, SseChunkSource, SseConnectError,
 };
@@ -194,7 +196,7 @@ const REFRESH_RETRY_DELAYS: [Duration; 3] = [
 ];
 
 /// The browser peer's [`HeadSink`]: ledger updates refresh the cached
-/// ledger through `LedgerManager::notify` (between queries — a query in
+/// ledger through `LedgerManager::follow` (between queries — a query in
 /// flight keeps its frozen view) and fan out to registered callbacks;
 /// retractions evict the cached ledger.
 pub(crate) struct PeerHeadSink {
@@ -215,11 +217,7 @@ impl PeerHeadSink {
         let ledger_id = record.ledger_id.clone();
         let mut delays = REFRESH_RETRY_DELAYS.iter();
         loop {
-            let notify = NsNotify {
-                ledger_id: ledger_id.clone(),
-                record: Some(record.clone()),
-            };
-            match mgr.notify(notify).await {
+            match mgr.follow(record.clone()).await {
                 Ok(NotifyResult::NotLoaded | NotifyResult::Current) => return,
                 Ok(result) => {
                     tracing::info!(ledger_id = %ledger_id, ?result, "refreshed cached ledger from head stream");
@@ -445,6 +443,90 @@ mod tests {
         assert!(sleeper.0.lock().unwrap().is_empty(), "no retry");
         assert_eq!(cached_t(&sink).await, Some(t));
         assert_eq!(seen.lock().unwrap().len(), 1);
+    }
+
+    /// A head event is followed across a rebase that puts the branch on
+    /// another line at the `t` the peer has cached: the cached ledger moves
+    /// to the new line. Taken as a refresh, a record at the cached `t` is
+    /// current, and the peer went on serving the replaced commits.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_head_event_follows_a_rebase_onto_another_line() {
+        use fluree_db_api::{ConflictStrategy, FlureeBuilder, NameServiceMode};
+        use fluree_db_nameservice_sync::RemoteEvent;
+        use serde_json::json;
+
+        let dir = tempfile::tempdir().unwrap();
+        let writer = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+            .without_indexing()
+            .build()
+            .unwrap();
+        let name = |s: &str, n: &str| {
+            json!({"@context": {"ex": "http://example.org/ns/"},
+                   "@graph": [{"@id": format!("ex:{s}"), "ex:name": n}]})
+        };
+        let main = writer.create_ledger("rb").await.unwrap();
+        let main = writer
+            .insert(main, &name("alice", "alice"))
+            .await
+            .unwrap()
+            .ledger;
+        writer.create_branch("rb", "dev", None, None).await.unwrap();
+        for i in 0..2 {
+            let dev = writer.ledger("rb:dev").await.unwrap();
+            writer
+                .insert(dev, &name("alice", &format!("alice-dev{i}")))
+                .await
+                .unwrap();
+        }
+        let main = writer
+            .insert(main, &name("alice", "alice-main"))
+            .await
+            .unwrap()
+            .ledger;
+        writer.insert(main, &name("dave", "dave")).await.unwrap();
+
+        let storage = || {
+            fluree_db_core::FileStorage::new(dir.path())
+                .with_durability(fluree_db_core::Durability::Sync)
+                .without_wal_replay()
+        };
+        let peer = FlureeBuilder::memory().build_with(
+            storage(),
+            NameServiceMode::ReadOnly(Arc::new(
+                fluree_db_nameservice::file::FileNameService::with_storage(storage()),
+            )),
+        );
+        let cached_head = || {
+            let peer = peer.clone();
+            async move {
+                let handle = peer.ledger_cached("rb:dev").await.unwrap();
+                let state = handle.snapshot().await.to_ledger_state();
+                (state.t(), state.head_commit_id)
+            }
+        };
+        let (before_t, before_head) = cached_head().await;
+
+        writer
+            .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+            .await
+            .unwrap();
+        let record = writer
+            .nameservice()
+            .lookup("rb:dev")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.commit_t, before_t, "the rebase keeps the branch's t");
+        assert_ne!(record.commit_head_id, before_head, "on another line");
+
+        let sink = PeerHeadSink {
+            fluree: peer.clone(),
+            registry: Arc::new(HeadRegistry::default()),
+            sleeper: Arc::new(RecordingSleeper::default()),
+        };
+        sink.on_event(RemoteEvent::LedgerUpdated(record.clone()))
+            .await;
+        assert_eq!(cached_head().await.1, record.commit_head_id);
     }
 
     #[test]

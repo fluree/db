@@ -207,17 +207,33 @@ pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
     }
 }
 
-/// Encode `iri` by its canonical split without allocating: the code `code_of`
-/// gives its prefix, or `Sid(EMPTY, iri)` when the prefix has none.
+/// The highest code a user namespace can take. A table holding it is full:
+/// the write path stores an IRI whose prefix has no code whole, as
+/// `Sid(OVERFLOW, iri)`.
+pub const LAST_USER_CODE: u16 = OVERFLOW - 1;
+
+/// Whether a code → prefix table is full: it holds [`LAST_USER_CODE`], so
+/// the write path gives every new prefix `OVERFLOW`.
+#[inline]
+pub fn table_full(codes: &HashMap<u16, String>) -> bool {
+    codes.contains_key(&LAST_USER_CODE)
+}
+
+/// Encode `iri` by its canonical split without allocating, as the write path
+/// stores it: under the code `code_of` gives its prefix, else whole under
+/// `OVERFLOW` once `table_full`. While the table has room, a prefix without a
+/// code belongs to no stored IRI, and the result is `Sid(EMPTY, iri)`.
 #[inline]
 pub fn encode_registered(
     iri: &str,
     mode: NsSplitMode,
     code_of: impl FnOnce(&str) -> Option<u16>,
+    table_full: impl FnOnce() -> bool,
 ) -> Sid {
     let (prefix, suffix) = canonical_split(iri, mode);
     match code_of(prefix) {
         Some(code) => Sid::new(code, suffix),
+        None if table_full() => Sid::new(OVERFLOW, iri),
         None => Sid::new(EMPTY, iri),
     }
 }
@@ -793,6 +809,12 @@ impl NamespaceCodes {
     /// The next code that will be allocated.
     pub fn next_code(&self) -> u16 {
         self.next_code
+    }
+
+    /// Whether every user code is taken, so a new prefix gets `OVERFLOW`:
+    /// the same test as [`table_full`].
+    pub fn is_full(&self) -> bool {
+        self.get_prefix(LAST_USER_CODE).is_some()
     }
 
     /// Iterate over all registered `(code, prefix)` pairs. The layers are
