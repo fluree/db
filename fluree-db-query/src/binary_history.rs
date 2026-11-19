@@ -209,6 +209,7 @@ impl BinaryHistoryScanOperator {
                     store.as_ref(),
                     &s_sid,
                     &p_sid,
+                    None,
                 )
                 .map_err(|e| QueryError::Internal(format!("history scan: build_filter: {e}")))?;
 
