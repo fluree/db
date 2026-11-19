@@ -305,6 +305,101 @@ async fn construct_writes_a_list_as_a_collection() {
     );
 }
 
+/// Lists on several predicates are met in the same order by every request,
+/// so their cells take the same labels and the Graph Store `GET`'s CONSTRUCT
+/// writes the same N-Triples each time, from novelty and from an index. The
+/// Turtle and JSON-LD writers, which fold the cells back into lists through
+/// randomly seeded hash maps, write the same text each time too.
+#[tokio::test]
+async fn every_request_names_the_cells_alike() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    let ttl = "ex:s ex:a (1 2) ; ex:b (3 4) ; ex:c (5 6) ; ex:d (7 8) .\n\
+               ex:t ex:a (9) ; ex:d (10) .";
+    let fluree = FlureeBuilder::memory().build_memory();
+    let novel = ledger_with(&fluree, "named-alike", ttl).await;
+    let indexed = indexed_ledger_with(&fluree, "named-alike-indexed", ttl).await;
+    let query = "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }";
+    for (lane, ledger) in [("novelty", &novel), ("index", &indexed)] {
+        for (format, config) in [
+            ("N-Triples", FormatterConfig::ntriples()),
+            ("Turtle", FormatterConfig::turtle()),
+            ("JSON-LD", FormatterConfig::jsonld()),
+        ] {
+            let mut written = std::collections::BTreeSet::new();
+            for _ in 0..16 {
+                let result = rdf_query(&fluree, ledger, query).await.expect("construct");
+                let text =
+                    format_results_string(&result, &result.context, &ledger.snapshot, &config)
+                        .unwrap_or_else(|e| panic!("{format}: {e}"));
+                written.insert(text);
+            }
+            assert_eq!(written.len(), 1, "{lane} {format}: {written:#?}");
+        }
+        let result = rdf_query(&fluree, ledger, query).await.expect("construct");
+        let nt = format_results_string(
+            &result,
+            &result.context,
+            &ledger.snapshot,
+            &FormatterConfig::ntriples(),
+        )
+        .expect("n-triples");
+        // Owner edges, then two triples per cell: ex:s's, then ex:t's.
+        assert_eq!(
+            nt.lines().count(),
+            (4 + 2 * 8) + (2 + 2 * 2),
+            "{lane}:\n{nt}"
+        );
+    }
+}
+
+/// A list with more triples than a batch holds is answered a batch at a time,
+/// not as one batch of every triple, and still reads back whole: the Turtle
+/// writer folds the cells back into the list only if the chain and its labels
+/// carry across the batches.
+#[tokio::test]
+async fn a_long_list_is_answered_a_batch_at_a_time() {
+    use fluree_db_api::format::{format_results_string, FormatterConfig};
+
+    const N: usize = 2_500;
+    let members: Vec<String> = (0..N).map(|i| i.to_string()).collect();
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ttl = format!("ex:s ex:items ({}) .", members.join(" "));
+    let ledger = ledger_with(&fluree, "long", &ttl).await;
+
+    let result = rdf_query(&fluree, &ledger, "SELECT ?s ?p ?o WHERE { ?s ?p ?o }")
+        .await
+        .expect("select");
+    let sizes: Vec<usize> = result
+        .batches
+        .iter()
+        .map(fluree_db_api::Batch::len)
+        .collect();
+    assert_eq!(sizes.iter().sum::<usize>(), 1 + 2 * N, "{sizes:?}");
+    // The default batch size is 1,000 rows; the list alone is 5,001.
+    assert!(sizes.iter().all(|&n| n <= 1_000), "{sizes:?}");
+
+    let construct = rdf_query(
+        &fluree,
+        &ledger,
+        "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+    )
+    .await
+    .expect("construct");
+    let ttl = format_results_string(
+        &construct,
+        &construct.context,
+        &ledger.snapshot,
+        &FormatterConfig::turtle(),
+    )
+    .expect("turtle");
+    assert!(
+        ttl.contains(&format!("( {} )", members.join(" "))),
+        "the list is not written whole:\n{}",
+        &ttl[..ttl.len().min(2_000)]
+    );
+}
+
 /// The fuel of `rdf:rest*/rdf:first` grows with the list, not with its
 /// square or cube: the walk starts at the owner, though statistics count no
 /// `rdf:first` for a compact list, and reads the list once.
