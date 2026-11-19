@@ -145,6 +145,7 @@ jobs:
         run: |
           tag=latest
           case "$VERSION" in *-*) tag=next ;; esac
+          debian() { printf '%s' "$1" | tr '-' '~'; }
           # The engine first: an app peering with @fluree/react installs both.
           # A version already published is skipped, so a re-run after a
           # partial publish finishes the job.
@@ -154,5 +155,16 @@ jobs:
               echo "$name@$VERSION is already published"
               continue
             fi
-            npm publish "npm/fluree-$spec-$VERSION.tgz" --access public --provenance --tag "$tag"
+            # A tag only moves forward: a release older than the one the tag
+            # names (a 4.x after a 5.0, both pre-releases on `next`, say) is
+            # published under its line's own tag, `next-4`, and the tag stays
+            # put. Debian ordering with `-` as `~` sorts 4.2.4-beta.2 before
+            # 4.2.4, as the Homebrew job does.
+            publish_tag=$tag
+            current=$(npm view "$name" "dist-tags.$tag" 2>/dev/null || true)
+            if [ -n "$current" ] && dpkg --compare-versions "$(debian "$VERSION")" lt "$(debian "$current")"; then
+              publish_tag="$tag-${VERSION%%.*}"
+              echo "::notice::$name's $tag is at $current, newer than $VERSION; publishing under $publish_tag"
+            fi
+            npm publish "npm/fluree-$spec-$VERSION.tgz" --access public --provenance --tag "$publish_tag"
           done
