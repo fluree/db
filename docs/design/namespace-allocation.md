@@ -70,10 +70,14 @@ pub enum NsSplitMode {
   A built-in namespace's own IRI (`http://www.w3.org/2001/XMLSchema#`) keeps its code, and an IRI
   with no earlier delimiter (`urn:`) keeps the last one.
 
-The mode persists as a single byte, in the first commit's envelope and in every index root:
-`0x00` = `MostGranular`, `0x01..=0xFE` = `HostPlusN(n-1)`, `0xFF` = `NamedLocal`.
-`HOST_PLUS_N_MAX = 253`. Byte `0xFF` once meant `HostPlusN(254)`; no release wrote a `HostPlusN`
-above 1, which is the only value the bulk-import preflight selects.
+The mode persists in the first commit's envelope and in every index root, as a byte:
+`0x00` = `MostGranular`, `0x01..=0xFE` = `HostPlusN(n-1)`. `HOST_PLUS_N_MAX = 253`. Byte `0xFF`
+once meant `HostPlusN(254)`; no release wrote a `HostPlusN` above 1, which is the only value the
+bulk-import preflight selects. An index root stores `NamedLocal` as `0xFF`. A commit envelope
+stores `0xFF` as an escape followed by an extended mode id, `0x00` for `NamedLocal`: a 4.x decoder
+reads the escape as `HostPlusN(254)` and refuses the id after it as a trailing byte, so it refuses
+the ledger instead of encoding new IRIs differently from it. An extended id the decoder does not
+know is refused too. 4.x refuses a v5 root already, so the root needs no escape.
 
 Implementation: `fluree-db-core/src/ns_encoding.rs` (`NsSplitMode`, `canonical_split`).
 The registry reads it via `LedgerSnapshot::ns_split_mode()` and applies it in
