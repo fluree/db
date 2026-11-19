@@ -566,23 +566,6 @@ fn api_error_code(e: &ApiError) -> &'static str {
     }
 }
 
-/// Buffered [`BatchSink`] that collects batches into a `Vec` — the dataset
-/// buffered path's collector, mirroring the query crate's internal `VecSink`.
-#[derive(Default)]
-pub(crate) struct CollectSink {
-    pub(crate) batches: Vec<fluree_db_query::binding::Batch>,
-}
-
-impl BatchSink for CollectSink {
-    async fn push(
-        &mut self,
-        batch: fluree_db_query::binding::Batch,
-    ) -> std::result::Result<(), fluree_db_query::QueryError> {
-        self.batches.push(batch);
-        Ok(())
-    }
-}
-
 /// The compactor for streamed rows. Rows are the `bindings` entries `/query`
 /// returns, so they take its SPARQL-results profile: absolute IRIs, since a
 /// row carries no prefix map to expand a compact one against.

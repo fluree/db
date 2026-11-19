@@ -43,6 +43,7 @@ pub use runner::execute;
 pub use runner::execute_prepared;
 pub use runner::execute_prepared_streaming;
 pub use runner::BatchSink;
+pub use runner::CollectSink;
 pub use runner::ContextConfig;
 pub use runner::ExecutableQuery;
 

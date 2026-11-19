@@ -592,7 +592,7 @@ pub async fn prepare_execution_with_config(
 
 /// Destination for the batches an operator tree produces.
 ///
-/// The buffered path collects into a `Vec` ([`VecSink`]); the streaming path
+/// The buffered path collects into a `Vec` ([`CollectSink`]); the streaming path
 /// formats and flushes each batch as it arrives. Both drive the exact same
 /// [`run_operator_into`] loop, so execution behaviour (tracing, cancellation,
 /// fuel) can never drift between them.
@@ -607,14 +607,48 @@ pub trait BatchSink: Send {
 }
 
 /// Buffered sink: collects every batch into a `Vec` (the standard,
-/// benchmark-critical query path). The per-batch `push` is just the `Vec::push`
-/// the loop used to do inline.
-struct VecSink {
+/// benchmark-critical query path). The per-batch `push` is the `Vec::push`
+/// the loop used to do inline, plus one charge on the query's memory budget.
+/// Every buffered path collects through this one type.
+///
+/// The collected result is held until the query ends, so it is charged as it
+/// grows (at [`BINDING_EST_BYTES`](crate::context::BINDING_EST_BYTES) per
+/// binding, like the operators' own charges), and the runner's checkpoint
+/// before each next batch enforces the budget on it. A query whose answer
+/// alone outgrows the budget then stops typed instead of growing the process
+/// until it is killed. The charge is released when the result is handed back
+/// ([`Self::into_batches`]).
+pub struct CollectSink {
     batches: Vec<Batch>,
+    charge: fluree_db_core::MemoryCharge,
 }
 
-impl BatchSink for VecSink {
+impl CollectSink {
+    /// An empty collector charging the query whose handle is `memory` (none:
+    /// nothing is charged).
+    pub fn new(memory: Option<&QueryCancellation>) -> Self {
+        Self {
+            batches: Vec::new(),
+            charge: memory
+                .map(fluree_db_core::MemoryCharge::new)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The collected batches, returning their charge.
+    pub fn into_batches(self) -> Vec<Batch> {
+        self.batches
+    }
+}
+
+impl BatchSink for CollectSink {
     async fn push(&mut self, batch: Batch) -> Result<()> {
+        self.charge.record(
+            batch
+                .len()
+                .saturating_mul(batch.schema().len())
+                .saturating_mul(crate::context::BINDING_EST_BYTES),
+        );
         self.batches.push(batch);
         Ok(())
     }
@@ -623,16 +657,14 @@ impl BatchSink for VecSink {
 /// Run an operator tree to completion and collect all result batches.
 ///
 /// This is the buffered entry point used by all non-streaming execution paths.
-/// It drives [`run_operator_into`] with a [`VecSink`].
+/// It drives [`run_operator_into`] with a [`CollectSink`].
 pub async fn run_operator(
     operator: BoxedOperator,
     ctx: &ExecutionContext<'_>,
 ) -> Result<Vec<Batch>> {
-    let mut sink = VecSink {
-        batches: Vec::new(),
-    };
+    let mut sink = CollectSink::new(Some(&ctx.cancellation));
     run_operator_into(operator, ctx, &mut sink).await?;
-    Ok(sink.batches)
+    Ok(sink.into_batches())
 }
 
 /// Run an operator tree to completion, feeding each batch to `sink` as it is
@@ -704,7 +736,9 @@ async fn run_operator_into<S: BatchSink>(
         let mut max_batch_ms: u64 = 0;
         let run_start = Instant::now();
         loop {
-            ctx.check_cancelled()?;
+            // Cancellation and the memory budget, which also covers what a
+            // buffering sink has collected so far.
+            ctx.checkpoint()?;
             let batch_start = Instant::now();
             let next = operator.next_batch(ctx).await?;
             ctx.check_cancelled()?;
@@ -855,11 +889,9 @@ pub async fn execute_prepared<'a>(
     prepared: PreparedExecution,
     config: ContextConfig<'a, '_>,
 ) -> Result<Vec<Batch>> {
-    let mut sink = VecSink {
-        batches: Vec::new(),
-    };
+    let mut sink = CollectSink::new(config.cancellation.as_ref());
     execute_prepared_into(db, vars, prepared, config, &mut sink).await?;
-    Ok(sink.batches)
+    Ok(sink.into_batches())
 }
 
 /// Streaming counterpart to [`execute_prepared`]: builds the same execution
@@ -1118,4 +1150,60 @@ pub async fn execute<'a>(
         .await
         .map_err(|e| e.name_variables(vars))?;
     execute_prepared(db, vars, prepared, config).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::binding::Binding;
+    use crate::error::QueryError;
+    use crate::seed::BatchReplayOperator;
+    use crate::var_registry::VarId;
+
+    /// `n` batches of `rows` rows over two variables.
+    fn replay(n: usize, rows: usize) -> BoxedOperator {
+        let schema: Arc<[VarId]> = Arc::from(vec![VarId(0), VarId(1)].into_boxed_slice());
+        let batches = (0..n)
+            .map(|b| {
+                let column = |v: usize| {
+                    (0..rows)
+                        .map(|r| Binding::iri(format!("http://ex/{b}/{r}/{v}")))
+                        .collect()
+                };
+                Batch::new(Arc::clone(&schema), vec![column(0), column(1)]).unwrap()
+            })
+            .collect();
+        Box::new(BatchReplayOperator::new(schema, batches))
+    }
+
+    /// The buffered path holds the whole answer until the query ends, so it
+    /// is charged as it grows: an answer past the budget stops the query
+    /// typed, between two batches, rather than growing the process until it
+    /// is killed. Either way the charge is returned when the run ends.
+    #[tokio::test]
+    async fn a_buffered_answer_is_charged_to_the_budget() {
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        // 50 batches of 100 rows of two bindings each.
+        let per_batch = 100 * 2 * crate::context::BINDING_EST_BYTES;
+
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(10 * per_batch);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel.clone());
+        let err = run_operator(replay(50, 100), &ctx)
+            .await
+            .expect_err("an answer past the budget stops the query");
+        assert!(
+            matches!(err, QueryError::MemoryBudgetExceeded { .. }),
+            "got {err:?}"
+        );
+        assert_eq!(cancel.allocated_bytes(), 0, "the charge is returned");
+
+        let cancel = QueryCancellation::new();
+        cancel.set_memory_limit(51 * per_batch);
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel.clone());
+        let batches = run_operator(replay(50, 100), &ctx).await.unwrap();
+        assert_eq!(batches.len(), 50);
+        assert_eq!(cancel.allocated_bytes(), 0, "the charge is returned");
+    }
 }

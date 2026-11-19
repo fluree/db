@@ -688,12 +688,12 @@ impl Fluree {
         r2rml: crate::R2rmlProviders<'_>,
         options: &QueryExecutionOptions,
     ) -> Result<Vec<crate::Batch>> {
-        let mut sink = crate::view::stream_query::CollectSink::default();
+        let mut sink = fluree_db_query::execute::CollectSink::new(options.cancellation.as_ref());
         self.execute_dataset_into_with_r2rml(
             dataset, vars, executable, tracker, r2rml, options, &mut sink,
         )
         .await?;
-        Ok(sink.batches)
+        Ok(sink.into_batches())
     }
 
     /// Sink-generic core shared by the buffered
