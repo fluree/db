@@ -1620,9 +1620,11 @@ class QueryProfile:
     ``reasoning`` is the server's tracked ``reasoning`` block when a
     reasoning mode ran, else ``None``: whether the materialization was
     ``capped``, ``derived_facts``, ``rules_fired`` per rule, and for datalog
-    the ``rule_set`` that ran (a content hash that changes whenever a rule
-    does) and, when the stored rules came from another graph or ledger,
-    ``rules_source`` (``ledger``, ``graph`` and the ``t`` they were read at).
+    the ``rule_set`` that ran (a SHA-256 that changes whenever a rule does),
+    ``rules`` (each rule's ``id`` and the ``hash`` of its text) and, when the
+    stored rules came from another graph or ledger, ``rules_source``
+    (``ledger``, ``graph``, the ``t`` they were read at and, for another
+    ledger, its ``commit_id`` there).
     """
 
     result: Any

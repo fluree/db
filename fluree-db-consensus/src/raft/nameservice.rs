@@ -2473,6 +2473,7 @@ mod tests {
                 evaluation_time: None,
                 rules_fired: std::collections::BTreeMap::new(),
                 rule_set: None,
+                rules: Vec::new(),
                 rules_source: None,
             })),
             sql: None,
@@ -2559,6 +2560,7 @@ mod tests {
                 evaluation_time: None,
                 rules_fired: std::collections::BTreeMap::new(),
                 rule_set: None,
+                rules: Vec::new(),
                 rules_source: None,
             })),
             sql: None,
@@ -2828,10 +2830,15 @@ mod tests {
             evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
             rules_fired: std::collections::BTreeMap::from([("ex:rule".to_string(), 3)]),
             rule_set: Some("00000000000000ab".to_string()),
+            rules: vec![fluree_db_core::tracking::RuleTally {
+                id: "ex:rule".to_string(),
+                hash: "00000000000000cd".to_string(),
+            }],
             rules_source: Some(fluree_db_core::tracking::RulesSourceTally {
                 ledger: "rules:main".to_string(),
                 graph: "http://example.org/rules".to_string(),
                 t: 7,
+                commit_id: Some("bafy-test".to_string()),
             }),
         };
         let original_tally = TrackingTally {
@@ -2921,6 +2928,7 @@ mod tests {
             evaluation_time: rt_evaluation_time,
             rules_fired: rt_rules_fired,
             rule_set: rt_rule_set,
+            rules: rt_rules,
             rules_source: rt_rules_source,
         } = *rt_reasoning.expect("reasoning Some on round-trip");
         // Not carried by the recorded mirror: adding them would change the
@@ -2929,6 +2937,7 @@ mod tests {
         assert_eq!(rt_evaluation_time, None);
         assert!(rt_rules_fired.is_empty());
         assert_eq!(rt_rule_set, None);
+        assert!(rt_rules.is_empty());
         assert_eq!(rt_rules_source, None);
         let original_reasoning = original_tally.reasoning.expect("reasoning populated above");
         assert_eq!(rt_capped, original_reasoning.capped);

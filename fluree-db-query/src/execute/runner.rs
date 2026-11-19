@@ -907,6 +907,14 @@ async fn execute_prepared_into<'a, S: BatchSink>(
                 .map(|(rule, n)| (rule.clone(), *n as u64))
                 .collect(),
             rule_set: diag.rule_set.clone(),
+            rules: diag
+                .rule_digests
+                .iter()
+                .map(|(id, hash)| fluree_db_core::RuleTally {
+                    id: id.clone(),
+                    hash: hash.clone(),
+                })
+                .collect(),
             rules_source: prepared.rules_source.clone(),
         });
     }

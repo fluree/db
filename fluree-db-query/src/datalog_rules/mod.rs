@@ -202,6 +202,45 @@ impl DatalogRuleSet {
         }
         h.finish()
     }
+
+    /// Each rule's name and [`DatalogRule::digest`], sorted by name: what a
+    /// run record lists to show which rules ran, and that one rule's text is
+    /// unchanged from one run to the next.
+    pub fn rule_digests(&self) -> Vec<(String, String)> {
+        let mut digests: Vec<(String, String)> = self
+            .rules
+            .iter()
+            .map(|r| (r.name.clone(), r.digest()))
+            .collect();
+        digests.sort();
+        digests
+    }
+
+    /// The rule set's digest for records: SHA-256 (hex) over every rule's
+    /// name and [`DatalogRule::digest`], in name order. Unlike
+    /// [`Self::content_hash`], which keys the reasoning cache and may change
+    /// with the toolchain's hasher, it is stable across releases, so a
+    /// recorded run can be compared with a later one.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        for (name, digest) in self.rule_digests() {
+            h.update(name.as_bytes());
+            h.update(b"\0");
+            h.update(digest.as_bytes());
+            h.update(b"\n");
+        }
+        format!("{:x}", h.finalize())
+    }
+}
+
+impl DatalogRule {
+    /// SHA-256 (hex) of the rule's source text, as stored or supplied: the
+    /// same text has the same digest in every ledger and release.
+    pub fn digest(&self) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(self.source.as_bytes()))
+    }
 }
 
 /// Result of executing datalog rules.
@@ -314,6 +353,8 @@ pub struct ImportedRules {
     pub graph: String,
     /// The `t` of that ledger they were read at.
     pub t: i64,
+    /// The commit of that ledger at `t`, when the resolver knows it.
+    pub commit_id: Option<String>,
     pub rules: Vec<ImportedRule>,
 }
 

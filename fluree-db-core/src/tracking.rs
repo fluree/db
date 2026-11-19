@@ -682,12 +682,18 @@ pub struct ReasoningTally {
     /// rule id). It counts derived facts, not rule applications.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub rules_fired: BTreeMap<String, u64>,
-    /// The datalog rule set that ran, by content: a hash (16 hex digits) of
-    /// every rule's id and source text, the one the reasoning cache keys on
-    /// and an explanation of a derived fact reports. It changes whenever a
-    /// rule is added, removed or edited, wherever the rules came from.
+    /// The datalog rule set that ran, by content: SHA-256 (hex) over every
+    /// rule's name and the digest of its text (see [`Self::rules`]), the value
+    /// an explanation of a derived fact reports. It changes whenever a rule is
+    /// added, removed or edited, wherever the rules came from, and is stable
+    /// across releases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule_set: Option<String>,
+    /// Each datalog rule that ran, by name, with the SHA-256 (hex) of its
+    /// text, sorted by name: one rule's text can be shown unchanged from one
+    /// run to the next.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<RuleTally>,
     /// Where the stored datalog rules were read from, when not the graph the
     /// query reads: another ledger's graph (`f:rulesSource` with `f:ledger`)
     /// at the `t` it resolved to, or this ledger's own `f:rulesSource` graph
@@ -705,6 +711,21 @@ pub struct RulesSourceTally {
     pub graph: String,
     /// The `t` of that ledger they were read at.
     pub t: i64,
+    /// The commit of that ledger at `t`, when known (another ledger's rules):
+    /// unlike `t`, it names one state even if the ledger is rebuilt under the
+    /// same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
+}
+
+/// One datalog rule that ran ([`ReasoningTally::rules`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleTally {
+    /// The rule's name: the IRI of the subject its `f:rule` value is on, or a
+    /// query-time rule's `@id`.
+    pub id: String,
+    /// SHA-256 (hex) of the rule's text, as stored or supplied.
+    pub hash: String,
 }
 
 fn format_time_ms(duration: Duration) -> String {

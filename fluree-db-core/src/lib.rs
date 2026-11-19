@@ -230,7 +230,7 @@ pub use storage::{
 pub use subject_id::{SubjectId, SubjectIdColumn, SubjectIdEncoding};
 pub use temporal::{Date, DateTime, Time};
 pub use tracking::{
-    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningTally,
+    FuelExceededError, PolicyEnforcement, PolicyStats, PushedStatement, ReasoningTally, RuleTally,
     RulesSourceTally, Tracker, TrackingOptions, TrackingTally,
 };
 pub use value::{

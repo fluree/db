@@ -640,8 +640,25 @@ async fn cross_ledger_sparql_rules_run_and_the_response_says_what_ran() {
     assert_eq!(source.graph, SCORED_RULES_GRAPH);
     let model_t = fluree.ledger(model_id).await.expect("M").t();
     assert_eq!(source.t, model_t);
+    assert!(
+        source.commit_id.is_some(),
+        "the rules ledger's commit at t names it across rebuilds: {source:?}"
+    );
     let first_hash = tally.rule_set.clone().expect("rule set reported");
-    assert_eq!(first_hash.len(), 16, "{first_hash}");
+    assert_eq!(first_hash.len(), 64, "SHA-256 hex: {first_hash}");
+    let first_rules: Vec<&str> = tally.rules.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(
+        first_rules,
+        ["http://example.org/r1", "http://example.org/r2"],
+        "{:?}",
+        tally.rules
+    );
+    assert!(
+        tally.rules.iter().all(|r| r.hash.len() == 64),
+        "{:?}",
+        tally.rules
+    );
+    let first_tally_rules = tally.rules.clone();
     assert_eq!(
         tally.rules_fired.get("http://example.org/r2"),
         Some(&2),
@@ -677,6 +694,12 @@ async fn cross_ledger_sparql_rules_run_and_the_response_says_what_ran() {
     let source = tally.rules_source.expect("rules source reported");
     assert!(source.t > model_t, "{} > {model_t}", source.t);
     assert_ne!(tally.rule_set.expect("rule set reported"), first_hash);
+    // The rules that did not change keep their hashes; the new one is listed.
+    let after: Vec<&fluree_db_api::RuleTally> = tally.rules.iter().collect();
+    assert_eq!(after.len(), 3, "{after:?}");
+    assert_eq!(after[2].id, "http://example.org/r3");
+    assert_eq!(after[0], &first_tally_rules[0]);
+    assert_eq!(after[1], &first_tally_rules[1]);
 }
 
 /// An `f:rule` value of any other datatype fails the query naming the rule,

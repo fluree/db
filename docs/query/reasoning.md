@@ -351,9 +351,9 @@ just logged:
   }
   ```
 
-- The same JSON rides the `x-fdb-reasoning` response header, without
-  `rules_fired` (which can name every rule of a program; it stays in the
-  body).
+- The same JSON rides the `x-fdb-reasoning` response header, without the
+  per-rule lists (`rules_fired`, `rules`), which can name every rule of a
+  program; they stay in the body.
 - `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
   `"iterations"` (the fixpoint hit its round limit before converging).
 - `rules_fired` breaks the tally down per rule. It counts derived **facts**
@@ -363,16 +363,22 @@ just logged:
   running when the cap fired and `pending_rules` the rules it kept from
   running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
   time they returned (see [Datalog rules](datalog-rules.md)).
-- When datalog runs, `rule_set` names the rule set that ran by content: 16 hex
-  digits hashing every rule's id and text, the same value an
-  [explanation](datalog-rules.md#explaining-a-derived-fact) of a derived fact
-  reports. It changes whenever a rule is added, removed or edited, wherever it
-  is stored. When the stored rules come from somewhere other than the graph
-  the query reads, `rules_source` says where: another ledger's graph
-  (`f:rulesSource` with `f:ledger`) and the `t` that ledger was read at, or
-  this ledger's own `f:rulesSource` graph at the query's `t`. Together with
-  the query's own `t`, that is the record of a run: "rule set `rule_set`, read
-  from `rules_source.ledger` at `rules_source.t`, over this ledger at `t`".
+- When datalog runs, `rule_set` names the rule set that ran by content: a
+  SHA-256 (hex) over every rule's name and the digest of its text, the same
+  value an [explanation](datalog-rules.md#explaining-a-derived-fact) of a
+  derived fact reports. `rules` lists each rule by name with the SHA-256 of
+  its text, so one rule can be shown unchanged from one run to the next. Both
+  change only when a rule is added, removed or edited, wherever it is stored,
+  and are stable across releases. When the stored rules come from somewhere
+  other than the graph the query reads, `rules_source` says where: another
+  ledger's graph (`f:rulesSource` with `f:ledger`), the `t` that ledger was
+  read at and its `commit_id` there, or this ledger's own `f:rulesSource`
+  graph at the query's `t`. With the query's own data pin, that is the record
+  of a run: "rule set `rule_set`, read from `rules_source.ledger` at
+  `rules_source.commit_id`, over this ledger at …". A ledger rebuilt under the
+  same name reuses its `t` values, so for a record that must name one state,
+  pin the data by commit (`"from": "data:main@commit:<cid>"`) rather than by
+  `t`.
 
   ```json
   "reasoning": {
@@ -381,14 +387,22 @@ just logged:
     "iterations": 2,
     "duration_ms": 3,
     "rules_fired": {"http://example.org/r1": 1, "http://example.org/r2": 1},
-    "rule_set": "5d41402abc4b2a76",
+    "rule_set": "9f2c…e41a",
+    "rules": [
+      {"id": "http://example.org/r1", "hash": "3b5d…7c10"},
+      {"id": "http://example.org/r2", "hash": "a81f…0d92"}
+    ],
     "rules_source": {
       "ledger": "rules:main",
       "graph": "http://example.org/rules",
-      "t": 12
+      "t": 12,
+      "commit_id": "bafy…"
     }
   }
   ```
+
+  The `x-fdb-reasoning` header carries the same block without `rules_fired`
+  and `rules`, which grow with the program.
 
 - The server logs a WARN per capped materialization.
 
@@ -482,7 +496,7 @@ Reasoning composes with view policy, but mind the contract when both are on:
 - Data a rule or axiom reads is security data. A derived fact can grant access as well as deny it: a rule can place a subject in a class an `f:onClass` policy allows, or satisfy an `f:query` condition, so whoever can write a rule's inputs can open access through it.
 - A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off; see [Override control](../ledger-config/override-control.md).
 
-**Query-time rules are admin-only.** Under a non-root view policy, caller-supplied `rules` are stripped before execution — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
+**Query-time rules are admin-only.** Under a non-root view policy, a query that supplies `rules` is refused with a 400 — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data) — and so is one whose ledger config denies query-time rules for the request (`f:allowQueryTimeRules false`). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
 
 ## Related pages
 

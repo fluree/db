@@ -427,12 +427,14 @@ pub async fn compute_derived_facts(
                 pending_rules: dl_diag.pending_rules,
                 evaluation_time: dl_diag.evaluation_time,
                 rule_set: None,
+                rule_digests: Vec::new(),
             },
         });
         // Name the rule set before the result is cached, so a cached run
         // reports it as this one does.
         if let Some(diagnostics) = diagnostics.as_mut() {
-            diagnostics.rule_set = Some(format!("{:016x}", rule_set.content_hash()));
+            diagnostics.rule_set = Some(rule_set.digest());
+            diagnostics.rule_digests = rule_set.rule_digests();
         }
         all_flakes.extend(datalog_result.derived_flakes);
     }
@@ -488,6 +490,7 @@ pub fn rules_source_tally(
             ledger: imported.ledger.clone(),
             graph: imported.graph.clone(),
             t: imported.t,
+            commit_id: imported.commit_id.clone(),
         });
     }
     let g_id = config.rules_source_g_id.filter(|g| *g != db.g_id)?;
@@ -499,6 +502,7 @@ pub fn rules_source_tally(
             .iri_for_graph_id(g_id)?
             .to_string(),
         t: db.t,
+        commit_id: None,
     })
 }
 
@@ -580,7 +584,7 @@ pub async fn explain_derived_facts(
     .await?;
     Ok(Explanation {
         t: base_db.t,
-        rule_set: format!("{:016x}", rule_set.content_hash()),
+        rule_set: rule_set.digest(),
         evaluation_time: diagnostics.evaluation_time,
         complete: !diagnostics.capped && replayed,
         facts,

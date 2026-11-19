@@ -124,7 +124,8 @@ def test_profile_reports_which_rules_ran(family):
 
     first = family.profile({**GRANDPARENTS, "reasoning": "datalog", "rules": [GRANDPARENT_RULE]})
     assert first.result == ["ex:eve"]
-    assert len(first.reasoning["rule_set"]) == 16
+    assert len(first.reasoning["rule_set"]) == 64
+    assert [len(rule["hash"]) for rule in first.reasoning["rules"]] == [64]
     assert sum(first.reasoning["rules_fired"].values()) >= 1
     assert "rules_source" not in first.reasoning
 

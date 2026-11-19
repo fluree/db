@@ -93,6 +93,7 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             evaluation_time: None,
             rules_fired: std::collections::BTreeMap::new(),
             rule_set: None,
+            rules: Vec::new(),
             rules_source: None,
         }
     }

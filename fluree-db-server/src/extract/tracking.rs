@@ -72,13 +72,14 @@ pub fn tracking_headers(tally: &TrackingTally) -> HeaderMap {
 
     // Add reasoning header if a materialization ran. Plain JSON (not base64):
     // the payload is short, and `capped` should be greppable straight off the
-    // wire. `rules_fired` stays in the body: it names every rule that derived
-    // a fact, which for a large program would grow the header past what
-    // proxies accept.
+    // wire. `rules_fired` and `rules` stay in the body: they name every rule,
+    // which for a large program would grow the header past what proxies
+    // accept.
     if let Some(ref reasoning) = tally.reasoning {
         if let Ok(mut json) = serde_json::to_value(reasoning) {
             if let Some(fields) = json.as_object_mut() {
                 fields.remove("rules_fired");
+                fields.remove("rules");
             }
             if let Ok(value) = HeaderValue::from_str(&json.to_string()) {
                 headers.insert(HeaderName::from_static(X_FDB_REASONING), value);
@@ -105,8 +106,7 @@ mod tests {
     use fluree_db_api::{ReasoningTally, RulesSourceTally};
 
     /// The reasoning header says what ran (the rule set and its source) but
-    /// leaves the per-rule breakdown, which grows with the program, to the
-    /// body.
+    /// leaves the per-rule lists, which grow with the program, to the body.
     #[test]
     fn the_reasoning_header_names_the_rule_set_without_per_rule_counts() {
         let tally = TrackingTally {
@@ -128,10 +128,15 @@ mod tests {
                     2,
                 )]),
                 rule_set: Some("00000000000000ab".to_string()),
+                rules: vec![fluree_db_api::RuleTally {
+                    id: "http://example.org/r1".to_string(),
+                    hash: "00000000000000cd".to_string(),
+                }],
                 rules_source: Some(RulesSourceTally {
                     ledger: "rules:main".to_string(),
                     graph: "http://example.org/rules".to_string(),
                     t: 12,
+                    commit_id: None,
                 }),
             })),
             sql: None,
@@ -150,5 +155,6 @@ mod tests {
         assert_eq!(header["rules_source"]["ledger"], "rules:main");
         assert_eq!(header["rules_source"]["t"], 12);
         assert!(header.get("rules_fired").is_none(), "{header}");
+        assert!(header.get("rules").is_none(), "{header}");
     }
 }

@@ -319,7 +319,7 @@ async fn the_tally_names_the_rule_set_and_a_rules_source_graph() {
     assert_eq!(source.graph, rules_iri);
     assert_eq!(source.t, ledger.t());
     let configured = tally.rule_set.expect("rule set reported");
-    assert_eq!(configured.len(), 16, "{configured}");
+    assert_eq!(configured.len(), 64, "SHA-256 hex: {configured}");
     assert_eq!(
         tally.rules_fired.get("http://example.org/grandparentRule"),
         Some(&1),

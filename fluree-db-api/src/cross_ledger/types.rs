@@ -530,6 +530,7 @@ impl RulesArtifactWire {
             ledger: self.origin.model_ledger_id.clone(),
             graph: self.origin.graph_iri.clone(),
             t: self.origin.resolved_t,
+            commit_id: self.origin.commit_id.as_ref().map(ToString::to_string),
             rules: self.rules.clone(),
         })
     }
