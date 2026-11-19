@@ -1587,7 +1587,8 @@ mod inner {
         // (non-annotated) bulk import pays nothing. Reserved predicates are
         // refused in what the file wrote, by the IRIs the expander resolves:
         // an annotated chunk's here, as written, before the lowering adds
-        // statements of its own, and any other's on the expansions below.
+        // statements of its own, and any other's by the sink, as each
+        // statement reaches it.
         let expand_error = |e| TransactError::Parse(format!("JSON-LD expand error: {e}"));
         let needs_lowering = jsonld.contains("@annotation")
             || jsonld.contains("@edge")
@@ -1599,14 +1600,9 @@ mod inner {
                 &mut doc, &top_ctx, false,
             )?;
             refused?;
+        } else {
+            sink.refuse_reserved_predicates();
         }
-        let refuse_reserved = |expanded: &serde_json::Value| {
-            if needs_lowering {
-                Ok(())
-            } else {
-                crate::parse::edge_annotations::refuse_reserved_iris(expanded)
-            }
-        };
 
         // Register @context prefix→IRI mappings in the namespace trie BEFORE
         // expansion. JSON-LD expand() resolves prefixes internally, but the
@@ -1619,7 +1615,6 @@ mod inner {
         match &shared {
             None => {
                 let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
-                refuse_reserved(&expanded)?;
                 write_jsonld_document(
                     &expanded,
                     &mut sink,
@@ -1639,7 +1634,6 @@ mod inner {
                 // names, as the document it is.
                 let lines = ndjson_lines(&doc)?;
                 let expanded = fluree_graph_json_ld::expand(&doc).map_err(expand_error)?;
-                refuse_reserved(&expanded)?;
                 let serde_json::Value::Array(expanded) = expanded else {
                     return Err(not_an_ndjson_chunk());
                 };
@@ -1654,7 +1648,6 @@ mod inner {
                     }
                     let expanded = fluree_graph_json_ld::expand_with_context(line, shared)
                         .map_err(expand_error)?;
-                    refuse_reserved(&expanded)?;
                     write_jsonld_document(
                         &expanded,
                         &mut sink,
