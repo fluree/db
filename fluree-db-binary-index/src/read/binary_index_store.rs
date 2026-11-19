@@ -427,11 +427,6 @@ pub struct BinaryIndexStore {
     /// Identity tables this store has built.
     #[cfg(test)]
     identity_builds: std::sync::atomic::AtomicUsize,
-    /// Per graph, the [`ShardPins`] its table-resolved vector keys share,
-    /// held weakly so it drops with the last such key. Shared across views:
-    /// an operator may key each batch through a fresh view, and its keys
-    /// from every batch compare against each other.
-    vector_pins: RwLock<HashMap<GraphId, std::sync::Weak<ShardPins>>>,
     /// The predicates with list rows, built on first use. See
     /// [`Self::list_predicate_ids`].
     list_predicate_ids: std::sync::OnceLock<Arc<std::collections::HashSet<u32>>>,
@@ -521,7 +516,6 @@ impl BinaryIndexStore {
             vector_identities: RwLock::new(HashMap::new()),
             #[cfg(test)]
             identity_builds: std::sync::atomic::AtomicUsize::new(0),
-            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -716,7 +710,6 @@ impl BinaryIndexStore {
             vector_identities: RwLock::new(HashMap::new()),
             #[cfg(test)]
             identity_builds: std::sync::atomic::AtomicUsize::new(0),
-            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -822,7 +815,6 @@ impl BinaryIndexStore {
             vector_identities: RwLock::new(HashMap::new()),
             #[cfg(test)]
             identity_builds: std::sync::atomic::AtomicUsize::new(0),
-            vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
             list_census: RwLock::new(HashMap::new()),
@@ -2723,18 +2715,6 @@ impl BinaryIndexStore {
         Ok(Some(Arc::clone(identity)))
     }
 
-    /// `g_id`'s shared [`ShardPins`]: the live one if any key holds it, or a
-    /// new one.
-    fn shard_pins(store: &Arc<Self>, g_id: GraphId) -> Arc<ShardPins> {
-        let mut pins = store.vector_pins.write();
-        if let Some(live) = pins.get(&g_id).and_then(std::sync::Weak::upgrade) {
-            return live;
-        }
-        let fresh = Arc::new(ShardPins::new(Arc::clone(store), g_id));
-        pins.insert(g_id, Arc::downgrade(&fresh));
-        fresh
-    }
-
     /// `(g_id, p_id)`'s vector identity table if something has built it;
     /// never builds it.
     pub fn built_vector_identity(&self, g_id: GraphId, p_id: u32) -> Option<Arc<VectorIdentity>> {
@@ -3608,14 +3588,15 @@ pub enum ArenaVectorForm {
     },
 }
 
-/// The shards that comparisons of a graph's table-resolved vector keys have
-/// read, shared by those keys. A comparison that reads a vector's components
-/// pins its shard here, so later comparisons in that shard reuse it rather
-/// than reload it after the shared cache evicts it (a scan in subject order
-/// reads handles out of order). It lives as long as the keys do: the store
-/// and its views hold it weakly. Each shard is pinned at most once, and only
-/// shards a comparison needed, so a `DISTINCT` or `GROUP BY` over one tabled
-/// predicate pins none.
+/// The shards that comparisons of one query's table-resolved vector keys of
+/// a graph have read, shared by those keys. A comparison that reads a
+/// vector's components pins its shard here, so later comparisons in that
+/// shard reuse it rather than reload it after the shared cache evicts it (a
+/// scan in subject order reads handles out of order). The query holds it
+/// ([`QueryShardPins`]), so its shards drop when the query and its keys do,
+/// whatever other queries still hold. Each shard is pinned at most once, and
+/// only shards a comparison needed, so a `DISTINCT` or `GROUP BY` over one
+/// tabled predicate pins none.
 pub struct ShardPins {
     store: Arc<BinaryIndexStore>,
     g_id: GraphId,
@@ -3672,6 +3653,28 @@ impl ShardPins {
             }
         };
         Ok(crate::arena::vector::VectorSlice::new(shard, offset))
+    }
+}
+
+/// One query's [`ShardPins`], per store and graph. One per query: every view
+/// the query keys through carries it ([`TermView::with_shard_pins`]), since
+/// an operator may key each batch through a fresh view and its keys from
+/// every batch compare against each other. A view the query doesn't attach
+/// one to has its own.
+#[derive(Default)]
+pub struct QueryShardPins(
+    parking_lot::Mutex<rustc_hash::FxHashMap<(u64, GraphId), Arc<ShardPins>>>,
+);
+
+impl QueryShardPins {
+    /// The query's pins for `store`'s graph `g_id`.
+    fn of_graph(&self, store: &Arc<BinaryIndexStore>, g_id: GraphId) -> Arc<ShardPins> {
+        Arc::clone(
+            self.0
+                .lock()
+                .entry((store.store_id(), g_id))
+                .or_insert_with(|| Arc::new(ShardPins::new(Arc::clone(store), g_id))),
+        )
     }
 }
 
@@ -3799,6 +3802,10 @@ pub struct TermView {
     /// return. Its own unless the query attaches its slot
     /// ([`Self::with_key_read_errors`]).
     key_read_errors: Arc<KeyReadErrors>,
+    /// Where comparisons of keys read from this view pin the shards they
+    /// read. Its own unless the query attaches its pins
+    /// ([`Self::with_shard_pins`]).
+    shard_pins: Arc<QueryShardPins>,
 }
 
 /// A vector arena of a store: its graph and predicate. A [`TermView`] has no
@@ -3825,9 +3832,9 @@ struct VectorCursorInner {
     /// than one copy of the arena. Holds nothing alive itself.
     handed_out:
         rustc_hash::FxHashMap<(ArenaId, usize), std::sync::Weak<crate::arena::vector::VectorShard>>,
-    /// The store's [`ShardPins`] for the graph keyed last, weakly, so a key
-    /// skips the store's lock while the pins live.
-    pins: Option<(GraphId, std::sync::Weak<ShardPins>)>,
+    /// The query's [`ShardPins`] for the graph keyed last, so a key skips
+    /// the query's lock.
+    pins: Option<(GraphId, Arc<ShardPins>)>,
 }
 
 impl VectorCursor {
@@ -3930,6 +3937,12 @@ impl BinaryGraphView {
         self
     }
 
+    /// [`TermView::with_shard_pins`].
+    pub fn with_shard_pins(mut self, pins: Arc<QueryShardPins>) -> Self {
+        self.terms = self.terms.with_shard_pins(pins);
+        self
+    }
+
     pub fn g_id(&self) -> GraphId {
         self.g_id
     }
@@ -3968,6 +3981,7 @@ impl TermView {
             subject_iris: SubjectMemo::new(),
             vector_cursor: VectorCursor::default(),
             key_read_errors: Arc::default(),
+            shard_pins: Arc::default(),
         }
     }
 
@@ -3982,6 +3996,14 @@ impl TermView {
     /// return; a caller that builds keys records its own failures here too.
     pub fn key_read_errors(&self) -> &KeyReadErrors {
         &self.key_read_errors
+    }
+
+    /// Pin the shards that comparisons of keys read from this view read in
+    /// `pins`, the query's, so they drop with the query.
+    pub fn with_shard_pins(mut self, pins: Arc<QueryShardPins>) -> Self {
+        self.shard_pins = pins;
+        self.vector_cursor.lock().pins = None;
+        self
     }
 
     /// Attach a fuel tracker. When set, each forward-pack dict touch (a call
@@ -4262,16 +4284,14 @@ impl TermView {
             .as_ref()
             .and_then(|(_, identity)| identity.as_ref()?.of(handle))
         {
-            let held = cursor
-                .pins
-                .as_ref()
-                .filter(|(g, _)| *g == g_id)
-                .and_then(|(_, pins)| pins.upgrade());
-            let pins = held.unwrap_or_else(|| {
-                let pins = BinaryIndexStore::shard_pins(&self.store, g_id);
-                cursor.pins = Some((g_id, Arc::downgrade(&pins)));
-                pins
-            });
+            let pins = match cursor.pins.as_ref().filter(|(g, _)| *g == g_id) {
+                Some((_, pins)) => Arc::clone(pins),
+                None => {
+                    let pins = self.shard_pins.of_graph(&self.store, g_id);
+                    cursor.pins = Some((g_id, Arc::clone(&pins)));
+                    pins
+                }
+            };
             drop(cursor);
             return Ok(Some(ArenaVector {
                 hash,
@@ -5244,8 +5264,8 @@ pub(crate) mod tests {
     }
 
     /// Comparisons of table-resolved keys pin the shards they read, shared by
-    /// the graph's keys across views (an operator may key each batch through
-    /// a fresh view): after the shared cache evicts a shard, a later
+    /// a query's keys across its views (an operator may key each batch
+    /// through a fresh view): after the shared cache evicts a shard, a later
     /// comparison in it reuses the copy an earlier one read rather than load
     /// another, so a join whose matches jump between shards loads each once.
     #[test]
@@ -5260,10 +5280,12 @@ pub(crate) mod tests {
         let view = view_with_vector_arena(7, arena);
         view.store().vector_identity(0, 7).unwrap().unwrap();
         let store = view.clone_store();
+        let query = Arc::new(QueryShardPins::default());
         // Each key through its own view, as a batch-at-a-time operator has.
         let keys: Vec<ArenaVector> = (0..4)
             .map(|h| {
                 BinaryGraphView::new(Arc::clone(&store), 0)
+                    .with_shard_pins(Arc::clone(&query))
                     .arena_vector(0, 7, h)
                     .unwrap()
                     .unwrap()
@@ -5281,6 +5303,53 @@ pub(crate) mod tests {
             keys[0].components().unwrap().unwrap().same_shard(&again),
             "a second read of shard 0 loaded another copy of it"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The shards a query's comparisons pin drop when that query's keys do,
+    /// though another query still holds keys of the same graph.
+    #[test]
+    fn a_query_holds_no_pins_once_it_ends() {
+        let dir = std::env::temp_dir().join("fluree_vector_pins_per_query");
+        std::fs::create_dir_all(dir.join("a")).unwrap();
+        std::fs::create_dir_all(dir.join("b")).unwrap();
+        let a = vec![vec![vec![1.0f32, 0.0], vec![0.5, 0.5]]];
+        let b = vec![vec![vec![0.5f32, 0.5], vec![1.0, 0.0]]];
+        let view = view_with_vector_arenas(vec![
+            (7, vector_arena_of(&dir.join("a"), 2, 2, &a)),
+            (8, vector_arena_of(&dir.join("b"), 2, 2, &b)),
+        ]);
+        let store = view.clone_store();
+        store.vector_identity(0, 7).unwrap().unwrap();
+        store.vector_identity(0, 8).unwrap().unwrap();
+        let query_view = || {
+            BinaryGraphView::new(Arc::clone(&store), 0)
+                .with_shard_pins(Arc::new(QueryShardPins::default()))
+        };
+        let pins_of = |key: &ArenaVector| match &key.form {
+            ArenaVectorForm::Canonical { pins, .. } => Arc::downgrade(pins),
+            ArenaVectorForm::Slice(_) => panic!("a tabled key"),
+        };
+
+        // A later query keys the graph and is still running.
+        let later = query_view();
+        let later_key = later.arena_vector(0, 7, 1).unwrap().unwrap();
+
+        // A query's comparison across the two arenas reads, and pins, both
+        // vectors' shards.
+        let earlier = query_view();
+        let x = earlier.arena_vector(0, 7, 1).unwrap().unwrap();
+        let y = earlier.arena_vector(0, 8, 0).unwrap().unwrap();
+        assert!(x.same_value(&y).unwrap());
+        let pinned = pins_of(&x);
+        assert_eq!(pinned.upgrade().unwrap().lock().len(), 2);
+
+        drop((x, y, earlier));
+        assert!(
+            pinned.upgrade().is_none(),
+            "the ended query's pinned shards outlive it"
+        );
+        assert!(pins_of(&later_key).upgrade().unwrap().lock().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -297,6 +297,11 @@ pub struct ExecutionContext<'a> {
     /// from this one share it, and [`Self::checkpoint`] fails the query once
     /// it holds an error.
     pub key_read_errors: Arc<fluree_db_binary_index::KeyReadErrors>,
+    /// The vector shards this query's key comparisons have pinned. Every
+    /// graph view the query keys through pins there, and the contexts
+    /// derived from this one share it, so the query reads each shard at most
+    /// once and holds none once it ends.
+    pub vector_shard_pins: Arc<fluree_db_binary_index::QueryShardPins>,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
     /// When true, scan operators bypass the variable-predicate filter
@@ -574,6 +579,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -642,6 +648,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -714,6 +721,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -775,6 +783,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -835,6 +844,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -897,6 +907,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
             key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -1514,7 +1525,8 @@ impl<'a> ExecutionContext<'a> {
             .graph_with_novelty(self.binary_g_id, self.dict_novelty.clone())
             .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
             .with_tracker(self.tracker.clone())
-            .with_key_read_errors(Arc::clone(&self.key_read_errors));
+            .with_key_read_errors(Arc::clone(&self.key_read_errors))
+            .with_shard_pins(Arc::clone(&self.vector_shard_pins));
         Some(view)
     }
 
@@ -1539,11 +1551,13 @@ impl<'a> ExecutionContext<'a> {
         }
         let store = self.binary_store.as_ref()?;
         // Keys built through it record the reads they can't return in the
-        // query's slot, which the operators that key rows check.
+        // query's slot, which the operators that key rows check, and pin the
+        // shards their comparisons read in the query's pins.
         let terms = TermView::new(Arc::clone(store), self.dict_novelty.clone())
             .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
             .with_tracker(self.tracker.clone())
-            .with_key_read_errors(Arc::clone(&self.key_read_errors));
+            .with_key_read_errors(Arc::clone(&self.key_read_errors))
+            .with_shard_pins(Arc::clone(&self.vector_shard_pins));
         Some(terms)
     }
 
@@ -1836,6 +1850,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
             key_read_errors: Arc::clone(&self.key_read_errors),
+            vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
@@ -1907,6 +1922,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
             key_read_errors: Arc::clone(&self.key_read_errors),
+            vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
@@ -1979,6 +1995,7 @@ impl<'a> ExecutionContext<'a> {
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
             key_read_errors: Arc::clone(&self.key_read_errors),
+            vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
