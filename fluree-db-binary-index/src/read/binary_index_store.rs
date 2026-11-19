@@ -423,7 +423,10 @@ pub struct BinaryIndexStore {
     /// Per `(graph, predicate)` vector arena, its identity table, built on
     /// first use. The store owns it, so it lives and dies with the store's
     /// immutable arenas. See [`Self::vector_identity`].
-    vector_identities: RwLock<HashMap<(GraphId, u32), Arc<VectorIdentity>>>,
+    vector_identities: RwLock<HashMap<(GraphId, u32), IdentityCell>>,
+    /// Identity tables this store has built.
+    #[cfg(test)]
+    identity_builds: std::sync::atomic::AtomicUsize,
     /// Per graph, the [`ShardPins`] its table-resolved vector keys share,
     /// held weakly so it drops with the last such key. Shared across views:
     /// an operator may key each batch through a fresh view, and its keys
@@ -516,6 +519,8 @@ impl BinaryIndexStore {
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
             vector_identities: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            identity_builds: std::sync::atomic::AtomicUsize::new(0),
             vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
@@ -709,6 +714,8 @@ impl BinaryIndexStore {
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
             vector_identities: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            identity_builds: std::sync::atomic::AtomicUsize::new(0),
             vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
@@ -813,6 +820,8 @@ impl BinaryIndexStore {
             p_id_by_sid: std::sync::OnceLock::new(),
             decimal_only_proofs: RwLock::new(HashMap::new()),
             vector_identities: RwLock::new(HashMap::new()),
+            #[cfg(test)]
+            identity_builds: std::sync::atomic::AtomicUsize::new(0),
             vector_pins: RwLock::new(HashMap::new()),
             list_predicate_ids: std::sync::OnceLock::new(),
             leaf_list_subjects: RwLock::new(HashMap::new()),
@@ -2681,8 +2690,9 @@ impl BinaryIndexStore {
     /// that hashes every vector in the arena (shards read without entering
     /// the shared cache), then compares the vectors of any hash that repeats.
     /// `None` without an arena. The arena is immutable for the store's
-    /// lifetime, so the table is too; concurrent first callers may each build
-    /// it, and one wins.
+    /// lifetime, so the table is too. It is built once: concurrent first
+    /// callers wait on that build rather than each read the arena, and a
+    /// build that fails leaves it to the next caller.
     pub fn vector_identity(
         &self,
         g_id: GraphId,
@@ -2698,13 +2708,19 @@ impl BinaryIndexStore {
         if let Some(built) = self.built_vector_identity(g_id, p_id) {
             return Ok(Some(built));
         }
-        let identity = Arc::new(VectorIdentity::build(arena)?);
-        Ok(Some(Arc::clone(
+        let cell = Arc::clone(
             self.vector_identities
                 .write()
                 .entry((g_id, p_id))
-                .or_insert(identity),
-        )))
+                .or_default(),
+        );
+        let identity = cell.get_or_try_init(|| {
+            #[cfg(test)]
+            self.identity_builds
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            VectorIdentity::build(arena).map(Arc::new)
+        })?;
+        Ok(Some(Arc::clone(identity)))
     }
 
     /// `g_id`'s shared [`ShardPins`]: the live one if any key holds it, or a
@@ -2722,7 +2738,10 @@ impl BinaryIndexStore {
     /// `(g_id, p_id)`'s vector identity table if something has built it;
     /// never builds it.
     pub fn built_vector_identity(&self, g_id: GraphId, p_id: u32) -> Option<Arc<VectorIdentity>> {
-        self.vector_identities.read().get(&(g_id, p_id)).cloned()
+        self.vector_identities
+            .read()
+            .get(&(g_id, p_id))
+            .and_then(|cell| cell.get().cloned())
     }
 
     /// Whether any NumBig arena of `g_id` holds one value under several
@@ -3451,6 +3470,10 @@ impl NsLookup for BinaryIndexStore {
 // ============================================================================
 // BinaryGraphView — graph-scoped wrapper
 // ============================================================================
+
+/// A vector arena's identity table, built at most once
+/// ([`BinaryIndexStore::vector_identity`]).
+type IdentityCell = Arc<once_cell::sync::OnceCell<Arc<VectorIdentity>>>;
 
 /// One vector arena's identity table: per handle, the hash of its value
 /// ([`fluree_db_core::value::vector_value_hash_f32`], the same function a
@@ -5122,6 +5145,45 @@ pub(crate) mod tests {
                 }
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Concurrent first callers share one build of an arena's identity table
+    /// rather than each read the arena.
+    #[test]
+    fn concurrent_first_callers_build_the_identity_table_once() {
+        let dir = std::env::temp_dir().join("fluree_vector_identity_built_once");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Enough vectors that a build outlasts the callers' start.
+        let shards: Vec<Vec<Vec<f32>>> = (0..8)
+            .map(|s| {
+                (0..4096)
+                    .map(|i| vec![s as f32, i as f32, 0.5, 0.25])
+                    .collect()
+            })
+            .collect();
+        let arena = vector_arena_of(&dir, 4096, 4, &shards);
+        let store = store_with_vector_arenas(vec![(0, 7, arena)]);
+        let callers = 8;
+        let start = std::sync::Barrier::new(callers);
+        let tables: Vec<Arc<VectorIdentity>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..callers)
+                .map(|_| {
+                    scope.spawn(|| {
+                        start.wait();
+                        store.vector_identity(0, 7).unwrap().unwrap()
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        assert_eq!(
+            store
+                .identity_builds
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(tables.iter().all(|t| Arc::ptr_eq(t, &tables[0])));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
