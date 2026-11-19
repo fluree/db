@@ -945,6 +945,19 @@ pub struct BindPattern {
 }
 
 impl BindPattern {
+    /// The variables this bind reads while it is pending: its expression's,
+    /// and its target, since once an earlier step binds the target the bind
+    /// is an equality check against it. A join step's live set and the
+    /// range-semijoin fold both count a pending bind's readers through this,
+    /// so the two cannot disagree.
+    pub fn read_vars(&self) -> impl Iterator<Item = VarId> {
+        let var = self.var;
+        self.expr
+            .referenced_vars()
+            .into_iter()
+            .chain(std::iter::once(var))
+    }
+
     /// Construct a `BindPattern` only when all the expression's variables are
     /// already present in `bound_vars`. Returns `None` when the expression
     /// depends on variables not yet bound, avoiding the `expr.clone()` in
@@ -1996,7 +2009,8 @@ fn build_sequential_join_block(
                     .iter()
                     .flat_map(|f| f.expr.referenced_vars()),
             );
-            live.extend(pending_binds.iter().flat_map(|b| b.expr.referenced_vars()));
+            // A pending bind reads its target too (see `BindPattern::read_vars`).
+            live.extend(pending_binds.iter().flat_map(BindPattern::read_vars));
             live.into_iter().collect::<Vec<VarId>>()
         });
 
@@ -4186,7 +4200,7 @@ fn collect_range_semijoin_folds(
             .any(|(i, t)| i != j && t.referenced_vars().contains(v))
             || pending_binds
                 .iter()
-                .any(|b| b.var == *v || b.expr.referenced_vars().contains(v));
+                .any(|b| b.read_vars().any(|read| read == *v));
         // Consumed constant filters are enforced by the scan/join we would
         // remove. Keep that probe unless its bounds are carried by the fold.
         if read_elsewhere || pushdown_bounds.contains_key(v) {

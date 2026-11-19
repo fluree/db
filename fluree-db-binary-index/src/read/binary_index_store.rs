@@ -17,7 +17,9 @@ use std::time::Duration;
 
 use fluree_db_core::clock::Instant;
 use fluree_db_core::ids::DatatypeDictId;
-use fluree_db_core::ns_encoding::{canonical_split, NsLookup, NsSplitMode};
+use fluree_db_core::ns_encoding::{
+    canonical_split, encode_registered, table_full, NsLookup, NsSplitMode,
+};
 use fluree_db_core::o_type::{DecodeKind, OType};
 use fluree_db_core::o_type_registry::OTypeRegistry;
 use fluree_db_core::value_id::{ObjKey, ObjKind};
@@ -2265,21 +2267,22 @@ impl BinaryIndexStore {
         self.dicts.predicate_reverse.get(iri).copied()
     }
 
-    /// Encode an IRI to a namespaced `Sid` using canonical splitting and exact-prefix lookup.
-    ///
-    /// Uses `canonical_split` + exact-prefix lookup via reverse map. If the
-    /// canonical prefix is not registered, returns `Sid(EMPTY, iri)`.
-    /// No longest-prefix-match — canonical encoding prohibits `starts_with` matching.
+    /// Encode an IRI to a namespaced `Sid` using canonical splitting and
+    /// exact-prefix lookup, per [`encode_registered`]: an IRI whose prefix has
+    /// no code is `Sid(OVERFLOW, iri)` once the table is full, else
+    /// `Sid(EMPTY, iri)`. No longest-prefix-match — canonical encoding
+    /// prohibits `starts_with` matching.
     pub fn encode_iri(&self, iri: &str) -> Sid {
         debug_assert!(
             self.ns_split_mode_set,
             "BinaryIndexStore::encode_iri called before ns_split_mode was set"
         );
-        let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
-        if let Some(&code) = self.dicts.namespace_reverse.get(canonical_prefix) {
-            return Sid::new(code, canonical_suffix);
-        }
-        Sid::new(0, iri)
+        encode_registered(
+            iri,
+            self.ns_split_mode,
+            |prefix| self.dicts.namespace_reverse.get(prefix).copied(),
+            || table_full(&self.dicts.namespace_codes),
+        )
     }
 
     /// Resolve language ID to BCP 47 tag string.
@@ -2963,6 +2966,15 @@ impl BinaryIndexStore {
             .write()
             .insert(leaf.leaf_cid.clone(), Arc::clone(&subjects));
         Ok(subjects)
+    }
+
+    /// Subject IRI → id lookups since load that searched a dictionary leaf.
+    #[cfg(feature = "test-counters")]
+    pub fn subject_reverse_leaf_lookups(&self) -> u64 {
+        self.dicts
+            .subject_reverse_tree
+            .as_ref()
+            .map_or(0, |tree| tree.leaf_lookups())
     }
 
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
@@ -4317,6 +4329,17 @@ impl TermView {
         self.dict_novelty.as_ref()
     }
 
+    /// Whether `s_id` was assigned by the store's own dictionary, not by
+    /// novelty: at or below its namespace's persisted watermark.
+    pub fn is_persisted_subject_id(&self, s_id: u64) -> bool {
+        use fluree_db_core::subject_id::SubjectId;
+        let Some(dn) = self.dict_novelty.as_ref() else {
+            return true;
+        };
+        let sid64 = SubjectId::from_u64(s_id);
+        sid64.local_id() <= dn.subjects.watermark_for_ns(sid64.ns_code())
+    }
+
     // ── Internal watermark helpers ──────────────────────────────────────
 
     /// If `s_id` is above the watermark for its namespace, resolve from
@@ -4550,12 +4573,12 @@ async fn build_dictionary_set(
         .datatype_iris
         .iter()
         .map(|iri| {
-            let (canonical_prefix, canonical_suffix) = canonical_split(iri, root.ns_split_mode);
-            if let Some(&code) = namespace_reverse.get(canonical_prefix) {
-                Sid::new(code, canonical_suffix)
-            } else {
-                Sid::new(0, iri)
-            }
+            encode_registered(
+                iri,
+                root.ns_split_mode,
+                |prefix| namespace_reverse.get(prefix).copied(),
+                || table_full(&namespace_codes),
+            )
         })
         .collect();
 
