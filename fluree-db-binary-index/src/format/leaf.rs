@@ -1027,6 +1027,8 @@ pub struct LeafletDirEntryV3 {
     /// names the rows themselves.
     pub first_key: [u8; ORDERED_KEY_V2_SIZE],
     pub last_key: [u8; ORDERED_KEY_V2_SIZE],
+    /// The groups of the rows live at the index `t`. A read below that `t`
+    /// must not trust them: a row retracted since is not among them.
     pub live_edges: LiveEdges,
     pub p_const: Option<u32>,
     pub o_type_const: Option<u16>,
