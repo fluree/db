@@ -1778,8 +1778,8 @@ impl Fluree {
             if !db.datalog_enabled() {
                 executable.reasoning.modes.datalog = false;
             }
-            if !db.query_time_rules_allowed() {
-                executable.reasoning.modes.rules.clear();
+            if !db.query_time_rules_allowed() && !executable.reasoning.modes.rules.is_empty() {
+                return Err(query_time_rules_not_allowed());
             }
         }
 
@@ -1790,9 +1790,11 @@ impl Fluree {
         // not its provenance, and a caller-invented predicate can't be
         // pre-denied. DB-stored rules and OWL reasoning are admin-controlled and
         // unaffected. See docs/security/policy-in-queries.md (Reasoning).
+        //
+        // Refused rather than dropped: dropped, a query reading a derived
+        // predicate came back empty, which reads as "the rules derived nothing".
         if strip_query_rules && !executable.reasoning.modes.rules.is_empty() {
-            tracing::debug!("stripping query-time datalog rules under non-root view policy");
-            executable.reasoning.modes.rules.clear();
+            return Err(query_time_rules_under_policy());
         }
 
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
@@ -2192,6 +2194,28 @@ impl Fluree {
 
         execute_prepared(db_ref, vars, prepared, config).await
     }
+}
+
+/// The refusal for query-time `rules` under a view policy. They were dropped
+/// without a word, and a query reading a derived predicate came back empty.
+pub(crate) fn query_time_rules_under_policy() -> ApiError {
+    ApiError::invalid_query(
+        "query-time datalog rules need an unrestricted view: under a view policy, a \
+         caller-supplied rule could derive a visible fact from data the policy hides. Store \
+         the rules in the ledger as f:rule values, which run under policy, or query without \
+         a policy",
+    )
+}
+
+/// The refusal for query-time `rules` the ledger's config does not allow for
+/// this request (`f:allowQueryTimeRules false` under an override control that
+/// denies it). They were dropped without a word, too.
+pub(crate) fn query_time_rules_not_allowed() -> ApiError {
+    ApiError::invalid_query(
+        "this ledger's config does not allow query-time datalog rules for this request \
+         (f:allowQueryTimeRules false). Store the rules in the ledger as f:rule values, or \
+         ask with an identity its override control allows",
+    )
 }
 
 // ============================================================================

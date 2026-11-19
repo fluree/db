@@ -636,10 +636,7 @@ impl Fluree {
             }
             _ => {
                 if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
-                    tracing::debug!(
-                        "stripping query-time datalog rules under non-root view policy"
-                    );
-                    executable.reasoning.modes.rules.clear();
+                    return Err(super::query::query_time_rules_under_policy());
                 }
             }
         }

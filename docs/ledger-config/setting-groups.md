@@ -205,7 +205,7 @@ Controls Fluree's stored datalog rules (`f:rule`).
 |-------|------|---------|-------------|
 | `f:datalogEnabled` | boolean | `false` | Enable or disable datalog rule evaluation |
 | `f:rulesSource` | `f:GraphRef` | (none) | Graph containing `f:rule` definitions |
-| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules |
+| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules (a query that supplies them when they are not allowed is refused with a 400) |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
 `f:rulesSource` is non-overridable. `f:datalogEnabled` and `f:allowQueryTimeRules` are overridable.

@@ -8319,36 +8319,46 @@ async fn datalog_override_identity_restricted_end_to_end() {
         ledger_id: &str,
         query: &serde_json::Value,
         server_identity: Option<&str>,
-    ) -> serde_json::Value {
+    ) -> Result<serde_json::Value, fluree_db_api::ApiError> {
         let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
         let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
         let mut options = QueryExecutionOptions::new();
         if let Some(id) = server_identity {
             options = options.with_server_identity(VerifiedIdentity::new(id));
         }
-        fluree
+        Ok(fluree
             .query_with_options(&db, query, options)
-            .await
-            .expect("query")
+            .await?
             .to_jsonld(&ledger_state.snapshot)
-            .expect("to_jsonld")
+            .expect("to_jsonld"))
     }
 
     assert_eq!(
-        grandparents_as(&fluree, ledger_id, &query, Some("did:key:admin")).await,
+        grandparents_as(&fluree, ledger_id, &query, Some("did:key:admin"))
+            .await
+            .expect("query"),
         json!(["ex:charlie"]),
         "the allow-listed verified identity may inject a query-time rule"
     );
-    assert_eq!(
-        grandparents_as(&fluree, ledger_id, &query, Some("did:key:other")).await,
-        json!([]),
-        "a verified identity outside the allow-list has its rule stripped"
-    );
-    assert_eq!(
-        grandparents_as(&fluree, ledger_id, &query, None).await,
-        json!([]),
-        "an anonymous request has its rule stripped"
-    );
+    // Refused rather than dropped: dropped, the query answered `[]`, which
+    // reads as "no grandparent".
+    for (identity, who) in [
+        (
+            Some("did:key:other"),
+            "a verified identity outside the allow-list",
+        ),
+        (None, "an anonymous request"),
+    ] {
+        let err = grandparents_as(&fluree, ledger_id, &query, identity)
+            .await
+            .expect_err(who);
+        assert_eq!(err.status_code(), 400, "{who}: {err}");
+        assert!(
+            err.to_string()
+                .contains("does not allow query-time datalog rules for this request"),
+            "{who}: {err}"
+        );
+    }
 }
 
 // =============================================================================
