@@ -210,6 +210,13 @@ pub struct PolicyEnforcement {
     /// graph to run a policy query against. Empty on native ledgers.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unevaluable_policies: Vec<String>,
+    /// Triples maps of a graph source (Iceberg / SQL) whose subjects other
+    /// maps can also mint with other classes, where a class-targeted view
+    /// policy's decision depended on those classes: a row is shown only when
+    /// every class set its subject could hold allows it, so some rows a
+    /// native ledger would show may be hidden. Empty on native ledgers.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub undecidable_class_maps: Vec<String>,
 }
 
 /// Fuel limit exceeded. Field values are micro-fuel; use the helpers for fuel decimals.
@@ -409,10 +416,17 @@ impl Tracker {
                             unevaluable_policies.push(id);
                         }
                     }
+                    let mut undecidable_class_maps = prev.undecidable_class_maps;
+                    for map in state.undecidable_class_maps {
+                        if !undecidable_class_maps.contains(&map) {
+                            undecidable_class_maps.push(map);
+                        }
+                    }
                     PolicyEnforcement {
                         enforced: true,
                         denies_all_data: prev.denies_all_data && state.denies_all_data,
                         unevaluable_policies,
+                        undecidable_class_maps,
                     }
                 }
                 None => state,
@@ -438,6 +452,31 @@ impl Tracker {
             });
             if !state.unevaluable_policies.iter().any(|id| id == policy_id) {
                 state.unevaluable_policies.push(policy_id.to_string());
+            }
+        }
+    }
+
+    /// Record a triples map whose rows a class-targeted view policy decided
+    /// over every class set its subjects could hold (see
+    /// [`PolicyEnforcement::undecidable_class_maps`]).
+    pub fn record_undecidable_class_map(&self, triples_map: &str) {
+        let Some(inner) = &self.0 else {
+            return;
+        };
+        if !inner.options.track_policy || triples_map.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = inner.policy_enforcement.write() {
+            let state = slot.get_or_insert_with(|| PolicyEnforcement {
+                enforced: true,
+                ..PolicyEnforcement::default()
+            });
+            if !state
+                .undecidable_class_maps
+                .iter()
+                .any(|m| m == triples_map)
+            {
+                state.undecidable_class_maps.push(triples_map.to_string());
             }
         }
     }
@@ -502,6 +541,25 @@ impl Tracker {
     #[inline]
     pub fn current_fuel(&self) -> Option<f64> {
         self.current_micro_fuel().map(micro_to_fuel)
+    }
+
+    /// Roll the fuel counter back to a snapshot taken earlier with
+    /// [`current_micro_fuel`](Self::current_micro_fuel).
+    ///
+    /// For retry frames — the residency drain/fetch/re-run loops — whose
+    /// round re-runs a *pure* function and discards the failed round's work:
+    /// without the rollback, N rounds charge N× the fuel of one round, and a
+    /// query near its budget can fail `FuelExceeded` merely for having missed
+    /// residency N times. Caller invariants: `snapshot` must be a value this
+    /// counter actually held, and the caller must be the counter's sole fuel
+    /// writer for the rolled-back span (the store would silently erase a
+    /// concurrent `consume_fuel`). No-op when fuel tracking is disabled.
+    pub fn restore_micro_fuel(&self, snapshot: u64) {
+        if let Some(inner) = &self.0 {
+            if inner.options.track_fuel {
+                inner.fuel_total.store(snapshot, Ordering::Relaxed);
+            }
+        }
     }
 
     /// Finalize tracking into a serializable tally.
@@ -635,6 +693,41 @@ mod tests {
     }
 
     #[test]
+    fn restore_micro_fuel_rolls_back_a_discarded_round() {
+        // The residency retry frames re-run a PURE round and discard the
+        // failed attempt's work; restoring to a snapshot makes N rounds
+        // charge like one, so a near-budget query cannot fail FuelExceeded
+        // merely for having missed residency N times.
+        let t = fuel_tracker(Some(100));
+        t.consume_fuel(40).unwrap();
+        let snapshot = t.current_micro_fuel().unwrap();
+
+        // A failed round charges 50; without the rollback the next (final)
+        // round's 50 would blow the 100 budget at 140.
+        t.consume_fuel(50).unwrap();
+        t.restore_micro_fuel(snapshot);
+        assert_eq!(t.current_micro_fuel(), Some(40));
+
+        // The successful round's charge stands, inside budget.
+        t.consume_fuel(50).unwrap();
+        assert_eq!(t.current_micro_fuel(), Some(90));
+    }
+
+    #[test]
+    fn restore_micro_fuel_is_inert_when_fuel_tracking_is_off() {
+        let disabled = Tracker::disabled();
+        disabled.restore_micro_fuel(0); // must not panic
+        assert_eq!(disabled.current_micro_fuel(), None);
+
+        let no_fuel = Tracker::new(TrackingOptions {
+            track_policy: true,
+            ..Default::default()
+        });
+        no_fuel.restore_micro_fuel(7);
+        assert_eq!(no_fuel.current_micro_fuel(), None);
+    }
+
+    #[test]
     fn index_dict_history_touches_are_one_hundredth_fuel() {
         for touch in [
             INDEX_TOUCH_MICRO_FUEL,
@@ -712,6 +805,7 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
@@ -719,6 +813,7 @@ mod tests {
                 enforced: true,
                 denies_all_data: true,
                 unevaluable_policies: Vec::new(),
+                undecidable_class_maps: Vec::new(),
             })
         );
     }
@@ -734,6 +829,7 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         let tally = t.tally().unwrap();
         assert_eq!(tally.policy, None);
@@ -749,11 +845,13 @@ mod tests {
             enforced: true,
             denies_all_data: true,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         t.record_policy_enforcement(Some(PolicyEnforcement {
             enforced: true,
             denies_all_data: false,
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         }));
         assert_eq!(
             t.tally().unwrap().policy_enforcement,
@@ -761,6 +859,7 @@ mod tests {
                 enforced: true,
                 denies_all_data: false,
                 unevaluable_policies: Vec::new(),
+                undecidable_class_maps: Vec::new(),
             })
         );
     }

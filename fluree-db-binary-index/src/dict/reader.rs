@@ -98,6 +98,10 @@ pub struct DictTreeReader {
     remote_fetches: AtomicU64,
     cache_hits: AtomicU64,
     cache_misses: AtomicU64,
+    /// Reverse lookups that searched a leaf: every one except a key routed
+    /// outside the tree.
+    #[cfg(feature = "test-counters")]
+    leaf_lookups: AtomicU64,
 }
 
 impl DictTreeReader {
@@ -113,6 +117,8 @@ impl DictTreeReader {
             local_file_reads: AtomicU64::new(0),
             remote_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            #[cfg(feature = "test-counters")]
+            leaf_lookups: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
     }
@@ -137,6 +143,8 @@ impl DictTreeReader {
             local_file_reads: AtomicU64::new(0),
             remote_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            #[cfg(feature = "test-counters")]
+            leaf_lookups: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
     }
@@ -157,6 +165,8 @@ impl DictTreeReader {
             local_file_reads: AtomicU64::new(0),
             remote_fetches: AtomicU64::new(0),
             cache_hits: AtomicU64::new(0),
+            #[cfg(feature = "test-counters")]
+            leaf_lookups: AtomicU64::new(0),
             cache_misses: AtomicU64::new(0),
         }
     }
@@ -320,6 +330,8 @@ impl DictTreeReader {
             None => return Ok(None),
         };
         let find_leaf = clock.lap();
+        #[cfg(feature = "test-counters")]
+        self.leaf_lookups.fetch_add(1, Ordering::Relaxed);
 
         let address = &self.branch.leaves[leaf_idx].address;
         let leaf_data = self.load_leaf(address)?;
@@ -834,6 +846,12 @@ impl DictTreeReader {
     /// Number of cache misses since creation.
     pub fn cache_misses(&self) -> u64 {
         self.cache_misses.load(Ordering::Relaxed)
+    }
+
+    /// Number of reverse lookups that searched a leaf since creation.
+    #[cfg(feature = "test-counters")]
+    pub fn leaf_lookups(&self) -> u64 {
+        self.leaf_lookups.load(Ordering::Relaxed)
     }
 
     /// Preload all leaves into the global cache (or just read them into OS page cache).

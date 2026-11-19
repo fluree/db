@@ -357,10 +357,8 @@ async fn stream_query_inner(
                     fluree_db_api::LedgerRef::parse(&ledger)?,
                 ))
             };
-            // Ensure the head is fresh before view loading (shared storage).
-            if !state.config.is_proxy_storage_mode() {
-                let _ = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
-            }
+            // Ensure the head is fresh before view loading.
+            let _ = load_ledger_for_query(state.as_ref(), &ledger, &span).await?;
             let dataset = fluree
                 .build_stream_dataset_from_spec(&spec, &qc_opts)
                 .await

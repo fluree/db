@@ -427,6 +427,16 @@ fn holds(op: &str, ord: std::cmp::Ordering) -> bool {
     }
 }
 
+/// Whether `op` holds between a plain string and a temporal value it orders
+/// `ord` against. Ordering reads the string as the temporal it spells, but a
+/// plain string is never `=` a temporal: SPARQL has no `=` for an
+/// `xsd:string` and an `xsd:dateTime` or `xsd:time`, so `RDFterm-equal` is a
+/// type error and the FILTER is false. So `<=` and `>=` can both hold where
+/// `=` doesn't.
+fn holds_for_a_string(op: &str, ord: std::cmp::Ordering) -> bool {
+    op != "=" && holds(op, ord)
+}
+
 /// The operator `op` reads as with its operands swapped.
 fn mirrored(op: &str) -> &str {
     match op {
@@ -442,7 +452,8 @@ const OPS: [&str; 5] = ["<", "<=", "=", ">=", ">"];
 
 /// A `dateTime` or `time` constant past the microsecond is held to it like
 /// every value, for ordering as well as equality, so a stored value is
-/// exactly one of `<`, `=` and `>` it. The value is written as `DT_NS` and
+/// exactly one of `<`, `=` and `>` it (a plain-string constant orders but is
+/// never `=` it, [`holds_for_a_string`]). The value is written as `DT_NS` and
 /// `TIME_NS`, and `>=` that same constant finds it, which is how a client
 /// pages from a timestamp it wrote. On SPARQL as a typed literal, a cast, a
 /// constant on the left, and one bound first through `BIND` or `VALUES`,
@@ -489,7 +500,12 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
                     "where": [{"@id": "ex:s", "ex:d": "?d"}, ["filter", [op, "?d", rhs]]]
                 })
             };
-            jsonld.push((format!("JSON-LD ?d {op} \"{c}\""), filter(json!(c)), want));
+            // A JSON-LD filter's bare string is a plain string.
+            jsonld.push((
+                format!("JSON-LD ?d {op} \"{c}\""),
+                filter(json!(c)),
+                holds_for_a_string(op, ord),
+            ));
             let mut by_values = filter(json!("?c"));
             by_values["values"] = json!(["?c", [{"@value": c, "@type": "xsd:dateTime"}]]);
             jsonld.push((format!("JSON-LD values ?d {op} {c}"), by_values, want));
@@ -515,7 +531,7 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
                 "select": ["?t"],
                 "where": [{"@id": "ex:s", "ex:t": "?t"}, ["filter", [op, "?t", TIME_ABOVE]]]
             }),
-            want,
+            holds_for_a_string(op, Equal),
         ));
     }
     sparql.push((
@@ -602,9 +618,10 @@ async fn a_constant_is_held_to_the_microsecond_for_ordering_too() {
 /// A plain string that reads as a `dateTime` is ordered against a temporal
 /// value as the value it reads as, held to the microsecond: a stored
 /// `"…1234565Z"` and a constant `"…1234569Z"^^xsd:dateTime` both read as
-/// `…123456Z`, so exactly one of `<`, `=` and `>` holds, `=`, either way
-/// round, as for a string equal to the constant at every digit. In process,
-/// reloaded and indexed.
+/// `…123456Z`, so `<=` and `>=` hold and `<` and `>` don't, either way
+/// round, as for a string equal to the constant at every digit. `=` doesn't
+/// hold: a plain string is never `=` a temporal ([`holds_for_a_string`]). In
+/// process, reloaded and indexed.
 #[tokio::test]
 async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -612,7 +629,7 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
     let c = "\"2020-01-01T00:00:00.1234569Z\"^^xsd:dateTime";
     let mut checks: Vec<(String, String, bool)> = Vec::new();
     for op in OPS {
-        let want = holds(op, std::cmp::Ordering::Equal);
+        let want = holds_for_a_string(op, std::cmp::Ordering::Equal);
         let mirror = mirrored(op);
         checks.push((
             format!("?v {op} c"),
@@ -669,6 +686,123 @@ async fn a_string_is_ordered_against_a_temporal_at_the_microsecond() {
         (none.clone(), none.clone(), none),
         "checks answered wrongly in process, reloaded, indexed"
     );
+}
+
+/// Two plain-string bounds on one side of a `dateTime` object order one way
+/// as text and the other as instants (`"…00.5Z"` sorts before `"…00Z"`), so
+/// which is tighter depends on the row, and the plan keeps both: the pushed
+/// bounds answer what the evaluated filters do. Two FILTERs merge in the
+/// pushdown, one `&&` FILTER in the planner, and a pair of bounds the planner
+/// would find contradictory as text is not. Over novelty and over the index,
+/// in SPARQL and JSON-LD.
+#[tokio::test]
+async fn two_string_bounds_on_a_temporal_keep_both_filters() {
+    const LEDGER: &str = "it/temporal-string-bounds:main";
+    const LATE: &str = "2026-01-01T10:00:00.5Z";
+    const EARLY: &str = "2026-01-01T10:00:00Z";
+    // The stored instant, 10:00:00.2, lies between EARLY and LATE.
+    let sparql: Vec<(String, bool)> = [
+        (
+            format!(r#"FILTER(?at > "{LATE}") FILTER(?at > "{EARLY}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at > "{EARLY}") FILTER(?at > "{LATE}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at < "{EARLY}") FILTER(?at < "{LATE}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at > "{LATE}" && ?at > "{EARLY}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at < "{LATE}" && ?at < "{EARLY}")"#),
+            false,
+        ),
+        (
+            format!(r#"FILTER(?at > "{EARLY}" && ?at < "{LATE}")"#),
+            true,
+        ),
+        (
+            format!(r#"FILTER(?at > "{EARLY}") FILTER(?at < "{LATE}")"#),
+            true,
+        ),
+    ]
+    .into_iter()
+    .collect();
+    let jsonld: Vec<(Vec<String>, bool)> = vec![
+        (
+            vec![
+                format!(r#"(> ?at "{LATE}")"#),
+                format!(r#"(> ?at "{EARLY}")"#),
+            ],
+            false,
+        ),
+        (
+            vec![
+                format!(r#"(> ?at "{EARLY}")"#),
+                format!(r#"(< ?at "{LATE}")"#),
+            ],
+            true,
+        ),
+    ];
+
+    let fluree = FlureeBuilder::memory().without_indexing().build_memory();
+    fluree.create_ledger(LEDGER).await.expect("create");
+    fluree
+        .graph(LEDGER)
+        .transact()
+        .sparql_update(&format!(
+            "{PFX}INSERT DATA {{ ex:e ex:at \"2026-01-01T10:00:00.2Z\"^^xsd:dateTime }}"
+        ))
+        .commit()
+        .await
+        .expect("insert");
+    let mut wrong = Vec::new();
+    for state in ["novelty", "indexed"] {
+        if state == "indexed" {
+            fluree
+                .reindex(LEDGER, fluree_db_api::ReindexOptions::default())
+                .await
+                .expect("index");
+            fluree.disconnect_ledger(LEDGER).await;
+        }
+        let db = fluree.db(LEDGER).await.expect("db");
+        for (filters, want) in &sparql {
+            let q = format!("{PFX}ASK {{ ex:e ex:at ?at {filters} }}");
+            let json = fluree
+                .query(&db, &q)
+                .await
+                .expect("ask")
+                .to_sparql_json(&db.snapshot)
+                .expect("json");
+            if json["boolean"].as_bool() != Some(*want) {
+                wrong.push(format!("{state}: {filters}"));
+            }
+        }
+        for (filters, want) in &jsonld {
+            let mut where_ = vec![json!({"@id": "ex:e", "ex:at": "?at"})];
+            for f in filters {
+                where_.push(json!(["filter", f]));
+            }
+            let q = json!({"@context": ctx(), "select": "?at", "where": where_});
+            let rows = fluree
+                .query(&db, &q)
+                .await
+                .expect("query")
+                .to_jsonld_async(db.as_graph_db_ref())
+                .await
+                .expect("jsonld");
+            let found = rows.as_array().is_some_and(|rows| !rows.is_empty());
+            if found != *want {
+                wrong.push(format!("{state}: JSON-LD {filters:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "answered wrongly: {wrong:#?}");
 }
 
 /// A Cypher `datetime()` or `time()` constant past the microsecond is held to

@@ -1,6 +1,8 @@
 #[path = "support/mod.rs"]
 mod support;
 
+#[path = "it_arena_literal_keys.rs"]
+mod it_arena_literal_keys;
 #[path = "it_bounded_overlay_translation.rs"]
 mod it_bounded_overlay_translation;
 #[path = "it_differential_fastpath.rs"]
@@ -63,6 +65,8 @@ mod it_query_post_order_limit;
 mod it_query_property;
 #[path = "it_query_rdf_list_parity.rs"]
 mod it_query_rdf_list_parity;
+#[path = "it_query_result_cache.rs"]
+mod it_query_result_cache;
 #[path = "it_query_reverse.rs"]
 mod it_query_reverse;
 #[path = "it_query_self_loop_star_join.rs"]
@@ -77,5 +81,7 @@ mod it_query_wildcard_system_facts;
 mod it_reserved_graph_contract;
 #[path = "it_service_cross_ledger_iri.rs"]
 mod it_service_cross_ledger_iri;
+#[path = "it_union_fact_identity.rs"]
+mod it_union_fact_identity;
 #[path = "it_unordered_output_order.rs"]
 mod it_unordered_output_order;

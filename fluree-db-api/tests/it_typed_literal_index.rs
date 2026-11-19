@@ -322,27 +322,50 @@ async fn typed_literal_deletes_across_surfaces() {
     }
 }
 
+/// A transaction refuses an ill-typed literal. One a ledger already holds
+/// (written before transactions refused them, or by bulk import) keeps its
+/// lexical form in novelty and through a full rebuild, and a delete removes it
+/// through a bound variable.
 #[tokio::test]
 async fn ill_typed_literals_keep_their_lexical_form() {
     let fluree = memory_fluree();
-    let ledger_id = "typed-literal-index:ill-typed";
-    let ledger = fluree.create_ledger(ledger_id).await.expect("create");
-    fluree
-        .insert_turtle(ledger, &format!("<{EX}seed> <{EX}name> \"seed\" ."))
+    let refusing = fluree
+        .create_ledger("typed-literal-index:ill-typed-refused")
         .await
-        .expect("seed");
-    let indexed = reindexed(&fluree, ledger_id).await;
-
-    let turtle = format!(
-        "<{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date> ;\n\
-         <{EX}int> \"abc\"^^<{XSD}integer> ;\n\
-         <{EX}good> \"2026-09-08\"^^<{XSD}date> ."
+        .expect("create");
+    let refused = fluree
+        .insert_turtle(
+            refusing,
+            &format!("<{EX}a> <{EX}int> \"abc\"^^<{XSD}integer> ."),
+        )
+        .await
+        .map(|r| r.receipt.t)
+        .expect_err("Turtle refuses an ill-typed literal");
+    assert!(
+        refused
+            .to_string()
+            .contains("Cannot parse 'abc' as integer"),
+        "{refused}"
     );
-    let ledger = fluree
-        .insert_turtle(indexed, &turtle)
-        .await
-        .expect("Turtle keeps ill-typed literals")
-        .ledger;
+
+    let ledger_id = "typed-literal-index:ill-typed";
+    let ledger = support::ledger_with_stored_ill_typed_literals(
+        &fluree,
+        ledger_id,
+        &format!(
+            "<{EX}seed> <{EX}name> \"seed\" .\n<{EX}a> <{EX}good> \"2026-09-08\"^^<{XSD}date> ."
+        ),
+        &[
+            (
+                &format!("{EX}a"),
+                &format!("{EX}date"),
+                "1990-00-00",
+                "date",
+            ),
+            (&format!("{EX}a"), &format!("{EX}int"), "abc", "integer"),
+        ],
+    )
+    .await;
     let expected: Vec<Row> = [
         ("date", "1990-00-00", "date"),
         ("good", "2026-09-08", "date"),
@@ -352,12 +375,8 @@ async fn ill_typed_literals_keep_their_lexical_form() {
     .map(|(p, o, dt)| (p.to_string(), o.to_string(), dt.to_string()))
     .collect();
 
-    assert!(ledger.snapshot.range_provider.is_some());
-    assert_eq!(
-        objects_of(&fluree, &ledger, "a").await,
-        expected,
-        "novelty over an index"
-    );
+    assert!(ledger.snapshot.range_provider.is_none(), "novelty only");
+    assert_eq!(objects_of(&fluree, &ledger, "a").await, expected, "novelty");
     let indexed = reindexed(&fluree, ledger_id).await;
     assert_eq!(
         objects_of(&fluree, &indexed, "a").await,
@@ -411,20 +430,24 @@ async fn sparql_update_rejects_ill_typed_literal() {
 
 /// The JSON-LD twin: an insert and a delete, with a `where` or without one,
 /// refuse an ill-typed literal written as a constant, as SPARQL does, even
-/// when a Turtle write stored that literal. A delete removes it through a
+/// when the ledger holds that literal. A delete removes it through a
 /// variable instead (`datatypes.md`).
 #[tokio::test]
 async fn jsonld_transactions_reject_ill_typed_literal() {
     let fluree = memory_fluree();
     let ledger_id = "typed-literal-index:reject-jsonld";
-    let ledger = fluree.create_ledger(ledger_id).await.expect("create");
-    fluree
-        .insert_turtle(
-            ledger,
-            &format!("<{EX}a> <{EX}date> \"1990-00-00\"^^<{XSD}date> ."),
-        )
-        .await
-        .expect("Turtle keeps the ill-typed literal");
+    support::ledger_with_stored_ill_typed_literals(
+        &fluree,
+        ledger_id,
+        "",
+        &[(
+            &format!("{EX}a"),
+            &format!("{EX}date"),
+            "1990-00-00",
+            "date",
+        )],
+    )
+    .await;
     let node = json!({
         "@id": format!("{EX}a"),
         format!("{EX}date"): {"@value": "1990-00-00", "@type": format!("{XSD}date")}
@@ -463,15 +486,13 @@ async fn an_upsert_replaces_a_stored_ill_typed_literal() {
     let expected = vec![("int".to_string(), "5".to_string(), "integer".to_string())];
     for indexed in [false, true] {
         let ledger_id = format!("typed-literal-index:ill-typed-upsert-{indexed}");
-        let ledger = fluree.create_ledger(&ledger_id).await.expect("create");
-        let mut ledger = fluree
-            .insert_turtle(
-                ledger,
-                &format!("<{EX}a> <{EX}int> \"abc\"^^<{XSD}integer> ."),
-            )
-            .await
-            .expect("Turtle keeps the ill-typed literal")
-            .ledger;
+        let mut ledger = support::ledger_with_stored_ill_typed_literals(
+            &fluree,
+            &ledger_id,
+            "",
+            &[(&format!("{EX}a"), &format!("{EX}int"), "abc", "integer")],
+        )
+        .await;
         if indexed {
             ledger = reindexed(&fluree, &ledger_id).await;
         }

@@ -7,6 +7,7 @@
 use crate::binding::{Batch, Binding};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
+use crate::index_scope::{overlay_carries_novelty, IndexScope};
 use crate::ir::triple::Ref;
 use crate::operator::{BoxedOperator, Operator, OperatorState};
 use crate::policy::PredicateCoverage;
@@ -51,6 +52,48 @@ pub(crate) fn bail_if_cancelled(cancellation: &fluree_db_core::QueryCancellation
         Some(reason) => Err(QueryError::Cancelled { reason }),
         None => Ok(()),
     }
+}
+
+/// Charge `tracker` one index touch for a leaflet a fast path reads, the unit
+/// `BinaryCursor` charges per leaflet it returns, cache hit or not.
+///
+/// Same placement rule as [`bail_if_cancelled`]: once per leaflet, never per
+/// row. On an untracked query `consume_fuel` returns before touching the
+/// atomic.
+///
+/// Only the enabled check is inlined: the charge itself is out of line, so a
+/// refill inlined into a per-row loop keeps that loop's code as it was.
+#[inline]
+pub(crate) fn charge_leaflet(tracker: &fluree_db_core::Tracker) -> Result<()> {
+    if tracker.is_enabled() {
+        charge_leaflet_tracked(tracker)
+    } else {
+        Ok(())
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn charge_leaflet_tracked(tracker: &fluree_db_core::Tracker) -> Result<()> {
+    tracker
+        .consume_fuel(fluree_db_core::tracking::schedule::INDEX_TOUCH_MICRO_FUEL)
+        .map_err(QueryError::FuelLimitExceeded)
+}
+
+/// Decode `projection`'s columns of leaflet `idx` straight from `handle`,
+/// bypassing the leaflet cache, and charge `tracker` for the read.
+#[inline]
+pub(crate) fn load_leaflet_columns_charged(
+    handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
+    idx: usize,
+    projection: &ColumnProjection,
+    order: RunSortOrder,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<ColumnBatch> {
+    charge_leaflet(tracker)?;
+    handle
+        .load_columns(idx, projection, order)
+        .map_err(|e| QueryError::from_io("load columns", e))
 }
 
 // ---------------------------------------------------------------------------
@@ -124,14 +167,17 @@ pub fn projection_sid_only() -> ColumnProjection {
 
 /// Decode `projection`'s columns of leaflet `idx`, through the leaflet cache
 /// when the store has one: an entry that covers them serves them projected;
-/// one that falls short decodes only the missing columns into it.
+/// one that falls short decodes only the missing columns into it. Charges
+/// `tracker` for the read either way.
 pub(crate) fn load_leaflet_projection(
     store: &BinaryIndexStore,
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     idx: usize,
     projection: &ColumnProjection,
     order: RunSortOrder,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<ColumnBatch> {
+    charge_leaflet(tracker)?;
     let batch = match store.leaflet_cache() {
         Some(cache) => load_columns_cached_via_handle(
             handle,
@@ -147,7 +193,7 @@ pub(crate) fn load_leaflet_projection(
         ),
         None => handle.load_columns(idx, projection, order),
     };
-    batch.map_err(|e| QueryError::Internal(format!("load columns: {e}")))
+    batch.map_err(|e| QueryError::from_io("load columns", e))
 }
 
 /// Projection that loads only the OKey column (internal, not output).
@@ -345,7 +391,7 @@ pub const fn is_post_desc_orderable(o_type: u16) -> bool {
 
 /// Construct min/max `RunRecordV2` keys spanning all rows for a predicate.
 #[inline]
-fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
+pub(crate) fn predicate_range_keys(p_id: u32, g_id: GraphId) -> (RunRecordV2, RunRecordV2) {
     let min_key = RunRecordV2 {
         s_id: SubjectId(0),
         o_key: 0,
@@ -459,6 +505,7 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
     g_id: GraphId,
     p_id: u32,
     replay_to: Option<i64>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<bool> {
     use fluree_db_binary_index::format::leaflet::flags::HAS_O_I;
     for leaf_entry in leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id) {
@@ -491,9 +538,13 @@ pub(crate) fn predicate_unsafe_for_cross_predicate_o_key_join(
                     }
                     // Range straddles a non-identifying o_type: decode this
                     // leaflet's o_type column and check exact membership.
-                    let batch = handle
-                        .load_columns(idx, &projection_otype_only(), RunSortOrder::Post)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                    let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                        &*handle,
+                        idx,
+                        &projection_otype_only(),
+                        RunSortOrder::Post,
+                        tracker,
+                    )?;
                     for i in 0..batch.row_count {
                         if !OType::from_u16(batch.o_type.get(i)).o_key_is_globally_identifying() {
                             return Ok(true);
@@ -666,6 +717,7 @@ pub fn collect_subjects_for_predicate_sorted(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_only();
@@ -682,9 +734,13 @@ pub fn collect_subjects_for_predicate_sorted(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if prev != Some(sid) {
@@ -704,11 +760,27 @@ pub fn collect_subjects_for_predicate_set(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<FxHashSet<u64>> {
+    let mut out: FxHashSet<u64> = FxHashSet::default();
+    extend_subjects_for_predicate_set(store, g_id, p_id, &mut out, tracker)?;
+    Ok(out)
+}
+
+/// Add the distinct subject IDs of a predicate in one graph (PSOT) to `out`.
+///
+/// For a set over several graphs: each graph's subjects go into one set, with
+/// no per-graph set to build and merge.
+pub fn extend_subjects_for_predicate_set(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    p_id: u32,
+    out: &mut FxHashSet<u64>,
+    tracker: &fluree_db_core::Tracker,
+) -> Result<()> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_only();
 
-    let mut out: FxHashSet<u64> = FxHashSet::default();
     let mut prev: Option<u64> = None;
 
     for leaf_entry in leaves {
@@ -720,9 +792,13 @@ pub fn collect_subjects_for_predicate_set(
             if entry.row_count == 0 || entry.p_const != Some(p_id) {
                 continue;
             }
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
             for row in 0..batch.row_count {
                 let sid = batch.s_id.get(row);
                 if prev != Some(sid) {
@@ -732,7 +808,7 @@ pub fn collect_subjects_for_predicate_set(
             }
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -851,6 +927,8 @@ pub struct PsotSubjectCountIter<'a> {
     hi: u64,
     /// Checked once per leaflet refill (cold path), never per group.
     cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSubjectCountIter<'a> {
@@ -888,6 +966,7 @@ impl<'a> PsotSubjectCountIter<'a> {
             lo,
             hi,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         })
     }
 
@@ -897,6 +976,16 @@ impl<'a> PsotSubjectCountIter<'a> {
         self
     }
 
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
+        self
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         bail_if_cancelled(&self.cancellation)?;
         let projection = projection_sid_only();
@@ -936,6 +1025,7 @@ impl<'a> PsotSubjectCountIter<'a> {
                     idx,
                     &projection,
                     RunSortOrder::Psot,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1044,6 +1134,8 @@ pub struct PsotSubjectSeek<'a> {
     projection: ColumnProjection,
     /// Checked once per leaflet refill (cold path), never per probe.
     cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSubjectSeek<'a> {
@@ -1087,6 +1179,7 @@ impl<'a> PsotSubjectSeek<'a> {
             batch: None,
             projection,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         }
     }
 
@@ -1096,6 +1189,16 @@ impl<'a> PsotSubjectSeek<'a> {
         self
     }
 
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
+        self
+    }
+
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self, target_s: u64) -> Result<Option<()>> {
         use fluree_db_binary_index::format::run_record_v2::read_ordered_key_v2;
         bail_if_cancelled(&self.cancellation)?;
@@ -1153,6 +1256,7 @@ impl<'a> PsotSubjectSeek<'a> {
                     idx,
                     &self.projection,
                     RunSortOrder::Psot,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1283,10 +1387,17 @@ pub struct PostObjectGroupCountIter<'a> {
     /// Accumulated object key for a group that may span leaflet boundaries.
     cur_key: Option<u64>,
     cur_count: u64,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PostObjectGroupCountIter<'a> {
-    pub fn new(store: &'a BinaryIndexStore, g_id: GraphId, p_id: u32) -> Result<Option<Self>> {
+    pub fn new(
+        store: &'a BinaryIndexStore,
+        g_id: GraphId,
+        p_id: u32,
+        tracker: &fluree_db_core::Tracker,
+    ) -> Result<Option<Self>> {
         Ok(Some(Self {
             store,
             p_id,
@@ -1299,9 +1410,14 @@ impl<'a> PostObjectGroupCountIter<'a> {
             mixed: false,
             cur_key: None,
             cur_count: 0,
+            tracker: tracker.clone(),
         }))
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         let proj_okey = projection_okey_only();
         let proj_otype_okey = projection_otype_okey();
@@ -1348,6 +1464,7 @@ impl<'a> PostObjectGroupCountIter<'a> {
                     idx,
                     if mixed { &proj_otype_okey } else { &proj_okey },
                     RunSortOrder::Post,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1452,6 +1569,8 @@ pub struct PsotSubjectWeightedSumIter<'a> {
     all_default: bool,
     /// Checked once per leaflet refill (cold path), never per group.
     cancellation: fluree_db_core::QueryCancellation,
+    /// Charged one index touch per leaflet refill, beside `cancellation`.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotSubjectWeightedSumIter<'a> {
@@ -1481,12 +1600,19 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             mixed: false,
             all_default: false,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         }))
     }
 
     /// Attach a cancellation handle, checked once per leaflet refill.
     pub fn with_cancellation(mut self, cancellation: &fluree_db_core::QueryCancellation) -> Self {
         self.cancellation = cancellation.clone();
+        self
+    }
+
+    /// Charge `tracker` one index touch per leaflet this iterator reads.
+    pub fn with_tracker(mut self, tracker: &fluree_db_core::Tracker) -> Self {
+        self.tracker = tracker.clone();
         self
     }
 
@@ -1522,9 +1648,14 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
             mixed: false,
             all_default: false,
             cancellation: fluree_db_core::QueryCancellation::disabled(),
+            tracker: fluree_db_core::Tracker::disabled(),
         }))
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         bail_if_cancelled(&self.cancellation)?;
         let proj_sid_okey = projection_sid_okey();
@@ -1578,6 +1709,7 @@ impl<'a> PsotSubjectWeightedSumIter<'a> {
                         &proj_sid_okey
                     },
                     RunSortOrder::Psot,
+                    &self.tracker,
                 )?;
                 self.row = 0;
                 self.batch = Some(batch);
@@ -1767,6 +1899,8 @@ pub struct PsotObjectFilterCountIter<'a> {
     /// True when the current batch is a mixed leaflet (o_type_const is None) —
     /// each row must be checked for IRI_REF type before set membership lookup.
     mixed: bool,
+    /// Charged one index touch per leaflet read.
+    tracker: fluree_db_core::Tracker,
 }
 
 impl<'a> PsotObjectFilterCountIter<'a> {
@@ -1776,6 +1910,7 @@ impl<'a> PsotObjectFilterCountIter<'a> {
         p_id: u32,
         reference_set: &'a FxHashSet<u64>,
         mode: ObjectFilterMode,
+        tracker: &fluree_db_core::Tracker,
     ) -> Result<Option<Self>> {
         Ok(Some(Self {
             store,
@@ -1790,9 +1925,14 @@ impl<'a> PsotObjectFilterCountIter<'a> {
             batch: None,
             all_count: false,
             mixed: false,
+            tracker: tracker.clone(),
         }))
     }
 
+    // Out of line: the refill runs at leaflet boundaries, off the per-group
+    // path. Inlined into it, its charge kept the tracker live there and cost
+    // every group a callee-saved register.
+    #[inline(never)]
     fn load_next_batch(&mut self) -> Result<Option<()>> {
         let proj_sid_okey = projection_sid_okey();
         let proj_sid_otype_okey = projection_sid_otype_okey();
@@ -1840,9 +1980,13 @@ impl<'a> PsotObjectFilterCountIter<'a> {
                     }
                     // NotInSet: load s_id + o_key, mark all_count so next_group
                     // counts every row without checking the reference set.
-                    let batch = handle
-                        .load_columns(idx, &proj_sid_okey, RunSortOrder::Psot)
-                        .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                    let batch = load_leaflet_columns_charged(
+                        handle.as_ref(),
+                        idx,
+                        &proj_sid_okey,
+                        RunSortOrder::Psot,
+                        &self.tracker,
+                    )?;
                     self.row = 0;
                     self.batch = Some(batch);
                     self.all_count = true;
@@ -1855,9 +1999,13 @@ impl<'a> PsotObjectFilterCountIter<'a> {
                 } else {
                     &proj_sid_okey
                 };
-                let batch = handle
-                    .load_columns(idx, projection, RunSortOrder::Psot)
-                    .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+                let batch = load_leaflet_columns_charged(
+                    handle.as_ref(),
+                    idx,
+                    projection,
+                    RunSortOrder::Psot,
+                    &self.tracker,
+                )?;
                 self.row = 0;
                 self.batch = Some(batch);
                 self.all_count = false;
@@ -1934,6 +2082,7 @@ pub fn collect_subjects_with_object_in_set(
     g_id: GraphId,
     p_id: u32,
     object_set: &FxHashSet<u64>,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<Vec<u64>>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Psot, p_id);
     let projection = projection_sid_okey();
@@ -1953,9 +2102,13 @@ pub fn collect_subjects_with_object_in_set(
                 return Ok(None);
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Psot)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Psot,
+                tracker,
+            )?;
 
             let mut i = 0usize;
             while i < batch.row_count {
@@ -1988,6 +2141,7 @@ pub fn sum_post_object_counts_filtered(
     g_id: GraphId,
     p_id: u32,
     allowed_objects_sorted: &[u64],
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let projection = projection_okey_only();
@@ -2009,9 +2163,13 @@ pub fn sum_post_object_counts_filtered(
                 return Ok(None);
             }
 
-            let batch: ColumnBatch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch: ColumnBatch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
 
             let mut i = 0usize;
             while i < batch.row_count {
@@ -2844,6 +3002,10 @@ pub(crate) fn probe_lane_admission(
     if ctx.is_history_range() {
         return Some(ProbeLanePlan::Decline);
     }
+    // The lanes read one graph's index (`binary_g_id`'s).
+    if !ctx.reads_exactly_one_graph() {
+        return Some(ProbeLanePlan::Decline);
+    }
     // Every predicate the lane reads must clear; an empty set has nothing to
     // clear and declines under any non-root policy. `Allow` keeps the lane,
     // anything else declines it (the lanes have no empty result to
@@ -3116,11 +3278,13 @@ pub fn build_overlay_cursor_for_predicate(
         p_id: Some(p_id),
         ..Default::default()
     };
-    let Some(mut cursor) =
+    let Some(cursor) =
         build_range_cursor(store, g_id, order, &min_key, &max_key, filter, projection)
     else {
         return Ok(None);
     };
+    // Every leaflet it reads is charged to the query, as the scan's are.
+    let mut cursor = cursor.with_tracker(ctx.tracker.clone());
     cursor.set_to_t(ctx.to_t);
 
     // Fold the novelty overlay in. Skip the walk entirely when there is no
@@ -3195,8 +3359,9 @@ pub fn build_post_cursor_for_predicate(
 /// for parallelizing an overlay count: the partition harness hands each worker a
 /// subject range, and each worker scans only its leaves and merges only its ops.
 ///
-/// Takes `to_t` as a value (not `&ExecutionContext`) so the caller can hoist
-/// it out of the parallel region and keep the reducer `Sync`. The cursor's leaf
+/// Takes `to_t` and the query's `tracker` as values (not `&ExecutionContext`)
+/// so the caller can hoist them out of the parallel region and keep the
+/// reducer `Sync`; the tracker is charged for every leaflet the cursor reads. The cursor's leaf
 /// range is bounded by the keys, but rows are filtered only by `p_id`, so a boundary
 /// leaf shared with an adjacent partition still emits its out-of-range subjects — the
 /// caller MUST drop rows with `s_id < lo || s_id >= hi` so each subject is counted by
@@ -3211,6 +3376,7 @@ pub fn build_overlay_cursor_for_subject_range(
     hi: u64,
     sliced_ops: Vec<fluree_db_binary_index::read::types::OverlayOp>,
     to_t: i64,
+    tracker: &fluree_db_core::Tracker,
 ) -> Option<BinaryCursor> {
     let overlay_active = !sliced_ops.is_empty();
     // Identity columns must be present for merge_overlay_into_batch (see
@@ -3239,7 +3405,8 @@ pub fn build_overlay_cursor_for_subject_range(
         &max_key,
         filter,
         projection,
-    )?;
+    )?
+    .with_tracker(tracker.clone());
     cursor.set_to_t(to_t);
     if overlay_active {
         cursor.set_overlay_ops(sliced_ops.into());
@@ -3321,7 +3488,7 @@ impl CursorSubjectCountStream {
                 self.current = self
                     .cursor
                     .next_batch()
-                    .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?;
+                    .map_err(|e| QueryError::from_io("cursor batch", e))?;
                 self.row = 0;
                 if self.current.is_none() {
                     if let Some(s) = self.cur_s.take() {
@@ -3519,7 +3686,7 @@ where
     let mut total: u64 = 0;
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for r in 0..batch.row_count {
             match per_row(batch.s_id.get(r), batch.o_type.get(r), batch.o_key.get(r)) {
@@ -3561,6 +3728,7 @@ where
         None => return Ok(None),
     };
     let to_t = ctx.to_t;
+    let tracker = &ctx.tracker;
     let total_rows = count_rows_for_predicate_psot(store, g_id, p_id)?;
 
     let ops_ref = &ops;
@@ -3582,13 +3750,14 @@ where
                 hi,
                 sliced,
                 to_t,
+                tracker,
             ) else {
                 return Ok(0u128);
             };
             let mut total: u128 = 0;
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+                .map_err(|e| QueryError::from_io("cursor batch", e))?
             {
                 for r in 0..batch.row_count {
                     let s = batch.s_id.get(r);
@@ -3725,10 +3894,11 @@ pub fn count_predicate_overlay_delta(
             hi,
             sliced,
             to_t,
+            &ctx.tracker,
         ) {
             while let Some(batch) = cursor
                 .next_batch()
-                .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+                .map_err(|e| QueryError::from_io("cursor batch", e))?
             {
                 for r in 0..batch.row_count {
                     let s = batch.s_id.get(r);
@@ -3871,7 +4041,7 @@ pub fn build_iri_adjacency_from_cursor(
     let mut adj: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
     while let Some(batch) = cursor
         .next_batch()
-        .map_err(|e| QueryError::Internal(format!("cursor batch: {e}")))?
+        .map_err(|e| QueryError::from_io("cursor batch", e))?
     {
         for i in 0..batch.row_count {
             if batch.o_type.get(i) != iri_ref {
@@ -4005,35 +4175,8 @@ pub fn term_to_ref_s_id(
         .map_err(|e| QueryError::execution(format!("find_subject_id_by_parts: {e}")))
 }
 
-/// Check whether the execution context allows fast-path operators.
-///
-/// Fast paths are only valid when single-ledger, no `from_t`, root (or no)
-/// policy, and no uncommitted overlay. History mode is filtered at the
-/// planner level (in `execute::operator_tree::build_operator_tree_inner`),
-/// so this runtime gate doesn't repeat that check.
-#[inline]
-fn allow_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    fast_path_eligible_no_policy(ctx) && ctx.allow_unfiltered()
-}
-
-/// The non-policy half of [`allow_fast_path`]: single-ledger, no `from_t`, no
-/// uncommitted overlay.
-///
-/// Fast paths rely on a single binary index + single-ledger semantics for
-/// encoded IDs; dataset (multi-ledger) execution can span multiple
-/// ledgers/graphs, so they are disabled there. History mode is filtered at the
-/// planner level, so this runtime gate doesn't repeat that check.
-///
-/// Split out so single-predicate O1 callers can reuse the structural conditions
-/// after discharging the view policy themselves via
-/// [`cursor_fast_path_for_predicate`] (an uncovered predicate is safe to read
-/// unfiltered).
-#[inline]
-fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && !overlay_has_novelty(ctx)
-}
-
-/// True when the overlay can still contribute flakes.
+/// True when the overlay can still contribute flakes
+/// ([`overlay_carries_novelty`]).
 ///
 /// `epoch()` is a monotonic mutation counter that never resets, so
 /// `epoch() == 0` means "never had novelty since this overlay was created" —
@@ -4045,54 +4188,55 @@ fn fast_path_eligible_no_policy(ctx: &ExecutionContext<'_>) -> bool {
 /// exactly this distinction; keep `epoch()` itself for cache keys only.
 #[inline]
 pub fn overlay_has_novelty(ctx: &ExecutionContext<'_>) -> bool {
-    match &ctx.overlay {
-        Some(o) => o.epoch() != 0 && !o.is_effectively_empty(),
-        None => false,
-    }
+    ctx.overlay.is_some_and(overlay_carries_novelty)
 }
 
-/// Combined fast-path eligibility: [`allow_fast_path`] + binary store present + `to_t == max_t`.
+/// The store a metadata fast path reads, when it may: the scope reads one
+/// graph ([`IndexScope::One`] from [`ExecutionContext::index_scope`]: a store,
+/// one graph, no `from_t`, root or no policy) whose index alone answers for it
+/// ([`IndexMember::index_is_current`]: no novelty, `to_t == max_t`). `None`
+/// otherwise.
 ///
-/// Returns the store reference if the fast path can proceed, `None` otherwise.
+/// A default graph of several graphs is not `One`: there `binary_g_id` names
+/// one member, which these lanes would read alone.
+///
+/// [`IndexMember::index_is_current`]: crate::index_scope::IndexMember::index_is_current
 #[inline]
 pub fn fast_path_store<'a>(ctx: &'a ExecutionContext<'_>) -> Option<&'a Arc<BinaryIndexStore>> {
-    if !allow_fast_path(ctx) {
-        return None;
+    match ctx.index_scope()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
     }
-    let store = ctx.binary_store.as_ref()?;
-    if ctx.to_t != store.max_t() {
-        return None;
-    }
-    Some(store)
 }
 
 /// Like [`fast_path_store`] but with the view-policy clause **already
-/// discharged by the caller** — use only after [`cursor_fast_path_for_predicate`]
-/// returned [`PredicateFastPath::Allow`] for the operator's single scanned
-/// predicate. Same structural metadata-lane conditions otherwise: single-ledger,
-/// no `from_t`, overlay-free, store present, `to_t == max_t`.
+/// discharged by the caller** ([`ExecutionContext::index_scope_policy_cleared`])
+/// — use only after [`cursor_fast_path_for_predicate`] returned
+/// [`PredicateFastPath::Allow`] for the operator's single scanned predicate.
+/// Same structural metadata-lane conditions otherwise: one graph, no `from_t`,
+/// overlay-free, store present, `to_t == max_t`.
 #[inline]
 pub fn fast_path_store_policy_cleared<'a>(
     ctx: &'a ExecutionContext<'_>,
 ) -> Option<&'a Arc<BinaryIndexStore>> {
-    if !fast_path_eligible_no_policy(ctx) {
-        return None;
+    match ctx.index_scope_policy_cleared()? {
+        IndexScope::One(member) if member.index_is_current() => Some(member.store()),
+        _ => None,
     }
-    let store = ctx.binary_store.as_ref()?;
-    (ctx.to_t == store.max_t()).then_some(store)
 }
 
 /// Cursor-flavored fast-path gate (strategy (b)).
 ///
-/// Unlike [`allow_fast_path`], this does **not** reject uncommitted overlay or
+/// Unlike [`fast_path_store`], this does **not** reject uncommitted overlay or
 /// `to_t < max_t`: operators using this gate read through a [`BinaryCursor`]
 /// (built by [`build_psot_cursor_for_predicate`]) that folds the novelty overlay
-/// in and honors `to_t`, so those cases stay correct. It still requires
-/// single-ledger, no `from_t`, and root (or no) policy; History mode is filtered
-/// at the planner level.
+/// in and honors `to_t`, so those cases stay correct. It still requires a scope
+/// of one graph read through a store ([`IndexScope::One`]: the cursor reads
+/// `binary_g_id`'s graph), no `from_t`, and root (or no) policy; History mode
+/// is filtered at the planner level too.
 #[inline]
 pub fn allow_cursor_fast_path(ctx: &ExecutionContext<'_>) -> bool {
-    !ctx.is_multi_ledger() && !ctx.is_history_range() && ctx.allow_unfiltered()
+    matches!(ctx.index_scope(), Some(IndexScope::One(_)))
 }
 
 /// Verdict for a single-predicate cursor fast path under a view policy, returned
@@ -4121,8 +4265,9 @@ pub enum PredicateFastPath {
 ///   uncovered + default-allow).
 /// - [`PredicateFastPath::Empty`] — uncovered + default-deny: emit the empty
 ///   result for this predicate without scanning.
-/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the query is
-///   multi-ledger / historical: take the filtered fallback.
+/// - [`PredicateFastPath::Decline`] — a restriction may apply, or the scope
+///   reads more than one graph ([`ExecutionContext::reads_exactly_one_graph`])
+///   or is historical: take the filtered fallback.
 ///
 /// Only valid for an operator that scans exactly one ground predicate; multi- or
 /// wildcard-predicate fast paths must keep using [`allow_cursor_fast_path`]
@@ -4132,7 +4277,7 @@ pub fn cursor_fast_path_for_predicate(
     ctx: &ExecutionContext<'_>,
     pred_sid: &Sid,
 ) -> PredicateFastPath {
-    if ctx.is_multi_ledger() || ctx.is_history_range() {
+    if !ctx.reads_exactly_one_graph() || ctx.is_history_range() {
         return PredicateFastPath::Decline;
     }
     // No policy or root: nothing to filter, run the fast path unfiltered.
