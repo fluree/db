@@ -1,30 +1,19 @@
 //! Unified LRU cache for decoded leaflet regions and dictionary leaves.
 //!
 //! Uses one `moka::sync::SegmentedCache` (synchronous — `BinaryCursor` is
-//! sync) with TinyLFU eviction. All entry types — Region 1, Region 2, and
-//! dictionary tree leaves — share one pool so TinyLFU decides what stays
-//! based on actual access patterns rather than fixed budget splits. The pool
-//! is split by key hash into shards; see [`pool_segments`].
+//! sync) with TinyLFU eviction. Every entry type (see `CacheKey`) shares one
+//! pool so TinyLFU decides what stays based on actual access patterns rather
+//! than fixed budget splits. The pool is split by key hash into shards; see
+//! [`pool_segments`].
 //!
 //! History is **never cached** — it lives outside the leaflet entirely, in the
 //! per-leaf history sidecar (`FHS1`, located via `LeafEntry.sidecar_cid`). It's
 //! cold-path data decoded on demand for time-travel replay and discarded
 //! afterwards, so a HEAD-only query never pays for it.
 //!
-//! Note: "Region 1" / "Region 2" here are *decode groupings* used by this cache
-//! (R1 = the key columns used for filtering and joins; R2 = the remaining
-//! per-row columns needed to reconstruct a full flake). The V3 on-disk leaflet
-//! is per-column blocks, not numbered regions — see
-//! `crate::format::leaflet` and `docs/design/index-format.md`.
-//!
-//! ## Cache Key
-//!
-//! A `CacheKey` enum discriminates entry types:
-//! - `R1` / `R2`: keyed by `(leaf_id, leaflet_index, to_t, epoch)`.
-//!   `to_t` distinguishes time-travel snapshots; `epoch` distinguishes
-//!   staged vs committed views at the same `t`.
-//! - `DictLeaf`: keyed by `xxh3_128(cas_address)`. Content-addressed and
-//!   immutable — no epoch/time dimension needed.
+//! Scans cache a leaflet's decoded base columns (`V3Batch`), keyed by the
+//! content-addressed leaf and the leaflet index. Overlay merging and
+//! time-travel replay run after the cache, so one entry serves every `t`.
 
 use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;

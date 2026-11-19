@@ -4,8 +4,8 @@
 //! cardinality estimates. When a `StatsView` is provided, uses HLL-derived
 //! property statistics; otherwise falls back to heuristic defaults.
 //!
-//! The main entry point is `reorder_patterns`, called from
-//! `build_where_operators_seeded` in `execute/where_plan.rs`.
+//! The main entry point is `reorder_patterns_with_seed`, called from
+//! `build_where_operators_seeded_with_needed` in `execute/where_plan.rs`.
 
 use crate::ir::triple::{Ref, Term, TriplePattern};
 use crate::ir::{CompareOp, Function, Grouping, OrderRole, Pattern, SubqueryPattern};
@@ -1026,11 +1026,12 @@ pub enum PatternEstimate {
     /// IndexSearch, VectorSearch, GeoSearch, S2Search, Graph, PropertyPath,
     /// R2rml, Service)
     Source { row_count: f64 },
-    /// Shrinks the stream — fraction of rows surviving (< 1.0) (MINUS, EXISTS, NOT EXISTS)
+    /// Shrinks the stream — fraction of rows surviving (< 1.0). No pattern
+    /// estimates as a reducer: MINUS, EXISTS and NOT EXISTS are `Deferred`.
     Reducer { multiplier: f64 },
     /// Grows the stream via left-join — expansion factor (>= 1.0) (OPTIONAL)
     Expander { multiplier: f64 },
-    /// FILTER/BIND — deferred, no cardinality effect
+    /// FILTER, BIND, MINUS, EXISTS, NOT EXISTS — placed once ready
     Deferred,
 }
 
@@ -2061,9 +2062,11 @@ fn unpark(list: &mut Vec<RankedPattern>, parked: Vec<RankedPattern>) {
 /// (IndexSearch, VectorSearch, GeoSearch, S2Search, Graph, PropertyPath,
 /// R2rml, Service). Uses a priority-based greedy algorithm:
 ///
-/// 1. **Eligible reducers** first (lowest multiplier) — shrink the stream ASAP
-/// 2. **Sources** next (lowest estimate) — same greedy logic as triple reorder
-/// 3. **Eligible expanders** last (lowest multiplier) — defer row expansion
+/// 1. **Sources** first (lowest estimate) — same greedy logic as triple reorder
+/// 2. **Eligible expanders** next (lowest multiplier) — defer row expansion
+///
+/// Deferred patterns (FILTER, BIND, MINUS, EXISTS) are drained as soon as
+/// they are ready.
 pub fn reorder_patterns(
     patterns: &[Pattern],
     stats: Option<&StatsView>,

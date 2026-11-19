@@ -47,7 +47,9 @@ pub struct EncodedLeaflet {
     pub p_const: Option<u32>,
     /// Constant `o_type` when all rows share the same type. Set for:
     /// - OPST (always, by segmentation design)
-    /// - POST/PSOT/SPOT (when single-type predicate or leaflet — optimization)
+    /// - POST/PSOT when the leaflet is single-typed
+    ///
+    /// Never set for SPOT.
     pub o_type_const: Option<u16>,
     /// Bitflags (HAS_O_I, HAS_O_TYPE_COL, etc.).
     pub flags: u32,
