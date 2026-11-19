@@ -8,6 +8,7 @@ use fluree_db_core::{
     Flake, FlakeValue, GraphDbRef, GraphId, LedgerSnapshot, OverlayProvider, Sid, Tracker,
 };
 use fluree_db_policy::{is_schema_flake, is_schema_predicate, ClassState, PolicyContext};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 /// Plan-time-style verdict for a single statically-known scanned predicate under
@@ -144,9 +145,9 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t (not ctx-level!)
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
-        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
-        let state = ClassState::of(db);
-        self.cache_subject_classes(&state, db, &flakes).await?;
+        let classes = self
+            .subject_classes(GraphDbRef::new(snapshot, g_id, overlay, to_t), &flakes)
+            .await?;
 
         let mut result = Vec::with_capacity(flakes.len());
 
@@ -154,7 +155,7 @@ impl QueryPolicyEnforcer {
             // A term names its triple even under a schema predicate, so it is
             // checked before the schema exemption.
             if !self
-                .term_visible(&state, &flake.o, &executor, tracker)
+                .term_visible(&classes, &flake.o, &executor, tracker)
                 .await?
             {
                 continue;
@@ -165,11 +166,7 @@ impl QueryPolicyEnforcer {
                 continue;
             }
 
-            // Get subject classes from cache
-            let subject_classes = self
-                .policy
-                .get_cached_subject_classes(&state, &flake.s)
-                .unwrap_or_default();
+            let subject_classes = classes.of(&self.policy, &flake.s);
 
             // Async policy check with f:query support
             match self
@@ -217,13 +214,15 @@ impl QueryPolicyEnforcer {
 
         // Create executor using the GRAPH's snapshot/overlay/to_t
         let executor = QueryPolicyExecutor::with_overlay(snapshot, overlay, to_t);
-        let db = GraphDbRef::new(snapshot, g_id, overlay, to_t);
-        let state = ClassState::of(db);
-        self.cache_subject_classes(&state, db, std::slice::from_ref(flake))
+        let classes = self
+            .subject_classes(
+                GraphDbRef::new(snapshot, g_id, overlay, to_t),
+                std::slice::from_ref(flake),
+            )
             .await?;
         // Before the schema exemption: a term names its triple under any predicate.
         if !self
-            .term_visible(&state, &flake.o, &executor, tracker)
+            .term_visible(&classes, &flake.o, &executor, tracker)
             .await?
         {
             return Ok(false);
@@ -234,11 +233,7 @@ impl QueryPolicyEnforcer {
             return Ok(true);
         }
 
-        // Get subject classes from cache
-        let subject_classes = self
-            .policy
-            .get_cached_subject_classes(&state, &flake.s)
-            .unwrap_or_default();
+        let subject_classes = classes.of(&self.policy, &flake.s);
 
         // Async policy check
         self.policy
@@ -259,17 +254,14 @@ impl QueryPolicyEnforcer {
     /// so on through a nested term. Other objects pass.
     async fn term_visible(
         &self,
-        state: &ClassState,
+        subject_classes: &SubjectClasses,
         object: &FlakeValue,
         executor: &QueryPolicyExecutor<'_>,
         tracker: &Tracker,
     ) -> Result<bool> {
         let mut object = object;
         while let FlakeValue::TripleTerm(term) = object {
-            let classes = self
-                .policy
-                .get_cached_subject_classes(state, &term.s)
-                .unwrap_or_default();
+            let classes = subject_classes.of(&self.policy, &term.s);
             let allowed = self
                 .policy
                 .allow_view_flake_async(&term.s, &term.p, &term.o, &classes, executor, tracker)
@@ -283,19 +275,22 @@ impl QueryPolicyEnforcer {
         Ok(true)
     }
 
-    /// Cache, under `state`, the classes of every subject the checks of
-    /// `flakes` read: each flake's, and those of the triple terms among their
-    /// objects, which `term_visible` checks like any flake subject. A caller's
-    /// prefetch is not enough: a miss reads as no classes, and a state of an
-    /// overlay with no content version matches only itself.
-    async fn cache_subject_classes(
+    /// Resolve, under the state they read with, the classes of every subject
+    /// the checks of `flakes` read: each non-schema flake's, and those of the
+    /// triple terms among their objects, which `term_visible` checks like any
+    /// flake subject. Callers need no prefetch: a miss reads as no classes, so
+    /// the check resolves its own.
+    ///
+    /// A state shared with nothing keeps its lookups in a map of this call's
+    /// own: in the context's cache they would be entries no later check
+    /// reads, kept for the context's life.
+    async fn subject_classes(
         &self,
-        state: &ClassState,
         db: GraphDbRef<'_>,
         flakes: &[Flake],
-    ) -> Result<()> {
+    ) -> Result<SubjectClasses> {
         if !self.policy.wrapper().has_class_policies() {
-            return Ok(());
+            return Ok(SubjectClasses::Local(HashMap::new()));
         }
         let subjects = flakes.iter().flat_map(|flake| {
             let terms = std::iter::successors(Some(&flake.o), |object| match object {
@@ -306,22 +301,37 @@ impl QueryPolicyEnforcer {
                 FlakeValue::TripleTerm(term) => Some(&term.s),
                 _ => None,
             });
-            std::iter::once(&flake.s).chain(terms)
+            let own = (!is_schema_flake(&flake.p, &flake.o)).then_some(&flake.s);
+            own.into_iter().chain(terms)
         });
-        let mut subjects = self.policy.retain_uncached_iter(state, subjects);
-        if subjects.is_empty() {
-            return Ok(());
+        let state = ClassState::of(db);
+        if state.is_shared() {
+            let mut uncached = self.policy.retain_uncached_iter(&state, subjects);
+            if !uncached.is_empty() {
+                uncached.sort();
+                uncached.dedup();
+                fluree_db_policy::populate_class_cache_in(&state, &uncached, db, &self.policy)
+                    .await
+                    .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
+            }
+            Ok(SubjectClasses::Shared(state))
+        } else {
+            let mut subjects: Vec<Sid> = subjects.cloned().collect();
+            subjects.sort();
+            subjects.dedup();
+            fluree_db_policy::lookup_subject_classes(&subjects, db)
+                .await
+                .map(SubjectClasses::Local)
+                .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
         }
-        subjects.sort();
-        subjects.dedup();
-        fluree_db_policy::populate_class_cache_in(state, &subjects, db, &self.policy)
-            .await
-            .map_err(|e| crate::error::QueryError::Policy(e.to_string()))
     }
 
-    /// Populate the class cache for subjects using a graph database reference.
-    ///
-    /// Call this before filtering to ensure class lookups are cached.
+    /// Prefetch the classes of `subjects` for a run of
+    /// [`allow_flake_for_graph`](Self::allow_flake_for_graph) checks, which
+    /// otherwise look up one subject at a time. A subject with no classes is
+    /// cached too, so its check does not read its `rdf:type` again.
+    /// [`filter_flakes_for_graph`](Self::filter_flakes_for_graph) needs no
+    /// prefetch: it resolves its batch's subjects in one lookup.
     pub async fn populate_class_cache_for_graph(
         &self,
         db: fluree_db_core::GraphDbRef<'_>,
@@ -331,6 +341,25 @@ impl QueryPolicyEnforcer {
             .await
             .map_err(|e| crate::error::QueryError::Policy(e.to_string()))?;
         Ok(())
+    }
+}
+
+/// Where a check finds its subjects' classes.
+enum SubjectClasses {
+    /// The context's cache, under a state other lookups can share.
+    Shared(ClassState),
+    /// This call's own lookups.
+    Local(HashMap<Sid, Vec<Sid>>),
+}
+
+impl SubjectClasses {
+    fn of(&self, policy: &PolicyContext, subject: &Sid) -> Vec<Sid> {
+        match self {
+            Self::Shared(state) => policy
+                .get_cached_subject_classes(state, subject)
+                .unwrap_or_default(),
+            Self::Local(classes) => classes.get(subject).cloned().unwrap_or_default(),
+        }
     }
 }
 
@@ -417,8 +446,8 @@ mod tests {
     }
 
     /// A class deny reaches a subject read through an overlay with no content
-    /// version, whose classes a caller's prefetch cached under a state of its
-    /// own.
+    /// version, which shares its class lookups with nothing: not a caller's
+    /// prefetch, nor the context's cache.
     #[tokio::test]
     async fn a_class_policy_applies_over_an_overlay_with_no_content_version() {
         let mut snapshot = LedgerSnapshot::genesis("test:main");

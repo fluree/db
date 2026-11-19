@@ -108,28 +108,6 @@ pub(crate) async fn await_query_min_t_requirements(
         return Ok(());
     }
 
-    if state.config.is_proxy_storage_mode() {
-        for (ledger_id, min_t) in requirements {
-            let ledger = state
-                .fluree
-                .ledger(&ledger_id)
-                .await
-                .map_err(ServerError::Api)?;
-            let current = ledger.t();
-            if current < min_t {
-                // A proxy peer tracks head passively via its SSE subscription and
-                // cannot refresh on demand, so report a behind head as a
-                // read-after-write timeout (HTTP 408) — consistent with the
-                // non-proxy wait path — rather than a misleading "not implemented".
-                return Err(ServerError::Api(ApiError::AwaitTNotReached {
-                    requested: min_t,
-                    current,
-                }));
-            }
-        }
-        return Ok(());
-    }
-
     let configured_timeout = Duration::from_millis(state.config.query_min_t_timeout_ms);
     let timeout = if state.config.query_timeout_ms == 0 {
         configured_timeout
@@ -557,6 +535,21 @@ pub(crate) fn inject_headers_into_query(query: &mut JsonValue, headers: &FlureeH
             headers.inject_into_opts(opts_obj);
         }
     }
+}
+
+/// `x-fdb-cache` on a response the result cache was asked to serve.
+fn with_result_cache_header(
+    mut response: Response,
+    outcome: Option<&fluree_db_api::ResultCacheOutcome>,
+) -> Response {
+    if let Some(status) = outcome.and_then(fluree_db_api::ResultCacheOutcome::status) {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&status.header_value()) {
+            response
+                .headers_mut()
+                .insert(axum::http::HeaderName::from_static("x-fdb-cache"), value);
+        }
+    }
+    response
 }
 
 fn jsonld_query_has_context(query: &JsonValue) -> bool {
@@ -1560,11 +1553,7 @@ pub async fn explain_ledger(
             await_query_min_t_requirements(state.as_ref(), min_t_requirements).await?;
 
             let ledger_id = ledger.clone();
-            let loaded = if state.config.is_proxy_storage_mode() {
-                state.fluree.ledger(&ledger_id).await.map_err(ServerError::Api)?
-            } else {
-                load_ledger_for_query(&state, &ledger_id, &span).await?
-            };
+            let loaded = load_ledger_for_query(&state, &ledger_id, &span).await?;
             let db = match &path.pin {
                 None => fluree_db_api::GraphDb::from_ledger_state(&loaded),
                 Some(pin) => state
@@ -1710,11 +1699,7 @@ pub async fn explain_ledger(
             return Ok(Json(result));
         }
 
-        let loaded = if state.config.is_proxy_storage_mode() {
-            state.fluree.ledger(&ledger_id).await.map_err(ServerError::Api)?
-        } else {
-            load_ledger_for_query(&state, &ledger_id, &span).await?
-        };
+        let loaded = load_ledger_for_query(&state, &ledger_id, &span).await?;
         let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
         let db = crate::routes::policy_auth::wrap_jsonld_view(&state, db, &query_json, &headers).await?;
         let result = state
@@ -2904,18 +2889,7 @@ async fn execute_query(
             .map(IntoResponse::into_response);
     }
 
-    // In proxy mode, use the unified Fluree methods (no local freshness checking)
-    if state.config.is_proxy_storage_mode() {
-        if let Some(fmt) = delimited {
-            return Err(ServerError::not_acceptable(format!(
-                "{} format not supported in proxy mode",
-                fmt.name().to_uppercase()
-            )));
-        }
-        return execute_query_proxy(state, ledger_id, query_json, &span).await;
-    }
-
-    // Shared storage mode: use load_ledger_for_query with freshness checking.
+    // Load the cached ledger, refreshed against a peer's watermark.
     // The alias may name a mapped graph source (Iceberg, R2RML, SQL, Delta)
     // rather than a ledger; that resolves through the connection/dataset path,
     // which queries it via its source engine instead of loading a ledger
@@ -3035,6 +3009,30 @@ async fn execute_query(
         return Ok(delimited_response(bytes, fmt));
     }
 
+    if fluree_db_api::jsonld_requests_result_cache(query_json) {
+        let outcome = fluree_db_api::ResultCacheOutcome::new();
+        let body = graph
+            .query(fluree.as_ref())
+            .jsonld(query_json)
+            .execution_options(query_execution_options(state))
+            .result_cache(&outcome)
+            .execute_formatted_json_bytes()
+            .await
+            .map_err(|e| {
+                let server_error = ServerError::Api(e);
+                set_span_error_code(&span, "error:InvalidQuery");
+                tracing::error!(error = %server_error, "query execution failed");
+                server_error
+            })?;
+        tracing::info!(status = "success", tracked = false, cache = ?outcome.status());
+        let response = (
+            [(axum::http::header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response();
+        return Ok(with_result_cache_header(response, Some(&outcome)));
+    }
+
     // Execute query via builder - formatted JSON-LD output
     let result = match graph
         .query(fluree.as_ref())
@@ -3062,85 +3060,6 @@ async fn execute_query(
     }
     .instrument(span)
     .await
-}
-
-/// Execute a JSON-LD query in proxy mode (uses Fluree wrapper methods)
-async fn execute_query_proxy(
-    state: &AppState,
-    ledger_id: &str,
-    query_json: &JsonValue,
-    span: &tracing::Span,
-) -> Result<Response> {
-    let view = state.fluree.db(ledger_id).await?;
-    let view = state.fluree.wrap_policy_defaults(view).await?;
-    // Check if tracking is requested
-    if has_tracking_opts(query_json) {
-        // Execute tracked query
-        let response = match view
-            .query(state.fluree.as_ref())
-            .jsonld(query_json)
-            .execution_options(query_execution_options(state))
-            .execute_tracked()
-            .await
-        {
-            Ok(response) => response,
-            Err(e) => {
-                let server_error =
-                    ServerError::Api(fluree_db_api::ApiError::http(e.status, e.error));
-                set_span_error_code(span, "error:InvalidQuery");
-                tracing::error!(error = %server_error, "tracked query failed (proxy)");
-                return Err(server_error);
-            }
-        };
-
-        // Record tracker fields on the execution span
-        if let Some(ref time) = response.time {
-            span.record("tracker_time", time.as_str());
-        }
-        if let Some(fuel) = response.fuel {
-            span.record("tracker_fuel", fuel);
-        }
-
-        // Extract tracking info for headers
-        let tally = TrackingTally {
-            time: response.time.clone(),
-            fuel: response.fuel,
-            policy: response.policy.clone(),
-            policy_enforcement: response.policy_enforcement.clone(),
-            reasoning: response.reasoning.clone(),
-            sql: response.sql.clone(),
-            sql_elided: response.sql_elided,
-        };
-        let headers = tracking_headers(&tally);
-
-        tracing::info!(status = "success", tracked = true, time = ?response.time, fuel = response.fuel);
-        return Ok((headers, Json(response)).into_response());
-    }
-
-    // Execute query
-    let result = match view
-        .query(state.fluree.as_ref())
-        .jsonld(query_json)
-        .execution_options(query_execution_options(state))
-        .execute_formatted()
-        .await
-    {
-        Ok(result) => {
-            tracing::info!(
-                status = "success",
-                tracked = false,
-                result_count = result.as_array().map(std::vec::Vec::len).unwrap_or(0)
-            );
-            result
-        }
-        Err(e) => {
-            let server_error = ServerError::Api(e);
-            set_span_error_code(span, "error:InvalidQuery");
-            tracing::error!(error = %server_error, "query execution failed (proxy)");
-            return Err(server_error);
-        }
-    };
-    Ok((HeaderMap::new(), Json(result)).into_response())
 }
 
 /// The graph registry of a ledger-scoped route's ledger, used to resolve the
@@ -3640,65 +3559,6 @@ async fn execute_sparql_ledger(
         let (json_fmt_config, json_content_type) =
             sparql_json_response_format(parsed.ast.as_ref(), headers);
 
-        // In proxy mode, use the unified Fluree method (returns pre-formatted JSON)
-        if state.config.is_proxy_storage_mode() && !dataset_lane {
-            if wants_sparql_xml {
-                return Err(ServerError::not_acceptable(
-                    "SPARQL Results XML is not supported in proxy mode".to_string(),
-                ));
-            }
-            if let Some(fmt) = graph_format {
-                return Err(ServerError::not_acceptable(format!(
-                    "{} is not supported in proxy mode",
-                    fmt.name()
-                )));
-            }
-            if let Some(fmt) = delimited {
-                return Err(ServerError::not_acceptable(format!(
-                    "{} format not supported in proxy mode",
-                    fmt.name().to_uppercase()
-                )));
-            }
-            let result = if qc_opts.has_any_policy_inputs() {
-                let view = state.fluree.db_with_policy(ledger_id, &qc_opts).await
-                    .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?;
-                let view =
-                    attach_default_context_to_graph(state, ledger_id, view, use_default_context)
-                        .await?;
-                view.query(state.fluree.as_ref())
-                    .sparql(sparql)
-                    .format(json_fmt_config.clone())
-                    .execution_options(execution())
-                    .execute_formatted()
-                    .await
-                    .inspect_err(|_| { set_span_error_code(&span, "error:QueryFailed"); })?
-            } else {
-                let view = if use_default_context {
-                    state.fluree.db_with_default_context(ledger_id).await
-                } else {
-                    state.fluree.db(ledger_id).await
-                }
-                .inspect_err(|_| {
-                    set_span_error_code(&span, "error:QueryFailed");
-                })?;
-                let view = state.fluree.wrap_policy_defaults(view).await?;
-                view.query(state.fluree.as_ref())
-                    .sparql(sparql)
-                    .format(json_fmt_config.clone())
-                    .execution_options(execution())
-                    .execute_formatted()
-                    .await
-                    .inspect_err(|_| {
-                        set_span_error_code(&span, "error:QueryFailed");
-                    })?
-            };
-            return Ok((
-                [(axum::http::header::CONTENT_TYPE, json_content_type)],
-                Json(result),
-            )
-                .into_response());
-        }
-
         // Policy-scoped queries (identity or explicit policy inputs) without a
         // dataset clause go through the connection path (returns pre-formatted
         // JSON). Dataset-clause queries with policy are handled in the dataset
@@ -3773,21 +3633,18 @@ async fn execute_sparql_ledger(
                 ));
             }
 
-            // Ensure head is fresh in shared storage mode before time-travel view loading.
+            // Ensure the head is fresh before time-travel view loading.
             // The URL alias may name a graph source rather than a ledger; a graph
             // source is a genesis view with no ledger head to refresh, so a clean
             // not-found there is expected — let the dataset build resolve it (it
             // already supports graph sources via `load_view_from_source`). A
             // genuinely-missing ledger still propagates its not-found.
-            if !state.config.is_proxy_storage_mode() {
-                if let Err(e) = load_ledger_or_missing(state, ledger_id, &span).await {
-                    let is_not_found = matches!(&e, ServerError::Api(api) if api.is_not_found());
-                    if !(is_not_found
-                        && state.fluree.resolve_graph_source(ledger_id).await?.is_some())
-                    {
-                        report_missing_ledger(&span, &e);
-                        return Err(e);
-                    }
+            if let Err(e) = load_ledger_or_missing(state, ledger_id, &span).await {
+                let is_not_found = matches!(&e, ServerError::Api(api) if api.is_not_found());
+                if !(is_not_found && state.fluree.resolve_graph_source(ledger_id).await?.is_some())
+                {
+                    report_missing_ledger(&span, &e);
+                    return Err(e);
                 }
             }
 
@@ -4034,6 +3891,9 @@ async fn execute_sparql_ledger(
         .await?;
         let graph = state.fluree.wrap_policy_defaults(graph).await?;
         let fluree = &state.fluree;
+        let result_cache = headers
+            .wants_result_cache()
+            .then(fluree_db_api::ResultCacheOutcome::new);
 
         // Tracked SPARQL: if tracking headers are present, use tracked execution path
         if headers.has_tracking() {
@@ -4151,11 +4011,16 @@ async fn execute_sparql_ledger(
                         .to_string(),
                 ));
             }
-            let xml = graph
+            let builder = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fluree_db_api::FormatterConfig::sparql_xml())
-                .execution_options(execution())
+                .execution_options(execution());
+            let builder = match &result_cache {
+                Some(outcome) => builder.result_cache(outcome),
+                None => builder,
+            };
+            let xml = builder
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
@@ -4163,31 +4028,38 @@ async fn execute_sparql_ledger(
                 })
                 .map_err(ServerError::Api)?;
             let content_type = "application/sparql-results+xml; charset=utf-8";
-            return Ok((
+            let response = (
                 [(axum::http::header::CONTENT_TYPE, content_type)],
                 xml.into_bytes(),
             )
-                .into_response());
+                .into_response();
+            return Ok(with_result_cache_header(response, result_cache.as_ref()));
         }
 
         // Turtle / N-Triples / RDF/XML: a CONSTRUCT/DESCRIBE graph
         if let Some(fmt) = graph_format {
-            let body = graph
+            let builder = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(fmt.formatter())
-                .execution_options(execution())
+                .execution_options(execution());
+            let builder = match &result_cache {
+                Some(outcome) => builder.result_cache(outcome),
+                None => builder,
+            };
+            let body = builder
                 .execute_formatted_string()
                 .await
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })
                 .map_err(ServerError::Api)?;
-            return Ok((
+            let response = (
                 [(axum::http::header::CONTENT_TYPE, fmt.content_type())],
                 body.into_bytes(),
             )
-                .into_response());
+                .into_response();
+            return Ok(with_result_cache_header(response, result_cache.as_ref()));
         }
 
         // AgentJson: execute with agent-optimized envelope format
@@ -4213,22 +4085,43 @@ async fn execute_sparql_ledger(
             if let Some(max_bytes) = headers.max_bytes() {
                 config = config.with_max_bytes(max_bytes);
             }
-            let result = graph
+            let builder = graph
                 .query(fluree.as_ref())
                 .sparql(sparql)
                 .format(config)
+                .execution_options(execution());
+            // Agent JSON is never cached; asked, the response says so.
+            let builder = match &result_cache {
+                Some(outcome) => builder.result_cache(outcome),
+                None => builder,
+            };
+            let result = builder.execute_formatted().await.inspect_err(|_| {
+                set_span_error_code(&span, "error:QueryFailed");
+            })?;
+            let content_type = "application/vnd.fluree.agent+json; charset=utf-8";
+            let response = (
+                [(axum::http::header::CONTENT_TYPE, content_type)],
+                Json(result),
+            )
+                .into_response();
+            return Ok(with_result_cache_header(response, result_cache.as_ref()));
+        }
+
+        if let Some(outcome) = &result_cache {
+            let body = graph
+                .query(fluree.as_ref())
+                .sparql(sparql)
+                .format(json_fmt_config)
                 .execution_options(execution())
-                .execute_formatted()
+                .result_cache(outcome)
+                .execute_formatted_json_bytes()
                 .await
                 .inspect_err(|_| {
                     set_span_error_code(&span, "error:QueryFailed");
                 })?;
-            let content_type = "application/vnd.fluree.agent+json; charset=utf-8";
-            return Ok((
-                [(axum::http::header::CONTENT_TYPE, content_type)],
-                Json(result),
-            )
-                .into_response());
+            let response =
+                ([(axum::http::header::CONTENT_TYPE, json_content_type)], body).into_response();
+            return Ok(with_result_cache_header(response, Some(outcome)));
         }
 
         // Execute SPARQL query via builder - formatted JSON output
@@ -4393,11 +4286,7 @@ pub async fn explain(
                 return Ok(Json(result));
             }
 
-            let loaded = if state.config.is_proxy_storage_mode() {
-                state.fluree.ledger(&ledger_id).await.map_err(ServerError::Api)?
-            } else {
-                load_ledger_for_query(&state, &ledger_id, &span).await?
-            };
+            let loaded = load_ledger_for_query(&state, &ledger_id, &span).await?;
             let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
             let db = crate::routes::policy_auth::wrap_authorized_view(&state, db, &headers).await?;
             let result = {
@@ -4491,11 +4380,7 @@ pub async fn explain(
         }
 
         // Execute explain (HEAD fast path)
-        let loaded = if state.config.is_proxy_storage_mode() {
-            state.fluree.ledger(&ledger_id).await.map_err(ServerError::Api)?
-        } else {
-            load_ledger_for_query(&state, &ledger_id, &span).await?
-        };
+        let loaded = load_ledger_for_query(&state, &ledger_id, &span).await?;
         let db = fluree_db_api::GraphDb::from_ledger_state(&loaded);
         let db = crate::routes::policy_auth::wrap_jsonld_view(&state, db, &query_json, &headers).await?;
         let result = match state.fluree.explain(&db, &query_json).await {
@@ -4519,16 +4404,11 @@ pub async fn explain(
 
 // ===== Peer mode support =====
 
-/// Load a ledger for query, handling peer mode freshness checking.
-///
-/// **Note**: This function is only used for non-proxy storage modes (file-backed Fluree).
-/// In proxy mode, routes use `Fluree` wrapper methods instead.
-///
-/// Load a ledger for query execution
+/// Load a ledger for query execution.
 ///
 /// In transaction mode, simply loads the ledger via ledger_cached().
-/// In peer mode with shared storage, checks if the local ledger is stale vs SSE watermarks
-/// and reloads if needed using LedgerManager::reload() for coalesced reloading.
+/// In peer mode, either storage access mode, checks if the local ledger is stale vs SSE
+/// watermarks and reloads if needed using LedgerManager::reload() for coalesced reloading.
 pub(crate) async fn load_ledger_for_query(
     state: &AppState,
     ledger_id: &str,
@@ -4589,7 +4469,7 @@ pub(crate) async fn load_ledger_or_missing(
         return Ok(ledger_state);
     }
 
-    // In peer mode (shared storage), check freshness and potentially reload
+    // In peer mode, check freshness and potentially reload
     let peer_state = state
         .peer_state
         .as_ref()
@@ -4603,7 +4483,7 @@ pub(crate) async fn load_ledger_or_missing(
     if let Some(watermark) = peer_state.watermark(handle.id()) {
         match handle.check_freshness(&watermark).await {
             FreshnessCheck::Stale => {
-                // Remote is ahead - reload ledger from shared storage
+                // Remote is ahead - reload ledger from storage
                 // Uses LedgerManager::reload() which handles coalescing
                 tracing::info!(
                     ledger_id = ledger_id,

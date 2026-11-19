@@ -19,15 +19,18 @@ pub trait IriEncoder {
     /// Returns `None` if the IRI's namespace is not registered.
     fn encode_iri(&self, iri: &str) -> Option<Sid>;
 
-    /// Encode an IRI only when its canonical prefix is registered.
+    /// Encode an IRI only when the ledger can hold it: its canonical prefix
+    /// has a code, or the namespace table is full and it is stored whole
+    /// under `OVERFLOW`.
     ///
-    /// Unlike `encode_iri`, this does not fall back to a full-IRI SID.
+    /// Unlike `encode_iri`, this does not fall back to the EMPTY full-IRI SID.
     fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
         self.encode_iri(iri)
     }
 
-    /// Lower a constant IRI in subject or predicate position: a SID when the
-    /// prefix is registered, else the IRI for the scan to encode per graph.
+    /// Lower a constant IRI in subject or predicate position: a SID when
+    /// [`encode_iri_strict`](Self::encode_iri_strict) gives one, else the IRI
+    /// for the scan to encode per graph.
     ///
     /// The one lowering rule every query surface shares. Operators that need
     /// a statically known predicate — the nested-loop join's batched probe
@@ -47,6 +50,20 @@ pub trait IriEncoder {
             Some(sid) => Term::Sid(sid),
             None => Term::Iri(iri.into()),
         }
+    }
+
+    /// The SID that names a literal's datatype IRI, wherever a query writes
+    /// or builds one: a triple-pattern constraint, a VALUES row, a typed
+    /// literal or `STRDT` in an expression.
+    ///
+    /// A registered namespace gives its canonical SID. Any other IRI is still
+    /// a datatype (SPARQL 1.1 §17.4.2.9), so it gets the EMPTY-namespace
+    /// full-IRI SID, the form the non-strict encoder falls back to. No stored
+    /// literal carries it, so it matches nothing in the store, and a write
+    /// re-encodes it under the namespace the write registers.
+    fn encode_datatype(&self, iri: &str) -> Sid {
+        self.encode_iri(iri)
+            .unwrap_or_else(|| Sid::new(fluree_vocab::namespaces::EMPTY, iri))
     }
 }
 

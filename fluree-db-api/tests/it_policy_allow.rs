@@ -1121,3 +1121,63 @@ async fn multiple_targeted_query_rules_any_allow_grants_stably() {
         }
     }
 }
+
+/// `f:onClass` governs the class's members only, even on a property that
+/// statistics credit to that class alone: an untyped subject carrying it
+/// counts toward no class, so it is no counterexample to the statistics.
+/// `ex:b` is untyped. An allow on `ex:Member` must not show its secret, and a
+/// deny on `ex:Member` must not hide it.
+#[tokio::test]
+async fn policy_onclass_judges_an_untyped_subject_on_an_exclusive_property() {
+    let mut observed = Vec::new();
+    for indexed in [false, true] {
+        let ledger_id = format!("policy/onclass-exclusive-{indexed}:main");
+        let (writer, reader) = support::instances_sharing_storage();
+        let ledger = genesis_ledger(&writer, &ledger_id).await;
+        writer
+            .insert(
+                ledger,
+                &json!({
+                    "@context": {"ex": "http://example.org/"},
+                    "@graph": [
+                        {"@id": "ex:a", "@type": "ex:Member", "ex:secret": "a-secret"},
+                        {"@id": "ex:b", "ex:secret": "b-secret"}
+                    ]
+                }),
+            )
+            .await
+            .expect("seed");
+        if indexed {
+            support::rebuild_and_publish_index(&writer, &ledger_id).await;
+        }
+        let cases = [
+            ("allow", true, false, json!(["a-secret"])),
+            ("deny", false, true, json!(["b-secret"])),
+        ];
+        for (label, allow, default_allow, expected) in cases {
+            let query = json!({
+                "@context": {"ex": "http://example.org/"},
+                "from": ledger_id,
+                "opts": {
+                    "policy": [{
+                        "@id": "ex:memberPolicy",
+                        "@type": "f:AccessPolicy",
+                        "f:action": "f:view",
+                        "f:onClass": [{"@id": "http://example.org/Member"}],
+                        "f:allow": allow
+                    }],
+                    "default-allow": default_allow
+                },
+                "select": "?v",
+                "where": {"@id": "?s", "ex:secret": "?v"}
+            });
+            let result = reader.query_connection(&query).await.expect("query");
+            let ledger = reader.ledger(&ledger_id).await.expect("ledger");
+            let got = normalize_rows(&result.to_jsonld(&ledger.snapshot).expect("to_jsonld"));
+            if got != normalize_rows(&expected) {
+                observed.push(format!("indexed={indexed}, {label}: got {got:?}"));
+            }
+        }
+    }
+    assert!(observed.is_empty(), "{observed:#?}");
+}

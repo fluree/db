@@ -2284,6 +2284,33 @@ async fn jsonld_bind_into_a_bound_variable_checks_it_when_only_counted() {
     );
 }
 
+/// SPARQL reaches the same trim: the planner joins the triples that read the
+/// BIND's target (`ex:q`, `ex:r`) before the one its expression needs
+/// (`ex:p`), so the target is bound at a join step while the BIND waits, and
+/// the step must keep it or the count becomes a cross product (24 here).
+#[tokio::test]
+async fn sparql_bind_target_read_by_later_triples_joins_on_it() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger0 = genesis_ledger(&fluree, "exprsem/bind-join-step:sparql").await;
+    let mut graph: Vec<JsonValue> = (0..12)
+        .map(|i| json!({"@id": format!("ex:s{i}"), "ex:p": {"@id": format!("ex:o{i}")}}))
+        .collect();
+    graph.extend([
+        json!({"@id": "ex:o1", "ex:q": {"@id": "ex:z1"}}),
+        json!({"@id": "ex:o2", "ex:q": {"@id": "ex:z2"}}),
+        json!({"@id": "ex:z1", "ex:r": {"@id": "ex:w1"}}),
+        json!({"@id": "ex:z2", "ex:r": {"@id": "ex:w2"}}),
+    ]);
+    let ledger = fluree
+        .insert(ledger0, &json!({"@context": ctx(), "@graph": graph}))
+        .await
+        .expect("insert")
+        .ledger;
+    let q = "PREFIX ex: <http://example.org/ns/> \
+             SELECT (COUNT(?s) AS ?n) WHERE { ?s ex:p ?x . BIND(?x AS ?y) ?y ex:q ?z . ?z ex:r ?w }";
+    assert_eq!(sparql_rows(&fluree, &ledger, q).await, json!([[2]]));
+}
+
 /// Indexed decimals are keyed by a handle into their own predicate's arena,
 /// so the check must compare decoded values: against a constant, and against
 /// a decimal another predicate stored under a different handle.

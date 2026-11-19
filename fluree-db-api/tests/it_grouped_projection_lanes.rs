@@ -407,13 +407,19 @@ fn served(store: &span_capture::SpanStore, before: usize, site: &str) -> bool {
 }
 
 /// A query no fast path may answer runs the generic pipeline, whose only
-/// stamps are the fused chain it passed through and the scan's count-only
-/// drain under an ungrouped `COUNT(*)` (a sibling fast path, such as the
-/// count planner, would add its own).
+/// stamps are the fused chain it passed through, the nested-loop join's
+/// batched probes that join its patterns, the scan's count-only drain under
+/// an ungrouped `COUNT(*)`, and, for a GROUP BY over input sorted by its
+/// key, the GROUP BY operator's own partitioned mode, which aggregates the
+/// rows the pipeline hands it (a sibling fast path, such as the count
+/// planner, would add its own).
 fn generic_only(sites: &[String]) -> bool {
-    sites
-        .iter()
-        .all(|s| s == "fused_chain" || s == "scan-count-drain")
+    sites.iter().all(|s| {
+        s == "fused_chain"
+            || s == "nested-loop-batched"
+            || s == "scan-count-drain"
+            || s == "partitioned_group_by"
+    })
 }
 
 #[tokio::test]

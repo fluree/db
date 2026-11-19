@@ -612,7 +612,7 @@ impl RangeSemiJoinOperator {
             numeric => Ok(interval.numeric
                 && numeric
                     .numeric()
-                    .is_some_and(|v| interval.exact.matches(&v))),
+                    .is_some_and(|v| interval.exact.matches_number(&v))),
         }
     }
 
@@ -666,9 +666,7 @@ impl RangeSemiJoinOperator {
         let bounds = ObjectBounds {
             lower: envelope.lower.clone().map(|v| (v, true)),
             upper: envelope.upper.clone().map(|v| (v, true)),
-            term_predicate: None,
-            term_subject: None,
-            term_object: None,
+            ..ObjectBounds::new()
         };
         let narrow = ColumnSet::single(ColumnId::SId).union(ColumnSet::single(ColumnId::OKey));
         let mixed = narrow
@@ -696,12 +694,17 @@ impl RangeSemiJoinOperator {
                         }
                         match key_bounds(envelope, o_type.decode_kind()) {
                             Some((lo, hi)) => {
-                                let first =
-                                    read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_key;
-                                let last =
-                                    read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_key;
-                                if last < lo || first > hi {
-                                    continue;
+                                // The routing keys bound the rows, but history
+                                // can widen them into another o_type, whose
+                                // o_key does not compare with `lo`/`hi`.
+                                let bounds = crate::join::post_o_key_bounds(
+                                    &read_ordered_key_v2(RunSortOrder::Post, &entry.first_key),
+                                    &read_ordered_key_v2(RunSortOrder::Post, &entry.last_key),
+                                    (p_id, ot),
+                                );
+                                match bounds {
+                                    Some((first, last)) if last >= lo && first <= hi => {}
+                                    _ => continue,
                                 }
                                 Some((ot, lo, hi))
                             }
@@ -714,7 +717,7 @@ impl RangeSemiJoinOperator {
                     output: if key_range.is_some() { narrow } else { mixed },
                     internal: ColumnSet::EMPTY,
                 };
-                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None)?;
+                let batch = leaf.load_leaflet(store, leaflet_idx, &proj, None, &ctx.tracker)?;
 
                 let keyed = match key_range {
                     Some((ot, lo, hi)) => {
@@ -797,7 +800,7 @@ impl RangeSemiJoinOperator {
                         let val = store.decode_value_v3(ot, o_key, p_id, g_id).map_err(|e| {
                             QueryError::Internal(format!("decode_value_v3 (range walk): {e}"))
                         })?;
-                        if !bounds.matches(&val) {
+                        if !bounds.matches_encoded(&val, OType::from_u16(ot)) {
                             continue;
                         }
                         let value = match val {
@@ -1259,7 +1262,7 @@ impl Operator for RangeSemiJoinOperator {
                         }
                         Some(Binding::Poisoned) => false,
                         Some(subject) => {
-                            let key = binding_to_group_key_normalized(subject, dicts, gv);
+                            let key = binding_to_group_key_normalized(subject, dicts, gv)?;
                             let mut any = false;
                             for value in index.values.values_of(&key) {
                                 if self.value_passes(c, interval, &batch, row, value, ctx)? {

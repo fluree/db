@@ -110,7 +110,7 @@ pub(crate) struct ReasoningIndexState {
     /// reasoning query on a ledger with no indexes does not read the
     /// nameservice each time. A registration here clears its ledger at once;
     /// one made elsewhere is seen within [`NO_INDEXES_TTL`].
-    no_indexes: Mutex<HashMap<String, std::time::Instant>>,
+    no_indexes: Mutex<HashMap<String, fluree_db_core::clock::Instant>>,
     /// Index builds writing files, and sweeps holding them off, by ledger
     /// name. See [`ReasoningIndexState::begin_write`].
     writes: Mutex<IndexWrites>,
@@ -273,7 +273,7 @@ impl ReasoningIndexState {
         if no_indexes.len() > 4096 {
             no_indexes.retain(|_, read_at| read_at.elapsed() < NO_INDEXES_TTL);
         }
-        no_indexes.insert(ledger_id.to_string(), std::time::Instant::now());
+        no_indexes.insert(ledger_id.to_string(), fluree_db_core::clock::Instant::now());
     }
 
     pub(crate) fn take_registered(&self) -> Vec<String> {

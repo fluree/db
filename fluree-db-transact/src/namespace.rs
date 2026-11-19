@@ -177,12 +177,17 @@ impl NamespaceRegistry {
     }
 
     /// Encode an IRI to a Sid, mirroring `LedgerSnapshot::encode_iri`'s
-    /// contract: unknown namespaces fall back to the EMPTY-namespace
+    /// contract: an IRI whose prefix has no code is the `OVERFLOW` Sid a
+    /// write would store once the table is full, else the EMPTY-namespace
     /// full-IRI Sid, which matches no stored data. Lookup-only — never
     /// allocates a code.
     fn encode_iri_with_fallback(&self, iri: &str) -> fluree_db_core::Sid {
-        self.lookup_sid_for_iri(iri)
-            .unwrap_or_else(|| fluree_db_core::Sid::new(fluree_vocab::namespaces::EMPTY, iri))
+        fluree_db_core::ns_encoding::encode_registered(
+            iri,
+            self.split_mode(),
+            |prefix| self.codes.get_code(prefix),
+            || self.codes.is_full(),
+        )
     }
 
     /// Check if a prefix is registered
@@ -652,14 +657,15 @@ pub fn stable_blank_node_sid_from_label(label: &str) -> Option<Sid> {
 /// its staged data. Mirrors `LedgerSnapshot`'s contract exactly: unknown
 /// namespaces encode to the never-matching EMPTY-namespace full-IRI Sid
 /// (constraints over vocabulary the ledger has never seen are silently
-/// inert, not errors), and `encode_iri_strict` rejects them.
+/// inert, not errors), and `encode_iri_strict` rejects them. Once the table
+/// is full, both give the `OVERFLOW` Sid a write stores them under.
 impl fluree_db_query::parse::IriEncoder for NamespaceRegistry {
     fn encode_iri(&self, iri: &str) -> Option<Sid> {
         Some(self.encode_iri_with_fallback(iri))
     }
 
     fn encode_iri_strict(&self, iri: &str) -> Option<Sid> {
-        self.lookup_sid_for_iri(iri)
+        Some(self.encode_iri_with_fallback(iri))
             .filter(|sid| sid.namespace_code != fluree_vocab::namespaces::EMPTY)
     }
 }
@@ -689,6 +695,41 @@ mod tests {
             registry.get_prefix(XSD),
             Some("http://www.w3.org/2001/XMLSchema#")
         );
+    }
+
+    /// Once the table is full, a write stores an IRI whose prefix has no code
+    /// whole under `OVERFLOW`, and the snapshot and the staged registry read
+    /// it the same way. While it has room, no stored IRI has such a prefix.
+    #[test]
+    fn a_full_table_reads_an_uncoded_prefix_as_a_write_stores_it() {
+        use fluree_db_core::ns_encoding::LAST_USER_CODE;
+        use fluree_db_query::parse::IriEncoder;
+
+        let iri = "http://uncoded.example/s";
+        let mut snapshot = LedgerSnapshot::genesis("test:main");
+        let roomy = NamespaceRegistry::from_db(&snapshot);
+        assert_eq!(snapshot.encode_iri(iri), Some(Sid::new(EMPTY, iri)));
+        assert_eq!(snapshot.encode_iri_strict(iri), None);
+        assert_eq!(
+            IriEncoder::encode_iri(&roomy, iri),
+            Some(Sid::new(EMPTY, iri))
+        );
+        assert_eq!(IriEncoder::encode_iri_strict(&roomy, iri), None);
+
+        snapshot
+            .insert_namespace_code(LAST_USER_CODE, "http://last.example/".to_string())
+            .unwrap();
+        let mut full = NamespaceRegistry::from_db(&snapshot);
+        let stored = full.sid_for_iri(iri);
+        assert_eq!(stored, Sid::new(OVERFLOW, iri));
+        assert_eq!(snapshot.encode_iri(iri), Some(stored.clone()));
+        assert_eq!(snapshot.encode_iri_strict(iri), Some(stored.clone()));
+        assert_eq!(IriEncoder::encode_iri(&full, iri), Some(stored.clone()));
+        assert_eq!(IriEncoder::encode_iri_strict(&full, iri), Some(stored));
+
+        assert_eq!(full.sid_for_iri("bare"), Sid::new(EMPTY, "bare"));
+        assert_eq!(snapshot.encode_iri_strict("bare"), None);
+        assert_eq!(IriEncoder::encode_iri_strict(&full, "bare"), None);
     }
 
     #[test]

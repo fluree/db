@@ -11,7 +11,7 @@ use crate::operator::{
 };
 use crate::var_registry::VarId;
 use async_trait::async_trait;
-use fluree_db_binary_index::BinaryGraphView;
+use fluree_db_binary_index::TermView;
 use fluree_db_core::clock::Instant;
 use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{DatatypeConstraint, DatatypeDictId, FlakeValue, Sid};
@@ -31,7 +31,7 @@ const SORT_DEBUG_MIN_MS: u64 = 25;
 /// value semantics for literals) rather than raw ID ordering.
 fn materialize_encoded_for_sort(
     b: &Binding,
-    gv: &BinaryGraphView,
+    gv: &TermView,
     assume_lex_sorted_string_ids: bool,
 ) -> Option<Binding> {
     match b {
@@ -43,6 +43,7 @@ fn materialize_encoded_for_sort(
             lang_id,
             i_val,
             t,
+            arena_g_id,
         } => {
             // Experiment: if string IDs are lex-order-preserving, keep EncodedLit for
             // simple xsd:string values so ORDER BY can compare by raw o_key.
@@ -54,9 +55,9 @@ fn materialize_encoded_for_sort(
                 return None;
             }
 
-            // BinaryGraphView handles novelty watermark routing internally.
+            // TermView handles novelty watermark routing internally.
             let val = gv
-                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id)
+                .decode_value_from_kind(*o_kind, *o_key, *p_id, *dt_id, *lang_id, *arena_g_id)
                 .ok()?;
             match val {
                 FlakeValue::Ref(sid) => Some(Binding::sid(sid)),
@@ -81,7 +82,7 @@ fn materialize_encoded_for_sort(
             }
         }
         Binding::EncodedSid { s_id, .. } => {
-            // BinaryGraphView::resolve_subject_sid handles novelty routing
+            // TermView::resolve_subject_sid handles novelty routing
             // and returns Sid directly (no IRI string + trie lookup).
             let sid = gv.resolve_subject_sid(*s_id).ok()?;
             Some(Binding::sid(sid))
@@ -102,7 +103,7 @@ fn materialize_encoded_for_sort(
 fn materialize_sort_keys_in_rows(
     rows: &mut [Vec<Binding>],
     sort_col_indices: &[usize],
-    gv: &BinaryGraphView,
+    gv: &TermView,
     assume_lex_sorted_string_ids: bool,
 ) {
     for row in rows.iter_mut() {
@@ -122,7 +123,7 @@ fn materialize_sort_keys_in_rows(
 fn materialize_sort_keys_in_row(
     row: &mut Vec<Binding>,
     sort_col_indices: &[usize],
-    gv: &BinaryGraphView,
+    gv: &TermView,
     assume_lex_sorted_string_ids: bool,
 ) {
     materialize_sort_keys_in_rows(
@@ -354,6 +355,7 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
                 p_id: p1,
                 dt_id: dt1,
                 lang_id: l1,
+                arena_g_id: g1,
                 ..
             },
             Binding::EncodedLit {
@@ -362,13 +364,15 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
                 p_id: p2,
                 dt_id: dt2,
                 lang_id: l2,
+                arena_g_id: g2,
                 ..
             },
         ) => {
             // IMPORTANT:
             // - `i_val` is list-index metadata and must not affect value ordering.
-            // - `p_id` is only relevant for NUM_BIG (per-predicate arena); for other kinds
-            //   it must not affect ordering semantics.
+            // - An arena handle (NUM_BIG, VECTOR) is numbered per (graph,
+            //   predicate), so both break its ties; for other kinds they must
+            //   not affect ordering semantics.
             let base = k1
                 .cmp(k2)
                 .then(ok1.cmp(ok2))
@@ -377,16 +381,41 @@ pub fn compare_bindings(a: &Binding, b: &Binding) -> Ordering {
 
             if base != Ordering::Equal {
                 base
-            } else if *k1 == fluree_db_core::ObjKind::NUM_BIG.as_u8() {
-                p1.cmp(p2)
+            } else if crate::binding::is_arena_kind(*k1) {
+                p1.cmp(p2).then(g1.cmp(g2))
             } else {
                 Ordering::Equal
             }
+        }
+        // A plain string the sort keeps encoded (lex-sorted string ids) against
+        // a decoded literal of another type: their types decide, as they would
+        // decoded. A triple term or JSON sorts after it, a number before.
+        (Binding::Lit { val, .. }, kept)
+            if is_kept_plain_string(kept) && !matches!(val, FlakeValue::String(_)) =>
+        {
+            compare_flake_values(val, &FlakeValue::String(String::new()))
+        }
+        (kept, Binding::Lit { val, .. })
+            if is_kept_plain_string(kept) && !matches!(val, FlakeValue::String(_)) =>
+        {
+            compare_flake_values(&FlakeValue::String(String::new()), val)
         }
         // Cross-Lit type: Lit sorts before EncodedLit when mixed
         (Binding::Lit { .. }, Binding::EncodedLit { .. }) => Ordering::Less,
         (Binding::EncodedLit { .. }, Binding::Lit { .. }) => Ordering::Greater,
     }
+}
+
+/// The literal [`materialize_encoded_for_sort`] leaves encoded when string ids
+/// are lex-sorted: a plain `xsd:string`.
+fn is_kept_plain_string(b: &Binding) -> bool {
+    matches!(
+        b,
+        Binding::EncodedLit { o_kind, dt_id, lang_id, .. }
+            if *o_kind == ObjKind::LEX_ID.as_u8()
+                && *dt_id == DatatypeDictId::STRING.as_u16()
+                && *lang_id == 0
+    )
 }
 
 /// Compare two Sids for sorting
@@ -609,7 +638,7 @@ impl Operator for SortOperator {
         self.buffer = None;
         self.emit_idx = 0;
         self.assume_lex_sorted_string_ids = ctx
-            .graph_view()
+            .term_view()
             .map(|gv| gv.store().lex_sorted_string_ids())
             .unwrap_or(false);
         self.state = OperatorState::Open;
@@ -663,7 +692,7 @@ impl Operator for SortOperator {
                 let k = self.topk.unwrap_or(0);
 
                 // Build novelty-aware graph view once for the entire drain loop.
-                let cached_gv = ctx.graph_view();
+                let cached_gv = ctx.term_view();
 
                 loop {
                     ctx.check_cancelled()?;
@@ -737,7 +766,7 @@ impl Operator for SortOperator {
                         all_rows.len()
                     },
                     sort_columns = self.sort_col_indices.len(),
-                    materialize = ctx.graph_view().is_some(),
+                    materialize = ctx.term_view().is_some(),
                 );
                 let _sort_exec_guard = sort_execute_span.enter();
                 ctx.check_cancelled()?;
@@ -861,6 +890,54 @@ impl Operator for SortOperator {
     fn estimated_rows(&self) -> Option<usize> {
         // Sort doesn't change row count
         self.child.estimated_rows()
+    }
+}
+
+#[cfg(test)]
+mod kept_string_tests {
+    use super::*;
+
+    /// A plain string the sort leaves encoded (lex-sorted string ids) against
+    /// decoded literals of other types: SPARQL 1.2 orders literals by type
+    /// as `FlakeValue` does, a triple term after every other literal.
+    #[test]
+    fn a_kept_string_orders_by_type_against_decoded_literals() {
+        let kept = Binding::EncodedLit {
+            o_kind: ObjKind::LEX_ID.as_u8(),
+            o_key: 7,
+            p_id: 1,
+            dt_id: DatatypeDictId::STRING.as_u16(),
+            lang_id: 0,
+            i_val: fluree_db_core::list_index::NONE,
+            t: 1,
+            arena_g_id: fluree_db_core::NO_ARENA_GRAPH,
+        };
+        let lit = |val: FlakeValue| Binding::Lit {
+            val,
+            dtc: DatatypeConstraint::Explicit(Sid::new(2, "x")),
+            t: None,
+            op: None,
+            p_id: None,
+        };
+        let triple = FlakeValue::TripleTerm(Box::new(fluree_db_core::TripleTermValue {
+            s: Sid::new(9, "s"),
+            p: Sid::new(9, "p"),
+            o: FlakeValue::Ref(Sid::new(9, "o")),
+            dt: Sid::new(0, ""),
+            lang: None,
+        }));
+        for (decoded, want) in [
+            (lit(triple), Ordering::Greater),
+            (lit(FlakeValue::Json("{}".into())), Ordering::Greater),
+            (lit(FlakeValue::Long(5)), Ordering::Less),
+        ] {
+            assert_eq!(compare_bindings(&decoded, &kept), want, "{decoded:?}");
+            assert_eq!(
+                compare_bindings(&kept, &decoded),
+                want.reverse(),
+                "{decoded:?}"
+            );
+        }
     }
 }
 

@@ -130,6 +130,24 @@ fluree.close().await;
 
 To use one directory from several processes, run a [server](../operations/running-fluree.md) on it.
 
+### Cache budgets
+
+`cache_max_mb` sizes the in-memory cache of decoded index data. The default is a tiered fraction of
+system RAM. `query_result_cache_max_mb` is a separate ceiling, in addition to it, for answers kept
+by the [query result cache](../query/result-cache.md). It defaults to 10% of `cache_max_mb`, and
+nothing is allocated for it until a query opts in. `0` disables result caching.
+
+```rust
+let fluree = FlureeBuilder::file("./data")
+    .cache_max_mb(4096)
+    .query_result_cache_max_mb(200)
+    .build_async()
+    .await?;
+```
+
+A query opts in with `.result_cache(&outcome)` on `GraphDb::query()`, or with
+`"opts": {"cache": true}` in JSON-LD.
+
 ### Bulk import (high throughput)
 
 For initial ledger bootstraps (large Turtle or JSON-LD datasets), Fluree exposes a bulk import
@@ -291,6 +309,7 @@ Any string/number config value can be specified directly or via a `Configuration
 Connection node:
 - `parallelism`
 - `cacheMaxMb`
+- `queryResultCacheMaxMb` (see [Cache budgets](#cache-budgets))
 - `indexStorage`, `commitStorage`
 - `primaryPublisher` (publisher node)
 - `defaults.indexing`: `reindexMinBytes`, `reindexMaxBytes`, `indexingEnabled`, and the [index retention](#index-retention) settings `gcMinTimeMins`, `maxOldIndexes`, `gcHardMaxOldIndexes`

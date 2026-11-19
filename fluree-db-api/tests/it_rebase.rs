@@ -1301,3 +1301,614 @@ async fn a_build_of_the_replaced_line_is_not_published() {
         "a build of the head's line, behind the head"
     );
 }
+
+// A query peer reads the writer's root and follows the writer's records
+// (`LedgerManager::follow`). A record can trail the peer's cache, which a
+// load reads from the nameservice ahead of the event stream; only one that
+// replaces the cached line reloads it.
+
+async fn peer_fluree(dir: &tempfile::TempDir) -> fluree_db_api::Fluree {
+    FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .read_only()
+        .build_client()
+        .await
+        .unwrap()
+}
+
+async fn follow(
+    peer: &fluree_db_api::Fluree,
+    record: fluree_db_nameservice::NsRecord,
+) -> fluree_db_api::NotifyResult {
+    peer.ledger_manager()
+        .expect("a peer caches ledgers")
+        .follow(record)
+        .await
+        .unwrap()
+}
+
+/// A branch whose `dev_commits` commits after the fork each conflict with
+/// the source's `alice-main`, and a source that moved on to `dave` at `t` 3:
+/// a `Skip` rebase skips them all and moves the branch to the source's head.
+async fn conflicting_branch(fluree: &fluree_db_api::Fluree, dev_commits: usize) {
+    let name = |s: &str, n: &str| {
+        json!({"@context": {"ex": "http://example.org/ns/"},
+               "@graph": [{"@id": format!("ex:{s}"), "ex:name": n}]})
+    };
+    let main = fluree.create_ledger("rb").await.unwrap();
+    let main = fluree
+        .insert(main, &name("alice", "alice"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree.create_branch("rb", "dev", None, None).await.unwrap();
+    for i in 0..dev_commits {
+        let dev = fluree.ledger("rb:dev").await.unwrap();
+        fluree
+            .insert(dev, &name("alice", &format!("alice-dev{i}")))
+            .await
+            .unwrap();
+    }
+    let main = fluree
+        .insert(main, &name("alice", "alice-main"))
+        .await
+        .unwrap()
+        .ledger;
+    fluree.insert(main, &name("dave", "dave")).await.unwrap();
+}
+
+/// A record behind the peer's cache, on its line, is stale: the peer keeps
+/// its state and does not reload. The writer's record is left as it was.
+#[tokio::test]
+async fn a_peer_keeps_its_cache_over_a_record_it_has_passed() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    diverged(&writer).await;
+    let behind = dev_record(&writer).await;
+    let dev = writer.ledger("rb:dev").await.unwrap();
+    writer
+        .insert(
+            dev,
+            &json!({"@context": {"ex": "http://example.org/ns/"},
+                    "@id": "ex:erin", "ex:name": "erin"}),
+        )
+        .await
+        .unwrap();
+    let head = dev_record(&writer).await;
+
+    let peer = peer_fluree(&dir).await;
+    assert!(peer.nameservice_mode().is_read_only());
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "bob", "carol", "erin"]
+    );
+    assert!(behind.commit_t < head.commit_t);
+    assert_eq!(
+        follow(&peer, behind).await,
+        fluree_db_api::NotifyResult::Current
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "bob", "carol", "erin"]
+    );
+    let after = dev_record(&writer).await;
+    assert_eq!(
+        (after.commit_head_id, after.commit_t),
+        (head.commit_head_id, head.commit_t)
+    );
+}
+
+/// A rebase can move a branch's head below the peer's cached `t`, onto
+/// another line: the peer reloads and reads the new line.
+#[tokio::test]
+async fn a_peer_follows_a_rebase_that_moves_the_head_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 3).await;
+    let peer = peer_fluree(&dir).await;
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1", "alice-dev2"]
+    );
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    assert_eq!(rebased.commit_t, 3, "below the peer's t of 4");
+    assert_eq!(
+        follow(&peer, rebased).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
+/// A rebase can leave a branch's head at the peer's cached `t`, on another
+/// commit: the peer reloads and reads the new line.
+#[tokio::test]
+async fn a_peer_follows_a_rebase_to_another_head_at_its_t() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+    let peer = peer_fluree(&dir).await;
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    assert_eq!(rebased.commit_t, 3, "the peer's t");
+    assert_eq!(
+        follow(&peer, rebased).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
+/// A rebase resets the branch's index to the source's or to none: once the
+/// nameservice holds the peer's head with a lower index, or none, the peer
+/// reloads and drops the index. A record saying so while the nameservice
+/// still holds the index is not a reset, and changes nothing.
+#[tokio::test]
+async fn a_peer_follows_a_reset_that_lowers_the_index_of_its_head() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    diverged(&writer).await;
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let indexed = dev_record(&writer).await;
+    assert!(indexed.index_head_id.is_some());
+
+    let peer = peer_fluree(&dir).await;
+    let cached_index = || async {
+        let handle = peer.ledger_cached("rb:dev").await.unwrap();
+        handle.state_metrics().await.1.id
+    };
+    assert_eq!(cached_index().await, indexed.index_head_id);
+    assert_eq!(
+        follow(&peer, indexed.clone()).await,
+        fluree_db_api::NotifyResult::Current
+    );
+    let unindexed = fluree_db_nameservice::NsRecord {
+        index_head_id: None,
+        index_t: 0,
+        ..indexed.clone()
+    };
+    assert_eq!(
+        follow(&peer, unindexed).await,
+        fluree_db_api::NotifyResult::Current,
+        "the nameservice still holds the index"
+    );
+    assert_eq!(cached_index().await, indexed.index_head_id);
+
+    writer
+        .branch_admin()
+        .unwrap()
+        .reset_head_fenced(
+            "rb:dev",
+            fluree_db_nameservice::WriteBasis::fenced(indexed.fence),
+            fluree_db_nameservice::NsRecordSnapshot {
+                commit_head_id: indexed.commit_head_id.clone(),
+                commit_t: indexed.commit_t,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .unwrap();
+    let reset = dev_record(&writer).await;
+    assert_eq!(reset.index_head_id, None);
+    assert_eq!(
+        follow(&peer, reset).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    assert_eq!(cached_index().await, None);
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "bob", "carol"]
+    );
+}
+
+/// A record naming the peer's head with an index the nameservice no longer
+/// holds (one sent before a reset, or a reset read half-written) does not
+/// install that index.
+#[tokio::test]
+async fn a_peer_does_not_install_an_index_a_reset_took_away() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    diverged(&writer).await;
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let indexed = dev_record(&writer).await;
+    assert!(indexed.index_head_id.is_some());
+    writer
+        .branch_admin()
+        .unwrap()
+        .reset_head_fenced(
+            "rb:dev",
+            fluree_db_nameservice::WriteBasis::fenced(indexed.fence),
+            fluree_db_nameservice::NsRecordSnapshot {
+                commit_head_id: indexed.commit_head_id.clone(),
+                commit_t: indexed.commit_t,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let peer = peer_fluree(&dir).await;
+    let cached_index_t = || async {
+        let handle = peer.ledger_cached("rb:dev").await.unwrap();
+        handle.index_t().await
+    };
+    assert_eq!(cached_index_t().await, 0);
+    assert_eq!(
+        follow(&peer, indexed).await,
+        fluree_db_api::NotifyResult::Current
+    );
+    assert_eq!(cached_index_t().await, 0, "no index installed");
+}
+
+/// A peer draining a backlog sees records far behind its cache, from its own
+/// line: each changes nothing, however far behind it is.
+#[tokio::test]
+async fn a_peer_keeps_its_cache_over_a_record_far_behind_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    let mut ledger = writer.create_ledger("bk").await.unwrap();
+    let mut first = None;
+    for n in 0..8 {
+        ledger = writer
+            .insert(
+                ledger,
+                &json!({"@context": {"ex": "http://example.org/ns/"},
+                        "@id": format!("ex:s{n}"), "ex:name": format!("s{n}")}),
+            )
+            .await
+            .unwrap()
+            .ledger;
+        if first.is_none() {
+            first = writer.nameservice().lookup("bk:main").await.unwrap();
+        }
+    }
+    let first = first.unwrap();
+    assert_eq!(first.commit_t, 1);
+
+    let peer = peer_fluree(&dir).await;
+    peer.ledger_cached("bk:main").await.unwrap();
+    assert_eq!(
+        follow(&peer, first).await,
+        fluree_db_api::NotifyResult::Current
+    );
+}
+
+/// A nameservice whose lookup of one ledger, while armed, reads the record
+/// and then waits to return it: a load that read the nameservice before a
+/// rebase and lands after it.
+#[derive(Debug)]
+struct PausedLookup {
+    inner: std::sync::Arc<dyn fluree_db_nameservice::NameServiceLookup>,
+    ledger_id: &'static str,
+    armed: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+mod paused_lookup {
+    use super::PausedLookup;
+    use async_trait::async_trait;
+    use fluree_db_nameservice::{
+        ConfigLookup, ConfigValue, GraphSourceLookup, GraphSourceRecord, LedgerHeads,
+        NameServiceLookup, NsLookupResult, NsRecord, ReasoningIndexes, ReasoningIndexesLookup,
+        RefKind, RefLookup, RefValue, Result, StatusLookup, StatusValue,
+    };
+    use std::sync::atomic::Ordering;
+
+    #[async_trait]
+    impl GraphSourceLookup for PausedLookup {
+        async fn lookup_graph_source(&self, id: &str) -> Result<Option<GraphSourceRecord>> {
+            self.inner.lookup_graph_source(id).await
+        }
+        async fn lookup_any(&self, id: &str) -> Result<NsLookupResult> {
+            self.inner.lookup_any(id).await
+        }
+        async fn all_graph_source_records(&self) -> Result<Vec<GraphSourceRecord>> {
+            self.inner.all_graph_source_records().await
+        }
+    }
+
+    #[async_trait]
+    impl ReasoningIndexesLookup for PausedLookup {
+        async fn get_reasoning_indexes(&self, id: &str) -> Result<Option<ReasoningIndexes>> {
+            self.inner.get_reasoning_indexes(id).await
+        }
+    }
+
+    #[async_trait]
+    impl RefLookup for PausedLookup {
+        async fn get_ref(&self, id: &str, kind: RefKind) -> Result<Option<RefValue>> {
+            self.inner.get_ref(id, kind).await
+        }
+    }
+
+    #[async_trait]
+    impl StatusLookup for PausedLookup {
+        async fn get_status(&self, id: &str) -> Result<Option<StatusValue>> {
+            self.inner.get_status(id).await
+        }
+    }
+
+    #[async_trait]
+    impl ConfigLookup for PausedLookup {
+        async fn get_config(&self, id: &str) -> Result<Option<ConfigValue>> {
+            self.inner.get_config(id).await
+        }
+    }
+
+    #[async_trait]
+    impl NameServiceLookup for PausedLookup {
+        async fn lookup(&self, id: &str) -> Result<Option<NsRecord>> {
+            let record = self.inner.lookup(id).await?;
+            if id == self.ledger_id && self.armed.swap(false, Ordering::SeqCst) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            Ok(record)
+        }
+        async fn all_records(&self) -> Result<Vec<NsRecord>> {
+            self.inner.all_records().await
+        }
+        async fn branch_records(&self, name: &str) -> Result<Vec<NsRecord>> {
+            self.inner.branch_records(name).await
+        }
+        async fn heads(&self, id: &str) -> Result<Option<LedgerHeads>> {
+            self.inner.heads(id).await
+        }
+    }
+}
+
+/// An index update for the branch's old line, still installing when a
+/// rebase is followed, does not land after it: the peer ends on the new
+/// line, not on the old line's index. The update comes from `follow` itself
+/// or from another path that brings the cache up to date, `refresh`.
+async fn a_rebase_outlasts_an_index_install_in_flight(via_refresh: bool) {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+
+    let storage = || {
+        fluree_db_core::FileStorage::new(dir.path())
+            .with_durability(fluree_db_core::Durability::Sync)
+            .without_wal_replay()
+    };
+    // Building the branch's store for the index looks up its source branch.
+    let lookup = Arc::new(PausedLookup {
+        inner: Arc::new(fluree_db_nameservice::file::FileNameService::with_storage(
+            storage(),
+        )),
+        ledger_id: "rb:main",
+        armed: false.into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let peer = FlureeBuilder::memory().build_with(
+        storage(),
+        fluree_db_api::NameServiceMode::ReadOnly(Arc::clone(&lookup) as _),
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let indexed = dev_record(&writer).await;
+    lookup
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let index_update = {
+        let peer = peer.clone();
+        tokio::spawn(async move {
+            if via_refresh {
+                peer.refresh("rb:dev", Default::default()).await.unwrap();
+            } else {
+                follow(&peer, indexed).await;
+            }
+        })
+    };
+    lookup.entered.notified().await;
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    assert_eq!(
+        follow(&peer, rebased).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    lookup.release.notify_one();
+    index_update.await.unwrap();
+
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebase_outlasts_an_index_install_follow_started() {
+    a_rebase_outlasts_an_index_install_in_flight(false).await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebase_outlasts_an_index_install_refresh_started() {
+    a_rebase_outlasts_an_index_install_in_flight(true).await;
+}
+
+/// On the writer, an index install planned on the branch's old line, which
+/// arrives after the writer's own rebase, is not made: the rebase starts a
+/// new line, so the cache stays on the rebased commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_writers_rebase_outlasts_an_index_install_planned_before_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+    assert_eq!(
+        query_cached_names(&writer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    let handle = writer.ledger_cached("rb:dev").await.unwrap();
+    let planned_on = handle.line();
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    let old_index = dev_record(&writer).await.index_head_id.unwrap();
+    let store = writer.branched_content_store("rb:dev").await.unwrap();
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let installed = handle
+        .apply_index_v2(&old_index, store, None, planned_on)
+        .await
+        .unwrap();
+
+    assert!(
+        !installed,
+        "the old line's index landed on the rebased state"
+    );
+    assert_eq!(
+        query_cached_names(&writer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
+/// A refresh that read the branch's record before a rebase, and goes on
+/// after the rebase was followed, does not install that record's index of
+/// the old line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rebase_outlasts_a_refresh_that_read_the_record_before_it() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+
+    let storage = || {
+        fluree_db_core::FileStorage::new(dir.path())
+            .with_durability(fluree_db_core::Durability::Sync)
+            .without_wal_replay()
+    };
+    let lookup = Arc::new(PausedLookup {
+        inner: Arc::new(fluree_db_nameservice::file::FileNameService::with_storage(
+            storage(),
+        )),
+        ledger_id: "rb:dev",
+        armed: false.into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let peer = FlureeBuilder::memory().build_with(
+        storage(),
+        fluree_db_api::NameServiceMode::ReadOnly(Arc::clone(&lookup) as _),
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-dev0", "alice-dev1"]
+    );
+
+    support::rebuild_and_publish_index(&writer, "rb:dev").await;
+    lookup
+        .armed
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let refresh = {
+        let peer = peer.clone();
+        tokio::spawn(async move { peer.refresh("rb:dev", Default::default()).await })
+    };
+    lookup.entered.notified().await;
+
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    assert_eq!(
+        follow(&peer, rebased).await,
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    lookup.release.notify_one();
+    refresh.await.unwrap().unwrap();
+
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}
+
+/// A rebase published while a peer loads the branch, after the load read the
+/// nameservice: the peer follows the record once the load lands, rather than
+/// serving the replaced line until the next event.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_peer_follows_a_rebase_sent_while_it_loads_the_branch() {
+    use std::sync::Arc;
+
+    let dir = tempfile::tempdir().unwrap();
+    let writer = file_fluree(&dir);
+    conflicting_branch(&writer, 2).await;
+
+    let storage = || {
+        fluree_db_core::FileStorage::new(dir.path())
+            .with_durability(fluree_db_core::Durability::Sync)
+            .without_wal_replay()
+    };
+    let lookup = Arc::new(PausedLookup {
+        inner: Arc::new(fluree_db_nameservice::file::FileNameService::with_storage(
+            storage(),
+        )),
+        ledger_id: "rb:dev",
+        armed: true.into(),
+        entered: tokio::sync::Notify::new(),
+        release: tokio::sync::Notify::new(),
+    });
+    let peer = FlureeBuilder::memory().build_with(
+        storage(),
+        fluree_db_api::NameServiceMode::ReadOnly(Arc::clone(&lookup) as _),
+    );
+
+    let loading = {
+        let peer = peer.clone();
+        tokio::spawn(async move { peer.ledger_cached("rb:dev").await.map(drop) })
+    };
+    lookup.entered.notified().await;
+    writer
+        .rebase_branch("rb", "dev", ConflictStrategy::Skip)
+        .await
+        .unwrap();
+    let rebased = dev_record(&writer).await;
+    let following = {
+        let peer = peer.clone();
+        tokio::spawn(async move { follow(&peer, rebased).await })
+    };
+    lookup.release.notify_one();
+    loading.await.unwrap().unwrap();
+
+    assert_eq!(
+        following.await.unwrap(),
+        fluree_db_api::NotifyResult::Reloaded
+    );
+    assert_eq!(
+        query_cached_names(&peer, "rb:dev").await,
+        ["alice", "alice-main", "dave"]
+    );
+}

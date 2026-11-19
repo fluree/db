@@ -1062,6 +1062,7 @@ impl GraphDb {
             // `evaluate::allow_view_flake`, before any policy runs.
             denies_all_data: wrapper.view().restrictions.is_empty() && !wrapper.default_allow(),
             unevaluable_policies: Vec::new(),
+            undecidable_class_maps: Vec::new(),
         })
     }
 }
@@ -1239,6 +1240,108 @@ impl std::fmt::Debug for DerivedFactsHandle {
     }
 }
 
+// ============================================================================
+// Query-result cache
+// ============================================================================
+
+impl GraphDb {
+    /// Hash everything about this view that decides a query's answer, for
+    /// the query-result cache. `Err` names what the cache cannot key.
+    ///
+    /// The ledger state is the overlay's content version, unique to its
+    /// contents, and the content-addressed index root: a commit, an index
+    /// build or a recreated ledger changes one of them.
+    pub(crate) fn hash_for_result_cache<H: std::hash::Hasher>(
+        &self,
+        h: &mut H,
+    ) -> std::result::Result<(), &'static str> {
+        use std::hash::Hash;
+        let Self {
+            snapshot,
+            overlay,
+            t,
+            ledger_id,
+            graph_id,
+            policy,
+            default_context,
+            union_default_graph,
+            cross_ledger_resolved_heads,
+            graph_source_id,
+            graph_source_time,
+            over_graph_source,
+            instance_bits,
+            commit_id,
+            fence,
+            erasure_generation,
+            historical,
+            // Derived from the ledger state hashed below.
+            novelty: _,
+            binary_store: _,
+            dict_novelty: _,
+            runtime_small_dicts: _,
+            ledger_config: _,
+            resolved_config: _,
+            config_absent: _,
+            // Read only when reasoning or rules run, which the caller
+            // bypasses once the plan shows them.
+            reasoning: _,
+            reasoning_precedence: _,
+            config_reasoning_budget: _,
+            datalog_enabled: _,
+            query_time_rules_allowed: _,
+            datalog_override_allowed: _,
+            rules_source_g_id: _,
+            // Serves `f:query` restrictions, which the policy hash refuses.
+            policy_enforcer: _,
+        } = self;
+        if graph_source_id.is_some() || graph_source_time.is_some() || *over_graph_source {
+            return Err("graph source");
+        }
+        if !cross_ledger_resolved_heads.is_empty() {
+            return Err("cross-ledger governance");
+        }
+        let content_version = overlay
+            .content_version()
+            .ok_or("overlay without a content version")?;
+        let index_root = snapshot.index_root_id();
+        if snapshot.t > 0 && index_root.is_none() {
+            return Err("index root unknown");
+        }
+        // Which ledger, which incarnation of the branch, which commit and
+        // which erasures: a ledger dropped and created again, a rebased
+        // branch or an erasure changes one of them.
+        ledger_id.hash(h);
+        instance_bits.hash(h);
+        fence.hash(h);
+        commit_id.hash(h);
+        erasure_generation.hash(h);
+        historical.hash(h);
+        t.hash(h);
+        snapshot.t.hash(h);
+        index_root.hash(h);
+        content_version.hash(h);
+        graph_id.hash(h);
+        union_default_graph.hash(h);
+        match default_context {
+            None => 0u8.hash(h),
+            Some(ctx) => {
+                1u8.hash(h);
+                crate::query::result_cache::hash_json(ctx, h).map_err(|_| "default context")?;
+            }
+        }
+        match policy {
+            None => 0u8.hash(h),
+            Some(policy) => {
+                1u8.hash(h);
+                if !policy.hash_view_policy(h) {
+                    return Err("f:query policy");
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1246,6 +1349,41 @@ mod tests {
 
     fn make_test_snapshot() -> LedgerSnapshot {
         LedgerSnapshot::genesis("test:main")
+    }
+
+    #[test]
+    fn result_cache_key_covers_each_view_input() {
+        fn key(view: &GraphDb) -> u128 {
+            let mut h = xxhash_rust::xxh3::Xxh3::new();
+            view.hash_for_result_cache(&mut h).expect("keyable");
+            h.digest128()
+        }
+        let novelty = Arc::new(Novelty::new(0));
+        let overlay = novelty.clone() as Arc<dyn OverlayProvider>;
+        let base = GraphDb::new(
+            Arc::new(make_test_snapshot()),
+            overlay,
+            Some(novelty),
+            5,
+            "test:main",
+        );
+        assert_eq!(key(&base), key(&base.clone()));
+        let variants = [
+            ("t", base.clone().as_of(4)),
+            ("graph", base.clone().with_graph_id(3)),
+            (
+                "default context",
+                base.clone()
+                    .with_default_context(Some(serde_json::json!({"ex": "http://ex/"}))),
+            ),
+            ("union switch", base.clone().with_union_default_graph(true)),
+        ];
+        let unkeyed: Vec<&str> = variants
+            .iter()
+            .filter(|(_, view)| key(view) == key(&base))
+            .map(|(input, _)| *input)
+            .collect();
+        assert!(unkeyed.is_empty(), "not keyed: {unkeyed:?}");
     }
 
     #[test]

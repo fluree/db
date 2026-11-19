@@ -5131,3 +5131,299 @@ async fn test_raw_objects_wait_on_no_leader() {
     assert_eq!(status(plain_head, plain).await, StatusCode::OK);
     assert_eq!(replicas.0.load(std::sync::atomic::Ordering::Relaxed), 0);
 }
+
+/// A peer forwards the nameservice sync routes to the transaction server,
+/// whose nameservice they read and advance, as it does transactions. They
+/// used to return 404 on a peer, or, on a shared-storage peer, write the
+/// transaction server's nameservice from the peer's process.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_peer_forwards_nameservice_sync() {
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer = build_router(peer);
+    let send = |method: &str, uri: &str| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    };
+
+    let resp = peer
+        .clone()
+        .oneshot(send("POST", "/v1/fluree/nameservice/refs/nsfw:main/init"))
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["created"], true, "{body}");
+    assert!(
+        state
+            .fluree
+            .nameservice()
+            .lookup("nsfw:main")
+            .await
+            .unwrap()
+            .is_some(),
+        "the transaction server's nameservice holds the ledger"
+    );
+
+    let resp = peer
+        .oneshot(send("GET", "/v1/fluree/nameservice/snapshot"))
+        .await
+        .unwrap();
+    let (status, body) = json_body(resp).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(
+        body["ledgers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["ledger_id"] == "nsfw:main" || r["ledgerId"] == "nsfw:main"),
+        "{body}"
+    );
+    server_handle.abort();
+}
+
+/// A proxy peer answers in every format the transaction server does, for
+/// SPARQL and JSON-LD alike, with the same bytes. It used to refuse every
+/// format but JSON with 406.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_negotiates_every_query_format() {
+    use fluree_db_api::ReindexOptions;
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let tx_app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let served = tx_app.clone();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, served).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let create = client
+        .post(format!("{server_url}/v1/fluree/create"))
+        .header("content-type", "application/json")
+        .body(r#"{"ledger": "formats:main"}"#)
+        .send()
+        .await
+        .expect("create ledger");
+    assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+    let insert = client
+        .post(format!("{server_url}/v1/fluree/upsert/formats:main"))
+        .header("content-type", "text/turtle")
+        .body(
+            "@prefix ex: <http://example.org/> .\n\
+             ex:a ex:name \"A\" ; ex:age 1 .\n\
+             ex:b ex:name \"B\" ; ex:age 2 .\n",
+        )
+        .send()
+        .await
+        .expect("insert");
+    assert_eq!(insert.status(), reqwest::StatusCode::OK);
+    state
+        .fluree
+        .reindex("formats:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+
+    let send = |app: axum::Router,
+                content_type: &'static str,
+                accept: &'static str,
+                body: String| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/fluree/query/formats:main")
+                    .header("content-type", content_type)
+                    .header("accept", accept)
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let status = resp.status();
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        (status, String::from_utf8_lossy(&bytes).to_string())
+    };
+
+    let select = "PREFIX ex: <http://example.org/> \
+                  SELECT ?s ?n WHERE { ?s ex:name ?n } ORDER BY ?n"
+        .to_string();
+    let describe = "PREFIX ex: <http://example.org/> DESCRIBE ex:a".to_string();
+    let construct = "PREFIX ex: <http://example.org/> \
+                     CONSTRUCT { ?s ex:name ?n } WHERE { ?s ex:name ?n }"
+        .to_string();
+    let jsonld = serde_json::json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": ["?n", "?age"],
+        "where": {"@id": "?s", "ex:name": "?n", "ex:age": "?age"},
+        "orderBy": "?n"
+    })
+    .to_string();
+
+    let cases = [
+        (
+            "application/sparql-query",
+            "application/sparql-results+xml",
+            select.clone(),
+        ),
+        ("application/sparql-query", "text/csv", select.clone()),
+        (
+            "application/sparql-query",
+            "text/tab-separated-values",
+            select.clone(),
+        ),
+        (
+            "application/sparql-query",
+            "application/sparql-results+json",
+            select,
+        ),
+        ("application/sparql-query", "text/turtle", describe.clone()),
+        ("application/sparql-query", "application/rdf+xml", describe),
+        (
+            "application/sparql-query",
+            "application/n-triples",
+            construct,
+        ),
+        ("application/json", "text/csv", jsonld.clone()),
+        ("application/json", "text/tab-separated-values", jsonld),
+    ];
+    for (content_type, accept, body) in cases {
+        let (tx_status, tx_body) = send(tx_app.clone(), content_type, accept, body.clone()).await;
+        assert_eq!(tx_status, StatusCode::OK, "{accept}: {tx_body}");
+        let (peer_status, peer_body) = send(peer_app.clone(), content_type, accept, body).await;
+        assert_eq!(peer_status, StatusCode::OK, "{accept}: {peer_body}");
+        assert_eq!(peer_body, tx_body, "{content_type} as {accept}");
+    }
+
+    server_handle.abort();
+}
+
+/// A proxy peer reports a ledger's full metadata, the transaction server's
+/// own: stats, commit and heads. It used to answer with the nameservice
+/// record alone. The top-level `t` is the head's, with or without an index
+/// at it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_proxy_peer_reports_full_ledger_info() {
+    use fluree_db_api::ReindexOptions;
+    use tokio::net::TcpListener;
+
+    let (_tmp, state) = tx_server_state().await;
+    let tx_app = build_router(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind to ephemeral port");
+    let server_url = format!("http://{}", listener.local_addr().expect("local addr"));
+    let served = tx_app.clone();
+    let server_handle = tokio::spawn(async move {
+        axum::serve(listener, served).await.expect("server run");
+    });
+    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+
+    let client = reqwest::Client::new();
+    let commit = |ledger: &'static str, name: &'static str| {
+        let client = client.clone();
+        let server_url = server_url.clone();
+        async move {
+            let insert = client
+                .post(format!("{server_url}/v1/fluree/upsert/{ledger}"))
+                .header("content-type", "text/turtle")
+                .body(format!(
+                    "@prefix ex: <http://example.org/> . ex:{name} a ex:Person ; ex:name \"{name}\" ."
+                ))
+                .send()
+                .await
+                .expect("insert");
+            assert_eq!(insert.status(), reqwest::StatusCode::OK);
+        }
+    };
+    for ledger in ["info:main", "fresh:main"] {
+        let create = client
+            .post(format!("{server_url}/v1/fluree/create"))
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"ledger": "{ledger}"}}"#))
+            .send()
+            .await
+            .expect("create ledger");
+        assert_eq!(create.status(), reqwest::StatusCode::CREATED);
+        commit(ledger, "a").await;
+        commit(ledger, "b").await;
+    }
+    // `info:main`'s index trails its head; `fresh:main` has none.
+    state
+        .fluree
+        .reindex("info:main", ReindexOptions::default())
+        .await
+        .expect("reindex");
+    commit("info:main", "c").await;
+
+    let signing_key = SigningKey::from_bytes(&[0u8; 32]);
+    let token = create_storage_proxy_token_no_identity(&signing_key, true);
+    let (_peer_tmp, peer) = proxy_peer_state(&server_url, &token)
+        .await
+        .expect("peer state");
+    let peer_app = build_router(peer);
+
+    let info = |app: axum::Router, ledger: &'static str| async move {
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/v1/fluree/info/{ledger}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        json_body(resp).await
+    };
+    // `t` is the head's, which a client compares with its own head.
+    for (ledger, head_t) in [("info:main", 3), ("fresh:main", 2)] {
+        let (tx_status, mut tx_info) = info(tx_app.clone(), ledger).await;
+        assert_eq!(tx_status, StatusCode::OK, "{tx_info}");
+        let (peer_status, mut peer_info) = info(peer_app.clone(), ledger).await;
+        assert_eq!(peer_status, StatusCode::OK, "{peer_info}");
+        assert!(peer_info.get("commitId").is_some(), "{peer_info}");
+        assert!(peer_info.get("stats").is_some(), "{peer_info}");
+        assert_eq!(peer_info["t"], head_t, "{ledger}: {peer_info}");
+        // The transaction server's `nameservice` block is the record its
+        // cached ledger last loaded or indexed from, which its own commits
+        // do not refresh; the peer's, loaded now, is the current one.
+        tx_info.as_object_mut().unwrap().remove("nameservice");
+        peer_info.as_object_mut().unwrap().remove("nameservice");
+        assert_eq!(peer_info, tx_info, "{ledger}");
+    }
+
+    server_handle.abort();
+}

@@ -47,6 +47,7 @@ pub fn exists_join_count_distinct_object_operator(
                 ctx.binary_g_id,
                 &count_predicate,
                 &exists_predicate,
+                &ctx.tracker,
             )? {
                 Some(count) => Ok(Some(build_count_batch(out_var, count as i64)?)),
                 None => Ok(None),
@@ -65,6 +66,7 @@ fn count_distinct_object_with_exists_subject_post(
     g_id: GraphId,
     count_predicate: &Ref,
     exists_predicate: &Ref,
+    tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<u64>> {
     let count_sid = normalize_pred_sid(store, count_predicate)?;
     let exists_sid = normalize_pred_sid(store, exists_predicate)?;
@@ -76,7 +78,7 @@ fn count_distinct_object_with_exists_subject_post(
         return Ok(Some(0));
     };
 
-    let subjects = collect_subjects_for_predicate_set(store, g_id, p_exists)?;
+    let subjects = collect_subjects_for_predicate_set(store, g_id, p_exists, tracker)?;
     if subjects.is_empty() {
         return Ok(Some(0));
     }
@@ -109,9 +111,13 @@ fn count_distinct_object_with_exists_subject_post(
                 return Ok(None);
             }
 
-            let batch = handle
-                .load_columns(leaflet_idx, &projection, RunSortOrder::Post)
-                .map_err(|e| QueryError::Internal(format!("load columns: {e}")))?;
+            let batch = crate::fast_path_common::load_leaflet_columns_charged(
+                &*handle,
+                leaflet_idx,
+                &projection,
+                RunSortOrder::Post,
+                tracker,
+            )?;
 
             for row in 0..batch.row_count {
                 let okey = batch.o_key.get(row);
