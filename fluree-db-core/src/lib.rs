@@ -100,7 +100,7 @@ pub mod wasm_cache;
 // Re-export main types
 pub use address::{extract_identifier, extract_path, parse_fluree_address, ParsedFlureeAddress};
 pub use annotation_index::{AnnotationIndexRoot, AnnotationStats};
-pub use cancellation::{QueryCancellation, QueryCancellationReason};
+pub use cancellation::{MemoryCharge, QueryCancellation, QueryCancellationReason};
 pub use coerce::{coerce_json_value, coerce_value, CoercionError, CoercionResult};
 pub use commit::{
     collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,

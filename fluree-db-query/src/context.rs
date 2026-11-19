@@ -1067,6 +1067,25 @@ impl<'a> ExecutionContext<'a> {
         self.cancellation.release(bytes);
     }
 
+    /// An empty charge on this query's memory counter, released when dropped
+    /// (see [`MemoryCharge`](fluree_db_core::MemoryCharge)). For memory with a
+    /// drop point the owner holds: keep the charge beside it.
+    #[inline]
+    pub fn memory_charge(&self) -> fluree_db_core::MemoryCharge {
+        fluree_db_core::MemoryCharge::new(&self.cancellation)
+    }
+
+    /// Record `bytes` more on `charge`, then [`checkpoint`](Self::checkpoint).
+    #[inline]
+    pub fn charge(
+        &self,
+        charge: &mut fluree_db_core::MemoryCharge,
+        bytes: usize,
+    ) -> Result<(), QueryError> {
+        charge.record(bytes);
+        self.checkpoint()
+    }
+
     /// Retained query memory recorded so far via [`record_alloc`](Self::record_alloc).
     #[inline]
     pub fn mem_used(&self) -> usize {
