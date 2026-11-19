@@ -219,7 +219,12 @@ pub fn canonical_split(iri: &str, mode: NsSplitMode) -> (&str, &str) {
         }
     }
 
-    if mode == NsSplitMode::NamedLocal && is_builtin_namespace_iri(iri) {
+    // Every built-in prefix but `@` (handled above) ends in one of these, so
+    // only such an IRI can be one: the check skips the trie for the rest.
+    if mode == NsSplitMode::NamedLocal
+        && matches!(iri.as_bytes().last(), Some(b'/' | b'#' | b':'))
+        && is_builtin_namespace_iri(iri)
+    {
         return (iri, "");
     }
 
@@ -1039,6 +1044,17 @@ mod tests {
             named("http://www.w3.org/2001/XMLSchema#string/"),
             ("http://www.w3.org/2001/XMLSchema#", "string/")
         );
+    }
+
+    /// `canonical_split` looks a built-in namespace's own IRI up only when it
+    /// ends in a delimiter, so a built-in prefix ending otherwise would split.
+    #[test]
+    fn named_local_keeps_every_builtin_namespace_iri_as_its_namespace() {
+        for prefix in default_namespace_codes().into_values() {
+            if !prefix.is_empty() {
+                assert_eq!(named(&prefix), (prefix.as_str(), ""));
+            }
+        }
     }
 
     // ---- canonical_split: normative test table ----
