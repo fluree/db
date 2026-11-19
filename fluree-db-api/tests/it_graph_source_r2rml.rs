@@ -6186,6 +6186,189 @@ async fn verify_twin_quick_catches_sampled_subject_corruption() {
     );
 }
 
+/// A source whose 0/1 columns (a `long` and a `decimal(1,0)`) are typed
+/// `xsd:boolean`: three widgets, so the Quick gate samples every one of them.
+#[cfg(feature = "native")]
+fn boolean_flag_provider() -> Arc<MultiTableMock> {
+    use fluree_db_r2rml::mapping::{
+        ObjectMap, PredicateMap, PredicateObjectMap, SubjectMap, TriplesMap,
+    };
+
+    let mut widget = TriplesMap::new("<#Widget>", "dw.widget");
+    widget.subject_map =
+        SubjectMap::template("http://ex.org/widget/{id}").with_class("http://ex.org/Widget");
+    widget.predicate_object_maps = vec![
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/active"),
+            object_map: ObjectMap::column_typed("flag", fluree_vocab::xsd::BOOLEAN),
+        },
+        PredicateObjectMap {
+            predicate_map: PredicateMap::constant("http://ex.org/enabled"),
+            object_map: ObjectMap::column_typed("flag_dec", fluree_vocab::xsd::BOOLEAN),
+        },
+    ];
+    let mapping = Arc::new(CompiledR2rmlMapping::new(vec![widget]));
+
+    let batch = ColumnBatch::new(
+        Arc::new(BatchSchema::new(vec![
+            FieldInfo {
+                name: "id".to_string(),
+                field_type: FieldType::Int64,
+                nullable: false,
+                field_id: 1,
+            },
+            FieldInfo {
+                name: "flag".to_string(),
+                field_type: FieldType::Int64,
+                nullable: true,
+                field_id: 2,
+            },
+            FieldInfo {
+                name: "flag_dec".to_string(),
+                field_type: FieldType::Decimal {
+                    precision: 1,
+                    scale: 0,
+                },
+                nullable: true,
+                field_id: 3,
+            },
+        ])),
+        vec![
+            Column::Int64(vec![Some(1), Some(2), Some(3)]),
+            Column::Int64(vec![Some(1), Some(0), Some(1)]),
+            Column::Decimal {
+                values: vec![Some(0), Some(1), Some(0)],
+                precision: 1,
+                scale: 0,
+            },
+        ],
+    )
+    .unwrap();
+
+    let mut tables = HashMap::new();
+    tables.insert("dw.widget".to_string(), vec![batch]);
+    Arc::new(MultiTableMock { mapping, tables })
+}
+
+/// PARITY GATE (#2386): a 0/1 column typed `xsd:boolean` materializes as
+/// booleans and passes both gates. The source renders `"1"^^xsd:boolean`, the
+/// twin answers `"true"^^xsd:boolean`, and the two are the same value. A twin
+/// holding the other boolean still fails both gates.
+#[cfg(feature = "native")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn verify_twin_passes_on_a_zero_one_column_typed_boolean() {
+    use fluree_db_api::materialize::{verify_twin, CheckOutcome, VerifyMode};
+
+    const LEDGER: &str = "test/verify-boolean:main";
+    let provider = boolean_flag_provider();
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let fluree = FlureeBuilder::file(dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build Fluree");
+    fluree
+        .create(LEDGER)
+        .import_r2rml(Arc::clone(&provider), "gs:main")
+        .threads(2)
+        .memory_budget_mb(256)
+        .execute()
+        .await
+        .expect("build twin");
+    let ledger = fluree.ledger(LEDGER).await.expect("load twin");
+
+    // The twin holds booleans, not the source's 0/1 text.
+    for (subject, predicate, want) in [
+        ("widget/1", "active", "true"),
+        ("widget/2", "active", "false"),
+        ("widget/1", "enabled", "false"),
+        ("widget/2", "enabled", "true"),
+    ] {
+        let q = format!(
+            "SELECT ?v WHERE {{ <http://ex.org/{subject}> <http://ex.org/{predicate}> ?v }}"
+        );
+        let json = support::query_sparql(&fluree, &ledger, &q)
+            .await
+            .expect("query")
+            .to_sparql_json(&ledger.snapshot)
+            .expect("sparql json");
+        let v = &json["results"]["bindings"][0]["v"];
+        assert_eq!(v["value"], want, "{subject} {predicate}: {v}");
+        assert_eq!(
+            v["datatype"],
+            fluree_vocab::xsd::BOOLEAN,
+            "{subject} {predicate}: {v}"
+        );
+    }
+
+    for mode in [VerifyMode::Quick, VerifyMode::Full] {
+        let report = verify_twin(&fluree, &ledger, &*provider, "gs:main", mode, None)
+            .await
+            .expect("verify");
+        assert!(
+            report.passed,
+            "a 0/1 column typed xsd:boolean must pass {mode:?}; failures: {:?}",
+            report.failures()
+        );
+    }
+
+    // Flip widget/1's ex:active from true to false: the source still says 1.
+    let flip = serde_json::json!({
+        "where":  {"@id": "http://ex.org/widget/1", "http://ex.org/active": "?a"},
+        "delete": {"@id": "http://ex.org/widget/1", "http://ex.org/active": "?a"},
+        "insert": {"@id": "http://ex.org/widget/1", "http://ex.org/active": false}
+    });
+    let flipped = fluree.update(ledger, &flip).await.expect("flip a flag");
+
+    let quick = verify_twin(
+        &fluree,
+        &flipped.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Quick,
+        None,
+    )
+    .await
+    .expect("verify quick");
+    assert!(!quick.passed, "a flipped boolean must fail Quick");
+    assert!(
+        quick
+            .failures()
+            .iter()
+            .any(|c| c.name == "sample:<http://ex.org/widget/1>"
+                && c.outcome
+                    == CheckOutcome::TripleDiff {
+                        missing_in_twin: 1,
+                        extra_in_twin: 1
+                    }),
+        "widget/1 must fail with one missing and one extra triple; failures: {:?}",
+        quick.failures()
+    );
+
+    let full = verify_twin(
+        &fluree,
+        &flipped.ledger,
+        &*provider,
+        "gs:main",
+        VerifyMode::Full,
+        None,
+    )
+    .await
+    .expect("verify full");
+    assert!(!full.passed, "a flipped boolean must fail Full");
+    let diff = full
+        .checks
+        .iter()
+        .find(|c| c.name == "full-triple-diff")
+        .expect("full-diff check present");
+    assert_eq!(
+        diff.outcome,
+        CheckOutcome::TripleDiff {
+            missing_in_twin: 1,
+            extra_in_twin: 1
+        },
+        "the full diff must report exactly the flipped triple"
+    );
+}
+
 /// DROP-ON-FAIL mechanism: the CLI hard-drops a twin whose gate fails, so nothing
 /// unverified stays announced. Verify the drop actually UNPUBLISHES — after a
 /// hard drop, the twin is no longer a live, queryable ledger (its nameservice
