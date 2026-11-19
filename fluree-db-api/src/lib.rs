@@ -4286,22 +4286,6 @@ impl Fluree {
         ))
     }
 
-    /// Resolve attachment-event coverage from a loaded ledger state, the way
-    /// [`Fluree::reindex`] does.
-    ///
-    /// For callers that drive the indexer themselves without a
-    /// `LedgerManager`, chiefly `fluree index`: there
-    /// [`Fluree::attachment_events_provider`] is `None`, and an indexer handed
-    /// no coverage drops the annotation arena while root assembly sets the
-    /// sticky `had_annotation_arena` bit, which then blocks the bootstrap that
-    /// would have sealed one.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub async fn attachment_coverage_from_state(
-        state: &LedgerState,
-    ) -> Option<fluree_db_indexer::AttachmentEventCoverage> {
-        crate::indexer_attachment_provider::attachment_events_from_state(state).await
-    }
-
     /// Per-instance cache for cross-ledger governance artifacts.
     ///
     /// Exposed so the resolver in `cross_ledger::resolver` can plug

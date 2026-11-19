@@ -270,12 +270,8 @@ async fn scan_base_index_for_attachment_events(
 
 /// True when `FLUREE_FORCE_ANNOTATION_BOOTSTRAP` asks to run the base-index
 /// bootstrap even though the sticky `had_annotation_arena` bit is set.
-/// EXPERIMENTAL.
-///
-/// The bit cannot be made to track actual seals instead: a retracted
-/// `f:reifies*` row leaves no trace in the index, so no pass can tell a ledger
-/// whose arena was never sealed from one whose arena was sealed and then
-/// dropped, and only the first is safe to rebuild from currently-live bundles.
+/// EXPERIMENTAL — not a substitute for fixing the bit to track actual
+/// seals/retracts.
 #[cfg(not(target_arch = "wasm32"))]
 fn force_annotation_bootstrap() -> bool {
     std::env::var("FLUREE_FORCE_ANNOTATION_BOOTSTRAP")

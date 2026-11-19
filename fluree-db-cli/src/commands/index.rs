@@ -47,15 +47,17 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
     let mut config = fluree_db_indexer::IndexerConfig::default()
         .with_fulltext_config_provider(fluree.fulltext_config_provider());
 
-    // Resolve attachment-event coverage so an annotated ledger seals (or
-    // keeps) its `f:reifies*` arena on this run. `build_index_for_ledger`
-    // reads only the concrete `IndexerConfig.attachment_events`; handed none,
-    // it drops the arena, and the sticky `had_annotation_arena` bit it sets
-    // then blocks the bootstrap that would have sealed one (#1882).
-    //
-    // The provider reads a running `LedgerManager`. A one-shot CLI process
-    // has none, so it derives coverage from one ledger load instead, the way
-    // `reindex` does.
+    // Resolve the attachment-events provider into a concrete
+    // coverage envelope so an annotated ledger seals an
+    // authoritative `f:reifies*` arena on this indexing run.
+    // `build_index_for_ledger` reads `IndexerConfig.attachment_events`
+    // directly — only the orchestrator's job dispatcher consults
+    // the provider trait, so we have to resolve here. Without this,
+    // the indexer takes the defensive-drop path (`annotation_index
+    // = None`) and queries fall back to the M2a scan path —
+    // correct but slower. The provider reads from the running
+    // `LedgerManager`, so we cache the ledger first to make sure
+    // its attachment overlay is loaded.
     //
     // **Sticky-bit gate.** Mirror `admin.rs::reindex`: only resolve
     // for ledgers that have actually observed a `f:reifies*` flake.
@@ -74,20 +76,6 @@ pub async fn index_ledger(fluree: &Fluree, ledger_id: &str) -> CliResult<IndexOu
             view.snapshot.has_annotations || view.novelty.attachments.has_annotations();
         if ledger_has_annotations {
             config.attachment_events = provider.attachment_events(handle.id()).await;
-        }
-    } else {
-        // Not fatal: what is lost is only the chance to resolve coverage.
-        match fluree.ledger(ledger_id).await {
-            Ok(state) => {
-                if state.snapshot.has_annotations || state.novelty.attachments.has_annotations() {
-                    config.attachment_events = Fluree::attachment_coverage_from_state(&state).await;
-                }
-            }
-            Err(e) => tracing::debug!(
-                error = %e,
-                ledger_id,
-                "index: no loadable ledger state; annotation arena will not be sealed this pass"
-            ),
         }
     }
 
