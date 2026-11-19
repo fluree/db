@@ -762,6 +762,31 @@ impl LazyVectorArena {
         Ok(shard)
     }
 
+    /// Record every shard the content store's resident tier doesn't hold in
+    /// its miss register, for a reader that reads every shard (an identity
+    /// table's build). It then fails on the first missing shard as before,
+    /// but one retry round fetches the whole arena, rather than one round
+    /// per shard against the retry budget's cap.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    pub(crate) fn register_missing_shards(&self) {
+        let Some(cs) = self.cas.as_ref() else {
+            return;
+        };
+        let Some(register) = cs.miss_register() else {
+            return;
+        };
+        for cid in self.shard_sources.iter().filter_map(|s| s.cid.as_ref()) {
+            if cs.resolve_cached_bytes(cid).is_none() {
+                register.record(cid, crate::read::need_fetch::FetchKind::VectorShard);
+            }
+        }
+    }
+
+    /// Without a residency tier every shard reads from storage directly.
+    #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
+    #[inline]
+    pub(crate) fn register_missing_shards(&self) {}
+
     /// True when the content store carries a sync residency tier.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn residency_mode(&self) -> bool {

@@ -3467,6 +3467,9 @@ pub struct VectorIdentity {
 
 impl VectorIdentity {
     fn build(arena: &crate::arena::vector::LazyVectorArena) -> io::Result<Self> {
+        // It reads every shard: on a residency host, ask for all the missing
+        // ones at once rather than fail on each in turn.
+        arena.register_missing_shards();
         let len = arena.len() as usize;
         let mut hashes = vec![0u64; len];
         let mut canonical: Vec<u32> = (0..len as u32).collect();
@@ -5448,6 +5451,96 @@ pub(crate) mod tests {
             .arena_vector(NO_ARENA_GRAPH, 7, 0)
             .expect_err("a vector literal with no graph");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// On a residency host, a cold identity-table build asks for every shard
+    /// of its arena at once, so one retry round fetches the whole arena.
+    /// Failing on each missing shard in turn took one round per shard, and an
+    /// arena with more shards than the retry budget's cap could not be built.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    #[test]
+    fn a_cold_identity_table_build_fetches_its_arena_in_one_round() {
+        use crate::arena::vector::tests::write_test_shard;
+        use crate::arena::vector::{LazyVectorArena, ShardInfo, ShardSource, VectorManifest};
+        use crate::read::need_fetch::tests::MissInjectingStore;
+        use crate::read::need_fetch::{NeedFetch, RetryBudget};
+        use fluree_db_core::content_kind::DictKind;
+        let dir = std::env::temp_dir().join("fluree_vector_identity_residency");
+        std::fs::create_dir_all(&dir).unwrap();
+        let store = Arc::new(MissInjectingStore::new());
+        let shards = 8u32;
+        let (mut sources, mut infos) = (Vec::new(), Vec::new());
+        for i in 0..shards {
+            let vectors: Vec<Vec<f32>> = (0..2).map(|j| vec![i as f32, j as f32]).collect();
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            let (path, _) = write_test_shard(&dir, &format!("s{i}.vas"), 2, &refs);
+            let bytes = std::fs::read(&path).unwrap();
+            let cid = run_sync_on_runtime({
+                let inner = store.inner.clone();
+                async move {
+                    inner
+                        .put(
+                            ContentKind::DictBlob {
+                                dict: DictKind::VectorShard { p_id: 7 },
+                            },
+                            &bytes,
+                        )
+                        .await
+                        .map_err(|e| io::Error::other(e.to_string()))
+                }
+            })
+            .unwrap();
+            sources.push(ShardSource {
+                cid_hash: LeafletCache::cid_cache_key(format!("residency-s{i}").as_bytes()),
+                cid: Some(cid),
+                path: dir.join(format!("absent-{i}")),
+                on_disk: std::sync::atomic::AtomicBool::new(false),
+            });
+            infos.push(ShardInfo {
+                cas: format!("s{i}"),
+                count: 2,
+            });
+        }
+        let manifest = VectorManifest {
+            version: 1,
+            dims: 2,
+            dtype: "f32".to_string(),
+            normalized: false,
+            shard_capacity: 2,
+            total_count: 2 * shards,
+            shards: infos,
+        };
+        let cs: Arc<dyn ContentStore> = Arc::clone(&store) as Arc<dyn ContentStore>;
+        let arena = LazyVectorArena::new(
+            manifest,
+            sources,
+            Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024)),
+            Some(cs),
+        );
+        let mut rounds = 0;
+        let table = loop {
+            match VectorIdentity::build(&arena) {
+                Ok(table) => break table,
+                Err(err) => {
+                    assert!(NeedFetch::from_io_error(&err).is_some(), "{err}");
+                    rounds += 1;
+                    assert!(rounds <= shards, "the build never completed");
+                    let fetched = run_sync_on_runtime({
+                        let store = Arc::clone(&store);
+                        async move { RetryBudget::default().after_error(store.as_ref(), 4).await }
+                    })
+                    .unwrap();
+                    assert!(fetched, "a retry round fetched nothing");
+                }
+            }
+        };
+        assert_eq!(
+            rounds, 1,
+            "a cold build took {rounds} retry rounds for {shards} shards"
+        );
+        assert!(table.duplicate_free());
+        assert!(table.of(2 * shards - 1).is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
