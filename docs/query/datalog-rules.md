@@ -320,10 +320,16 @@ SELECT ?a FROM <data:main@commit:bafy…> WHERE { ?a a ex:Candidate }
   pragma (a write evaluates no reasoning).
 - **The rules are stored rules** of the ledger they are read from: each is
   named by the IRI of its subject, parsed as a stored rule, and one that does
-  not parse fails the query naming it and that ledger (400). A ledger that is
-  not on this instance, or a graph it does not hold at that state, fails as a
+  not parse fails the query naming it and that ledger (400). An `f:rule` value
+  that is neither `@json` nor `f:sparql` fails as it does for a
   [cross-ledger rules source](../security/cross-ledger-policy.md#cross-ledger-datalog-rules)
-  does (502).
+  (502).
+- **What it names has to exist.** A ledger that is not on this instance, or a
+  graph it does not hold at that state, is the request's mistake, reported as
+  the same mistake in the query's own `from` is: 404, with error type
+  `err:db/LedgerNotFound` or `err:db/GraphNotFound`. (A configured
+  `f:rulesSource` naming a missing ledger or graph is a 502: there the
+  missing upstream is the config's.)
 
 A tracked query reports the rules as it reports any stored rules read from
 elsewhere: `rules_source` names the ledger, the graph, the `t` the pin

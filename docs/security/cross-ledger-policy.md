@@ -651,12 +651,15 @@ still run beside them.
   a non-root view policy, where D's config denies query-time rules
   to the request (`f:allowQueryTimeRules false`), and where D's
   config sets the request's reasoning.
-- **Same failures.** A ledger that is not on this instance, a
-  graph it does not hold at that state, and an `f:rule` value of
-  another datatype fail as they do for a configured source (502,
-  with the variants under [Failure modes](#failure-modes)); a rule
-  that does not parse fails with a 400 naming it and M; naming
-  `#config` or `#txn-meta` is a 400.
+- **Failures.** What `rulesFrom` names is the request's, so a
+  ledger that is not on this instance, or a graph it does not hold
+  at that state, is reported as the same mistake in the query's own
+  `from` is (404, `err:db/LedgerNotFound` / `err:db/GraphNotFound`),
+  not as the 502 a configured source gets for a missing upstream.
+  An `f:rule` value of another datatype fails as it does for a
+  configured source (502, `TranslationFailed`); a rule that does not
+  parse fails with a 400 naming it and M; naming a system graph
+  (`#config`, `#txn-meta`, or either by IRI) is a 400.
 
 See [Datalog rules](../query/datalog-rules.md#3-stored-rules-named-per-query-rulesfrom)
 for the syntax and [Recording a rule run](../query/datalog-rules.md#recording-a-rule-run)

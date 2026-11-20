@@ -143,20 +143,25 @@ pub async fn resolve_graph_ref(
 /// at its pin (the head when it has none), to the rules stored there.
 ///
 /// It takes the path a configured cross-ledger `f:rulesSource` takes, with
-/// the query's pin: the ledger is canonicalized through the nameservice and
-/// refused as missing like a configured model ledger, a system graph is
-/// refused, and the read is memoized and cached under the head it resolved
-/// to. An unpinned read shares the request's head capture for that ledger,
-/// so policy and rules read one head of it. A pinned read resolves its own
-/// ([`pinned_head`]) and leaves the capture alone.
+/// the query's pin: the ledger is canonicalized through the nameservice, a
+/// system graph is refused, and the read is memoized and cached under the
+/// head it resolved to. An unpinned read shares the request's head capture
+/// for that ledger, so policy and rules read one head of it. A pinned read
+/// resolves its own ([`pinned_head`]) and leaves the capture alone.
+///
+/// What it names is the request's, not the config's, so a ledger or graph
+/// that is not there is reported as the same mistake in a query's own `from`
+/// is ([`rules_from_error`]), not as a missing upstream.
 pub(crate) async fn resolve_rules_from(
     rules_from: &fluree_db_query::ir::RulesFrom,
     ctx: &mut ResolveCtx<'_>,
 ) -> crate::error::Result<Arc<ResolvedGraph>> {
     let graph_iri = rules_from.graph_iri();
-    let ns_record = model_record(rules_from.ledger().as_str(), graph_iri, ctx).await?;
+    let ns_record = model_record(rules_from.ledger().as_str(), graph_iri, ctx)
+        .await
+        .map_err(rules_from_error)?;
     let canonical_ledger_id = ns_record.ledger_id.clone();
-    reject_if_reserved_graph(&canonical_ledger_id, graph_iri)?;
+    reject_if_reserved_graph(&canonical_ledger_id, graph_iri).map_err(rules_from_error)?;
     let (head, cacheable) = match rules_from.at() {
         None | Some(TimeSpec::Latest) => (captured_head(&ns_record, ctx), true),
         Some(spec) => {
@@ -168,7 +173,7 @@ pub(crate) async fn resolve_rules_from(
             (head, cacheable)
         }
     };
-    Ok(resolve_at(
+    resolve_at(
         ArtifactKind::Rules,
         canonical_ledger_id.as_str(),
         graph_iri,
@@ -176,7 +181,38 @@ pub(crate) async fn resolve_rules_from(
         cacheable,
         ctx,
     )
-    .await?)
+    .await
+    .map_err(rules_from_error)
+}
+
+/// A resolution failure of a `rulesFrom`, reported as the caller's mistake
+/// where it is one, as a query's own `from` reports it: a ledger that is not
+/// on this instance is `NotFound` (404, `LedgerNotFound`), a graph it does
+/// not hold at the state read is `GraphNotFound` (404), and a system graph
+/// named by its IRI is refused as the `#config` / `#txn-meta` keywords are
+/// (400). A configured `f:rulesSource` names its upstream in the ledger's
+/// config, so the same failures stay 502s there. Any other failure (a rule
+/// value of another datatype, a cycle, a read that fails) is the rules
+/// ledger's, not the request's, and stays a cross-ledger failure.
+fn rules_from_error(e: CrossLedgerError) -> crate::error::ApiError {
+    use crate::error::ApiError;
+    match e {
+        CrossLedgerError::ModelLedgerMissing { ledger_id } => {
+            ApiError::NotFound(format!("{ledger_id} (the ledger rulesFrom names)"))
+        }
+        CrossLedgerError::GraphMissingAtT {
+            ledger_id,
+            graph_iri,
+            resolved_t,
+        } => ApiError::GraphNotFound(format!(
+            "{graph_iri} in ledger '{ledger_id}' at t={resolved_t} (the graph rulesFrom names)"
+        )),
+        CrossLedgerError::ReservedGraphSelected { graph_iri } => ApiError::invalid_query(format!(
+            "rulesFrom names the system graph <{graph_iri}>, which holds no rules; name \
+                 the graph that holds the f:rule values"
+        )),
+        other => ApiError::CrossLedger(other),
+    }
 }
 
 /// The nameservice record of a model ledger named `raw_ledger_ref`.

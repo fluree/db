@@ -514,10 +514,14 @@ async fn an_invalid_rule_from_is_named_with_its_ledger() {
     );
 }
 
-/// What `rulesFrom` names has to exist: a ledger missing from this instance
-/// and a graph R does not hold fail as a configured cross-ledger source's do
-/// (502), and a pin past R's head as a query's own pin does (400). An
-/// address that does not parse, or names a system graph, is a 400.
+/// What `rulesFrom` names has to exist, and naming what does not is the
+/// caller's mistake, reported as the same mistake in a query's own `from` is:
+/// a ledger that is not on this instance is a 404 `LedgerNotFound`, and a
+/// graph R does not hold a 404 `GraphNotFound`. (A configured cross-ledger
+/// `f:rulesSource` keeps its 502: there the missing upstream is the
+/// config's.) A pin past R's head is a 400, as a query's own pin is, and so
+/// are an address that does not parse and a system graph, by keyword or by
+/// IRI.
 #[tokio::test]
 async fn what_rules_from_names_has_to_exist() {
     let fluree = FlureeBuilder::memory().build_memory();
@@ -527,22 +531,71 @@ async fn what_rules_from_names_has_to_exist() {
         "test/rules-from/missing-data:main",
     );
     let pinned = ledgers(&fluree, rules_id, model_id, data_id).await;
-    for (rules_from, status, needle, what) in [
+    let missing_ledger = "test/rules-from/nope:main";
+    let missing_graph = format!("{rules_id}#http://example.org/no-such-graph");
+
+    // The same mistakes in a query's own `from`.
+    let from = |from: String| {
+        let fluree = &fluree;
+        async move {
+            fluree
+                .query_connection(&json!({
+                    "from": from,
+                    "select": "?s",
+                    "where": {"@id": "?s", "?p": "?o"}
+                }))
+                .await
+                .expect_err("a from naming what is not there")
+        }
+    };
+    let rules_from = |address: String| {
+        let fluree = &fluree;
+        async move {
+            let view = fluree.db(data_id).await.expect("load D");
+            fluree
+                .query(
+                    &view,
+                    &json!({
+                        "select": "?s",
+                        "where": {"@id": "?s", "?p": "?o"},
+                        "rulesFrom": address
+                    }),
+                )
+                .await
+                .expect_err("a rulesFrom naming what is not there")
+        }
+    };
+    for (address, status, error_type, needle, what) in [
         (
-            format!("test/rules-from/nope:main#{RULES_GRAPH}"),
-            502,
-            "model ledger 'test/rules-from/nope:main' is not present".to_string(),
+            format!("{missing_ledger}#{RULES_GRAPH}"),
+            404,
+            "err:db/LedgerNotFound",
+            missing_ledger.to_string(),
             "a ledger that is not here",
         ),
         (
-            format!("{rules_id}#http://example.org/no-such-graph"),
-            502,
-            format!("graph 'http://example.org/no-such-graph' is not present in model ledger '{rules_id}'"),
+            missing_graph.clone(),
+            404,
+            "err:db/GraphNotFound",
+            format!("http://example.org/no-such-graph in ledger '{rules_id}'"),
             "a graph R does not hold",
         ),
+    ] {
+        let named = rules_from(address.clone()).await;
+        assert_eq!(named.status_code(), status, "{what}: {named}");
+        assert_eq!(named.error_type(), error_type, "{what}: {named}");
+        assert!(named.to_string().contains(&needle), "{what}: {named}");
+        let own = from(address.replace(&format!("#{RULES_GRAPH}"), "")).await;
+        assert_eq!(
+            (own.status_code(), own.error_type()),
+            (named.status_code(), named.error_type()),
+            "{what}: as a query's own from reports it ({own})"
+        );
+    }
+
+    for (address, needle, what) in [
         (
             format!("{rules_id}@t:{}#{RULES_GRAPH}", pinned.t + 5),
-            400,
             format!(
                 "Target t={} is beyond current head t={} for '{rules_id}'",
                 pinned.t + 5,
@@ -552,21 +605,24 @@ async fn what_rules_from_names_has_to_exist() {
         ),
         (
             format!("{rules_id}#config"),
-            400,
             "holds no rules".to_string(),
-            "a system graph",
+            "a system graph by keyword",
+        ),
+        (
+            format!("{rules_id}#urn:fluree:{rules_id}#config"),
+            "holds no rules".to_string(),
+            "a system graph by IRI",
         ),
         (
             format!("{rules_id}@nope:1#{RULES_GRAPH}"),
-            400,
             "rulesFrom".to_string(),
             "an address that does not parse",
         ),
     ] {
-        let err = classes(&fluree, data_id, json!({"rulesFrom": rules_from}))
+        let err = classes(&fluree, data_id, json!({"rulesFrom": address}))
             .await
             .expect_err(what);
-        assert_eq!(err.status, status, "{what}: {}", err.error);
+        assert_eq!(err.status, 400, "{what}: {}", err.error);
         assert!(err.error.contains(&needle), "{what}: {}", err.error);
     }
 }

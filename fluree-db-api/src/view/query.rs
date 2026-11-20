@@ -1948,10 +1948,12 @@ impl Fluree {
     /// cross-ledger source's, and the tally names the ledger, graph, `t` and
     /// commit they were read at. Skipped when datalog does not run.
     ///
-    /// Errors are the cross-ledger resolver's (`ApiError::CrossLedger`,
-    /// 502: a ledger that is not on this instance, a graph it does not hold
-    /// at that `t`, a rule value of another datatype), and, for a pin, the
-    /// time-travel errors a query's own pin raises.
+    /// What it names is the request's: a ledger that is not on this
+    /// instance, or a graph it does not hold at that `t`, is reported as the
+    /// same mistake in a query's own `from` is (404 `NotFound` /
+    /// `GraphNotFound`), and a pin raises the time-travel errors a query's
+    /// own pin does. A rule value of another datatype stays a cross-ledger
+    /// failure (`ApiError::CrossLedger`, 502), as for a configured source.
     async fn attach_rules_from(
         rules_from: &fluree_db_query::ir::RulesFrom,
         executable: &mut ExecutableQuery,
