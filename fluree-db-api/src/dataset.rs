@@ -1287,7 +1287,7 @@ fn validate_alias_uniqueness(spec: &DatasetSpec) -> Result<(), DatasetParseError
 /// allow one unchecked. [`sparql_dataset_ledgers`] gives the typed ids of the
 /// ledgers the connection path loads.
 pub fn sparql_dataset_ledger_ids(sparql: &str) -> Result<Vec<String>, DatasetParseError> {
-    let spec = DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?;
+    let spec = DatasetSpec::from_sparql_ast(dataset_ast(&crate::parse_sparql_shared(sparql))?)?;
     let mut out: Vec<String> = Vec::new();
     let reported = spec
         .sources()
@@ -1312,14 +1312,13 @@ pub fn sparql_dataset_ledger_ids(sparql: &str) -> Result<Vec<String>, DatasetPar
 /// dataset clause: every member with an address reading, and the history
 /// range's ledger ([`DatasetSpec::ledgers`]).
 pub fn sparql_dataset_ledgers(sparql: &str) -> Result<Vec<LedgerId>, DatasetParseError> {
-    Ok(DatasetSpec::from_sparql_ast(&parse_sparql_for_dataset(sparql)?)?.ledgers())
+    Ok(DatasetSpec::from_sparql_ast(dataset_ast(&crate::parse_sparql_shared(sparql))?)?.ledgers())
 }
 
-fn parse_sparql_for_dataset(
-    sparql: &str,
-) -> Result<fluree_db_sparql::SparqlAst, DatasetParseError> {
-    let parsed = fluree_db_sparql::parse_sparql(sparql);
-    parsed.ast.ok_or_else(|| {
+fn dataset_ast(
+    parsed: &crate::SharedSparqlParse,
+) -> Result<&fluree_db_sparql::SparqlAst, DatasetParseError> {
+    parsed.ast.as_ref().ok_or_else(|| {
         let msg = parsed
             .diagnostics
             .first()
@@ -1332,9 +1331,10 @@ fn parse_sparql_for_dataset(
 /// Whether a SPARQL query carries a dataset clause (`FROM`, `FROM NAMED` or
 /// `TO`). A query that does not parse has none.
 pub fn sparql_has_dataset_clause(sparql: &str) -> bool {
-    fluree_db_sparql::parse_sparql(sparql)
+    crate::parse_sparql_shared(sparql)
         .ast
-        .is_some_and(|ast| crate::query::helpers::sparql_ast_has_dataset(&ast))
+        .as_ref()
+        .is_some_and(crate::query::helpers::sparql_ast_has_dataset)
 }
 
 #[cfg(test)]

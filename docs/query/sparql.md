@@ -398,8 +398,10 @@ WHERE {
 
 ### Parameters
 
-When Fluree is embedded (the Rust API and the Python package), a query or
-update can take parameters: values bound to variables by name. A parameter
+A query or update can take parameters: values bound to variables by name.
+Embedded Fluree (the Rust API and the Python package) takes them with the
+request; over HTTP, a query takes them as the `params` request parameter, a
+JSON object (see the [query endpoint](../api/endpoints.md#post-query)). A parameter
 replaces its variable — written `?name` or `$name`, which SPARQL treats as the
 same variable — everywhere in the request before it is planned, so
 `SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
@@ -415,6 +417,17 @@ subquery.
   remote `SERVICE`, whose body is sent to the endpoint as written.
 - `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
   `INSERT { ... } WHERE { ... }`.
+
+A value is written as in JSON-LD: a JSON string, number or boolean; `{"@id":
+iri}` for an IRI (full IRIs only — no prefix applies); `{"@value": v, "@type":
+datatype}` for a typed literal; or `{"@value": s, "@language": tag}`. Over HTTP:
+
+```bash
+curl -G http://localhost:8090/v1/fluree/query/books:main \
+  --data-urlencode 'query=PREFIX ex: <http://example.org/>
+    SELECT ?book WHERE { ?book ex:author $author ; ex:year ?year }' \
+  --data-urlencode 'params={"author": {"@id": "http://example.org/le-guin"}}'
+```
 
 ## Aggregation
 

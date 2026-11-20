@@ -122,7 +122,7 @@ async fn stream_query_connection_inner(
     // Both branches below set it, so there is no default to fall back on.
     let warn_headers;
     params.absorb_form_body(&mut credential)?;
-    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
+    params.reject_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
@@ -143,13 +143,14 @@ async fn stream_query_connection_inner(
         // surface whose caller is least likely to notice a short result set as
         // the only silent one.
         warn_headers = crate::routes::query::sparql_dataset_warning_headers(
-            fluree_db_sparql::parse_sparql(&sparql).ast.as_ref(),
+            fluree_db_api::parse_sparql_shared(&sparql).ast.as_ref(),
         );
 
         // The auth-layer-verified identity gates `f:overrideControl` on the
         // ledgers' reasoning defaults, so planning carries it too.
-        let plan_options =
-            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        let plan_options = params.bind(crate::query_control::options_for_identity(
+            headers.server_identity.as_ref(),
+        ));
         let dataset = fluree
             .build_stream_dataset_for_sparql(
                 &sparql,
@@ -287,7 +288,7 @@ async fn stream_query_inner(
     // only named graphs and then matches outside them (see `X_FDB_WARNING`).
     let mut warn_headers = HeaderMap::new();
     params.absorb_form_body(&mut credential)?;
-    params.reject_dataset_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
+    params.reject_outside_sparql(is_sparql_request(&headers, &credential, &params))?;
     let (stream_plan, tracker) = if is_sparql_request(&headers, &credential, &params) {
         let sparql = resolve_sparql_text(&params, &credential)?;
         // Merge the `# PRAGMA` options into the headers (see `with_sparql_pragmas`).
@@ -301,13 +302,15 @@ async fn stream_query_inner(
         // SPARQL has no body `opts`, so policy arrives via the resolved identity
         // (bearer/header), the server default policy class, and the
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
-        let plan_options =
-            crate::query_control::options_for_identity(headers.server_identity.as_ref());
+        let plan_options = params.bind(crate::query_control::options_for_identity(
+            headers.server_identity.as_ref(),
+        ));
         let identity = headers.identity.clone();
         let qc_opts = crate::routes::policy_auth::bound_governance(identity.as_deref(), &headers)?;
 
-        // Detect FROM/FROM NAMED dataset clauses.
-        let parsed = fluree_db_sparql::parse_sparql(&sparql);
+        // Detect FROM/FROM NAMED dataset clauses (through the parse the plan
+        // below reads).
+        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
         let dataset_clause = parsed.ast.as_ref().and_then(|ast| match &ast.body {
             fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
             fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),

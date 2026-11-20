@@ -711,6 +711,18 @@ impl Fluree {
         sparql: &str,
         opts: &GovernanceOptions,
     ) -> Result<JsonValue> {
+        self.explain_connection_sparql_with_opts_and_params(sparql, opts, None)
+            .await
+    }
+
+    /// [`Self::explain_connection_sparql_with_opts`] with `params` substituted,
+    /// as [`QueryExecutionOptions::with_params`] would run the query.
+    pub async fn explain_connection_sparql_with_opts_and_params(
+        &self,
+        sparql: &str,
+        opts: &GovernanceOptions,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> Result<JsonValue> {
         let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
@@ -727,7 +739,7 @@ impl Fluree {
             ));
         };
 
-        self.explain_sparql(&view, sparql).await
+        self.explain_sparql_with_params(&view, sparql, params).await
     }
 
     /// Execute a SPARQL query via connection (dataset specified via SPARQL `FROM` / `FROM NAMED`).

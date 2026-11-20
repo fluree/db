@@ -184,9 +184,10 @@ pub(crate) fn parse_cypher_to_ir(
     lower_cypher_ast_to_ir(&ast, snapshot, default_context, overlay, policy)
 }
 
-/// Statements longer than this are parsed but never cached: unique bulk
-/// payloads (inline CREATE data) would evict the short, hot statements the
-/// cache exists for, and entry count — not bytes — bounds the LRU.
+/// Statements longer than this are parsed but never cached (Cypher and
+/// SPARQL alike): unique bulk payloads (inline CREATE data, large VALUES
+/// blocks) would evict the short, hot statements the caches exist for, and
+/// entry count — not bytes — bounds each LRU.
 const MAX_CACHED_STATEMENT_LEN: usize = 8 * 1024;
 
 /// Process-wide parsed-AST LRU, keyed on statement text.
@@ -557,24 +558,102 @@ fn parse_and_validate_unparameterized(sparql: &str) -> Result<fluree_db_sparql::
     #[cfg(test)]
     SPARQL_PARSE_COUNT.with(|c| c.set(c.get() + 1));
 
-    let ast = parse_sparql_strict(sparql)?;
-
-    // Validation errors: validate against Fluree capabilities/restrictions.
-    let capabilities = fluree_db_sparql::Capabilities::default();
-    let diagnostics = fluree_db_sparql::validate(&ast, &capabilities);
-    let errors: Vec<_> = diagnostics
-        .into_iter()
-        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
-        .collect();
-    if !errors.is_empty() {
-        let message = errors
-            .first()
-            .map(|d| d.message.clone())
-            .unwrap_or_else(|| "SPARQL validation error".to_string());
-        return Err(ApiError::sparql(message, errors));
+    let (parsed, accepted) = parse_sparql_cached(sparql);
+    if let (true, Some(ast)) = (accepted, parsed.ast.as_ref()) {
+        return Ok(ast.clone());
     }
 
-    Ok(ast)
+    // Rejected: parse errors first (authoritative even when recovery produced
+    // an AST — see `parse_sparql_strict`), then validation errors.
+    let errors: Vec<_> = parsed
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .cloned()
+        .collect();
+    let (errors, fallback) = match parsed.ast.as_ref() {
+        Some(ast) if errors.is_empty() => {
+            (sparql_validation_errors(ast), "SPARQL validation error")
+        }
+        _ => (errors, "SPARQL parse error"),
+    };
+    let message = errors
+        .first()
+        .map(|d| d.message.clone())
+        .unwrap_or_else(|| fallback.to_string());
+    Err(ApiError::sparql(message, errors))
+}
+
+/// Validation errors for `ast` against Fluree's capabilities/restrictions.
+fn sparql_validation_errors(
+    ast: &fluree_db_sparql::SparqlAst,
+) -> Vec<fluree_db_sparql::Diagnostic> {
+    fluree_db_sparql::validate(ast, &fluree_db_sparql::Capabilities::default())
+        .into_iter()
+        .filter(|d| d.severity == fluree_db_sparql::Severity::Error)
+        .collect()
+}
+
+/// A SPARQL parse as [`fluree_db_sparql::parse_sparql`] returns it, shared.
+pub type SharedSparqlParse = Arc<fluree_db_sparql::ParseOutput<fluree_db_sparql::SparqlAst>>;
+
+type SparqlAstCache = parking_lot::Mutex<lru::LruCache<Box<str>, SharedSparqlParse>>;
+
+/// Process-wide parsed-SPARQL LRU, keyed on query text.
+///
+/// Holds only parses the API accepts as written — no error diagnostic, and
+/// valid against Fluree's capabilities — so a hit skips validation too. The
+/// cached AST is pre-substitution: callers clone it before substituting
+/// parameters or injecting default prefixes. Capacity comes from
+/// `FLUREE_SPARQL_AST_CACHE` (entries, default 512; `0` disables), read once.
+fn sparql_ast_cache() -> Option<&'static SparqlAstCache> {
+    use std::num::NonZeroUsize;
+    use std::sync::OnceLock;
+    static CACHE: OnceLock<Option<SparqlAstCache>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let capacity = std::env::var("FLUREE_SPARQL_AST_CACHE")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(512);
+            NonZeroUsize::new(capacity).map(|c| parking_lot::Mutex::new(lru::LruCache::new(c)))
+        })
+        .as_ref()
+}
+
+/// Parse `sparql` through the process-wide cache, returning the parse and
+/// whether the API accepts it as written (always true for a hit).
+fn parse_sparql_cached(sparql: &str) -> (SharedSparqlParse, bool) {
+    if let Some(cache) = sparql_ast_cache() {
+        if let Some(hit) = cache.lock().get(sparql) {
+            return (Arc::clone(hit), true);
+        }
+    }
+    let output = fluree_db_sparql::parse_sparql(sparql);
+    let accepted = !output.has_errors()
+        && output
+            .ast
+            .as_ref()
+            .is_some_and(|ast| sparql_validation_errors(ast).is_empty());
+    let output = Arc::new(output);
+    if accepted && sparql.len() <= MAX_CACHED_STATEMENT_LEN {
+        if let Some(cache) = sparql_ast_cache() {
+            cache.lock().put(sparql.into(), Arc::clone(&output));
+        }
+    }
+    (output, accepted)
+}
+
+/// Parse SPARQL text as [`fluree_db_sparql::parse_sparql`] does, through the
+/// cache the API's own parse reads.
+///
+/// For a caller that inspects a query before running it — the server reads
+/// the dataset clause and query form to route a request — so the run that
+/// follows finds the parse already done, and a repeated text is parsed once.
+/// A text that does not parse cleanly is parsed afresh on every call, so its
+/// diagnostics are exactly the parser's.
+pub fn parse_sparql_shared(sparql: &str) -> SharedSparqlParse {
+    parse_sparql_cached(sparql).0
 }
 
 /// Parse a SPARQL query. Return an error if the parser produced any
@@ -852,6 +931,69 @@ mod tests {
 
         // Missing param still errors through the cached path.
         assert!(substituted_cypher_ast(text, None).is_err());
+    }
+
+    #[test]
+    fn sparql_ast_cache_shares_one_parse_per_text() {
+        let text = "SELECT ?s WHERE { ?s <http://ex.org/cacheHitTest> ?o }";
+        let first = parse_sparql_shared(text);
+        let second = parse_sparql_shared(text);
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "same query text must hit the cache"
+        );
+    }
+
+    #[test]
+    fn sparql_ast_cache_skips_oversized_queries() {
+        let filler = "x".repeat(MAX_CACHED_STATEMENT_LEN);
+        let text = format!("SELECT ?s WHERE {{ ?s <http://ex.org/p> \"{filler}\" }}");
+        let first = parse_sparql_shared(&text);
+        let second = parse_sparql_shared(&text);
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "oversized queries must not be cached"
+        );
+        assert_eq!(first.ast, second.ast);
+    }
+
+    /// A text the API rejects is parsed afresh on every call, so its
+    /// diagnostics are exactly the parser's — for a parse error and for a
+    /// query that parses but fails validation alike.
+    #[test]
+    fn sparql_rejected_texts_are_not_cached() {
+        for (text, reason) in [
+            ("SELECT ?s WHERE { ?s <http://ex.org/p> ", "parse error"),
+            (
+                "SELECT * WHERE { ?s ?p ?o } GROUP BY ?s",
+                "validation error",
+            ),
+        ] {
+            let first = parse_sparql_shared(text);
+            let second = parse_sparql_shared(text);
+            assert!(!Arc::ptr_eq(&first, &second), "{reason} cached: {text}");
+            assert!(
+                parse_and_validate_sparql(text, None).is_err(),
+                "{reason} accepted: {text}"
+            );
+        }
+    }
+
+    /// Parameters are substituted into a copy: the cached parse, which the
+    /// next request with the same text reads, keeps its variable.
+    #[test]
+    fn sparql_substitution_leaves_the_cached_parse_unbound() {
+        let text = "SELECT ?s WHERE { ?s <http://ex.org/substTest> ?name }";
+        let mut params = fluree_db_sparql::ParamMap::new();
+        params.insert("name".into(), serde_json::json!("Alice"));
+
+        let bound = parse_and_validate_sparql(text, Some(&params)).expect("bound");
+        let unbound = parse_and_validate_sparql(text, None).expect("unbound");
+
+        assert_ne!(bound, unbound, "the binding must change the AST");
+        let fresh = fluree_db_sparql::parse_sparql(text).ast.expect("parse");
+        assert_eq!(unbound, fresh);
+        assert_eq!(parse_sparql_shared(text).ast.as_ref(), Some(&fresh));
     }
 
     use fluree_db_core::LedgerSnapshot;
