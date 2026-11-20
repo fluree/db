@@ -6132,6 +6132,7 @@ mod embedded_tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -6190,6 +6191,7 @@ mod embedded_tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
