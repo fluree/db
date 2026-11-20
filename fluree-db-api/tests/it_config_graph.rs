@@ -5550,6 +5550,80 @@ async fn datalog_config_blocks_query_time_rules() {
     );
 }
 
+/// `f:datalogEnabled` defaults to `true`: a ledger with no config runs its
+/// stored rules when a query asks for datalog, and so does one whose
+/// `f:datalogDefaults` leaves the field out, even where no request may
+/// override the group (were the default `false`, that query would be
+/// refused).
+#[tokio::test]
+async fn datalog_enabled_defaults_to_true() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/datalog-enabled-default:main";
+    let ledger = genesis_ledger(&fluree, ledger_id);
+    let ledger = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob", "ex:parent": {"@id": "ex:charlie"}},
+                    {"@id": "ex:grandparentRule", "f:rule": {"@type": "@json", "@value": {
+                        "@context": {"ex": "http://example.org/"},
+                        "where": {"@id": "?p", "ex:parent": {"ex:parent": "?g"}},
+                        "insert": {"@id": "?p", "ex:grandparent": {"@id": "?g"}}
+                    }}}
+                ]
+            }),
+        )
+        .await
+        .expect("seed")
+        .ledger;
+    let query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?g",
+        "where": {"@id": "ex:alice", "ex:grandparent": "?g"},
+        "reasoning": "datalog"
+    });
+    let grandparents = || async {
+        let view = fluree.db(ledger_id).await.expect("load");
+        let state = fluree.ledger(ledger_id).await.expect("load ledger");
+        fluree
+            .query(&view, &query)
+            .await
+            .expect("datalog query")
+            .to_jsonld(&state.snapshot)
+            .expect("to_jsonld")
+    };
+    assert_eq!(grandparents().await, json!(["ex:charlie"]), "no config");
+
+    let config_iri = config_graph_iri(ledger_id);
+    fluree
+        .stage_owned(ledger)
+        .upsert_turtle(&format!(
+            r"
+            @prefix f: <https://ns.flur.ee/db#> .
+            @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+            GRAPH <{config_iri}> {{
+                <urn:config:main> rdf:type f:LedgerConfig .
+                <urn:config:main> f:datalogDefaults <urn:config:datalog> .
+                <urn:config:datalog> f:overrideControl f:OverrideNone .
+            }}"
+        ))
+        .execute()
+        .await
+        .expect("config write");
+    assert_eq!(
+        grandparents().await,
+        json!(["ex:charlie"]),
+        "a datalog group that leaves f:datalogEnabled out"
+    );
+    let view = fluree.db(ledger_id).await.unwrap();
+    let datalog = config_resolver::merge_datalog_opts(view.resolved_config().unwrap(), None)
+        .expect("a datalog group");
+    assert!(datalog.enabled && !datalog.override_allowed, "{datalog:?}");
+}
+
 // =============================================================================
 // Test 20: Datalog override control identity-restricted
 // =============================================================================
