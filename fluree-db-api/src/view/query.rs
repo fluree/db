@@ -1721,10 +1721,18 @@ impl Fluree {
     /// completed view is returned, so the caller reads any further config
     /// setting off it without resolving the config again.
     ///
+    /// Reasoning the query asks for that the ledger's config won't run for
+    /// this request is refused with a 400 rather than replaced: a mode the
+    /// config's forced `f:reasoningModes` leave out, `"none"` where they turn
+    /// reasoning on, query-time rules or an inline ontology under them, and
+    /// datalog where `f:datalogEnabled false` applies. A mode the config's
+    /// own defaults supply is not the query's doing and is not refused.
+    ///
     /// `strip_query_rules` is true when a non-root view policy applies —
     /// `!db.is_root()` for a single view, `dataset.any_non_root_policy()`
-    /// for a dataset. It strips *query-supplied* rules only; config-sourced
-    /// rules attach afterwards because they're admin-controlled.
+    /// for a dataset. A query that supplies rules there is refused;
+    /// config-sourced rules attach afterwards because they're
+    /// admin-controlled.
     pub(crate) async fn apply_reasoning_to_executable(
         &self,
         db: &GraphDb,
@@ -1735,6 +1743,13 @@ impl Fluree {
         let completed = self.complete_config_defaults(db, server_identity).await?;
         let db = &completed;
 
+        // What the query itself asked for, before the view's and the config's
+        // defaults have their say: a mode the config then won't run is
+        // refused below rather than dropped.
+        let asked = executable.reasoning.modes.mode_names();
+        let asked_none = executable.reasoning.modes.is_disabled();
+        let mut config_forced = false;
+
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {
             // Check query's reasoning state
@@ -1742,25 +1757,68 @@ impl Fluree {
             let query_disabled = executable.reasoning.modes.is_disabled();
 
             // Apply precedence rules. Mode replacement keeps the query's
-            // budget: wrapper modes come from config mode strings and never
-            // carry one, and whether the query budget survives is decided
-            // below by `ConfigReasoningBudget::apply` (override control),
-            // not by mode precedence.
+            // budget and evaluation time: wrapper modes come from config mode
+            // strings and never carry either, and whether the query budget
+            // survives is decided below by `ConfigReasoningBudget::apply`
+            // (override control), not by mode precedence.
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
-                // Every budget field the query set has to be carried across
-                // the mode replacement, not just the two that existed first:
-                // wrapper modes come from config mode strings and never carry
-                // a budget, so anything dropped here is silently lost and the
-                // query's own ceiling never applies.
-                let (max_facts, max_seconds, max_memory_mb) = (
+                if db.config_forces_reasoning() {
+                    // The config decides this request's reasoning. Rules or
+                    // axioms the query brings would be replaced with it, so
+                    // the query is refused rather than answered without them.
+                    if !executable.reasoning.modes.rules.is_empty() {
+                        return Err(reasoning_set_by_config(effective, "add query-time rules"));
+                    }
+                    if executable.reasoning.modes.ontology.is_some() {
+                        return Err(reasoning_set_by_config(effective, "add an inline ontology"));
+                    }
+                    config_forced = true;
+                }
+                // Every field the query set that is not a mode selection has
+                // to be carried across the mode replacement: wrapper modes
+                // never carry one, so anything dropped here is silently lost
+                // (the query's budget never applies; `NOW()` in a rule body
+                // reads the commit time instead of the query's
+                // `reasoningTime`).
+                let (max_facts, max_seconds, max_memory_mb, evaluation_time) = (
                     executable.reasoning.modes.max_facts,
                     executable.reasoning.modes.max_seconds,
                     executable.reasoning.modes.max_memory_mb,
+                    executable.reasoning.modes.evaluation_time.take(),
                 );
                 executable.reasoning.modes = effective.clone();
                 executable.reasoning.modes.max_facts = max_facts;
                 executable.reasoning.modes.max_seconds = max_seconds;
                 executable.reasoning.modes.max_memory_mb = max_memory_mb;
+                executable.reasoning.modes.evaluation_time = evaluation_time;
+            }
+        }
+
+        // A mode the query asked for that the config's forced modes leave
+        // out, or `"none"` where the config turns reasoning on, is refused:
+        // answering without it reads as "reasoning derived nothing" (or, for
+        // `none`, passes derived facts off as stored ones). A mode the
+        // config's own defaults supply is not the query's doing and stays
+        // silent.
+        if config_forced {
+            let effective = &executable.reasoning.modes;
+            let running = effective.mode_names();
+            let missing: Vec<&str> = asked
+                .iter()
+                .copied()
+                .filter(|mode| !running.contains(mode))
+                .collect();
+            if !missing.is_empty() {
+                return Err(reasoning_set_by_config(
+                    effective,
+                    &format!("turn on {}", quoted_list(&missing)),
+                ));
+            }
+            if asked_none && effective.has_any_enabled() {
+                return Err(reasoning_set_by_config(
+                    effective,
+                    "turn reasoning off (\"none\")",
+                ));
             }
         }
 
@@ -1776,6 +1834,14 @@ impl Fluree {
         if !db.datalog_override_allowed() {
             // Config override denied — force config settings
             if !db.datalog_enabled() {
+                // Datalog the query asked for (by name, or by supplying rules,
+                // which turn it on) is refused; datalog a reasoning default
+                // turned on is switched off without a word.
+                if asked.contains(&"datalog") && executable.reasoning.modes.datalog {
+                    return Err(datalog_not_allowed(
+                        !executable.reasoning.modes.rules.is_empty(),
+                    ));
+                }
                 executable.reasoning.modes.datalog = false;
             }
             if !db.query_time_rules_allowed() && !executable.reasoning.modes.rules.is_empty() {
@@ -2216,6 +2282,54 @@ pub(crate) fn query_time_rules_not_allowed() -> ApiError {
          (f:allowQueryTimeRules false). Store the rules in the ledger as f:rule values, or \
          ask with an identity its override control allows",
     )
+}
+
+/// The refusal for reasoning a query asks for that the ledger's config does
+/// not let it have: the config's `f:reasoningDefaults` apply to this request
+/// under an `f:overrideControl` that does not allow it to change them, and
+/// `asked` (e.g. "turn on 'datalog'") is what the query wanted. It used to be
+/// answered with the config's reasoning instead, without a word.
+fn reasoning_set_by_config(config: &fluree_db_query::ir::ReasoningModes, asked: &str) -> ApiError {
+    let modes = config.mode_names();
+    let modes = if modes.is_empty() {
+        "none".to_string()
+    } else {
+        modes.join(", ")
+    };
+    ApiError::invalid_query(format!(
+        "this ledger's config sets the reasoning for this request (f:reasoningModes {modes}, \
+         under an f:overrideControl that does not allow this request to change it), so a \
+         query cannot {asked}. Leave it out of the query, or ask with an identity the \
+         override control allows"
+    ))
+}
+
+/// The refusal for datalog a query asks for (by name, or with query-time
+/// `rules`, which turn it on) where the ledger's config turns datalog off for
+/// the request (`f:datalogEnabled false` under an override control that
+/// denies it). It used to be switched off without a word.
+fn datalog_not_allowed(by_rules: bool) -> ApiError {
+    let how = if by_rules {
+        " (query-time rules turn it on)"
+    } else {
+        ""
+    };
+    ApiError::invalid_query(format!(
+        "this ledger's config does not allow a query to turn on reasoning mode 'datalog'{how} \
+         for this request (f:datalogEnabled false, under an f:overrideControl that does not \
+         allow this request to change it). Leave it out of the query, or ask with an \
+         identity the override control allows"
+    ))
+}
+
+/// `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+fn quoted_list(items: &[&str]) -> String {
+    let quoted: Vec<String> = items.iter().map(|item| format!("'{item}'")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
+    }
 }
 
 // ============================================================================

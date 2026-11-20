@@ -8076,9 +8076,10 @@ async fn config_change_is_visible_to_the_next_read() {
 // The identity `f:overrideControl` gates on is the auth-layer-verified
 // `QueryExecutionOptions::server_identity`, threaded from the request boundary
 // through query preparation. Nothing a caller writes in the body can stand in
-// for it. These drive the whole path and assert on the result shape: config
-// says `f:reasoningModes f:rdfs`, the query says `"reasoning": "none"`, so an
-// entailed row means the override was denied and no row means it was allowed.
+// for it. These drive the whole path: config says `f:reasoningModes f:rdfs`,
+// the query says `"reasoning": "none"`, so no row means the override was
+// allowed, and a 400 means it was denied (the query asked for something the
+// config won't give it; it used to get the config's rdfs without a word).
 
 const REASONING_OVERRIDE_ADMIN_ONLY: &str = r"
             <urn:config:reasoning> f:overrideControl <urn:config:oc> .
@@ -8109,7 +8110,7 @@ async fn entailed_names_as(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
     server_identity: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, fluree_db_api::ApiError> {
     let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
     let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
     let mut options = QueryExecutionOptions::new();
@@ -8118,9 +8119,20 @@ async fn entailed_names_as(
     }
     let result = fluree
         .query_with_options(&db, &reasoning_none_query(None, None), options)
-        .await
-        .expect("query");
-    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+        .await?;
+    Ok(result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld"))
+}
+
+/// A denied `"reasoning": "none"` is refused naming what it asked for.
+#[track_caller]
+fn assert_none_refused(result: Result<serde_json::Value, fluree_db_api::ApiError>, who: &str) {
+    let err = result.expect_err(who);
+    assert_eq!(err.status_code(), 400, "{who}: {err}");
+    assert!(
+        err.to_string()
+            .contains("so a query cannot turn reasoning off (\"none\")"),
+        "{who}: {err}"
+    );
 }
 
 /// Connection (`from`) path, where the body's `opts` are parsed into
@@ -8130,17 +8142,16 @@ async fn entailed_names_connection_as(
     ledger_id: &str,
     opts: Option<serde_json::Value>,
     server_identity: Option<&str>,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, fluree_db_api::ApiError> {
     let mut options = QueryExecutionOptions::new();
     if let Some(id) = server_identity {
         options = options.with_server_identity(VerifiedIdentity::new(id));
     }
     let result = fluree
         .query_connection_with_options(&reasoning_none_query(Some(ledger_id), opts), options)
-        .await
-        .expect("connection query");
+        .await?;
     let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
-    result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld")
+    Ok(result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld"))
 }
 
 #[tokio::test]
@@ -8154,19 +8165,19 @@ async fn reasoning_override_identity_restricted_end_to_end() {
     .await;
 
     assert_eq!(
-        entailed_names_as(&fluree, ledger_id, Some("did:key:admin")).await,
+        entailed_names_as(&fluree, ledger_id, Some("did:key:admin"))
+            .await
+            .expect("admin"),
         json!([]),
         "the allow-listed verified identity may turn reasoning off"
     );
-    assert_eq!(
+    assert_none_refused(
         entailed_names_as(&fluree, ledger_id, Some("did:key:other")).await,
-        json!(["Alice"]),
-        "a verified identity outside the allow-list is denied; config's rdfs wins"
+        "a verified identity outside the allow-list is denied",
     );
-    assert_eq!(
+    assert_none_refused(
         entailed_names_as(&fluree, ledger_id, None).await,
-        json!(["Alice"]),
-        "an anonymous request is denied; config's rdfs wins"
+        "an anonymous request is denied",
     );
 }
 
@@ -8185,21 +8196,23 @@ async fn reasoning_override_ignores_body_identity() {
     .await;
     let body_opts = json!({"identity": "did:key:admin", "default-allow": true});
 
-    assert_eq!(
+    assert_none_refused(
         entailed_names_connection_as(&fluree, ledger_id, Some(body_opts.clone()), None).await,
-        json!(["Alice"]),
-        "opts.identity naming the allow-listed DID must not authorize the override"
+        "opts.identity naming the allow-listed DID must not authorize the override",
     );
     // Control: the same body with the verified identity present is permitted,
     // so the assertion above is about the identity's provenance, not the body.
     assert_eq!(
         entailed_names_connection_as(&fluree, ledger_id, Some(body_opts), Some("did:key:admin"))
-            .await,
+            .await
+            .expect("admin with body identity"),
         json!([]),
         "the verified identity alongside the same body is permitted"
     );
     assert_eq!(
-        entailed_names_connection_as(&fluree, ledger_id, None, Some("did:key:admin")).await,
+        entailed_names_connection_as(&fluree, ledger_id, None, Some("did:key:admin"))
+            .await
+            .expect("admin"),
         json!([]),
         "connection path: the verified identity alone is permitted"
     );
@@ -8244,11 +8257,53 @@ async fn reasoning_override_identity_restricted_sparql() {
     let anon = fluree
         .query_with_options(&db, sparql, QueryExecutionOptions::new())
         .await
-        .expect("sparql anonymous");
-    assert_eq!(
-        rows(anon).len(),
-        1,
-        "an anonymous SPARQL request is denied; config's rdfs wins"
+        .map(|_| json!("answered"));
+    assert_none_refused(anon, "an anonymous SPARQL request is denied");
+}
+
+/// An explanation of a derived fact is gated on the request's verified
+/// identity, as a query is: the allow-listed identity may turn datalog on for
+/// it, and an anonymous request is refused.
+#[tokio::test]
+async fn reasoning_override_identity_restricted_explain() {
+    let ledger_id = "it/config-reasoning-identity-explain:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_ADMIN_ONLY,
+    )
+    .await;
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let request = json!({
+        "@context": {"ex": "http://example.org/"},
+        "reasoning": "datalog",
+        "explain": {"@id": "ex:alice", "ex:name": "Alice"}
+    });
+    let explain_as = |identity: Option<&str>| {
+        let mut options = QueryExecutionOptions::new();
+        if let Some(id) = identity {
+            options = options.with_server_identity(VerifiedIdentity::new(id));
+        }
+        let (fluree, db, request) = (&fluree, &db, &request);
+        async move {
+            fluree
+                .explain_derived_with_options(db, request, &options, None)
+                .await
+        }
+    };
+
+    explain_as(Some("did:key:admin"))
+        .await
+        .expect("the allow-listed verified identity may turn datalog on");
+    let err = explain_as(None)
+        .await
+        .expect_err("an anonymous request is denied");
+    assert_eq!(err.status_code(), 400, "{err}");
+    assert!(
+        err.to_string()
+            .contains("so a query cannot turn on 'datalog'"),
+        "{err}"
     );
 }
 
@@ -8357,6 +8412,386 @@ async fn datalog_override_identity_restricted_end_to_end() {
             err.to_string()
                 .contains("does not allow query-time datalog rules for this request"),
             "{who}: {err}"
+        );
+    }
+}
+
+// =============================================================================
+// Reasoning a query asks for that the config won't run is refused
+// =============================================================================
+//
+// Where a reasoning group's `f:overrideControl` does not allow the request,
+// the config's setting is what runs. A query that asked for other reasoning
+// used to be answered with the config's instead, without a word: a mode it
+// named came back as if it had derived nothing, and `"none"` came back with
+// derived facts. It is now refused with a 400 naming what it asked for. What
+// the config's own defaults turn on is not the query's doing, so a query that
+// asks for nothing, or only for what the config runs anyway, runs as before.
+
+const REASONING_OVERRIDE_NONE: &str = "<urn:config:reasoning> f:overrideControl f:OverrideNone .";
+
+/// The entailment query with `extra` (reasoning keys, `from`, `opts`) merged
+/// in at the top level.
+fn entailment_query(extra: serde_json::Value) -> serde_json::Value {
+    let mut query = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    for (key, value) in extra.as_object().expect("an object") {
+        query[key] = value.clone();
+    }
+    query
+}
+
+/// JSON-LD over a bare view of `ledger_id`, as an anonymous caller.
+async fn answer_jsonld(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    query: &serde_json::Value,
+) -> Result<serde_json::Value, fluree_db_api::ApiError> {
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let result = fluree.query(&db, query).await?;
+    Ok(result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld"))
+}
+
+/// SPARQL over a bare view of `ledger_id`: the number of rows.
+async fn answer_sparql(
+    fluree: &fluree_db_api::Fluree,
+    ledger_id: &str,
+    prologue: &str,
+) -> Result<usize, fluree_db_api::ApiError> {
+    let sparql = format!(
+        "{prologue}PREFIX ex: <http://example.org/>
+         SELECT ?v WHERE {{ ex:alice ex:name ?v }}"
+    );
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let result = fluree.query(&db, &sparql).await?;
+    let json = result
+        .to_sparql_json(&ledger_state.snapshot)
+        .expect("to_sparql_json");
+    Ok(support::normalize_sparql_bindings(&json).len())
+}
+
+#[track_caller]
+fn assert_refused<T: std::fmt::Debug>(
+    result: Result<T, fluree_db_api::ApiError>,
+    needle: &str,
+    what: &str,
+) {
+    let err = result.expect_err(what);
+    assert_eq!(err.status_code(), 400, "{what}: {err}");
+    assert!(err.to_string().contains(needle), "{what}: {err}");
+}
+
+/// Config runs rdfs and lets no request change it. A mode the query names
+/// that rdfs leaves out is refused, naming it; so is `"none"`. Naming rdfs,
+/// or nothing, runs rdfs.
+#[tokio::test]
+async fn a_reasoning_mode_the_config_does_not_run_is_refused() {
+    let ledger_id = "it/config-reasoning-refuse-mode:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_NONE,
+    )
+    .await;
+
+    for (extra, what) in [
+        (json!({}), "no reasoning asked: the config's rdfs runs"),
+        (json!({"reasoning": "rdfs"}), "the mode the config runs"),
+    ] {
+        assert_eq!(
+            answer_jsonld(&fluree, ledger_id, &entailment_query(extra))
+                .await
+                .expect(what),
+            json!(["Alice"]),
+            "{what}"
+        );
+    }
+
+    for (extra, needle, what) in [
+        (
+            json!({"reasoning": "datalog"}),
+            "so a query cannot turn on 'datalog'.",
+            "a mode the config leaves out",
+        ),
+        (
+            json!({"opts": {"reasoning": "owl2rl"}}),
+            "so a query cannot turn on 'owl2rl'.",
+            "the same, from opts",
+        ),
+        (
+            json!({"reasoning": ["rdfs", "datalog"]}),
+            "so a query cannot turn on 'datalog'.",
+            "beside a mode the config runs, only the other one is named",
+        ),
+        (
+            json!({"reasoning": ["owl2ql", "datalog"]}),
+            "so a query cannot turn on 'owl2ql' and 'datalog'.",
+            "two",
+        ),
+        (
+            json!({"reasoning": "none"}),
+            "so a query cannot turn reasoning off (\"none\")",
+            "none",
+        ),
+    ] {
+        let result = answer_jsonld(&fluree, ledger_id, &entailment_query(extra)).await;
+        assert_refused(result, needle, what);
+    }
+    assert_refused(
+        answer_jsonld(
+            &fluree,
+            ledger_id,
+            &entailment_query(json!({"reasoning": "datalog"})),
+        )
+        .await,
+        "(f:reasoningModes rdfs, under an f:overrideControl",
+        "the refusal names what the config runs",
+    );
+}
+
+/// SPARQL twin: the reasoning pragma is the request.
+#[tokio::test]
+async fn a_reasoning_mode_the_config_does_not_run_is_refused_sparql() {
+    let ledger_id = "it/config-reasoning-refuse-mode-sparql:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_NONE,
+    )
+    .await;
+
+    assert_eq!(
+        answer_sparql(&fluree, ledger_id, "")
+            .await
+            .expect("no pragma"),
+        1
+    );
+    assert_eq!(
+        answer_sparql(&fluree, ledger_id, "# PRAGMA reasoning: rdfs\n")
+            .await
+            .expect("rdfs"),
+        1
+    );
+    assert_refused(
+        answer_sparql(&fluree, ledger_id, "# PRAGMA reasoning: datalog\n").await,
+        "so a query cannot turn on 'datalog'.",
+        "SPARQL datalog",
+    );
+    assert_refused(
+        answer_sparql(&fluree, ledger_id, "# PRAGMA reasoning: none\n").await,
+        "so a query cannot turn reasoning off (\"none\")",
+        "SPARQL none",
+    );
+}
+
+/// The connection path (`from`), a multi-ledger dataset, a streaming plan and
+/// an explanation of a derived fact all prepare through the same gate.
+#[tokio::test]
+async fn every_query_surface_refuses_a_mode_the_config_does_not_run() {
+    let ledger_id = "it/config-reasoning-refuse-surfaces:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_NONE,
+    )
+    .await;
+    let other_id = "it/config-reasoning-refuse-surfaces-other:main";
+    let other = genesis_ledger(&fluree, other_id);
+    fluree
+        .insert(
+            other,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 1}),
+        )
+        .await
+        .expect("seed other ledger");
+    let needle = "so a query cannot turn on 'datalog'.";
+
+    let connection = entailment_query(json!({"from": ledger_id, "reasoning": "datalog"}));
+    assert_refused(
+        fluree.query_connection(&connection).await,
+        needle,
+        "connection path",
+    );
+
+    let dataset = entailment_query(json!({"from": [ledger_id, other_id], "reasoning": "datalog"}));
+    assert_refused(fluree.query_connection(&dataset).await, needle, "dataset");
+    // Control: the same dataset without the mode answers with config's rdfs.
+    let plain_dataset = entailment_query(json!({"from": [ledger_id, other_id]}));
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    assert_eq!(
+        fluree
+            .query_connection(&plain_dataset)
+            .await
+            .expect("dataset without a mode")
+            .to_jsonld(&ledger_state.snapshot)
+            .expect("to_jsonld"),
+        json!(["Alice"])
+    );
+
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state);
+    let stream =
+        fluree_db_api::OwnedStreamQuery::JsonLd(entailment_query(json!({"reasoning": "datalog"})));
+    assert_refused(
+        fluree.plan_stream_query(&db, &stream).await.map(|_| ()),
+        needle,
+        "streaming",
+    );
+
+    let explain = json!({
+        "@context": {"ex": "http://example.org/"},
+        "reasoning": "datalog",
+        "explain": {"@id": "ex:alice", "ex:name": "Alice"}
+    });
+    assert_refused(
+        fluree.explain_derived(&db, &explain).await.map(|_| ()),
+        needle,
+        "explain",
+    );
+}
+
+/// Config runs rdfs and datalog and lets no request change them. Rules or
+/// axioms a query brings would be replaced by the config's reasoning, so the
+/// query is refused rather than answered without them.
+#[tokio::test]
+async fn query_time_rules_and_ontology_under_a_config_that_sets_reasoning_are_refused() {
+    let ledger_id = "it/config-reasoning-refuse-rules:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs, f:datalog .",
+        REASONING_OVERRIDE_NONE,
+    )
+    .await;
+
+    let rules = json!({"rules": [{
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "?s", "ex:childName": "?n"},
+        "insert": {"@id": "?s", "ex:label": "?n"}
+    }]});
+    assert_refused(
+        answer_jsonld(&fluree, ledger_id, &entailment_query(rules)).await,
+        "so a query cannot add query-time rules.",
+        "query-time rules",
+    );
+
+    let ontology = json!({
+        "reasoning": "rdfs",
+        "ontology": {
+            "@context": {
+                "ex": "http://example.org/",
+                "rdfs": "http://www.w3.org/2000/01/rdf-schema#"
+            },
+            "@id": "ex:nickname",
+            "rdfs:subPropertyOf": {"@id": "ex:name"}
+        }
+    });
+    assert_refused(
+        answer_jsonld(&fluree, ledger_id, &entailment_query(ontology)).await,
+        "so a query cannot add an inline ontology.",
+        "inline ontology",
+    );
+
+    assert_eq!(
+        answer_jsonld(
+            &fluree,
+            ledger_id,
+            &entailment_query(json!({"reasoning": ["rdfs", "datalog"]}))
+        )
+        .await
+        .expect("the modes the config runs"),
+        json!(["Alice"])
+    );
+}
+
+/// `f:datalogEnabled false` under `f:OverrideNone`: datalog the query asks
+/// for, by name or with rules, is refused; datalog a reasoning default turns
+/// on is switched off without a word, as before.
+#[tokio::test]
+async fn datalog_the_config_turns_off_is_refused_when_the_query_asks_for_it() {
+    let ledger_id = "it/config-datalog-refuse:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        // A default, which a request may override: it turns datalog on for
+        // a query that asks for nothing, and the datalog group turns it off.
+        "<urn:config:reasoning> f:reasoningModes f:rdfs, f:datalog .",
+        r"
+            <urn:config:main> f:datalogDefaults <urn:config:datalog> .
+            <urn:config:datalog> f:datalogEnabled false .
+            <urn:config:datalog> f:overrideControl f:OverrideNone .",
+    )
+    .await;
+
+    for (extra, what) in [
+        (json!({}), "datalog from a reasoning default"),
+        (json!({"reasoning": "rdfs"}), "a mode the config allows"),
+    ] {
+        assert_eq!(
+            answer_jsonld(&fluree, ledger_id, &entailment_query(extra))
+                .await
+                .expect(what),
+            json!(["Alice"]),
+            "{what}"
+        );
+    }
+
+    let needle = "does not allow a query to turn on reasoning mode 'datalog'";
+    assert_refused(
+        answer_jsonld(
+            &fluree,
+            ledger_id,
+            &entailment_query(json!({"reasoning": ["rdfs", "datalog"]})),
+        )
+        .await,
+        needle,
+        "datalog by name",
+    );
+    let rules = json!({"rules": [{
+        "@context": {"ex": "http://example.org/"},
+        "where": {"@id": "?s", "ex:childName": "?n"},
+        "insert": {"@id": "?s", "ex:label": "?n"}
+    }]});
+    assert_refused(
+        answer_jsonld(&fluree, ledger_id, &entailment_query(rules)).await,
+        "'datalog' (query-time rules turn it on)",
+        "datalog by rules",
+    );
+    assert_refused(
+        answer_sparql(&fluree, ledger_id, "# PRAGMA reasoning: datalog\n").await,
+        needle,
+        "SPARQL datalog",
+    );
+}
+
+/// A caller's own `Force` wrapper is not the ledger's config: it keeps its
+/// documented behavior and ignores the query's modes.
+#[tokio::test]
+async fn a_callers_force_wrapper_still_ignores_the_querys_modes() {
+    use fluree_db_api::ReasoningModePrecedence;
+    use fluree_db_query::ir::reasoning::ReasoningModes;
+
+    let ledger_id = "it/config-reasoning-caller-force:main";
+    let fluree = seed_reasoning_defaults_with(
+        ledger_id,
+        "<urn:config:reasoning> f:reasoningModes f:rdfs .",
+        REASONING_OVERRIDE_NONE,
+    )
+    .await;
+    let ledger_state = fluree.ledger(ledger_id).await.expect("load ledger");
+    let db = fluree_db_api::GraphDb::from_ledger_state(&ledger_state)
+        .with_reasoning_precedence(ReasoningModes::rdfs(), ReasoningModePrecedence::Force);
+    for reasoning in ["none", "datalog"] {
+        let result = fluree
+            .query(&db, &entailment_query(json!({"reasoning": reasoning})))
+            .await
+            .unwrap_or_else(|e| panic!("{reasoning}: {e}"));
+        assert_eq!(
+            result.to_jsonld(&ledger_state.snapshot).expect("to_jsonld"),
+            json!(["Alice"]),
+            "{reasoning}: the caller's forced rdfs runs"
         );
     }
 }

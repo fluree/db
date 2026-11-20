@@ -99,7 +99,10 @@ impl Fluree {
             db.default_context.as_ref(),
             None,
         )?;
-        let executable = self.build_executable_for_view(db, &parsed, None).await?;
+        // The verified identity `f:overrideControl` gates on, as a query has.
+        let executable = self
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
+            .await?;
         let target = explain_target(node, &parsed.context, &db.snapshot)?;
 
         let db_ref = db.as_graph_db_ref();

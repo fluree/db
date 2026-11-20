@@ -68,6 +68,10 @@ pub enum ReasoningModePrecedence {
     ///
     /// Use this for server-policy enforcement where reasoning modes
     /// should not be overridable by clients.
+    ///
+    /// When the ledger's config sets this (its `f:reasoningDefaults` under an
+    /// `f:overrideControl` that does not allow the request), a query that
+    /// asks for other reasoning is refused instead of ignored.
     Force,
 }
 
@@ -159,6 +163,15 @@ pub struct GraphDb {
 
     /// Precedence for reasoning mode resolution.
     reasoning_precedence: ReasoningModePrecedence,
+
+    /// Whether `reasoning` came from the ledger's config
+    /// (`f:reasoningDefaults`) rather than from the caller that built the
+    /// view. With `Force` precedence it means the config decides this
+    /// request's reasoning, so a query that asks for other reasoning is
+    /// refused rather than overridden (see
+    /// [`Self::config_forces_reasoning`]). A caller's own `Force` wrapper
+    /// keeps its documented behavior: the query's modes are ignored.
+    reasoning_from_config: bool,
 
     /// OWL2-RL materialization budget from ledger config
     /// (`f:reasoningMaxFacts` / `f:reasoningMaxSeconds`).
@@ -308,6 +321,7 @@ impl GraphDb {
             policy_enforcer: None,
             reasoning: None,
             reasoning_precedence: ReasoningModePrecedence::default(),
+            reasoning_from_config: false,
             config_reasoning_budget: None,
             binary_store: None,
             dict_novelty: None,
@@ -892,6 +906,7 @@ impl GraphDb {
     pub fn with_reasoning(mut self, modes: ReasoningModes) -> Self {
         self.reasoning = Some(modes);
         self.reasoning_precedence = ReasoningModePrecedence::DefaultUnlessQueryOverrides;
+        self.reasoning_from_config = false;
         self
     }
 
@@ -918,7 +933,31 @@ impl GraphDb {
     ) -> Self {
         self.reasoning = Some(modes);
         self.reasoning_precedence = precedence;
+        self.reasoning_from_config = false;
         self
+    }
+
+    /// Apply the reasoning the ledger's config (`f:reasoningDefaults`) sets
+    /// for this request: [`Self::with_reasoning_precedence`], marked as the
+    /// config's. With `Force` precedence a query that asks for other
+    /// reasoning is then refused instead of silently overridden.
+    pub(crate) fn with_config_reasoning(
+        mut self,
+        modes: ReasoningModes,
+        precedence: ReasoningModePrecedence,
+    ) -> Self {
+        self = self.with_reasoning_precedence(modes, precedence);
+        self.reasoning_from_config = true;
+        self
+    }
+
+    /// Whether the ledger's config decides this request's reasoning: its
+    /// `f:reasoningDefaults` modes apply with `Force` precedence because the
+    /// group's `f:overrideControl` does not allow the request to change them.
+    pub(crate) fn config_forces_reasoning(&self) -> bool {
+        self.reasoning_from_config
+            && self.reasoning.is_some()
+            && self.reasoning_precedence == ReasoningModePrecedence::Force
     }
 
     /// Remove reasoning defaults from the view.
@@ -926,6 +965,7 @@ impl GraphDb {
     /// Queries will use their own reasoning modes (default: none).
     pub fn without_reasoning(mut self) -> Self {
         self.reasoning = None;
+        self.reasoning_from_config = false;
         self
     }
 
@@ -1086,6 +1126,7 @@ impl GraphDb {
             // bypasses once the plan shows them.
             reasoning: _,
             reasoning_precedence: _,
+            reasoning_from_config: _,
             config_reasoning_budget: _,
             datalog_enabled: _,
             query_time_rules_allowed: _,

@@ -201,6 +201,22 @@ impl ReasoningModes {
         self.explicit_none
     }
 
+    /// The modes this enables, by the names a query writes them with, in the
+    /// order `rdfs`, `owl2ql`, `datalog`, `owl2rl`, `owl-datalog`. A mode
+    /// another implies is listed too (`owl2ql` turns on `rdfs`).
+    pub fn mode_names(&self) -> Vec<&'static str> {
+        [
+            (self.rdfs, "rdfs"),
+            (self.owl2ql, "owl2ql"),
+            (self.datalog, "datalog"),
+            (self.owl2rl, "owl2rl"),
+            (self.owl_datalog, "owl-datalog"),
+        ]
+        .into_iter()
+        .filter_map(|(on, name)| on.then_some(name))
+        .collect()
+    }
+
     /// Parse from a JSON value (string or array of strings)
     ///
     /// Valid values:
