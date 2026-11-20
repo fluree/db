@@ -364,13 +364,26 @@ async fn grandparent_tally_from(
 ) -> fluree_db_api::ReasoningTally {
     fluree
         .query_from()
-        .jsonld(&json!({
-            "@context": {"ex": "http://example.org/"},
-            "from": from,
-            "select": "?grandparent",
-            "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
-            "reasoning": "datalog"
-        }))
+        .jsonld(&{
+            let mut q = json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": "?grandparent",
+                "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+                "reasoning": "datalog"
+            });
+            // A dataset is given as `{"from": …, "fromNamed": […]}`: rules run
+            // over a default graph of one graph (#2463), so the other ledger is
+            // a named graph, not a second `from`.
+            match &from {
+                serde_json::Value::Object(dataset) => {
+                    for (k, v) in dataset {
+                        q[k] = v.clone();
+                    }
+                }
+                _ => q["from"] = from.clone(),
+            }
+            q
+        })
         .track_all()
         .execute_tracked()
         .await
@@ -433,12 +446,12 @@ async fn the_tally_names_the_data_commit_the_rules_ran_over() {
         (json!(at_t), named(&pinned), "pinned by t"),
         (json!(at_commit), named(&pinned), "pinned by commit"),
         (
-            json!([ledger_id, other_id]),
+            json!({"from": [ledger_id], "fromNamed": [other_id]}),
             named(&head),
             "a dataset at the head",
         ),
         (
-            json!([at_t, other_id]),
+            json!({"from": [at_t], "fromNamed": [other_id]}),
             named(&pinned),
             "a dataset pinned by t",
         ),
