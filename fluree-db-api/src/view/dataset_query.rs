@@ -962,9 +962,12 @@ impl Fluree {
         }
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
-        let prepared = prepare_execution_with_config(db, executable, &prepare_config)
+        let mut prepared = prepare_execution_with_config(db, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;
+        // A tracked lane: its tally reaches the caller. Reasoning runs over
+        // the primary graph.
+        super::query::name_reasoned_data_commit(primary, &mut prepared, tracker).await;
 
         // Perf guardrail: skip fulltext arena map + `"en"` lang_id resolution
         // for queries that don't actually call `fulltext(...)`. Spatial

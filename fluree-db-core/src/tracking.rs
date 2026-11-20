@@ -650,9 +650,9 @@ pub struct PushedStatement {
 /// query results may be missing entailments. Clients should treat capped
 /// results as incomplete, not merely slow.
 ///
-/// `rule_set` and `rules_source` together say what a datalog run read, so a
-/// caller can record "these rules, as of the rules' `t`, over this data as of
-/// its `t`" from the response rather than its own bookkeeping.
+/// `rule_set`, `rules_source` and `data` together say what a run read, so a
+/// caller can record "these rules, as of the rules' commit, over this data as
+/// of its commit" from the response rather than its own bookkeeping.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReasoningTally {
     /// Whether materialization was capped before reaching fixpoint.
@@ -700,6 +700,26 @@ pub struct ReasoningTally {
     /// at the query's `t`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules_source: Option<RulesSourceTally>,
+    /// The data the run reasoned over: the queried ledger, its `t`, and the
+    /// commit that produced that `t`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<ReasoningDataTally>,
+}
+
+/// The ledger state a reasoning run read ([`ReasoningTally::data`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReasoningDataTally {
+    /// The queried ledger (for a dataset, its primary ledger).
+    pub ledger: String,
+    /// The `t` the query read it at.
+    pub t: i64,
+    /// The commit that produced `t`, when the request resolved it: the
+    /// loaded head's commit, or one lookup by `t` for a tracked request at
+    /// an earlier `t`. Absent when the lookup is ambiguous (a rebased ledger
+    /// can hold two commits at one `t`) or fails. Unlike `t`, it names one
+    /// state even if the ledger is rebuilt under the same name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_id: Option<String>,
 }
 
 /// Where a datalog run read its stored rules ([`ReasoningTally::rules_source`]).

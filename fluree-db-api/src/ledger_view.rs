@@ -240,7 +240,7 @@ impl LedgerView {
                 resolve_commit_prefix(&self.snapshot, &self.novelty, &prefix, self.t).await
             }
             CommitRef::T(t) => {
-                resolve_t_to_commit_id(&self.snapshot, &self.novelty, t, self.t).await
+                resolve_t_to_commit_id(&self.snapshot, &*self.novelty, t, self.t).await
             }
         }
     }
@@ -470,13 +470,19 @@ async fn resolve_commit_prefix(
 ///
 /// Queries the POST index for commit flakes where predicate = `fluree:db/t`
 /// and object = the target `t` value. The matching commit subject's hex digest
-/// is then converted to a [`CommitId`].
-async fn resolve_t_to_commit_id(
+/// is then converted to a [`CommitId`]. One bounded range read; more than one
+/// commit at `t` (a rebased history) is an error rather than a guess.
+///
+/// `overlay` is the ledger's novelty, or any overlay over it (a query view's).
+pub(crate) async fn resolve_t_to_commit_id<O>(
     snapshot: &LedgerSnapshot,
-    overlay: &Novelty,
+    overlay: &O,
     target_t: i64,
     current_t: i64,
-) -> Result<CommitId> {
+) -> Result<CommitId>
+where
+    O: fluree_db_core::OverlayProvider + ?Sized,
+{
     use fluree_db_core::{
         range_with_overlay, FlakeValue, IndexType, RangeMatch, RangeOptions, RangeTest, Sid,
         TXN_META_GRAPH_ID,

@@ -1624,7 +1624,10 @@ class QueryProfile:
     ``rules`` (each rule's ``id`` and the ``hash`` of its text) and, when the
     stored rules came from another graph or ledger, ``rules_source``
     (``ledger``, ``graph``, the ``t`` they were read at and, for another
-    ledger, its ``commit_id`` there).
+    ledger, its ``commit_id`` there). ``data`` names what the rules ran over:
+    the queried ``ledger``, its ``t`` and the ``commit_id`` that produced it
+    (left out when it cannot be named without a guess, as in a rebased
+    history with two commits at one ``t``).
     """
 
     result: Any

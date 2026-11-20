@@ -2475,6 +2475,7 @@ mod tests {
                 rule_set: None,
                 rules: Vec::new(),
                 rules_source: None,
+                data: None,
             })),
             sql: None,
             sql_elided: None,
@@ -2562,6 +2563,7 @@ mod tests {
                 rule_set: None,
                 rules: Vec::new(),
                 rules_source: None,
+                data: None,
             })),
             sql: None,
             sql_elided: None,
@@ -2840,6 +2842,11 @@ mod tests {
                 t: 7,
                 commit_id: Some("bafy-test".to_string()),
             }),
+            data: Some(fluree_db_core::tracking::ReasoningDataTally {
+                ledger: "data:main".to_string(),
+                t: 3,
+                commit_id: Some("bafy-data".to_string()),
+            }),
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -2930,6 +2937,7 @@ mod tests {
             rule_set: rt_rule_set,
             rules: rt_rules,
             rules_source: rt_rules_source,
+            data: rt_data,
         } = *rt_reasoning.expect("reasoning Some on round-trip");
         // Not carried by the recorded mirror: adding them would change the
         // wire form of records already in the log.
@@ -2939,6 +2947,7 @@ mod tests {
         assert_eq!(rt_rule_set, None);
         assert!(rt_rules.is_empty());
         assert_eq!(rt_rules_source, None);
+        assert_eq!(rt_data, None);
         let original_reasoning = original_tally.reasoning.expect("reasoning populated above");
         assert_eq!(rt_capped, original_reasoning.capped);
         assert_eq!(rt_capped_reason, original_reasoning.capped_reason);

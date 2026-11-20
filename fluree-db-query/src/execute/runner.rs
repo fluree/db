@@ -150,6 +150,12 @@ pub struct PreparedExecution {
     /// Per request rather than in `reasoning_diagnostics`: those are cached by
     /// rule content, which two sources can share.
     pub rules_source: Option<fluree_db_core::RulesSourceTally>,
+    /// The commit that produced the queried `t`, for the tally's
+    /// [`data`](fluree_db_core::ReasoningTally::data) block. Preparation
+    /// leaves it unset: commits are the host's to resolve, and a host that
+    /// reports the tally sets it between preparing and executing, only when
+    /// a materialization ran.
+    pub data_commit_id: Option<String>,
 }
 
 /// The request a query is prepared for. Preparing a query that reasons
@@ -589,6 +595,7 @@ pub async fn prepare_execution_with_config(
             reasoning_memory_limit: derived_outcome.memory_limit_bytes,
             reasoning_active: reasoning.has_any_enabled(),
             rules_source: super::reasoning_prep::rules_source_tally(&query.reasoning, db),
+            data_commit_id: None,
         })
     }
     .instrument(span)
@@ -890,7 +897,8 @@ async fn execute_prepared_into<'a, S: BatchSink>(
 ) -> Result<()> {
     // Surface the materialization outcome in request tracking so a capped
     // (incomplete) closure is visible to clients, not just in logs, and so is
-    // what ran: the rule set by content, and where its stored rules came from.
+    // what ran: the rule set by content, where its stored rules came from, and
+    // the data it ran over.
     if let (Some(diag), Some(tracker)) = (&prepared.reasoning_diagnostics, config.tracker) {
         tracker.record_reasoning(fluree_db_core::ReasoningTally {
             capped: diag.capped,
@@ -916,6 +924,11 @@ async fn execute_prepared_into<'a, S: BatchSink>(
                 })
                 .collect(),
             rules_source: prepared.rules_source.clone(),
+            data: Some(fluree_db_core::ReasoningDataTally {
+                ledger: db.snapshot.ledger_id.to_string(),
+                t: db.t,
+                commit_id: prepared.data_commit_id.clone(),
+            }),
         });
     }
 

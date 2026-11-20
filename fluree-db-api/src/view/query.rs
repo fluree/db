@@ -2241,9 +2241,11 @@ impl Fluree {
         prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
-        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
+        let mut prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;
+        // A tracked lane: its tally reaches the caller.
+        name_reasoned_data_commit(db, &mut prepared, tracker).await;
 
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)?;
 
@@ -2259,6 +2261,20 @@ impl Fluree {
         config.dataset = union.as_ref();
 
         execute_prepared(db_ref, vars, prepared, config).await
+    }
+}
+
+/// Name the data a tracked reasoning run read by the commit that produced its
+/// `t`, for the tally's `data` block. Only when the request is tracked and its
+/// query materialized: off the head this is an index read, which an untracked
+/// query (whose tally nobody reads) never pays.
+pub(crate) async fn name_reasoned_data_commit(
+    db: &GraphDb,
+    prepared: &mut fluree_db_query::execute::PreparedExecution,
+    tracker: &Tracker,
+) {
+    if tracker.is_enabled() && prepared.reasoning_diagnostics.is_some() {
+        prepared.data_commit_id = db.commit_id_at_t().await.map(|id| id.to_string());
     }
 }
 

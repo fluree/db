@@ -401,12 +401,19 @@ just logged:
   other than the graph the query reads, `rules_source` says where: another
   ledger's graph (`f:rulesSource` with `f:ledger`), the `t` that ledger was
   read at and its `commit_id` there, or this ledger's own `f:rulesSource`
-  graph at the query's `t`. With the query's own data pin, that is the record
-  of a run: "rule set `rule_set`, read from `rules_source.ledger` at
-  `rules_source.commit_id`, over this ledger at …". A ledger rebuilt under the
-  same name reuses its `t` values, so for a record that must name one state,
-  pin the data by commit (`"from": "data:main@commit:<cid>"`) rather than by
-  `t`.
+  graph at the query's `t`. `data`, on any materialization (OWL 2 RL as
+  well), names what the run reasoned over: the queried ledger (a dataset's
+  primary one), the `t` it was read at, and the `commit_id` that produced
+  that `t`. Together that is the record of a run:
+  "rule set `rule_set`, read from `rules_source.ledger` at
+  `rules_source.commit_id`, over `data.ledger` at `data.commit_id`". A ledger
+  rebuilt under the same name reuses its `t` values, so a commit is what
+  names one state; to repeat a run over the same data, pin it by commit
+  (`"from": "data:main@commit:<cid>"`). `data.commit_id` is left out rather
+  than guessed when the `t` cannot name one commit (a rebased history can
+  hold two at one `t`). At the ledger's head the commit is known already;
+  for an earlier `t` the request looks it up once, which only a tracked
+  request does.
 
   ```json
   "reasoning": {
@@ -424,6 +431,11 @@ just logged:
       "ledger": "rules:main",
       "graph": "http://example.org/rules",
       "t": 12,
+      "commit_id": "bafy…"
+    },
+    "data": {
+      "ledger": "data:main",
+      "t": 41,
       "commit_id": "bafy…"
     }
   }

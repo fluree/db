@@ -103,10 +103,11 @@ fn format_fuel(fuel: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_api::{ReasoningTally, RulesSourceTally};
+    use fluree_db_api::{ReasoningDataTally, ReasoningTally, RulesSourceTally};
 
-    /// The reasoning header says what ran (the rule set and its source) but
-    /// leaves the per-rule lists, which grow with the program, to the body.
+    /// The reasoning header says what ran (the rule set and its source) and
+    /// over which data, but leaves the per-rule lists, which grow with the
+    /// program, to the body.
     #[test]
     fn the_reasoning_header_names_the_rule_set_without_per_rule_counts() {
         let tally = TrackingTally {
@@ -138,6 +139,11 @@ mod tests {
                     t: 12,
                     commit_id: None,
                 }),
+                data: Some(ReasoningDataTally {
+                    ledger: "data:main".to_string(),
+                    t: 5,
+                    commit_id: Some("bafy-data".to_string()),
+                }),
             })),
             sql: None,
             sql_elided: None,
@@ -154,6 +160,10 @@ mod tests {
         assert_eq!(header["rule_set"], "00000000000000ab");
         assert_eq!(header["rules_source"]["ledger"], "rules:main");
         assert_eq!(header["rules_source"]["t"], 12);
+        // The data block is three short values: it rides the header.
+        assert_eq!(header["data"]["ledger"], "data:main");
+        assert_eq!(header["data"]["t"], 5);
+        assert_eq!(header["data"]["commit_id"], "bafy-data");
         assert!(header.get("rules_fired").is_none(), "{header}");
         assert!(header.get("rules").is_none(), "{header}");
     }

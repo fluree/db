@@ -138,6 +138,28 @@ def test_profile_reports_which_rules_ran(family):
     assert second.reasoning["rule_set"] != first.reasoning["rule_set"]
 
 
+def test_profile_names_the_data_the_rules_ran_over(conn):
+    """The ``data`` block names the ledger, the ``t`` the rules read and the
+    commit that produced it, at the head and at an earlier ``t`` or commit."""
+    ledger = conn.create("rundata")
+    earlier = ledger.insert({
+        "@context": CTX,
+        "@graph": [
+            {"@id": "ex:carol", "ex:parent": {"@id": "ex:dave"}},
+            {"@id": "ex:dave", "ex:parent": {"@id": "ex:eve"}},
+        ],
+    })
+    head = ledger.insert({"@context": CTX, "@id": "ex:zed", "ex:name": "Zed"})
+    query = {**GRANDPARENTS, "reasoning": "datalog", "rules": [GRANDPARENT_RULE]}
+
+    def named(commit):
+        return {"ledger": ledger.id, "t": commit.t, "commit_id": commit.id}
+
+    assert ledger.profile(query).reasoning["data"] == named(head)
+    assert ledger.at(earlier.t).profile(query).reasoning["data"] == named(earlier)
+    assert ledger.at(commit=earlier.id).profile(query).reasoning["data"] == named(earlier)
+
+
 def test_an_invalid_rule_is_an_error_not_a_silent_skip(family):
     bad = {**GRANDPARENT_RULE, "where": [["optional", {"@id": "?person", "ex:parent": "?p"}]]}
     with pytest.raises(fluree.InvalidRequestError):

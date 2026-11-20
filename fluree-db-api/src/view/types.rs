@@ -237,6 +237,13 @@ pub struct GraphDb {
     /// Cross-ledger rules surface separately on `rules_source_iri`.
     pub(crate) rules_source_g_id: Option<fluree_db_core::GraphId>,
 
+    /// The ledger's head commit and the `t` it produced, when this view was
+    /// built from a loaded ledger state at its head. A tracked reasoning run
+    /// names the data it read by commit
+    /// ([`ReasoningTally::data`](fluree_db_core::ReasoningTally::data)); at
+    /// the head this is that commit, with no lookup.
+    pub(crate) head_commit: Option<(i64, fluree_db_core::ContentId)>,
+
     /// Per-request governance-context capture carried across
     /// cross-ledger entry points within the same logical request.
     ///
@@ -335,6 +342,7 @@ impl GraphDb {
             query_time_rules_allowed: true,
             datalog_override_allowed: true,
             rules_source_g_id: None,
+            head_commit: None,
             cross_ledger_resolved_heads: Arc::new(std::collections::HashMap::new()),
             graph_source_id: None,
             graph_source_time: None,
@@ -365,6 +373,10 @@ impl GraphDb {
         );
         gdb.dict_novelty = Some(ledger.dict_novelty.clone());
         gdb.runtime_small_dicts = Some(ledger.runtime_small_dicts.clone());
+        gdb.head_commit = ledger
+            .head_commit_id
+            .clone()
+            .map(|commit_id| (ledger.t(), commit_id));
         // Extract binary_store from LedgerState's TypeErasedStore
         gdb.binary_store = ledger
             .binary_store
@@ -595,6 +607,40 @@ impl GraphDb {
 // ============================================================================
 
 impl GraphDb {
+    /// The commit that produced this view's `t`, which a tracked reasoning
+    /// run reports as the data it read
+    /// ([`ReasoningTally::data`](fluree_db_core::ReasoningTally::data)).
+    ///
+    /// At the ledger's head the loaded state already knows it. Otherwise one
+    /// POST-index lookup on the txn-meta graph resolves it; `None` when that
+    /// is ambiguous (a rebased ledger can hold two commits at one `t`) or
+    /// fails, rather than a guess. Costs a read off the head, so only a
+    /// tracked request whose query materialized calls it.
+    pub(crate) async fn commit_id_at_t(&self) -> Option<fluree_db_core::ContentId> {
+        if let Some((head_t, commit_id)) = &self.head_commit {
+            if *head_t == self.t {
+                return Some(commit_id.clone());
+            }
+        }
+        if self.over_graph_source || self.graph_source_id.is_some() {
+            return None;
+        }
+        match crate::ledger_view::resolve_t_to_commit_id(
+            &self.snapshot,
+            &*self.overlay,
+            self.t,
+            self.t,
+        )
+        .await
+        {
+            Ok(commit_id) => Some(commit_id),
+            Err(e) => {
+                tracing::debug!(t = self.t, error = %e, "no commit named for the reasoning tally");
+                None
+            }
+        }
+    }
+
     /// Create a `GraphDbRef` bundling snapshot, graph id, overlay, and time.
     pub fn as_graph_db_ref(&self) -> GraphDbRef<'_> {
         let db = GraphDbRef::new(&self.snapshot, self.graph_id, &*self.overlay, self.t);
@@ -1132,6 +1178,8 @@ impl GraphDb {
             query_time_rules_allowed: _,
             datalog_override_allowed: _,
             rules_source_g_id: _,
+            // Named by the ledger id, `t` and index root hashed below.
+            head_commit: _,
             // Serves `f:query` restrictions, which the policy hash refuses.
             policy_enforcer: _,
         } = self;
