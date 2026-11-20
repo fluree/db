@@ -605,7 +605,8 @@ impl Fluree {
     /// restrictions, local and cross-ledger `f:rulesSource`, and the
     /// `f:schemaSource` bundle (local, cross-ledger, and inline ontology).
     /// The query-time rule policy gate uses `dataset.any_non_root_policy()`
-    /// so a restricted policy on *any* source strips caller-supplied rules.
+    /// so a restricted policy on *any* source refuses caller-supplied rules
+    /// (query-time `rules` or a `rulesFrom`).
     ///
     /// `server_identity` is the auth-layer-verified caller identity that
     /// `f:overrideControl` gates on (`QueryExecutionOptions::server_identity`
@@ -635,8 +636,11 @@ impl Fluree {
                 .await?;
             }
             _ => {
-                if dataset.any_non_root_policy() && !executable.reasoning.modes.rules.is_empty() {
-                    return Err(super::query::query_time_rules_under_policy());
+                if dataset.any_non_root_policy() {
+                    if let Some(rules) = super::query::CallerRules::of(&executable.reasoning.modes)
+                    {
+                        return Err(super::query::query_time_rules_under_policy(rules));
+                    }
                 }
             }
         }

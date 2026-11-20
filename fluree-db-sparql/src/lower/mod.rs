@@ -490,7 +490,7 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
     }
 
     /// Build the query's `ReasoningConfig` from the `# PRAGMA reasoning: ...`
-    /// directive, if present.
+    /// directive and its companions (`reasoning-*`, `rules-from`), if present.
     ///
     /// Mirrors the JSON-LD `"reasoning"` option: no pragma means
     /// `ReasoningConfig::default()` (ledger/config defaults apply); an
@@ -556,6 +556,14 @@ impl<'a, E: IriEncoder> LoweringContext<'a, E> {
                     )
                 })?,
             );
+        }
+
+        // Like JSON-LD `rulesFrom`, a rules source turns datalog on.
+        if let Some(raw) = self.ast.pragmas.rules_from.as_deref() {
+            let rules_from = fluree_db_query::ir::RulesFrom::parse(raw.trim())
+                .map_err(|e| LowerError::invalid_pragma("rules-from", e, self.ast.span))?;
+            modes.rules_from = Some(rules_from);
+            modes.datalog = true;
         }
 
         if modes == ReasoningModes::default() {
@@ -5267,6 +5275,41 @@ mod pragma_tests {
         )
         .unwrap_err();
         assert!(matches!(err, LowerError::InvalidPragma { .. }), "{err}");
+    }
+
+    /// `# PRAGMA rules-from:` is JSON-LD `rulesFrom`: the parsed address,
+    /// and datalog on.
+    #[test]
+    fn pragma_rules_from_names_the_rules_and_turns_on_datalog() {
+        let query = lower_query(
+            "# PRAGMA rules-from: rules:main@t:3#http://example.org/rules
+             SELECT * WHERE { ?s ?p ?o }",
+        )
+        .unwrap();
+        let modes = &query.reasoning.modes;
+        assert!(modes.datalog);
+        let rules_from = modes.rules_from.as_ref().expect("rules-from carried");
+        assert_eq!(rules_from.ledger().as_str(), "rules:main");
+        assert_eq!(
+            rules_from.at(),
+            Some(&fluree_db_core::dataset_ref::TimeSpec::AtT(3))
+        );
+        assert_eq!(rules_from.graph_iri(), "http://example.org/rules");
+    }
+
+    #[test]
+    fn pragma_rules_from_that_does_not_parse_errors() {
+        for value in ["", "rules:main@nope:1", "rules:main#config"] {
+            let err = lower_query(&format!(
+                "# PRAGMA rules-from: {value}
+                 SELECT * WHERE {{ ?s ?p ?o }}"
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, LowerError::InvalidPragma { .. }),
+                "{value}: {err}"
+            );
+        }
     }
 }
 

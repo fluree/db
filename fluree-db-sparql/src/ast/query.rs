@@ -55,7 +55,7 @@ impl SparqlAst {
 /// reasoning values are the exception — collected verbatim and validated
 /// during lowering. When a pragma repeats, the last one wins.
 ///
-/// Query behaviour (`reasoning*`, `include-system-facts`) is applied by
+/// Query behaviour (`reasoning*`, `rules-from`, `include-system-facts`) is applied by
 /// lowering. The rest are request options the host applies, exactly where it
 /// applies the matching JSON-LD `opts` key or `fluree-*` header.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -76,6 +76,11 @@ pub struct Pragmas {
     /// return in datalog rule bodies (JSON-LD `reasoningTime`). Collected
     /// verbatim; validates during lowering.
     pub reasoning_time: Option<String>,
+    /// `# PRAGMA rules-from: <ledger>[@<pin>][#<graph IRI>]` — reason with
+    /// the stored rules of that graph instead of the ledger's configured
+    /// ones (JSON-LD `rulesFrom`). Collected verbatim; validates during
+    /// lowering.
+    pub rules_from: Option<String>,
     /// `# PRAGMA include-system-facts: true` — surface the `f:reifies*`
     /// edge-annotation encoding in variable-predicate scans (JSON-LD
     /// `opts.includeSystemFacts`). Queries only.

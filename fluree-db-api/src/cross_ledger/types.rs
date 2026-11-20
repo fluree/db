@@ -12,7 +12,7 @@ use fluree_db_core::graph_registry::{names_config_graph, txn_meta_graph_iri};
 use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_ledger::LedgerState;
 use fluree_db_policy::PolicyArtifactWire;
-pub use fluree_db_query::datalog_rules::{ImportedRule, ImportedRules, RuleLanguage};
+pub use fluree_db_query::datalog_rules::{ImportOrigin, ImportedRule, ImportedRules, RuleLanguage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -504,7 +504,11 @@ pub struct RulesArtifactWire {
 
 impl RulesArtifactWire {
     /// The rules as a query runs them: stored rules, named by their
-    /// IRI, with the ledger, graph and `t` they were read from.
+    /// IRI, with the ledger, graph and `t` they were read from, as a
+    /// configured `f:rulesSource` imports them (beside the data ledger's
+    /// own). A query's `rulesFrom` sets
+    /// [`ImportOrigin::RulesFrom`](fluree_db_query::datalog_rules::ImportOrigin::RulesFrom)
+    /// on the result.
     ///
     /// **Fail-closed**: a JSON-LD rule whose text is not JSON returns
     /// [`super::CrossLedgerError::TranslationFailed`] naming the rule,
@@ -532,6 +536,7 @@ impl RulesArtifactWire {
             t: self.origin.resolved_t,
             commit_id: self.origin.commit_id.as_ref().map(ToString::to_string),
             rules: self.rules.clone(),
+            origin: ImportOrigin::RulesSource,
         })
     }
 }

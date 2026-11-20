@@ -43,6 +43,8 @@ mod it_reasoning_policy_contract;
 mod it_reasoning_request_limits;
 #[path = "it_rules_cross_ledger.rs"]
 mod it_rules_cross_ledger;
+#[path = "it_rules_from.rs"]
+mod it_rules_from;
 #[path = "it_rules_source.rs"]
 mod it_rules_source;
 #[path = "it_schema_cross_ledger.rs"]

@@ -21,10 +21,11 @@ mod types;
 pub use cache::GovernanceCache;
 pub use error::CrossLedgerError;
 pub use resolver::resolve_graph_ref;
+pub(crate) use resolver::resolve_rules_from;
 pub use types::{
-    ArtifactKind, ConstraintsArtifactWire, GovernanceArtifact, ImportedRule, ImportedRules,
-    ModelHead, ResolveCtx, ResolvedGraph, RuleLanguage, RulesArtifactWire, SchemaArtifactWire,
-    ShapesArtifactWire, WireObject, WireOrigin, WireTriple,
+    ArtifactKind, ConstraintsArtifactWire, GovernanceArtifact, ImportOrigin, ImportedRule,
+    ImportedRules, ModelHead, ResolveCtx, ResolvedGraph, RuleLanguage, RulesArtifactWire,
+    SchemaArtifactWire, ShapesArtifactWire, WireObject, WireOrigin, WireTriple,
 };
 
 /// Resolve a `f:graphSelector` IRI against a model ledger snapshot.

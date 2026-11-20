@@ -338,8 +338,11 @@ fn parse_stored_rule(
     })
 }
 
-/// Datalog rules this ledger's `f:rulesSource` reads from another ledger
-/// (`f:ledger`), as they are stored there, and where they were read.
+/// Stored datalog rules read from a graph the query does not read, as they
+/// are stored there, and where they were read: another ledger's graph that
+/// this ledger's `f:rulesSource` names (`f:ledger`), or the graph a query's
+/// `rulesFrom` names. [`Self::origin`] says which, and so whether this
+/// ledger's own stored rules run beside them.
 ///
 /// They join the rule set as stored rules, not query-time ones: their author
 /// is not present, and they are re-read on every query, so a check that
@@ -356,6 +359,23 @@ pub struct ImportedRules {
     /// The commit of that ledger at `t`, when the resolver knows it.
     pub commit_id: Option<String>,
     pub rules: Vec<ImportedRule>,
+    /// What brought them into the query.
+    pub origin: ImportOrigin,
+}
+
+/// What brought [`ImportedRules`] into a query, which decides whether the
+/// queried ledger's own stored rules run beside them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum ImportOrigin {
+    /// The ledger's config: an `f:rulesSource` naming another ledger. The
+    /// ledger's own `f:rule` values, in the graph the query reads, run
+    /// beside them.
+    #[default]
+    RulesSource,
+    /// The query's `rulesFrom`. They replace every stored rule the ledger's
+    /// config would run: its own `f:rule` values, a local `f:rulesSource`
+    /// graph, and a cross-ledger one, which is not read.
+    RulesFrom,
 }
 
 /// One rule of [`ImportedRules`]: the IRI of the subject its `f:rule` value
@@ -368,6 +388,12 @@ pub struct ImportedRule {
 }
 
 impl ImportedRules {
+    /// Whether these rules stand in for the queried ledger's own stored
+    /// rules rather than run beside them.
+    pub fn replace_stored_rules(&self) -> bool {
+        self.origin == ImportOrigin::RulesFrom
+    }
+
     /// Parse each rule against `snapshot`, the ledger the rules run over, and
     /// add it to `rule_set`. A rule that does not parse fails the query,
     /// naming the rule and the ledger it came from.

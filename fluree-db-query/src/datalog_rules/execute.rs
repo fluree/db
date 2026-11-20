@@ -72,8 +72,10 @@ pub async fn execute_datalog_rules(
 }
 
 /// Load the stored rules (from `rules_source_g_id`, or the query graph), the
-/// rules another ledger's `f:rulesSource` supplies (`imported`), and the
-/// query-time rules into one ordered rule set.
+/// rules read from elsewhere (`imported`: another ledger's `f:rulesSource`,
+/// or a query's `rulesFrom`), and the query-time rules into one ordered rule
+/// set. Rules a `rulesFrom` names replace the ledger's own stored rules
+/// ([`super::ImportedRules::replace_stored_rules`]): those are not read.
 pub async fn load_rule_set(
     db: GraphDbRef<'_>,
     query_time_rules: &[serde_json::Value],
@@ -84,7 +86,11 @@ pub async fn load_rule_set(
         Some(rg) if rg != db.g_id => GraphDbRef::new(db.snapshot, rg, db.overlay, db.t),
         _ => db,
     };
-    let mut rule_set = extract_datalog_rules(rules_db).await?;
+    let mut rule_set = if imported.is_some_and(super::ImportedRules::replace_stored_rules) {
+        DatalogRuleSet::new()
+    } else {
+        extract_datalog_rules(rules_db).await?
+    };
     if let Some(imported) = imported {
         imported.add_to(&mut rule_set, db.snapshot)?;
     }
