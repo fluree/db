@@ -38,6 +38,36 @@ impl std::fmt::Display for OutputFormatKind {
     }
 }
 
+/// Box-drawing style shared by every table the CLI prints.
+///
+/// This is comfy-table's `UTF8_FULL_CONDENSED` (outer border, column rules, a
+/// header rule, no rules between body rows) with two changes: column rules are
+/// solid `│` instead of dashed `┆`, and the header rule is a single `─` line
+/// with `├ ┼ ┤` junctions instead of `╞ ═ ╪ ╡`:
+///
+/// ```text
+/// ┌───────┬─────┐
+/// │ name  │ age │
+/// ├───────┼─────┤
+/// │ Alice │ 42  │
+/// │ Bob   │ 27  │
+/// └───────┴─────┘
+/// ```
+///
+/// Characters follow comfy-table's preset order: left/right border, top/bottom
+/// border, header rule (left, line, middle, right), column rule, row rule
+/// (line, middle, left, right; blank = none), top/bottom junctions, corners.
+const TABLE_STYLE: &str = "││──├─┼┤│    ┬┴┌┐└┘";
+
+/// A new [`Table`] with the CLI's shared box-drawing style applied.
+///
+/// Use this instead of `Table::new()` so every table the CLI prints matches.
+pub fn new_table() -> Table {
+    let mut table = Table::new();
+    table.load_preset(TABLE_STYLE);
+    table
+}
+
 /// Result of formatting: the rendered string plus the total row count.
 pub struct FormatOutput {
     pub text: String,
@@ -102,7 +132,7 @@ pub fn format_sparql_table_from_result(
         });
     }
 
-    let mut table = Table::new();
+    let mut table = new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(&headers);
 
@@ -438,7 +468,7 @@ fn fql_row_count(json: &serde_json::Value) -> usize {
 }
 
 fn format_sparql_table(json: &serde_json::Value, limit: Option<usize>) -> CliResult<FormatOutput> {
-    let mut table = Table::new();
+    let mut table = new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
 
     let vars = json
@@ -545,7 +575,7 @@ fn format_jsonld_table(json: &serde_json::Value, limit: Option<usize>) -> CliRes
         )));
     }
 
-    let mut table = Table::new();
+    let mut table = new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(&columns);
 
@@ -590,6 +620,40 @@ mod tests {
     use serde_json::json;
 
     const LEDGER: &str = "cli/table-novelty:main";
+
+    // ---- shared table style ------------------------------------------------
+
+    /// Every CLI table renders with box-drawing characters, and the header
+    /// rule has a junction under each column separator (comfy-table's default
+    /// `ASCII_FULL` drew `+=====+` with no junction, which read as broken).
+    #[test]
+    fn new_table_renders_box_drawing_borders() {
+        let mut table = new_table();
+        table.set_header(["name", "age"]);
+        table.add_row(["Alice", "42"]);
+        table.add_row(["Bob", "27"]);
+        let expected = "\
+┌───────┬─────┐
+│ name  │ age │
+├───────┼─────┤
+│ Alice │ 42  │
+│ Bob   │ 27  │
+└───────┴─────┘";
+        assert_eq!(table.to_string(), expected);
+    }
+
+    /// The SPARQL table path goes through the shared style too.
+    #[test]
+    fn sparql_table_uses_shared_style() {
+        let json = json!({
+            "head": {"vars": ["name"]},
+            "results": {"bindings": [{"name": {"type": "literal", "value": "Alice"}}]}
+        });
+        let out = format_sparql_table(&json, None).expect("renders");
+        assert!(out.text.starts_with('┌'), "got:\n{}", out.text);
+        assert!(out.text.contains("│ Alice │"), "got:\n{}", out.text);
+        assert!(!out.text.contains('+'), "no ASCII junctions:\n{}", out.text);
+    }
 
     // ---- #1805 secondary: the JSON-LD table renderer's input contract ------
 

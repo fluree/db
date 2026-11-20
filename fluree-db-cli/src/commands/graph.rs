@@ -3,7 +3,7 @@ use crate::commands::create::{self, ImportOpts, ImportTarget};
 use crate::context::{self, LedgerMode};
 use crate::error::{CliError, CliResult};
 use crate::remote_client::RemoteLedgerClient;
-use comfy_table::{ContentArrangement, Table};
+use comfy_table::ContentArrangement;
 use fluree_db_api::server_defaults::FlureeDir;
 use fluree_db_core::graph_registry::{
     config_graph_iri, txn_meta_graph_iri, CONFIG_GRAPH_ID, DEFAULT_GRAPH_ID, TXN_META_GRAPH_ID,
@@ -312,7 +312,7 @@ async fn run_list(
         return Ok(());
     }
 
-    let mut table = Table::new();
+    let mut table = crate::output::new_table();
     table.set_content_arrangement(ContentArrangement::Dynamic);
     table.set_header(vec!["IRI", "Kind", "g-id", "Flakes", "Size"]);
     for (entry, g_id) in entries {
