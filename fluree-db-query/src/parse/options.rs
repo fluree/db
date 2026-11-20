@@ -673,7 +673,7 @@ mod tests {
             let modes = reasoning_of(&query).expect("rulesFrom is a reasoning key");
             assert!(modes.datalog, "{query}");
             assert_eq!(
-                modes.rules_from.as_ref().map(|r| r.as_str()),
+                modes.rules_from.as_ref().map(crate::ir::RulesFrom::as_str),
                 Some("rules:main#http://example.org/rules"),
                 "{query}"
             );
