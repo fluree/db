@@ -27,8 +27,10 @@ cross-ledger references today:
   staged namespace at validation time and rejected/accepted
   transactions on D accordingly.
 - **Cross-ledger datalog rules** (`f:rulesSource` with
-  `f:ledger`) — M's `f:rule` JSON bodies feed D's query-time
-  datalog evaluator alongside any rules D stores locally.
+  `f:ledger`) — M's `f:rule` values (JSON-LD or SPARQL) feed D's
+  query-time datalog evaluator alongside any rules D stores
+  locally. A query can also name a rules graph, at a pin, itself
+  (`rulesFrom`).
 
 This page covers configuration for all five. For the
 underlying design (resolver contract, term-space translation,
@@ -621,7 +623,44 @@ Specifics:
   "these rules as of M's `t`, over D as of its `t`" (see
   [Reasoning](../query/reasoning.md)).
 - M is read at its head for the request; pinning M to an
-  earlier `t` (`f:atT`) is not yet supported (see Limitations).
+  earlier `t` in D's config (`f:atT`) is not yet supported (see
+  Limitations).
+
+### Naming the rules per query: `rulesFrom`
+
+A query can name a rules graph itself, at a pin, instead of
+reading the one D's config names:
+`"rulesFrom": "rules:main@commit:<cid>#http://example.org/rules"`
+(SPARQL: `# PRAGMA rules-from:`). It takes the same resolver and
+the same reading of `f:rule` values as a configured
+`f:rulesSource`, and the rules it names **replace** D's stored
+rules for that query: D's own `f:rule` values and its configured
+`f:rulesSource`, local or cross-ledger, do not run, and a
+configured cross-ledger source is not read. Query-time `rules`
+still run beside them.
+
+- **Pinned or at the head.** `@commit:<cid>` and `@t:N` read M as
+  of that commit or `t` (`@time:` and `@recorded:` work too); with
+  no pin M's head is read, sharing the request's head capture for
+  M with any policy D's config reads from it. A `t` past M's head
+  is refused (400). `rules_source` in the tracked response names
+  M, the graph, the `t` the pin resolved to and the `commit_id` at
+  that `t`.
+- **Admin-only.** A query that names its rules chooses them, so
+  `rulesFrom` is refused (400) where query-time `rules` are: under
+  a non-root view policy, where D's config denies query-time rules
+  to the request (`f:allowQueryTimeRules false`), and where D's
+  config sets the request's reasoning.
+- **Same failures.** A ledger that is not on this instance, a
+  graph it does not hold at that state, and an `f:rule` value of
+  another datatype fail as they do for a configured source (502,
+  with the variants under [Failure modes](#failure-modes)); a rule
+  that does not parse fails with a 400 naming it and M; naming
+  `#config` or `#txn-meta` is a 400.
+
+See [Datalog rules](../query/datalog-rules.md#3-stored-rules-named-per-query-rulesfrom)
+for the syntax and [Recording a rule run](../query/datalog-rules.md#recording-a-rule-run)
+for pinning a run's rules and data together.
 
 ## Limitations
 
@@ -630,7 +669,7 @@ closed when configured:
 
 | Configuration                              | Outcome |
 |--------------------------------------------|---------|
-| `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. |
+| `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. For rules, a query can pin M itself with [`rulesFrom`](#naming-the-rules-per-query-rulesfrom). |
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
 | `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. Exception: a [virtual graph source](#virtual-graph-sources-iceberg--sql) looks the identity's classes up in M. |

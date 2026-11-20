@@ -131,11 +131,11 @@ For each setting group independently:
 
 A query denied an override is refused with a 400 naming what it asked for,
 rather than answered with the configured modes: a mode they leave out,
-`"none"` where they turn reasoning on, or query-time `rules` or an inline
-`ontology`. A query that asks for no reasoning, or only for modes the config
+`"none"` where they turn reasoning on, or query-time `rules`, a `rulesFrom`
+or an inline `ontology`. A query that asks for no reasoning, or only for modes the config
 runs anyway, gets the configured modes. Likewise, under `f:datalogDefaults`
-with `f:datalogEnabled false`, a denied query that asks for datalog (by name
-or with `rules`) is refused. A query's budget (`reasoningBudget`) is not
+with `f:datalogEnabled false`, a denied query that asks for datalog (by name,
+or with `rules` or a `rulesFrom`) is refused. A query's budget (`reasoningBudget`) is not
 refused: where it may not override, the configured budget replaces it, and a
 capped run says so in the tracked `reasoning` block.
 

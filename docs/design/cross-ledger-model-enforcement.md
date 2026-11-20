@@ -284,6 +284,7 @@ D, never against M.
 | `f:atT N`                  | `resolved_t = N`. Per-resolve, not stored in `resolved_ts`. M time-travels to that point. |
 | `f:atT N`, N pruned        | Fail closed (see [Failure variants](#failure-variants)). No fallback to nearest-available. |
 | Mid-request M advancement  | Not reflected in the current request. The next request re-captures on its first reference. |
+| A query's `rulesFrom` with a pin (`@t:`, `@commit:`, `@time:`, `@recorded:`) | The pin resolves against M's current state to a `t` and the commit at that `t` (left out where a rebased history holds two); a `t` past M's head fails (400). Keyed by that head, not stored in `resolved_heads`, and kept out of the per-instance cache when no commit names it. An unpinned `rulesFrom` takes the captured head like any unpinned reference. |
 
 Capture is **lazy and per request**: a request that never needs M
 never pays for M's head lookup. Once captured, `resolved_t` is
@@ -541,12 +542,9 @@ materializers aren't implemented. Each lands as a new
   across ledgers) lands separately.
 - `f:ontologyImportMap` cross-ledger (mapping table entries
   whose `f:graphRef` targets another model ledger).
-- `f:rulesSource` cross-ledger (datalog rules). The same-ledger
-  routing for `f:rulesSource` is also still pending; the
-  cross-ledger path will route through the shared resolver
-  once same-ledger lands.
-- `f:atT` temporal pinning (currently rejected as
-  `UnsupportedFeature`).
+- `f:atT` temporal pinning in config (currently rejected as
+  `UnsupportedFeature`). For datalog rules, a query can pin the
+  rules source itself (`rulesFrom`, above).
 - `f:trustPolicy` and `f:rollbackGuard` (rejected as
   `UnsupportedFeature` for the same reason).
 

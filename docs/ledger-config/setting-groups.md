@@ -214,7 +214,7 @@ Controls Fluree's stored datalog rules (`f:rule`).
 |-------|------|---------|-------------|
 | `f:datalogEnabled` | boolean | `true` | Enable or disable datalog rule evaluation (a query that turns datalog on when a request may not override this is refused with a 400) |
 | `f:rulesSource` | `f:GraphRef` | (none) | Graph containing `f:rule` definitions |
-| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules (a query that supplies them when they are not allowed is refused with a 400) |
+| `f:allowQueryTimeRules` | boolean | `true` | Allow queries to supply ad-hoc rules, or to name the stored rules they reason with (`rulesFrom`); a query that does either when it is not allowed is refused with a 400 |
 | `f:overrideControl` | IRI or object | `f:OverrideAll` | Override gating |
 
 `f:rulesSource` is non-overridable. `f:datalogEnabled` and `f:allowQueryTimeRules` are overridable.
@@ -225,7 +225,7 @@ datalog or `f:reasoningDefaults` turns it on.
 
 Where `f:overrideControl` does not allow a request to override them and
 `f:datalogEnabled` is `false`, a query that asks for datalog, by name or by
-supplying `rules` (which turn it on), is refused with a 400. Datalog that
+supplying `rules` or a `rulesFrom` (which turn it on), is refused with a 400. Datalog that
 `f:reasoningDefaults` turns on for a query that did not ask for it is switched
 off without an error.
 

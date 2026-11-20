@@ -183,7 +183,7 @@ body.
 
 ## Providing rules
 
-Rules can be provided in two ways:
+Rules can be provided in three ways:
 
 ### 1. Query-time rules
 
@@ -270,6 +270,65 @@ same fixpoint loop. A tracked query reports the merged set by
 content (`rule_set`) and where its stored rules were read
 (`rules_source`, with the `t` they were read at); see
 [Reasoning](reasoning.md) for the `reasoning` block.
+
+### 3. Stored rules named per query (`rulesFrom`)
+
+A query can name the graph whose stored rules it reasons with, and the state
+to read them at, with `rulesFrom` (SPARQL: `# PRAGMA rules-from:`). The value
+is a ledger address:
+
+```text
+<ledger>[:branch][@t:N | @commit:<id> | @time:<ISO-8601> | @recorded:<ISO-8601>][#<graph IRI>]
+```
+
+```json
+{
+  "@context": {"ex": "http://example.org/"},
+  "from": "data:main@commit:bafy…",
+  "select": ["?a"],
+  "where": {"@id": "?a", "@type": "ex:Candidate"},
+  "rulesFrom": "rules:main@commit:bafy…#http://example.org/rules"
+}
+```
+
+```sparql
+# PRAGMA rules-from: rules:main@commit:bafy…#http://example.org/rules
+PREFIX ex: <http://example.org/>
+SELECT ?a FROM <data:main@commit:bafy…> WHERE { ?a a ex:Candidate }
+```
+
+- **They replace the configured rules.** The `f:rule` values in that graph,
+  as of that state, are the query's stored rules: the queried ledger's own
+  `f:rule` values, a local `f:rulesSource` graph and a cross-ledger
+  `f:rulesSource` do not run (the cross-ledger one is not read). Query-time
+  `rules`, if the query also has them, run beside them.
+- **Pin them.** Without a pin the rules ledger's head is read, which moves
+  as rules are added. Prefer `@commit:`, which names one state even if the
+  ledger is rebuilt under the same name; `@t:` reads the commit at that `t`.
+  A pin past the rules ledger's head is refused (400), as reading the ledger
+  there is.
+- **The graph.** Without `#<graph IRI>`, the rules ledger's default graph is
+  read. `#txn-meta` and `#config` hold no rules and are refused (400). The
+  graph IRI is written in full, as in a `from` address.
+- **Like query-time rules, `rulesFrom` turns datalog on and is admin-only.**
+  It is refused (400), naming `rulesFrom`, wherever query-time `rules` are:
+  under a non-root view policy, where the ledger's config denies query-time
+  rules to the request (`f:allowQueryTimeRules false` under an
+  `f:overrideControl` that does not allow it), where the config sets the
+  request's reasoning, and where it turns datalog off. A history query
+  refuses it as it refuses any reasoning, and a SPARQL update refuses the
+  pragma (a write evaluates no reasoning).
+- **The rules are stored rules** of the ledger they are read from: each is
+  named by the IRI of its subject, parsed as a stored rule, and one that does
+  not parse fails the query naming it and that ledger (400). A ledger that is
+  not on this instance, or a graph it does not hold at that state, fails as a
+  [cross-ledger rules source](../security/cross-ledger-policy.md#cross-ledger-datalog-rules)
+  does (502).
+
+A tracked query reports the rules as it reports any stored rules read from
+elsewhere: `rules_source` names the ledger, the graph, the `t` the pin
+resolved to and the `commit_id` at that `t`; `rule_set` and `rules` are the
+rules that ran.
 
 ## SPARQL rules
 
@@ -603,17 +662,22 @@ Derived facts live in the query's overlay and are never committed. To keep
 what a run concluded, with a record of what produced it, a runner reads the
 conclusions with a query and writes them, and the record, itself:
 
-1. **Pin the data.** Query the ledger at a fixed state: `"from":
-   "data:main@commit:<cid>"`, or `@t:` for a ledger that is never rebuilt (a
-   ledger rebuilt under the same name reuses its `t` values; a commit names
-   one state). Pinning is what lets the run be repeated over the same data;
-   the tracked response names the data commit a run read either way.
+1. **Pin the data, and the rules.** Query the ledger at a fixed state:
+   `"from": "data:main@commit:<cid>"`, or `@t:` for a ledger that is never
+   rebuilt (a ledger rebuilt under the same name reuses its `t` values; a
+   commit names one state). Name the rules the same way with
+   [`rulesFrom`](#3-stored-rules-named-per-query-rulesfrom):
+   `"rulesFrom": "rules:main@commit:<cid>#<graph IRI>"`. Pinning both is what
+   lets the run be repeated, the same rules over the same data; the tracked
+   response names the data commit and the rules commit a run read either
+   way, so an unpinned run can be repeated pinned afterwards.
 2. **Run the rules, tracked.** A `construct` query with `"reasoning":
    "datalog"` and `"opts": {"meta": true}` returns the derived triples; a
    `select` with aggregates returns per-rule counts. The tracked
    [`reasoning` block](reasoning.md) says what ran: `rule_set`, each rule's
    name and text digest (`rules`), where stored rules were read
-   (`rules_source`, with the rules ledger's `t` and `commit_id`), the data
+   (`rules_source`, with the rules ledger's `t` and `commit_id`: for a pinned
+   `rulesFrom`, the commit it was pinned to), the data
    they ran over (`data`, with this ledger's `t` and the `commit_id` that
    produced it), `rules_fired`, `evaluation_time`, and whether a budget cut
    the run (`capped`). Don't record a capped run as complete: a positive
