@@ -214,7 +214,7 @@ impl Novelty {
     }
 
     /// Every flake of `g_id`, segment by segment.
-    fn graph_flakes(&self, g_id: GraphId) -> impl Iterator<Item = &Flake> {
+    pub(crate) fn graph_flakes(&self, g_id: GraphId) -> impl Iterator<Item = &Flake> {
         self.graphs
             .get(g_id)
             .and_then(Option::as_ref)

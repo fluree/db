@@ -15,12 +15,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 
-/// Full identity of a fact — every [`Flake`] component except `t` and `op`,
-/// and the datatype of a value the index keys by value alone
-/// ([`FlakeValue::index_keys_by_value`]): storage holds an integer too large
-/// for 64 bits as one fact whatever XSD subtype each op writes it with, so
-/// netting it per term would replay a retraction under one subtype and an
-/// assertion under another at one `t`, which a commit may not hold.
+/// Full identity of a fact — every [`Flake`] component except `t` and `op`.
 ///
 /// This is deliberately NOT `Flake`'s own `Eq`/`Hash` (which ignore `g` by
 /// design — flake identity is graph-independent for index purposes). Netting
@@ -33,7 +28,7 @@ pub struct FactKey {
     s: Sid,
     p: Sid,
     o: FlakeValue,
-    dt: Option<Sid>,
+    dt: Sid,
     lang: Option<String>,
     place: Option<ListPlace>,
 }
@@ -46,7 +41,7 @@ impl FactKey {
             s: flake.s.clone(),
             p: flake.p.clone(),
             o: flake.o.clone(),
-            dt: (!flake.o.index_keys_by_value()).then(|| flake.dt.clone()),
+            dt: flake.dt.clone(),
             lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
             place: flake.m.as_ref().and_then(fluree_db_core::FlakeMeta::place),
         }
@@ -378,42 +373,25 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// An integer too large for 64 bits is one fact whatever subtype each op
-    /// writes it with, so a delete under one subtype and a write under
-    /// another net to the write alone. A value that fits 64 bits keeps its
-    /// datatype in the key.
+    /// A value's datatype is part of its fact, for an integer too large for
+    /// 64 bits as for one that fits: a delete under one subtype and a write
+    /// under another are two facts, as the index keeps them.
     #[test]
-    fn a_big_integer_nets_by_value_across_subtypes() {
-        let big = |dt: &str, t: i64, op: bool| {
-            Flake::new(
-                sid("a"),
-                sid("pred"),
-                FlakeValue::BigInt(Box::new(
-                    "123456789012345678901234567890".parse().expect("big"),
-                )),
-                sid(dt),
-                t,
-                op,
-                None,
-            )
-        };
-        let out = net(&[big("integer", 1, false), big("nonNegativeInteger", 2, true)]);
-        assert_eq!(out.len(), 1);
-        assert!(out[0].op);
-        assert_eq!(out[0].dt, sid("nonNegativeInteger"));
-
-        let long = |dt: &str, t: i64, op: bool| {
-            Flake::new(
-                sid("a"),
-                sid("pred"),
-                FlakeValue::Long(7),
-                sid(dt),
-                t,
-                op,
-                None,
-            )
-        };
-        let out = net(&[long("integer", 1, false), long("int", 2, true)]);
-        assert_eq!(out.len(), 2);
+    fn an_integer_nets_per_subtype() {
+        for value in [
+            FlakeValue::BigInt(Box::new(
+                "123456789012345678901234567890".parse().expect("big"),
+            )),
+            FlakeValue::Long(7),
+        ] {
+            let flake = |dt: &str, t: i64, op: bool| {
+                Flake::new(sid("a"), sid("pred"), value.clone(), sid(dt), t, op, None)
+            };
+            let out = net(&[
+                flake("integer", 1, false),
+                flake("nonNegativeInteger", 2, true),
+            ]);
+            assert_eq!(out.len(), 2, "{value:?}");
+        }
     }
 }

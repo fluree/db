@@ -318,6 +318,7 @@ impl HistoricalLedgerView {
         let mut lifecycle: Vec<fluree_db_core::CommitGraphLifecycle> = Vec::new();
 
         let mut commit_count = 0;
+        let mut by_value: Vec<Flake> = Vec::new();
         while let Some(result) = stream.next().await {
             let commit = result?;
             commit_count += 1;
@@ -357,6 +358,18 @@ impl HistoricalLedgerView {
             } else {
                 None
             };
+
+            // What a commit staged by value retracts of a big integer is read
+            // once the index is attached (see `fluree_db_novelty::by_value`).
+            if commit.retracts_big_integers_by_value() {
+                by_value.extend(
+                    commit
+                        .flakes
+                        .iter()
+                        .filter(|f| f.o.is_big_integer())
+                        .cloned(),
+                );
+            }
 
             let meta_flakes = generate_commit_flakes(&commit, ledger_id, commit.t);
             let mut all_flakes = commit.flakes;
@@ -472,6 +485,8 @@ impl HistoricalLedgerView {
             novelty.apply_commit(flakes, commit_t, &reverse_graph)?;
         }
         crate::link_base_without_annotations(&mut novelty, snapshot)?;
+        by_value.sort_by_key(|f| f.t);
+        novelty.note_by_value_ops(&by_value, None);
 
         tracing::trace!(
             commit_count,

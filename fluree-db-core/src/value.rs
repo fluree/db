@@ -310,11 +310,11 @@ impl FlakeValue {
 
     /// Whether two different terms whose values are of this kind can share a
     /// persisted index key, so that storage, which merges ops by key, holds
-    /// them as one fact. A big integer is keyed by its value alone, whatever
-    /// XSD subtype it was written with, and every null shares one key. For
-    /// every other kind the key is a function of the term that no two terms
-    /// share: a `dateTime` or `time` is keyed to the microsecond, which is
-    /// all it holds.
+    /// them as one fact. A `main` root keys a big integer by its value alone,
+    /// whatever XSD subtype it was written with (a v5 root keys the subtype
+    /// too), and every null shares one key. For every other kind the key is a
+    /// function of the term that no two terms share: a `dateTime` or `time`
+    /// is keyed to the microsecond, which is all it holds.
     ///
     /// A double is listed although no two double terms share a key: its key
     /// is its value under its datatype, with every NaN as one and -0.0 as
@@ -351,20 +351,11 @@ impl FlakeValue {
         }
     }
 
-    /// Whether the index keys this value by the value alone, whatever XSD
-    /// datatype it is written with: an integer too large for 64 bits, which
-    /// its `(graph, predicate)` arena keys by value, so every subtype it is
-    /// written under is one stored fact. Decided without an index, unlike
-    /// the other kinds of [`Self::index_key_may_merge_terms`].
-    pub fn index_keys_by_value(&self) -> bool {
-        matches!(self, FlakeValue::BigInt(v) if v.to_i64().is_none())
-    }
-
-    /// Whether this value, written with datatype `dt`, keeps less in its
+    /// Whether this value, written with datatype `dt`, can keep less in its
     /// persisted index key than the term holds, so the key decodes to a
     /// different term: an integer too large for 64 bits written with an XSD
-    /// subtype (the key keeps no subtype), or a null (every null shares one
-    /// key). A query that reads such a term through its key gets the other
+    /// subtype (a `main` root's key keeps no subtype), or a null (every null
+    /// shares one key). A query that reads such a term through its key gets the other
     /// term. No double does, `±INF` and NaN included: its key decodes to a
     /// value equal to the one written.
     /// See [`Self::index_key_may_merge_terms`] for the kinds.
@@ -374,6 +365,14 @@ impl FlakeValue {
             FlakeValue::Null => true,
             _ => false,
         }
+    }
+
+    /// Whether this is an integer too large for 64 bits: a value an earlier
+    /// release's index keyed by value alone, every XSD subtype it was written
+    /// with as one fact. A commit staged against such an index retracts it
+    /// under every subtype ([`crate::Commit::num_big_typing`]).
+    pub fn is_big_integer(&self) -> bool {
+        matches!(self, FlakeValue::BigInt(v) if v.to_i64().is_none())
     }
 
     /// Check if this is any temporal type (DateTime, Date, Time, g-types)

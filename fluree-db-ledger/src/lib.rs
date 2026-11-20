@@ -600,6 +600,7 @@ impl LedgerState {
         let stream = trace_first_parent_commits_by_id(store, head_cid.clone(), index_t);
         futures::pin_mut!(stream);
 
+        let mut by_value: Vec<Flake> = Vec::new();
         let mut head_temporal: Option<HeadTemporal> = None;
         let mut first_commit = true;
         while let Some(result) = stream.next().await {
@@ -609,6 +610,19 @@ impl LedgerState {
             if first_commit {
                 head_temporal = HeadTemporal::from_commit(&commit);
                 first_commit = false;
+            }
+
+            // A commit staged by value retracts big integers under every
+            // subtype stored before it; what those are is read once the
+            // index is attached (see `fluree_db_novelty::by_value`).
+            if commit.retracts_big_integers_by_value() {
+                by_value.extend(
+                    commit
+                        .flakes
+                        .iter()
+                        .filter(|f| f.o.is_big_integer())
+                        .cloned(),
+                );
             }
 
             // Collect flakes for deferred replay
@@ -720,6 +734,8 @@ impl LedgerState {
         novelty.bulk_apply_commits(commit_batches, &reverse_graph)?;
         // Every commit after the index was populated above, oldest first.
         dict_novelty.mark_covered_through(novelty.t);
+        by_value.sort_by_key(|f| f.t);
+        novelty.note_by_value_ops(&by_value, None);
 
         Ok((novelty, Some(head_cid.clone()), head_temporal))
     }
@@ -1325,6 +1341,19 @@ impl LedgerState {
             stamp_graph_on_commit_flakes(&mut meta_flakes, &g_sid);
         }
 
+        // A commit staged by value retracts big integers under every subtype
+        // stored before it; the caller reads what those are.
+        let by_value: Vec<Flake> = if commit.retracts_big_integers_by_value() {
+            commit
+                .flakes
+                .iter()
+                .filter(|f| f.o.is_big_integer())
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+
         // Combine data flakes + metadata flakes. The blob's own flakes are
         // screened first: a flake claiming commit provenance cannot have come
         // from any legitimate writer (see `load_novelty` above, and #1846).
@@ -1375,6 +1404,9 @@ impl LedgerState {
         Arc::make_mut(&mut self.dict_novelty).populate_from_flakes(&links);
         if covered {
             Arc::make_mut(&mut self.dict_novelty).mark_covered_through(self.novelty.t);
+        }
+        if !by_value.is_empty() {
+            Arc::make_mut(&mut self.novelty).note_by_value_ops(&by_value, None);
         }
 
         // Update state

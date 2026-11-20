@@ -2,15 +2,18 @@
 //! on every path: the assertion holds (`fluree_db_core::same_t`).
 //!
 //! Commits written by earlier versions can hold such a pair: a restating
-//! write of a subtyped big integer (the index keeps no subtype, so the
-//! retraction names the stored term and the assertion the written one) or of
-//! a `dateTime` past the microsecond (the commit keeps six digits, so the two
-//! terms reload identical). The transactor no longer builds one, so these
-//! tests stage the pair as a pushed commit, which a target takes verbatim,
-//! as it takes an old ledger's commits. Each case then requires the value
-//! present, once, on every path: live on the instance that took the push,
-//! reloaded, at `t - 1` and `t`, in the ledger's stats, after an incremental
-//! build, after a full rebuild, and on a ledger never indexed.
+//! write of a subtyped big integer (their index kept no subtype, so the
+//! retraction names the stored term as `xsd:integer` and the assertion the
+//! written one; the commit retracts it by value, which stands for the stored
+//! subtype) or of a `dateTime` past the microsecond (the commit keeps six
+//! digits, so the two terms reload identical). The transactor no longer
+//! builds one, so these tests stage the pair as a pushed commit, which a
+//! target takes verbatim, as it takes an old ledger's commits. Each case
+//! then requires the value present, once, on every path: live on the
+//! instance that took the push, reloaded, at `t - 1` and `t`, in the
+//! ledger's stats, after the next build (incremental, or a full one when the
+//! pair retracts by value), after a full rebuild, and on a ledger never
+//! indexed.
 //!
 //! The targets are file-backed with `without_indexing()`, so every index
 //! build is the one the test asks for.
@@ -35,7 +38,9 @@ const DT: &str = "2026-10-19T12:34:56.123456Z";
 #[derive(Clone, Copy, Debug)]
 enum Kind {
     /// Written `^^xsd:nonNegativeInteger`; the pair retracts it as
-    /// `xsd:integer` (the term the index decodes) and asserts it as written.
+    /// `xsd:integer` (the term an earlier release's index decoded) and
+    /// asserts it as written. The commit retracts it by value, so the
+    /// retraction stands for the stored subtype too.
     BigInt,
     /// A `dateTime` written past the microsecond reloads as six digits: the
     /// pair's two terms are identical.
@@ -188,6 +193,9 @@ async fn source_commits(
         .cloned()
         .expect("the delete's retraction");
     commit.flakes = kind.pair(&deleted, order);
+    // As an earlier release wrote it: its retractions name big integers by
+    // value (`Commit::num_big_typing`).
+    commit.num_big_typing = fluree_db_core::NumBigTyping::ByValue;
     commit.id = None;
     commits.push(Base64Bytes(
         write_commit(&commit, true, None).expect("encode").bytes,
@@ -344,7 +352,36 @@ async fn run_case(kind: Kind, path: Path, graph: Option<&str>, order: Order) -> 
         )
         .await;
     } else {
-        support::build_incrementally_and_publish_index(&fluree, id).await;
+        match kind {
+            // What a commit staged by value retracts is known to a replay
+            // from the first commit alone: an incremental build refuses its
+            // window, and the next build is a full one.
+            Kind::BigInt => {
+                let record = fluree
+                    .nameservice()
+                    .lookup(id)
+                    .await
+                    .expect("lookup")
+                    .expect("record");
+                let incremental = fluree_db_indexer::build_incremental_index_for_record(
+                    fluree.branched_content_store(id).await.expect("store"),
+                    &record,
+                    fluree_db_indexer::IndexerConfig::default(),
+                )
+                .await;
+                if !matches!(
+                    incremental,
+                    Err(fluree_db_indexer::IndexerError::IncrementalAbort(_))
+                ) {
+                    observed.push((
+                        "an incremental build refuses the window".into(),
+                        vec![format!("{:?}", incremental.map(|r| r.index_t))],
+                    ));
+                }
+                support::build_and_publish_index(&fluree, id).await;
+            }
+            Kind::DateTime => support::build_incrementally_and_publish_index(&fluree, id).await,
+        }
         fluree.disconnect_ledger(id).await;
         drop(fluree);
         reads(
@@ -352,7 +389,7 @@ async fn run_case(kind: Kind, path: Path, graph: Option<&str>, order: Order) -> 
             id,
             graph,
             t_pair,
-            "incremental",
+            "next build",
             &mut observed,
         )
         .await;
@@ -432,7 +469,8 @@ async fn a_same_t_datetime_pair_stored_assert_first_reads_present_on_every_path(
 
 /// A commit built here may not hold a retraction and an assertion of one
 /// fact at one `t`: `build_commit` refuses one with a typed internal error
-/// naming the fact. Staging never builds one, so the view is built by hand.
+/// naming the fact. Staging never builds one, so the view is built by hand,
+/// of one term: a big integer's two subtypes are two facts.
 #[tokio::test]
 async fn a_local_commit_holding_a_same_t_pair_is_refused() {
     for kind in [Kind::BigInt, Kind::DateTime] {
@@ -476,7 +514,7 @@ async fn a_local_commit_holding_a_same_t_pair_is_refused() {
             .expect("reverse graph");
         let view = StagedLedger::new(
             ledger,
-            kind.pair(&deleted, Order::RetractFirst),
+            Order::RetractFirst.arrange(deleted, held),
             &reverse_graph,
         )
         .expect("stage");
@@ -592,6 +630,120 @@ async fn a_rebase_replays_a_same_t_pair_as_its_assertion() {
         values(&fluree, dev, None, None).await,
         vec![BIG.to_string()]
     );
+}
+
+/// The values of `ex:s ex:p` on `id`'s head, each as `value^^datatype`.
+async fn typed_values(fluree: &Fluree, id: &str) -> Vec<String> {
+    let json = fluree
+        .graph(id)
+        .query()
+        .sparql(&format!("{PFX}SELECT ?o WHERE {{ ex:s ex:p ?o }}"))
+        .format(FormatterConfig::sparql_json())
+        .execute_formatted()
+        .await
+        .expect("query");
+    let mut v: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| {
+            let dt = b["o"]["datatype"].as_str().unwrap_or_default();
+            format!(
+                "{}^^{}",
+                b["o"]["value"].as_str().unwrap_or("?"),
+                dt.rsplit('#').next().unwrap_or(dt)
+            )
+        })
+        .collect();
+    v.sort();
+    v
+}
+
+/// A pair written by an earlier release, over the value it restates, folds
+/// as that value's own pair: a revert of its commit keeps the value under
+/// its stored subtype, and a merge of a branch holding it leaves the value
+/// as it was. Neither brings in the `xsd:integer` the retraction names.
+#[tokio::test]
+async fn a_merged_or_reverted_pair_keeps_the_subtype() {
+    let want = vec![format!("{BIG}^^nonNegativeInteger")];
+    let mut failures = Vec::new();
+    for order in [Order::RetractFirst, Order::AssertFirst] {
+        // Revert: the pair over the indexed value, then its revert.
+        let commits = source_commits(Kind::BigInt, Path::Indexed, None, order).await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().to_string_lossy().to_string();
+        let id = "it/same-t-revert-pair:main";
+        let fluree = open(&path);
+        fluree.create_ledger(id).await.expect("create");
+        let n = commits.len();
+        for (i, commit) in commits.into_iter().enumerate() {
+            if i + 1 == n {
+                fluree
+                    .reindex(id, ReindexOptions::default())
+                    .await
+                    .expect("index the value");
+            }
+            push(&fluree, id, commit).await;
+        }
+        let pair = fluree
+            .nameservice()
+            .lookup(id)
+            .await
+            .expect("lookup")
+            .expect("record")
+            .commit_head_id
+            .expect("head");
+        fluree
+            .revert_commits(
+                "it/same-t-revert-pair",
+                "main",
+                vec![CommitRef::Exact(pair)],
+                ConflictStrategy::TakeSource,
+            )
+            .await
+            .expect("revert");
+        let got = typed_values(&fluree, id).await;
+        if got != want {
+            failures.push(format!("{order:?} reverted: {got:?}"));
+        }
+
+        // Merge: the pair on a branch, merged back after the target moves on.
+        let commits = source_commits(Kind::BigInt, Path::NeverIndexed, None, order).await;
+        let fluree = FlureeBuilder::memory().build_memory();
+        let name = "it/same-t-merge-pair";
+        let main = "it/same-t-merge-pair:main";
+        fluree.create_ledger(main).await.expect("create");
+        let mut commits = commits.into_iter();
+        for commit in commits.by_ref().take(2) {
+            push(&fluree, main, commit).await;
+        }
+        fluree
+            .create_branch(name, "dev", Some("main"), None)
+            .await
+            .expect("branch");
+        push(
+            &fluree,
+            "it/same-t-merge-pair:dev",
+            commits.next().expect("the pair"),
+        )
+        .await;
+        fluree
+            .graph(main)
+            .transact()
+            .sparql_update(&insert(None, "ex:other ex:k \"o\" ."))
+            .commit()
+            .await
+            .expect("main moves");
+        fluree
+            .merge_branch(name, "dev", Some("main"), ConflictStrategy::default())
+            .await
+            .expect("merge");
+        let got = typed_values(&fluree, main).await;
+        if got != want {
+            failures.push(format!("{order:?} merged: {got:?}"));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// A source ledger's commits, oldest first.
@@ -837,15 +989,16 @@ async fn a_range_revert_from_a_pair_restores_what_held_before_it() {
 }
 
 /// A `DELETE DATA` of an indexed big integer, while novelty holds a pair of
-/// it (`-x^^xsd:integer`, `+x^^xsd:nonNegativeInteger`), deletes it: the
-/// read it names the stored fact from merges the index row and the two ops
-/// by index key, and the pair holds the assertion. Under either subtype,
-/// with the pair stored in either order.
+/// it from an earlier release's commit (`-x^^xsd:integer`,
+/// `+x^^xsd:nonNegativeInteger`), deletes it under the subtype it is stored
+/// with, after a reload and a full rebuild alike. Under another subtype it
+/// deletes nothing: a write here names one term. With the pair stored in
+/// either order.
 #[tokio::test]
 async fn a_delete_of_an_indexed_big_integer_names_a_pair_novelty_holds() {
     let mut failures = Vec::new();
     for order in [Order::RetractFirst, Order::AssertFirst] {
-        for subtype in ["nonNegativeInteger", "integer"] {
+        for (subtype, deletes) in [("nonNegativeInteger", true), ("integer", false)] {
             let case = format!("{order:?} ^^xsd:{subtype}");
             let commits = source_commits(Kind::BigInt, Path::Indexed, None, order).await;
             let dir = tempfile::tempdir().expect("tempdir");
@@ -874,24 +1027,31 @@ async fn a_delete_of_an_indexed_big_integer_names_a_pair_novelty_holds() {
                     "{PFX}DELETE DATA {{ ex:s ex:p \"{BIG}\"^^xsd:{subtype} }}"
                 ))
                 .commit()
-                .await
-                .expect("delete")
-                .receipt;
-            if receipt.assert_count != 0 || receipt.retract_count == 0 {
-                failures.push(format!(
-                    "{case}: committed {}+/{}-",
-                    receipt.assert_count, receipt.retract_count
-                ));
+                .await;
+            let retracted = match receipt {
+                Ok(r) => r.receipt.assert_count == 0 && r.receipt.retract_count > 0,
+                Err(e) => {
+                    failures.push(format!("{case}: the delete failed: {e}"));
+                    continue;
+                }
+            };
+            if retracted != deletes {
+                failures.push(format!("{case}: retracted {retracted}, wanted {deletes}"));
             }
             fluree.disconnect_ledger(id).await;
             drop(fluree);
+            let want: Vec<String> = if deletes {
+                Vec::new()
+            } else {
+                vec![BIG.to_string()]
+            };
             let got = values(&open(&path), id, None, None).await;
-            if !got.is_empty() {
+            if got != want {
                 failures.push(format!("{case}: after the delete: {got:?}"));
             }
             full_rebuild(&path, id).await;
             let got = values(&open(&path), id, None, None).await;
-            if !got.is_empty() {
+            if got != want {
                 failures.push(format!("{case}: after a full rebuild: {got:?}"));
             }
         }

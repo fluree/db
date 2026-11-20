@@ -402,6 +402,26 @@ A ledger created by this release cannot be read by an earlier one, which refuses
 
 For Rust embedders: `LedgerSnapshot::genesis()` and `NamespaceRegistry::new()` now split under `NsSplitMode::NamedLocal`, `NsSplitMode` has that new variant, and `HOST_PLUS_N_MAX` is 253.
 
+#### Integers too large for 64 bits keep their subtype (breaking)
+
+An integer beyond the 64-bit range keeps the XSD subtype it was written with: `"18446744073709551615"^^xsd:unsignedLong` reads back as `xsd:unsignedLong`, and the same value written as `xsd:integer` or `xsd:nonNegativeInteger` is another term. Earlier releases read every such integer back from the index as `xsd:integer`, and stored two subtypes of one value as one fact. Now, as for any literal:
+
+- `DATATYPE()`, `COUNT(DISTINCT ...)`, `GROUP BY` and a datatype filter see the declared subtype, before and after indexing.
+- Writing one value under two subtypes keeps both. A `DELETE DATA` naming another subtype than the stored one deletes nothing, and a `BIND(?o AS ?v)` keeps `?o`'s subtype, so a `DELETE` of `?v` deletes it.
+- Index statistics count such a value under its datatype rather than as unknown, so the literal-count fold and the bound-decimal seeks apply to properties that hold them.
+
+A decimal that doesn't fit the index's inline encoding is stored the same way and still reads back as `xsd:decimal`.
+
+**Upgrading.** An index an earlier release built is served as it was, by value, until the ledger's next index build. That build is a full rebuild from the commits, which hold each value's datatype, so it restores every subtype: a ledger that held one value under two subtypes then holds two terms. A ledger with no new commits keeps its earlier index until one is built (`fluree reindex`).
+
+Until that build, a write is read against the earlier index, which holds one such value's subtypes as one fact read back as `xsd:integer`, so deleting the value under any of its subtypes deletes all of them, as an earlier release did.
+
+**Deletions written before the upgrade keep their effect.** An earlier release named a deleted value as its index read it back, `xsd:integer`, whatever subtype it was written with. Each commit records whether it was written against an index that keeps subtypes; one that wasn't (any commit an earlier release wrote, and one written over an earlier release's index) deletes such a value by value. Wherever it is read, its deletion of a value deletes every subtype of it held at that subject and property just before the commit. This covers the rebuild, a push of the commit, another instance catching up, reopening the ledger, a query as of a later `t`, a rebase, a merge of a branch holding it, and a revert of it, which restores every subtype it deleted. A value deleted or replaced before the upgrade stays deleted. Commits keep their bytes, so their ids and signatures don't change.
+
+A merge or revert reads what such a commit deleted from its branch's index. While that index is still an earlier release's, which holds a value's subtypes as one fact, the merge or revert is refused (HTTP 409) until the branch is reindexed.
+
+A commit written against an index that keeps subtypes deletes the one term it names. An incremental index build over a commit that deletes by value builds the index in full instead, since only a replay from the first commit knows what that commit deleted.
+
 #### JSON-LD reads `@base` as JSON-LD 1.1 does, and a type's scoped context stops at nested nodes (breaking)
 
 A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, as one in Turtle already did; it used to be joined to `@base` as a string. A base ending in `/` resolves as before. Otherwise the result differs:
@@ -649,7 +669,7 @@ A commit can hold a fact retracted and asserted at the same `t` (one pulled from
 
 - A `DELETE DATA` or a JSON-LD `delete` that names a stored ill-typed literal (such as `"2024-02-30"^^xsd:date`) by its text used to delete it. It is now refused, as an insert of it is. Bind it through a variable instead, or replace the property's values ([Text That Is Not a Value of Its Datatype](../concepts/datatypes.md#text-that-is-not-a-value-of-its-datatype)).
 - A `dateTime` or `time` written past the microsecond used to keep every digit until the ledger was reloaded or indexed, and six after. It now keeps six fractional digits from the moment it is read, on every write path and in query constants, as the SPARQL 1.1 Query deviation above describes. A `DELETE DATA` naming such a value as it was written now finds it after a restart.
-- A big integer with an XSD subtype is one fact per value. Deleting and re-inserting one, or changing only its subtype, used to lose the value on an indexed ledger; such writes now commit nothing and keep it. A `DELETE DATA` naming it under another integer subtype deletes it.
+- An integer too large for 64 bits keeps the XSD subtype it was written with, in the index as in novelty: `"18446744073709551615"^^xsd:unsignedLong` and the same value as `xsd:integer` are two terms. It used to read back from the index as `xsd:integer`, and two subtypes of one value were one fact. Deleting and re-inserting one, or an identical re-upsert, commits nothing and keeps it. A `DELETE DATA` naming it under another subtype deletes nothing, and a `BIND(?o AS ?v)` of it keeps its subtype. See [Integers too large for 64 bits](#integers-too-large-for-64-bits-keep-their-subtype).
 - A Turtle or TriG upsert with blank nodes whose spelling differs from what is stored (`1` against `"1"^^xsd:integer`, tag case, a statement written twice) mints its blank nodes once more on the first upsert after the upgrade. Later upserts of the same document commit nothing. The orphan query in [How RDF Text Is Read](../transactions/turtle.md#how-rdf-text-is-read) lists the earlier nodes.
 
 #### A ledger's own address names its default graph in every graph position

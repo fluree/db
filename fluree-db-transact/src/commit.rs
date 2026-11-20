@@ -787,6 +787,9 @@ pub async fn build_commit(
     // this process has not loaded. Merge, rebase and revert reach here
     // without staging.
     check_index_loaded(&base.snapshot)?;
+    // The typing of the index the retractions were read from, which says
+    // what a retraction of a big integer names.
+    let num_big_typing = crate::current_facts::num_big_typing(&base);
 
     // Move commit options into locals so we can pass ownership where useful
     // (e.g., txn_meta) without forcing clones, while still using other fields later.
@@ -1044,9 +1047,11 @@ pub async fn build_commit(
     let mut commit_record = {
         let span = tracing::debug_span!("commit_build_record");
         let _g = span.enter();
-        Commit::new(new_t, flakes)
+        let mut commit = Commit::new(new_t, flakes)
             .with_namespace_delta(ns_delta)
-            .with_time(timestamp)
+            .with_time(timestamp);
+        commit.num_big_typing = num_big_typing;
+        commit
     };
 
     if let Some(txn_cid) = txn_id {
@@ -1307,6 +1312,19 @@ fn finalize_state_with_base(
     // dual-stamp decision stay in-memory integer checks.
     let head_temporal = HeadTemporal::from_commit(&commit_record).or(base.head_temporal);
     let (assert_count, retract_count) = count_ops(&commit_record.flakes);
+    // Staged against an earlier release's index: what its retractions of big
+    // integers retract is read again once an index that keeps subtypes
+    // replaces it (`resolve_by_value_retractions`).
+    let by_value: Vec<Flake> = if commit_record.retracts_big_integers_by_value() {
+        commit_record
+            .flakes
+            .iter()
+            .filter(|f| f.o.is_big_integer())
+            .cloned()
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     // 10. Generate commit metadata flakes
     let commit_metadata_flakes = {
@@ -1399,6 +1417,10 @@ fn finalize_state_with_base(
             Arc::make_mut(&mut new_novelty).apply_commit(all_flakes, new_t, &reverse_graph)?;
         if !links.is_empty() {
             populate_dict_novelty(Arc::make_mut(&mut dict_novelty), store.as_deref(), &links)?;
+        }
+        if !by_value.is_empty() {
+            Arc::make_mut(&mut new_novelty)
+                .note_by_value_ops(&by_value, Some(fluree_db_core::NumBigTyping::ByValue));
         }
     }
 

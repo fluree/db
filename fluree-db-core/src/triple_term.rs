@@ -89,18 +89,26 @@ pub const fn is_lexical_term_object(o_type: OType) -> bool {
 /// Equal values share a form: a decimal is normalized as the main index's
 /// arena normalizes it, and a vector is read at the `f32` precision ingest
 /// quantizes it to. A decimal's form always carries an exponent and a big
-/// integer's never does, so the two cannot collide under one `o_type`.
-pub fn lexical_term_object(o: &FlakeValue) -> Option<(OType, String)> {
+/// integer's never does.
+///
+/// A number is typed by `dt`, its declared datatype, as the main index types
+/// its arena values ([`crate::NumBigTyping::Declared`]), so an
+/// `xsd:unsignedLong` and an `xsd:integer` of one value are two terms. A
+/// datatype with no NumBig form keeps the by-value
+/// [`OType::NUM_BIG_OVERFLOW`].
+pub fn lexical_term_object(o: &FlakeValue, dt: &crate::Sid) -> Option<(OType, String)> {
+    let num_big = || {
+        crate::o_type_registry::datatype_otype(dt)
+            .and_then(|datatype| crate::NumBigTyping::Declared.o_type_for(datatype))
+            .unwrap_or(OType::NUM_BIG_OVERFLOW)
+    };
     match o {
         FlakeValue::Decimal(d) => {
             let (unscaled, scale) = d.normalized().as_bigint_and_exponent();
-            Some((
-                OType::NUM_BIG_OVERFLOW,
-                format!("{unscaled}e{}", -i128::from(scale)),
-            ))
+            Some((num_big(), format!("{unscaled}e{}", -i128::from(scale))))
         }
         FlakeValue::BigInt(b) if num_traits::ToPrimitive::to_i64(b.as_ref()).is_none() => {
-            Some((OType::NUM_BIG_OVERFLOW, b.to_string()))
+            Some((num_big(), b.to_string()))
         }
         FlakeValue::Vector(v) => {
             let elements: Vec<String> = v
@@ -253,39 +261,64 @@ mod tests {
 
     #[test]
     fn lexical_forms_identify_values_and_round_trip() {
+        use crate::Sid;
+        use fluree_vocab::{namespaces, xsd_names};
+        let xsd = |name: &str| Sid::new(namespaces::XSD, name);
+        let (decimal_dt, integer_dt) = (Sid::xsd_decimal(), Sid::xsd_integer());
+        let vector_dt = Sid::new(namespaces::FLUREE_DB, "embeddingVector");
         let decimal = |s: &str| FlakeValue::Decimal(Box::new(s.parse().unwrap()));
-        let form = |o: &FlakeValue| lexical_term_object(o).expect("arena kind").1;
+        let form = |o: &FlakeValue, dt: &Sid| lexical_term_object(o, dt).expect("arena kind").1;
 
-        assert_eq!(form(&decimal("1.5")), form(&decimal("1.50")));
-        assert_ne!(form(&decimal("1.5")), form(&decimal("15")));
+        assert_eq!(
+            form(&decimal("1.5"), &decimal_dt),
+            form(&decimal("1.50"), &decimal_dt)
+        );
+        assert_ne!(
+            form(&decimal("1.5"), &decimal_dt),
+            form(&decimal("15"), &decimal_dt)
+        );
         let big: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
         let big = FlakeValue::BigInt(Box::new(big));
         let integral = decimal("123456789012345678901234567890");
         assert_ne!(
-            form(&big),
-            form(&integral),
+            form(&big, &integer_dt),
+            form(&integral, &decimal_dt),
             "decimal and integer stay apart"
         );
-        assert!(lexical_term_object(&FlakeValue::BigInt(Box::new(7.into()))).is_none());
-        assert!(lexical_term_object(&FlakeValue::Long(7)).is_none());
+        assert!(
+            lexical_term_object(&FlakeValue::BigInt(Box::new(7.into())), &integer_dt).is_none()
+        );
+        assert!(lexical_term_object(&FlakeValue::Long(7), &integer_dt).is_none());
+
+        // The declared datatype types a number; the form is the value's.
+        let typed = |o: &FlakeValue, dt: &Sid| lexical_term_object(o, dt).unwrap();
+        let unsigned = typed(&big, &xsd(xsd_names::NON_NEGATIVE_INTEGER));
+        let integer = typed(&big, &integer_dt);
+        assert_eq!(unsigned.0, OType::NUM_BIG_NON_NEGATIVE_INTEGER);
+        assert_eq!(integer.0, OType::NUM_BIG_INTEGER);
+        assert_eq!(unsigned.1, integer.1);
+        assert_eq!(typed(&integral, &decimal_dt).0, OType::NUM_BIG_DECIMAL);
 
         let vector = |v: &[f64]| FlakeValue::Vector(v.to_vec().into());
-        assert_eq!(form(&vector(&[-0.0, 1.5])), form(&vector(&[0.0, 1.5])));
+        assert_eq!(
+            form(&vector(&[-0.0, 1.5]), &vector_dt),
+            form(&vector(&[0.0, 1.5]), &vector_dt)
+        );
 
-        for o in [
-            decimal("1.50"),
-            decimal("-0.000123"),
-            decimal("1E+30"),
-            decimal("0"),
-            big,
-            vector(&[0.1f32 as f64, -2.5, 1e-30f32 as f64]),
+        for (o, dt) in [
+            (decimal("1.50"), &decimal_dt),
+            (decimal("-0.000123"), &decimal_dt),
+            (decimal("1E+30"), &decimal_dt),
+            (decimal("0"), &decimal_dt),
+            (big, &integer_dt),
+            (vector(&[0.1f32 as f64, -2.5, 1e-30f32 as f64]), &vector_dt),
         ] {
-            let (o_type, s) = lexical_term_object(&o).unwrap();
+            let (o_type, s) = lexical_term_object(&o, dt).unwrap();
             assert!(is_lexical_term_object(o_type));
             let back = parse_lexical_term_object(o_type, &s).unwrap();
             assert_eq!(back, o, "{s}");
             assert_eq!(std::mem::discriminant(&back), std::mem::discriminant(&o));
-            assert_eq!(lexical_term_object(&back).unwrap().1, s);
+            assert_eq!(lexical_term_object(&back, dt).unwrap(), (o_type, s));
         }
         assert!(!is_lexical_term_object(OType::XSD_STRING));
         assert!(parse_lexical_term_object(OType::XSD_STRING, "1").is_none());

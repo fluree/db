@@ -542,11 +542,10 @@ async fn upsert_over_an_annotated_lang_value_retracts_the_edge_as_stored() {
 }
 
 /// An identical re-upsert keeps an indexed big integer typed with an XSD
-/// subtype. The index stores it with no datatype (`NUM_BIG`), so the upsert
-/// retracts the stored `xsd:integer` value and asserts the declared one: two
-/// terms under one storage key, which storage resolves at one `t` as the
-/// retraction. The operation tells facts apart the way storage does
-/// (`FactIdentity`), so the two are one fact and cancel.
+/// subtype. The index keeps the subtype, so the stored term is the one the
+/// upsert writes and the two cancel. (A `main` root kept no subtype: there
+/// the upsert retracted the stored `xsd:integer` and asserted the declared
+/// term, one storage key, which `FactIdentity` told apart as storage does.)
 #[tokio::test]
 async fn an_identical_reupsert_keeps_an_indexed_big_integer_subtype() {
     let mut h = Harness::new("u5").await;

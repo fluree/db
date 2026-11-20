@@ -467,6 +467,10 @@ pub struct BinaryIndexStore {
     /// Decimal-encoding policy of the loaded root. Governs how query constants
     /// encode so they match stored rows (inline vs NumBig arena).
     decimal_encoding: fluree_db_core::DecimalEncoding,
+    /// How the loaded root types its NumBig arena values. Governs the o_type
+    /// a big-number constant or novelty fact encodes to, as
+    /// `decimal_encoding` does for decimals.
+    num_big_typing: fluree_db_core::NumBigTyping,
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set from the snapshot's `ns_split_mode` via `set_ns_split_mode()`.
     ns_split_mode: NsSplitMode,
@@ -575,6 +579,7 @@ impl BinaryIndexStore {
             language_tags: Vec::new(),
             lex_sorted_string_ids: false,
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
             ns_split_mode: NsSplitMode::default(),
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
@@ -858,6 +863,7 @@ impl BinaryIndexStore {
             language_tags: normalize_root_lang_tags(&root.language_tags),
             lex_sorted_string_ids: root.lex_sorted_string_ids,
             decimal_encoding: root.decimal_encoding(),
+            num_big_typing: root.num_big_typing,
             ns_split_mode: root.ns_split_mode,
             ns_split_mode_set: true,
             p_sid_table: std::sync::OnceLock::new(),
@@ -994,6 +1000,7 @@ impl BinaryIndexStore {
             language_tags: self.language_tags.clone(),
             lex_sorted_string_ids: self.lex_sorted_string_ids,
             decimal_encoding: self.decimal_encoding,
+            num_big_typing: self.num_big_typing,
             ns_split_mode: self.ns_split_mode,
             ns_split_mode_set: self.ns_split_mode_set,
             p_sid_table: std::sync::OnceLock::new(),
@@ -1021,6 +1028,15 @@ impl BinaryIndexStore {
     #[inline]
     pub fn decimal_encoding(&self) -> fluree_db_core::DecimalEncoding {
         self.decimal_encoding
+    }
+
+    /// How the loaded root types its NumBig arena values. A big-number
+    /// constant or novelty fact must take the o_type this names to match
+    /// stored rows, and a scan over every NumBig row reads
+    /// [`NumBigTyping::o_types`](fluree_db_core::NumBigTyping::o_types).
+    #[inline]
+    pub fn num_big_typing(&self) -> fluree_db_core::NumBigTyping {
+        self.num_big_typing
     }
 
     /// Whether `g_id` lives in the pooled tree. A pooled graph has no tree of
@@ -2636,6 +2652,10 @@ impl BinaryIndexStore {
             OType::FULLTEXT => Some(Sid::new(namespaces::FLUREE_DB, "fullText")),
             OType::GEO_POINT => Some(Sid::new(namespaces::OGC_GEO, geo_names::WKT_LITERAL)),
             OType::TRIPLE_TERM => Some(fluree_db_core::triple_term_datatype_sid().clone()),
+            // A typed NumBig o_type names the datatype of its inline twin.
+            ot if ot.is_num_big_typed() => ot
+                .inline_twin()
+                .and_then(|twin| self.resolve_datatype_sid(twin.as_u16())),
 
             // Types without a stable datatype (or not representable as typed literals)
             // return None so callers can either skip constraints or use a safe fallback.
@@ -2646,12 +2666,11 @@ impl BinaryIndexStore {
     /// Resolve the datatype Sid for a decoded value, disambiguating o_types
     /// that name no single datatype.
     ///
-    /// The `NUM_BIG_OVERFLOW` arena holds both overflow `xsd:integer` (BigInt)
-    /// and `xsd:decimal` (BigDecimal) values, so [`resolve_datatype_sid`] can't
-    /// name its type from `o_type` alone and returns `None`. Fall back to the
-    /// decoded value's variant so the datatype isn't lost — otherwise arena-
-    /// served big numerics render with an empty `@type` while their novelty
-    /// counterparts (still o_type-tagged) render correctly (issue #1329).
+    /// Only the by-value [`OType::NUM_BIG_OVERFLOW`] of a `main` (v2) root
+    /// needs it: that o_type holds overflow `xsd:integer` (BigInt) and
+    /// `xsd:decimal` (BigDecimal) values alike, so [`resolve_datatype_sid`]
+    /// returns `None` and the decoded value's variant names the datatype
+    /// (issue #1329). A typed NumBig o_type names its own datatype.
     ///
     /// [`resolve_datatype_sid`]: Self::resolve_datatype_sid
     pub fn resolve_datatype_sid_for_value(&self, o_type: u16, val: &FlakeValue) -> Option<Sid> {
@@ -2662,18 +2681,21 @@ impl BinaryIndexStore {
     /// Resolve the datatype Sid of a decoded `EncodedLit` — the `dt_id`-keyed
     /// twin of [`resolve_datatype_sid_for_value`].
     ///
-    /// Every NUM_BIG `EncodedLit` carries `dt_id = DECIMAL`, because the scan
-    /// cannot tell an overflow `xsd:integer` from an `xsd:decimal` without
-    /// decoding. The decoded value's variant therefore wins over `dt_id`. Any
-    /// site that turns a decoded `EncodedLit` into a typed term must resolve
-    /// its datatype here; one that reads `dt_sids()` directly reports overflow
-    /// integers as `xsd:decimal` and keys them apart from decoded copies of
-    /// the same value (issue #1329). A triple-term `EncodedLit` carries no
-    /// `dt_id` either.
+    /// A NumBig `EncodedLit` carries `dt_id = INTEGER` or `DECIMAL` for a typed
+    /// row (`object_binding`). A by-value row's datatype is unknown until it is
+    /// decoded, so its `EncodedLit` carries
+    /// [`DatatypeDictId::NUM_BIG_BY_VALUE`], resolved here from the decoded
+    /// value. Every other `dt_id` names the datatype, so a value never
+    /// overrides it. Any site that turns a decoded `EncodedLit` into a typed
+    /// term must resolve its datatype here; one that reads `dt_sids()`
+    /// directly finds no datatype for a by-value row. A triple-term
+    /// `EncodedLit` carries no `dt_id` either.
     ///
     /// [`resolve_datatype_sid_for_value`]: Self::resolve_datatype_sid_for_value
     pub fn resolve_dt_id_sid_for_value(&self, dt_id: u16, val: &FlakeValue) -> Option<Sid> {
-        val.overflow_numeric_datatype_sid()
+        (dt_id == DatatypeDictId::NUM_BIG_BY_VALUE.as_u16())
+            .then(|| val.overflow_numeric_datatype_sid())
+            .flatten()
             .or_else(|| {
                 val.is_triple_term()
                     .then(|| fluree_db_core::triple_term_datatype_sid().clone())
@@ -2977,6 +2999,13 @@ impl BinaryIndexStore {
     pub fn graph_numbig_has_duplicate_handles(&self, g_id: GraphId) -> bool {
         self.numbig_arenas(g_id)
             .any(|(_, arena)| arena.has_duplicate_handles())
+    }
+
+    /// Type this store's NumBig values as a root of `typing` would. For tests
+    /// of the by-value typing a `main` root uses.
+    #[doc(hidden)]
+    pub fn set_num_big_typing_for_test(&mut self, typing: fluree_db_core::NumBigTyping) {
+        self.num_big_typing = typing;
     }
 
     /// Install `arena` as `(g_id, p_id)`'s NumBig arena. For tests that need
@@ -5156,22 +5185,40 @@ async fn load_per_graph_arenas(
 
     for ga in graph_arenas {
         let mut numbig = HashMap::new();
-        for (p_id, cid) in &ga.numbig {
+        for nb in &ga.numbig {
             let phase = Instant::now();
-            let bytes = cs.get(cid).await.map_err(storage_io_error)?;
+            let mut chunks = Vec::with_capacity(nb.chunks.len());
+            for chunk in &nb.chunks {
+                let bytes = cs.get(&chunk.cid).await.map_err(storage_io_error)?;
+                let held = crate::arena::numbig::numbig_entry_count(&bytes)?;
+                if chunk.entries != 0 && held != chunk.entries {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "NumBig chunk {} of g_id={}, p_id={} holds {held} entries, \
+                             its root names {}",
+                            chunk.cid, ga.g_id, nb.p_id, chunk.entries
+                        ),
+                    ));
+                }
+                chunks.push(bytes);
+            }
             let read_us = phase.elapsed().as_micros() as u64;
             let phase = Instant::now();
-            let arena = crate::arena::numbig::read_numbig_arena_from_bytes(&bytes)?;
+            let arena = crate::arena::numbig::read_numbig_arena_from_chunks(
+                chunks.iter().map(|bytes| &bytes[..]),
+            )?;
             tracing::debug!(
                 target: "fluree::open",
                 g_id = ga.g_id,
-                p_id,
-                bytes = bytes.len(),
+                p_id = nb.p_id,
+                chunks = chunks.len(),
+                bytes = chunks.iter().map(|b| b.len()).sum::<usize>(),
                 read_us,
                 decode_us = phase.elapsed().as_micros() as u64,
                 "NumBig arena loaded"
             );
-            numbig.insert(*p_id, arena);
+            numbig.insert(nb.p_id, arena);
         }
 
         let mut vectors = HashMap::new();

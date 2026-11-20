@@ -659,7 +659,7 @@ mod inner {
                 self.spool_term(inner, t)?
                     .map(|ordinal| (ObjKind::TRIPLE_TERM.as_u8(), ordinal))
             } else if let Some((o_type, form)) =
-                fluree_db_core::triple_term::lexical_term_object(&term.o)
+                fluree_db_core::triple_term::lexical_term_object(&term.o, &term.dt)
             {
                 let o_kind = if o_type == fluree_db_core::o_type::OType::VECTOR {
                     ObjKind::VECTOR_ID

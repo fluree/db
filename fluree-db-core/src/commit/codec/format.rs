@@ -49,6 +49,14 @@ pub const FLAG_ZSTD: u8 = 0x01;
 /// Bit 1: commit has a signature block after the hash.
 pub const FLAG_HAS_COMMIT_SIG: u8 = 0x02;
 
+/// Bit 2: the commit was staged against an index that keeps the declared
+/// XSD subtype of an integer too large for 64 bits, so each retraction names
+/// one term. Clear on every commit an earlier release wrote, and on one
+/// written against such a release's index: there a retraction of a big
+/// integer stands for the value under every subtype (see
+/// [`crate::NumBigTyping`] and [`crate::Commit::num_big_typing`]).
+pub const FLAG_NUM_BIG_DECLARED: u8 = 0x04;
+
 // --- Per-op flags ---
 
 /// Bit 0: 1 = assert, 0 = retract.
@@ -305,6 +313,17 @@ impl CommitHeader {
         buf[18..20].copy_from_slice(&self.sig_block_len.to_le_bytes());
         // reserved bytes 20..32
         buf[20..32].fill(0);
+    }
+
+    /// How the index the commit was staged against typed big integers:
+    /// [`FLAG_NUM_BIG_DECLARED`] set, or clear on a commit an earlier
+    /// release wrote.
+    pub fn num_big_typing(&self) -> crate::NumBigTyping {
+        if self.flags & FLAG_NUM_BIG_DECLARED != 0 {
+            crate::NumBigTyping::Declared
+        } else {
+            crate::NumBigTyping::ByValue
+        }
     }
 
     /// Read the header from the first 32 bytes of `buf`.

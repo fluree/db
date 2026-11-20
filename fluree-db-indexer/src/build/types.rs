@@ -67,8 +67,8 @@ pub struct UploadedDicts {
     pub datatype_iris: Vec<String>,
     /// Language tags by (lang_id - 1). `lang_id = index + 1`, 0 = "no tag".
     pub language_tags: Vec<String>,
-    /// Numbig arena CIDs: g_id_str → (p_id_str → CID).
-    pub numbig: BTreeMap<String, BTreeMap<String, ContentId>>,
+    /// Numbig arena refs: g_id_str → (p_id_str → arena chunks).
+    pub numbig: BTreeMap<String, BTreeMap<String, fluree_db_binary_index::NumBigArenaRef>>,
     /// Vector arena refs: g_id_str → (p_id_str → VectorDictRef).
     pub vectors: BTreeMap<String, BTreeMap<String, VectorDictRef>>,
 }

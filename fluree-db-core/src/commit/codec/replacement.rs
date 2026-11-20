@@ -187,6 +187,7 @@ pub(crate) fn read_commit_replacement(bytes: &[u8]) -> Result<Commit, CommitCode
             op_count: r.header.op_count,
             signers: r.signers,
         }),
+        num_big_typing: r.header.num_big_typing(),
     })
 }
 
@@ -217,13 +218,10 @@ pub(crate) fn load_commit_ops_replacement(bytes: &[u8]) -> Result<CommitOps, Com
         .flat_map(|(_, op)| *op)
         .copied()
         .collect();
-    Ok(CommitOps::new(
-        envelope,
-        r.header.t,
-        r.survivors.len() as u32,
-        r.dicts,
-        ops,
-    ))
+    Ok(
+        CommitOps::new(envelope, r.header.t, r.survivors.len() as u32, r.dicts, ops)
+            .with_num_big_typing(r.header.num_big_typing()),
+    )
 }
 
 #[cfg(test)]

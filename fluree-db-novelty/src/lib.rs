@@ -33,6 +33,7 @@
 //! let slice = novelty.slice_for_range(g_id, IndexType::Spot, Some(&first), Some(&rhs), false);
 //! ```
 
+pub mod by_value;
 mod commit;
 mod commit_flakes;
 pub mod delta;
@@ -42,6 +43,7 @@ mod links;
 mod runtime_stats;
 mod stats;
 
+pub use by_value::ByValueOp;
 pub use commit::{
     collect_dag_cids, collect_first_parent_cids, collect_first_parent_cids_with_split_mode,
     find_common_ancestor, load_commit_by_id, load_commit_envelope_by_id,
@@ -774,6 +776,10 @@ pub struct Novelty {
     /// their own ([`Self::pin_planner_stats`]). Cleared by every change to
     /// the overlay's content.
     planner_stats_pin: Option<Arc<fluree_db_core::StatsView>>,
+
+    /// Ops on big integers from commits staged by value, whose retractions'
+    /// effect depends on the index novelty overlays (see [`by_value`]).
+    by_value: Vec<ByValueOp>,
 }
 
 #[inline]
@@ -848,6 +854,7 @@ impl Novelty {
             links_through: t,
             saw_annotations: false,
             planner_stats_pin: None,
+            by_value: Vec::new(),
         }
     }
 
@@ -1515,6 +1522,7 @@ impl Novelty {
     fn clear_up_to_rebuilding(&mut self, cutoff_t: i64, rebuild_max: usize) {
         // Commits at or before the cutoff have their links in the index now.
         self.trim_link_base(cutoff_t);
+        self.trim_by_value(cutoff_t);
         self.links_through = self.links_through.max(cutoff_t.min(self.t));
         if self.flake_count == 0 {
             return;

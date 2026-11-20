@@ -346,6 +346,9 @@ where
 
             // Enable schema hierarchy extraction during resolution.
             shared.schema_hook = Some(crate::stats::SchemaExtractor::new());
+            // Every commit is read in order, so the retractions of big
+            // integers staged by value can be told what they retract.
+            shared.big_integers = Some(Default::default());
 
             // What a graph held before its latest drop is not indexed: the
             // commits keep it, the index does not (see `Commit::graph_drops`).
@@ -1306,10 +1309,15 @@ where
                     .await?;
 
             // Phase F-V3: Upload dicts + assemble FIR6 root.
-            let uploaded_dicts =
-                upload_dicts_from_disk(&content_store, &run_dir, &shared.ns_prefixes, false)
-                    .instrument(tracing::debug_span!("upload_dicts_v3"))
-                    .await?;
+            let uploaded_dicts = upload_dicts_from_disk(
+                &content_store,
+                &run_dir,
+                &shared.ns_prefixes,
+                false,
+                config.numbig_chunk_bytes,
+            )
+            .instrument(tracing::debug_span!("upload_dicts_v3"))
+            .await?;
 
             let term_dict = if term_builder.is_empty() {
                 None
@@ -1412,14 +1420,10 @@ where
                     .into_iter()
                     .map(|g_id| {
                         let g_id_str = g_id.to_string();
-                        let numbig: Vec<(u32, ContentId)> = uploaded_dicts
+                        let numbig: Vec<fluree_db_binary_index::NumBigArenaRef> = uploaded_dicts
                             .numbig
                             .get(&g_id_str)
-                            .map(|m| {
-                                m.iter()
-                                    .map(|(k, v)| (k.parse::<u32>().unwrap_or(0), v.clone()))
-                                    .collect()
-                            })
+                            .map(|m| m.values().cloned().collect())
                             .unwrap_or_default();
                         let vectors: Vec<VectorDictRef> = uploaded_dicts
                             .vectors

@@ -429,10 +429,10 @@ fn distinct_facts_by_value(
         p_id: Some(p_id),
         ..BinaryFilter::default()
     };
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
     // A fact: subject, object type, object, list position. A big number's
     // object is the id of its value: one per distinct normalized repr across
-    // the members, so equal values share it whatever their handles.
+    // the members, so equal values share it whatever their handles. Its
+    // o_type stays in the fact, so two datatypes of one value stay apart.
     let mut facts: FxHashSet<(u64, u16, u64, u64)> = FxHashSet::with_capacity_and_hasher(
         usize::try_from(rows).unwrap_or(0).min(FACT_SET_PRESIZE_CAP),
         Default::default(),
@@ -473,7 +473,7 @@ fn distinct_facts_by_value(
             for row in 0..batch.row_count {
                 let o_type = batch.o_type.get(row);
                 let o_key = batch.o_key.get(row);
-                let object = if o_type == numbig {
+                let object = if OType::from_u16(o_type).is_num_big() {
                     let handle = o_key as u32;
                     match handle_ids.get(&handle) {
                         Some(&id) => id,

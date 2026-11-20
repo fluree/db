@@ -15,6 +15,61 @@ use fluree_db_novelty::NetChangeAccumulator;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
+/// The ledger whose history a range of commits is, for a merge or revert
+/// folding them: what a commit in it staged by value retracts of a big
+/// integer is read there, as of just before the commit
+/// ([`fluree_db_core::Commit::num_big_typing`]).
+pub(crate) struct Line<'a> {
+    pub(crate) fluree: &'a crate::Fluree,
+    pub(crate) ledger_id: &'a str,
+    /// Refuse a line that cannot say what such a commit deleted (see
+    /// [`Self::resolve`]). Off for a fast-forward's check, whose target
+    /// adopts the commits themselves, read as every reader reads them.
+    pub(crate) strict: bool,
+}
+
+impl Line<'_> {
+    /// Each commit staged by value among `commits` as the ops it made: its
+    /// retractions of big integers become retractions of the terms of their
+    /// values the line held before it, every subtype included
+    /// ([`fluree_db_transact::by_value_replaced`]). The line is loaded only
+    /// when such a commit is among them.
+    ///
+    /// A line served by an index an earlier release built holds a big
+    /// integer's subtypes as one fact, so it cannot say which it held:
+    /// the operation is refused until the line is reindexed, rather than
+    /// folding a deletion that names none of them.
+    pub(crate) async fn resolve(&self, commits: &mut [Commit]) -> crate::Result<()> {
+        if !commits.iter().any(Commit::retracts_big_integers_by_value) {
+            return Ok(());
+        }
+        let state = self.fluree.ledger(self.ledger_id).await?;
+        if fluree_db_transact::num_big_typing(&state) == fluree_db_core::NumBigTyping::ByValue {
+            if !self.strict {
+                return Ok(());
+            }
+            return Err(crate::ApiError::http(
+                409,
+                format!(
+                    "{} holds a commit an earlier release wrote that deletes an integer too \
+                     large for 64 bits, and its index, also an earlier release's, does not \
+                     record which XSD subtype it held; reindex {} first",
+                    self.ledger_id, self.ledger_id
+                ),
+            ));
+        }
+        for commit in commits
+            .iter_mut()
+            .filter(|c| c.retracts_big_integers_by_value())
+        {
+            let flakes = std::mem::take(&mut commit.flakes);
+            commit.flakes = fluree_db_transact::by_value_replaced(&state, flakes, commit.t).await?;
+            commit.num_big_typing = fluree_db_core::NumBigTyping::Declared;
+        }
+        Ok(())
+    }
+}
+
 /// Which flakes on one side of a branch comparison are that side's own
 /// changes, tracked as its commits are walked oldest-first.
 ///

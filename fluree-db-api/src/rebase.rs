@@ -862,6 +862,17 @@ impl crate::Fluree {
         // an assertion of one fact at one `t`. The pair means the fact holds,
         // and a commit built here may not hold it, so the replay keeps the
         // assertion alone.
+        // A commit staged by value retracts a big integer under every subtype
+        // stored before it. The replay is a commit built here, which names
+        // each term it retracts, so it retracts those terms instead.
+        let flakes = if original_commit.num_big_typing == fluree_db_core::NumBigTyping::ByValue
+            && fluree_db_transact::num_big_typing(&state) == fluree_db_core::NumBigTyping::Declared
+        {
+            let t = state.t() + 1;
+            fluree_db_transact::by_value_replaced(&state, flakes, t).await?
+        } else {
+            flakes
+        };
         let flakes = fluree_db_transact::resolve_same_t_pairs(&state, flakes);
         // A commit that conformed on the branch can violate a shape the
         // source installed since the fork. Each replay is validated against

@@ -1,0 +1,18 @@
+{
+  "@context": {
+    "f": "https://ns.flur.ee/db#"
+  },
+  "@id": "v4/numbig-changed:main",
+  "@type": [
+    "f:LedgerSource"
+  ],
+  "f:ledger": {
+    "@id": "v4/numbig-changed"
+  },
+  "f:branch": "main",
+  "f:commitCid": "bagaybqabciqbwhm7yapfv2vvoysi7lw6cipnjnnwjiuvov6vs727gbtdzam5joi",
+  "f:t": 2,
+  "f:status": "ready",
+  "f:statusV": 1,
+  "f:configV": 0
+}

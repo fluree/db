@@ -423,6 +423,21 @@ impl Fluree {
         target_t: i64,
         head: Option<fluree_db_ledger::HeadDrops<'_>>,
     ) -> Result<GraphDb> {
+        let mut view = self
+            .load_graph_db_historical_unresolved(ledger_id, target_t, head)
+            .await?;
+        resolve_historical_by_value(&mut view).await?;
+        Ok(view)
+    }
+
+    /// [`Self::load_graph_db_historical`] without reading what the commits
+    /// staged by value its novelty holds retract of big integers.
+    async fn load_graph_db_historical_unresolved(
+        &self,
+        ledger_id: &str,
+        target_t: i64,
+        head: Option<fluree_db_ledger::HeadDrops<'_>>,
+    ) -> Result<GraphDb> {
         let historical = self
             .ledger_view_at_from_head(ledger_id, target_t, head)
             .await?;
@@ -1505,6 +1520,24 @@ fn populate_dict_novelty_from_view(
         )
         .map_err(|e| ApiError::internal(format!("populate_dict_novelty_safe: {e}")))?;
     }
+    Ok(())
+}
+
+/// Add to a historical view's novelty what the commits staged by value it
+/// holds retract of big integers, read through the view's index, as a loaded
+/// ledger's novelty has them ([`fluree_db_transact::resolve_by_value_retractions`]).
+async fn resolve_historical_by_value(view: &mut GraphDb) -> Result<()> {
+    let Some(novelty) = view.novelty.as_ref() else {
+        return Ok(());
+    };
+    if novelty.by_value_ops().is_empty() {
+        return Ok(());
+    }
+    let mut state =
+        fluree_db_ledger::LedgerState::new((*view.snapshot).clone(), (**novelty).clone());
+    fluree_db_transact::resolve_by_value_retractions(&mut state).await?;
+    view.overlay = Arc::clone(&state.novelty) as Arc<dyn fluree_db_core::OverlayProvider>;
+    view.novelty = Some(state.novelty);
     Ok(())
 }
 

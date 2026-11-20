@@ -150,13 +150,51 @@ pub struct TermDictRefs {
 pub struct GraphArenaRefs {
     pub g_id: GraphId,
     /// Per-predicate numbig arenas, sorted by p_id.
-    pub numbig: Vec<(u32, ContentId)>,
+    pub numbig: Vec<NumBigArenaRef>,
     /// Per-predicate vector arenas, sorted by p_id.
     pub vectors: Vec<VectorDictRef>,
     /// Per-predicate spatial index refs, sorted by p_id.
     pub spatial: Vec<SpatialArenaRef>,
     /// Per-predicate fulltext BoW arena refs, sorted by p_id.
     pub fulltext: Vec<FulltextArenaRef>,
+}
+
+/// One predicate's NumBig arena: its chunks in handle order. Chunk `k` holds
+/// the handles after those of chunks `0..k`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumBigArenaRef {
+    pub p_id: u32,
+    pub chunks: Vec<NumBigChunkRef>,
+}
+
+impl NumBigArenaRef {
+    /// Every chunk CID, in handle order.
+    pub fn cids(&self) -> impl Iterator<Item = &ContentId> {
+        self.chunks.iter().map(|c| &c.cid)
+    }
+
+    /// The chunks a build that appends to this arena keeps, and the first
+    /// handle after them, where it resumes splitting. An arena is split
+    /// greedily, so every chunk but the last is closed: appending never
+    /// changes it. A chunk of unknown size (a `main` root's single blob)
+    /// keeps none.
+    pub fn closed_chunks(&self) -> (&[NumBigChunkRef], usize) {
+        let closed = match self.chunks.split_last() {
+            Some((_, closed)) if self.chunks.iter().all(|c| c.entries > 0) => closed,
+            _ => &[],
+        };
+        (closed, closed.iter().map(|c| c.entries as usize).sum())
+    }
+}
+
+/// One NumBig arena chunk: an NBA1 blob of consecutive handles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NumBigChunkRef {
+    pub cid: ContentId,
+    /// How many handles the chunk holds; at least one in a v5 root. `0` for
+    /// a `main` (v2) root's single arena blob, whose count only its own
+    /// header holds.
+    pub entries: u32,
 }
 
 /// Vector arena ref with u32 p_id key.
@@ -603,5 +641,29 @@ mod wire_count_tests {
             subject_fwd_ns_packs: vec![(0, entries(64)), (7, entries(19_629))],
         };
         assert_eq!(ordinary.wire_count_overflow(), None);
+    }
+
+    /// An appending build keeps every chunk but the last, and resumes at the
+    /// handle after them; an arena of one chunk, or with a chunk of unknown
+    /// size, keeps none.
+    #[test]
+    fn appending_keeps_the_closed_chunks() {
+        let chunk = |entries: u32| NumBigChunkRef {
+            cid: ContentId::new(fluree_db_core::ContentKind::Commit, &entries.to_le_bytes()),
+            entries,
+        };
+        let arena = |entries: &[u32]| NumBigArenaRef {
+            p_id: 1,
+            chunks: entries.iter().map(|&n| chunk(n)).collect(),
+        };
+        let kept = |entries: &[u32]| {
+            let arena = arena(entries);
+            let (closed, start) = arena.closed_chunks();
+            (closed.iter().map(|c| c.entries).collect::<Vec<_>>(), start)
+        };
+        assert_eq!(kept(&[3, 4, 2]), (vec![3, 4], 7));
+        assert_eq!(kept(&[5]), (vec![], 0));
+        assert_eq!(kept(&[]), (vec![], 0));
+        assert_eq!(kept(&[0]), (vec![], 0), "a main root's blob");
     }
 }

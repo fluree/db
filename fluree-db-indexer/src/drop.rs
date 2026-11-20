@@ -252,6 +252,7 @@ mod tests {
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
             pool: None,
         }
     }
@@ -281,6 +282,7 @@ mod tests {
             graph_delta: std::collections::HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
 
         let result = write_commit(&commit, false, None).expect("write_commit");

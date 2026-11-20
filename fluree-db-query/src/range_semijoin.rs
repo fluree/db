@@ -102,7 +102,7 @@ const WALK_ROWS_PER_DRIVING_ROW: usize = 16;
 const MAX_WALKS_PER_CONDITION: usize = 4;
 
 fn walkable_numeric(o_type: OType) -> bool {
-    o_type.is_numeric() || o_type == OType::NUM_BIG_OVERFLOW
+    o_type.is_numeric() || o_type.is_num_big()
 }
 
 fn walk_row_floor() -> usize {

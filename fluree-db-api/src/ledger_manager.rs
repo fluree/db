@@ -1026,6 +1026,10 @@ impl LedgerHandle {
             let te_store: Arc<dyn std::any::Any + Send + Sync> = arc_store.clone();
             state.binary_store = Some(TypeErasedStore(te_store));
             *self.inner.binary_store.write().await = Some(arc_store);
+            // An index that keeps big integers' subtypes, replacing an earlier
+            // release's, changes what the commits staged by value still in
+            // novelty retract.
+            fluree_db_transact::resolve_by_value_retractions(&mut state).await?;
             tracing::debug!(
                 target: "fluree::write_path",
                 ledger = ledger_id,
@@ -1488,6 +1492,22 @@ pub(crate) async fn load_and_attach_binary_store(
 /// reasoning index's), or one whose branch is not yet visible to lookups,
 /// as during a restore.
 pub(crate) async fn attach_binary_store_from(
+    cs: Arc<dyn ContentStore>,
+    state: &mut LedgerState,
+    leaflet_cache: Option<Arc<LeafletCache>>,
+    prev: Option<&BinaryIndexStore>,
+    root: Option<DecodedIndexRoot<IndexRoot>>,
+) -> std::result::Result<Option<Arc<BinaryIndexStore>>, ApiError> {
+    let store = attach_binary_store_only(cs, state, leaflet_cache, prev, root).await?;
+    // Now that novelty's index is known, what the commits staged by value it
+    // holds retract of big integers can be read.
+    fluree_db_transact::resolve_by_value_retractions(state).await?;
+    Ok(store)
+}
+
+/// [`attach_binary_store_from`] without reading what novelty's commits
+/// staged by value retract.
+async fn attach_binary_store_only(
     cs: Arc<dyn ContentStore>,
     state: &mut LedgerState,
     leaflet_cache: Option<Arc<LeafletCache>>,
@@ -3094,6 +3114,20 @@ impl LedgerManager {
                 }
 
                 commits.reverse(); // oldest → newest
+
+                // What a commit staged by value retracts of a big integer is
+                // read through the attached index, which a reload does.
+                if commits
+                    .iter()
+                    .any(fluree_db_core::Commit::retracts_big_integers_by_value)
+                {
+                    tracing::debug!(
+                        alias = %input.ledger_id,
+                        "incremental catch-up: a commit retracts big integers by value, reloading"
+                    );
+                    self.reload(&input.ledger_id).await?;
+                    return Ok(NotifyResult::Reloaded);
+                }
 
                 #[cfg(any(target_arch = "wasm32", feature = "residency"))]
                 let translation_prefetch: Option<(

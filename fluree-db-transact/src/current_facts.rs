@@ -49,13 +49,12 @@ use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::range::resolve_current_flakes;
 use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
-    range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, NoOverlay, OverlayProvider,
-    RangeMatch, RangeOptions, RangeTest, Sid, Tracker, DEFAULT_GRAPH_ID,
+    range_with_overlay, Flake, FlakeMeta, FlakeValue, GraphId, NoOverlay, NumBigTyping,
+    OverlayProvider, RangeMatch, RangeOptions, RangeTest, Sid, Tracker, DEFAULT_GRAPH_ID,
 };
 use fluree_db_ledger::LedgerState;
 use fluree_db_query::fast_path_outcome::{stamp_fast_path, FastPathFallback, FastPathOutcome};
 use fluree_db_query::BinaryRangeProvider;
-use num_bigint::BigInt;
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::collections::hash_map::Entry;
@@ -353,23 +352,6 @@ fn same_term(stored: &Flake, intent: &Flake) -> bool {
         && lang_matches(lang_of(stored), lang_of(intent))
 }
 
-/// Whether `a` and `b` hold one big integer, whatever XSD subtype each
-/// carries: storage holds it as one fact per value ([`FactIdentity`]).
-fn same_value(a: &Flake, b: &Flake) -> bool {
-    a.o.index_keys_by_value() && a.o == b.o
-}
-
-/// The hash a big integer is grouped by value with ([`same_value`]); `None`
-/// for any other value.
-fn value_hash(f: &Flake) -> Option<u64> {
-    if !f.o.index_keys_by_value() {
-        return None;
-    }
-    let mut h = FxHasher::default();
-    f.o.hash(&mut h);
-    Some(h.finish())
-}
-
 /// Whether every stored fact a DELETE intent can name is found by reading
 /// the intent's value alone: an IRI or blank-node reference, or a plain
 /// `xsd:string` with no tag. The index keys either by one dictionary id
@@ -409,12 +391,29 @@ fn term_hash(f: &Flake) -> u64 {
 /// A fact's persisted index key, `(o_type, o_key)`.
 type IndexKey = (u16, u64);
 
+/// How the index `ledger` serves types integers too large for 64 bits. A
+/// commit staged against it carries this ([`Commit::num_big_typing`]): on an
+/// earlier release's index, one fact holds the value under every subtype, so
+/// a retraction read from it stands for them all. With no index, novelty
+/// keeps each term, as a v5 index does.
+///
+/// [`Commit::num_big_typing`]: fluree_db_core::Commit::num_big_typing
+pub fn num_big_typing(ledger: &LedgerState) -> NumBigTyping {
+    ledger
+        .snapshot
+        .range_provider
+        .as_ref()
+        .and_then(|rp| rp.as_any().downcast_ref::<BinaryRangeProvider>())
+        .map_or(NumBigTyping::Declared, |p| p.store().num_big_typing())
+}
+
 /// Index keys, for the kinds of value whose key two terms can share.
 ///
-/// The index keeps less than some terms carry: a big integer keeps no XSD
-/// subtype. (A `dateTime` or `time` is keyed to the microsecond, which is
-/// all it holds; see `fluree_db_core::DateTime`.) Terms with one index
-/// key are one stored fact to storage, which merges every op by that key,
+/// The index can keep less than some terms carry: a `main` root's big
+/// integer keeps no XSD subtype (its NumBig values are typed by value; a v5
+/// root keeps the subtype). (A `dateTime` or `time` is keyed to the
+/// microsecond, which is all it holds; see `fluree_db_core::DateTime`.)
+/// Terms with one index key are one stored fact to storage, which merges every op by that key,
 /// in the index and in queries over novelty alike (`resolve_overlay_ops`).
 /// So an indexed fact's decode can differ from the term that was written,
 /// and from the term a query row carries for it, and an op on one term can
@@ -530,18 +529,11 @@ pub enum FactTerm {
 }
 
 /// The key storage merges the ops of a value by, for the kinds of value
-/// whose key two terms can share ([`IndexKeys`]).
+/// whose key two terms can share ([`IndexKeys`]): its persisted index key
+/// `(o_type, o_key)`. A value the index has no key for is told by term, as
+/// storage tells it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum FactKey {
-    /// An integer too large for 64 bits, by value. The index keys one by its
-    /// `(graph, predicate)` arena's handle for the value, whatever XSD
-    /// subtype it was written with, so the value is its key before the arena
-    /// holds it as well as after: a value first written since the last index
-    /// build is merged by value at the next.
-    BigInt(Box<BigInt>),
-    /// A persisted index key `(o_type, o_key)`.
-    Index((u16, u64)),
-}
+pub struct FactKey(pub (u16, u64));
 
 /// A [`FactKey`] and list place: how storage tells apart the facts of one
 /// `(graph, subject, predicate)` whose kind of value can merge terms
@@ -597,10 +589,7 @@ impl<'l> FactIdentity<'l> {
         if !flake.o.index_key_may_merge_terms() {
             return None;
         }
-        let key = match &flake.o {
-            FlakeValue::BigInt(v) if flake.o.index_keys_by_value() => FactKey::BigInt(v.clone()),
-            _ => FactKey::Index(self.keys.key(g_id()?, p_id(), flake)?),
-        };
+        let key = FactKey(self.keys.key(g_id()?, p_id(), flake)?);
         Some((key, place_of(flake)))
     }
 
@@ -776,6 +765,176 @@ pub fn resolve_same_t_pairs(ledger: &LedgerState, flakes: Vec<Flake>) -> Vec<Fla
     let mut flakes = flakes;
     flakes.retain(|_| keep.next().unwrap_or(true));
     flakes
+}
+
+/// What a commit staged by value retracts of each big integer it retracts
+/// ([`Commit::num_big_typing`]): every term of the value stored at the
+/// retraction's slot and list place as of `t - 1`, its own term included
+/// when stored, whatever subtype it was written with. The index such a
+/// commit was read from held them as one fact, read back as `xsd:integer`.
+///
+/// One entry per retraction among `flakes` whose object is an integer too
+/// large for 64 bits ([`FlakeValue::is_big_integer`]), with its position in
+/// `flakes`, in order; none for any other flake. `ledger` holds the state
+/// the commit lands on: what it stores through `t - 1` is read, so it may
+/// already hold the commit, at `t`.
+///
+/// [`Commit::num_big_typing`]: fluree_db_core::Commit::num_big_typing
+pub async fn by_value_targets(
+    ledger: &LedgerState,
+    flakes: &[Flake],
+    t: i64,
+) -> Result<Vec<(usize, Vec<StoredFact>)>> {
+    let mut targets: Vec<(usize, Vec<StoredFact>)> = Vec::new();
+    // Each retraction in a graph the ledger has, with its entry in `targets`.
+    let mut items: Vec<(Slot, &Flake)> = Vec::new();
+    let mut item_targets: Vec<usize> = Vec::new();
+    for (at, f) in flakes.iter().enumerate() {
+        if f.op || !f.o.is_big_integer() {
+            continue;
+        }
+        if let Some(slot) = Slot::in_ledger(ledger, &f.g, &f.s, &f.p) {
+            items.push((slot, f));
+            item_targets.push(targets.len());
+        }
+        targets.push((at, Vec::new()));
+    }
+    if items.is_empty() {
+        return Ok(targets);
+    }
+    let (slots, item_slots) = distinct_slots(&items);
+    let facts = CurrentFacts::at(ledger, t - 1).of_slots(&slots).await?;
+    for (((_, retraction), slot), target) in items.iter().zip(item_slots).zip(item_targets) {
+        let place = retraction.m.as_ref().and_then(FlakeMeta::place);
+        targets[target].1.extend(
+            facts[slot]
+                .iter()
+                .filter(|fact| {
+                    let f = fact.flake();
+                    same_big_integer(&f.o, &retraction.o)
+                        && f.m.as_ref().and_then(FlakeMeta::place) == place
+                })
+                .cloned(),
+        );
+    }
+    Ok(targets)
+}
+
+/// Whether `a` and `b` are one integer too large for 64 bits. Not `==`,
+/// which compares numbers across kinds.
+fn same_big_integer(a: &FlakeValue, b: &FlakeValue) -> bool {
+    matches!((a, b), (FlakeValue::BigInt(x), FlakeValue::BigInt(y)) if x == y)
+}
+
+/// The retractions a commit staged by value makes beyond its own flakes
+/// ([`by_value_targets`]): for each of its retractions of a big integer, one
+/// of every other term of the value stored before it, at the commit's `t`.
+/// What storage applies alongside the commit, which keeps its own flakes as
+/// written. None retracts a term the commit asserts: on its `t` the
+/// assertion holds. `flakes` are the commit's (or its ops on big integers),
+/// at `t`; the caller checks the commit was staged by value
+/// ([`Commit::retracts_big_integers_by_value`]).
+///
+/// [`Commit::retracts_big_integers_by_value`]: fluree_db_core::Commit::retracts_big_integers_by_value
+pub async fn by_value_retractions(
+    ledger: &LedgerState,
+    flakes: &[Flake],
+    t: i64,
+) -> Result<Vec<Flake>> {
+    let targets = by_value_targets(ledger, flakes, t).await?;
+    let mut out: Vec<Flake> = Vec::new();
+    for (at, held) in targets {
+        let own = &flakes[at];
+        for fact in held {
+            let retraction = fact.retract(t).into_flake();
+            if retraction.dt != own.dt
+                && !out.iter().any(|o| o.g == retraction.g && *o == retraction)
+            {
+                out.push(retraction);
+            }
+        }
+    }
+    // A term the commit retracts itself needs no second retraction, and one
+    // it asserts holds on its `t` whatever it retracts (`same_t`).
+    out.retain(|r| !flakes.iter().any(|f| f.g == r.g && f == r));
+    Ok(out)
+}
+
+/// A commit staged by value as the ops it made on `ledger`'s history, for a
+/// commit built from it here (a rebase's replay, a merge, a revert), which
+/// names each term it retracts: each retraction of a big integer becomes a
+/// retraction of every term of the value `ledger` stored before `t`
+/// ([`by_value_targets`]), or nothing when it stored none. Every other flake
+/// is kept, in order.
+pub async fn by_value_replaced(
+    ledger: &LedgerState,
+    flakes: Vec<Flake>,
+    t: i64,
+) -> Result<Vec<Flake>> {
+    let mut targets = by_value_targets(ledger, &flakes, t)
+        .await?
+        .into_iter()
+        .peekable();
+    let mut replaced: Vec<Flake> = Vec::with_capacity(flakes.len());
+    for (at, flake) in flakes.into_iter().enumerate() {
+        match targets.next_if(|(i, _)| *i == at) {
+            Some((_, held)) => {
+                for fact in held {
+                    let r = fact.retract(flake.t).into_flake();
+                    if !replaced.iter().any(|f| !f.op && f.g == r.g && *f == r) {
+                        replaced.push(r);
+                    }
+                }
+            }
+            None => replaced.push(flake),
+        }
+    }
+    Ok(replaced)
+}
+
+/// Work out what the retractions of commits staged by value that `ledger`'s
+/// novelty holds retract, now that it has the index it overlays, and add
+/// them to novelty at each commit's `t`
+/// ([`fluree_db_novelty::Novelty::add_by_value_retractions`]). Oldest commit
+/// first, so each reads what the earlier ones retracted.
+///
+/// Over an earlier release's index nothing is added: it holds every subtype
+/// of a big integer as one fact, which a retraction of any of them retracts.
+/// The retractions are worked out again when an index that keeps subtypes
+/// replaces it.
+pub async fn resolve_by_value_retractions(ledger: &mut LedgerState) -> Result<()> {
+    let typing = num_big_typing(ledger);
+    if typing == NumBigTyping::ByValue || !ledger.novelty.by_value_unresolved(typing) {
+        return Ok(());
+    }
+    let mut pending: Vec<Flake> = ledger
+        .novelty
+        .by_value_ops()
+        .iter()
+        .map(|r| r.flake.clone())
+        .collect();
+    pending.sort_by_key(|f| f.t);
+    let reverse_graph = ledger.snapshot.build_reverse_graph()?;
+    for commit in pending.chunk_by(|a, b| a.t == b.t) {
+        let t = commit[0].t;
+        let extras = by_value_retractions(ledger, commit, t).await?;
+        let routed = extras
+            .into_iter()
+            .map(|f| {
+                let g_id = match &f.g {
+                    None => DEFAULT_GRAPH_ID,
+                    Some(g) => *reverse_graph.get(g).ok_or_else(|| {
+                        TransactError::InvariantViolation(format!(
+                            "graph {g:?} is not in the ledger"
+                        ))
+                    })?,
+                };
+                Ok((g_id, f))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        std::sync::Arc::make_mut(&mut ledger.novelty).add_by_value_retractions(routed, typing)?;
+    }
+    Ok(())
 }
 
 /// The id `ledger` gives graph `g` (`None` is the default graph), or `None`
@@ -1550,17 +1709,11 @@ impl<'l> DeleteResolver<'l> {
                     self.expanded.insert(key);
                 }
                 stats.matched += 1;
-                for m in facts.same_facts(&named) {
-                    out.push(facts.facts[m].clone().retract(t));
-                }
                 for n in named {
                     out.push(facts.facts[n].retract_named(intent.flake.clone(), t));
                 }
             } else if let Some(n) = facts.named(&intent.flake, keys) {
                 stats.matched += 1;
-                for m in facts.same_facts(&[n]) {
-                    out.push(facts.facts[m].clone().retract(t));
-                }
                 out.push(facts.facts[n].retract_named(intent.flake, t));
             } else {
                 stats.phantom_intents += 1;
@@ -1652,10 +1805,6 @@ struct SlotFacts {
     keys: Option<Vec<Option<IndexKey>>>,
     /// A wide slot's facts by index key, grouped with `keys`.
     by_key: Option<Groups<IndexKey>>,
-    /// A wide slot's big integers by value ([`value_hash`]), built when an
-    /// intent first needs them. Boxed: most slots never build it, and every
-    /// slot a batch reads carries the field.
-    by_value: Option<Box<Groups<u64>>>,
 }
 
 impl SlotFacts {
@@ -1693,7 +1842,6 @@ impl SlotFacts {
             has_entries,
             keys: None,
             by_key: None,
-            by_value: None,
         }
     }
 
@@ -1734,54 +1882,6 @@ impl SlotFacts {
         self.keys = Some(fact_keys);
     }
 
-    /// Group a wide slot's big integers by value, once.
-    fn ensure_by_value(&mut self) {
-        if self.is_wide() && self.by_value.is_none() {
-            self.by_value = Some(Box::new(Groups::build(
-                &self.facts,
-                |_, f| value_hash(&f.flake),
-                same_value,
-            )));
-        }
-    }
-
-    /// The slot's other facts that are the same stored fact as one of
-    /// `named`, which hold one value: terms of one big integer at one list
-    /// position, which novelty holds apart until the next index build. Every
-    /// other kind is one term per fact once the read is resolved. One pass
-    /// over the value's facts, however many entries hold it.
-    fn same_facts(&mut self, named: &[usize]) -> Vec<usize> {
-        let Some(&n) = named.first() else {
-            return Vec::new();
-        };
-        if !self.facts[n].flake.o.index_keys_by_value() {
-            return Vec::new();
-        }
-        self.ensure_by_value();
-        let fact = &self.facts[n].flake;
-        let at: HashSet<Option<ListPlace>> = named
-            .iter()
-            .map(|&n| place_of(&self.facts[n].flake))
-            .collect();
-        let named: HashSet<usize> = named.iter().copied().collect();
-        let sibling = |m: usize| {
-            !named.contains(&m)
-                && same_value(&self.facts[m].flake, fact)
-                && at.contains(&place_of(&self.facts[m].flake))
-        };
-        match (&self.by_value, value_hash(fact)) {
-            (Some(groups), Some(h)) => groups
-                .get(h)
-                .map(|g| groups.members(g))
-                .unwrap_or_default()
-                .iter()
-                .map(|&m| m as usize)
-                .filter(|&m| sibling(m))
-                .collect(),
-            _ => (0..self.facts.len()).filter(|&m| sibling(m)).collect(),
-        }
-    }
-
     /// The stored fact a DELETE intent names (see [`DeleteResolver`]).
     fn named(&mut self, intent: &Flake, keys: &IndexKeys) -> Option<usize> {
         let position = place_of(intent);
@@ -1796,18 +1896,7 @@ impl SlotFacts {
         // Else by the fact's identity, whichever op of it survived: an index
         // row and a later novelty op of one key are one stored fact, which
         // the novelty op stands for, and an intent naming the index's term
-        // names it too. A big integer is one fact per value, indexed or not.
-        if intent.o.index_keys_by_value() {
-            self.ensure_by_value();
-            let same = |_: usize, f: &StoredFact| same_value(&f.flake, intent);
-            return match &self.by_value {
-                Some(groups) => {
-                    let group = value_hash(intent).and_then(|h| groups.get(h));
-                    self.first_in(group, groups, position, same)
-                }
-                None => self.first(position, same),
-            };
-        }
+        // names it too.
         let key = self.key_of(keys, intent)?;
         self.ensure_keys(keys);
         let fact_keys = self.keys.as_deref()?;
@@ -1834,17 +1923,6 @@ impl SlotFacts {
             if !hits.is_empty() {
                 break 'lookup hits;
             }
-            if intent.o.index_keys_by_value() {
-                self.ensure_by_value();
-                let same = |_: usize, f: &StoredFact| same_value(&f.flake, intent);
-                break 'lookup match &self.by_value {
-                    Some(groups) => {
-                        let group = value_hash(intent).and_then(|h| groups.get(h));
-                        self.all_in(group, groups, same)
-                    }
-                    None => self.all(same),
-                };
-            }
             let Some(key) = self.key_of(keys, intent) else {
                 break 'lookup Vec::new();
             };
@@ -1869,22 +1947,14 @@ impl SlotFacts {
     /// The entries of every stored list that list literal `members` (in
     /// position order) names, each with the index of the member it holds:
     /// lists with one position per member, the k-th holding member k as a
-    /// scalar intent names its value ([`Self::named`]: by term, else a big
-    /// integer by value, else by index key).
+    /// scalar intent names its value ([`Self::named`]: by term, else by index
+    /// key).
     fn lists_named(&mut self, members: &[&Flake], keys: &IndexKeys) -> Vec<(usize, usize)> {
         if !self.has_entries {
             return Vec::new();
         }
-        let member_keys: Vec<Option<IndexKey>> = members
-            .iter()
-            .map(|m| {
-                if m.o.index_keys_by_value() {
-                    None
-                } else {
-                    self.key_of(keys, m)
-                }
-            })
-            .collect();
+        let member_keys: Vec<Option<IndexKey>> =
+            members.iter().map(|m| self.key_of(keys, m)).collect();
         if member_keys.iter().any(Option::is_some) {
             self.ensure_keys(keys);
         }
@@ -1906,13 +1976,12 @@ impl SlotFacts {
         let holds = |n: u32, k: usize| {
             let (fact, member) = (&self.facts[n as usize].flake, members[k]);
             same_term(fact, member)
-                || same_value(fact, member)
                 || member_keys[k]
                     .is_some_and(|key| fact_keys.is_some_and(|keys| keys[n as usize] == Some(key)))
         };
         let mut named = Vec::new();
         for list in entries.chunk_by(|a, b| a.0 .0 == b.0 .0) {
-            // A position holding two terms of one big integer (novelty, until
+            // A position holding two terms of one index key (novelty, until
             // the next index build) is one position.
             let positions = || list.chunk_by(|a, b| a.0 == b.0);
             let mut held = 0;
@@ -3285,12 +3354,10 @@ mod tests {
         }
     }
 
-    /// `named_by` names an integer too large for 64 bits by value with no
-    /// index yet, as the first build will key it, and by term first: of two
-    /// terms of one value that novelty holds side by side, an item naming one
-    /// of them exactly names that one.
+    /// `named_by` names an integer too large for 64 bits by its term: each
+    /// XSD subtype of one value is a fact of its own, as an index keys it.
     #[tokio::test]
-    async fn named_by_names_a_big_integer_by_value_its_own_term_first() {
+    async fn named_by_names_a_big_integer_by_its_term() {
         let big = |n: i64, dt: &str, t: i64, m: Option<FlakeMeta>| {
             let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
             Flake::new(
@@ -3322,7 +3389,7 @@ mod tests {
                 big(0, "positiveInteger", 3, None),
                 Some("positiveInteger"),
             ),
-            ("a third subtype", big(0, "integer", 3, None), Some("")),
+            ("a third subtype", big(0, "integer", 3, None), None),
             ("another value", big(1, "nonNegativeInteger", 3, None), None),
             (
                 "a list position",
@@ -3335,19 +3402,17 @@ mod tests {
         let named = current.named_by(&items).await.unwrap();
         for ((what, _, want), fact) in cases.iter().zip(&named) {
             let got = fact.as_ref().map(|f| f.flake().dt.name.to_string());
-            match want {
-                Some("") => assert!(got.is_some(), "{what}: {got:?}"),
-                want => assert_eq!(got.as_deref(), *want, "{what}"),
-            }
+            assert_eq!(got.as_deref(), *want, "{what}");
         }
     }
 
     /// A big integer novelty holds under two subtypes, at each of three list
-    /// positions and beside the list, loses every term to one intent naming
-    /// it with no position: each entry's and the plain value's other term
-    /// are the same stored fact. On the scanned and on the indexed path.
+    /// positions and beside the list, loses the named subtype at every entry
+    /// and beside the list to one intent naming it with no position, and
+    /// keeps the other subtype: two subtypes are two facts. On the scanned
+    /// and on the indexed path.
     #[tokio::test]
-    async fn a_value_named_once_retracts_every_term_of_every_entry() {
+    async fn a_value_named_once_retracts_its_term_at_every_entry() {
         let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
         let big = |dt: &str, t: i64, i: Option<i32>| {
             Flake::new(
@@ -3389,27 +3454,18 @@ mod tests {
                 .collect();
             assert_eq!(
                 positions,
-                [
-                    None,
-                    None,
-                    Some(0),
-                    Some(0),
-                    Some(1),
-                    Some(1),
-                    Some(2),
-                    Some(2)
-                ],
+                [None, Some(0), Some(1), Some(2)],
                 "narrow_slot={narrow_slot}"
             );
         }
     }
 
     /// Two retractions of one big integer, under two subtypes, and an
-    /// assertion of it at one `t`: novelty held the value under both
-    /// subtypes when the commit was written. Both retractions pair with the
-    /// assertion, so resolving the pairs drops both and keeps the assertion.
+    /// assertion of it under one of them at one `t`: only the retraction of
+    /// the asserted subtype pairs with the assertion, so resolving the pairs
+    /// drops it and keeps the other subtype's retraction.
     #[test]
-    fn every_retraction_of_a_key_pairs_with_its_assertion() {
+    fn a_retraction_pairs_with_an_assertion_of_its_own_subtype() {
         let ledger = ledger(Vec::new(), &HashMap::new());
         let ids = FactIdentity::new(&ledger);
         let v: num_bigint::BigInt = "123456789012345678901234567890".parse().unwrap();
@@ -3426,20 +3482,22 @@ mod tests {
         };
         let flakes = vec![
             big("integer", false),
-            big("nonNegativeInteger", false),
+            big("positiveInteger", false),
             big("positiveInteger", true),
         ];
         let mut spot: Vec<&Flake> = flakes.iter().collect();
         spot.sort_by(|a, b| IndexType::Spot.compare(a, b));
-        assert_eq!(ids.same_t_pairs(spot).len(), 2);
+        assert_eq!(ids.same_t_pairs(spot).len(), 1);
         let resolved = resolve_same_t_pairs(&ledger, flakes);
-        assert_eq!(resolved.len(), 1, "{resolved:?}");
-        assert!(resolved[0].op);
+        let kept: Vec<(bool, &str)> = resolved.iter().map(|f| (f.op, f.dt.name_str())).collect();
+        assert_eq!(kept.len(), 2, "{resolved:?}");
+        assert!(kept.contains(&(false, "integer")), "{kept:?}");
+        assert!(kept.contains(&(true, "positiveInteger")), "{kept:?}");
     }
 
     /// Resolving a commit's pairs drops each pair's retraction wherever it
-    /// sits: flakes out of SPOT order, two pairs by term (one behind another
-    /// value of its slot) and one by index key, and a retraction and
+    /// sits: flakes out of SPOT order, three pairs by term (one behind another
+    /// value of its slot, one of a big integer), and a retraction and
     /// assertions that pair with nothing. Each pair names its retraction's
     /// place in the walk.
     #[test]
@@ -3463,7 +3521,7 @@ mod tests {
             big("integer", false),
             flake("m", "p", "m", 2, false, None),
             flake("z", "p", "z", 2, false, None),
-            big("nonNegativeInteger", true),
+            big("integer", true),
             flake("m", "p", "m", 2, true, None),
             flake("b", "p", "new", 2, true, None),
             flake("m", "p", "a", 2, true, None),

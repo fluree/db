@@ -751,6 +751,7 @@ pub async fn upload_dicts_from_disk(
     run_dir: &std::path::Path,
     namespace_codes: &std::collections::HashMap<u16, String>,
     trust_sorted_order_invariants: bool,
+    numbig_chunk_bytes: usize,
 ) -> Result<UploadedDicts> {
     use fluree_db_binary_index::dict::branch::DictBranch;
     use fluree_db_core::{ContentKind, DictKind};
@@ -1187,7 +1188,7 @@ pub async fn upload_dicts_from_disk(
             }
         },
         // Task C: Numbig arenas (per-graph subdirectories)
-        upload_numbig_arenas_from_disk(content_store, run_dir),
+        upload_numbig_arenas_from_disk(content_store, run_dir, numbig_chunk_bytes),
         // Task D: Vector arenas (per-graph subdirectories)
         upload_vector_arenas_from_disk(content_store, run_dir),
     )?;
@@ -1234,15 +1235,23 @@ pub async fn upload_dicts_from_disk(
 }
 
 /// Upload the numbig arenas an import wrote under `run_dir/g_{g_id}/numbig/`,
-/// keyed by graph id and then predicate id (both as decimal strings).
+/// each split into chunks, keyed by graph id and then predicate id (both as
+/// decimal strings).
 pub async fn upload_numbig_arenas_from_disk(
     content_store: &dyn ContentStore,
     run_dir: &std::path::Path,
-) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<String, ContentId>>> {
-    use fluree_db_core::DictKind;
+    chunk_bytes: usize,
+) -> Result<
+    std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, fluree_db_binary_index::NumBigArenaRef>,
+    >,
+> {
+    use fluree_db_binary_index::arena::numbig;
     use std::collections::BTreeMap;
 
-    let mut numbig: BTreeMap<String, BTreeMap<String, ContentId>> = BTreeMap::new();
+    let mut numbig: BTreeMap<String, BTreeMap<String, fluree_db_binary_index::NumBigArenaRef>> =
+        BTreeMap::new();
     // Scan for g_{id}/numbig/ subdirectories
     for dir_entry in std::fs::read_dir(run_dir)
         .map_err(|e| IndexerError::StorageRead(format!("read run_dir: {e}")))?
@@ -1266,14 +1275,31 @@ pub async fn upload_numbig_arenas_from_disk(
                     if let Some(rest) = name_str.strip_prefix("p_") {
                         if let Some(id_str) = rest.strip_suffix(".nba") {
                             if let Ok(p_id) = id_str.parse::<u32>() {
-                                let cid = upload_dict_file(
+                                let path = entry.path();
+                                let arena = numbig::read_numbig_arena(&path).map_err(|e| {
+                                    IndexerError::StorageRead(format!(
+                                        "read {}: {e}",
+                                        path.display()
+                                    ))
+                                })?;
+                                let chunks =
+                                    numbig::write_numbig_arena_chunks(&arena, 0, chunk_bytes)
+                                        .map_err(|e| {
+                                            IndexerError::StorageWrite(format!(
+                                                "numbig chunks: {e}"
+                                            ))
+                                        })?;
+                                let chunks = super::upload::upload_numbig_chunks(
                                     content_store,
-                                    &entry.path(),
-                                    DictKind::NumBig { p_id },
-                                    "dict artifact uploaded to CAS (from disk)",
+                                    p_id,
+                                    &chunks,
+                                    "numbig arena chunk uploaded to CAS (from disk)",
                                 )
                                 .await?;
-                                per_pred.insert(p_id.to_string(), cid);
+                                per_pred.insert(
+                                    p_id.to_string(),
+                                    fluree_db_binary_index::NumBigArenaRef { p_id, chunks },
+                                );
                             }
                         }
                     }
@@ -1496,9 +1522,15 @@ mod tests {
         trust: bool,
     ) -> (MemoryContentStore, UploadedDicts) {
         let store = MemoryContentStore::new();
-        let out = upload_dicts_from_disk(&store, run_dir, namespace_codes, trust)
-            .await
-            .unwrap();
+        let out = upload_dicts_from_disk(
+            &store,
+            run_dir,
+            namespace_codes,
+            trust,
+            fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
+        )
+        .await
+        .unwrap();
         (store, out)
     }
 
@@ -1764,9 +1796,15 @@ mod tests {
         let before = peak_rss_bytes();
 
         let store = DiscardingContentStore::default();
-        let out = upload_dicts_from_disk(&store, &dir, &ns, trust)
-            .await
-            .unwrap();
+        let out = upload_dicts_from_disk(
+            &store,
+            &dir,
+            &ns,
+            trust,
+            fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
+        )
+        .await
+        .unwrap();
 
         let after = peak_rss_bytes();
         // Rough materialized footprint: subjects ~44 B/term + strings ~36 B/term,

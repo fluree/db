@@ -50,6 +50,9 @@ pub struct CommitOps {
     /// [`super::legacy_v3::load_commit_ops_v3`]; always `false` for v4 ops
     /// produced by [`load_commit_ops_v4`].
     legacy_v3_canonicalize: bool,
+    /// What the commit's retractions of big integers name
+    /// ([`crate::Commit::num_big_typing`]).
+    pub num_big_typing: crate::NumBigTyping,
 }
 
 impl CommitOps {
@@ -69,7 +72,35 @@ impl CommitOps {
             dicts,
             ops_data,
             legacy_v3_canonicalize: false,
+            num_big_typing: crate::NumBigTyping::ByValue,
         }
+    }
+
+    /// Set what the commit's retractions of big integers name, from its
+    /// header.
+    pub(in crate::commit::codec) fn with_num_big_typing(
+        mut self,
+        typing: crate::NumBigTyping,
+    ) -> Self {
+        self.num_big_typing = typing;
+        self
+    }
+
+    /// Whether the commit retracts an integer too large for 64 bits by value
+    /// ([`crate::Commit::num_big_typing`]). Decodes the ops of such a commit
+    /// only.
+    pub fn retracts_big_integers_by_value(&self) -> Result<bool, CommitCodecError> {
+        if self.num_big_typing == crate::NumBigTyping::Declared {
+            return Ok(false);
+        }
+        let mut found = false;
+        self.for_each_op(|op| {
+            if !op.op && matches!(op.o, RawObject::BigIntStr(s) if is_big_integer_lexical(s)) {
+                found = true;
+            }
+            Ok(())
+        })?;
+        Ok(found)
     }
 
     /// Return a `CommitOps` that will canonicalize legacy v3 datatype
@@ -386,13 +417,16 @@ pub(crate) fn load_commit_ops_v4(bytes: &[u8]) -> Result<CommitOps, CommitCodecE
     let mut envelope = envelope;
     envelope.t = header.t;
 
-    Ok(CommitOps::new(
-        envelope,
-        header.t,
-        header.op_count,
-        dicts,
-        ops_data,
-    ))
+    Ok(
+        CommitOps::new(envelope, header.t, header.op_count, dicts, ops_data)
+            .with_num_big_typing(header.num_big_typing()),
+    )
+}
+
+/// Whether a big integer's lexical form, as a commit stores it, is of an
+/// integer too large for 64 bits ([`crate::FlakeValue::is_big_integer`]).
+pub fn is_big_integer_lexical(lexical: &str) -> bool {
+    lexical.parse::<i64>().is_err() && lexical.parse::<num_bigint::BigInt>().is_ok()
 }
 
 // ============================================================================
@@ -1084,5 +1118,53 @@ mod tests {
         })
         .unwrap();
         assert_eq!(names, vec!["Alice", "Bob", "Alice"]);
+    }
+
+    /// A commit carries what its retractions of big integers name in its
+    /// header: set when written here, clear on an earlier release's commit.
+    /// Only a by-value commit's retraction of a value beyond 64 bits depends
+    /// on what was stored before it.
+    #[cfg(feature = "credential")]
+    #[test]
+    fn a_commit_carries_how_it_names_big_integers() {
+        use crate::commit::codec::{load_commit_ops, read_commit, write_commit};
+        use crate::{Commit, NumBigTyping};
+        let flake = |o: FlakeValue, op: bool| {
+            Flake::new(
+                Sid::new(100, "s"),
+                Sid::new(100, "p"),
+                o,
+                Sid::xsd_integer(),
+                1,
+                op,
+                None,
+            )
+        };
+        let big = || FlakeValue::BigInt(Box::new("18446744073709551615".parse().unwrap()));
+        let small = || FlakeValue::BigInt(Box::new(7.into()));
+        for (typing, flakes, by_value) in [
+            (NumBigTyping::Declared, vec![flake(big(), false)], false),
+            (NumBigTyping::ByValue, vec![flake(big(), false)], true),
+            (NumBigTyping::ByValue, vec![flake(big(), true)], false),
+            (NumBigTyping::ByValue, vec![flake(small(), false)], false),
+        ] {
+            let mut commit = Commit::new(1, flakes);
+            commit.num_big_typing = typing;
+            let bytes = write_commit(&commit, false, None).unwrap().bytes;
+            assert_eq!(
+                bytes[5] & format::FLAG_NUM_BIG_DECLARED != 0,
+                typing == NumBigTyping::Declared
+            );
+            let read = read_commit(&bytes).unwrap();
+            assert_eq!(read.num_big_typing, typing);
+            assert_eq!(read.retracts_big_integers_by_value(), by_value);
+            let ops = load_commit_ops(&bytes).unwrap();
+            assert_eq!(ops.num_big_typing, typing);
+            assert_eq!(ops.retracts_big_integers_by_value().unwrap(), by_value);
+        }
+        assert_eq!(
+            Commit::new(1, Vec::new()).num_big_typing,
+            NumBigTyping::Declared
+        );
     }
 }

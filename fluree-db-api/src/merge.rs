@@ -598,7 +598,7 @@ impl crate::Fluree {
         // past the validation.
         if let (Some(base), Some(diff)) = (base, diff) {
             if let Some(outcome) = self
-                .validate_fast_forward(base, source_branch, source_store, diff)
+                .validate_fast_forward(base, source_branch, source_id.as_str(), source_store, diff)
                 .await?
             {
                 outcome.into_result()?;
@@ -700,6 +700,11 @@ impl crate::Fluree {
             &diff.source.commits,
             &diff.source.own,
             &mut config,
+            &crate::commit_data::Line {
+                fluree: self,
+                ledger_id: source_id.as_str(),
+                strict: true,
+            },
         )
         .await?;
         let target_delta = config.keys(target_delta);
@@ -976,15 +981,20 @@ pub(crate) async fn collect_commit_data(
     cids: &[ContentId],
     own: &[ContentId],
     config: &mut ConfigGraphs,
+    line: &crate::commit_data::Line<'_>,
 ) -> Result<(CollectedCommitData, FxHashSet<ConflictKey>)> {
     let mut changes = OwnChanges::new(own);
     let mut commits = Vec::with_capacity(cids.len());
     for cid in cids {
-        let mut commit = load_commit_by_id(store, cid).await?;
+        commits.push(load_commit_by_id(store, cid).await?);
+    }
+    // What a commit staged by value deleted, read on the line it was
+    // written on, before it is folded.
+    line.resolve(&mut commits).await?;
+    for (cid, commit) in cids.iter().zip(&mut commits) {
         config.adopt(&commit.namespace_delta);
         config.flakes(&mut commit.flakes);
         changes.retain_changes(cid, &mut commit.flakes);
-        commits.push(commit);
     }
     let retention_input = commits
         .iter()

@@ -462,9 +462,19 @@ impl crate::Fluree {
         // named graphs, matching the merge path's `collect_commit_data`.
         let mut commits = Vec::with_capacity(plan.ordered_commits.len());
         for commit_id in plan.ordered_commits.iter().rev() {
-            let mut commit = load_commit_by_id(&branch_store, commit_id).await?;
+            commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+        }
+        // What a commit staged by value deleted, read on the branch before
+        // it, so that undoing it restores what it removed.
+        crate::commit_data::Line {
+            fluree: self,
+            ledger_id: branch_id.as_str(),
+            strict: true,
+        }
+        .resolve(&mut commits)
+        .await?;
+        for commit in &mut commits {
             config.flakes(&mut commit.flakes);
-            commits.push(commit);
         }
         let reverted: Vec<RevertedWrites> = commits.iter().map(RevertedWrites::of).collect();
         let CollectedCommitData {

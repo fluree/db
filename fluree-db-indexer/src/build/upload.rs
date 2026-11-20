@@ -75,6 +75,30 @@ async fn upload_stats_sketch_within(
     Ok(Some((cid, bytes)))
 }
 
+/// Upload `chunks` of `p_id`'s NumBig arena, in handle order.
+pub(crate) async fn upload_numbig_chunks(
+    cs: &dyn ContentStore,
+    p_id: u32,
+    chunks: &[fluree_db_binary_index::arena::numbig::NumBigChunk],
+    msg: &'static str,
+) -> Result<Vec<fluree_db_binary_index::NumBigChunkRef>> {
+    let mut refs = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        let cid = upload_dict_blob(
+            cs,
+            fluree_db_core::DictKind::NumBig { p_id },
+            &chunk.bytes,
+            msg,
+        )
+        .await?;
+        refs.push(fluree_db_binary_index::NumBigChunkRef {
+            cid,
+            entries: chunk.entries,
+        });
+    }
+    Ok(refs)
+}
+
 /// Read a dict artifact file from disk and upload it to the content store.
 pub(crate) async fn upload_dict_file(
     cs: &dyn ContentStore,

@@ -165,19 +165,30 @@ pub(crate) fn late_materialized_object_binding(
             t,
             arena_g_id: NO_ARENA_GRAPH,
         }),
-        // The arena holds overflow integers and decimals alike, so `dt_id` is
-        // a placeholder: decode, then resolve via
-        // `BinaryIndexStore::resolve_dt_id_sid_for_value`.
-        DecodeKind::NumBigArena => Some(Binding::EncodedLit {
-            o_kind: ObjKind::NUM_BIG.as_u8(),
-            o_key,
-            p_id,
-            dt_id: DatatypeDictId::DECIMAL.as_u16(),
-            lang_id: 0,
-            i_val: o_i,
-            t,
-            arena_g_id: g_id,
-        }),
+        // A typed `xsd:integer` or `xsd:decimal` carries its reserved
+        // `dt_id`. A by-value row (`NUM_BIG_OVERFLOW`, a `main` root) holds
+        // either, so it carries `NUM_BIG_BY_VALUE`, which
+        // `BinaryIndexStore::resolve_dt_id_sid_for_value` resolves from the
+        // decoded value. The other integer subtypes have no reserved `dt_id`
+        // and stay materialized, as `xsd:int` does.
+        DecodeKind::NumBigArena => {
+            let dt_id = match ot {
+                OType::NUM_BIG_INTEGER => DatatypeDictId::INTEGER,
+                OType::NUM_BIG_DECIMAL => DatatypeDictId::DECIMAL,
+                OType::NUM_BIG_OVERFLOW => DatatypeDictId::NUM_BIG_BY_VALUE,
+                _ => return None,
+            };
+            Some(Binding::EncodedLit {
+                o_kind: ObjKind::NUM_BIG.as_u8(),
+                o_key,
+                p_id,
+                dt_id: dt_id.as_u16(),
+                lang_id: 0,
+                i_val: o_i,
+                t,
+                arena_g_id: g_id,
+            })
+        }
         // Inline integer/float values whose datatype has a reserved dict id:
         // keep them encoded so they hash/compare/clone as cheap ints through
         // DISTINCT and joins, with materialization deferred to projection.

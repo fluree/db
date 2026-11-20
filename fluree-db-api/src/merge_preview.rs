@@ -560,6 +560,11 @@ impl crate::Fluree {
                             &diff.source.commits,
                             &diff.source.own,
                             source_config.as_mut().expect("loaded for a divergence"),
+                            &crate::commit_data::Line {
+                                fluree: self,
+                                ledger_id: source_id.as_str(),
+                                strict: true,
+                            },
                         )
                         .await?;
                         Ok::<_, ApiError>((
@@ -739,40 +744,41 @@ impl crate::Fluree {
         // it on a clone of the target state, and run the branch-operation
         // validator. Under `Abort` with conflicts the merge never reaches
         // validation, so neither does the preview.
-        let validation =
-            if need_validation && !opts.conflict_strategy.aborts_on(all_conflict_keys.len()) {
-                let target_state = target_state.as_ref().expect("loaded for validation");
-                // The change summary above borrowed it; nothing needs it
-                // after this, so hand it over.
-                let net = net_flakes.take();
-                let (ns_delta, graph_iris) = source_deltas.unwrap_or_default();
-                let (_view, outcome) = self
-                    .stage_merge(
-                        target_state.clone(),
-                        source_branch,
-                        net.unwrap_or_default(),
-                        &all_conflict_keys,
-                        &opts.conflict_strategy,
-                        &ns_delta,
-                        &graph_iris,
-                    )
-                    .await?;
-                Some(ValidationSummary {
+        let validation = if need_validation
+            && !opts.conflict_strategy.aborts_on(all_conflict_keys.len())
+        {
+            let target_state = target_state.as_ref().expect("loaded for validation");
+            // The change summary above borrowed it; nothing needs it
+            // after this, so hand it over.
+            let net = net_flakes.take();
+            let (ns_delta, graph_iris) = source_deltas.unwrap_or_default();
+            let (_view, outcome) = self
+                .stage_merge(
+                    target_state.clone(),
+                    source_branch,
+                    net.unwrap_or_default(),
+                    &all_conflict_keys,
+                    &opts.conflict_strategy,
+                    &ns_delta,
+                    &graph_iris,
+                )
+                .await?;
+            Some(ValidationSummary {
+                conforms: outcome.conforms(),
+                report: outcome.report(),
+            })
+        } else if let (Some(base), Some(diff)) = (fast_forward_base, diff.as_ref()) {
+            // A fast-forward: the check the merge runs before adopting the
+            // commits, when it runs one.
+            self.validate_fast_forward(base, source_branch, source_id.as_str(), &source_store, diff)
+                .await?
+                .map(|outcome| ValidationSummary {
                     conforms: outcome.conforms(),
                     report: outcome.report(),
                 })
-            } else if let (Some(base), Some(diff)) = (fast_forward_base, diff.as_ref()) {
-                // A fast-forward: the check the merge runs before adopting the
-                // commits, when it runs one.
-                self.validate_fast_forward(base, source_branch, &source_store, diff)
-                    .await?
-                    .map(|outcome| ValidationSummary {
-                        conforms: outcome.conforms(),
-                        report: outcome.report(),
-                    })
-            } else {
-                None
-            };
+        } else {
+            None
+        };
 
         let mergeable = !opts.conflict_strategy.aborts_on(conflicts.count)
             && validation.as_ref().is_none_or(|v| v.conforms);

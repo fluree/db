@@ -7,7 +7,7 @@
 use super::envelope;
 use super::format::{
     encode_sig_block, sig_block_size, CommitFooter, CommitHeader, CommitSignature, DictLocation,
-    FLAG_HAS_COMMIT_SIG, FLAG_ZSTD, FOOTER_LEN, HEADER_LEN, VERSION,
+    FLAG_HAS_COMMIT_SIG, FLAG_NUM_BIG_DECLARED, FLAG_ZSTD, FOOTER_LEN, HEADER_LEN, VERSION,
 };
 use super::op_codec::{encode_op, CommitDicts};
 use super::CommitCodecError;
@@ -132,6 +132,9 @@ pub fn write_commit(
     }
     if signing.is_some() {
         flags |= FLAG_HAS_COMMIT_SIG;
+    }
+    if commit.num_big_typing == crate::NumBigTyping::Declared {
+        flags |= FLAG_NUM_BIG_DECLARED;
     }
     let header = CommitHeader {
         version: VERSION,

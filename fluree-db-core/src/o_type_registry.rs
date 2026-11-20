@@ -83,7 +83,14 @@ impl OTypeRegistry {
             ObjKind::DATE_TIME => OType::XSD_DATE_TIME,
             ObjKind::VECTOR_ID => OType::VECTOR,
             ObjKind::JSON_ID => OType::RDF_JSON,
-            ObjKind::NUM_BIG => OType::NUM_BIG_OVERFLOW,
+            // A big number keeps its declared datatype. Coercion gives a big
+            // number only an integer type that reaches past `i64` or
+            // `xsd:decimal`; any other datatype falls back to the by-value
+            // o_type rather than failing the build.
+            ObjKind::NUM_BIG => self
+                .resolve_by_dt(dt)
+                .num_big_twin()
+                .unwrap_or(OType::NUM_BIG_OVERFLOW),
             ObjKind::NUM_DEC => OType::XSD_DECIMAL_INLINE,
             ObjKind::G_YEAR => OType::XSD_G_YEAR,
             ObjKind::G_YEAR_MONTH => OType::XSD_G_YEAR_MONTH,
@@ -281,6 +288,16 @@ pub fn resolve_iri_to_otype_option(iri: &str) -> Option<OType> {
     }
 }
 
+/// The `OType` of a datatype `Sid` Fluree knows, in any of the forms a
+/// datatype `Sid` takes; `None` for a custom datatype and for
+/// `rdf:langString`, as [`resolve_iri_to_otype_option`].
+pub fn datatype_otype(dt: &crate::Sid) -> Option<OType> {
+    match crate::datatypes::known_datatype(dt).map(known_datatype_to_otype) {
+        Some(OType::RESERVED) => None,
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,7 +341,11 @@ mod tests {
         );
         assert_eq!(
             reg.resolve(ObjKind::NUM_BIG, DatatypeDictId::DECIMAL, 0),
-            OType::NUM_BIG_OVERFLOW
+            OType::NUM_BIG_DECIMAL
+        );
+        assert_eq!(
+            reg.resolve(ObjKind::NUM_BIG, DatatypeDictId::INTEGER, 0),
+            OType::NUM_BIG_INTEGER
         );
         assert_eq!(
             reg.resolve(ObjKind::NUM_DEC, DatatypeDictId::DECIMAL, 0),
@@ -368,6 +389,43 @@ mod tests {
             reg.resolve(ObjKind::NUM_INT, DatatypeDictId::from_u16(17), 0),
             OType::XSD_UNSIGNED_LONG
         );
+    }
+
+    /// A big number keeps its declared datatype, including a subtype the
+    /// ledger registers as a custom datatype id. A datatype with no NumBig
+    /// form falls back to the by-value o_type.
+    #[test]
+    fn num_big_keeps_declared_datatype() {
+        let reg = OTypeRegistry::new(&[
+            "http://www.w3.org/2001/XMLSchema#unsignedLong".to_string(),
+            "http://www.w3.org/2001/XMLSchema#nonNegativeInteger".to_string(),
+            "http://www.w3.org/2001/XMLSchema#positiveInteger".to_string(),
+            "http://www.w3.org/2001/XMLSchema#nonPositiveInteger".to_string(),
+            "http://www.w3.org/2001/XMLSchema#negativeInteger".to_string(),
+            "http://example.org/myType".to_string(),
+        ]);
+        let expected = [
+            OType::NUM_BIG_UNSIGNED_LONG,
+            OType::NUM_BIG_NON_NEGATIVE_INTEGER,
+            OType::NUM_BIG_POSITIVE_INTEGER,
+            OType::NUM_BIG_NON_POSITIVE_INTEGER,
+            OType::NUM_BIG_NEGATIVE_INTEGER,
+        ];
+        for (i, ot) in expected.into_iter().enumerate() {
+            let dt = DatatypeDictId::from_u16(DatatypeDictId::RESERVED_COUNT + i as u16);
+            assert_eq!(reg.resolve(ObjKind::NUM_BIG, dt, 0), ot, "dt {dt:?}");
+        }
+        for dt in [
+            DatatypeDictId::from_u16(DatatypeDictId::RESERVED_COUNT + 5),
+            DatatypeDictId::LONG,
+            DatatypeDictId::STRING,
+        ] {
+            assert_eq!(
+                reg.resolve(ObjKind::NUM_BIG, dt, 0),
+                OType::NUM_BIG_OVERFLOW,
+                "dt {dt:?}"
+            );
+        }
     }
 
     #[test]

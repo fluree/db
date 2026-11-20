@@ -1030,7 +1030,7 @@ fn binary_range_eq_v3(
             };
             // Decode object.
             let o_val = view.decode_value(o_type, o_key, p_id)?;
-            // Resolve datatype (value-aware: NUM_BIG_OVERFLOW names no o_type).
+            // Resolve datatype (value-aware: a by-value NUM_BIG_OVERFLOW names none).
             let dt = store
                 .resolve_datatype_sid_for_value(o_type, &o_val)
                 .unwrap_or_else(|| Sid::new(0, ""));

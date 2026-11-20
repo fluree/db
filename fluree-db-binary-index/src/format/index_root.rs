@@ -22,7 +22,8 @@ use super::wire_helpers::{
     read_string, read_string_array, read_term_dict_refs, read_u16_at, read_u32_at, read_u64_at,
     read_u8_at, write_cid, write_dict_pack_refs, write_dict_tree_refs, write_str,
     write_string_array, write_term_dict_refs, BinaryGarbageRef, BinaryPrevIndexRef, DictRefs,
-    FulltextArenaRef, GraphArenaRefs, SpatialArenaRef, TermDictRefs, VectorDictRef,
+    FulltextArenaRef, GraphArenaRefs, NumBigArenaRef, NumBigChunkRef, SpatialArenaRef,
+    TermDictRefs, VectorDictRef,
 };
 use fluree_db_core::index_schema::IndexSchema;
 use fluree_db_core::index_stats::IndexStats;
@@ -282,6 +283,11 @@ pub struct IndexRoot {
     /// root, otherwise the `FLAG_EXT_DECIMAL_ARENA_ONLY` flag. Sticky:
     /// incremental writes preserve it; only a full reindex changes it.
     pub decimal_encoding: fluree_db_core::DecimalEncoding,
+
+    /// How this root types its NumBig arena values. Never encoded: a `main`
+    /// (v2) root types them by value, and every root this build writes by
+    /// declared datatype.
+    pub num_big_typing: fluree_db_core::NumBigTyping,
 
     // ── Cumulative commit stats ────────────────────────────────────
     pub total_commit_size: u64,
@@ -614,6 +620,48 @@ impl IndexRoot {
                 DictFamily::NumBigArena,
             ),
             (
+                OType::NUM_BIG_INTEGER.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::INTEGER),
+                DictFamily::NumBigArena,
+            ),
+            (
+                OType::NUM_BIG_DECIMAL.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::DECIMAL),
+                DictFamily::NumBigArena,
+            ),
+            (
+                OType::NUM_BIG_UNSIGNED_LONG.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::UNSIGNED_LONG),
+                DictFamily::NumBigArena,
+            ),
+            (
+                OType::NUM_BIG_NON_NEGATIVE_INTEGER.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::NON_NEGATIVE_INTEGER),
+                DictFamily::NumBigArena,
+            ),
+            (
+                OType::NUM_BIG_POSITIVE_INTEGER.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::POSITIVE_INTEGER),
+                DictFamily::NumBigArena,
+            ),
+            (
+                OType::NUM_BIG_NON_POSITIVE_INTEGER.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::NON_POSITIVE_INTEGER),
+                DictFamily::NumBigArena,
+            ),
+            (
+                OType::NUM_BIG_NEGATIVE_INTEGER.as_u16(),
+                DecodeKind::NumBigArena,
+                Some(xsd::NEGATIVE_INTEGER),
+                DictFamily::NumBigArena,
+            ),
+            (
                 OType::SPATIAL_COMPLEX.as_u16(),
                 DecodeKind::SpatialArena,
                 None,
@@ -862,7 +910,7 @@ impl IndexRoot {
         write_graph(&mut buf, sorted_arenas.len() as u32);
         for ga in &sorted_arenas {
             write_graph(&mut buf, ga.g_id);
-            write_graph_arenas_v5(&mut buf, ga);
+            write_graph_arenas_v5(&mut buf, ga, wide);
         }
 
         // ---- Watermarks ----
@@ -1098,6 +1146,11 @@ impl IndexRoot {
             } else {
                 fluree_db_core::DecimalEncoding::InlineWhenFits
             };
+        let num_big_typing = if version == ROOT_V6_VERSION {
+            fluree_db_core::NumBigTyping::ByValue
+        } else {
+            fluree_db_core::NumBigTyping::Declared
+        };
         let mut pos = 8; // skip past flags_ext + reserved
         let index_t = read_i64_at(data, &mut pos)?;
         let base_t = read_i64_at(data, &mut pos)?;
@@ -1412,6 +1465,7 @@ impl IndexRoot {
             string_watermark,
             lex_sorted_string_ids,
             decimal_encoding,
+            num_big_typing,
             total_commit_size,
             total_asserts,
             total_retracts,
@@ -1503,8 +1557,8 @@ impl IndexRoot {
 
         // Per-graph arenas (numbig, vectors, spatial, fulltext)
         for ga in &self.graph_arenas {
-            for (_, cid) in &ga.numbig {
-                ids.push(cid.clone());
+            for nb in &ga.numbig {
+                ids.extend(nb.cids().cloned());
             }
             for vdr in &ga.vectors {
                 ids.push(vdr.manifest.clone());
@@ -1564,14 +1618,26 @@ impl IndexRoot {
 // Shared arena encode/decode
 // ============================================================================
 
-fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs) {
-    // numbig
+fn write_graph_arenas_v5(buf: &mut Vec<u8>, ga: &GraphArenaRefs, wide: bool) {
+    // numbig: v5 lists each arena's chunks with their entry counts; `main`'s
+    // v2 layout holds one blob per arena.
     let mut sorted_nb = ga.numbig.clone();
-    sorted_nb.sort_by_key(|(p_id, _)| *p_id);
+    sorted_nb.sort_by_key(|nb| nb.p_id);
     buf.extend_from_slice(&(sorted_nb.len() as u16).to_le_bytes());
-    for (p_id, cid) in &sorted_nb {
-        buf.extend_from_slice(&p_id.to_le_bytes());
-        write_cid(buf, cid);
+    for nb in &sorted_nb {
+        buf.extend_from_slice(&nb.p_id.to_le_bytes());
+        if wide {
+            buf.extend_from_slice(&(nb.chunks.len() as u32).to_le_bytes());
+            for chunk in &nb.chunks {
+                buf.extend_from_slice(&chunk.entries.to_le_bytes());
+                write_cid(buf, &chunk.cid);
+            }
+        } else {
+            let [chunk] = nb.chunks.as_slice() else {
+                panic!("main's layout holds one NumBig blob per arena");
+            };
+            write_cid(buf, &chunk.cid);
+        }
     }
     // vectors
     let mut sorted_v = ga.vectors.clone();
@@ -1626,8 +1692,22 @@ fn read_graph_arenas_v5(data: &[u8], pos: &mut usize, wide: bool) -> io::Result<
     let mut numbig = Vec::with_capacity(nb_count);
     for _ in 0..nb_count {
         let p_id = read_u32_at(data, pos)?;
-        let cid = read_cid(data, pos)?;
-        numbig.push((p_id, cid));
+        let chunks = if wide {
+            let chunk_count = read_u32_at(data, pos)? as usize;
+            let mut chunks = Vec::with_capacity(chunk_count.min(1024));
+            for _ in 0..chunk_count {
+                let entries = read_u32_at(data, pos)?;
+                let cid = read_cid(data, pos)?;
+                chunks.push(NumBigChunkRef { cid, entries });
+            }
+            chunks
+        } else {
+            vec![NumBigChunkRef {
+                cid: read_cid(data, pos)?,
+                entries: 0,
+            }]
+        };
+        numbig.push(NumBigArenaRef { p_id, chunks });
     }
     // vectors
     let vec_count = read_u16_at(data, pos)? as usize;
@@ -1786,6 +1866,7 @@ mod tests {
             graph_drops: Vec::new(),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
             pool: None,
         }
     }
@@ -2405,8 +2486,8 @@ mod tests {
     #[test]
     fn o_type_table_built_in() {
         let table = IndexRoot::build_o_type_table(&[], &[]);
-        // Should contain all 32 embedded + 14 Fluree = 46 entries.
-        assert_eq!(table.len(), 46);
+        // Should contain all 32 embedded + 21 Fluree = 53 entries.
+        assert_eq!(table.len(), 53);
 
         // Spot-check a few entries.
         let int_entry = table
@@ -2430,13 +2511,21 @@ mod tests {
             .unwrap();
         assert_eq!(ref_entry.decode_kind, DecodeKind::IriRef);
         assert_eq!(ref_entry.dict_family, Some(DictFamily::SubjectDict));
+
+        let big_entry = table
+            .iter()
+            .find(|e| e.o_type == OType::NUM_BIG_UNSIGNED_LONG.as_u16())
+            .unwrap();
+        assert_eq!(big_entry.decode_kind, DecodeKind::NumBigArena);
+        assert_eq!(big_entry.datatype_iri.as_deref(), Some(xsd::UNSIGNED_LONG));
+        assert_eq!(big_entry.dict_family, Some(DictFamily::NumBigArena));
     }
 
     #[test]
     fn o_type_table_with_langs() {
         let table = IndexRoot::build_o_type_table(&[], &["en".to_string(), "fr".to_string()]);
-        // 46 built-in + 2 langString = 48.
-        assert_eq!(table.len(), 48);
+        // 53 built-in + 2 langString = 55.
+        assert_eq!(table.len(), 55);
 
         // lang_id is 1-based: first tag "en" gets lang_id=1
         let en_entry = table
@@ -2450,8 +2539,8 @@ mod tests {
     #[test]
     fn o_type_table_with_custom_types() {
         let table = IndexRoot::build_o_type_table(&["http://example.org/myType".to_string()], &[]);
-        // 46 built-in + 1 customer = 47.
-        assert_eq!(table.len(), 47);
+        // 53 built-in + 1 customer = 54.
+        assert_eq!(table.len(), 54);
 
         let custom = table.last().unwrap();
         assert!(OType::from_u16(custom.o_type).is_customer_datatype());

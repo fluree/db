@@ -479,12 +479,11 @@ async fn delete_insert_where_replaces_every_language() {
     }
 }
 
-/// A big integer typed with an XSD subtype decodes from the index with a
-/// lossy datatype (`NUM_BIG` stores none). A witnessed DELETE WHERE row
-/// carries that decode and still deletes the value through the shared
-/// storage key, as before. On a list-bearing ledger the row also goes
-/// through the resolver for list positions; this pins that the exact
-/// datatype rule does not drop it there.
+/// A big integer typed with an XSD subtype decodes from the index with its
+/// subtype. A witnessed DELETE WHERE row carries that decode and deletes
+/// the value. On a list-bearing ledger the row also goes through the
+/// resolver for list positions; this pins that the exact datatype rule does
+/// not drop it there.
 async fn numbig_rows(fluree: &Fluree, ledger: &LedgerState) -> usize {
     let q = format!("PREFIX ex: <{EX}>\nSELECT ?o WHERE {{ GRAPH <{G1}> {{ ?s ex:n ?o }} }}");
     let r = support::query_sparql(fluree, ledger, &q).await.expect("q");
@@ -2175,6 +2174,35 @@ async fn a_write_that_restates_a_stored_value_keeps_it() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
+/// The values of `ex:s`'s `ex:p`, each with its datatype's local name, read
+/// cold from the ledger at `path`.
+async fn typed_values_of(path: &str, id: &str) -> Vec<String> {
+    let fluree = FlureeBuilder::file(path.to_string())
+        .without_indexing()
+        .without_storage_lock()
+        .build()
+        .expect("reload");
+    let ledger = fluree.ledger(id).await.expect("ledger");
+    let q = format!("PREFIX ex: <{EX}>\nSELECT ?o WHERE {{ ex:s ex:p ?o }}");
+    let json = support::query_sparql(&fluree, &ledger, &q)
+        .await
+        .expect("query")
+        .to_sparql_json(&ledger.snapshot)
+        .expect("json");
+    let mut values: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|b| {
+            let dt = b["o"]["datatype"].as_str().unwrap_or("?");
+            let dt = dt.rsplit('#').next().unwrap_or(dt);
+            format!("{}^^{dt}", b["o"]["value"].as_str().unwrap_or("?"))
+        })
+        .collect();
+    values.sort();
+    values
+}
+
 /// The values of `ex:s`'s `pred`, read cold from the ledger at `path`.
 async fn values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
     let fluree = FlureeBuilder::file(path.to_string())
@@ -2225,15 +2253,15 @@ async fn stored_values_of(path: &str, id: &str, pred: &str) -> Vec<String> {
     values
 }
 
-/// An integer too large for 64 bits is one stored fact per value, whatever
-/// XSD subtype it is written with: the index keys it by value. So a write
-/// that retracts it under one subtype and asserts it under another commits
-/// nothing and keeps it, whether the index holds it, holds the value for
-/// another subject only, has not seen it since its last build, or does not
-/// exist yet; and it is still there after the next index build. In one
-/// operation (SPARQL and JSON-LD) and across two of one request.
+/// An integer too large for 64 bits is a term per XSD subtype, as the index
+/// keeps it. So a write that retracts it under one subtype and asserts it
+/// under another replaces the one term with the other, whether the index
+/// holds it, holds the value for another subject only, has not seen it since
+/// its last build, or does not exist yet; and the new term is there after
+/// the next index build. In one operation (SPARQL and JSON-LD) and across
+/// two of one request.
 #[tokio::test]
-async fn changing_a_big_integers_subtype_keeps_it() {
+async fn changing_a_big_integers_subtype_replaces_it() {
     const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
                        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
     const BIG: &str = "123456789012345678901234567890";
@@ -2322,7 +2350,7 @@ async fn changing_a_big_integers_subtype_keeps_it() {
                 };
                 tx.commit().await.expect("write").receipt.flake_count
             };
-            let after = values_of(&path, id, "ex:p").await;
+            let after = typed_values_of(&path, id).await;
             {
                 let fluree = FlureeBuilder::file(path.clone())
                     .without_storage_lock()
@@ -2330,11 +2358,12 @@ async fn changing_a_big_integers_subtype_keeps_it() {
                     .expect("reload");
                 support::rebuild_and_publish_index(&fluree, id).await;
             }
-            let reindexed = values_of(&path, id, "ex:p").await;
-            if flakes != 0 || after != [BIG] || reindexed != [BIG] {
+            let reindexed = typed_values_of(&path, id).await;
+            let want = [format!("{BIG}^^positiveInteger")];
+            if flakes != 2 || after != want || reindexed != want {
                 failures.push(format!(
                     "{case}, {lane}: flakes {flakes}, values {after:?}, after reindex \
-                     {reindexed:?}; expected no commit and [{BIG}]"
+                     {reindexed:?}; expected a retraction and an assertion, and {want:?}"
                 ));
             }
         }
@@ -2425,16 +2454,16 @@ async fn a_write_retracting_a_value_a_list_holds_twice_retracts_both_entries() {
 }
 
 /// ADD, COPY and MOVE tell the facts of the source and the destination apart
-/// the way storage does: a big integer by value, whatever XSD subtype either
-/// side holds it with. So a value both graphs hold, one in its index and the
+/// the way storage does. So a term both graphs hold, one in its index and the
 /// other since its last build, is a restatement: it stays in the destination,
 /// read in process, after a reload and after the next full index build (no
-/// background indexer, so the index state is the test's). Before,
-/// the destination's term was retracted and the source's asserted at one
-/// `t`, and the retraction won. Both directions (indexed destination,
-/// novelty source and the reverse), into a named graph and into the default
-/// graph. A `dateTime` written past the microsecond is a control: both sides
-/// hold it at the microsecond.
+/// background indexer, so the index state is the test's). Before, the
+/// destination's term was retracted and the source's asserted at one `t`,
+/// and the retraction won. A big integer is a term per XSD subtype, so an
+/// ADD of one subtype onto another leaves both. Both directions (indexed
+/// destination, novelty source and the reverse), into a named graph and into
+/// the default graph. A `dateTime` written past the microsecond is a
+/// control: both sides hold it at the microsecond.
 #[tokio::test]
 async fn a_transfer_keeps_a_value_both_graphs_hold() {
     const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
@@ -2560,12 +2589,20 @@ async fn a_transfer_keeps_a_value_both_graphs_hold() {
                     got.push(count(reload(), id.clone(), dest).await);
                     src_left.push(count(reload(), id.clone(), Some(src)).await);
                     let want_src = if verb == "MOVE" { "0" } else { "1" };
-                    if got.iter().any(|n| n != "1") || src_left.iter().any(|n| n != want_src) {
+                    let want = if verb == "ADD"
+                        && src_value != dest_value
+                        && src_value.contains("Integer")
+                    {
+                        "2"
+                    } else {
+                        "1"
+                    };
+                    if got.iter().any(|n| n != want) || src_left.iter().any(|n| n != want_src) {
                         failures.push(format!(
                             "{verb} of {src_value} onto {dest_value} ({} indexed) into {}: \
                              destination values in process, reloaded, after an incremental \
                              and a full build = {got:?}, source values reloaded and after \
-                             the builds {src_left:?}; expected 1 each and {want_src}",
+                             the builds {src_left:?}; expected {want} each and {want_src}",
                             if dest_indexed {
                                 "destination"
                             } else {

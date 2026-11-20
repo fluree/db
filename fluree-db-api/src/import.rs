@@ -7585,6 +7585,7 @@ where
             // Same source as the spool object resolution (SpoolConfig): the root
             // version must match how the import encoded decimals.
             decimal_encoding: IMPORT_DECIMAL_ENCODING,
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
             pool,
         };
 
@@ -7630,7 +7631,10 @@ where
 /// Per-graph arena refs for the numbig and vector arenas an import uploaded,
 /// keyed by graph id and then predicate id (both as decimal strings).
 pub(crate) fn graph_arena_refs(
-    numbig: &std::collections::BTreeMap<String, std::collections::BTreeMap<String, ContentId>>,
+    numbig: &std::collections::BTreeMap<
+        String,
+        std::collections::BTreeMap<String, fluree_db_binary_index::NumBigArenaRef>,
+    >,
     vectors: &std::collections::BTreeMap<
         String,
         std::collections::BTreeMap<String, fluree_db_binary_index::VectorDictRef>,
@@ -7648,13 +7652,9 @@ pub(crate) fn graph_arena_refs(
         .into_iter()
         .map(|g_id| {
             let g_id_str = g_id.to_string();
-            let numbig: Vec<(u32, ContentId)> = numbig
+            let numbig: Vec<fluree_db_binary_index::NumBigArenaRef> = numbig
                 .get(&g_id_str)
-                .map(|m| {
-                    m.iter()
-                        .map(|(k, v)| (k.parse::<u32>().unwrap_or(0), v.clone()))
-                        .collect()
-                })
+                .map(|m| m.values().cloned().collect())
                 .unwrap_or_default();
             let vectors: Vec<VectorDictRef> = vectors
                 .get(&g_id_str)

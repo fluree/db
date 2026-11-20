@@ -172,6 +172,7 @@ pub(crate) fn read_commit_v4(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
         redaction: None,
+        num_big_typing: header.num_big_typing(),
     })
 }
 

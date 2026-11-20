@@ -323,6 +323,7 @@ pub(crate) async fn encode_and_write_root_v6(
         sketch_ref: inputs.sketch_ref,
         // Same source as the resolver's policy for this run (see Fir6Inputs).
         decimal_encoding: inputs.decimal_encoding,
+        num_big_typing: fluree_db_core::NumBigTyping::Declared,
         has_annotations,
         legacy_annotation_arena: None,
         term_dict: inputs.term_dict,
@@ -474,6 +475,7 @@ mod tests {
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: fluree_db_core::ns_encoding::NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
             pool: None,
         }
     }

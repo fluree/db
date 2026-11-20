@@ -478,7 +478,7 @@ pub(crate) fn driver_subject_boundaries(
 /// join key **across two different predicates** (#1652 case 3). True when any
 /// POST leaflet shows either hazard:
 ///
-/// - an arena-backed object (`NUM_BIG_OVERFLOW`, `VECTOR`): its `o_key` is a
+/// - an arena-backed object (NumBig, `VECTOR`): its `o_key` is a
 ///   handle into a **per-predicate** arena (see
 ///   [`OType::o_key_is_globally_identifying`]), so equal values under two
 ///   predicates carry unrelated handles and never compare equal, and equal
@@ -500,7 +500,7 @@ pub(crate) fn driver_subject_boundaries(
 /// `o_type` immediately after `p_id`); only when that range straddles a
 /// non-identifying o_type is the leaflet's o_type column decoded for an exact
 /// membership check, because the range alone over-declines (inline numerics
-/// sort below `NUM_BIG_OVERFLOW` and langstrings above it, so a plain
+/// sort below the NumBig o_types and langstrings above them, so a plain
 /// int+string+langstring leaflet straddles it without containing one).
 ///
 /// Covers the base index only — novelty NumBig values get query-scoped

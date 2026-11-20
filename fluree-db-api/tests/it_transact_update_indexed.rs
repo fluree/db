@@ -538,7 +538,8 @@ async fn multi_op_reversal_nets_a_value_the_index_keeps_less_of() {
 /// The kind of value [`multi_op_last_op_matrix`] writes.
 #[derive(Clone, Copy, Debug)]
 enum Kind {
-    /// An integer too large for 64 bits, under XSD integer subtypes.
+    /// An integer too large for 64 bits, under XSD integer subtypes, each a
+    /// term of its own.
     BigInteger = 0,
     /// A `dateTime` written with digits past the microsecond. Its spellings
     /// are one term once read, so a base holding a second spelling holds one
@@ -560,21 +561,24 @@ enum Base {
     IndexedThenNovelty,
 }
 
-/// Every first and last op of a multi-operation update over a value the index
-/// keeps less of, from `base`: the value is there afterwards exactly when the
-/// last operation inserts it, whatever subtype (or digits past the
-/// microsecond) each operation writes it with, read in process, after a
-/// reload and after the next incremental and full index builds. A retraction
-/// that survives the fold names the value as the base stores it, under every
-/// term the base holds it by.
+/// Every first and last op of a multi-operation update over one value written
+/// several ways, from `base`, read in process, after a reload and after the
+/// next incremental and full index builds.
+///
+/// - A big integer's XSD subtypes are terms of their own, in novelty and in
+///   the index: each op inserts or deletes its own subtype, and the value
+///   reads once per subtype left.
+/// - A `dateTime`'s spellings past the microsecond are one term once
+///   stored: the value is there afterwards exactly when the last operation
+///   inserts it. A retraction that survives the fold names the value as the
+///   base stores it, under every term the base holds it by.
 ///
 /// The sequences cover every one- and two-op sequence over the stored
 /// spelling and another, so each first and last op is tried with the same
 /// term and with another term of the value, either way round; every
 /// three-op sequence whose first and last ops spell it differently; and
 /// longer ones. The one- and two-op sequences also run as separate
-/// requests, one commit per op: a `DELETE DATA` naming one spelling of a
-/// value the ledger holds under another names that stored fact.
+/// requests, one commit per op.
 async fn multi_op_last_op_matrix(base: Base, kind: Kind) {
     const PFX: &str = "PREFIX ex: <http://example.org/ns/>\n\
                        PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>\n";
@@ -716,10 +720,29 @@ async fn multi_op_last_op_matrix(base: Base, kind: Kind) {
                 .await
                 .expect("update");
         }
-        let want = if ops.last().expect("an op").0 {
-            "1"
-        } else {
-            "0"
+        let want = match kind {
+            // Each subtype is a term of its own, in novelty and in the index.
+            Kind::BigInteger => {
+                let mut held: std::collections::BTreeSet<usize> = match base {
+                    Base::Absent => [].into(),
+                    Base::Novelty | Base::Indexed => [0].into(),
+                    Base::TwoTermsInNovelty | Base::IndexedThenNovelty => [0, 1].into(),
+                };
+                for &(insert, n) in ops {
+                    if insert {
+                        held.insert(n);
+                    } else {
+                        held.remove(&n);
+                    }
+                }
+                held.len().to_string()
+            }
+            Kind::DateTime => if ops.last().expect("an op").0 {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
         };
         let reload = || {
             FlureeBuilder::file(path.clone())
@@ -743,24 +766,25 @@ async fn multi_op_last_op_matrix(base: Base, kind: Kind) {
                 .expect("full rebuild");
             count(reload(), ledger_id.clone()).await
         };
-        // Novelty holds each term of a value as its own fact until
-        // the next build (#2090), so a value it holds and asserts
-        // under another subtype reads twice before then, as after an
-        // `INSERT DATA` of that subtype alone.
+        // Novelty holds each spelling of a `dateTime` past the
+        // microsecond as its own fact until the next build (#2090), so a
+        // value it holds and asserts under another spelling reads twice
+        // before then, as after an `INSERT DATA` of that spelling alone.
         // So can two spellings that separate requests assert.
         let asserted: std::collections::HashSet<usize> = ops
             .iter()
             .filter(|(insert, _)| *insert)
             .map(|(_, n)| *n)
             .collect();
-        let two_terms_in_novelty = want == "1"
+        let two_terms_in_novelty = matches!(kind, Kind::DateTime)
+            && want == "1"
             && (matches!(base, Base::Novelty | Base::TwoTermsInNovelty)
                 || (split && matches!(base, Base::Absent) && asserted.len() > 1));
         let unbuilt_ok = |n: &String| {
-            n == want || (two_terms_in_novelty && n.parse::<u32>().is_ok_and(|n| n > 1))
+            *n == want || (two_terms_in_novelty && n.parse::<u32>().is_ok_and(|n| n > 1))
         };
         let got = [in_process, reloaded, incremental, rebuilt];
-        if !got[..2].iter().all(unbuilt_ok) || got[2..].iter().any(|n| n != want) {
+        if !got[..2].iter().all(unbuilt_ok) || got[2..].iter().any(|n| *n != want) {
             failures.push(format!(
                 "{base:?} base, {}{}: values in process, reloaded, after an \
                          incremental build, after a rebuild = {got:?}; expected {want} each{}",

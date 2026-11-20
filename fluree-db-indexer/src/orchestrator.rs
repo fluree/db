@@ -3435,6 +3435,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -3474,6 +3475,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -3522,6 +3524,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid1 = store_commit(&storage, &commit1).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -3557,6 +3560,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid2 = store_commit(&storage, &commit2).await;
         ns.publish_commit("test:main", 2, &cid2).await.unwrap();
@@ -3587,6 +3591,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -4284,6 +4289,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -4332,6 +4338,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -4888,6 +4895,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let cid = store_commit(&storage, &commit).await;
         fluree_db_nameservice::testing::create_at_name_root(&ns, "test:main")
@@ -4987,6 +4995,7 @@ mod tests {
             graph_delta: HashMap::new(),
             ns_split_mode: None,
             graph_drops: Vec::new(),
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
         };
         let first = store_commit(&storage, &commit(1, Vec::new(), false)).await;
         let second = store_commit(&storage, &commit(2, vec![first], true)).await;

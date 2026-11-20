@@ -699,15 +699,52 @@ impl Fluree {
             // 4.1 Retraction invariant (strict), read as of `current_t`: the
             // state's `t` is the greater of the index's and novelty's.
             let evolving_state = base_state.clone_with_novelty(Arc::new(evolving_novelty.clone()));
-            assert_retractions_exist(&evolving_state, &c.commit.flakes, &reverse_graph)
-                .await
-                .map_err(PushError::into_api_error)?;
+            // A commit staged by value retracts each big integer it retracts
+            // under every subtype stored before it, which need not include
+            // the one it names: it holds when it retracts something, and the
+            // others' retractions apply alongside it. Over an earlier
+            // release's index the stored fact is all those subtypes already.
+            let by_value = if c.commit.retracts_big_integers_by_value()
+                && fluree_db_transact::num_big_typing(&evolving_state)
+                    == fluree_db_core::NumBigTyping::Declared
+            {
+                let targets = fluree_db_transact::by_value_targets(
+                    &evolving_state,
+                    &c.commit.flakes,
+                    c.commit.t,
+                )
+                .await?;
+                let held: HashSet<usize> = targets
+                    .iter()
+                    .filter(|(_, held)| !held.is_empty())
+                    .map(|(at, _)| *at)
+                    .collect();
+                let extras = fluree_db_transact::by_value_retractions(
+                    &evolving_state,
+                    &c.commit.flakes,
+                    c.commit.t,
+                )
+                .await?;
+                (held, extras)
+            } else {
+                (HashSet::new(), Vec::new())
+            };
+            assert_retractions_exist(
+                &evolving_state,
+                &c.commit.flakes,
+                &by_value.0,
+                &reverse_graph,
+            )
+            .await
+            .map_err(PushError::into_api_error)?;
+            let commit_flakes: Vec<Flake> =
+                c.commit.flakes.iter().chain(&by_value.1).cloned().collect();
 
             // 4.2 Stage flakes (policy/backpressure) under the policy from
             // 4.0.2. No WHERE/cancellation; flakes are prebuilt.
             let staged_view = match stage_commit_flakes(
                 evolving_state,
-                &c.commit.flakes,
+                &commit_flakes,
                 index_config,
                 policy_ctx.as_ref(),
                 &routing.graph_ids,
@@ -803,7 +840,7 @@ impl Fluree {
             // records are derived from the envelope just below and never ride
             // the flake stream. Without this an ingested ledger serves forged
             // commit records until it is indexed (#1846).
-            let mut all_flakes = c.commit.flakes.clone();
+            let mut all_flakes = commit_flakes;
             let mut meta_flakes =
                 generate_commit_flakes(&c.commit, base_state.ledger_id(), c.commit.t);
             let dropped = drop_forged_commit_flakes(&mut all_flakes, &txn_meta_g);
@@ -1625,15 +1662,18 @@ async fn stage_commit_flakes(
     fluree_db_transact::stage_flakes(ledger, flakes.to_vec(), options).await
 }
 
+/// Every retraction among `flakes` names a stored fact, but those at the
+/// positions in `held`, which hold already.
 async fn assert_retractions_exist(
     state: &LedgerState,
     flakes: &[Flake],
+    held: &HashSet<usize>,
     reverse_graph: &HashMap<Sid, GraphId>,
 ) -> std::result::Result<(), PushError> {
     let mut at = Vec::new();
     let mut items = Vec::new();
     for (idx, f) in flakes.iter().enumerate() {
-        if f.op {
+        if f.op || held.contains(&idx) {
             continue;
         }
         at.push(idx);
@@ -1835,6 +1875,9 @@ fn apply_pushed_commits_to_state(
     // with it attached deep-clones the dictionary and leaves the provider —
     // the copy every read through `base.snapshot` resolves against — without
     // the subjects and strings these commits introduce.
+    // The typing the retractions of commits staged by value were worked out
+    // under (see `push_commits_with`).
+    let num_big_typing = fluree_db_transact::num_big_typing(&base);
     let provider_store = fluree_db_transact::detach_binary_provider(&mut base);
     let mut dict_novelty = base.dict_novelty.clone();
     // Like the commit path, extend the runtime dictionaries with every
@@ -1867,6 +1910,10 @@ fn apply_pushed_commits_to_state(
             .map_err(|e| {
                 PushError::Internal(format!("novelty apply_commit failed at t={t}: {e}"))
             })?;
+        if c.commit.retracts_big_integers_by_value() {
+            Arc::make_mut(&mut base.novelty)
+                .note_by_value_ops(&c.commit.flakes, Some(num_big_typing));
+        }
         fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
             Arc::make_mut(&mut dict_novelty),
             store_opt,

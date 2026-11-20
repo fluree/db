@@ -240,6 +240,23 @@ pub struct Commit {
     /// Set when the commit was read from a redacted replacement: `flakes`
     /// are then only its surviving operations.
     pub redaction: Option<Redaction>,
+
+    /// How the index the commit was staged against typed integers too large
+    /// for 64 bits ([`crate::NumBigTyping`]), and so what its retractions of
+    /// them name.
+    ///
+    /// [`Declared`](crate::NumBigTyping::Declared): each retraction names one
+    /// term, its declared subtype included. [`ByValue`](crate::NumBigTyping::ByValue):
+    /// the commit was written by an earlier release, or against such a
+    /// release's index, where every subtype of one big integer was one fact
+    /// read back as `xsd:integer`. Its retraction of a big integer retracts
+    /// the value under every subtype stored at its slot just before the
+    /// commit, whatever subtype it names. The rest of its ops name one term,
+    /// as a declared commit's do.
+    ///
+    /// Carried in the header's [`FLAG_NUM_BIG_DECLARED`](codec::format::FLAG_NUM_BIG_DECLARED),
+    /// so a commit keeps it through every copy.
+    pub num_big_typing: crate::NumBigTyping,
 }
 
 /// What a commit read from a redacted replacement no longer holds.
@@ -292,6 +309,7 @@ impl Commit {
             graph_drops: Vec::new(),
             ns_split_mode: None,
             redaction: None,
+            num_big_typing: crate::NumBigTyping::Declared,
         }
     }
 
@@ -320,6 +338,14 @@ impl Commit {
     pub fn with_merge_parents(mut self, refs: Vec<CommitId>) -> Self {
         self.parents = refs;
         self
+    }
+
+    /// Whether the commit retracts an integer too large for 64 bits by value
+    /// ([`Self::num_big_typing`]), so that what it retracts depends on what
+    /// was stored before it.
+    pub fn retracts_big_integers_by_value(&self) -> bool {
+        self.num_big_typing == crate::NumBigTyping::ByValue
+            && self.flakes.iter().any(|f| !f.op && f.o.is_big_integer())
     }
 
     /// Set the transaction CID
