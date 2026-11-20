@@ -251,7 +251,11 @@ INSERT DATA {
 
 See [Setting groups — datalogDefaults](../ledger-config/setting-groups.md) for
 full configuration options and [Writing config data](../ledger-config/writing-config.md)
-for the other ways to write the config graph.
+for the other ways to write the config graph. Where the config turns datalog
+off for a request and its `f:overrideControl` does not let the request turn it
+back on, a query that asks for datalog, by name or with `rules`, is refused
+with a 400 rather than answered without it (see
+[Configured reasoning a query may not change](reasoning.md#configured-reasoning-a-query-may-not-change)).
 
 `f:rulesSource` also supports cross-ledger references — set
 `f:ledger` on the inner `f:graphSource` to read the `f:rule`

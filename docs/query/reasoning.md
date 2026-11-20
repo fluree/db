@@ -42,7 +42,10 @@ are active:
 ```
 
 Use `"none"` to override any view- or ledger-wide reasoning defaults for
-this query (with no defaults configured, it is a no-op affirmation).
+this query (with no defaults configured, it is a no-op affirmation). Where
+the ledger's config does not allow the request to override its reasoning
+defaults, `"none"` is refused with a 400, like any mode the config won't
+run; see [Configured reasoning a query may not change](#configured-reasoning-a-query-may-not-change).
 
 ### Valid mode strings
 
@@ -87,6 +90,31 @@ To enable reasoning without setting it per query, configure a default at the
 view level (`GraphDb::with_reasoning(...)` in the Rust API) or in the ledger
 configuration graph (`reasoningModes`). To override such a default for a
 single query, use `"reasoning": "none"`.
+
+### Configured reasoning a query may not change
+
+A ledger's config can decide a request's reasoning: `f:reasoningDefaults`
+under an `f:overrideControl` that does not allow the request to override it
+(`f:OverrideNone`, or an identity list the caller is not on), or
+`f:datalogDefaults` with `f:datalogEnabled false` under one. A query that then
+asks for reasoning the config won't run is refused with a 400 naming what it
+asked for, rather than answered with the config's reasoning:
+
+- a mode the configured modes leave out (`"reasoning": "datalog"`, the same
+  key in `opts`, or `# PRAGMA reasoning: datalog`, under
+  `f:reasoningModes f:rdfs`);
+- `"none"` (or `# PRAGMA reasoning: none`) where the configured modes turn
+  reasoning on;
+- query-time `rules` or an inline `ontology`, which the configured modes
+  would replace;
+- datalog, by name or by supplying `rules`, where `f:datalogEnabled false`
+  applies.
+
+A query that asks for no reasoning, or only for modes the config runs anyway,
+runs with the configured modes, and a mode the config's own defaults turn on
+is never refused. Ask with an identity the override control allows to
+change the reasoning, or leave the key out. See
+[Override control](../ledger-config/override-control.md).
 
 > **Behavior change**: versions prior to this release auto-enabled RDFS when a
 > schema hierarchy existed in the data (though for imported ledgers the
@@ -494,7 +522,7 @@ Reasoning composes with view policy, but mind the contract when both are on:
 **Policy reads what the query reads.** In a reasoning query, class policies and `f:query` conditions see derived facts; a query without reasoning is judged on stored facts. Two consequences follow:
 
 - Data a rule or axiom reads is security data. A derived fact can grant access as well as deny it: a rule can place a subject in a class an `f:onClass` policy allows, or satisfy an `f:query` condition, so whoever can write a rule's inputs can open access through it.
-- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off; see [Override control](../ledger-config/override-control.md).
+- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off (one that asks for `"none"` is refused); see [Override control](../ledger-config/override-control.md).
 
 **Query-time rules are admin-only.** Under a non-root view policy, a query that supplies `rules` is refused with a 400 — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data) — and so is one whose ledger config denies query-time rules for the request (`f:allowQueryTimeRules false`). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
 

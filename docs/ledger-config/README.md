@@ -147,7 +147,7 @@ GRAPH <urn:fluree:mydb:main#config> {
 }
 ```
 
-With `f:OverrideAll` (the default), individual queries can still opt out by passing `"reasoning": "none"`.
+With `f:OverrideAll` (the default), individual queries can still opt out by passing `"reasoning": "none"`. Where `f:overrideControl` does not allow a request to override, a query that asks for other reasoning is refused with a 400 rather than answered with the configured modes.
 
 ### Different policy per graph
 
