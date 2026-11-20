@@ -90,13 +90,13 @@ Systems with time travel, triple-level policy and reasoning are assumed to trade
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/dblp-core-geomean-dark.svg">
-    <img src="docs/assets/readme/dblp-core-geomean-light.svg" width="760" alt="Log-scale bar chart of DBLP-core geometric-mean query time, lower is faster: Fluree 16.1 ms (105/105 queries), then QLever 202.4 ms, Virtuoso 299.7 ms, MillenniumDB 1.7 s, Jena 67.7 s, Oxigraph 87.0 s, Blazegraph 332.9 s">
+    <img src="docs/assets/readme/dblp-core-geomean-light.svg" width="760" alt="Bar chart of DBLP-core geometric-mean query time, lower is faster: Fluree 16.1 ms (105/105 queries), then QLever 202.4 ms, Virtuoso 299.7 ms, MillenniumDB 1.7 s, Jena 67.7 s, Oxigraph 87.0 s, Blazegraph 332.9 s">
   </picture>
 </p>
 
 **At Wikidata scale.** On the [full Wikidata dump](https://github.com/fluree/benchmark-db/blob/main/benchmarks/wgpb/reports/wikidata-all/REPORT.md) (21.1B distinct triples), Fluree v4.2.7 completes all 850/850 WGPB graph-pattern queries with a 14.4 ms geometric mean. On [Wikidata-truthy](https://github.com/fluree/benchmark-db/blob/main/benchmarks/sparqloscope/reports/wikidata-truthy/REPORT.md) (8.18B triples), Fluree v4.2.8 answers 105/105 SPARQLoscope queries with a 270.9 ms geometric mean; QLever answers 91/105 and takes 14.1× as long.
 
-<sub>Fluree v4.2.8, measured 2026-11-19. Other engines were measured earlier on the same instance type (Pokec peers: 2026-09-11); each report lists versions, dates and caveats. The chart uses a log scale; benchmark-db's linear-scale charts are the reference.</sub>
+<sub>Fluree v4.2.8, measured 2026-11-19. Other engines were measured earlier on the same instance type (Pokec peers: 2026-09-11); each report lists versions, dates and caveats. The chart is linear up to 500 ms; slower engines are clipped and labeled.</sub>
 <!-- BENCH:END -->
 
 **Reproduce it yourself:** [fluree/benchmark-db](https://github.com/fluree/benchmark-db) ships pinned datasets, per-engine setup and full result sets, including MillenniumDB, Jena, Oxigraph, Blazegraph and BSBM throughput. Why it's fast: [Performance architecture](docs/design/performance.md).

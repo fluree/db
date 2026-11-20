@@ -1,40 +1,43 @@
 <svg xmlns='http://www.w3.org/2000/svg' width='760' height='354' viewBox='0 0 760 354' font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif'>
+<defs><pattern id='off-light' width='7' height='7' patternTransform='rotate(45)' patternUnits='userSpaceOnUse'><rect width='7' height='7' fill='#A3AEC2'/><line x1='0' y1='0' x2='0' y2='7' stroke='#C9D3EC' stroke-width='2.5'/></pattern></defs>
 <text x='120' y='26' font-size='17' font-weight='700' fill='#091133'>DBLP-core · geometric-mean query time</text>
 <text x='120' y='47' font-size='12.5' fill='#556480'>561M triples · m7a.4xlarge · a failed query counts as 2× the 180 s timeout</text>
 <line x1='120.0' y1='64' x2='120.0' y2='316' stroke='#E3E8F0'/>
-<text x='120.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>1 ms</text>
-<line x1='223.3' y1='64' x2='223.3' y2='316' stroke='#E3E8F0'/>
-<text x='223.3' y='332' font-size='11' fill='#556480' text-anchor='middle'>10 ms</text>
-<line x1='326.7' y1='64' x2='326.7' y2='316' stroke='#E3E8F0'/>
-<text x='326.7' y='332' font-size='11' fill='#556480' text-anchor='middle'>100 ms</text>
-<line x1='430.0' y1='64' x2='430.0' y2='316' stroke='#E3E8F0'/>
-<text x='430.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>1 s</text>
-<line x1='533.3' y1='64' x2='533.3' y2='316' stroke='#E3E8F0'/>
-<text x='533.3' y='332' font-size='11' fill='#556480' text-anchor='middle'>10 s</text>
-<line x1='636.7' y1='64' x2='636.7' y2='316' stroke='#E3E8F0'/>
-<text x='636.7' y='332' font-size='11' fill='#556480' text-anchor='middle'>100 s</text>
+<text x='120.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>0 ms</text>
+<line x1='244.0' y1='64' x2='244.0' y2='316' stroke='#E3E8F0'/>
+<text x='244.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>100 ms</text>
+<line x1='368.0' y1='64' x2='368.0' y2='316' stroke='#E3E8F0'/>
+<text x='368.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>200 ms</text>
+<line x1='492.0' y1='64' x2='492.0' y2='316' stroke='#E3E8F0'/>
+<text x='492.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>300 ms</text>
+<line x1='616.0' y1='64' x2='616.0' y2='316' stroke='#E3E8F0'/>
+<text x='616.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>400 ms</text>
 <line x1='740.0' y1='64' x2='740.0' y2='316' stroke='#E3E8F0'/>
-<text x='740.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>1000 s</text>
+<text x='740.0' y='332' font-size='11' fill='#556480' text-anchor='middle'>500 ms</text>
 <text x='108' y='88' font-size='13' font-weight='700' fill='#091133' text-anchor='end'>Fluree</text>
-<rect x='120' y='72' width='124.7' height='22' rx='3' fill='#13C6FF'/>
-<text x='252.7' y='88' font-size='12.5' font-weight='700' fill='#091133'>16.1 ms<tspan font-weight='400' fill='#556480'>  fastest · 105/105 passed</tspan></text>
+<rect x='120' y='72' width='20.0' height='22' rx='3' fill='#13C6FF'/>
+<text x='148.0' y='88' font-size='12.5' font-weight='700' fill='#091133'>16.1 ms<tspan font-weight='400' fill='#556480'>  fastest · 105/105 passed</tspan></text>
 <text x='108' y='122' font-size='13' font-weight='400' fill='#091133' text-anchor='end'>QLever</text>
-<rect x='120' y='106' width='238.3' height='22' rx='3' fill='#A3AEC2'/>
-<text x='366.3' y='122' font-size='12.5' font-weight='400' fill='#091133'>202.4 ms<tspan font-weight='400' fill='#556480'>  12.6× slower · 105/105 passed</tspan></text>
+<rect x='120' y='106' width='251.0' height='22' rx='3' fill='#A3AEC2'/>
+<text x='379.0' y='122' font-size='12.5' font-weight='400' fill='#091133'>202.4 ms<tspan font-weight='400' fill='#556480'>  12.6× slower · 105/105 passed</tspan></text>
 <text x='108' y='156' font-size='13' font-weight='400' fill='#091133' text-anchor='end'>Virtuoso</text>
-<rect x='120' y='140' width='255.9' height='22' rx='3' fill='#A3AEC2'/>
-<text x='383.9' y='156' font-size='12.5' font-weight='400' fill='#091133'>299.7 ms<tspan font-weight='400' fill='#556480'>  18.6× slower · 103/105 passed</tspan></text>
+<rect x='120' y='140' width='371.7' height='22' rx='3' fill='#A3AEC2'/>
+<text x='499.7' y='156' font-size='12.5' font-weight='400' fill='#091133'>299.7 ms<tspan font-weight='400' fill='#556480'>  18.6× slower · 103/105 passed</tspan></text>
 <text x='108' y='190' font-size='13' font-weight='400' fill='#091133' text-anchor='end'>MillenniumDB</text>
-<rect x='120' y='174' width='332.9' height='22' rx='3' fill='#A3AEC2'/>
-<text x='460.9' y='190' font-size='12.5' font-weight='400' fill='#091133'>1.7 s<tspan font-weight='400' fill='#556480'>  103× slower · 103/105 passed</tspan></text>
+<rect x='120' y='174' width='620.0' height='22' rx='3' fill='url(#off-light)'/>
+<rect x='414.0' y='174' width='326.0' height='22' rx='3' fill='#A3AEC2'/>
+<text x='732.0' y='190' font-size='12.5' fill='#091133' text-anchor='end'>1.7 s  103× slower · 103/105 passed  ▶ off scale</text>
 <text x='108' y='224' font-size='13' font-weight='400' fill='#091133' text-anchor='end'>Jena</text>
-<rect x='120' y='208' width='499.1' height='22' rx='3' fill='#A3AEC2'/>
-<text x='611.1' y='224' font-size='12.5' font-weight='400' fill='#091133' text-anchor='end'>67.7 s  4,204× slower · 34/105 passed</text>
+<rect x='120' y='208' width='620.0' height='22' rx='3' fill='url(#off-light)'/>
+<rect x='401.0' y='208' width='339.0' height='22' rx='3' fill='#A3AEC2'/>
+<text x='732.0' y='224' font-size='12.5' fill='#091133' text-anchor='end'>67.7 s  4,204× slower · 34/105 passed  ▶ off scale</text>
 <text x='108' y='258' font-size='13' font-weight='400' fill='#091133' text-anchor='end'>Oxigraph</text>
-<rect x='120' y='242' width='510.4' height='22' rx='3' fill='#A3AEC2'/>
-<text x='622.4' y='258' font-size='12.5' font-weight='400' fill='#091133' text-anchor='end'>87.0 s  5,409× slower · 39/105 passed</text>
+<rect x='120' y='242' width='620.0' height='22' rx='3' fill='url(#off-light)'/>
+<rect x='401.0' y='242' width='339.0' height='22' rx='3' fill='#A3AEC2'/>
+<text x='732.0' y='258' font-size='12.5' fill='#091133' text-anchor='end'>87.0 s  5,409× slower · 39/105 passed  ▶ off scale</text>
 <text x='108' y='292' font-size='13' font-weight='400' fill='#091133' text-anchor='end'>Blazegraph</text>
-<rect x='120' y='276' width='570.6' height='22' rx='3' fill='#A3AEC2'/>
-<text x='682.6' y='292' font-size='12.5' font-weight='400' fill='#091133' text-anchor='end'>332.9 s  20,685× slower · 3/105 passed</text>
-<text x='430.0' y='350' font-size='12' font-weight='700' fill='#556480' text-anchor='middle'>Log scale · lower is faster</text>
+<rect x='120' y='276' width='620.0' height='22' rx='3' fill='url(#off-light)'/>
+<rect x='394.5' y='276' width='345.5' height='22' rx='3' fill='#A3AEC2'/>
+<text x='732.0' y='292' font-size='12.5' fill='#091133' text-anchor='end'>332.9 s  20,685× slower · 3/105 passed  ▶ off scale</text>
+<text x='430.0' y='350' font-size='12' font-weight='700' fill='#556480' text-anchor='middle'>Lower is faster · bars to scale up to 500 ms</text>
 </svg>

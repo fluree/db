@@ -19,8 +19,8 @@ common/make_charts.py, not copied from its prose:
 Versions and dates come from each report's meta.json.
 
 It also draws two README-only charts of the DBLP-core results, in Fluree brand
-colors on a log scale: docs/assets/readme/dblp-core-geomean-{light,dark}.svg.
-benchmark-db's own (linear-scale) chart remains the reference.
+colors on a linear scale: docs/assets/readme/dblp-core-geomean-{light,dark}.svg.
+The axis ends at CAP_MS; slower engines are drawn clipped and labeled off scale.
 
 Usage:
   python3 scripts/readme/sync-bench.py --bench-repo ../benchmark-db [--check]
@@ -54,12 +54,13 @@ WGPB = f"{B}/wgpb/reports/wikidata-all"
 POKEC = f"{B}/benchgraph/reports/pokec"
 POKEC_PEERS = ["falkordb", "memgraph", "neo4j"]
 PENALTY = 2
+CAP_MS = 500  # README chart axis end; slower engines are drawn clipped
 
 # Brand tokens (docs/assets/readme/BRAND.md).
 VIBRANT = "#13C6FF"
 THEMES = {
-    "light": {"ink": "#091133", "muted": "#556480", "grid": "#E3E8F0", "other": "#A3AEC2", "inside": "#091133"},
-    "dark": {"ink": "#F6F6F6", "muted": "#9AA6BD", "grid": "#2A3350", "other": "#4D5A78", "inside": "#F6F6F6"},
+    "light": {"ink": "#091133", "muted": "#556480", "grid": "#E3E8F0", "other": "#A3AEC2", "inside": "#091133", "hatch": "#C9D3EC"},
+    "dark": {"ink": "#F6F6F6", "muted": "#9AA6BD", "grid": "#2A3350", "other": "#4D5A78", "inside": "#F6F6F6", "hatch": "#3A4664"},
 }
 
 
@@ -113,24 +114,33 @@ def esc(s: str) -> str:
 
 
 def dblp_chart(rows: list[tuple[str, float, int, int]], subtitle: str, theme: str) -> str:
-    """Horizontal log-scale bars, Fluree in brand blue. rows: (label, ms, passed, total), Fluree first."""
+    """Horizontal linear-scale bars, Fluree in brand blue. rows: (label, ms, passed, total), Fluree first.
+
+    Bars are exactly proportional to time up to CAP_MS. Slower engines are drawn as
+    hatched "off scale" bars clipped at the axis end, with their real value printed.
+    """
     c = THEMES[theme]
     W, L, R, T, row_h, bh = 760, 120, 20, 72, 34, 22
     H = T + len(rows) * row_h + 44
-    lo, hi = 1.0, 1_000_000.0  # 1 ms .. 1000 s
     pw = W - L - R
+    cap = CAP_MS
 
     def x(ms: float) -> float:
-        return L + (math.log10(max(ms, lo)) - math.log10(lo)) / (math.log10(hi) - math.log10(lo)) * pw
+        return L + min(ms, cap) / cap * pw
 
     font = "font-family='-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif'"
     s = [f"<svg xmlns='http://www.w3.org/2000/svg' width='{W}' height='{H}' viewBox='0 0 {W} {H}' {font}>"]
+    s.append(f"<defs><pattern id='off-{theme}' width='7' height='7' patternTransform='rotate(45)' "
+             f"patternUnits='userSpaceOnUse'><rect width='7' height='7' fill='{c['other']}'/>"
+             f"<line x1='0' y1='0' x2='0' y2='7' stroke='{c['hatch']}' stroke-width='2.5'/></pattern></defs>")
     s.append(f"<text x='{L}' y='26' font-size='17' font-weight='700' fill='{c['ink']}'>"
              "DBLP-core · geometric-mean query time</text>")
     s.append(f"<text x='{L}' y='47' font-size='12.5' fill='{c['muted']}'>{esc(subtitle)}</text>")
-    for ms, label in [(1, "1 ms"), (10, "10 ms"), (100, "100 ms"), (1000, "1 s"), (10_000, "10 s"),
-                      (100_000, "100 s"), (1_000_000, "1000 s")]:
+    steps = 5
+    for k in range(steps + 1):
+        ms = cap * k / steps
         gx = x(ms)
+        label = f"{ms / 1000:g} s" if ms >= 1000 else f"{ms:g} ms"
         s.append(f"<line x1='{gx:.1f}' y1='{T - 8}' x2='{gx:.1f}' y2='{H - 38}' stroke='{c['grid']}'/>")
         s.append(f"<text x='{gx:.1f}' y='{H - 22}' font-size='11' fill='{c['muted']}' "
                  f"text-anchor='middle'>{label}</text>")
@@ -138,23 +148,27 @@ def dblp_chart(rows: list[tuple[str, float, int, int]], subtitle: str, theme: st
     for i, (label, ms, passed, total) in enumerate(rows):
         y = T + i * row_h
         is_f = i == 0
+        clipped = ms > cap
         weight = "700" if is_f else "400"
         bx = x(ms)
+        fill = VIBRANT if is_f else (f"url(#off-{theme})" if clipped else c["other"])
         s.append(f"<text x='{L - 12}' y='{y + 16}' font-size='13' font-weight='{weight}' "
                  f"fill='{c['ink']}' text-anchor='end'>{esc(label)}</text>")
-        s.append(f"<rect x='{L}' y='{y}' width='{bx - L:.1f}' height='{bh}' rx='3' "
-                 f"fill='{VIBRANT if is_f else c['other']}'/>")
+        s.append(f"<rect x='{L}' y='{y}' width='{max(bx - L, 3):.1f}' height='{bh}' rx='3' fill='{fill}'/>")
         value = fmt_ms(ms)
         meta = f"  {'fastest' if is_f else fmt_ratio(ms / best) + ' slower'} · {passed}/{total} passed"
-        if bx + 10 + (len(value) + len(meta)) * 6.5 <= W - 4:
-            s.append(f"<text x='{bx + 8:.1f}' y='{y + 16}' font-size='12.5' font-weight='{weight}' "
+        if clipped:
+            text = f"{value}{meta}  ▶ off scale"
+            tw = len(text) * 6.5 + 14
+            s.append(f"<rect x='{bx - tw:.1f}' y='{y}' width='{tw:.1f}' height='{bh}' rx='3' fill='{c['other']}'/>")
+            s.append(f"<text x='{bx - 8:.1f}' y='{y + 16}' font-size='12.5' fill='{c['inside']}' "
+                     f"text-anchor='end'>{esc(text)}</text>")
+        else:
+            s.append(f"<text x='{max(bx, L + 3) + 8:.1f}' y='{y + 16}' font-size='12.5' font-weight='{weight}' "
                      f"fill='{c['ink']}'>{esc(value)}<tspan font-weight='400' fill='{c['muted']}'>"
                      f"{esc(meta)}</tspan></text>")
-        else:
-            s.append(f"<text x='{bx - 8:.1f}' y='{y + 16}' font-size='12.5' font-weight='{weight}' "
-                     f"fill='{c['inside']}' text-anchor='end'>{esc(value + meta)}</text>")
     s.append(f"<text x='{L + pw / 2:.1f}' y='{H - 4}' font-size='12' font-weight='700' fill='{c['muted']}' "
-             "text-anchor='middle'>Log scale · lower is faster</text>")
+             f"text-anchor='middle'>Lower is faster · bars to scale up to {cap:g} ms</text>")
     s.append("</svg>")
     return "\n".join(s) + "\n"
 
@@ -216,7 +230,7 @@ def render(bench: pathlib.Path) -> tuple[str, dict[str, str]]:
     charts = {t: dblp_chart([r[:4] for r in d_rows], subtitle, t) for t in THEMES}
 
     others = ", ".join(f"{r[0]} {fmt_ms(r[1])}" for r in d_rows[1:])
-    alt = (f"Log-scale bar chart of DBLP-core geometric-mean query time, lower is faster: "
+    alt = (f"Bar chart of DBLP-core geometric-mean query time, lower is faster: "
            f"Fluree {fmt_ms(f_ms)} ({f_pass}/{f_total} queries), then {others}")
 
     commit = bench_commit(bench)
@@ -243,7 +257,7 @@ def render(bench: pathlib.Path) -> tuple[str, dict[str, str]]:
 
 **At Wikidata scale.** On the [full Wikidata dump]({gh}/{WGPB}/REPORT.md) ({w_triples_b:.1f}B distinct triples), Fluree {w_version} completes all {w_res['completed']}/{w_total} WGPB graph-pattern queries with a {fmt_ms(w_res['geo_mean_ms'])} geometric mean. On [Wikidata-truthy]({gh}/{TRUTHY}/REPORT.md) ({t_triples_b:.2f}B triples), Fluree {t_version} answers {t_f[1]}/{t_f[2]} SPARQLoscope queries with a {fmt_ms(t_f[0])} geometric mean; QLever answers {t_q[1]}/{t_q[2]} and takes {t_q[0] / t_f[0]:.1f}× as long.
 
-<sub>{fluree_line} Other engines were measured earlier on the same instance type (Pokec peers: {p_peer_date}); each report lists versions, dates and caveats. The chart uses a log scale; benchmark-db's linear-scale charts are the reference.</sub>
+<sub>{fluree_line} Other engines were measured earlier on the same instance type (Pokec peers: {p_peer_date}); each report lists versions, dates and caveats. The chart is linear up to 500 ms; slower engines are clipped and labeled.</sub>
 {END}"""
     return block, charts
 
