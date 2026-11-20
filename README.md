@@ -29,9 +29,9 @@
 </p>
 
 <p align="center">
-  <img src="docs/assets/readme/tour.gif" width="820" alt="Terminal recording of the 60-second tour: fluree init and fluree create movies, insert Blade Runner and Alien directed by Ridley Scott, add a sci-fi genre with an update, then query now (both films show sci-fi) and with --at 1 (neither film has a genre).">
+  <img src="docs/assets/readme/tour.gif" width="900" alt="Terminal recording of the 60-second tour: fluree init and fluree create movies, insert Blade Runner and Alien directed by Ridley Scott, add a sci-fi genre with an update, show the SPARQL query file, then run it now (both films are sci-fi) and with --at 1 (neither film has a genre).">
   <br>
-  <sub>The <a href="#zero-to-graph-in-60-seconds">60-second tour</a>, recorded with <a href="https://github.com/charmbracelet/vhs">VHS</a> from <a href="docs/assets/readme/tour.tape"><code>tour.tape</code></a> on a laptop. Timings shown in the recording are not benchmarks.</sub>
+  <sub>The <a href="#zero-to-graph-in-60-seconds">60-second tour</a>, recorded with <a href="https://github.com/charmbracelet/vhs">VHS</a> from <a href="docs/assets/readme/tour.tape"><code>tour.tape</code></a>. Query timings shown are from a laptop, not benchmarks.</sub>
 </p>
 
 <table>
@@ -87,13 +87,17 @@ Systems with time travel, triple-level policy and reasoning are assumed to trade
 </tr>
 </table>
 
-<p align="center"><img src="docs/assets/readme/dblp-core-geomean.svg" width="680" alt="Bar chart of DBLP-core geometric-mean query time, lower is faster: Fluree 16.1 ms (105/105 queries), QLever 202.4 ms (12.6x), Virtuoso 299.7 ms (18.6x), plus MillenniumDB, Jena, Oxigraph and Blazegraph"></p>
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/readme/dblp-core-geomean-dark.svg">
+    <img src="docs/assets/readme/dblp-core-geomean-light.svg" width="760" alt="Log-scale bar chart of DBLP-core geometric-mean query time, lower is faster: Fluree 16.1 ms (105/105 queries), then QLever 202.4 ms, Virtuoso 299.7 ms, MillenniumDB 1.7 s, Jena 67.7 s, Oxigraph 87.0 s, Blazegraph 332.9 s">
+  </picture>
+</p>
 
-<sub>Fluree v4.2.8, measured 2026-11-19. Other engines were measured earlier on the same instance type (Pokec peers: 2026-09-11); each report lists versions, dates and caveats. Lower latency is better.</sub>
+**At Wikidata scale.** On the [full Wikidata dump](https://github.com/fluree/benchmark-db/blob/main/benchmarks/wgpb/reports/wikidata-all/REPORT.md) (21.1B distinct triples), Fluree v4.2.7 completes all 850/850 WGPB graph-pattern queries with a 14.4 ms geometric mean. On [Wikidata-truthy](https://github.com/fluree/benchmark-db/blob/main/benchmarks/sparqloscope/reports/wikidata-truthy/REPORT.md) (8.18B triples), Fluree v4.2.8 answers 105/105 SPARQLoscope queries with a 270.9 ms geometric mean; QLever answers 91/105 and takes 14.1× as long.
+
+<sub>Fluree v4.2.8, measured 2026-11-19. Other engines were measured earlier on the same instance type (Pokec peers: 2026-09-11); each report lists versions, dates and caveats. The chart uses a log scale; benchmark-db's linear-scale charts are the reference.</sub>
 <!-- BENCH:END -->
-
-<!-- TODO(Kevin): the Wikidata and import-rate claims below do not match fluree/benchmark-db (see the PR description). Left unchanged pending a decision. -->
-Billions of graph facts on commodity hardware. Over 2M facts/second bulk import. On the full 21.5-billion-triple Wikidata dump, all 850/850 WGPB graph-pattern queries complete with a 43 ms geometric mean, and on Wikidata-truthy (8.19B triples) the next fastest engine is 10.4x slower.
 
 **Reproduce it yourself:** [fluree/benchmark-db](https://github.com/fluree/benchmark-db) ships pinned datasets, per-engine setup and full result sets, including MillenniumDB, Jena, Oxigraph, Blazegraph and BSBM throughput. Why it's fast: [Performance architecture](docs/design/performance.md).
 
@@ -129,12 +133,13 @@ fluree query --format table 'SELECT ?title ?date WHERE {
 ```
 
 ```
-┌──────────────┬────────────┐
-│ title        │ date       │
-├──────────────┼────────────┤
-│ Alien        │ 1979-05-25 │
-│ Blade Runner │ 1982-06-25 │
-└──────────────┴────────────┘
++------------+--------------+
+| date       | title        |
++===========================+
+| 1979-05-25 | Alien        |
+|------------+--------------|
+| 1982-06-25 | Blade Runner |
++------------+--------------+
 ```
 
 That's a SPARQL query. The same query in JSON-LD:

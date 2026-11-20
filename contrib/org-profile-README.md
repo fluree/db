@@ -19,7 +19,7 @@
 <p align="center">
   Fluree builds a temporal, verifiable, standards-based graph database for data that matters.<br>
   Time travel, branching, triple-level policy and built-in search in one engine, with SPARQL, JSON-LD, openCypher and GraphQL.<br>
-  Open source under BSL 1.1, converting to Apache 2.0. Built in Rust, built for AI agents.
+  Source-available under BSL 1.1, converting to Apache 2.0. Built in Rust, built for AI agents.
 </p>
 
 <table>
