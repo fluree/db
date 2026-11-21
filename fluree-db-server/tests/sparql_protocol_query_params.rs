@@ -331,6 +331,55 @@ async fn explain_plans_the_bound_query() {
     assert!(plan.to_string().contains("s1"), "{plan}");
 }
 
+/// Each explain lane a `FROM` selects plans the bound query: the connection
+/// route at the head, the connection route's dataset lane (a time-travel
+/// `fluree-ledger` header), and the ledger route's connection lane.
+#[tokio::test]
+async fn explain_with_a_from_plans_the_bound_query() {
+    let (_tmp, app) = seeded_app().await;
+    let from_ledger =
+        format!("PREFIX ex: <http://ex.org/> SELECT ?n FROM <{LEDGER}> WHERE {{ ?s ex:name ?n }}");
+    let pinned = format!("{LEDGER}@t:1");
+
+    for (path, ledger_header) in [
+        ("/v1/fluree/explain".to_string(), None),
+        ("/v1/fluree/explain".to_string(), Some(pinned.as_str())),
+        (format!("/v1/fluree/explain/{LEDGER}"), None),
+    ] {
+        let mut request = direct_post(&path, &from_ledger, r#"{"s": {"@id": "http://ex.org/s1"}}"#);
+        if let Some(ledger) = ledger_header {
+            request
+                .headers_mut()
+                .insert("fluree-ledger", ledger.parse().unwrap());
+        }
+        let (status, plan) = send(&app, request).await;
+
+        assert_eq!(status, StatusCode::OK, "{path} {ledger_header:?}: {plan}");
+        assert!(
+            plan.to_string().contains("s1"),
+            "{path} {ledger_header:?}: {plan}"
+        );
+    }
+}
+
+/// The connection stream route, which names its ledger with `FROM`.
+#[tokio::test]
+async fn connection_stream_route_binds_params() {
+    let (_tmp, app) = seeded_app().await;
+    let from_ledger =
+        format!("PREFIX ex: <http://ex.org/> SELECT ?s FROM <{LEDGER}> WHERE {{ ?s ex:name ?n }}");
+
+    let (status, body) = send_raw(
+        &app,
+        direct_post("/v1/fluree/stream/query", &from_ledger, r#"{"n": "C"}"#),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body.contains(S3), "{body}");
+    assert!(!body.contains(S1) && !body.contains(S2), "{body}");
+}
+
 #[tokio::test]
 async fn stream_route_binds_params() {
     let (_tmp, app) = seeded_app().await;
