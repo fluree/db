@@ -223,15 +223,14 @@ impl Operator for PredicateGroupCountFirstsOperator {
             // One graph whose index alone answers for it. A grouping the V6
             // path can't give falls back.
             Some(IndexScope::One(member)) if member.index_is_current() => {
-                let grouped = group_count_v6(
+                let grouped = crate::fast_path_common::answer_or_decline(group_count_v6(
                     member.store(),
                     member.g_id(),
                     &self.predicate,
                     self.limit,
                     &ctx.cancellation,
                     &ctx.tracker,
-                )
-                .ok();
+                ))?;
                 if grouped.is_some() {
                     one_graph_answered = true;
                     self.emit_g_id = member.g_id();
@@ -1030,7 +1029,7 @@ pub(crate) fn group_count_v6(
     // value twice, a legacy decimal arena), its rows are neither one run nor adjacent in POST
     // order, and the run-length count would split its group
     // (`BinaryIndexStore::objects_keyed_by_value`). Callers fall back on the
-    // error.
+    // error (`answer_or_decline`), unless it ends the query.
     if !store
         .objects_keyed_by_value(g_id, p_id, cancellation)
         .map_err(|e| QueryError::from_io("vector arena proof", e))?

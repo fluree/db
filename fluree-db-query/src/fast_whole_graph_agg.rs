@@ -937,14 +937,17 @@ fn compute_histogram(
         Some(distinct) if (distinct as usize) <= HISTOGRAM_MAX_GROUPS => {}
         _ => return Ok(None),
     }
-    let Ok(groups) = crate::fast_group_count_firsts::group_count_v6(
-        store,
-        ctx.binary_g_id,
-        &accessor.pred,
-        HISTOGRAM_MAX_GROUPS,
-        &ctx.cancellation,
-        &ctx.tracker,
-    ) else {
+    let Some(groups) = crate::fast_path_common::answer_or_decline(
+        crate::fast_group_count_firsts::group_count_v6(
+            store,
+            ctx.binary_g_id,
+            &accessor.pred,
+            HISTOGRAM_MAX_GROUPS,
+            &ctx.cancellation,
+            &ctx.tracker,
+        ),
+    )?
+    else {
         return Ok(None);
     };
 

@@ -32,6 +32,23 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 // ---------------------------------------------------------------------------
+// 0. Declining on a failure
+// ---------------------------------------------------------------------------
+
+/// A fast path's answer, or `None` to decline to the general pipeline when
+/// it failed on its own terms. An error the general pipeline would meet too
+/// is raised instead: one that ends the query (a cancellation, an exhausted
+/// memory budget or fuel) and a residency miss, which the host answers by
+/// fetching what was recorded and retrying.
+pub(crate) fn answer_or_decline<T>(result: Result<T>) -> Result<Option<T>> {
+    match result {
+        Ok(answer) => Ok(Some(answer)),
+        Err(e) if e.ends_the_query() || matches!(e, QueryError::NeedFetch(_)) => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 0a. Cold-path cancellation checkpoint
 // ---------------------------------------------------------------------------
 
@@ -4587,6 +4604,40 @@ mod tests {
     use super::*;
     use fluree_db_core::comparator::IndexType;
     use fluree_db_core::Flake;
+
+    /// A fast path declines on its own failures, and raises an error the
+    /// general pipeline would meet too: a cancellation, an exhausted budget
+    /// or fuel, a residency miss.
+    #[test]
+    fn a_fast_path_declines_only_on_its_own_failures() {
+        assert_eq!(answer_or_decline(Ok(3)).unwrap(), Some(3));
+        let declined = answer_or_decline::<u8>(Err(QueryError::Internal("not values".into())));
+        assert_eq!(declined.unwrap(), None);
+        let raised = [
+            QueryError::Cancelled {
+                reason: fluree_db_core::QueryCancellationReason::Cancelled,
+            },
+            QueryError::MemoryBudgetExceeded {
+                used_bytes: 2,
+                budget_bytes: 1,
+            },
+            QueryError::from_io(
+                "vector read",
+                fluree_db_core::storage::residency::NeedFetch::new(
+                    fluree_db_core::ContentId::new(
+                        fluree_db_core::ContentKind::IndexLeaf,
+                        b"missing leaf",
+                    ),
+                    fluree_db_core::storage::residency::FetchKind::IndexLeaf,
+                )
+                .into_io_error(),
+            ),
+        ];
+        for e in raised {
+            let shown = e.to_string();
+            assert!(answer_or_decline::<u8>(Err(e)).is_err(), "{shown}");
+        }
+    }
 
     /// A `GroupStream` over a fixed ascending list.
     struct VecGroups(VecDeque<(u64, u64)>);
