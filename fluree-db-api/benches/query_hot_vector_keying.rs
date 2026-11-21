@@ -6,7 +6,8 @@
 //! costs per ledger. The cells run first without the arenas' identity tables
 //! (a key is a slice of its shard), then with them built (a key is a hash and
 //! a canonical handle, and reads nothing). A per-predicate `COUNT(DISTINCT)`
-//! is what builds them. Tiny=2k, small=10k, medium=50k, large=100k subjects.
+//! is what builds them; the whole-graph `COUNT(DISTINCT ?o)` runs only after.
+//! Tiny=2k, small=10k, medium=50k, large=100k subjects.
 //!
 //! cargo bench -p fluree-db-api --bench query_hot_vector_keying
 //! FLUREE_BENCH_SCALE=small cargo bench -p fluree-db-api --bench query_hot_vector_keying
@@ -147,6 +148,13 @@ fn bench_query_hot_vector_keying(c: &mut Criterion) {
         run(format!("{name}_table_built"), &sparql);
     }
     run("count_distinct".to_string(), &count_distinct("v"));
+    // Every `ex:u` vector is also an `ex:v` vector, so each one is a hash the
+    // two arenas share and is compared across them. This count would build
+    // the tables itself, so it has no cell before them.
+    run(
+        "count_distinct_whole_graph".to_string(),
+        "SELECT (COUNT(DISTINCT ?o) AS ?k) WHERE { ?s ?p ?o }",
+    );
     group.finish();
 }
 
