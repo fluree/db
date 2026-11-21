@@ -265,3 +265,50 @@ async fn a_top_k_skipping_rows_without_a_solution_still_prunes() {
         );
     }
 }
+
+/// The top-k reads its files before the scan hands on a first batch, so a
+/// query past its memory budget stops reading at the first file rather than
+/// decoding every file it planned. Five names need both files here, so only
+/// the check after the first file keeps the second from being read.
+#[tokio::test(flavor = "current_thread")]
+async fn a_top_k_past_its_memory_budget_stops_reading_files() {
+    allow_fixture_roots();
+    let fluree = FlureeBuilder::memory().build_memory();
+    versions_with_oracle(&fluree, "versions-budget", "versions-budget-oracle:main").await;
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+    let sparql = "SELECT ?v ?n FROM <versions-budget:main> \
+                  WHERE { ?v <http://example.org/name> ?n } ORDER BY DESC(?n) LIMIT 5";
+
+    let answer = fluree
+        .query_from()
+        .sparql(sparql)
+        .execute_formatted()
+        .await
+        .expect("unbudgeted top-k");
+    assert_eq!(version_name_rows(&answer).len(), 5);
+    let unbudgeted = store.find_spans("iceberg.parquet_read").len();
+    assert_eq!(unbudgeted, 2, "five names need both files");
+
+    let cancellation = fluree_db_api::QueryCancellation::new();
+    cancellation.set_memory_limit(1);
+    let err = fluree
+        .query_from()
+        .sparql(sparql)
+        .execution_options(
+            fluree_db_api::QueryExecutionOptions::default().with_cancellation(cancellation.clone()),
+        )
+        .execute_formatted()
+        .await
+        .expect_err("a 1-byte budget stops the query");
+    assert!(err.to_string().contains("memory budget"), "{err}");
+    assert_eq!(
+        store.find_spans("iceberg.parquet_read").len() - unbudgeted,
+        1,
+        "the read stops at the first file"
+    );
+    assert_eq!(
+        cancellation.allocated_bytes(),
+        0,
+        "the file read is returned"
+    );
+}

@@ -5434,6 +5434,11 @@ impl FlureeR2rmlProvider<'_> {
                     }
                     collected.push(batches);
                     reads += 1;
+                    // These reads all finish before the stream is returned, so
+                    // no operator checkpoint sees them: a query cancelled or
+                    // past its budget stops reading here, and the files read
+                    // so far drop with `collected`, returning their charge.
+                    fluree_db_query::context::checkpoint_handle(memory)?;
                     // Stop iff the heap is full and the NEXT (best-remaining) file's
                     // bound is strictly WORSE than the k-th (below it for DESC, above
                     // it for ASC; over-keep on ties; a no-bound next → never stops).
