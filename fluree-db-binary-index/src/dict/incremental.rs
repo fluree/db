@@ -22,7 +22,7 @@ use std::io;
 
 use super::branch::{BranchLeafEntry, DictBranch};
 use super::builder::LeafArtifact;
-use super::key_scheme::{KeyRules, KeyScheme, RawGroups};
+use super::key_scheme::{KeyRules, KeyScheme};
 use super::pack_builder::{
     build_string_forward_packs, PackArtifact, DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
 };
@@ -546,17 +546,17 @@ fn prune_raw_groups(
 /// are keyed by value.
 pub struct GroupPlan {
     scheme: KeyScheme,
-    /// Each group the new values would hash into: values added, values held.
-    groups: BTreeMap<Vec<u8>, (usize, usize)>,
+    /// Each group the new values would hash into, and how many they add.
+    groups: BTreeMap<Vec<u8>, usize>,
 }
 
 impl GroupPlan {
     pub fn new<'v>(rules: KeyRules<'_>, values: impl IntoIterator<Item = &'v [u8]>) -> Self {
-        let mut groups = BTreeMap::<Vec<u8>, (usize, usize)>::new();
+        let mut groups = BTreeMap::<Vec<u8>, usize>::new();
         for value in values {
             if let Some(group) = rules.scheme.group(value) {
                 if rules.raw.get(group).is_none() {
-                    groups.entry(group.to_vec()).or_default().0 += 1;
+                    *groups.entry(group.to_vec()).or_default() += 1;
                 }
             }
         }
@@ -577,17 +577,16 @@ impl GroupPlan {
     }
 
     /// Key `values`, new to `branch`, for an update of it: list in
-    /// `branch.raw_groups` each group the write would take past the cap,
-    /// counting what it holds in `leaves` (each leaf [`Self::leaves`] names,
-    /// once), then key every value by the branch's rules, in key order. Two
-    /// values sharing a key are refused.
+    /// `branch.raw_groups` each group the write would take past the cap
+    /// ([`Self::fill`]), then key every value by the branch's rules, in key
+    /// order. Two values sharing a key are refused.
     pub fn key<'l>(
         self,
         branch: &mut DictBranch,
-        leaves: impl IntoIterator<Item = &'l [u8]>,
+        leaf: impl Fn(usize) -> Option<&'l [u8]>,
         mut values: Vec<ReverseEntry>,
     ) -> io::Result<Vec<ReverseEntry>> {
-        self.fill(&mut branch.raw_groups, leaves)?;
+        self.fill(branch, leaf)?;
         let rules = branch.keys();
         for entry in &mut values {
             if let Cow::Owned(key) = rules.key(&entry.key) {
@@ -604,27 +603,49 @@ impl GroupPlan {
         Ok(values)
     }
 
-    /// List in `raw` each group that would pass the cap, counting what it
-    /// holds in `leaves`: each leaf [`Self::leaves`] names, once.
+    /// List on `branch` each group that would pass the cap, counting the
+    /// hashed keys it holds in the leaves [`Self::leaves`] names, which
+    /// `leaf` gives by index. Only each leaf's keys in a group's hashed range
+    /// are read.
     pub fn fill<'l>(
-        mut self,
-        raw: &mut RawGroups,
-        leaves: impl IntoIterator<Item = &'l [u8]>,
+        self,
+        branch: &mut DictBranch,
+        leaf: impl Fn(usize) -> Option<&'l [u8]>,
     ) -> io::Result<()> {
-        for bytes in leaves {
-            let leaf = ReverseLeaf::from_bytes(bytes)?;
-            for (key, _) in leaf.iter() {
-                if let Some(group) = self.scheme.hashed_key_group(&key) {
-                    if let Some((_, held)) = self.groups.get_mut(group) {
-                        *held += 1;
+        let mut decoded: BTreeMap<usize, ReverseLeaf<'l>> = BTreeMap::new();
+        let mut listed = Vec::new();
+        for (group, added) in &self.groups {
+            let (start, end) = self.scheme.hashed_range(group);
+            let mut held = 0;
+            for i in branch.leaves_overlapping(&start, end.as_deref()) {
+                let leaf = match decoded.entry(i) {
+                    std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        let bytes = leaf(i).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "reverse leaf {i} holding a group's hashed keys was not read"
+                                ),
+                            )
+                        })?;
+                        e.insert(ReverseLeaf::from_bytes(bytes)?)
                     }
-                }
+                };
+                held += match &end {
+                    Some(end) => leaf.scan_range(&start, end).len(),
+                    None => leaf
+                        .iter()
+                        .filter(|(k, _)| k.as_ref() >= start.as_slice())
+                        .count(),
+                };
+            }
+            if held + added > self.scheme.cap() {
+                listed.push((group.clone(), held > 0));
             }
         }
-        for (group, (added, held)) in &self.groups {
-            if held + added > self.scheme.cap() {
-                raw.insert(group, *held > 0);
-            }
+        for (group, hashed) in listed {
+            branch.raw_groups.insert(&group, hashed);
         }
         Ok(())
     }
@@ -1548,14 +1569,14 @@ mod tests {
                 })
                 .collect();
             let plan = GroupPlan::new(self.branch.keys(), values.iter().map(|e| e.key.as_slice()));
-            let held: Vec<Vec<u8>> = plan
+            let held: std::collections::HashMap<usize, Vec<u8>> = plan
                 .leaves(&self.branch)
                 .into_iter()
-                .map(|i| self.leaf(i).unwrap())
+                .map(|i| (i, self.leaf(i).unwrap()))
                 .collect();
             let mut branch = self.branch.clone();
             let entries = plan
-                .key(&mut branch, held.iter().map(Vec::as_slice), values)
+                .key(&mut branch, |i| held.get(&i).map(Vec::as_slice), values)
                 .unwrap();
             let result =
                 update_reverse_tree(&branch, &entries, Self::TARGET, Self::FORMAT, &mut |i| {

@@ -207,7 +207,7 @@ async fn upload_incremental_reverse_tree_core(
         entries = plan
             .key(
                 &mut existing_branch,
-                prefetched.values().map(Vec::as_slice),
+                |i| prefetched.get(&i).map(Vec::as_slice),
                 entries,
             )
             .map_err(|e| IndexerError::StorageWrite(format!("key new {dict:?} values: {e}")))?;
