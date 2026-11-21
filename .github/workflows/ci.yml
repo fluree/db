@@ -58,6 +58,31 @@ jobs:
       - name: Format
         run: cargo fmt --all -- --check
 
+  # A directory outside the root workspace (an excluded crate, the wasm probe,
+  # the prover) keeps its own lockfile, which tracks workspace crates, and no
+  # other job resolves it with `--locked`. A dependency added to the workspace
+  # leaves it stale, and a yanked exact pin it lacks leaves it unresolvable.
+  # Resolution only, no build.
+  lockfiles:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.97.0
+      - name: Every lockfile resolves with --locked
+        run: |
+          status=0
+          for lock in $(git ls-files '*Cargo.lock'); do
+            dir=$(dirname "$lock")
+            echo "::group::$dir"
+            if ! (cd "$dir" && cargo metadata --locked --format-version 1 > /dev/null); then
+              echo "::error file=$lock::$lock does not resolve with --locked"
+              status=1
+            fi
+            echo "::endgroup::"
+          done
+          exit "$status"
+
   clippy:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
