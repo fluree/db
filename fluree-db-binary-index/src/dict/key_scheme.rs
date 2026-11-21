@@ -108,7 +108,8 @@ impl KeyScheme {
         }
     }
 
-    fn prefix_len(self) -> Option<usize> {
+    /// The bytes a group shares, `None` for a raw tree.
+    pub(crate) fn prefix_len(self) -> Option<usize> {
         match self {
             Self::Raw => None,
             Self::PrefixHash { prefix_len, .. } => Some(prefix_len as usize),

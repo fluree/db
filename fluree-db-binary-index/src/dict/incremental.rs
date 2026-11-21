@@ -442,12 +442,24 @@ pub fn remove_from_reverse_tree(
         })
         .collect();
     let slices = slice_entries_to_leaves(&probes, &existing_branch.leaves);
+    let touched = touched_groups(existing_branch, keys);
 
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
     let mut new_leaves: Vec<LeafArtifact> = Vec::new();
     let mut replaced_indices: Vec<usize> = Vec::new();
-    // The keys of each leaf read, by its place in the new branch.
-    let mut read: BTreeMap<usize, Vec<ReverseEntry>> = BTreeMap::new();
+    // Each leaf read, by its place in the new branch, with the keys it keeps
+    // under a touched group: all the pruning needs, and nothing when the
+    // removal touches no listed group.
+    let mut read: BTreeMap<usize, Vec<Vec<u8>>> = BTreeMap::new();
+    let k = existing_branch.key_scheme.prefix_len();
+    let under_touched = |kept: &[ReverseEntry]| -> Vec<Vec<u8>> {
+        kept.iter()
+            .filter(|e| {
+                k.is_some_and(|k| e.key.len() >= k && touched.binary_search(&&e.key[..k]).is_ok())
+            })
+            .map(|e| e.key.clone())
+            .collect()
+    };
     for (i, existing_leaf) in existing_branch.leaves.iter().enumerate() {
         let slice = slices[i];
         if slice.is_empty() {
@@ -469,13 +481,17 @@ pub fn remove_from_reverse_tree(
             })
             .collect();
         if kept.len() as u32 == existing_leaf.entry_count {
-            read.insert(branch_entries.len(), kept);
+            if !touched.is_empty() {
+                read.insert(branch_entries.len(), under_touched(&kept));
+            }
             branch_entries.push(existing_leaf.clone());
             continue;
         }
         if !kept.is_empty() {
+            if !touched.is_empty() {
+                read.insert(branch_entries.len(), under_touched(&kept));
+            }
             branch_entries.push(encode_and_track(&kept, format, &mut new_leaves));
-            read.insert(branch_entries.len() - 1, kept);
         }
         replaced_indices.push(i);
     }
@@ -485,7 +501,7 @@ pub fn remove_from_reverse_tree(
         key_scheme: existing_branch.key_scheme,
         raw_groups: existing_branch.raw_groups.clone(),
     };
-    prune_raw_groups(&mut branch, keys, &read);
+    prune_raw_groups(&mut branch, &touched, &read);
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
     Ok(IncrementalTreeResult {
@@ -497,20 +513,9 @@ pub fn remove_from_reverse_tree(
     })
 }
 
-/// After a removal of `keys`, stop listing each group it touched that the
-/// tree holds no key under, and clear `hashed` on one with no hashed key
-/// left. `read` holds the keys of each leaf the removal read, by its place in
-/// `branch`.
-///
-/// A leaf the removal did not read holds its first and last keys. The one
-/// leaf that can hold a group's whole range with neither of them in it is
-/// the leaf every key in the range routes to, which the removal read: a
-/// removed key of the group lies in that range.
-fn prune_raw_groups(
-    branch: &mut DictBranch,
-    keys: &[Vec<u8>],
-    read: &BTreeMap<usize, Vec<ReverseEntry>>,
-) {
+/// The listed groups `keys`, removed from `branch`, belong to: sorted, each
+/// once.
+fn touched_groups<'k>(branch: &DictBranch, keys: &'k [Vec<u8>]) -> Vec<&'k [u8]> {
     let scheme = branch.key_scheme;
     let mut touched: Vec<&[u8]> = keys
         .iter()
@@ -518,6 +523,24 @@ fn prune_raw_groups(
         .filter(|group| branch.raw_groups.get(group).is_some())
         .collect();
     touched.dedup();
+    touched
+}
+
+/// After a removal, stop listing each `touched` group the tree holds no key
+/// under, and clear `hashed` on one with no hashed key left. `read` holds,
+/// for each leaf the removal read, by its place in `branch`, its keys under
+/// the touched groups.
+///
+/// A leaf the removal did not read holds its first and last keys. The one
+/// leaf that can hold a group's whole range with neither of them in it is
+/// the leaf every key in the range routes to, which the removal read: a
+/// removed key of the group lies in that range.
+fn prune_raw_groups(
+    branch: &mut DictBranch,
+    touched: &[&[u8]],
+    read: &BTreeMap<usize, Vec<Vec<u8>>>,
+) {
+    let scheme = branch.key_scheme;
     let holds = |branch: &DictBranch, (start, end): (Vec<u8>, Option<Vec<u8>>)| {
         let within = |key: &[u8]| key >= start.as_slice() && end.as_deref().is_none_or(|e| key < e);
         branch.leaves_overlapping(&start, end.as_deref()).any(|i| {
@@ -526,10 +549,10 @@ fn prune_raw_groups(
                 || within(&leaf.last_key)
                 || read
                     .get(&i)
-                    .is_none_or(|entries| entries.iter().any(|e| within(&e.key)))
+                    .is_none_or(|keys| keys.iter().any(|key| within(key)))
         })
     };
-    for group in touched {
+    for &group in touched {
         if !holds(branch, scheme.group_range(group)) {
             branch.raw_groups.remove(group);
         } else if branch.raw_groups.get(group).is_some_and(|g| g.hashed)
@@ -1525,6 +1548,7 @@ mod tests {
     struct HashedTree {
         branch: DictBranch,
         leaves: std::collections::HashMap<String, Vec<u8>>,
+        target: usize,
     }
 
     impl HashedTree {
@@ -1541,6 +1565,16 @@ mod tests {
                     ..Default::default()
                 },
                 leaves: Default::default(),
+                target: Self::TARGET,
+            }
+        }
+
+        /// One leaf for everything, so a group's keys sit inside it, past
+        /// its first and last keys.
+        fn in_one_leaf(key_scheme: KeyScheme) -> Self {
+            Self {
+                target: usize::MAX / 4,
+                ..Self::new(key_scheme)
             }
         }
 
@@ -1579,7 +1613,7 @@ mod tests {
                 .key(&mut branch, |i| held.get(&i).map(Vec::as_slice), values)
                 .unwrap();
             let result =
-                update_reverse_tree(&branch, &entries, Self::TARGET, Self::FORMAT, &mut |i| {
+                update_reverse_tree(&branch, &entries, self.target, Self::FORMAT, &mut |i| {
                     self.leaf(i)
                 })
                 .unwrap();
@@ -1675,6 +1709,43 @@ mod tests {
             tree.branch.raw_groups
         );
         assert!(found(&tree, &filler));
+    }
+
+    /// A removal that leaves a group keys only inside one leaf, past its
+    /// first and last keys, keeps the group listed, and its flag while it
+    /// holds a hashed key: only the leaf's own keys show what is left.
+    #[test]
+    fn a_removal_reads_what_a_leaf_keeps_of_a_group() {
+        use super::super::key_scheme::RawGroup;
+        let mut tree = HashedTree::in_one_leaf(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let long = |i: u64| format!("groupAAA{i:040}");
+        let around: Vec<(String, u64)> = vec![("aaaa".into(), 100), ("zzzz".into(), 101)];
+        let hashed: Vec<(String, u64)> = (0..3).map(|i| (long(i), i)).collect();
+        let listed: Vec<(String, u64)> = (3..6).map(|i| (long(i), i)).collect();
+        tree.add(&[around.clone(), hashed.clone()].concat());
+        tree.add(&listed);
+        assert_eq!(tree.branch.leaves.len(), 1);
+        let group = |tree: &HashedTree| tree.branch.raw_groups.get(b"groupAAA").cloned();
+        let flagged = |hashed| {
+            Some(RawGroup {
+                prefix: b"groupAAA".to_vec(),
+                hashed,
+            })
+        };
+        assert_eq!(group(&tree), flagged(true));
+
+        // A value-keyed one gone: listed, still holding hashed keys.
+        tree.remove(&[&listed[0].0]);
+        assert_eq!(group(&tree), flagged(true));
+        // The hashed ones gone: listed, holding none.
+        tree.remove(&hashed.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert_eq!(group(&tree), flagged(false));
+        for (v, id) in &listed[1..] {
+            assert_eq!(tree.lookup(v), Some(*id), "{v}");
+        }
     }
 
     /// A group takes hashed values up to the cap, counting what it already
