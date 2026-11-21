@@ -637,11 +637,14 @@ where
         tracing::debug!(groups = raw_groups.len(), "string groups keyed by value");
     }
 
-    // Strings are taken a batch at a time and the long ones hashed in
-    // parallel, the build's main cost; values pass to the order as slices of
-    // `fwd`, and each key is written through one buffer. Tests take small
-    // batches, so groups run across them.
+    // Strings are taken a batch at a time, and a batch holding enough long
+    // strings to pay for the dispatch has them hashed in parallel, the
+    // build's main cost; a batch of mostly short ones is hashed as it is
+    // keyed. Values pass to the order as slices of `fwd`, and each key is
+    // written through one buffer. Tests take small batches and a low bar,
+    // so groups run across batches and both ways are taken.
     const HASH_BATCH: usize = if cfg!(test) { 64 } else { 4096 };
+    const PARALLEL_HASHES: usize = if cfg!(test) { 8 } else { 256 };
     let rules = KeyRules {
         scheme,
         raw: &raw_groups,
@@ -659,11 +662,19 @@ where
                 None => break,
             }
         }
-        let hashes: Vec<_> = batch
-            .par_iter()
-            .map(|entry| rules.key_hash(string_at(fwd, entry)))
-            .collect();
-        for (entry, hash) in batch.iter().zip(hashes) {
+        let long = batch
+            .iter()
+            .filter(|entry| scheme.group(string_at(fwd, entry)).is_some())
+            .count();
+        let hashes: Option<Vec<_>> = (long >= PARALLEL_HASHES).then(|| {
+            batch
+                .par_iter()
+                .with_min_len(64)
+                .map(|entry| rules.key_hash(string_at(fwd, entry)))
+                .collect()
+        });
+        for (i, entry) in batch.iter().enumerate() {
+            let hash = hashes.as_ref().and_then(|hashes| hashes[i]);
             order
                 .push_hashed(string_at(fwd, entry), entry.id, hash)
                 .map_err(invalid)?;
