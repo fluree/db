@@ -152,6 +152,7 @@ async fn upload_incremental_reverse_tree_core(
     remove: bool,
 ) -> Result<UpdatedReverseTree> {
     let kind = ContentKind::DictBlob { dict };
+    let format = fluree_db_binary_index::dict::reverse_leaf::LeafFormat::for_dict(dict);
 
     // 1. Async fetch existing branch.
     let existing_branch_bytes = content_store
@@ -199,6 +200,7 @@ async fn upload_incremental_reverse_tree_core(
             fluree_db_binary_index::dict::incremental::remove_from_reverse_tree(
                 &existing_branch_owned,
                 &keys,
+                format,
                 &mut fetch_leaf,
             )
         } else {
@@ -206,6 +208,7 @@ async fn upload_incremental_reverse_tree_core(
                 &existing_branch_owned,
                 &entries,
                 fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES,
+                format,
                 &mut fetch_leaf,
             )
         }

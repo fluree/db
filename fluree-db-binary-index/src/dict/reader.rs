@@ -37,20 +37,21 @@ pub(crate) struct FencedLeaf {
 }
 
 impl FencedLeaf {
-    /// Read `source` whole once to fence it; `None` unless its entries lie
-    /// one after another in key order, which a scan relies on.
-    fn open(source: Arc<dyn RangeSource>, spacing: u64) -> io::Result<Option<Self>> {
+    /// Read `source` whole once to fence it. A leaf is fenced only if its
+    /// entries lie one after another in key order, which a scan relies on;
+    /// one that is not comes back as the bytes just read, to be read whole
+    /// from them.
+    fn open(source: Arc<dyn RangeSource>, spacing: u64) -> io::Result<Result<Self, Vec<u8>>> {
         let len = source.len();
         let bytes = source
             .read_range(0..len)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let leaf = ReverseLeaf::from_bytes(&bytes)?;
-        if !leaf.is_sequential() {
-            return Ok(None);
-        }
-        let fences = leaf.fences(spacing.max(1) as usize);
+        let Some(fences) = leaf.fences(spacing.max(1) as usize) else {
+            return Ok(Err(bytes));
+        };
         fluree_db_core::io_stats::record_work("reverse leaf fenced", bytes.len());
-        Ok(Some(Self {
+        Ok(Ok(Self {
             entry_count: leaf.entry_count(),
             source,
             fences,
@@ -429,7 +430,9 @@ impl DictTreeReader {
     }
 
     /// Leaf `leaf_idx` fenced for range reads, from the cache or opened
-    /// there; `None` when it is read whole.
+    /// there; `None` when it is read whole. A leaf read to be fenced and not
+    /// fenced leaves its bytes in the dict-leaf cache, where reading it whole
+    /// finds them.
     fn fenced_leaf(&self, leaf_idx: usize) -> io::Result<Option<Arc<FencedLeaf>>> {
         if !self.fenced {
             return Ok(None);
@@ -454,7 +457,16 @@ impl DictTreeReader {
                 cache.note_unfenceable_leaf();
                 return Ok(None);
             };
-            Ok(FencedLeaf::open(source, self.fence_spacing)?.map(Arc::new))
+            match FencedLeaf::open(source, self.fence_spacing)? {
+                Ok(leaf) => Ok(Some(Arc::new(leaf))),
+                Err(whole) => {
+                    cache.insert_dict_leaf(
+                        xxhash_rust::xxh3::xxh3_128(address.as_bytes()),
+                        whole.into(),
+                    );
+                    Ok(None)
+                }
+            }
         })
     }
 
@@ -663,7 +675,7 @@ impl DictTreeReader {
             let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
 
             for (key, id) in leaf.scan_range(start_key, end_key) {
-                results.push((key.to_vec(), id));
+                results.push((key.into_owned(), id));
             }
         }
 
@@ -1386,7 +1398,7 @@ mod tests {
             let leaf = cache
                 .try_get_or_load_fenced_leaf(7, || {
                     cache.note_unrangeable_pack();
-                    Ok(FencedLeaf::open(source, FENCE_SPACING)?.map(Arc::new))
+                    Ok(FencedLeaf::open(source, FENCE_SPACING)?.ok().map(Arc::new))
                 })
                 .unwrap();
             assert!(leaf.is_some(), "fenced for this lookup");
@@ -1572,7 +1584,7 @@ mod tests {
                 assert_eq!(memory.leaves, 1);
                 assert_eq!(
                     memory.fence_bytes,
-                    leaf.fences(spacing as usize).heap_bytes() as u64
+                    leaf.fences(spacing as usize).unwrap().heap_bytes() as u64
                 );
                 assert_eq!(memory.source_charge, 1024, "the test source's charge");
                 cache
@@ -1584,8 +1596,8 @@ mod tests {
             };
             let (wide, close) = (weigh(4096), weigh(256));
             let (wide_index, close_index) = (
-                leaf.fences(4096).heap_bytes() as u64,
-                leaf.fences(256).heap_bytes() as u64,
+                leaf.fences(4096).unwrap().heap_bytes() as u64,
+                leaf.fences(256).unwrap().heap_bytes() as u64,
             );
             assert!(close_index > 8 * wide_index);
             assert!(wide > wide_index + 1024, "fences and source handle: {wide}");
@@ -1623,7 +1635,7 @@ mod tests {
         }
 
         /// A leaf whose entries do not lie one after another is read whole,
-        /// with the same answers.
+        /// once (the read made to fence it), with the same answers.
         #[test]
         fn a_leaf_out_of_layout_is_read_whole() {
             let entries: Vec<ReverseEntry> = entries().into_iter().take(500).collect();
@@ -1658,11 +1670,56 @@ mod tests {
             assert_eq!(branch.leaves.len(), 1);
             let cs = SegmentedContentStore::new(true);
             let address = branch.leaves[0].address.clone();
+            let len = moved.len() as u64;
             let reader = fenced_reader(&cs, vec![(address, moved)], branch);
             for e in &entries {
                 assert_eq!(reader.reverse_lookup(&e.key).unwrap(), Some(e.id));
             }
-            assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 1, "read whole");
+            let reads = cs.reads();
+            assert_eq!(
+                (cs.whole_reads.load(AtomicOrdering::SeqCst), reads.len()),
+                (0, 1),
+                "read once"
+            );
+            assert_eq!(reads[0], 0..len, "and whole");
+        }
+
+        /// A front-coded leaf under a fencing reader is read whole, once (the
+        /// read made to fence it), and answers lookups and range scans as the
+        /// plain tree does.
+        #[test]
+        fn a_front_coded_leaf_is_read_whole() {
+            let entries: Vec<ReverseEntry> = entries().into_iter().take(500).collect();
+            let format = crate::dict::reverse_leaf::LeafFormat::FrontCoded {
+                ns_relative_ids: false,
+            };
+            let built =
+                builder::build_reverse_tree_as(entries.clone(), usize::MAX, format).unwrap();
+            assert_eq!(built.branch.leaves.len(), 1);
+            let address = built.branch.leaves[0].address.clone();
+            let blob = built.leaves[0].bytes.clone();
+            assert!(ReverseLeaf::from_bytes(&blob).unwrap().is_front_coded());
+            let len = blob.len() as u64;
+            let cs = SegmentedContentStore::new(true);
+            let reader = fenced_reader(&cs, vec![(address, blob)], built.branch);
+            for key in probes(&entries) {
+                let want = entries.iter().find(|e| e.key == key).map(|e| e.id);
+                assert_eq!(reader.reverse_lookup(&key).unwrap(), want);
+            }
+            let (lo, hi) = (&entries[40].key, &entries[260].key);
+            let scanned = reader.reverse_range_scan(lo, hi).unwrap();
+            let want: Vec<(Vec<u8>, u64)> = entries[40..260]
+                .iter()
+                .map(|e| (e.key.clone(), e.id))
+                .collect();
+            assert_eq!(scanned, want);
+            let reads = cs.reads();
+            assert_eq!(
+                (cs.whole_reads.load(AtomicOrdering::SeqCst), reads.len()),
+                (0, 1),
+                "read once"
+            );
+            assert_eq!(reads[0], 0..len, "and whole");
         }
 
         /// An entry whose length runs past its stretch, or past the leaf, is
@@ -1675,7 +1732,7 @@ mod tests {
             // Fences at the 4 KiB read unit, and closer, so a stretch ends
             // inside a unit.
             for spacing in [4096usize, 512] {
-                let fences = leaf.fences(spacing);
+                let fences = leaf.fences(spacing).unwrap();
                 let at = fences.offset(1) as usize;
                 let mut bad = blob.clone();
                 bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());

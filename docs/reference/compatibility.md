@@ -706,6 +706,16 @@ A ledger whose binary index store failed to load used to be cached without the s
 
 A transaction server (`fluree server run` or `start`) and Python's `connect()` now take an exclusive lock on `<root>/.fluree-lock` for as long as they hold the directory. A second server or Python process on the same directory is refused, with `err:system/StorageInUse` (HTTP 423) or `fluree.DatabaseInUseError`; it used to open the directory beside the first, uncoordinated. A filesystem that cannot lock (some network and FUSE mounts) now fails to open; set `FLUREE_STORAGE_ALLOW_UNLOCKED=true` to open it without that protection. Peers on shared storage and Raft nodes don't take the lock, and one-shot CLI commands don't either. Rust embedders opt in with `FlureeBuilder::with_storage_lock()`. See [One process per directory](../operations/storage.md#one-process-per-directory).
 
+#### Subject dictionary leaves are front-coded (breaking for earlier 5.0 alphas)
+
+An index this release writes stores its subject dictionary's reverse leaves front-coded (`DLR2`): each key stores only the bytes it does not share with the key before it. The subject dictionary is several times smaller, and a cold lookup of a constant IRI reads less. This release reads indexes earlier releases wrote, and an incremental build writes front-coded leaves beside the ones it finds.
+
+The change is one-way within the 5.0 alphas. `v5.0.0-alpha.2` and `alpha.3` open an index this release wrote and fail at its first subject lookup, a query or a write, with `reverse leaf: invalid magic`. To go back to one of them, run a full reindex there ([`fluree reindex`](../cli/reindex.md)), which rebuilds the index from the commits.
+
+Warm queries that name subjects the index holds run about as fast as before. Lookups of subjects it doesn't hold cost more: a write of new subjects takes a few percent longer, and a query naming many absent IRIs up to about 10% longer.
+
+For Rust embedders: `ReverseLeaf::iter`, `scan_range`, `first_key` and `last_key` return `Cow<[u8]>` keys, owned for a front-coded leaf, and `ReverseLeaf::fences` returns `Option<Fences>`, `None` for a leaf a fenced scan can't read.
+
 #### Old index versions are kept by age, with a ceiling of 10
 
 Garbage collection used to keep at least 5 old index versions whatever their age, and with no upper bound every version superseded within the last 15 minutes. The floor is now 0 and a ceiling of 10 applies. A ledger that publishes slowly keeps no old version once its last one has been superseded for 15 minutes. One that publishes fast keeps at most 10 old versions, so a query still reading an older version can lose its files. Time travel does not depend on old versions. To keep a floor, set `--gc-max-old-indexes` (`FLUREE_GC_MAX_OLD_INDEXES`, `gc_max_old_indexes`). For ledgers that publish fast and serve long queries, raise `--gc-hard-max-old-indexes`. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention).

@@ -10,7 +10,7 @@
 //! whatever the import's size.
 
 use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
-use fluree_db_binary_index::dict::reverse_leaf::{encode_reverse_leaf, ReverseEntry, ReverseLeaf};
+use fluree_db_binary_index::dict::reverse_leaf::{LeafFormat, ReverseEntry, ReverseLeaf};
 use fluree_db_binary_index::{DictRefs, DictTreeRefs, PackBranchEntry};
 use fluree_db_core::subject_id::SubjectId;
 use fluree_db_core::{ContentId, ContentKind, ContentStore, DictKind};
@@ -269,7 +269,8 @@ impl LeafCutter {
     }
 
     fn push(&mut self, entry: ReverseEntry) {
-        // Offset slot + key length + id, as `encode_reverse_leaf` lays it out.
+        // Offset slot + key length + id, as a `DLR1` leaf lays it out: the
+        // measure leaves are cut by in either format.
         self.current_bytes += 16 + entry.key.len();
         self.current.push(entry);
         if self.current_bytes >= self.target {
@@ -306,6 +307,7 @@ impl LeafCutter {
 struct TreeWriter<'a> {
     content_store: &'a dyn ContentStore,
     kind: ContentKind,
+    format: LeafFormat,
     leaves: Vec<BranchLeafEntry>,
     leaf_cids: Vec<ContentId>,
 }
@@ -313,7 +315,7 @@ struct TreeWriter<'a> {
 impl TreeWriter<'_> {
     async fn upload(&mut self, cutter: &mut LeafCutter) -> Result<()> {
         for entries in cutter.ready.drain(..) {
-            let bytes = encode_reverse_leaf(&entries);
+            let bytes = self.format.encode(&entries);
             let cid = self
                 .content_store
                 .put(self.kind, &bytes)
@@ -381,6 +383,7 @@ async fn extend_reverse_tree(
     let mut writer = TreeWriter {
         content_store,
         kind,
+        format: LeafFormat::for_dict(dict),
         leaves: Vec::with_capacity(branch.leaves.len()),
         leaf_cids: Vec::with_capacity(branch.leaves.len()),
     };
@@ -424,7 +427,7 @@ async fn extend_reverse_tree(
                 (None, None) => break,
                 (Some(_), None) => false,
                 (None, Some(_)) => true,
-                (Some((old_key, _)), Some(new)) => match new.key.as_slice().cmp(old_key) {
+                (Some((old_key, _)), Some(new)) => match new.key.as_slice().cmp(old_key.as_ref()) {
                     std::cmp::Ordering::Less => true,
                     std::cmp::Ordering::Greater => false,
                     std::cmp::Ordering::Equal => {
@@ -439,7 +442,7 @@ async fn extend_reverse_tree(
             } else {
                 let (key, id) = old.next().expect("peeked");
                 cutter.push(ReverseEntry {
-                    key: key.to_vec(),
+                    key: key.into_owned(),
                     id,
                 });
             }
@@ -792,6 +795,56 @@ mod tests {
         assert!(updated.replaced_cids[1..]
             .iter()
             .all(|cid| !updated.tree_refs.leaves.contains(cid)));
+    }
+
+    /// A subject tree's rewritten leaves come out front-coded; the leaves no
+    /// new key reaches stay the plain artifacts they were.
+    #[tokio::test]
+    async fn rewritten_subject_leaves_are_front_coded() {
+        let cs = MemoryContentStore::new();
+        let dir = tempfile::tempdir().unwrap();
+        let suffix = |n: u32| format!("Offer{n:05}").into_bytes();
+        let entry = |id: u64, suffix: &[u8]| {
+            let mut key = Vec::new();
+            subject_key(id, suffix, &mut key);
+            (key, id)
+        };
+        let base: Vec<(Vec<u8>, u64)> = (0..600u32)
+            .step_by(2)
+            .map(|n| entry(SubjectId::new(5, u64::from(n)).as_u64(), &suffix(n)))
+            .collect();
+        let base_refs = upload_tree(&cs, &base).await;
+        assert!(base_refs.leaves.len() > 10);
+
+        let new: Vec<(u64, Vec<u8>)> = (201..260u32)
+            .step_by(2)
+            .map(|n| (SubjectId::new(5, 1_000 + u64::from(n)).as_u64(), suffix(n)))
+            .collect();
+        let new_terms = terms(dir.path(), "subjects.new", &new);
+        let updated = extend_reverse_tree(
+            &cs,
+            DictKind::SubjectReverse,
+            &base_refs,
+            &new_terms,
+            subject_key,
+            LEAF,
+        )
+        .await
+        .unwrap();
+
+        let (entries, _) = read_tree(&cs, &updated.tree_refs).await;
+        let mut expected = base.clone();
+        expected.extend(new.iter().map(|(id, suffix)| entry(*id, suffix)));
+        expected.sort();
+        assert_eq!(entries, expected);
+        let mut front_coded = 0;
+        for cid in &updated.tree_refs.leaves {
+            let bytes = cs.get(cid).await.unwrap();
+            let leaf = ReverseLeaf::from_bytes(&bytes).unwrap();
+            assert_eq!(leaf.is_front_coded(), !base_refs.leaves.contains(cid));
+            front_coded += usize::from(leaf.is_front_coded());
+        }
+        assert!(front_coded >= 2, "{front_coded}");
     }
 
     #[tokio::test]
