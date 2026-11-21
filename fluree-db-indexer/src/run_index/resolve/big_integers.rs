@@ -17,7 +17,7 @@
 
 use fluree_db_core::commit::codec::raw_reader::is_big_integer_lexical;
 use fluree_db_core::commit::codec::{RawObject, RawOp};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use sha2::{Digest, Sha256};
 
 /// A big integer's slot: graph, subject, predicate, list place, and the
@@ -187,18 +187,20 @@ impl BigIntegerTerms {
     /// not retracted at all. Assertions apply after retractions.
     pub(crate) fn end_commit(&mut self) -> Vec<(Retraction, Datatype)> {
         let mut added: Vec<(Retraction, u32)> = Vec::new();
-        for r in std::mem::take(&mut self.by_value) {
-            let Some(stored) = self.stored.get(&r.key) else {
-                continue;
-            };
-            for &dt in stored.ids() {
-                let named = |key: &SlotKey, d: u32| *key == r.key && d == dt;
-                if self.ops.iter().any(|(k, d, _)| named(k, *d))
-                    || added.iter().any(|(a, d)| named(&a.key, *d))
-                {
+        let by_value = std::mem::take(&mut self.by_value);
+        if !by_value.is_empty() {
+            // Each term the commit names, and each added so far, once.
+            let mut named: FxHashSet<(SlotKey, u32)> =
+                self.ops.iter().map(|(key, dt, _)| (*key, *dt)).collect();
+            for r in by_value {
+                let Some(stored) = self.stored.get(&r.key) else {
                     continue;
+                };
+                for &dt in stored.ids() {
+                    if named.insert((r.key, dt)) {
+                        added.push((r.clone(), dt));
+                    }
                 }
-                added.push((r.clone(), dt));
             }
         }
         let ops = std::mem::take(&mut self.ops);

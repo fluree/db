@@ -842,21 +842,28 @@ pub async fn by_value_retractions(
     t: i64,
 ) -> Result<Vec<Flake>> {
     let targets = by_value_targets(ledger, flakes, t).await?;
+    if targets.iter().all(|(_, held)| held.is_empty()) {
+        return Ok(Vec::new());
+    }
+    // A term the commit retracts itself needs no second retraction, and one
+    // it asserts holds on its `t` whatever it retracts (`same_t`). Only a big
+    // integer can be such a term. `Flake`'s equality leaves out its graph,
+    // `t` and op, so a term is keyed with its graph.
+    let mut named: HashSet<(Option<Sid>, Flake)> = flakes
+        .iter()
+        .filter(|f| f.o.is_big_integer())
+        .map(|f| (f.g.clone(), f.clone()))
+        .collect();
     let mut out: Vec<Flake> = Vec::new();
     for (at, held) in targets {
         let own = &flakes[at];
         for fact in held {
             let retraction = fact.retract(t).into_flake();
-            if retraction.dt != own.dt
-                && !out.iter().any(|o| o.g == retraction.g && *o == retraction)
-            {
+            if retraction.dt != own.dt && named.insert((retraction.g.clone(), retraction.clone())) {
                 out.push(retraction);
             }
         }
     }
-    // A term the commit retracts itself needs no second retraction, and one
-    // it asserts holds on its `t` whatever it retracts (`same_t`).
-    out.retain(|r| !flakes.iter().any(|f| f.g == r.g && f == r));
     Ok(out)
 }
 
