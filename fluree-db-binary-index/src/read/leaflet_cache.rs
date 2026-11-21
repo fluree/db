@@ -19,8 +19,7 @@ use crate::format::leaf::DecodedLeafDirV3;
 use crate::read::types::OverlayOp;
 #[cfg(target_arch = "wasm32")]
 use crate::wasm_compat::memmap2;
-use fluree_db_core::subject_id::SubjectIdColumn;
-use fluree_db_core::{Flake, ListIndex, Sid, StatsView};
+use fluree_db_core::{Flake, Sid, StatsView};
 // moka's eviction clock reads std::time::Instant at cache construction, which
 // aborts on wasm32-unknown-unknown; shadow-import core's clock-free LRU
 // stand-in there (same API subset, exact-LRU instead of TinyLFU).
@@ -54,149 +53,13 @@ fn arc_io_error(arc_err: std::sync::Arc<io::Error>) -> io::Error {
 }
 
 // ============================================================================
-// Sparse column types (for lang_id and list-index)
-// ============================================================================
-
-/// Sparse u16 column for lang_id values.
-///
-/// Stores only the non-zero rows as parallel `(position, value)` arrays.
-/// Positions are sorted ascending. Binary search provides O(log n) lookup
-/// where n is the number of non-zero entries (typically tiny).
-#[derive(Clone, Debug)]
-pub struct SparseU16Column {
-    /// Sorted ascending row indices within the leaflet.
-    pub positions: Arc<[u16]>,
-    /// Parallel values (same length as positions).
-    pub values: Arc<[u16]>,
-}
-
-impl SparseU16Column {
-    /// Look up the value at `row`. Returns 0 if the row is absent.
-    #[inline]
-    pub fn get(&self, row: u16) -> u16 {
-        match self.positions.binary_search(&row) {
-            Ok(idx) => self.values[idx],
-            Err(_) => 0,
-        }
-    }
-
-    /// Number of non-zero entries.
-    #[inline]
-    pub fn count(&self) -> usize {
-        self.positions.len()
-    }
-
-    /// Approximate byte size for cache weighing.
-    #[inline]
-    pub fn byte_size(&self) -> usize {
-        // positions: 2 bytes each, values: 2 bytes each
-        self.positions.len() * 4
-    }
-}
-
-/// Sparse list-index column with variable storage width.
-///
-/// Values are non-negative list positions stored at the narrowest width
-/// that fits the leaflet's `max_i`. Absent rows return `ListIndex::none()`.
-#[derive(Clone, Debug)]
-pub enum SparseIColumn {
-    U8 {
-        positions: Arc<[u16]>,
-        values: Arc<[u8]>,
-    },
-    U16 {
-        positions: Arc<[u16]>,
-        values: Arc<[u16]>,
-    },
-    U32 {
-        positions: Arc<[u16]>,
-        values: Arc<[u32]>,
-    },
-}
-
-impl SparseIColumn {
-    /// Look up the list index at `row`. Returns `ListIndex::none().as_i32()` if absent.
-    #[inline]
-    pub fn get(&self, row: u16) -> i32 {
-        match self {
-            SparseIColumn::U8 { positions, values } => match positions.binary_search(&row) {
-                Ok(idx) => values[idx] as i32,
-                Err(_) => ListIndex::none().as_i32(),
-            },
-            SparseIColumn::U16 { positions, values } => match positions.binary_search(&row) {
-                Ok(idx) => values[idx] as i32,
-                Err(_) => ListIndex::none().as_i32(),
-            },
-            SparseIColumn::U32 { positions, values } => match positions.binary_search(&row) {
-                Ok(idx) => values[idx] as i32,
-                Err(_) => ListIndex::none().as_i32(),
-            },
-        }
-    }
-
-    /// Number of non-sentinel entries.
-    #[inline]
-    pub fn count(&self) -> usize {
-        match self {
-            SparseIColumn::U8 { positions, .. } => positions.len(),
-            SparseIColumn::U16 { positions, .. } => positions.len(),
-            SparseIColumn::U32 { positions, .. } => positions.len(),
-        }
-    }
-
-    /// Approximate byte size for cache weighing.
-    #[inline]
-    pub fn byte_size(&self) -> usize {
-        match self {
-            // positions: 2 bytes each, values: 1 byte each
-            SparseIColumn::U8 { positions, .. } => positions.len() * 3,
-            // positions: 2 bytes each, values: 2 bytes each
-            SparseIColumn::U16 { positions, .. } => positions.len() * 4,
-            // positions: 2 bytes each, values: 4 bytes each
-            SparseIColumn::U32 { positions, .. } => positions.len() * 6,
-        }
-    }
-
-    /// The positions array (sorted ascending row indices).
-    #[inline]
-    pub fn positions(&self) -> &[u16] {
-        match self {
-            SparseIColumn::U8 { positions, .. } => positions,
-            SparseIColumn::U16 { positions, .. } => positions,
-            SparseIColumn::U32 { positions, .. } => positions,
-        }
-    }
-}
-
-// ============================================================================
 // Cache key
 // ============================================================================
 
-/// Leaflet identity fields shared by R1 and R2 entries.
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
-pub struct LeafletCacheKey {
-    /// Leaf identity: xxh3_128 of the content hash string from the branch manifest.
-    /// Uses 128-bit hash to make collisions astronomically unlikely (~1 in 3.4×10^38).
-    /// Leaves are content-addressed (`{sha256}.fli`), so this is stable.
-    pub leaf_id: u128,
-    /// Leaflet slot within the leaf (0..leaflet_count).
-    pub leaflet_index: u32,
-    /// Effective "state-at" t — always the resolved numeric t, never a sentinel.
-    /// For current-time queries: `to_t = store.max_t()`.
-    /// For time-travel: `to_t` = the target t requested by the query.
-    pub to_t: i64,
-    /// Overlay/stage invalidation epoch.
-    /// From `OverlayProvider::epoch()`; staged != committed.
-    /// 0 when no overlay is active.
-    pub epoch: u64,
-}
-
-/// Unified cache key. The enum discriminant ensures R1, R2, and dict leaf
-/// entries never collide even when the underlying identifiers match.
+/// Unified cache key. The enum discriminant keeps entry types apart even when
+/// their underlying identifiers match.
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 enum CacheKey {
-    R1(LeafletCacheKey),
-    R2(LeafletCacheKey),
     /// Key = xxh3_128(CAS address). Content-addressed → immutable.
     DictLeaf(u128),
     /// Decoded leaf directory (header+dir only, no payload). Key =
@@ -302,73 +165,6 @@ impl CachedV3Batch {
 // Cached value types
 // ============================================================================
 
-/// Cached decoded Region 1 (core columns: s_id, p_id, o_kind, o_key).
-///
-/// Uses `Arc<[T]>` for zero-copy sharing between cache and in-flight cursors.
-/// Subject IDs use [`SubjectIdColumn`] for compact storage: narrow mode (u32) saves
-/// ~20% cache capacity compared to wide mode (u64).
-#[derive(Clone, Debug)]
-pub struct CachedRegion1 {
-    pub s_ids: SubjectIdColumn,
-    pub p_ids: Arc<[u32]>,
-    pub o_kinds: Arc<[u8]>,
-    pub o_keys: Arc<[u64]>,
-    pub row_count: usize,
-}
-
-/// Cached decoded Region 2 (metadata columns: dt, t, lang, i).
-///
-/// `t` is stored as `u32` (narrowed from on-disk u32). Widen to `i64` at API
-/// boundaries via `t_i64()`. `lang` and `i` are stored sparsely — `None` when
-/// all rows have the default value (0 / sentinel).
-#[derive(Clone, Debug)]
-pub struct CachedRegion2 {
-    pub dt_values: Arc<[u32]>,
-    pub t_values: Arc<[u32]>,
-    pub lang: Option<SparseU16Column>,
-    pub i_col: Option<SparseIColumn>,
-}
-
-impl CachedRegion1 {
-    /// Approximate byte size of this cached value (for cache weighing).
-    pub fn byte_size(&self) -> usize {
-        // s_ids: 4 (narrow) or 8 (wide) + p_ids(4) + o_kinds(1) + o_keys(8)
-        self.s_ids.byte_size() + self.row_count * (4 + 1 + 8)
-    }
-}
-
-impl CachedRegion2 {
-    /// Approximate byte size of this cached value (for cache weighing).
-    pub fn byte_size(&self) -> usize {
-        let rows = self.dt_values.len();
-        // dt(4) + t(4) = 8 bytes per row, plus sparse overhead
-        let dense = rows * 8;
-        let lang_bytes = self.lang.as_ref().map_or(0, SparseU16Column::byte_size);
-        let i_bytes = self.i_col.as_ref().map_or(0, SparseIColumn::byte_size);
-        dense + lang_bytes + i_bytes
-    }
-
-    /// Get `t` at `row`, widened to i64 for API boundaries.
-    #[inline]
-    pub fn t_i64(&self, row: usize) -> i64 {
-        self.t_values[row] as i64
-    }
-
-    /// Get `lang_id` at `row` (0 if absent).
-    #[inline]
-    pub fn lang_id(&self, row: usize) -> u16 {
-        self.lang.as_ref().map_or(0, |c| c.get(row as u16))
-    }
-
-    /// Get list index at `row` (`ListIndex::none().as_i32()` if absent).
-    #[inline]
-    pub fn list_index(&self, row: usize) -> i32 {
-        self.i_col
-            .as_ref()
-            .map_or(ListIndex::none().as_i32(), |c| c.get(row as u16))
-    }
-}
-
 /// Translated overlay ops for one immutable novelty segment, cached in the
 /// shared pool. `ops` are sorted by the index order but **not** lifecycle-
 /// resolved or `to_t`-filtered; `untranslated` are the `@vector`/unsupported
@@ -408,8 +204,6 @@ impl CachedOverlaySegment {
 /// Unified value stored in the single moka cache.
 #[derive(Clone)]
 enum CachedEntry {
-    R1(CachedRegion1),
-    R2(CachedRegion2),
     DictLeaf(Arc<[u8]>),
     LeafDir(Arc<DecodedLeafDirV3>),
     LeafMmap(Arc<memmap2::Mmap>),
@@ -426,8 +220,6 @@ impl CachedEntry {
     /// Approximate byte size for the moka weigher.
     fn byte_size(&self) -> usize {
         match self {
-            CachedEntry::R1(r1) => r1.byte_size(),
-            CachedEntry::R2(r2) => r2.byte_size(),
             CachedEntry::DictLeaf(bytes) => bytes.len(),
             CachedEntry::LeafDir(dir) => dir.byte_size(),
             // A mapping is file-backed (reclaimable page cache), not heap:
@@ -458,8 +250,6 @@ impl CachedEntry {
 ///
 /// All entry types share one memory budget — TinyLFU decides what stays
 /// based on actual access frequency/recency rather than fixed splits.
-/// The lazy-Region-2 strategy is preserved: R1 and R2 use separate
-/// `CacheKey` variants, so inserting R1 never evicts or implies R2.
 pub struct LeafletCache {
     inner: Pool<CacheKey, CachedEntry>,
     /// Query planner `StatsView`s, in a pool of their own. See
@@ -562,54 +352,6 @@ fn in_blocking_region<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-macro_rules! region_cache_methods {
-    ($get_or:ident, $get:ident, $contains:ident, $cache_key_variant:ident, $entry_variant:ident, $ty:ty) => {
-        /// Get or decode a leaflet region for the given key.
-        ///
-        /// On cache miss, calls `decode_fn` to produce the value, inserts it,
-        /// and returns the cached copy.
-        pub fn $get_or<F>(&self, key: LeafletCacheKey, decode_fn: F) -> $ty
-        where
-            F: FnOnce() -> $ty,
-        {
-            // Fast path: a plain hit must not pay the block_in_place cost.
-            if let Some(v) = self.$get(&key) {
-                return v;
-            }
-            // Miss: run the single-flight wait/init in a blocking region so a
-            // waiter promotes a replacement worker (see in_blocking_region).
-            let entry = in_blocking_region(|| {
-                self.inner.get_with(CacheKey::$cache_key_variant(key), || {
-                    CachedEntry::$entry_variant(decode_fn())
-                })
-            });
-            match entry {
-                CachedEntry::$entry_variant(v) => v,
-                _ => unreachable!(concat!(
-                    stringify!($cache_key_variant),
-                    " key always maps to ",
-                    stringify!($entry_variant),
-                    " entry"
-                )),
-            }
-        }
-
-        /// Check if the region is cached for the given key (read-only, no insertion).
-        pub fn $get(&self, key: &LeafletCacheKey) -> Option<$ty> {
-            match self.inner.get(&CacheKey::$cache_key_variant(key.clone())) {
-                Some(CachedEntry::$entry_variant(v)) => Some(v),
-                _ => None,
-            }
-        }
-
-        /// Check if the region is cached for the given key.
-        pub fn $contains(&self, key: &LeafletCacheKey) -> bool {
-            self.inner
-                .contains_key(&CacheKey::$cache_key_variant(key.clone()))
-        }
-    };
-}
-
 impl LeafletCache {
     /// Create a new cache with the given maximum byte budget.
     ///
@@ -665,18 +407,6 @@ impl LeafletCache {
         #[cfg(target_arch = "wasm32")]
         1
     }
-
-    // ========================================================================
-    // Region 1
-    // ========================================================================
-
-    region_cache_methods!(get_or_decode_r1, get_r1, contains_r1, R1, R1, CachedRegion1);
-
-    // ========================================================================
-    // Region 2
-    // ========================================================================
-
-    region_cache_methods!(get_or_decode_r2, get_r2, contains_r2, R2, R2, CachedRegion2);
 
     // ========================================================================
     // Dict tree leaf cache
@@ -1110,168 +840,6 @@ impl LeafletCache {
 mod tests {
     use super::*;
 
-    fn make_key(leaf_id: u128, leaflet_index: u32, to_t: i64, epoch: u64) -> LeafletCacheKey {
-        LeafletCacheKey {
-            leaf_id,
-            leaflet_index,
-            to_t,
-            epoch,
-        }
-    }
-
-    fn make_r1(row_count: usize) -> CachedRegion1 {
-        CachedRegion1 {
-            s_ids: SubjectIdColumn::from_narrow(vec![1u32; row_count]),
-            p_ids: vec![2u32; row_count].into(),
-            o_kinds: vec![0u8; row_count].into(),
-            o_keys: vec![3u64; row_count].into(),
-            row_count,
-        }
-    }
-
-    fn make_r2(row_count: usize) -> CachedRegion2 {
-        CachedRegion2 {
-            dt_values: vec![0u32; row_count].into(),
-            t_values: vec![1u32; row_count].into(),
-            lang: None,
-            i_col: None,
-        }
-    }
-
-    #[test]
-    fn test_leaflet_cache_miss_then_hit() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024); // 10MB
-        let key = make_key(42, 0, 100, 0);
-
-        // Miss — should return None
-        assert!(cache.get_r1(&key).is_none());
-
-        // get_or_decode should call the decode fn
-        let mut called = false;
-        let r1 = cache.get_or_decode_r1(key.clone(), || {
-            called = true;
-            make_r1(100)
-        });
-        assert!(called);
-        assert_eq!(r1.row_count, 100);
-
-        // Hit — should not call decode fn
-        let mut called_again = false;
-        let r1_cached = cache.get_or_decode_r1(key.clone(), || {
-            called_again = true;
-            make_r1(999) // should NOT be used
-        });
-        assert!(!called_again);
-        assert_eq!(r1_cached.row_count, 100); // original value
-    }
-
-    #[test]
-    fn test_leaflet_cache_r2_independent() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-        let key = make_key(42, 0, 100, 0);
-
-        // Insert R1 but not R2
-        cache.get_or_decode_r1(key.clone(), || make_r1(50));
-        assert!(cache.get_r1(&key).is_some());
-        assert!(cache.get_r2(&key).is_none());
-
-        // Insert R2
-        cache.get_or_decode_r2(key.clone(), || make_r2(50));
-        assert!(cache.get_r2(&key).is_some());
-    }
-
-    #[test]
-    fn test_leaflet_cache_epoch_invalidation() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-
-        let key_committed = make_key(42, 0, 100, 0);
-        let key_staged = make_key(42, 0, 100, 1);
-
-        cache.get_or_decode_r1(key_committed.clone(), || make_r1(100));
-
-        // Different epoch → cache miss
-        assert!(cache.get_r1(&key_staged).is_none());
-
-        // Same epoch → cache hit
-        assert!(cache.get_r1(&key_committed).is_some());
-    }
-
-    #[test]
-    fn test_leaflet_cache_different_to_t() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-
-        let key_t100 = make_key(42, 0, 100, 0);
-        let key_t50 = make_key(42, 0, 50, 0);
-
-        cache.get_or_decode_r1(key_t100.clone(), || make_r1(100));
-
-        // Different to_t → cache miss (time-travel produces different state)
-        assert!(cache.get_r1(&key_t50).is_none());
-
-        // Same to_t → cache hit
-        assert!(cache.get_r1(&key_t100).is_some());
-    }
-
-    #[test]
-    fn test_leaflet_cache_different_leaflet_index() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-
-        let key_0 = make_key(42, 0, 100, 0);
-        let key_1 = make_key(42, 1, 100, 0);
-
-        cache.get_or_decode_r1(key_0.clone(), || make_r1(100));
-
-        // Different leaflet index → cache miss
-        assert!(cache.get_r1(&key_1).is_none());
-    }
-
-    #[test]
-    fn test_leaflet_cache_invalidate_all() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-        let key = make_key(42, 0, 100, 0);
-
-        cache.get_or_decode_r1(key.clone(), || make_r1(100));
-        cache.get_or_decode_r2(key.clone(), || make_r2(100));
-        assert!(cache.get_r1(&key).is_some());
-        assert!(cache.get_r2(&key).is_some());
-
-        cache.invalidate_all();
-        // moka may not synchronously evict; run_pending() forces it
-        // Use get() which should return None for invalidated entries
-        // Note: moka invalidate_all is lazy, but get() after invalidate should miss
-    }
-
-    #[test]
-    fn test_cached_region_byte_sizes() {
-        let r1 = make_r1(25000);
-        // narrow: s_ids(4) + p_ids(4) + o_kinds(1) + o_keys(8) = 17 bytes per row
-        assert_eq!(r1.byte_size(), 25000 * 17); // 425KB
-
-        let r2 = make_r2(25000);
-        // dt(4) + t(4) = 8 bytes per row, no sparse overhead when lang/i absent
-        assert_eq!(r2.byte_size(), 25000 * 8); // 200KB
-    }
-
-    #[test]
-    fn test_unified_pool_r1_and_dict_leaf() {
-        let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-        let key = make_key(42, 0, 100, 0);
-
-        // Insert R1 and a dict leaf into the same pool.
-        cache.get_or_decode_r1(key.clone(), || make_r1(50));
-        let dict_data: Arc<[u8]> = Arc::from(vec![1u8; 256].into_boxed_slice());
-        cache
-            .try_get_or_load_dict_leaf(999, || Ok(dict_data))
-            .unwrap();
-
-        // Both retrievable from the same pool.
-        assert!(cache.get_r1(&key).is_some());
-        assert!(cache.get_dict_leaf(999).is_some());
-
-        // Different dict key → miss.
-        assert!(cache.get_dict_leaf(1000).is_none());
-    }
-
     #[test]
     fn test_v3_batch_superset_serves_narrow_without_decode() {
         use crate::read::column_types::{ColumnBatch, ColumnData, ColumnSet};
@@ -1429,11 +997,8 @@ mod tests {
     #[test]
     fn test_bm25_leaflet_coexists_with_other_types() {
         let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-        let r1_key = make_key(42, 0, 100, 0);
 
-        // Insert R1, DictLeaf, and BM25Leaflet — all share the same pool.
-        cache.get_or_decode_r1(r1_key.clone(), || make_r1(50));
-
+        // Insert DictLeaf and BM25Leaflet — both share the same pool.
         let dict_data: Arc<[u8]> = Arc::from(vec![1u8; 256].into_boxed_slice());
         cache
             .try_get_or_load_dict_leaf(999, || Ok(dict_data))
@@ -1442,8 +1007,7 @@ mod tests {
         let bm25_data: Arc<[u8]> = vec![2u8; 512].into_boxed_slice().into();
         cache.insert_bm25_leaflet(888, bm25_data);
 
-        // All three retrievable from the same pool.
-        assert!(cache.get_r1(&r1_key).is_some());
+        // Both retrievable from the same pool.
         assert!(cache.get_dict_leaf(999).is_some());
         assert!(cache.get_bm25_leaflet(888).is_some());
 
@@ -1504,11 +1068,8 @@ mod tests {
     #[test]
     fn test_vector_shard_coexists_with_other_types() {
         let cache = LeafletCache::with_max_bytes(10 * 1024 * 1024);
-        let r1_key = make_key(42, 0, 100, 0);
 
-        // Insert R1, DictLeaf, BM25Leaflet, and VectorShard — all share one pool.
-        cache.get_or_decode_r1(r1_key.clone(), || make_r1(50));
-
+        // Insert DictLeaf, BM25Leaflet, and VectorShard — all share one pool.
         let dict_data: Arc<[u8]> = Arc::from(vec![1u8; 256].into_boxed_slice());
         cache
             .try_get_or_load_dict_leaf(999, || Ok(dict_data))
@@ -1526,8 +1087,7 @@ mod tests {
             .try_get_or_load_vector_shard(777, move || Ok(shard))
             .unwrap();
 
-        // All four retrievable from the same pool.
-        assert!(cache.get_r1(&r1_key).is_some());
+        // All three retrievable from the same pool.
         assert!(cache.get_dict_leaf(999).is_some());
         assert!(cache.get_bm25_leaflet(888).is_some());
         assert!(cache.get_vector_shard(777).is_some());
