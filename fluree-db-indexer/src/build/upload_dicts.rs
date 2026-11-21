@@ -384,9 +384,7 @@ where
 /// Build the subject reverse tree by draining `next_entry`. Entries must arrive
 /// in reverse-tree key order (`(ns_code, suffix)`). Key = `[ns_code BE][suffix]`.
 ///
-/// Leaves are written in the subject tree's format
-/// (`LeafFormat::for_tree`), cut where a `DLR1` leaf of the same entries
-/// would reach the target size.
+/// Leaves are written by [`ReverseTreeWriter`].
 async fn build_subject_reverse_tree<F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
@@ -395,76 +393,122 @@ async fn build_subject_reverse_tree<F>(
 where
     F: FnMut() -> Result<Option<SubjectEntry>>,
 {
-    use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
-    use fluree_db_binary_index::dict::builder;
-    use fluree_db_binary_index::dict::key_scheme::KeyScheme;
-    use fluree_db_binary_index::dict::reverse_leaf::LeafFormat;
-    use fluree_db_core::{ContentKind, DictKind};
+    use fluree_db_binary_index::dict::key_scheme::{KeyScheme, RawGroups};
+    use fluree_db_core::DictKind;
 
-    let kind = ContentKind::DictBlob {
-        dict: DictKind::SubjectReverse,
-    };
-    let mut leaf_cids: Vec<ContentId> = Vec::new();
-    let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
-
-    let mut writer = LeafFormat::for_tree(DictKind::SubjectReverse, KeyScheme::Raw).writer();
-    let mut chunk_bytes: usize = 0;
-    let mut first_key: Option<Vec<u8>> = None;
+    let mut tree = ReverseTreeWriter::new(DictKind::SubjectReverse, KeyScheme::Raw);
     let mut key: Vec<u8> = Vec::new();
+    while let Some(entry) = next_entry()? {
+        let suffix =
+            &fwd[entry.suf_off as usize..(entry.suf_off as usize + entry.suf_len as usize)];
+        key.clear();
+        key.extend_from_slice(&entry.ns_code.to_be_bytes());
+        key.extend_from_slice(suffix);
+        tree.push(content_store, &key, entry.sid).await?;
+    }
+    tree.finish(content_store, RawGroups::default()).await
+}
 
-    loop {
-        let entry = next_entry()?;
-        if let Some(entry) = &entry {
-            let suffix =
-                &fwd[entry.suf_off as usize..(entry.suf_off as usize + entry.suf_len as usize)];
-            key.clear();
-            key.extend_from_slice(&entry.ns_code.to_be_bytes());
-            key.extend_from_slice(suffix);
-            writer.push(&key, entry.sid);
-            chunk_bytes += 12 + key.len();
-            if first_key.is_none() {
-                first_key = Some(key.clone());
-            }
-        }
-        let flush = match entry {
-            Some(_) => chunk_bytes >= builder::DEFAULT_TARGET_LEAF_BYTES,
-            None => !writer.is_empty(),
-        };
-        if flush {
-            let entry_count = writer.entry_count();
-            let leaf_bytes = writer.finish();
-            chunk_bytes = 0;
-            let cas_result = content_store
-                .put(kind, &leaf_bytes)
-                .await
-                .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-            branch_entries.push(BranchLeafEntry {
-                first_key: first_key.take().unwrap_or_default(),
-                last_key: key.clone(),
-                entry_count,
-                address: cas_result.to_string(),
-            });
-            leaf_cids.push(cas_result);
-        }
-        if entry.is_none() {
-            break;
+/// Writes a reverse tree's leaves as its keys arrive, strictly ascending, in
+/// the format `LeafFormat::for_tree` gives its dictionary and key scheme,
+/// cutting each where a `DLR1` leaf of the same keys would reach the target
+/// size.
+struct ReverseTreeWriter {
+    kind: fluree_db_core::ContentKind,
+    scheme: fluree_db_binary_index::dict::key_scheme::KeyScheme,
+    writer: fluree_db_binary_index::dict::reverse_leaf::LeafWriter,
+    chunk_bytes: usize,
+    first_key: Vec<u8>,
+    last_key: Vec<u8>,
+    leaf_cids: Vec<ContentId>,
+    leaves: Vec<fluree_db_binary_index::dict::branch::BranchLeafEntry>,
+}
+
+impl ReverseTreeWriter {
+    fn new(
+        dict: fluree_db_core::DictKind,
+        scheme: fluree_db_binary_index::dict::key_scheme::KeyScheme,
+    ) -> Self {
+        use fluree_db_binary_index::dict::reverse_leaf::LeafFormat;
+        Self {
+            kind: fluree_db_core::ContentKind::DictBlob { dict },
+            scheme,
+            writer: LeafFormat::for_tree(dict, scheme).writer(),
+            chunk_bytes: 0,
+            first_key: Vec::new(),
+            last_key: Vec::new(),
+            leaf_cids: Vec::new(),
+            leaves: Vec::new(),
         }
     }
 
-    let branch = DictBranch {
-        leaves: branch_entries,
-        ..Default::default()
-    };
-    let branch_bytes = branch.encode();
-    let branch_result = content_store
-        .put(kind, &branch_bytes)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+    /// Add the next key, uploading a leaf when one fills.
+    async fn push(&mut self, content_store: &dyn ContentStore, key: &[u8], id: u64) -> Result<()> {
+        let started = !self.writer.is_empty() || !self.leaves.is_empty();
+        if started && key <= self.last_key.as_slice() {
+            return Err(IndexerError::StorageWrite(format!(
+                "{:?} reverse keys out of order, or two values share a key",
+                self.kind
+            )));
+        }
+        if self.writer.is_empty() {
+            self.first_key.clear();
+            self.first_key.extend_from_slice(key);
+        }
+        self.writer.push(key, id);
+        self.chunk_bytes += 12 + key.len();
+        self.last_key.clear();
+        self.last_key.extend_from_slice(key);
+        if self.chunk_bytes >= fluree_db_binary_index::dict::builder::DEFAULT_TARGET_LEAF_BYTES {
+            self.flush(content_store).await?;
+        }
+        Ok(())
+    }
 
-    Ok(DictTreeRefs {
-        branch: branch_result,
-        leaves: leaf_cids,
-    })
+    async fn flush(&mut self, content_store: &dyn ContentStore) -> Result<()> {
+        if self.writer.is_empty() {
+            return Ok(());
+        }
+        let entry_count = self.writer.entry_count();
+        let leaf_bytes = self.writer.finish();
+        self.chunk_bytes = 0;
+        let cid = content_store
+            .put(self.kind, &leaf_bytes)
+            .await
+            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        self.leaves
+            .push(fluree_db_binary_index::dict::branch::BranchLeafEntry {
+                first_key: std::mem::take(&mut self.first_key),
+                last_key: self.last_key.clone(),
+                entry_count,
+                address: cid.to_string(),
+            });
+        self.leaf_cids.push(cid);
+        Ok(())
+    }
+
+    /// Upload the last leaf and the branch, which records the scheme and
+    /// `raw_groups`.
+    async fn finish(
+        mut self,
+        content_store: &dyn ContentStore,
+        raw_groups: fluree_db_binary_index::dict::key_scheme::RawGroups,
+    ) -> Result<DictTreeRefs> {
+        self.flush(content_store).await?;
+        let branch = fluree_db_binary_index::dict::branch::DictBranch {
+            leaves: self.leaves,
+            key_scheme: self.scheme,
+            raw_groups,
+        };
+        let branch = content_store
+            .put(self.kind, &branch.encode())
+            .await
+            .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
+        Ok(DictTreeRefs {
+            branch,
+            leaves: self.leaf_cids,
+        })
+    }
 }
 
 /// Build string forward packs (FPK1 format, single `ns_code = 0` stream) by
@@ -550,9 +594,8 @@ fn string_at<'f>(fwd: &'f [u8], entry: &StringEntry) -> &'f [u8] {
 /// value order (lexicographic by string), and is called twice: a first pass
 /// finds the groups holding more long values than a new string tree's
 /// [`KeyScheme`] lets a group hash, and the second keys those groups' long
-/// values by value and hashes every other long value. Leaves are
-/// front-coded, cut where a `DLR1` leaf of the same keys would reach the
-/// target size.
+/// values by value and hashes every other long value. Leaves are written by
+/// [`ReverseTreeWriter`].
 ///
 /// [`KeyScheme`]: fluree_db_binary_index::dict::key_scheme::KeyScheme
 async fn build_string_reverse_tree<O, F>(
@@ -564,17 +607,11 @@ where
     O: FnMut() -> Result<F>,
     F: FnMut() -> Result<Option<StringEntry>>,
 {
-    use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
-    use fluree_db_binary_index::dict::builder;
     use fluree_db_binary_index::dict::key_scheme::{
         GroupCounter, KeyOrder, KeyScheme, RawGroup, RawGroups,
     };
-    use fluree_db_binary_index::dict::reverse_leaf::FrontCodedLeafWriter;
-    use fluree_db_core::{ContentKind, DictKind};
+    use fluree_db_core::DictKind;
 
-    let kind = ContentKind::DictBlob {
-        dict: DictKind::StringReverse,
-    };
     let scheme = KeyScheme::for_new_tree(DictKind::StringReverse);
     let invalid =
         |e: std::io::Error| IndexerError::StorageWrite(format!("string reverse keys: {e}"));
@@ -599,16 +636,10 @@ where
         tracing::debug!(groups = raw_groups.len(), "string groups keyed by value");
     }
 
-    let mut leaf_cids: Vec<ContentId> = Vec::new();
-    let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
+    let mut tree = ReverseTreeWriter::new(DictKind::StringReverse, scheme);
     let mut order = KeyOrder::new(scheme, raw_groups.clone());
-    let mut writer = FrontCodedLeafWriter::new(false);
-    let mut chunk_bytes: usize = 0;
-    let mut first_key: Option<Vec<u8>> = None;
-    let mut last_key: Vec<u8> = Vec::new();
     let mut next_entry = entries()?;
     let mut drained = false;
-
     while !drained {
         match next_entry()? {
             Some(entry) => order
@@ -620,86 +651,10 @@ where
             }
         }
         while let Some((key, id)) = order.pop() {
-            if (!writer.is_empty() || !branch_entries.is_empty()) && key <= last_key {
-                return Err(IndexerError::StorageWrite(
-                    "string reverse keys out of order, or two strings share a key".into(),
-                ));
-            }
-            writer.push(&key, id);
-            chunk_bytes += 12 + key.len();
-            if first_key.is_none() {
-                first_key = Some(key.clone());
-            }
-            last_key = key;
-            if chunk_bytes >= builder::DEFAULT_TARGET_LEAF_BYTES {
-                flush_string_leaf(
-                    content_store,
-                    kind,
-                    &mut writer,
-                    &mut first_key,
-                    &last_key,
-                    &mut leaf_cids,
-                    &mut branch_entries,
-                )
-                .await?;
-                chunk_bytes = 0;
-            }
+            tree.push(content_store, &key, id).await?;
         }
     }
-    if !writer.is_empty() {
-        flush_string_leaf(
-            content_store,
-            kind,
-            &mut writer,
-            &mut first_key,
-            &last_key,
-            &mut leaf_cids,
-            &mut branch_entries,
-        )
-        .await?;
-    }
-
-    let branch = DictBranch {
-        leaves: branch_entries,
-        key_scheme: scheme,
-        raw_groups,
-    };
-    let branch_bytes = branch.encode();
-    let branch_result = content_store
-        .put(kind, &branch_bytes)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-
-    Ok(DictTreeRefs {
-        branch: branch_result,
-        leaves: leaf_cids,
-    })
-}
-
-/// Upload the writer's leaf and record it in the branch.
-async fn flush_string_leaf(
-    content_store: &dyn ContentStore,
-    kind: fluree_db_core::ContentKind,
-    writer: &mut fluree_db_binary_index::dict::reverse_leaf::FrontCodedLeafWriter,
-    first_key: &mut Option<Vec<u8>>,
-    last_key: &[u8],
-    leaf_cids: &mut Vec<ContentId>,
-    branch_entries: &mut Vec<fluree_db_binary_index::dict::branch::BranchLeafEntry>,
-) -> Result<()> {
-    let entry_count = writer.entry_count();
-    let leaf_bytes = writer.finish();
-    let cid = content_store
-        .put(kind, &leaf_bytes)
-        .await
-        .map_err(|e| IndexerError::StorageWrite(e.to_string()))?;
-    branch_entries.push(fluree_db_binary_index::dict::branch::BranchLeafEntry {
-        first_key: first_key.take().unwrap_or_default(),
-        last_key: last_key.to_vec(),
-        entry_count,
-        address: cid.to_string(),
-    });
-    leaf_cids.push(cid);
-    Ok(())
+    tree.finish(content_store, raw_groups).await
 }
 
 ///
