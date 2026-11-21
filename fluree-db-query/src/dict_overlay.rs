@@ -294,17 +294,22 @@ impl DictOverlay {
 
     /// Look up or assign a string dictionary ID.
     ///
-    /// Tries: persisted tree → DictNovelty → ephemeral fallback.
+    /// Tries: DictNovelty → persisted tree → ephemeral fallback. DictNovelty
+    /// holds only strings the persisted tree doesn't (it is populated against
+    /// the tree, and rebuilt when an index is installed), so the order
+    /// changes no answer. Asking it first spares each novelty string the
+    /// persisted lookup, which for a long string hashes it to probe for a
+    /// key the tree can't hold.
     pub fn assign_string_id(&mut self, value: &str) -> io::Result<u32> {
-        // 1. Persisted tree
-        if let Some(id) = self.graph_view.store().find_string_id(value)? {
-            return Ok(id);
-        }
-        // 2. DictNovelty (populated during commit)
+        // 1. DictNovelty (populated during commit)
         if self.dict_novelty.is_initialized() {
             if let Some(id) = self.dict_novelty.strings.find_string(value) {
                 return Ok(id);
             }
+        }
+        // 2. Persisted tree
+        if let Some(id) = self.graph_view.store().find_string_id(value)? {
+            return Ok(id);
         }
         // 3. Ephemeral fallback (for range provider path)
         Ok(self.ext_strings.assign_or_lookup(value))

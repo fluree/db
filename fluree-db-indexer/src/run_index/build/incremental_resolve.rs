@@ -186,6 +186,9 @@ pub struct IncrementalNovelty {
     /// starting at `string_watermark + 1`. Consumed directly by forward
     /// pack builders (no re-sorting needed).
     pub new_strings: Vec<(u32, Vec<u8>)>,
+    /// The hash of each new string looked up by its hashed key, by string
+    /// id, so the string tree's update doesn't hash it again.
+    pub new_string_hashes: crate::build::dicts::StringHashes,
     /// Updated subject watermarks.
     pub updated_watermarks: Vec<u64>,
     /// Updated string watermark.
@@ -665,6 +668,7 @@ pub async fn resolve_incremental_commits_v6(
             updated_string_watermark: base_string_watermark,
             new_subjects: Vec::new(),
             new_strings: Vec::new(),
+            new_string_hashes: Default::default(),
             max_t,
             delta_commit_size,
             delta_asserts,
@@ -686,10 +690,18 @@ pub async fn resolve_incremental_commits_v6(
     // hit a warm disk cache instead. Prefetch only WARMS the cache — lookup
     // results, remaps, and downstream encoding are unchanged. Failures are
     // ignored: the sync path will fetch the leaf the old way.
+    let string_lookup = string_lookup_keys(&string_tree, &chunk);
     let t_prefetch_ms = {
         let t0 = Instant::now();
-        prefetch_reconcile_leaves(cs.as_ref(), &chunk, &subject_tree, &string_tree, &s3_budget)
-            .await;
+        prefetch_reconcile_leaves(
+            cs.as_ref(),
+            &chunk,
+            &subject_tree,
+            &string_tree,
+            &string_lookup,
+            &s3_budget,
+        )
+        .await;
         t0.elapsed().as_millis() as u64
     };
 
@@ -699,9 +711,11 @@ pub async fn resolve_incremental_commits_v6(
         &chunk,
         &subject_tree,
         &string_tree,
+        &string_lookup,
         &base_subject_watermarks,
         base_string_watermark,
     )?;
+    drop(string_lookup);
     let t_reconcile_ms = t_reconcile_start.elapsed().as_millis() as u64;
 
     // 8. Remap fulltext hook entries.
@@ -1042,6 +1056,7 @@ pub async fn resolve_incremental_commits_v6(
         shared,
         new_subjects: reconcile.new_subjects,
         new_strings: reconcile.new_strings,
+        new_string_hashes: reconcile.new_string_hashes,
         updated_watermarks: reconcile.updated_watermarks,
         updated_string_watermark: reconcile.updated_string_watermark,
         max_t,
@@ -1986,6 +2001,7 @@ struct ReconcileResult {
     string_remap: Vec<u32>,
     new_subjects: Vec<(u16, u64, Vec<u8>)>,
     new_strings: Vec<(u32, Vec<u8>)>,
+    new_string_hashes: crate::build::dicts::StringHashes,
     updated_watermarks: Vec<u64>,
     updated_string_watermark: u32,
 }
@@ -1996,20 +2012,50 @@ struct ReconcileResult {
 /// reverse keys (`ns_code` + name) and raw string value bytes (borrowed from
 /// the chunk). This is the single source of truth for the derivation so the
 /// async prefetch and the sync reconcile stay in lockstep.
-fn derive_reconcile_keys(chunk: &RebuildChunk) -> (Vec<Vec<u8>>, Vec<&[u8]>) {
-    let subject_keys: Vec<Vec<u8>> = chunk
+fn derive_reconcile_keys(chunk: &RebuildChunk) -> Vec<Vec<u8>> {
+    chunk
         .subjects
         .forward_entries()
         .iter()
         .map(|(ns_code, name_bytes)| subject_reverse_key(*ns_code, name_bytes))
-        .collect();
-    let string_keys: Vec<&[u8]> = chunk
+        .collect()
+}
+
+/// The string tree's lookup keys for the chunk's strings, in chunk-local-id
+/// order. A long string's key is its hash, so they are computed once, for
+/// the leaf prewarm, the reconcile and (through the hashes of new strings)
+/// the tree's update, and in parallel when the strings to hash are enough
+/// to pay for it.
+fn string_lookup_keys<'c>(
+    string_tree: &DictTreeReader,
+    chunk: &'c RebuildChunk,
+) -> Vec<fluree_db_binary_index::dict::key_scheme::LookupKeys<'c>> {
+    use rayon::prelude::*;
+    const PARALLEL_HASH_BYTES: usize = if cfg!(test) { 512 } else { 64 << 10 };
+    let rules = string_tree.key_rules();
+    let values: Vec<&'c [u8]> = chunk
         .strings
         .forward_entries()
         .iter()
         .map(Vec::as_slice)
         .collect();
-    (subject_keys, string_keys)
+    let to_hash: usize = values
+        .iter()
+        .filter(|value| rules.hashes(value))
+        .map(|value| value.len())
+        .sum();
+    if to_hash >= PARALLEL_HASH_BYTES {
+        values
+            .par_iter()
+            .with_min_len(64)
+            .map(|value| rules.lookup_keys(value))
+            .collect()
+    } else {
+        values
+            .iter()
+            .map(|value| rules.lookup_keys(value))
+            .collect()
+    }
 }
 
 /// Best-effort concurrent prewarm of the reverse-tree leaves the sync reconcile
@@ -2029,14 +2075,15 @@ async fn prefetch_reconcile_leaves(
     chunk: &RebuildChunk,
     subject_tree: &DictTreeReader,
     string_tree: &DictTreeReader,
+    string_lookup: &[fluree_db_binary_index::dict::key_scheme::LookupKeys<'_>],
     s3_budget: &Arc<tokio::sync::Semaphore>,
 ) {
-    let (subject_keys, string_keys) = derive_reconcile_keys(chunk);
+    let subject_keys = derive_reconcile_keys(chunk);
 
     let mut seen: std::collections::HashSet<ContentId> = std::collections::HashSet::new();
     let mut targets: Vec<ContentId> = Vec::new();
-    let mut collect = |tree: &DictTreeReader, keys: Vec<&[u8]>| {
-        for address in tree.touched_leaf_addresses(keys) {
+    let mut collect = |tree: &DictTreeReader, addresses: Vec<&str>| {
+        for address in addresses {
             if let Some(cid) = tree.leaf_cid(address) {
                 if seen.insert(cid.clone()) {
                     targets.push(cid.clone());
@@ -2046,9 +2093,12 @@ async fn prefetch_reconcile_leaves(
     };
     collect(
         subject_tree,
-        subject_keys.iter().map(Vec::as_slice).collect(),
+        subject_tree.touched_leaf_addresses(subject_keys.iter().map(Vec::as_slice)),
     );
-    collect(string_tree, string_keys);
+    collect(
+        string_tree,
+        string_tree.touched_leaf_addresses_keyed(string_lookup),
+    );
 
     if targets.is_empty() {
         return;
@@ -2082,10 +2132,11 @@ fn reconcile_chunk_to_global(
     chunk: &RebuildChunk,
     subject_tree: &DictTreeReader,
     string_tree: &DictTreeReader,
+    string_lookup: &[fluree_db_binary_index::dict::key_scheme::LookupKeys<'_>],
     subject_watermarks: &[u64],
     string_watermark: u32,
 ) -> Result<ReconcileResult, IncrementalResolveError> {
-    let (subject_reverse_keys, string_keys) = derive_reconcile_keys(chunk);
+    let subject_reverse_keys = derive_reconcile_keys(chunk);
 
     // Subject reconciliation.
     let subject_entries = chunk.subjects.forward_entries();
@@ -2180,6 +2231,7 @@ fn reconcile_chunk_to_global(
     let string_cache_misses_before = string_tree.cache_misses();
     let mut string_remap = vec![0u32; string_entries.len()];
     let mut new_strings = Vec::new();
+    let mut new_string_hashes = crate::build::dicts::StringHashes::default();
     let mut next_string_id = string_watermark + 1;
     let mut string_existing = 0usize;
     let mut string_new = 0usize;
@@ -2198,7 +2250,7 @@ fn reconcile_chunk_to_global(
     );
 
     let string_existing_ids = string_tree
-        .reverse_lookup_many(string_keys.iter().copied())
+        .reverse_lookup_keyed(string_lookup)
         .map_err(IncrementalResolveError::Io)?;
 
     for (chunk_local_id, (value_bytes, existing_id)) in
@@ -2214,6 +2266,9 @@ fn reconcile_chunk_to_global(
                 let id = next_string_id;
                 next_string_id += 1;
                 new_strings.push((id, value_bytes.clone()));
+                if let Some(hash) = string_lookup[chunk_local_id].hash() {
+                    new_string_hashes.insert(id, hash);
+                }
                 id
             }
         };
@@ -2259,6 +2314,7 @@ fn reconcile_chunk_to_global(
         string_remap,
         new_subjects,
         new_strings,
+        new_string_hashes,
         updated_watermarks,
         updated_string_watermark,
     })

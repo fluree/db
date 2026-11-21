@@ -16,11 +16,20 @@ mod it_graph_scope_streams;
 #[path = "it_novelty_subject_iri_formats.rs"]
 mod it_novelty_subject_iri_formats;
 
+#[path = "it_sparql_xml_repeated_values.rs"]
+mod it_sparql_xml_repeated_values;
+
 #[path = "it_overflow_iri_bound_lookups.rs"]
 mod it_overflow_iri_bound_lookups;
 
 #[path = "it_correlated_store_ids.rs"]
 mod it_correlated_store_ids;
+
+#[path = "it_subject_lookup_misses.rs"]
+mod it_subject_lookup_misses;
+
+#[path = "it_novelty_string_lookups.rs"]
+mod it_novelty_string_lookups;
 
 #[path = "it_issue_1721_repro.rs"]
 mod it_issue_1721_repro;

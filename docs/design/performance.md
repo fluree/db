@@ -2,8 +2,8 @@
 
 Fluree is a temporal, verifiable graph database with triple-level access control,
 reasoning, and integrated search. Systems with this feature set are commonly
-expected to trade speed for capability. In the published benchmarks below,
-Fluree outperforms engines that provide none of these features.
+expected to trade speed for capability; the benchmark results below show where
+Fluree stands.
 
 This document describes the design decisions behind that performance, with links
 into the code. It also describes the trade-offs Fluree makes and its current
@@ -11,40 +11,59 @@ limits; see [Limits and deliberate trade-offs](#limits-and-deliberate-trade-offs
 
 ## Measured results
 
-Head-to-head benchmarks against other engines are maintained in a separate
-repository: **[github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db)**.
-Each comparison uses the same hardware and datasets for every engine and can be
-reproduced from pinned S3 snapshots.
+Benchmark reports are maintained in a separate repository,
+**[github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db)**. Each
+report records its hardware, dataset, query set and configuration, and can be
+reproduced from pinned S3 snapshots. The figures below are for Fluree v4.2.8,
+measured in November 2026, except WGPB, which was measured with v4.2.7.
+Comparisons with other engines are summarized in the
+[README](../../README.md#performance).
 
-**SPARQLoscope on DBLP-core** (561 M triples, 105 queries, m7a.4xlarge 16c/64 GB):
+**SPARQLoscope on DBLP-core** (561 M triples, 105 queries, m7a.4xlarge 16c/64 GB,
+180-second timeout): all 105 queries complete, with a 16.1 ms geometric mean and
+a 25.1 ms median.
 
-| | Fluree | QLever | Virtuoso | MillenniumDB | Jena | Oxigraph | Blazegraph |
-|---|---|---|---|---|---|---|---|
-| Queries passed | 105/105 | 105/105 | 103/105 | 103/105 | 34/105 | 39/105 | 3/105 |
-| Geo mean | **17.5 ms** | 202.4 ms (11.5×) | 299.7 ms (17.1×) | 1,664 ms (95×) | 67.7 s | 87.0 s | 332.9 s |
-| Median (passed) | **26.6 ms** | 310.3 ms (11.7×) | 326.0 ms (12.3×) | 3,894 ms (147×) | 4.5 s | 5.1 s | 23.2 s |
+**SPARQLoscope on Wikidata-truthy** (8.18 B triples, 105 queries,
+r7a.16xlarge 64c/512 GB, 300-second timeout): all 105 queries complete, with a
+270.9 ms geometric mean and an 823.6 ms median.
 
-**Wikidata-truthy** (8.19 B triples, r7a.16xlarge 64c/512 GB): Fluree geometric
-mean 367.4 ms. The next engine, QLever, is 10.4× slower.
+No query fails in either run, so SPARQLoscope's P=2 aggregate, which counts a
+failed query as twice the timeout, equals the plain geometric mean.
 
-**WGPB** (full 21.5 B-triple Wikidata dump, 850 basic graph pattern queries,
-r7a.8xlarge 32c/256 GB): 850/850 passed, 43 ms geometric mean.
+**WGPB** (full Wikidata dump, 21.1 B distinct triples, 850 basic graph pattern
+queries, r7a.8xlarge 32c/256 GB): all 850 queries complete, with a 14.4 ms
+geometric mean and a 10.2 ms median.
 
-**Pokec / openCypher** (Memgraph's benchgraph suite, 1.6 M nodes / 30.6 M edges,
-r8a.4xlarge 16c/128 GB):
+**Pokec / openCypher** (the benchgraph suite, m7a.4xlarge 16c/64 GB). Geometric
+means of per-query medians, at three graph sizes:
 
-| | Fluree | Memgraph | Neo4j | FalkorDB |
-|---|---|---|---|---|
-| Durable writes | **1.73 ms** | 4.46 ms | 4.07 ms | 4.57 ms |
-| Read-only | **1.47 ms** | 4.41 ms | 6.80 ms | 4.57 ms |
+| Nodes / edges | Durable writes (8 queries) | Reads (27 queries) |
+|---|---|---|
+| 10 K / 122 K | 2.63 ms | 0.71 ms |
+| 100 K / 1.77 M | 2.40 ms | 1.29 ms |
+| 1.63 M / 30.6 M | 2.54 ms | 1.81 ms |
 
-Fluree's write latency is for durable commits, which are committed and
-recoverable when the call returns. The other engines ran with their default
-durability settings, which provide weaker guarantees.
+Each write is committed durably before it is acknowledged, as syscall traces in
+the report confirm. Write latency stays between 2.4 and 2.7 ms while the edge
+count grows 250-fold.
+
+**BSBM** (Berlin SPARQL Benchmark, m7a.4xlarge database with a separate
+m7a.2xlarge driver). Peak throughput, in query mixes per hour:
+
+| Mix | 1 M triples | 100 M | 200 M |
+|---|---|---|---|
+| Explore (25 queries) | 4,518,756 | 774,093 | 492,762 |
+| Explore, SELECT only (20 queries) | 5,034,353 | 796,932 | 497,843 |
+| Business Intelligence (15 queries) | 81,635 | 697.0 | 328.6 |
+
+Explore throughput scales to 32 clients and plateaus there. In the
+Explore-and-Update mix, where each write is fsynced before it is acknowledged,
+throughput at 1 M triples peaks at 88,464 query mixes per hour, or 737 mixed
+operations per second, with 16 clients.
 
 > The internal criterion benchmarks documented in
 > [BENCHMARKING.md](../../BENCHMARKING.md) serve a different purpose: they detect
-> per-PR regressions and do not compare Fluree with other engines.
+> regressions from one pull request to the next.
 
 ## Summary
 
@@ -52,8 +71,8 @@ Seven design choices account for most of Fluree's performance:
 
 1. **Integer-ID execution.** Dictionary encoding means joins compare `u64`s, not
    IRIs or strings. Many query shapes never access a dictionary.
-2. **Per-column compressed blocks.** Queries decompress only the columns they
-   filter on or project, and in some cases none.
+2. **Per-column compressed blocks.** A scan decompresses only the columns it
+   requests, and some directory-only answers decompress none.
 3. **Directory-only answers.** Leaflet headers carry enough metadata to answer
    many aggregates from the index directory in `O(leaflets)` rather than
    `O(rows)`.
@@ -81,10 +100,13 @@ apply to all of them:
   a recurring shape.
 - **Correctness is enforced below the optimization.** Overlay merging, time
   travel, and graph scoping are handled in the scan layer (Layer 2). Operators
-  built on the cursor inherit that behavior and do not reimplement it.
+  built on the cursor inherit that behavior. Probe lanes that read leaflets
+  directly reconcile novelty through a shared helper (`ProbeOps`) that mirrors
+  the cursor's merge, or decline when there is novelty.
 - **Specialized paths can decline.** Admission criteria are narrow and are
   checked again at runtime, and the generic plan is retained as a fallback. A
-  declined optimization costs a precondition check and does not affect results.
+  declined optimization usually costs one precondition check, never more than a
+  bounded amount of work, and does not affect results.
 - **Soundness conditions are explicit.** Each rewrite states the semantic
   condition that makes it valid, such as duplicate-insensitive aggregates,
   unchanged row counts, or preserved multiplicity, and is not applied when that
@@ -96,12 +118,13 @@ apply to all of them:
   paths that share a defect is not evidence of correctness.
 - **Decisions are observable and reversible.** Plan choices and rejected
   alternatives appear in [EXPLAIN](../query/explain.md), fast-path outcomes are
-  traced, and each class of optimizer rewrite has an
-  [environment variable that disables it](../troubleshooting/debugging-queries.md#isolating-an-optimizer-change)
+  traced, and the fast paths and several rewrites have
+  [environment variables that disable them](../troubleshooting/debugging-queries.md#isolating-an-optimizer-change)
   for comparison.
 - **Resource limits still apply.** Specialized operators check cancellation and
-  fuel, and charge the memory they retain, such as hash tables and key sets,
-  against the query's budget.
+  fuel. Several operators that hold intermediate state, including the hash-join
+  build, the streaming `GROUP BY` aggregate, `MINUS`, the semijoin and buffered
+  subquery rows, charge that memory against the query's budget.
 - **Changes are measured and gated.** Each change is justified with before/after
   measurements and a result check in its pull request. Criterion benchmarks in
   [BENCHMARKING.md](../../BENCHMARKING.md) guard against later regressions.
@@ -116,44 +139,55 @@ to performance are:
 **Four covering permutations:** `SPOT`, `PSOT`, `POST`, and `OPST`
 ([`fluree-db-core/src/comparator.rs`](../../fluree-db-core/src/comparator.rs)).
 Every triple pattern shape except one resolves to a contiguous range scan on one
-of them (see [Limits](#limits-and-deliberate-trade-offs)).
+of them (see [Limits](#limits-and-deliberate-trade-offs)). The pooled tree that
+small named graphs share keeps the same four with the graph compared last
+(`SPOT-g` and so on), plus `GSPO`, where each graph's rows are contiguous.
 
 `OPST` holds **all object types**, not only references. Because it leads with the
 object, its leaflets are segmented by `o_type`: IRI references form one
 contiguous partition and each literal type forms its own. This makes both reverse
 traversal (`?s ?p <iri>`, with `o_type = IRI_REF` pinned) and bound-literal scans
-inexpensive. For example, `fast_string_prefix_count_all` answers
-`FILTER(STRSTARTS(?o,"Com"))` by scanning an OPST slice bounded by the string
+inexpensive. For example, `fast_string_prefix_count_all` answers `COUNT(*)` with
+`FILTER(STRSTARTS(?o,"Com"))` by scanning OPST slices bounded by the string
 dictionary ID range for that prefix. `BinaryScanOperator` therefore prefers OPST
-for a constant object with an unbound subject, with one exception described under
-[Limits](#limits-and-deliberate-trade-offs).
+when only the object is bound (subject and predicate unbound), with one exception
+described under [Limits](#limits-and-deliberate-trade-offs).
 
 **Numeric IDs throughout.** Subjects, predicates, graphs, datatypes, languages,
 and string literals are stored in dictionaries; the index stores `u64`/`u32`
 keys. Joins, grouping, and deduplication operate on integers. A query that does
 not project a value does not decode it.
 
-**Order-preserving encodings.** Numeric, temporal, and boolean objects are
-encoded so that `o_key` byte order matches value order. This allows
-`ORDER BY DESC(?o) LIMIT k`, `MIN`, and `MAX` to be answered without a full scan
-(Layer 5).
+**Order-preserving encodings.** Integer (within `i64`), floating-point, temporal,
+and boolean objects, and `xsd:decimal` values of up to 17 significant digits, are
+encoded so that `o_key` byte order matches value order within each `o_type`. This
+allows `ORDER BY DESC(?o) LIMIT k`, `MIN`, and `MAX` to be answered without a full
+scan (Layer 5). Longer decimals and integers outside `i64` are stored as arena
+handles, which carry no value order.
 
 **Independently compressed per-column blocks.** A V3 leaflet stores one zstd
-block per column (`SId`, `PId`, `OType`, `OKey`, `OI`, `T`), each with its own
-`ColumnBlockRef`. A query decodes only the columns it filters on or projects; a
-scan by key does not decode `T` or `OI`.
+block per column (`SId`, `PId`, `OType`, `OKey`, `OI`, `T`, and `GId` in the
+pooled tree), each with its own `ColumnBlockRef`. The cursor decodes only the
+columns in its projection. The generic scan requests the four identity columns
+(and `GId` in the pooled tree); it adds `OI` only to hide list members, read
+history, or record a union member's facts. Fast paths and join probes request
+narrower sets. `T` is skipped on a current-time read of a leaf
+the overlay does not touch.
 
-Columns that are constant within a leaflet are omitted from the block set.
-POST/PSOT leaflets are predicate-homogeneous, so `p_id` is stored once as
-`p_const`. OPST leaflets are type-homogeneous by segmentation, so `o_type` is
-stored as `o_type_const`; other orders do the same when a leaflet is
-single-typed. Each column uses the narrowest integer width that fits the
-dictionary cardinality.
+Three columns can be omitted from the block set. POST/PSOT leaflets are
+predicate-homogeneous, so `p_id` is stored once as `p_const`. OPST leaflets are
+type-homogeneous by segmentation, so `o_type` is stored as `o_type_const`, and
+POST/PSOT leaflets do the same when they are single-typed; SPOT leaflets always
+carry an `OType` column. The `OI` block is omitted when no row is a list member.
+Each column has a fixed width (`u64` for `SId`, `OKey` and `OI`, `u32` for `PId`
+and `T`, `u16` for `OType`), and zstd removes the redundancy. The pooled tree's
+`GId` column is 2 bytes wide, or 4 in a leaflet holding a graph id past `u16`.
 
 **History is stored outside the leaflet.** Time-travel data is a separate
 content-addressed object, the per-leaf **history sidecar** (`FHS1`), located via
 `LeafEntry.sidecar_cid` on the branch manifest. It holds per-leaflet segments of
-31-byte `HistEntryV2` transition records sorted newest-first. A current-state
+36-byte `HistEntryV2` transition records (40 in the pooled tree, which records
+each entry's graph) sorted newest-first. A current-state
 query does not fetch, decompress, or cache any history data, and the leaflet
 cache excludes sidecar data. Time-travel support therefore adds no cost to
 current-state queries.
@@ -175,16 +209,17 @@ The same directory entry also carries the leaflet's history locator
 range into the sidecar blob, not inline data. The `min_t`/`max_t` pair lets a
 time-travel query skip a leaflet's history segment without reading it.
 
-**Content addressing.** Leaves, branches, and dictionary blobs are addressed by
-SHA-256 (local) or CIDv1 (remote). Because an address identifies its content,
-cached blobs never need invalidation.
+**Content addressing.** Leaves, branches, and dictionary blobs are identified by
+a CIDv1 over SHA-256 (`ContentId`) on every storage backend. Because an address
+identifies its content, cached blobs never need invalidation.
 
 ## Layer 2: Scan, decode, and cache
 
 `BinaryCursor` yields `ColumnBatch` values, which are leaflet-at-a-time columnar
-batches. A `ColumnProjection` / `ColumnSet` declares which columns the consumer
-needs, and unrequested columns are not decoded
-([`binary_scan.rs`](../../fluree-db-query/src/binary_scan.rs)).
+batches. A `ColumnProjection` / `ColumnSet`
+([`column_types.rs`](../../fluree-db-binary-index/src/read/column_types.rs))
+declares which columns the consumer needs, and unrequested columns are not
+decoded.
 
 **Late materialization.** When the persisted index is authoritative for decoding,
 scans emit encoded bindings (`EncodedSid`, `EncodedPid`, `EncodedLit`) instead of
@@ -195,42 +230,58 @@ rows that remain.
 **Overlay merging in the cursor.** The cursor skips base rows retracted by the
 overlay, injects overlay assertions, and applies `to_t` before the operator above
 receives a row. Correctness under uncommitted writes and time travel is
-therefore a property of the scan layer and does not need to be reimplemented by
-each operator.
+therefore a property of the scan layer for every operator that reads through the
+cursor. The batched join and cyclic-BGP probes read leaflets directly and
+reconcile novelty through `ProbeOps`, which mirrors the cursor's merge.
 
-Graph scoping is enforced at the same boundary. `BinaryGraphView` is a
-graph-scoped decode handle, so leaflet decoding, predicate dictionaries, and
-specialty arenas cannot read across named graphs.
+Graph scoping is enforced at the same boundary. A graph with a tree of its own
+has its own branch manifests, so a scan reads only that graph's leaves. Small
+named graphs share the pooled tree, and a scan of one filters that tree's rows on
+their graph column. `BinaryGraphView` decodes arena-backed values through the
+graph's arenas.
 
 **Caching.** Decoded leaflet regions and dictionary leaves share one
 frequency-aware memory budget
 ([`LeafletCache`](../../fluree-db-binary-index/src/read/leaflet_cache.rs)), keyed
-by content-addressed leaf identity, the query's effective `t`, and the overlay
-epoch. The budget is split by key hash into one shard per core, each at least
-256 MiB, so cache hits on different cores do not contend on one shared
-structure. Each shard enforces its share at its own housekeeping pass, so
-between passes a burst of inserts can run the pool over budget by more as the
-shard count grows. Remote blobs are fetched through a single-flight disk cache
+by content-addressed leaf identity and leaflet index. Entries hold base columns
+only; overlay merging and time-travel replay run after the cache, so one entry
+serves every `t` and overlay. On encrypted storage, part of the budget is first
+reserved for whole decrypted dictionary packs (`cache_dictionary_max_mb`, 60% by
+default) and for fenced reverse dictionary leaves; each reservation goes back to
+the leaflet pool as far as the data opened cannot use it. The leaflet pool is
+split by key hash into about one shard per core (the core count rounded up to a
+power of two), capped so that each shard holds at least 256 MiB (a small budget
+stays one pool), so cache hits on different cores do not contend on one shared
+structure. Each shard enforces its share at its own housekeeping pass, so between
+passes a burst of inserts can run the pool over budget by more as the shard count
+grows. Remote blobs are fetched through a single-flight disk cache
 ([`disk_cache.rs`](../../fluree-db-core/src/disk_cache.rs)), so concurrent
 requests for the same blob share one fetch.
 
 ## Layer 3: The planner
 
-The entry point is `reorder_patterns` in
-[`planner.rs`](../../fluree-db-query/src/planner.rs), called from
-`build_where_operators_seeded` in
+The entry point is `reorder_patterns_with_seed` in
+[`planner.rs`](../../fluree-db-query/src/planner.rs) (`reorder_patterns` wraps
+it), called from `build_where_operators_seeded_with_needed` in
 [`execute/where_plan.rs`](../../fluree-db-query/src/execute/where_plan.rs).
 
 ### Placement algorithm
 
 Placement is **greedy rather than dynamic-programming**. Patterns are placed one
-at a time, cheapest eligible first, in three priority tiers:
+at a time:
 
-1. **Reducers** first (lowest multiplier): FILTER and MINUS, to shrink the stream early
-2. **Sources** next (lowest estimate): triples, searches, subqueries
-3. **Expanders** last (lowest multiplier): OPTIONAL and UNION, to defer row growth
+- **Sources** (triples, VALUES, UNION, uncorrelated subqueries, GRAPH, property
+  paths, searches, SERVICE) are placed lowest estimate first. Once variables are
+  bound, only sources that join them are candidates, unless none does.
+- **Expanders** (OPTIONAL) are placed after the sources, to defer row growth.
+- **FILTER and BIND** are inserted as soon as the variables they read are bound,
+  so a filter shrinks the stream at the earliest point it can run.
+- **MINUS, EXISTS and NOT EXISTS** keep their position after every pattern
+  written before them, since their result depends on what those bind.
 
-Ties are broken by the pattern's original position, so planning is deterministic.
+When two sources have the same estimate, the planner prefers one that lets a
+pending selective FILTER run, then one that unlocks a larger hash-joinable scan,
+and finally the pattern written first, so planning is deterministic.
 
 Greedy placement keeps planning cost small relative to execution, even for large
 WHERE clauses. Plan quality therefore depends primarily on the estimator rather
@@ -255,12 +306,15 @@ therefore handles specific shapes where generic RDF cardinality estimates are
 known to be inaccurate:
 
 - **Anchored transitive paths.** `<s> <p>+ ?o` enumerates a bounded closure from
-  a fixed node rather than scanning the graph. It is estimated as small, so it
-  drives the join instead of being costed as a join product.
+  a fixed node, or from a node an earlier placement bound, rather than scanning
+  the graph. It is estimated as small, so it drives the join instead of being
+  costed as a full property scan.
 - **Anchored `DISTINCT` subquery producers.** A subquery such as
-  `MATCH (p {id: $x})-[:KNOWS*1..2]-(f) WITH DISTINCT f` is estimated at its
-  projected distinct output rather than its body's join product, which can be
-  larger by several orders of magnitude.
+  `MATCH (p {id: $x})-[:KNOWS*1..2]-(f) WITH DISTINCT f`, one projected variable
+  with a constant anchor in its body, is estimated at a small fixed constant
+  (`DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`) standing in for its distinct output,
+  rather than at its body's join product, which can be larger by several orders
+  of magnitude.
 - **Branches containing only compound patterns.** A chained
   `{A} UNION {B} UNION {C}` nests one UNION inside a branch of another, so that
   branch contains no triples of its own. It takes its member's estimate instead
@@ -273,9 +327,9 @@ that contains the shape, regardless of the surrounding patterns.
 
 ### Pre-planning rewrites
 
-Several rewrites run before `reorder_patterns`, so that ordering and the scan
-layer both operate on a narrower form. Each is a semantic identity under a
-stated condition:
+Several rewrites run around planning, so that ordering and the scan layer both
+operate on a narrower form. Each is a semantic identity under a stated
+condition. All but the VALUES star seeds run before the patterns are reordered:
 
 - **Redundant `rdf:type` elision.** `?s rdf:type <C>` is removed when statistics
   show that every subject of a co-occurring predicate is a `C`
@@ -290,7 +344,8 @@ stated condition:
 - **Selective VALUES seeds for stars.** When predicate statistics predict that a
   small, fully bound object `VALUES` table substantially reduces the work of a
   same-subject star, the star is driven from that table instead of from a scan
-  of its smallest predicate. The ordinary `ValuesOperator` joins are retained, so
+  of its smallest predicate. This is decided when the reordered star is built
+  into operators. The ordinary `ValuesOperator` joins are retained, so
   duplicates, `UNDEF`, and multi-column correlations keep their meaning. The
   thresholds are defined in `where_plan.rs`.
 - **Algebraic aggregate rewrites.**
@@ -306,7 +361,7 @@ stated condition:
 
 Estimator constants are not independent. `DISTINCT_SUBQUERY_PRODUCER_SELECTIVITY`
 also seeds the driving-side estimate for a downstream hash join, so it must stay
-large enough that `probe_count / driving_est` clears `HASH_JOIN_MAX_SCAN_RATIO`.
+large enough that `probe_count / driving_est` stays within `HASH_JOIN_MAX_SCAN_RATIO`.
 Otherwise the planner would choose an order that relies on a hash join the
 hash-join gate then rejects. The test
 `hash_join::tests::producer_seed_clears_scan_ratio_cap` asserts this relationship
@@ -317,36 +372,45 @@ model can be changed without silently invalidating decisions elsewhere.
 
 ### Inspecting plans
 
-Planner decisions are reported by [explain plans](../query/explain.md): the index
-permutation chosen for each scan, whether statistics or fallbacks were used,
-estimated row counts per node, hash-join selection and the reason an alternative
-was rejected, and whether patterns were reordered. EXPLAIN applies the same
-policy gate as execution, so it reports the plan that runs. To compare with the
+Planner decisions are reported by [explain plans](../query/explain.md): the
+planned index hint where the planner sets one (the final permutation is chosen
+when the scan is built and is not shown), whether statistics or fallbacks were
+used, estimated row counts per node, hash-join selection and the reason an
+alternative was rejected, and whether patterns were reordered. Under root policy,
+EXPLAIN plans with the same statistics as execution. Under a non-root policy it
+hides statistics, so the order and estimates it shows are heuristic and can
+differ from the plan that runs. To compare with the
 plan an optimization replaced, use the
 [environment variables that disable optimizer rewrites](../troubleshooting/debugging-queries.md#isolating-an-optimizer-change).
 
 ## Layer 4: Join operators
 
-The default is `NestedLoopJoinOperator`, which probes the right side in batches
-of distinct left-side keys. The planner selects a specialized operator when the
-shape warrants it.
+The default is `NestedLoopJoinOperator`, which binds each left row into the right
+pattern. For a fixed predicate correlated on its subject or its object, and for a
+subject-bound existence check, it batches distinct left-side keys into one probe.
+In the pooled tree only the subject lane batches, and only where the indexed rows
+are the whole answer; other shapes bind row by row.
+The planner selects a specialized operator when the shape warrants it.
 
 **`HashJoinOperator`** ([`hash_join.rs`](../../fluree-db-query/src/hash_join.rs))
 addresses object-to-subject joins between a small selective side and a large
 predicate scan. Driving from the selective side turns the large pattern into a
-right scan with a bound object, which the nested-loop path resolves by seeking
-the object-major OPST index once per distinct driving object. One predicate's
-triples are distributed across the entire OPST keyspace, so this degrades
-superlinearly: approximately 47 s at 100 M triples for approximately 61.8 K
-driving objects. The hash join builds from the small side and probes with a
-single scan of the large predicate's contiguous PSOT/POST partition, which takes
-approximately 75 ms at 100 M triples.
+right scan with a bound object. The nested-loop join answers that from the
+predicate's POST partition, reading each leaf at most once and searching it for
+each driving object. The hash join instead builds a table from the small side and
+probes it with one scan of the large predicate's partition. It is chosen when
+statistics show the probe predicate is no more than `HASH_JOIN_MAX_SCAN_RATIO`
+times the driving side's estimate and has at least 50,000 rows, or at least 1,000
+when the driving side is small (up to 20,000 rows) or medium (up to 250,000, and
+no smaller than the probe).
 
 **`PropertyJoinOperator`** evaluates same-subject multi-predicate stars anchored
 by a bound object or a range filter (`?s a :Person ; :name ?n ; :email ?e`) as a
 single operator rather than a join chain. One scan of the anchor produces the
 subjects, and the remaining predicates are looked up for those subjects only,
-by batched PSOT probes or a single SPOT walk.
+by batched PSOT probes or a single SPOT walk. Where neither applies, such as a
+predicate with a datatype constraint or a query over several ledgers, it falls
+back to a full scan of that predicate.
 
 **`MinusOperator`** builds its exclusion set once in a fresh scope, allowing the
 inner patterns to use ordinary scan and star planning. A single shared encoded
@@ -368,7 +432,7 @@ sets contribute to the query's retained-memory estimate and budget checks.
 
 **`OptionalOperator`** answers a single-triple `OPTIONAL` correlated on one end
 of its triple with a batched probe over the driving side: a PSOT probe when the
-subject comes from the required side (`OPTIONAL { ?s :email ?e }`), an OPST
+subject comes from the required side (`OPTIONAL { ?s :email ?e }`), a POST
 probe over at most 100,000 driving rows at a time when the object does
 (`OPTIONAL { ?c :subjectOf ?s }`), the window the join's own bound-object lane
 uses. A row a probe cannot key, such as a literal or an unbound value, is looked
@@ -404,8 +468,9 @@ is an error. What stays outside the rule:
 an IRI no dictionary holds keeps its decoded form, so its `Sid` and `Iri`
 forms still compare apart. An arena-backed literal (a big number or a vector,
 whose handle names a value within one graph) is never compared or keyed without
-a graph view to decode it: `same_term` refuses with an internal error and the
-key normalizers assert it in debug builds. Member scans of several graphs bind
+a graph view to decode it: `same_term` returns an internal error (and asserts in
+debug builds), and the key normalizers fail with a decode error rather than key
+by handle. Member scans of several graphs bind
 those literals decoded, so no query reaches either.
 
 **`CyclicBgpOperator`** handles small cyclic fixed-predicate BGPs (triangles and
@@ -459,8 +524,10 @@ broadly.
 (`?a p1 ?b . ?b p2 ?c . ?c p3 ?x`) accumulate duplicate rows: once `?a` is no
 longer needed, each distinct `?b` repeats once per `?a`, and each hop multiplies
 the duplication. After computing live-variable sets, the planner inserts
-streaming `DistinctOperator`s between joins, but only when every aggregate is
-duplicate-insensitive or the query is `SELECT DISTINCT`. Conversely, a
+streaming `DistinctOperator`s between joins, but only when the result cannot
+observe row multiplicity: every aggregate is duplicate-insensitive and no other
+variable is read raw, or, without grouping, the query is `SELECT DISTINCT`, an
+`ASK`, or a `CONSTRUCT` without blank-node templates or `LIMIT`/`OFFSET`. Conversely, a
 `DISTINCT` directly beneath a group whose aggregates are all `COUNT(DISTINCT …)`
 is removed, because the aggregate already deduplicates its input.
 
@@ -469,9 +536,12 @@ is removed, because the aggregate already deduplicates its input.
 A set of operators recognizes specific query shapes and answers them by fusing
 scan and aggregation, bypassing the generic operator tree.
 
-Each is built as a `FastPathOperator` that **retains the generic tree as a
-fallback** and returns `Ok(None)` from its `open()`-time closure when its runtime
-preconditions do not hold. A declined fast path costs one precondition check.
+Each **retains the generic tree as a fallback**. Most are built as a
+`FastPathOperator`, which returns `Ok(None)` from its `open()`-time closure when
+its runtime preconditions do not hold; a few, such as the FIRST-header group
+counts and the UNION-star count, are their own operators with the same fallback
+contract. Most decline on a cheap precondition check; a few, such as the
+POST-order `LIMIT` scan, decline only after a bounded amount of work.
 Decisions are emitted as structured tracing events
 ([`fast_path_outcome.rs`](../../fluree-db-query/src/fast_path_outcome.rs)), so
 planned and executed paths can be compared without a lock on the hot path.
@@ -481,7 +551,7 @@ planned and executed paths can be compared without a lock on the hot path.
 | Operator | Shape | Mechanism |
 |---|---|---|
 | [`fast_min_max_string`](../../fluree-db-query/src/fast_min_max_string.rs) | `MIN(?o)` / `MAX(?o)` | POST leaflet boundary keys are the extremes when the leaflet is `o_type`-homogeneous; only leaflets spanning an `o_type` boundary are column-scanned |
-| [`fast_group_count_firsts`](../../fluree-db-query/src/fast_group_count_firsts.rs) | `GROUP BY ?o COUNT(?s) ORDER BY DESC LIMIT k`, and `COUNT` of `?s <p> <o>` | Uncompressed per-leaflet FIRST headers: `FIRST(i)==FIRST(i+1)` shows the leaflet is one `(p,o)` group, which is counted without decoding. Single-datatype predicates skip the `OType` column |
+| [`fast_group_count_firsts`](../../fluree-db-query/src/fast_group_count_firsts.rs) | `GROUP BY ?o COUNT(?s) ORDER BY DESC LIMIT k`, and `COUNT` of `?s <p> <o>` | Uncompressed per-leaflet FIRST headers: `FIRST(i)==FIRST(i+1)` shows the leaflet is one `(p,o)` group, which is counted without decoding. A leaflet whose directory records one `o_type` skips the `OType` column |
 | [`fast_whole_graph_agg`](../../fluree-db-query/src/fast_whole_graph_agg.rs) | Cypher `MATCH (n) RETURN count(n), count(n.age), …` | Replaces the whole-graph distinct-subject scan with directory reads: `count(*) = N + count(P) − subj(P)`, each term computed from the directory |
 
 ### Order-exploiting scans
@@ -490,7 +560,7 @@ planned and executed paths can be compared without a lock on the hot path.
 |---|---|---|
 | [`fast_post_order_limit`](../../fluree-db-query/src/fast_post_order_limit.rs) | `ORDER BY DESC(?o) LIMIT k`, optionally with `?s a <Class>` | POST is ordered `(p_id, o_type, o_key, o_i, s_id)`, so for an order-preserving `o_type` the end of the predicate range holds the top-k. Leaves are read backward, only surviving rows are decoded, and reading stops at `OFFSET+LIMIT`. Separate base and overlay-merging variants |
 | [`fast_string_fold`](../../fluree-db-query/src/fast_string_fold.rs) | `COUNT(*)` with `REGEX`/`CONTAINS`; `SUM(STRLEN(?o))` and variants | POST places equal strings adjacently, so the function is evaluated once per distinct value (`O(distinct)` rather than `O(rows)`), reading the dictionary in ascending ID order |
-| [`fast_string_prefix_count_all`](../../fluree-db-query/src/fast_string_prefix_count_all.rs) | `COUNT(*)` with `REGEX(?o,"^pfx")` / `STRSTARTS` | String IDs are assigned in lexical order, so a prefix maps to contiguous dictionary ID ranges and bounded OPST slices instead of a full partition scan |
+| [`fast_string_prefix_count_all`](../../fluree-db-query/src/fast_string_prefix_count_all.rs) | `COUNT(*)` with `REGEX(?o,"^pfx")` / `STRSTARTS` | Where string IDs are in lexical order (a bulk-imported index, until it is first reindexed), a prefix maps to contiguous dictionary ID ranges and bounded OPST slices instead of a full partition scan; elsewhere, or with unindexed novelty, it declines |
 | [`fast_star_const_order_topk`](../../fluree-db-query/src/fast_star_const_order_topk.rs) | Constant-object star + numeric filter + label `ORDER BY … LIMIT` | Intersects OPST subject lists for each constant constraint, applies the numeric filter to those subjects only, and fetches labels for the remaining rows |
 
 ### Fused aggregates
@@ -511,11 +581,10 @@ planned and executed paths can be compared without a lock on the hot path.
 [`count_plan.rs`](../../fluree-db-query/src/count_plan.rs) and
 [`count_plan_exec.rs`](../../fluree-db-query/src/count_plan_exec.rs) generalize
 the per-shape `detect_*`/`fast_*` pairs into a single planner that analyzes the
-WHERE join graph and composes a count-only plan. Its IR enforces **key domain
-safety** (subject vs. object keys) and **output kind safety** (scalar vs. stream
-vs. key set) in the type system, so invalid compositions, such as anti-joining a
-subject stream against an object key set, fail to compile rather than producing
-incorrect results.
+WHERE join graph and composes a count-only plan. Its IR gives each **output
+kind** (scalar, stream, key set) its own type, so a stream cannot be used where a
+key set is expected. **Key domains** (subject vs. object keys) are a planner
+invariant documented on each node; the type checker does not enforce them.
 
 New count optimizations are added to this planner in preference to new
 per-shape detectors.
@@ -562,8 +631,8 @@ A single shared pool avoids oversubscribing cores under concurrent load, which
 per-query pools would cause. Partial results are combined in chunk order, so a
 parallel aggregate is bit-identical to its serial equivalent.
 
-**Write and index side.** Dictionary building, leaf rebuilds, incremental branch
-merges, and spatial index construction are parallelized
+**Write and index side.** Dictionary building, the per-order index builds, and
+incremental branch merges are parallelized
 ([`fluree-db-indexer`](../../fluree-db-indexer/)). Bulk import exceeds 2 M
 facts per second.
 
@@ -576,13 +645,18 @@ fast path runs its scan/join pipeline on one core. See
 Commits are written to an in-memory **novelty** overlay and are durable
 immediately; they do not wait for index maintenance. Background indexing is
 threshold-driven (`reindex-min-bytes` as a soft trigger, `reindex-max-bytes` for
-backpressure). It resolves only the commits in the novelty window and merges them
-into the affected leaf blobs **copy-on-write**, leaving the rest of the index
-unchanged, and publishes the new root atomically. See
+backpressure). Normally it resolves only the commits in the novelty window and
+merges them into the affected leaf blobs **copy-on-write**, leaving the rest of
+the index unchanged, and publishes the new root atomically. The pooled tree's
+graph-last orders instead append the window as a delta run, which a compaction
+later folds in. It falls back to a full rebuild when there is no prior index,
+when the published index is of an earlier format, when the window spans more
+than `incremental_max_commits` commits (10,000 by default), or when the
+incremental pass fails with a retryable error. See
 [Background indexing](../indexing-and-search/background-indexing.md).
 
-Because unchanged blobs are reused by address, a reindex rewrites only what
-changed and existing cache entries remain valid.
+Because an incremental reindex reuses unchanged blobs by address, it rewrites
+only what changed and existing cache entries remain valid.
 
 Queries merge the indexed base with novelty at scan time (Layer 2), so results
 are complete regardless of indexing lag.
@@ -601,8 +675,7 @@ The benefit is lower index build time and storage, with two fewer permutations
 to write on every reindex.
 
 **Undatatyped plain strings do not use the OPST preference.** A constant object
-written as a bare JSON-LD string, or a Cypher property-map value, carries no
-datatype constraint: it matches its text under any string datatype or language
+written as a bare JSON-LD string carries no datatype constraint: it matches its text under any string datatype or language
 tag, so `(o_type, o_key)` may not be encodable when the scan opens.
 `BinaryScanOperator` does not force OPST in that case, because doing so could
 produce a wide scan rather than a bounded one. A SPARQL string constant carries
@@ -618,7 +691,8 @@ A range whose string parses as a date or other temporal also seeks those
 temporal slices, since `<` and `>` order a string against a temporal value.
 
 **General operator trees are single-threaded.** Intra-query parallelism is
-limited to the fast paths and the count planner. A complex analytical join that
+limited to the fast paths, the count planner, cyclic-BGP edge loading, and R2RML
+graph-source materialization. A complex analytical join that
 does not use a fast path runs on one core. This is the largest remaining
 opportunity for improvement in the engine, and the area where engines with
 general intra-query parallelism can outperform Fluree on specific workloads.
@@ -652,32 +726,40 @@ index to be authoritative, so scans over a ledger with unindexed novelty decode
 values eagerly, and every scan performs the overlay merge. Below approximately
 10 unindexed transactions the overhead is negligible; above approximately 100 it
 is measurable in both latency and memory. Monitor `commit_t − index_t`; a lag
-above approximately 50 indicates that indexing is not keeping up and
-`reindex-min-bytes` should be lowered.
+above approximately 50 indicates that indexing is not keeping up. At the default
+`reindex-min-bytes` (100 bytes) a reindex already starts after essentially every
+commit, so lowering it helps only where it has been raised; otherwise indexing
+throughput is the limit, and `reindex-max-bytes` bounds novelty through
+backpressure.
 
 **Unanchored closures are computed but not optimized.** A property path with
 both endpoints unbound (`?s <p>+ ?o`) materializes the predicate's full
 transitive closure in memory, and composite paths (`?s (<a>/<b>)+ ?o`) run a
-separate traversal from every possible start node. Paths with one endpoint bound
-use the frontier path (Layer 6). Bind an endpoint where the query allows it.
+separate traversal from every possible start node. A non-composite path with one
+endpoint bound uses the frontier path (Layer 6) when it reads one graph of one
+ledger without a non-root policy; composite paths and the other cases traverse
+node by node, still from the bound endpoint but more slowly. Bind an endpoint
+where the query allows it.
 
-**Fast paths have preconditions.** Most require single-ledger execution, no
-`from_t`, root or no policy, and `to_t` at or after the persisted index point.
-Time travel to a point before the index requires the history sidecar and uses
-the generic pipeline, as do policy-enforced queries. The generic pipeline
-returns the same results, without the fast-path speedup.
+**Fast paths have preconditions.** All require single-ledger execution, no
+`from_t`, and a graph with index trees of its own; a small named graph in the
+pooled tree takes the generic pipeline. Most require root or no policy; single-predicate fast paths also run
+under a policy that provably does not cover their predicate. Fast paths that
+read only the index directory need a current index, with no unindexed novelty.
+Cursor-based ones tolerate novelty, and the count planner and `+`-path counts
+also answer a `to_t` before the index point by replaying the history sidecar.
+Where a precondition fails, the generic pipeline returns the same results,
+without the fast-path speedup.
 
 ## Reproducing the benchmarks
 
-The materials needed to run the comparisons are in
+The materials needed to reproduce these results are in
 [github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db):
 
 - pinned datasets at `s3://fluree-benchmark-data/`
-- per-engine setup guides in `common/engine-setup/`
+- the Fluree setup guide, `common/engine-setup/fluree.md`
 - a generic SPARQL runner, `common/run_benchmark.sh`
-- full per-engine results and run metadata in `benchmarks/*/reports/`
-
-Competitor configurations are included so that their tuning can be reviewed.
+- full results and run metadata in `benchmarks/*/reports/`
 
 ## Where this lives in code
 

@@ -3862,10 +3862,9 @@ fn build_scan_or_join_with(
 
             // For object→subject "path" joins, build a hash table from the small
             // (left/driving) side and probe a single contiguous scan of the large
-            // predicate, instead of the per-driving-row OPST object seek that degrades
-            // superlinearly at scale. The planner owns the shape + cost decision; we
-            // compute the annotated decision once, apply `chosen`, and stash it on the
-            // chosen operator so EXPLAIN can report why.
+            // predicate, instead of one probe per driving object. The planner owns
+            // the shape + cost decision; we compute the annotated decision once, apply
+            // `chosen`, and stash it on the chosen operator so EXPLAIN can report why.
             let decision = hash_planner.explain_object_hash_join(
                 &left_schema,
                 tp,

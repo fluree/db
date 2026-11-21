@@ -295,6 +295,7 @@ fn reverse_dict_incremental_only_rewrites_affected_leaf_and_lookups_still_work()
         &existing_branch,
         &new_entries,
         target_leaf_bytes,
+        fluree_db_binary_index::dict::reverse_leaf::LeafFormat::Plain,
         &mut fetch_leaf,
     )
     .expect("update_reverse_tree");

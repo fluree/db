@@ -509,15 +509,19 @@ impl<'a> TermDicts<'a> {
         self.novel_subjects?.find_subject(ns_code, name)
     }
 
-    /// The string-dictionary id of `value`, persisted first, then novelty.
+    /// The string-dictionary id of `value`, novelty first, then persisted.
     /// `None` also when the dictionary cannot be read.
+    ///
+    /// The novelty dictionary holds only strings the persisted one doesn't,
+    /// so the order changes no answer; a novelty string skips the persisted
+    /// lookup, which for a long string hashes it to probe for a key the tree
+    /// can't hold.
     #[inline]
     fn string_id(&self, value: &str) -> Option<u32> {
-        match self.store.find_string_id(value) {
-            Ok(Some(str_id)) => Some(str_id),
-            Ok(None) => self.novel_strings?.find_string(value),
-            Err(_) => None,
+        if let Some(str_id) = self.novel_strings.and_then(|n| n.find_string(value)) {
+            return Some(str_id);
         }
+        self.store.find_string_id(value).ok().flatten()
     }
 
     /// [`IriId`] of persisted predicate `p_id`'s IRI.

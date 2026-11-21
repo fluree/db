@@ -134,10 +134,6 @@ fn logical_node(
             );
             "source"
         }
-        PatternEstimate::Reducer { multiplier } => {
-            node.insert("estimate".into(), json!({ "multiplier": multiplier }));
-            "reducer"
-        }
         PatternEstimate::Expander { multiplier } => {
             node.insert("estimate".into(), json!({ "multiplier": multiplier }));
             "expander"
@@ -729,7 +725,8 @@ pub(crate) fn explain_sparql_for_view(
     params: Option<&fluree_db_sparql::ParamMap>,
     allow_semantic_elision: bool,
 ) -> Result<JsonValue> {
-    let (vars, parsed) = parse_sparql_to_ir(sparql, snapshot, default_context, params, false)?;
+    let (vars, parsed) =
+        parse_sparql_to_ir(None, sparql, snapshot, default_context, params, false)?;
 
     explain_from_parsed(
         snapshot,

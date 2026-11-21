@@ -1235,8 +1235,7 @@ impl BinaryIndexStore {
             }
         }
         if let Some(tree) = self.dicts.string_reverse_tree.as_ref() {
-            // String reverse keys are the raw UTF-8 value bytes (see
-            // `find_string_id`).
+            // The tree keys the values by its own scheme.
             let keys: Vec<&[u8]> = strings.map(str::as_bytes).collect();
             for address in tree.touched_leaf_addresses(keys.iter().copied()) {
                 if let Some(cid) = tree.leaf_cid(address) {
@@ -2736,9 +2735,17 @@ impl BinaryIndexStore {
         }
     }
 
-    fn find_full_iri_subject_fallback(&self, iri: &str) -> io::Result<Option<(u16, u64)>> {
+    /// `missed`, when given, is a key already looked up and not found: it is
+    /// not looked up again.
+    fn find_full_iri_subject_fallback(
+        &self,
+        iri: &str,
+        missed: Option<(u16, &str)>,
+    ) -> io::Result<Option<(u16, u64)>> {
         for ns_code in [namespaces::EMPTY, namespaces::OVERFLOW] {
-            if !self.dicts.subject_forward_packs.contains_key(&ns_code) {
+            if missed == Some((ns_code, iri))
+                || !self.dicts.subject_forward_packs.contains_key(&ns_code)
+            {
                 continue;
             }
             if let Some(s_id) = self.reverse_lookup_subject_key(ns_code, iri.as_bytes())? {
@@ -2754,16 +2761,40 @@ impl BinaryIndexStore {
     /// If not, it only consults full-IRI subject namespaces that are actually
     /// present in the persisted dictionaries.
     pub fn find_subject_id(&self, iri: &str) -> io::Result<Option<u64>> {
+        self.find_subject_id_skipping(iri, None)
+    }
+
+    /// [`Self::find_subject_id`] once [`Self::find_subject_id_by_parts`] has
+    /// missed for `(ns_code, name)`, the parts of a `Sid` naming `iri`. Under
+    /// canonical encoding the IRI's split is usually those parts, and a second
+    /// lookup of that key would search the same leaf for it again, so it is
+    /// skipped; every other key the IRI could be stored under is tried.
+    pub fn find_subject_id_after_parts_miss(
+        &self,
+        ns_code: u16,
+        name: &str,
+        iri: &str,
+    ) -> io::Result<Option<u64>> {
+        self.find_subject_id_skipping(iri, Some((ns_code, name)))
+    }
+
+    fn find_subject_id_skipping(
+        &self,
+        iri: &str,
+        missed: Option<(u16, &str)>,
+    ) -> io::Result<Option<u64>> {
         let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
         if let Some(&ns_code) = self.dicts.namespace_reverse.get(canonical_prefix) {
-            if let Some(s_id) =
-                self.reverse_lookup_subject_key(ns_code, canonical_suffix.as_bytes())?
-            {
-                return Ok(Some(s_id));
+            if missed != Some((ns_code, canonical_suffix)) {
+                if let Some(s_id) =
+                    self.reverse_lookup_subject_key(ns_code, canonical_suffix.as_bytes())?
+                {
+                    return Ok(Some(s_id));
+                }
             }
         }
         Ok(self
-            .find_full_iri_subject_fallback(iri)?
+            .find_full_iri_subject_fallback(iri, missed)?
             .map(|(_ns_code, s_id)| s_id))
     }
 
@@ -2779,7 +2810,7 @@ impl BinaryIndexStore {
             }
         }
         Ok(self
-            .find_full_iri_subject_fallback(iri)?
+            .find_full_iri_subject_fallback(iri, None)?
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
     }
 
@@ -3392,6 +3423,15 @@ impl BinaryIndexStore {
             .map_or(0, |tree| tree.leaf_lookups())
     }
 
+    /// String value → id lookups since load that searched a dictionary leaf.
+    #[cfg(feature = "test-counters")]
+    pub fn string_reverse_leaf_lookups(&self) -> u64 {
+        self.dicts
+            .string_reverse_tree
+            .as_ref()
+            .map_or(0, |tree| tree.leaf_lookups())
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
@@ -3465,24 +3505,50 @@ impl BinaryIndexStore {
         }
     }
 
-    /// Find all string IDs whose value starts with `prefix`.
+    /// How the string reverse tree keys values, if there is one.
+    pub fn string_key_rules(&self) -> Option<crate::dict::key_scheme::KeyRules<'_>> {
+        self.dicts
+            .string_reverse_tree
+            .as_ref()
+            .map(|tree| tree.key_rules())
+    }
+
+    /// Find all string IDs whose value starts with `prefix`, in no
+    /// particular order.
     ///
-    /// Uses a range scan on the reverse string tree over the key range
-    /// `[prefix, prefix || 0xFF)`. (0xFF sorts after all valid UTF-8 bytes.)
+    /// Range-scans the reverse string tree over the key ranges its scheme
+    /// gives for the prefix; a hashed key matching only the first part of a
+    /// long prefix is checked against its value, of which a group holds at
+    /// most a few (see [`KeyScheme`]).
+    ///
+    /// [`KeyScheme`]: crate::dict::key_scheme::KeyScheme
     pub fn find_strings_by_prefix(&self, prefix: &str) -> io::Result<Vec<u32>> {
-        match &self.dicts.string_reverse_tree {
-            Some(tree) => {
-                let start_key = prefix.as_bytes();
-                let mut end_key = prefix.as_bytes().to_vec();
-                end_key.push(0xFF);
-                let entries = tree.reverse_range_scan(start_key, &end_key)?;
-                Ok(entries
-                    .into_iter()
-                    .filter_map(|(_, id)| u32::try_from(id).ok())
-                    .collect())
+        let Some(tree) = &self.dicts.string_reverse_tree else {
+            return Ok(Vec::new());
+        };
+        let mut ids = Vec::new();
+        for range in tree.key_rules().prefix_ranges(prefix.as_bytes()) {
+            // An open range ends just past the tree's last key.
+            let end = range.end.unwrap_or_else(|| {
+                let mut end = tree
+                    .branch()
+                    .leaves
+                    .last()
+                    .map(|leaf| leaf.last_key.clone())
+                    .unwrap_or_default();
+                end.push(0);
+                end
+            });
+            for (_, id) in tree.reverse_range_scan(&range.start, &end)? {
+                let Ok(id) = u32::try_from(id) else {
+                    continue;
+                };
+                if !range.check || self.resolve_string_value(id)?.starts_with(prefix) {
+                    ids.push(id);
+                }
             }
-            None => Ok(Vec::new()),
         }
+        Ok(ids)
     }
 
     /// Number of predicates in the persisted dictionary.
@@ -7906,6 +7972,77 @@ pub(crate) mod tests {
         assert_eq!(
             store.find_subject_sid(full_iri).unwrap(),
             Some(Sid::new(namespaces::OVERFLOW, full_iri))
+        );
+    }
+
+    /// After a by-parts miss, the IRI's other keys are tried and the one that
+    /// missed is not: a subject stored whole, or under the IRI's split, is
+    /// still found, and the split that just missed is not searched again.
+    #[cfg(feature = "test-counters")]
+    #[test]
+    fn a_lookup_after_a_parts_miss_skips_the_key_that_missed() {
+        use crate::dict::reverse_leaf::subject_reverse_key;
+        const EX: u16 = 100;
+        let prefix = "https://example.org/";
+        let whole = "https://example.org/whole";
+        let split = "https://example.org/split";
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()));
+        store.set_ns_split_mode(NsSplitMode::MostGranular);
+        store.dicts_mut().namespace_codes = Arc::new(HashMap::from([(EX, prefix.to_string())]));
+        store.dicts_mut().namespace_reverse = Arc::new(HashMap::from([(prefix.to_string(), EX)]));
+        let whole_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
+        let split_id = SubjectId::new(EX, 8).as_u64();
+        let mut entries = vec![
+            ReverseEntry {
+                key: subject_reverse_key(namespaces::OVERFLOW, whole.as_bytes()),
+                id: whole_id,
+            },
+            ReverseEntry {
+                key: subject_reverse_key(EX, b"split"),
+                id: split_id,
+            },
+        ];
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        store.dicts_mut().subject_reverse_tree = Some(Arc::new(build_reverse_reader(entries)));
+        store.dicts_mut().subject_forward_packs.insert(
+            namespaces::OVERFLOW,
+            ForwardPackReader::from_memory(vec![Arc::from(
+                make_subject_pack_bytes(&[(7, whole.as_bytes())]).into_boxed_slice(),
+            )])
+            .unwrap(),
+        );
+
+        let lookups = |f: &dyn Fn() -> Option<u64>| {
+            let before = store.subject_reverse_leaf_lookups();
+            let found = f();
+            (found, store.subject_reverse_leaf_lookups() - before)
+        };
+        // The split missed: only the whole-IRI key is left, and it is absent.
+        // (Both keys sort inside the tree, so each reaches a leaf.)
+        let absent = "https://example.org/unknown";
+        assert_eq!(
+            lookups(&|| store
+                .find_subject_id_after_parts_miss(EX, "unknown", absent)
+                .unwrap()),
+            (None, 1)
+        );
+        assert_eq!(
+            lookups(&|| store.find_subject_id(absent).unwrap()),
+            (None, 2)
+        );
+        // Stored whole: found after the split misses.
+        assert_eq!(
+            lookups(&|| store
+                .find_subject_id_after_parts_miss(EX, "whole", whole)
+                .unwrap()),
+            (Some(whole_id), 1)
+        );
+        // The whole IRI missed: the split is still tried, and finds it.
+        assert_eq!(
+            lookups(&|| store
+                .find_subject_id_after_parts_miss(namespaces::OVERFLOW, split, split)
+                .unwrap()),
+            (Some(split_id), 1)
         );
     }
 

@@ -1415,12 +1415,23 @@ impl BinaryScanOperator {
             _ if known_s_id.is_some() => known_s_id,
             (Ref::Iri(iri), _) => store.find_subject_id(iri)?,
             (Ref::Sid(query_sid), Some(sid)) => {
-                if let Some(s_id) = sid_iri::sid_to_store_s_id(store, sid)? {
+                if let Some(s_id) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name)? {
                     Some(s_id)
-                } else if let Some(iri) = snapshot.decode_sid(query_sid) {
-                    store.find_subject_id(&iri)?
                 } else {
-                    None
+                    // The store's namespace table is a subset of the
+                    // snapshot's, so the two decode `sid` alike; the
+                    // snapshot's is for a code minted after the index.
+                    match store
+                        .sid_to_iri(sid)
+                        .or_else(|| snapshot.decode_sid(query_sid))
+                    {
+                        Some(iri) => store.find_subject_id_after_parts_miss(
+                            sid.namespace_code,
+                            &sid.name,
+                            &iri,
+                        )?,
+                        None => None,
+                    }
                 }
             }
             _ => None,
@@ -2882,8 +2893,20 @@ impl Operator for BinaryScanOperator {
         // an upsert-only path: `join.rs` and `optional.rs` rebind a correlated
         // subject to `Ref::Iri` per driving row, so every non-batched probe for a
         // missing subject paid it.
+        //
+        // What the filter has looked up and missed is not looked up again: an
+        // IRI it looked up whole, or the parts of `s_sid`.
         if let Some(target_iri) = self.unresolved_bound_subject_iri.clone() {
-            match store_ref.find_subject_id(&target_iri) {
+            let found = match (&self.pattern.s, s_sid.as_ref()) {
+                (Ref::Iri(_), _) => Ok(None),
+                (_, Some(sid)) => store_ref.find_subject_id_after_parts_miss(
+                    sid.namespace_code,
+                    &sid.name,
+                    &target_iri,
+                ),
+                _ => store_ref.find_subject_id(&target_iri),
+            };
+            match found {
                 Ok(Some(s_id)) => {
                     filter.s_id = Some(s_id);
                     self.unresolved_bound_subject_iri = None;
@@ -4486,24 +4509,24 @@ pub(crate) fn resolve_subject_v3(
     ))
 }
 
-/// Resolve a string value to a string_id using persisted dict then DictNovelty.
-/// Look up `value`'s string-dict id across the persisted and novelty dicts.
+/// Look up `value`'s string-dict id across the novelty and persisted dicts.
 ///
 /// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
 /// allocation, so callers on hot paths (every novelty duration flake) pay
 /// nothing to distinguish it. `Err` is a real dict/mmap I/O error propagated
 /// verbatim from `find_string_id`, so a corrupt dictionary surfaces as an error
 /// instead of being conflated with a miss.
+///
+/// DictNovelty first: it holds only strings the persisted tree doesn't, so
+/// the order changes no answer, and a novelty string, which overlay
+/// translation meets once per novelty flake, skips the persisted lookup
+/// (for a long string, a hash and a probe for a key the tree can't hold).
 fn find_string_id_v3(
     value: &str,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<Option<u32>> {
-    // 1. Persisted
-    if let Some(id) = store.find_string_id(value)? {
-        return Ok(Some(id));
-    }
-    // 2. DictNovelty
+    // 1. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
             if let Some(id) = dn.strings.find_string(value) {
@@ -4511,7 +4534,8 @@ fn find_string_id_v3(
             }
         }
     }
-    Ok(None)
+    // 2. Persisted
+    store.find_string_id(value)
 }
 
 /// [`find_string_id_v3`] for callers that treat "not in dict" as an error,

@@ -182,9 +182,9 @@ pub use commit_transfer::{
     PushCommitsResponse, PushedHead, RestoreResult, StagedPush, ERASURES_NEEDED,
 };
 pub use dataset::{
-    sparql_dataset_ledger_ids, sparql_dataset_ledgers, sparql_has_dataset_clause,
-    DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource, TimeSpec,
-    ACCEPTED_TIME_SPEC_SPELLINGS,
+    parsed_sparql_dataset_ledgers, sparql_dataset_ledger_ids, sparql_dataset_ledgers,
+    sparql_has_dataset_clause, DatasetParseError, DatasetSpec, GovernanceOptions, GraphSource,
+    TimeSpec, ACCEPTED_TIME_SPEC_SPELLINGS,
 };
 pub use error::{ApiError, BuilderError, BuilderErrors, Result, TargetTally};
 pub use fluree_db_core::ledger_id::format_ledger_id;
@@ -253,7 +253,7 @@ pub use policy_view::{
 pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
-pub use query::helpers::sparql_pragma_tracking;
+pub use query::helpers::{sparql_pragma_tracking, SharedSparqlParse, SparqlParse};
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::result_cache::{
     jsonld_requests_result_cache, ResultCacheOutcome, ResultCacheStatus,

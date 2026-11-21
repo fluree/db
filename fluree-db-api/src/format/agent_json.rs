@@ -157,7 +157,18 @@ fn truncation_resume_and_message(
     let mut resume = None;
 
     if let Some(ref ctx) = config.agent_json_context {
-        if ctx.from_count <= 1 {
+        if ctx.binds_params {
+            let pin = match (ctx.from_count, t, ctx.iso_timestamp.as_deref()) {
+                (1, Some(t), _) => format!(", @t:{t} on its FROM clause,"),
+                (n, _, Some(iso)) if n > 1 => format!(", @time:{iso} on each FROM clause,"),
+                _ => String::new(),
+            };
+            msg.push_str(&format!(
+                " To retrieve the next batch, re-send this query with the same variable \
+                 bindings{pin} and add OFFSET {row_count} LIMIT {}.",
+                ctx.resume_limit
+            ));
+        } else if ctx.from_count <= 1 {
             if let (Some(ref sparql), Some(t)) = (&ctx.sparql_text, t) {
                 if let Some(q) = generate_resume_query(sparql, t, row_count, ctx.resume_limit) {
                     msg = format!(
@@ -749,8 +760,45 @@ mod tests {
             from_count: 1,
             iso_timestamp: Some("2026-03-26T14:30:00Z".to_string()),
             resume_limit: 100,
+            binds_params: false,
         });
         assert_parity(&r, &config);
+    }
+
+    /// A resume query is the request's text with a pinned `t` and a new
+    /// `OFFSET`; it cannot carry the request's variable bindings, so a bound
+    /// request gets none and is told to re-send them.
+    #[test]
+    fn truncated_bound_request_gets_no_resume_query() {
+        let context = |binds_params| {
+            let mut config = super::super::config::FormatterConfig::agent_json();
+            config.agent_json_context = Some(super::super::config::AgentJsonContext {
+                sparql_text: Some("SELECT ?s FROM <mydb:main> WHERE { ?s ?p ?c }".to_string()),
+                from_count: 1,
+                iso_timestamp: Some("2026-03-26T14:30:00Z".to_string()),
+                resume_limit: 100,
+                binds_params,
+            });
+            config
+        };
+
+        let (resume, _) =
+            truncation_resume_and_message(&context(false), Some(7), 20, 50, Some(600));
+        assert_eq!(
+            resume.as_deref(),
+            Some("SELECT ?s FROM <mydb:main@t:7> WHERE { ?s ?p ?c } OFFSET 20 LIMIT 100")
+        );
+
+        let (resume, msg) =
+            truncation_resume_and_message(&context(true), Some(7), 20, 50, Some(600));
+        assert_eq!(resume, None);
+        assert!(
+            msg.contains(
+                "re-send this query with the same variable bindings, @t:7 on its FROM clause, \
+                 and add OFFSET 20 LIMIT 100"
+            ),
+            "{msg}"
+        );
     }
 
     #[test]

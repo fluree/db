@@ -1319,7 +1319,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
+            let ast = execution.parse_sparql(sparql, None)?;
             let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1422,7 +1422,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
+                let ast = execution.parse_sparql(sparql, None)?;
                 let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
                 if let Some(alias) = spec
                     .default_graphs
@@ -1493,7 +1493,7 @@ impl<'a> FromQueryBuilder<'a> {
                     execution.clone(),
                 )
                 .await?;
-            let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
+            let ast = execution.parse_sparql(sparql, None)?;
             let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
             return if let Some(alias) = spec
                 .default_graphs
@@ -1595,7 +1595,7 @@ impl<'a> FromQueryBuilder<'a> {
                         }
                     },
                 };
-                let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
+                let ast = execution.parse_sparql(sparql, None)?;
                 let spec = crate::query::helpers::connection_sparql_dataset_spec(&ast, &execution)?;
                 if let Some(alias) = spec
                     .default_graphs

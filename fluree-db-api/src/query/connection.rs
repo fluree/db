@@ -281,7 +281,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = options.parse_sparql(sparql, None)?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -711,6 +711,18 @@ impl Fluree {
         sparql: &str,
         opts: &GovernanceOptions,
     ) -> Result<JsonValue> {
+        self.explain_connection_sparql_with_opts_and_params(sparql, opts, None)
+            .await
+    }
+
+    /// [`Self::explain_connection_sparql_with_opts`] with `params` substituted,
+    /// as [`QueryExecutionOptions::with_params`] would run the query.
+    pub async fn explain_connection_sparql_with_opts_and_params(
+        &self,
+        sparql: &str,
+        opts: &GovernanceOptions,
+        params: Option<&fluree_db_sparql::ParamMap>,
+    ) -> Result<JsonValue> {
         let ast = parse_and_validate_sparql(sparql, None)?;
         let spec = extract_sparql_dataset_spec(&ast)?;
 
@@ -727,7 +739,7 @@ impl Fluree {
             ));
         };
 
-        self.explain_sparql(&view, sparql).await
+        self.explain_sparql_with_params(&view, sparql, params).await
     }
 
     /// Execute a SPARQL query via connection (dataset specified via SPARQL `FROM` / `FROM NAMED`).
@@ -744,7 +756,7 @@ impl Fluree {
         sparql: &str,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = options.parse_sparql(sparql, None)?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -764,7 +776,7 @@ impl Fluree {
         policy: &PolicyContext,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = options.parse_sparql(sparql, None)?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -797,7 +809,7 @@ impl Fluree {
         r2rml: Option<crate::R2rmlProviders<'_>>,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = options.parse_sparql(sparql, None)?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -833,7 +845,7 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = options.parse_sparql(sparql, None)?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -888,7 +900,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None)
+        let ast = options
+            .parse_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
         let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
@@ -951,7 +964,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None)
+        let ast = options
+            .parse_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
         let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
@@ -997,7 +1011,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None)
+        let ast = options
+            .parse_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
         let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
@@ -1045,7 +1060,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None)
+        let ast = options
+            .parse_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
         let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
@@ -1102,7 +1118,8 @@ impl Fluree {
         let floor = tracked_query_tracker(&input, &tracking_override, None);
         charge_query_floor(&floor)
             .map_err(|e| crate::query::TrackedErrorResponse::fuel_exceeded(&e, floor.tally()))?;
-        let ast = parse_and_validate_sparql(sparql, None)
+        let ast = options
+            .parse_sparql(sparql, None)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
         let spec = connection_sparql_dataset_spec(&ast, &options)
             .map_err(|e| crate::query::TrackedErrorResponse::from_api(e, floor.tally()))?;
@@ -1177,4 +1194,60 @@ fn apply_policy_to_dataset(mut dataset: DataSetDb, policy: &PolicyContext) -> Da
         .collect();
 
     dataset
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::query::helpers::{reset_sparql_parse_count, sparql_parse_count};
+    use crate::{FlureeBuilder, GovernanceOptions, QueryExecutionOptions, SparqlParse};
+    use std::sync::Arc;
+
+    const SPARQL: &str = "SELECT ?s FROM <handoff/conn:main> WHERE { ?s ?p ?o }";
+
+    fn handed_off() -> QueryExecutionOptions {
+        QueryExecutionOptions::default().with_sparql_parse(Arc::new(SparqlParse::new(SPARQL)))
+    }
+
+    /// The tracked connection query and the stream dataset build read the
+    /// request's handed-over parse rather than parsing its text again.
+    #[tokio::test]
+    async fn connection_sparql_paths_read_the_handed_off_parse() {
+        let fluree = FlureeBuilder::memory().build_memory();
+        fluree.create_ledger("handoff/conn").await.unwrap();
+
+        let options = handed_off();
+        reset_sparql_parse_count();
+        fluree
+            .query_connection_sparql_tracked_with_options(SPARQL, None, None, options)
+            .await
+            .unwrap_or_else(|e| panic!("tracked query: {e:?}"));
+        assert_eq!(sparql_parse_count(), 0, "the tracked query parsed again");
+
+        // Bindings substitute into a copy of the handed-off parse: still none.
+        let mut params = fluree_db_sparql::ParamMap::new();
+        params.insert("o".into(), serde_json::json!({"@id": "http://ex.org/a"}));
+        let options = handed_off().with_params(params);
+        reset_sparql_parse_count();
+        fluree
+            .query_connection_sparql_tracked_with_options(SPARQL, None, None, options)
+            .await
+            .unwrap_or_else(|e| panic!("bound tracked query: {e:?}"));
+        assert_eq!(sparql_parse_count(), 0, "the bound query parsed again");
+
+        let options = handed_off();
+        reset_sparql_parse_count();
+        fluree
+            .build_stream_dataset_for_sparql_with_options(
+                SPARQL,
+                &GovernanceOptions::default(),
+                &options,
+            )
+            .await
+            .expect("stream dataset");
+        assert_eq!(
+            sparql_parse_count(),
+            0,
+            "the stream dataset build parsed again"
+        );
+    }
 }

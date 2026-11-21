@@ -4003,7 +4003,7 @@ pub fn subject_ref_to_s_id(
             }
             if let Some(iri) = snapshot.decode_sid(sid).or_else(|| store.sid_to_iri(sid)) {
                 Ok(store
-                    .find_subject_id(&iri)
+                    .find_subject_id_after_parts_miss(sid.namespace_code, &sid.name, &iri)
                     .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?)
             } else {
                 Ok(None)
@@ -4199,7 +4199,19 @@ pub fn empty_batch(schema: Arc<[VarId]>) -> Result<Batch> {
 /// Resolve a bound predicate `Ref` to its binary-index predicate ID (`u32`).
 ///
 /// Uses `ExecutionContext` to decode `Sid` variants. Returns an error for `Ref::Var`.
-pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref) -> Result<u32> {
+/// `None` when the index has never seen the predicate: a fast path reading the
+/// index at its own `t` with no novelty then has no rows for it.
+///
+/// That answer is complete only where the index answers alone, as
+/// [`fast_path_store`] requires. A caller on a gate that tolerates novelty, or
+/// reads at a `t` other than the index's, would answer no rows for a
+/// predicate whose rows are all in novelty, so a miss there is refused, in
+/// release builds as well.
+pub fn ref_to_p_id(
+    ctx: &ExecutionContext<'_>,
+    store: &BinaryIndexStore,
+    r: &Ref,
+) -> Result<Option<u32>> {
     let iri: Arc<str> = match r {
         Ref::Sid(sid) => ctx
             .decode_sid(sid)
@@ -4212,9 +4224,13 @@ pub fn ref_to_p_id(ctx: &ExecutionContext<'_>, store: &BinaryIndexStore, r: &Ref
             ))
         }
     };
-    store.find_predicate_id(iri.as_ref()).ok_or_else(|| {
-        QueryError::execution(format!("predicate not found in binary index dict: {iri}"))
-    })
+    match store.find_predicate_id(iri.as_ref()) {
+        Some(p_id) => Ok(Some(p_id)),
+        None if overlay_has_novelty(ctx) || ctx.to_t != store.max_t() => Err(QueryError::Internal(
+            format!("{iri} is not in the index, and the index does not answer alone here"),
+        )),
+        None => Ok(None),
+    }
 }
 
 /// Resolve a bound `Term` (IRI or Sid) to its internal subject ID (`u64`).

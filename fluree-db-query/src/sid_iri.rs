@@ -15,7 +15,7 @@ pub(crate) fn sid_to_store_s_id(store: &BinaryIndexStore, sid: &Sid) -> io::Resu
         return Ok(Some(s_id));
     }
     match store.sid_to_iri(sid) {
-        Some(iri) => store.find_subject_id(&iri),
+        Some(iri) => store.find_subject_id_after_parts_miss(sid.namespace_code, &sid.name, &iri),
         None => Ok(None),
     }
 }
