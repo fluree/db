@@ -422,6 +422,10 @@ A merge or revert reads what such a commit deleted from its branch's index. Whil
 
 A commit written against an index that keeps subtypes deletes the one term it names. An incremental index build over a commit that deletes by value builds the index in full instead, since only a replay from the first commit knows what that commit deleted.
 
+#### A SPARQL constant of any integer subtype names its value (breaking)
+
+A typed constant of an XSD integer subtype is the number it spells, under that subtype: `{ ?s ex:n "5"^^xsd:short }` finds a stored `"5"^^xsd:short`, and `"18446744073709551615"^^xsd:unsignedLong` finds that term. Earlier releases read every subtype but `xsd:integer`, `xsd:int` and `xsd:long` as a string, which matched nothing. A constant outside its subtype's range, such as `"70000"^^xsd:short`, `"-1"^^xsd:unsignedLong` or `"5000000000"^^xsd:int`, is refused as a write refuses it; `xsd:int` used to accept any 64-bit value.
+
 #### JSON-LD reads `@base` as JSON-LD 1.1 does, and a type's scoped context stops at nested nodes (breaking)
 
 A relative `@id` or reference in JSON-LD resolves against `@base` by RFC 3986, as one in Turtle already did; it used to be joined to `@base` as a string. A base ending in `/` resolves as before. Otherwise the result differs:
