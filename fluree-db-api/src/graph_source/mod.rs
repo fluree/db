@@ -371,6 +371,9 @@ mod delta_catalog;
 pub use delta::{DeltaAzureFields, DeltaCreateConfig, DeltaCreateResult, DeltaUnityFields};
 
 #[cfg(feature = "delta")]
+pub(crate) use delta::info_table_counts as delta_info_table_counts;
+
+#[cfg(feature = "delta")]
 pub use delta_catalog::{
     DeltaColumnInfo, DeltaTableAccess, DeltaTablePreview, GenerateDeltaR2rmlRequest,
     GenerateDeltaR2rmlResponse,

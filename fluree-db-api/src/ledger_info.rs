@@ -2031,7 +2031,7 @@ pub fn build_virtual_ledger_info(
 
 /// Thin (redacted) metadata view of a graph-source record. Routes the config
 /// through [`redact_graph_source_config`] so no secret can leak; the historical
-/// `/info` stub shape for sources that are not virtual R2RML/Iceberg datasets
+/// `/info` stub shape for sources that are not virtual R2RML/Iceberg/Delta datasets
 /// (BM25 / Vector / Geo / Unknown).
 pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue {
     let mut obj = json!({
@@ -2070,8 +2070,9 @@ pub fn build_generic_graph_source_info(record: &GraphSourceRecord) -> JsonValue 
 /// entirely from the compiled R2RML mapping and Iceberg table **metadata**
 /// (row counts from the `loadTable` snapshot summary, else the snapshot's
 /// manifest list: metadata-only, NEVER a manifest or Parquet/data scan) — and
-/// NEVER includes auth/credentials. Other graph-source types get the
-/// thin (redacted) record view.
+/// NEVER includes auth/credentials. `Delta` sources get the same shape, their
+/// counts read from each table's Delta log (see `build_delta_virtual_info`).
+/// Other graph-source types get the thin (redacted) record view.
 ///
 /// This is the single shared builder behind the db-server `/info` route, the
 /// `LedgerInfoBuilder::execute` path (MCP `get_data_model`), and — by extension —
@@ -2092,8 +2093,89 @@ pub async fn build_graph_source_info(
                 Ok(build_generic_graph_source_info(record))
             }
         }
+        GraphSourceType::Delta => {
+            #[cfg(feature = "delta")]
+            {
+                build_delta_virtual_info(fluree, record).await
+            }
+            #[cfg(not(feature = "delta"))]
+            {
+                let _ = fluree;
+                Ok(build_generic_graph_source_info(record))
+            }
+        }
         _ => Ok(build_generic_graph_source_info(record)),
     }
+}
+
+/// [`build_graph_source_info`] for a Delta source: the same virtual shape as an
+/// Iceberg source's. Classes and properties come from the mapping alone and
+/// never wait on the tables. Each table's latest version and row count are
+/// read from its Delta log under the same budget
+/// (`FLUREE_ICEBERG_INFO_COUNT_BUDGET_MS`), and a table that cannot be read in
+/// time, or at all, loses only its count. The first table's version, in table
+/// order, is the dataset's `t`, as an Iceberg source reports its first table's
+/// snapshot.
+///
+/// A Delta table reports no key and its schema is not taken to prove columns
+/// non-null, so no table carries column facts: every class and property count
+/// is `null`, with `count-upper-bound` its tables' row counts when all are
+/// known.
+#[cfg(feature = "delta")]
+async fn build_delta_virtual_info(
+    fluree: &crate::Fluree,
+    record: &GraphSourceRecord,
+) -> crate::Result<JsonValue> {
+    use fluree_db_query::r2rml::R2rmlProvider;
+
+    let provider = crate::graph_source::FlureeR2rmlProvider::new(fluree);
+    let mapping = provider
+        .compiled_mapping(&record.graph_source_id, None)
+        .await
+        .ok();
+    let mut meta = VirtualSourceMeta {
+        source_type: graph_source_type_label(&record.source_type),
+        ..Default::default()
+    };
+    if let Ok(cfg) = fluree_db_delta::DeltaGsConfig::from_json(&record.config) {
+        meta.model = cfg.model.clone();
+        meta.default_allow = cfg.default_allow;
+        match &cfg.unity {
+            Some(unity) => {
+                meta.catalog_type = Some("unity".to_string());
+                meta.catalog_uri = Some(unity.uri.clone());
+            }
+            None => meta.table_location = cfg.root.clone(),
+        }
+    }
+    let mut tables: Vec<String> = mapping
+        .as_deref()
+        .map(mapping_source_tables)
+        .unwrap_or_default();
+    tables.sort();
+    tables.dedup();
+    meta.tables = tables.clone();
+
+    let budget_ms = info_count_budget_ms();
+    let fetched = if budget_ms > 0 {
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(budget_ms);
+        let per_table = crate::graph_source::delta_info_table_counts(
+            fluree,
+            record,
+            &tables,
+            deadline,
+            INFO_COUNT_FETCH_CONCURRENCY,
+        )
+        .await
+        .into_iter()
+        .map(|table| table.map(|(name, rows, version)| (name, rows, version, false, None)))
+        .collect();
+        VirtualTableCounts::collect(per_table)
+    } else {
+        VirtualTableCounts::default()
+    };
+    meta.snapshot_id = fetched.snapshot_id;
+    Ok(build_virtual_ledger_info(record, mapping.as_deref(), &meta, &fetched.counts).into_json())
 }
 
 /// Max in-flight per-table `loadTable` fetches for the virtual `/info` row-count

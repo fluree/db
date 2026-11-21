@@ -116,6 +116,20 @@ impl DeltaError {
             _ => false,
         }
     }
+
+    /// Kernel's refusal of a build for being told, or not told, the version
+    /// a catalog ratified: the table's catalog management is not what the
+    /// build assumed.
+    pub(crate) fn is_max_catalog_version(&self) -> bool {
+        fn is(error: &delta_kernel::Error) -> bool {
+            match error {
+                delta_kernel::Error::MaxCatalogVersion(_) => true,
+                delta_kernel::Error::Backtraced { source, .. } => is(source),
+                _ => false,
+            }
+        }
+        matches!(self, Self::Kernel { source, .. } if is(source))
+    }
 }
 
 /// Why the change data feed cannot serve a range, when that is what a failure
