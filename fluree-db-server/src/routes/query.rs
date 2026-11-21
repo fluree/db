@@ -830,7 +830,7 @@ pub async fn query(
         // agent-json and plain paths both need the AST, the advisory header is
         // derived from the same parse rather than a third one, and each
         // execution below is handed it rather than parsing again.
-        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
         let warn_headers = sparql_dataset_warning_headers(parsed.ast());
 
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
@@ -3582,7 +3582,7 @@ async fn execute_sparql_ledger(
         let span = tracing::Span::current();
         // One parse for routing below and for execution: each execution
         // option set hands it to the run.
-        let parsed = fluree_db_api::parse_sparql_shared(sparql);
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(sparql));
         let execution = || {
             params
                 .bind(query_execution_options(state).with_rdf_list_view(headers.rdf_list_view))

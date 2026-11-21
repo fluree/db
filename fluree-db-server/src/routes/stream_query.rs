@@ -142,7 +142,7 @@ async fn stream_query_connection_inner(
         // nothing here would otherwise look at the clause — leaving the one
         // surface whose caller is least likely to notice a short result set as
         // the only silent one.
-        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
         warn_headers = crate::routes::query::sparql_dataset_warning_headers(parsed.ast());
 
         // The auth-layer-verified identity gates `f:overrideControl` on the
@@ -301,7 +301,7 @@ async fn stream_query_inner(
         }
         // One parse for the dataset-clause check below and for planning,
         // which is handed it.
-        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
+        let parsed = Arc::new(fluree_db_api::SparqlParse::new(&sparql));
         // Resolve identity + policy the same way /query's SPARQL path does:
         // SPARQL has no body `opts`, so policy arrives via the resolved identity
         // (bearer/header), the server default policy class, and the

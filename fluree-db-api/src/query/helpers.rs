@@ -696,11 +696,6 @@ impl SparqlParse {
     }
 }
 
-/// [`SparqlParse::new`], shared between a request's routing and its run.
-pub fn parse_sparql_shared(sparql: &str) -> SharedSparqlParse {
-    Arc::new(SparqlParse::new(sparql))
-}
-
 /// Parse a SPARQL query. Return an error if the parser produced any
 /// error-severity diagnostic, even when error recovery still produced an AST.
 pub(crate) fn parse_sparql_strict(sparql: &str) -> Result<fluree_db_sparql::SparqlAst> {
