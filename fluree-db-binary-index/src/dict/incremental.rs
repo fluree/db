@@ -16,6 +16,7 @@
 //! old (real) and new (`pending:hash`) addresses — caller finalizes via
 //! [`super::builder::finalize_branch`] after CAS upload.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
@@ -523,6 +524,34 @@ impl GroupPlan {
         leaves
     }
 
+    /// Key `values`, new to `branch`, for an update of it: list in
+    /// `branch.raw_groups` each group the write would take past the cap,
+    /// counting what it holds in `leaves` (each leaf [`Self::leaves`] names,
+    /// once), then key every value by the branch's rules, in key order. Two
+    /// values sharing a key are refused.
+    pub fn key<'l>(
+        self,
+        branch: &mut DictBranch,
+        leaves: impl IntoIterator<Item = &'l [u8]>,
+        mut values: Vec<ReverseEntry>,
+    ) -> io::Result<Vec<ReverseEntry>> {
+        self.fill(&mut branch.raw_groups, leaves)?;
+        let rules = branch.keys();
+        for entry in &mut values {
+            if let Cow::Owned(key) = rules.key(&entry.key) {
+                entry.key = key;
+            }
+        }
+        values.sort_by(|a, b| a.key.cmp(&b.key));
+        if values.windows(2).any(|w| w[0].key == w[1].key) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "two new values share a reverse-tree key",
+            ));
+        }
+        Ok(values)
+    }
+
     /// List in `raw` each group that would pass the cap, counting what it
     /// holds in `leaves`: each leaf [`Self::leaves`] names, once.
     pub fn fill<'l>(
@@ -547,6 +576,27 @@ impl GroupPlan {
         }
         Ok(())
     }
+}
+
+/// The keys to remove `values` from a tree keyed by `rules` under: every key
+/// a lookup of each would try, in key order, each once.
+pub fn removal_keys(
+    rules: KeyRules<'_>,
+    values: impl IntoIterator<Item = Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    for value in values {
+        if !rules.scheme.reorders() {
+            keys.push(value);
+            continue;
+        }
+        let found = rules.lookup_keys(&value);
+        keys.extend(found.then);
+        keys.push(found.first.into_owned());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 // ============================================================================
@@ -1438,47 +1488,36 @@ mod tests {
         }
 
         fn add(&mut self, values: &[(String, u64)]) {
-            let mut raw = self.branch.raw_groups.clone();
-            let plan = GroupPlan::new(self.branch.keys(), values.iter().map(|(v, _)| v.as_bytes()));
+            let values: Vec<ReverseEntry> = values
+                .iter()
+                .map(|(v, id)| ReverseEntry {
+                    key: v.as_bytes().to_vec(),
+                    id: *id,
+                })
+                .collect();
+            let plan = GroupPlan::new(self.branch.keys(), values.iter().map(|e| e.key.as_slice()));
             let held: Vec<Vec<u8>> = plan
                 .leaves(&self.branch)
                 .into_iter()
                 .map(|i| self.leaf(i).unwrap())
                 .collect();
-            plan.fill(&mut raw, held.iter().map(Vec::as_slice)).unwrap();
-            let rules = KeyRules {
-                scheme: self.branch.key_scheme,
-                raw: &raw,
-            };
-            let mut entries: Vec<ReverseEntry> = values
-                .iter()
-                .map(|(v, id)| ReverseEntry {
-                    key: rules.key(v.as_bytes()).into_owned(),
-                    id: *id,
+            let mut branch = self.branch.clone();
+            let entries = plan
+                .key(&mut branch, held.iter().map(Vec::as_slice), values)
+                .unwrap();
+            let result =
+                update_reverse_tree(&branch, &entries, Self::TARGET, Self::FORMAT, &mut |i| {
+                    self.leaf(i)
                 })
-                .collect();
-            entries.sort_by(|a, b| a.key.cmp(&b.key));
-            let mut result = update_reverse_tree(
-                &self.branch,
-                &entries,
-                Self::TARGET,
-                Self::FORMAT,
-                &mut |i| self.leaf(i),
-            )
-            .unwrap();
-            result.branch.raw_groups = raw;
+                .unwrap();
             self.apply(result);
         }
 
         fn remove(&mut self, values: &[&String]) {
-            let rules = self.branch.keys();
-            let mut keys: Vec<Vec<u8>> = Vec::new();
-            for v in values {
-                let found = rules.lookup_keys(v.as_bytes());
-                keys.push(found.first.into_owned());
-                keys.extend(found.then);
-            }
-            keys.sort();
+            let keys = removal_keys(
+                self.branch.keys(),
+                values.iter().map(|v| v.as_bytes().to_vec()),
+            );
             let result =
                 remove_from_reverse_tree(&self.branch, &keys, Self::FORMAT, &mut |i| self.leaf(i))
                     .unwrap();

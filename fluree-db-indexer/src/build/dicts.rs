@@ -156,8 +156,8 @@ async fn upload_incremental_reverse_tree_core(
     warm_cache: Option<&LeafletCache>,
     remove: bool,
 ) -> Result<UpdatedReverseTree> {
-    use fluree_db_binary_index::dict::incremental::GroupPlan;
-    use fluree_db_binary_index::dict::key_scheme::{KeyRules, KeyScheme};
+    use fluree_db_binary_index::dict::incremental::{removal_keys, GroupPlan};
+    use fluree_db_binary_index::dict::key_scheme::KeyScheme;
     use fluree_db_binary_index::dict::reverse_leaf::{LeafFormat, ReverseEntry};
 
     let kind = ContentKind::DictBlob { dict };
@@ -175,7 +175,6 @@ async fn upload_incremental_reverse_tree_core(
     }
     let scheme = existing_branch.key_scheme;
     let format = LeafFormat::for_tree(dict, scheme);
-    let mut raw_groups = existing_branch.raw_groups.clone();
     let mut prefetched: std::collections::HashMap<usize, Vec<u8>> =
         std::collections::HashMap::new();
     let fetch = |idx: usize| {
@@ -191,46 +190,27 @@ async fn upload_incremental_reverse_tree_core(
                 .map_err(|e| IndexerError::StorageRead(format!("fetch reverse leaf: {e}")))
         }
     };
-    if scheme.reorders() {
-        if remove {
-            // A value is held under one of the keys a lookup would try.
-            let rules = existing_branch.keys();
-            let mut keys = Vec::with_capacity(entries.len());
-            for entry in &entries {
-                let found = rules.lookup_keys(&entry.key);
-                keys.extend(found.then.map(|key| ReverseEntry { key, id: 0 }));
-                keys.push(ReverseEntry {
-                    key: found.first.into_owned(),
-                    id: 0,
-                });
-            }
-            entries = keys;
-            entries.sort_by(|a, b| a.key.cmp(&b.key));
-            entries.dedup_by(|a, b| a.key == b.key);
-        } else {
-            let plan = GroupPlan::new(
-                existing_branch.keys(),
-                entries.iter().map(|e| e.key.as_slice()),
-            );
-            for idx in plan.leaves(&existing_branch) {
-                prefetched.insert(idx, fetch(idx).await?);
-            }
-            plan.fill(&mut raw_groups, prefetched.values().map(Vec::as_slice))
-                .map_err(|e| IndexerError::StorageRead(format!("count hashed keys: {e}")))?;
-            let rules = KeyRules {
-                scheme,
-                raw: &raw_groups,
-            };
-            for entry in &mut entries {
-                entry.key = rules.key(&entry.key).into_owned();
-            }
-            entries.sort_by(|a, b| a.key.cmp(&b.key));
-            if entries.windows(2).any(|w| w[0].key == w[1].key) {
-                return Err(IndexerError::StorageWrite(format!(
-                    "two new {dict:?} values share a reverse-tree key"
-                )));
-            }
+    if remove {
+        // A value is held under one of the keys a lookup would try.
+        entries = removal_keys(existing_branch.keys(), entries.into_iter().map(|e| e.key))
+            .into_iter()
+            .map(|key| ReverseEntry { key, id: 0 })
+            .collect();
+    } else if scheme.reorders() {
+        let plan = GroupPlan::new(
+            existing_branch.keys(),
+            entries.iter().map(|e| e.key.as_slice()),
+        );
+        for idx in plan.leaves(&existing_branch) {
+            prefetched.insert(idx, fetch(idx).await?);
         }
+        entries = plan
+            .key(
+                &mut existing_branch,
+                prefetched.values().map(Vec::as_slice),
+                entries,
+            )
+            .map_err(|e| IndexerError::StorageWrite(format!("key new {dict:?} values: {e}")))?;
     }
 
     // 2. Build address→CID map for existing leaves.
@@ -252,7 +232,7 @@ async fn upload_incremental_reverse_tree_core(
 
     // 4. CPU-bound CoW update in spawn_blocking.
     let existing_branch_owned = existing_branch;
-    let mut tree_result = tokio::task::spawn_blocking(move || {
+    let tree_result = tokio::task::spawn_blocking(move || {
         let mut fetch_leaf = |idx: usize| -> std::result::Result<Vec<u8>, std::io::Error> {
             prefetched
                 .remove(&idx)
@@ -279,7 +259,6 @@ async fn upload_incremental_reverse_tree_core(
     .await
     .map_err(|e| IndexerError::from_join("reverse tree task", e))?
     .map_err(|e| IndexerError::StorageWrite(format!("incremental reverse tree: {e}")))?;
-    tree_result.branch.raw_groups = raw_groups;
 
     // 5. Async upload new leaf artifacts.
     //
