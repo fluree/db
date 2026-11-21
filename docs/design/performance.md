@@ -2,8 +2,8 @@
 
 Fluree is a temporal, verifiable graph database with triple-level access control,
 reasoning, and integrated search. Systems with this feature set are commonly
-expected to trade speed for capability. In the published benchmarks below,
-Fluree outperforms engines that provide none of these features.
+expected to trade speed for capability; the benchmark results below show where
+Fluree stands.
 
 This document describes the design decisions behind that performance, with links
 into the code. It also describes the trade-offs Fluree makes and its current
@@ -11,59 +11,59 @@ limits; see [Limits and deliberate trade-offs](#limits-and-deliberate-trade-offs
 
 ## Measured results
 
-Head-to-head benchmarks against other engines are maintained in a separate
-repository: **[github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db)**.
-Each comparison runs every engine on the same instance type, dataset and query set,
-and can be reproduced from pinned S3 snapshots. The figures below are for Fluree
-v4.2.8 (WGPB: v4.2.7), measured in November 2026. Each report records the other
-engines' versions and measurement dates.
+Benchmark reports are maintained in a separate repository,
+**[github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db)**. Each
+report records its hardware, dataset, query set and configuration, and can be
+reproduced from pinned S3 snapshots. The figures below are for Fluree v4.2.8,
+measured in November 2026, except WGPB, which was measured with v4.2.7.
+Comparisons with other engines are summarized in the
+[README](../../README.md#performance).
 
-**SPARQLoscope on DBLP-core** (561 M triples, 105 queries, m7a.4xlarge 16c/64 GB):
-
-| | Fluree | QLever | Virtuoso | MillenniumDB | Jena | Oxigraph | Blazegraph |
-|---|---|---|---|---|---|---|---|
-| Queries passed | 105/105 | 105/105 | 103/105 | 103/105 | 34/105 | 39/105 | 3/105 |
-| Geo mean | **16.1 ms** | 202.4 ms (12.6×) | 299.7 ms (18.6×) | 1,664 ms (103×) | 67.7 s | 87.0 s | 332.9 s |
-| Median (passed) | **25.1 ms** | 310.3 ms (12.3×) | 326.0 ms (13.0×) | 3,894 ms (155×) | 4.5 s | 5.1 s | 23.2 s |
-
-The geometric mean is SPARQLoscope's P=2 aggregate, in which a failed query counts
-as twice the 180-second timeout.
+**SPARQLoscope on DBLP-core** (561 M triples, 105 queries, m7a.4xlarge 16c/64 GB,
+180-second timeout): all 105 queries complete, with a 16.1 ms geometric mean and
+a 25.1 ms median.
 
 **SPARQLoscope on Wikidata-truthy** (8.18 B triples, 105 queries,
-r7a.16xlarge 64c/512 GB): Fluree completes all 105 queries with a 270.9 ms
-geometric mean. QLever, the next engine, is 14.1× slower and completes 91.
+r7a.16xlarge 64c/512 GB, 300-second timeout): all 105 queries complete, with a
+270.9 ms geometric mean and an 823.6 ms median.
+
+No query fails in either run, so SPARQLoscope's P=2 aggregate, which counts a
+failed query as twice the timeout, equals the plain geometric mean.
 
 **WGPB** (full Wikidata dump, 21.1 B distinct triples, 850 basic graph pattern
-queries, r7a.8xlarge 32c/256 GB): 850/850 passed, 14.4 ms geometric mean,
-10.2 ms median.
+queries, r7a.8xlarge 32c/256 GB): all 850 queries complete, with a 14.4 ms
+geometric mean and a 10.2 ms median.
 
-**Pokec / openCypher** (Memgraph's benchgraph suite, m7a.4xlarge 16c/64 GB).
-Geometric means of per-query medians at the largest scale, 1.6 M nodes and
-30.6 M edges:
+**Pokec / openCypher** (the benchgraph suite, m7a.4xlarge 16c/64 GB). Geometric
+means of per-query medians, at three graph sizes:
 
-| | Fluree | Memgraph | Neo4j | FalkorDB |
-|---|---|---|---|---|
-| Durable writes (8 queries) | **2.54 ms** | 5.45 ms | 6.70 ms | 4.94 ms |
-| Reads (27 queries) | **1.81 ms** | 7.22 ms | 10.41 ms | 6.01 ms |
+| Nodes / edges | Durable writes (8 queries) | Reads (27 queries) |
+|---|---|---|
+| 10 K / 122 K | 2.63 ms | 0.71 ms |
+| 100 K / 1.77 M | 2.40 ms | 1.29 ms |
+| 1.63 M / 30.6 M | 2.54 ms | 1.81 ms |
 
-Every engine commits each write durably, as syscall traces in the report confirm.
-Fluree has the lowest read and write means at all three measured scales. The
-Memgraph and FalkorDB configurations keep the graph in memory; Fluree and Neo4j
-store it on disk.
+Each write is committed durably before it is acknowledged, as syscall traces in
+the report confirm. Write latency stays between 2.4 and 2.7 ms while the edge
+count grows 250-fold.
 
-**BSBM** (Berlin SPARQL Benchmark, throughput at 1 M, 100 M and 200 M triples,
-m7a.4xlarge database with a separate m7a.2xlarge driver): Fluree has the highest
-validated throughput in every multi-client comparison with QLever and Virtuoso. On
-the SELECT-only Explore mix, its peak is 11.4× Virtuoso's and 86× QLever's at
-1 M triples, and 4.5× and 20× at 100 M, where it reaches 796,932 query mixes per
-hour with 32 clients. Single-client results are closer, and one favors another
-engine: at 200 M triples QLever is 59% faster on the Business Intelligence mix.
-With writes acknowledged only after fsync, Fluree's Explore-and-Update throughput
-at 1 M triples is 2.7× Virtuoso's with one client and 3.5× at peak.
+**BSBM** (Berlin SPARQL Benchmark, m7a.4xlarge database with a separate
+m7a.2xlarge driver). Peak throughput, in query mixes per hour:
+
+| Mix | 1 M triples | 100 M | 200 M |
+|---|---|---|---|
+| Explore (25 queries) | 4,518,756 | 774,093 | 492,762 |
+| Explore, SELECT only (20 queries) | 5,034,353 | 796,932 | 497,843 |
+| Business Intelligence (15 queries) | 81,635 | 697.0 | 328.6 |
+
+Explore throughput scales to 32 clients and plateaus there. In the
+Explore-and-Update mix, where each write is fsynced before it is acknowledged,
+throughput at 1 M triples peaks at 88,464 query mixes per hour, or 737 mixed
+operations per second, with 16 clients.
 
 > The internal criterion benchmarks documented in
 > [BENCHMARKING.md](../../BENCHMARKING.md) serve a different purpose: they detect
-> per-PR regressions and do not compare Fluree with other engines.
+> regressions from one pull request to the next.
 
 ## Summary
 
@@ -729,15 +729,13 @@ without the fast-path speedup.
 
 ## Reproducing the benchmarks
 
-The materials needed to run the comparisons are in
+The materials needed to reproduce these results are in
 [github.com/fluree/benchmark-db](https://github.com/fluree/benchmark-db):
 
 - pinned datasets at `s3://fluree-benchmark-data/`
-- per-engine setup guides in `common/engine-setup/`
+- the Fluree setup guide, `common/engine-setup/fluree.md`
 - a generic SPARQL runner, `common/run_benchmark.sh`
-- full per-engine results and run metadata in `benchmarks/*/reports/`
-
-Competitor configurations are included so that their tuning can be reviewed.
+- full results and run metadata in `benchmarks/*/reports/`
 
 ## Where this lives in code
 
