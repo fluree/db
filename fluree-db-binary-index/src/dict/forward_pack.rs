@@ -1926,6 +1926,54 @@ mod tests {
         }
     }
 
+    /// Every symbol of every table a pack holds, as bytes.
+    fn symbols(bytes: &[u8]) -> Vec<Vec<u8>> {
+        let meta = parse_pack_meta(bytes).unwrap();
+        meta.codecs
+            .runs
+            .iter()
+            .filter_map(|(_, table)| table.as_ref())
+            .flat_map(|table| {
+                (0..table.len as usize).map(|i| {
+                    table.symbols[i].to_u64().to_le_bytes()[..table.lengths[i] as usize].to_vec()
+                })
+            })
+            .collect()
+    }
+
+    /// Erasure re-encodes the pack, so its table is trained without the
+    /// erased value: a symbol only that value spelled goes with it. The pack
+    /// is small enough that training sees every value, and only the erased
+    /// value uses these letters.
+    #[test]
+    fn blanking_retrains_the_table_without_the_erased_value() {
+        let mut entries = text_entries(0, 40);
+        let erased = entries[3].0;
+        entries[3].1 = "QZXJWVKQ".repeat(200).into_bytes();
+        let spells_it = |symbol: &Vec<u8>| symbol.iter().any(|b| b"QZXJWVK".contains(b));
+        assert!(entries
+            .iter()
+            .filter(|(id, _)| *id != erased)
+            .all(|(_, v)| !v.iter().any(|b| b"QZXJWVK".contains(b))));
+
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        assert!(ForwardPack::from_bytes(&bytes).unwrap().is_coded());
+        assert!(
+            symbols(&bytes).iter().any(spells_it),
+            "the table learned it"
+        );
+
+        let blanked = blank_forward_entries(&bytes, &[erased], 4096).unwrap();
+        let pack = ForwardPack::from_bytes(&blanked).unwrap();
+        assert!(pack.is_coded());
+        assert!(!symbols(&blanked).iter().any(spells_it), "and forgot it");
+        assert!(!blanked.windows(8).any(|w| w == b"QZXJWVKQ"));
+        for (id, value) in &entries {
+            let expected: &[u8] = if *id == erased { &[] } else { value };
+            assert_eq!(pack.lookup(*id).unwrap().as_deref(), Some(expected), "{id}");
+        }
+    }
+
     #[test]
     fn a_bad_codec_section_is_refused() {
         let entries = text_entries(0, 1_000);
