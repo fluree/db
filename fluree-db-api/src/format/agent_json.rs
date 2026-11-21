@@ -164,8 +164,8 @@ fn truncation_resume_and_message(
                 _ => String::new(),
             };
             msg.push_str(&format!(
-                " To retrieve the next batch, re-send this query with the same params{pin} \
-                 and add OFFSET {row_count} LIMIT {}.",
+                " To retrieve the next batch, re-send this query with the same variable \
+                 bindings{pin} and add OFFSET {row_count} LIMIT {}.",
                 ctx.resume_limit
             ));
         } else if ctx.from_count <= 1 {
@@ -764,8 +764,8 @@ mod tests {
     }
 
     /// A resume query is the request's text with a pinned `t` and a new
-    /// `OFFSET`; it cannot carry the request's `params`, so a bound request
-    /// gets none and is told to re-send its `params`.
+    /// `OFFSET`; it cannot carry the request's variable bindings, so a bound
+    /// request gets none and is told to re-send them.
     #[test]
     fn truncated_bound_request_gets_no_resume_query() {
         let context = |binds_params| {
@@ -791,7 +791,10 @@ mod tests {
             truncation_resume_and_message(&context(true), Some(7), 20, 50, Some(600));
         assert_eq!(resume, None);
         assert!(
-            msg.contains("re-send this query with the same params, @t:7 on its FROM clause, and add OFFSET 20 LIMIT 100"),
+            msg.contains(
+                "re-send this query with the same variable bindings, @t:7 on its FROM clause, \
+                 and add OFFSET 20 LIMIT 100"
+            ),
             "{msg}"
         );
     }

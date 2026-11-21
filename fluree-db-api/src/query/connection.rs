@@ -1223,6 +1223,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("tracked query: {e:?}"));
         assert_eq!(sparql_parse_count(), 0, "the tracked query parsed again");
 
+        // Bindings substitute into a copy of the handed-off parse: still none.
+        let mut params = fluree_db_sparql::ParamMap::new();
+        params.insert("o".into(), serde_json::json!({"@id": "http://ex.org/a"}));
+        let options = handed_off().with_params(params);
+        reset_sparql_parse_count();
+        fluree
+            .query_connection_sparql_tracked_with_options(SPARQL, None, None, options)
+            .await
+            .unwrap_or_else(|e| panic!("bound tracked query: {e:?}"));
+        assert_eq!(sparql_parse_count(), 0, "the bound query parsed again");
+
         let options = handed_off();
         reset_sparql_parse_count();
         fluree

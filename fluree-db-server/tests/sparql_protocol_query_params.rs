@@ -1,7 +1,7 @@
-//! SPARQL query parameters over HTTP: `params`, a JSON object binding
-//! variables to values for one request, read from the URL or a form-encoded
-//! body on every SPARQL query route — ledger (each response lane), connection,
-//! explain and stream.
+//! SPARQL query parameters over HTTP: one `$name=<RDF term>` parameter per
+//! variable (the convention other SPARQL servers share), binding it for one
+//! request, read from the URL or a form-encoded body on every SPARQL query
+//! route — ledger (each response lane), connection, explain and stream.
 //!
 //! A route that dropped `params` would leave the variable unbound and widen
 //! the match rather than fail, so each one is pinned here.
@@ -99,33 +99,38 @@ fn ledger_path() -> String {
     format!("/v1/fluree/query/{LEDGER}")
 }
 
-/// `GET {path}?query=…&params=…`.
+/// `$name=<term>` pairs, form- or URL-encoded (`$` as `%24`, as clients send it).
+fn bindings(pairs: &[(&str, &str)]) -> String {
+    pairs
+        .iter()
+        .map(|(name, term)| format!("{}={}", enc(&format!("${name}")), enc(term)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// `GET {path}?query=…&$name=…`.
 async fn get_with_params(
     app: &axum::Router,
     path: &str,
     sparql: &str,
-    params: &str,
+    params: &[(&str, &str)],
 ) -> (StatusCode, JsonValue) {
     send(
         app,
         Request::builder()
             .method("GET")
-            .uri(format!(
-                "{path}?query={}&params={}",
-                enc(sparql),
-                enc(params)
-            ))
+            .uri(format!("{path}?query={}&{}", enc(sparql), bindings(params)))
             .body(Body::empty())
             .unwrap(),
     )
     .await
 }
 
-/// `POST {path}?params=…` with the query as an `application/sparql-query` body.
-fn direct_post(path: &str, sparql: &str, params: &str) -> Request<Body> {
+/// `POST {path}?$name=…` with the query as an `application/sparql-query` body.
+fn direct_post(path: &str, sparql: &str, params: &[(&str, &str)]) -> Request<Body> {
     Request::builder()
         .method("POST")
-        .uri(format!("{path}?params={}", enc(params)))
+        .uri(format!("{path}?{}", bindings(params)))
         .header("content-type", "application/sparql-query")
         .body(Body::from(sparql.to_string()))
         .unwrap()
@@ -170,7 +175,7 @@ fn values(json: &JsonValue, var: &str) -> Vec<String> {
 async fn get_binds_a_literal_parameter() {
     let (_tmp, app) = seeded_app().await;
 
-    let (status, json) = get_with_params(&app, &ledger_path(), BY_NAME, r#"{"n": "B"}"#).await;
+    let (status, json) = get_with_params(&app, &ledger_path(), BY_NAME, &[("n", r#""B""#)]).await;
 
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(values(&json, "s"), [S2], "{json}");
@@ -184,7 +189,7 @@ async fn get_binds_an_iri_parameter() {
         &app,
         &ledger_path(),
         BY_SUBJECT,
-        r#"{"s": {"@id": "http://ex.org/s3"}}"#,
+        &[("s", "<http://ex.org/s3>")],
     )
     .await;
 
@@ -199,7 +204,7 @@ async fn form_encoded_post_takes_params_from_the_body() {
     let (status, json) = post_form(
         &app,
         &ledger_path(),
-        format!("query={}&params={}", enc(BY_NAME), enc(r#"{"n": "A"}"#)),
+        format!("query={}&{}", enc(BY_NAME), bindings(&[("n", r#""A""#)])),
     )
     .await;
 
@@ -211,10 +216,87 @@ async fn form_encoded_post_takes_params_from_the_body() {
 async fn direct_post_takes_params_from_the_url() {
     let (_tmp, app) = seeded_app().await;
 
-    let (status, json) = send(&app, direct_post(&ledger_path(), BY_NAME, r#"{"n": "B"}"#)).await;
+    let (status, json) = send(
+        &app,
+        direct_post(&ledger_path(), BY_NAME, &[("n", r#""B""#)]),
+    )
+    .await;
 
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(values(&json, "s"), [S2], "{json}");
+}
+
+/// Clients send `$` raw or as `%24`; both name the binding.
+#[tokio::test]
+async fn a_raw_dollar_in_the_url_names_the_binding() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, json) = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!(
+                "{}?query={}&$n={}",
+                ledger_path(),
+                enc(BY_NAME),
+                enc(r#""C""#)
+            ))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(values(&json, "s"), [S3], "{json}");
+}
+
+/// A number matches its stored value, written bare or as a typed literal,
+/// and keeps the datatype it would have written in the query: `30` is an
+/// `xsd:integer`, `1.5` an `xsd:decimal`, `1.5e0` an `xsd:double`.
+#[tokio::test]
+async fn a_number_binds_with_its_datatype() {
+    let (_tmp, app) = seeded_app().await;
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/fluree/upsert/{LEDGER}"))
+            .header("content-type", "text/turtle")
+            .body(Body::from(
+                "@prefix ex: <http://ex.org/> . ex:s1 ex:age 30 ; ex:score 1.5 .",
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "numbers upsert: {body}");
+
+    let by = |p: &str| format!("PREFIX ex: <http://ex.org/> SELECT ?s WHERE {{ ?s ex:{p} $v }}");
+    for (p, term) in [
+        ("age", "30"),
+        ("age", r#""30"^^<http://www.w3.org/2001/XMLSchema#integer>"#),
+        ("score", "1.5"),
+        (
+            "score",
+            r#""1.5"^^<http://www.w3.org/2001/XMLSchema#decimal>"#,
+        ),
+    ] {
+        let (status, json) = get_with_params(&app, &ledger_path(), &by(p), &[("v", term)]).await;
+        assert_eq!(status, StatusCode::OK, "{p} {term}: {json}");
+        assert_eq!(values(&json, "s"), [S1], "{p} {term}: {json}");
+    }
+
+    // Matching compares numbers by value, so the datatype shows in DATATYPE.
+    let datatype = "SELECT ?dt WHERE { BIND(DATATYPE($v) AS ?dt) }";
+    let xsd = |t: &str| format!("http://www.w3.org/2001/XMLSchema#{t}");
+    for (term, expected) in [
+        ("30", xsd("integer")),
+        ("1.5", xsd("decimal")),
+        ("1.5e0", xsd("double")),
+    ] {
+        let (status, json) = get_with_params(&app, &ledger_path(), datatype, &[("v", term)]).await;
+        assert_eq!(status, StatusCode::OK, "{term}: {json}");
+        assert_eq!(values(&json, "dt"), [expected], "{term}: {json}");
+    }
 }
 
 /// One query text, run with two bindings and then none: each answer is its
@@ -224,8 +306,8 @@ async fn direct_post_takes_params_from_the_url() {
 async fn one_text_answers_each_binding_and_the_unbound_query() {
     let (_tmp, app) = seeded_app().await;
 
-    let (_, a) = get_with_params(&app, &ledger_path(), BY_NAME, r#"{"n": "A"}"#).await;
-    let (_, c) = get_with_params(&app, &ledger_path(), BY_NAME, r#"{"n": "C"}"#).await;
+    let (_, a) = get_with_params(&app, &ledger_path(), BY_NAME, &[("n", r#""A""#)]).await;
+    let (_, c) = get_with_params(&app, &ledger_path(), BY_NAME, &[("n", r#""C""#)]).await;
     let (status, all) = send(
         &app,
         Request::builder()
@@ -249,7 +331,7 @@ async fn one_text_answers_each_binding_and_the_unbound_query() {
 #[tokio::test]
 async fn sparql_results_xml_lane_binds_params() {
     let (_tmp, app) = seeded_app().await;
-    let mut request = direct_post(&ledger_path(), BY_NAME, r#"{"n": "B"}"#);
+    let mut request = direct_post(&ledger_path(), BY_NAME, &[("n", r#""B""#)]);
     request
         .headers_mut()
         .insert("accept", "application/sparql-results+xml".parse().unwrap());
@@ -268,8 +350,8 @@ async fn dataset_lane_binds_params() {
     let in_g1 =
         "PREFIX ex: <http://ex.org/> SELECT ?s FROM <http://ex.org/g1> WHERE { ?s ex:name ?n }";
 
-    let (status, d) = get_with_params(&app, &ledger_path(), in_g1, r#"{"n": "D"}"#).await;
-    let (_, a) = get_with_params(&app, &ledger_path(), in_g1, r#"{"n": "A"}"#).await;
+    let (status, d) = get_with_params(&app, &ledger_path(), in_g1, &[("n", r#""D""#)]).await;
+    let (_, a) = get_with_params(&app, &ledger_path(), in_g1, &[("n", r#""A""#)]).await;
 
     assert_eq!(status, StatusCode::OK, "{d}");
     assert_eq!(values(&d, "s"), ["http://ex.org/s4"], "{d}");
@@ -283,7 +365,7 @@ async fn connection_route_binds_params() {
         format!("PREFIX ex: <http://ex.org/> SELECT ?s FROM <{LEDGER}> WHERE {{ ?s ex:name ?n }}");
 
     let (status, json) =
-        get_with_params(&app, "/v1/fluree/query", &from_ledger, r#"{"n": "C"}"#).await;
+        get_with_params(&app, "/v1/fluree/query", &from_ledger, &[("n", r#""C""#)]).await;
 
     assert_eq!(status, StatusCode::OK, "{json}");
     assert_eq!(values(&json, "s"), [S3], "{json}");
@@ -300,7 +382,7 @@ async fn tracked_lanes_bind_params() {
         (ledger_path(), BY_NAME.to_string()),
         ("/v1/fluree/query".to_string(), from_ledger),
     ] {
-        let mut request = direct_post(&path, &sparql, r#"{"n": "B"}"#);
+        let mut request = direct_post(&path, &sparql, &[("n", r#""B""#)]);
         request
             .headers_mut()
             .insert("fluree-track-fuel", "true".parse().unwrap());
@@ -322,7 +404,7 @@ async fn explain_plans_the_bound_query() {
         direct_post(
             &format!("/v1/fluree/explain/{LEDGER}"),
             BY_SUBJECT,
-            r#"{"s": {"@id": "http://ex.org/s1"}}"#,
+            &[("s", "<http://ex.org/s1>")],
         ),
     )
     .await;
@@ -346,7 +428,7 @@ async fn explain_with_a_from_plans_the_bound_query() {
         ("/v1/fluree/explain".to_string(), Some(pinned.as_str())),
         (format!("/v1/fluree/explain/{LEDGER}"), None),
     ] {
-        let mut request = direct_post(&path, &from_ledger, r#"{"s": {"@id": "http://ex.org/s1"}}"#);
+        let mut request = direct_post(&path, &from_ledger, &[("s", "<http://ex.org/s1>")]);
         if let Some(ledger) = ledger_header {
             request
                 .headers_mut()
@@ -371,7 +453,7 @@ async fn connection_stream_route_binds_params() {
 
     let (status, body) = send_raw(
         &app,
-        direct_post("/v1/fluree/stream/query", &from_ledger, r#"{"n": "C"}"#),
+        direct_post("/v1/fluree/stream/query", &from_ledger, &[("n", r#""C""#)]),
     )
     .await;
 
@@ -389,7 +471,7 @@ async fn stream_route_binds_params() {
         direct_post(
             &format!("/v1/fluree/stream/query/{LEDGER}"),
             BY_NAME,
-            r#"{"n": "C"}"#,
+            &[("n", r#""C""#)],
         ),
     )
     .await;
@@ -415,9 +497,9 @@ ex:s3 ex:cat ex:c2 .
 }
 ";
 
-/// The AgentJson lanes bind `params`, and a response the byte budget cuts
-/// gives no resume query: one built from the text alone would run unbound and
-/// answer a wider question on the next page. It says to re-send the `params`.
+/// The AgentJson lanes bind `$name` parameters, and a response the byte budget
+/// cuts gives no resume query: one built from the text alone would run unbound
+/// and answer a wider question on the next page. It says to re-send them.
 #[tokio::test]
 async fn agent_json_lanes_bind_params_and_withhold_the_resume_query() {
     let (_tmp, app) = seeded_app().await;
@@ -464,9 +546,9 @@ async fn agent_json_lanes_bind_params_and_withhold_the_resume_query() {
         let mut request = Request::builder()
             .method("GET")
             .uri(format!(
-                "{path}?query={}&params={}",
+                "{path}?query={}&{}",
                 enc(sparql),
-                enc(r#"{"c": {"@id": "http://ex.org/c1"}}"#)
+                bindings(&[("c", "<http://ex.org/c1>")])
             ))
             .header("accept", "application/vnd.fluree.agent+json");
         if tracked {
@@ -500,7 +582,7 @@ async fn agent_json_lanes_bind_params_and_withhold_the_resume_query() {
         );
         let message = json["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("re-send this query with the same params"),
+            message.contains("re-send this query with the same variable bindings"),
             "{lane}: {json}"
         );
     }
@@ -511,24 +593,28 @@ async fn agent_json_lanes_bind_params_and_withhold_the_resume_query() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn params_must_be_a_json_object() {
+async fn a_binding_must_be_one_full_rdf_term() {
     let (_tmp, app) = seeded_app().await;
 
-    for params in [r#"["A"]"#, "n=A", r#""A""#] {
-        let (status, json) = get_with_params(&app, &ledger_path(), BY_NAME, params).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST, "{params}: {json}");
-        assert!(json.to_string().contains("JSON object"), "{json}");
+    for (term, says) in [
+        ("A", "one RDF term"),
+        (r#""A" "B""#, "one RDF term"),
+        ("ex:a", "prefixed name"),
+    ] {
+        let (status, json) = get_with_params(&app, &ledger_path(), BY_NAME, &[("n", term)]).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{term}: {json}");
+        assert!(json.to_string().contains(says), "{term}: {json}");
     }
 }
 
 #[tokio::test]
-async fn params_may_appear_only_once() {
+async fn a_variable_may_be_bound_only_once() {
     let (_tmp, app) = seeded_app().await;
 
     let (status, json) = post_form(
         &app,
-        &format!("{}?params={}", ledger_path(), enc(r#"{"n": "A"}"#)),
-        format!("query={}&params={}", enc(BY_NAME), enc(r#"{"n": "B"}"#)),
+        &format!("{}?{}", ledger_path(), bindings(&[("n", r#""A""#)])),
+        format!("query={}&{}", enc(BY_NAME), bindings(&[("n", r#""B""#)])),
     )
     .await;
 
@@ -536,18 +622,44 @@ async fn params_may_appear_only_once() {
     assert!(json.to_string().contains("only once"), "{json}");
 }
 
+/// `params` is how a Cypher body spells its bindings; sent to a SPARQL
+/// query it is refused with the spelling to use, rather than ignored.
+#[tokio::test]
+async fn the_params_spelling_is_refused_with_a_pointer() {
+    let (_tmp, app) = seeded_app().await;
+
+    let (status, json) = send(
+        &app,
+        Request::builder()
+            .method("GET")
+            .uri(format!(
+                "{}?query={}&params={}",
+                ledger_path(),
+                enc(BY_NAME),
+                enc(r#"{"n": "A"}"#)
+            ))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(json.to_string().contains("$name"), "{json}");
+}
+
 /// A misspelt name must fail: left alone, its variable would stay unbound.
 #[tokio::test]
 async fn a_parameter_the_query_never_mentions_is_rejected() {
     let (_tmp, app) = seeded_app().await;
 
-    let (status, json) = get_with_params(&app, &ledger_path(), BY_NAME, r#"{"name": "A"}"#).await;
+    let (status, json) =
+        get_with_params(&app, &ledger_path(), BY_NAME, &[("name", r#""A""#)]).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
 }
 
 #[tokio::test]
-async fn params_on_a_jsonld_query_are_rejected() {
+async fn bindings_on_a_jsonld_query_are_rejected() {
     let (_tmp, app) = seeded_app().await;
     let query = serde_json::json!({
         "@context": { "ex": "http://ex.org/" },
@@ -559,7 +671,11 @@ async fn params_on_a_jsonld_query_are_rejected() {
         &app,
         Request::builder()
             .method("POST")
-            .uri(format!("{}?params={}", ledger_path(), enc(r#"{"n": "A"}"#)))
+            .uri(format!(
+                "{}?{}",
+                ledger_path(),
+                bindings(&[("n", r#""A""#)])
+            ))
             .header("content-type", "application/json")
             .body(Body::from(query.to_string()))
             .unwrap(),
@@ -570,16 +686,20 @@ async fn params_on_a_jsonld_query_are_rejected() {
     assert!(json.to_string().contains("only to SPARQL"), "{json}");
 }
 
-/// Cypher takes its parameters in its JSON body, never from `params`.
+/// Cypher takes its parameters in its JSON body, never from `$name`.
 #[tokio::test]
-async fn params_on_a_cypher_query_are_rejected() {
+async fn bindings_on_a_cypher_query_are_rejected() {
     let (_tmp, app) = seeded_app().await;
 
     let (status, json) = send(
         &app,
         Request::builder()
             .method("POST")
-            .uri(format!("{}?params={}", ledger_path(), enc(r#"{"n": "A"}"#)))
+            .uri(format!(
+                "{}?{}",
+                ledger_path(),
+                bindings(&[("n", r#""A""#)])
+            ))
             .header("content-type", "application/cypher")
             .body(Body::from("MATCH (n) RETURN n LIMIT 1"))
             .unwrap(),
@@ -594,7 +714,7 @@ async fn params_on_a_cypher_query_are_rejected() {
 /// variable unbound — this `DELETE WHERE` would delete every name — so the
 /// request fails and the data is untouched, from the URL and from a form.
 #[tokio::test]
-async fn params_on_an_update_are_rejected_and_nothing_changes() {
+async fn bindings_on_an_update_are_rejected_and_nothing_changes() {
     let (_tmp, app) = seeded_app().await;
     let delete = "DELETE WHERE { ?s <http://ex.org/name> ?n }";
     let update_path = format!("/v1/fluree/update/{LEDGER}");
@@ -603,7 +723,7 @@ async fn params_on_an_update_are_rejected_and_nothing_changes() {
         &app,
         Request::builder()
             .method("POST")
-            .uri(format!("{update_path}?params={}", enc(r#"{"n": "A"}"#)))
+            .uri(format!("{update_path}?{}", bindings(&[("n", r#""A""#)])))
             .header("content-type", "application/sparql-update")
             .body(Body::from(delete))
             .unwrap(),
@@ -612,7 +732,7 @@ async fn params_on_an_update_are_rejected_and_nothing_changes() {
     let (form_status, form_json) = post_form(
         &app,
         &update_path,
-        format!("update={}&params={}", enc(delete), enc(r#"{"n": "A"}"#)),
+        format!("update={}&{}", enc(delete), bindings(&[("n", r#""A""#)])),
     )
     .await;
     let (_, all) = send(

@@ -400,8 +400,9 @@ WHERE {
 
 A query or update can take parameters: values bound to variables by name.
 Embedded Fluree (the Rust API and the Python package) takes them with the
-request; over HTTP, a query takes them as the `params` request parameter, a
-JSON object (see the [query endpoint](../api/endpoints.md#post-query)). A parameter
+request; over HTTP, a query takes one `$name` request parameter per variable,
+the convention other SPARQL servers share (see the
+[query endpoint](../api/endpoints.md#post-query)). A parameter
 replaces its variable — written `?name` or `$name`, which SPARQL treats as the
 same variable — everywhere in the request before it is planned, so
 `SELECT ?person WHERE { ?person ex:name $name }` with `name = "Alice"` runs
@@ -418,15 +419,20 @@ subquery.
 - `INSERT DATA` and `DELETE DATA` take no variables, so no parameters; use
   `INSERT { ... } WHERE { ... }`.
 
-A value is written as in JSON-LD: a JSON string, number or boolean; `{"@id":
-iri}` for an IRI (full IRIs only — no prefix applies); `{"@value": v, "@type":
-datatype}` for a typed literal; or `{"@value": s, "@language": tag}`. Over HTTP:
+Embedded, a value is written as in JSON-LD: a JSON string, number or boolean;
+`{"@id": iri}` for an IRI; `{"@value": v, "@type": datatype}` for a typed
+literal; or `{"@value": s, "@language": tag}`. Over HTTP, a value is one RDF
+term, as N-Triples or Turtle write it: `<http://example.org/le-guin>` for an
+IRI, `"Alice"`, `"chat"@fr`, `"5"^^<http://www.w3.org/2001/XMLSchema#int>`, or
+a bare `5`, `5.5`, `5e0`, `true` or `false`, which keep the datatype they would
+have written in the query. Either way IRIs are full IRIs: no prefix applies.
 
 ```bash
 curl -G http://localhost:8090/v1/fluree/query/books:main \
   --data-urlencode 'query=PREFIX ex: <http://example.org/>
-    SELECT ?book WHERE { ?book ex:author $author ; ex:year ?year }' \
-  --data-urlencode 'params={"author": {"@id": "http://example.org/le-guin"}}'
+    SELECT ?book WHERE { ?book ex:author $author ; ex:year $year }' \
+  --data-urlencode '$author=<http://example.org/le-guin>' \
+  --data-urlencode '$year=1969'
 ```
 
 ## Aggregation

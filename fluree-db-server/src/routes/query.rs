@@ -215,17 +215,18 @@ pub struct SparqlParams {
     pub default_graph_uri: Vec<String>,
     /// `named-graph-uri` values (Protocol §2.1.4): the query's named graphs.
     pub named_graph_uri: Vec<String>,
-    /// `params`: a JSON object binding SPARQL variables to values for this
-    /// request (`{"name": value}`), as `QueryExecutionOptions::with_params`
-    /// binds them. A Fluree extension; the SPARQL Protocol has no binding.
+    /// Variable bindings for this request, one `$name=<RDF term>` parameter
+    /// per variable (the convention other SPARQL servers share), bound as
+    /// `QueryExecutionOptions::with_params` binds them. The SPARQL Protocol
+    /// itself has no binding.
     pub params: Option<fluree_db_sparql::ParamMap>,
     /// Whether a default-context flag has been read, so a second is refused.
     default_context_seen: bool,
 }
 
 impl SparqlParams {
-    /// Parse the request's query string. Unknown keys are ignored; `query` and
-    /// the default-context flag may appear at most once.
+    /// Parse the request's query string. Unknown keys are ignored; `query`, the
+    /// default-context flag and each `$name` binding may appear at most once.
     pub(crate) fn from_query_str(raw: &str) -> Result<Self> {
         let mut params = SparqlParams::default();
         params.apply_pairs(super::sparql_protocol::decode_pairs(raw)?)?;
@@ -264,24 +265,36 @@ impl SparqlParams {
                 }
                 DEFAULT_GRAPH_URI => self.default_graph_uri.push(value),
                 NAMED_GRAPH_URI => self.named_graph_uri.push(value),
+                // A Cypher request's JSON body spells bindings `params`; over the
+                // SPARQL Protocol they are `$name` parameters. Refused rather than
+                // ignored, which would leave every variable unbound.
                 "params" => {
-                    let parsed = match serde_json::from_str::<JsonValue>(&value) {
-                        Ok(JsonValue::Object(map)) => map,
-                        _ => {
-                            return Err(ServerError::bad_request(
-                                "`params` must be a JSON object binding variable names to \
-                                 values, as {\"name\": \"Alice\"}",
-                            ))
-                        }
-                    };
-                    if self.params.replace(parsed).is_some() {
-                        return Err(ServerError::bad_request(
-                            "the `params` parameter may appear only once",
-                        ));
-                    }
+                    return Err(ServerError::bad_request(
+                        "bind a SPARQL variable with one `$name=<RDF term>` parameter per \
+                         variable, as `$name=\"Alice\"` or `$s=<http://ex.org/a>`",
+                    ))
                 }
+                binding if binding.starts_with('$') => self.bind_param(&binding[1..], &value)?,
                 _ => {}
             }
+        }
+        Ok(())
+    }
+
+    /// Read one `$name=<RDF term>` binding.
+    fn bind_param(&mut self, name: &str, term: &str) -> Result<()> {
+        if name.is_empty() {
+            return Err(ServerError::bad_request(
+                "a `$` parameter must name a variable, as `$name=\"Alice\"`",
+            ));
+        }
+        let value = fluree_db_sparql::param_from_term(name, term)
+            .map_err(|e| ServerError::bad_request(e.to_string()))?;
+        let params = self.params.get_or_insert_with(Default::default);
+        if params.insert(name.to_string(), value).is_some() {
+            return Err(ServerError::bad_request(format!(
+                "the `${name}` parameter may appear only once"
+            )));
         }
         Ok(())
     }
@@ -322,8 +335,8 @@ impl SparqlParams {
         !self.default_graph_uri.is_empty() || !self.named_graph_uri.is_empty()
     }
 
-    /// Dataset parameters and `params` only mean something for SPARQL: a
-    /// JSON-LD query names its dataset with `from` / `fromNamed` and its
+    /// Dataset parameters and `$name` bindings only mean something for SPARQL:
+    /// a JSON-LD query names its dataset with `from` / `fromNamed` and its
     /// values in the query, and a Cypher query sends `params` in its JSON body.
     /// Refuse rather than ignore — an ignored binding leaves its variable
     /// unbound, which widens the match instead of failing.
@@ -339,7 +352,7 @@ impl SparqlParams {
         }
         if self.params.is_some() {
             return Err(ServerError::bad_request(
-                "`params` applies only to SPARQL queries; a JSON-LD query takes its \
+                "`$name` bindings apply only to SPARQL queries; a JSON-LD query takes its \
                  values in the query, and a Cypher query sends `params` in its JSON body",
             ));
         }
@@ -347,19 +360,19 @@ impl SparqlParams {
     }
 
     /// The request-scoped execution options for this request's SPARQL query,
-    /// with its `params` bound.
+    /// with its `$name` bindings bound.
     pub(crate) fn execution_options(&self, state: &AppState) -> QueryExecutionOptions {
         self.bind(query_execution_options(state))
     }
 
-    /// Whether this request binds any variable through `params`.
+    /// Whether this request binds any variable through a `$name` parameter.
     pub(crate) fn binds_params(&self) -> bool {
         self.params
             .as_ref()
             .is_some_and(|params| !params.is_empty())
     }
 
-    /// `options` with this request's `params` bound.
+    /// `options` with this request's `$name` bindings bound.
     pub(crate) fn bind(&self, options: QueryExecutionOptions) -> QueryExecutionOptions {
         match &self.params {
             Some(params) => options.with_params(params.clone()),

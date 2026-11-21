@@ -451,6 +451,7 @@ fn extract_query_params(request: &Request) -> Result<TransactQueryParams> {
             "dryRun" => params.dry_run = flag(key, value)?,
             "allowEmpty" => params.allow_empty = flag(key, value)?,
             "params" => return Err(update_bindings_unsupported()),
+            binding if binding.starts_with('$') => return Err(update_bindings_unsupported()),
             _ => {}
         }
     }
@@ -458,13 +459,14 @@ fn extract_query_params(request: &Request) -> Result<TransactQueryParams> {
     Ok(params)
 }
 
-/// `params` binds query variables on the query endpoints. An update reached
-/// with it must fail: ignored, the binding would leave its variable unbound,
-/// and `DELETE WHERE { ?s ex:name $name }` would delete every name.
+/// `$name` parameters bind query variables on the query endpoints. An update
+/// reached with one (or with `params`) must fail: ignored, the binding would
+/// leave its variable unbound, and `DELETE WHERE { ?s ex:name $name }` would
+/// delete every name.
 fn update_bindings_unsupported() -> ServerError {
     ServerError::bad_request(
-        "`params` is accepted only by the SPARQL query endpoints; an update carries \
-         its values in the request text",
+        "variable bindings (`$name` parameters) are accepted only by the SPARQL query \
+         endpoints; an update carries its values in the request text",
     )
 }
 
@@ -548,7 +550,10 @@ fn maybe_rewrite_form_encoded_update(
     };
 
     if let Some((_, sparql)) = parsed.iter().find(|(k, _)| k == "update") {
-        if parsed.iter().any(|(k, _)| k == "params") {
+        if parsed
+            .iter()
+            .any(|(k, _)| k == "params" || k.starts_with('$'))
+        {
             return Err(update_bindings_unsupported());
         }
         using.extend_from_pairs(&crate::routes::sparql_protocol::decode_pairs(body_str)?);
