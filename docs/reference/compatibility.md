@@ -412,7 +412,7 @@ An integer beyond the 64-bit range keeps the XSD subtype it was written with: `"
 
 A decimal that doesn't fit the index's inline encoding is stored the same way and still reads back as `xsd:decimal`.
 
-**Upgrading.** An index an earlier release built is served as it was, by value, until the ledger's next index build. That build is a full rebuild from the commits, which hold each value's datatype, so it restores every subtype: a ledger that held one value under two subtypes then holds two terms. A ledger with no new commits keeps its earlier index until one is built (`fluree reindex`).
+**Upgrading.** An index an earlier release built is served as it was, by value, until the ledger's next index build. That build is a full rebuild from the commits, which hold each value's datatype, so it restores every subtype: a ledger that held one value under two subtypes then holds two terms. From then on a delete names one term, so a delete naming the `xsd:integer` an earlier release read back deletes nothing where the value was written under another subtype: name the subtype it was written with. A ledger with no new commits keeps its earlier index until one is built (`fluree reindex`). Each branch has its own index and keeps the earlier one until its own next build, so reindex branches too.
 
 Until that build, a write is read against the earlier index, which holds one such value's subtypes as one fact read back as `xsd:integer`, so deleting a value it holds under any of its subtypes deletes all of them, as an earlier release did. A value first written since is held under each subtype it was written with: deleting it under one of those deletes all of them, and deleting it under another subtype deletes nothing.
 
@@ -421,6 +421,10 @@ Until that build, a write is read against the earlier index, which holds one suc
 A merge or revert reads what such a commit deleted from its branch's index. While that index is still an earlier release's, which holds a value's subtypes as one fact, the merge or revert is refused (HTTP 409) until the branch is reindexed.
 
 A commit written against an index that keeps subtypes deletes the one term it names. An incremental index build over a commit that deletes by value builds the index in full instead, since only a replay from the first commit knows what that commit deleted.
+
+#### A bound integer keeps its subtype (breaking)
+
+`BIND(?o AS ?v)` of an integer binds `?o`'s term, XSD subtype included, in SPARQL and in JSON-LD's `["bind", "?v", "?o"]`: an `xsd:int`, `xsd:short` or `xsd:unsignedLong` stays one, where earlier releases bound `xsd:integer`. So `DATATYPE(?v)`, `GROUP BY ?v` and `DISTINCT` over the bound variable see the declared subtype, and a `DELETE` of `?v` deletes the stored term.
 
 #### A SPARQL constant of any integer subtype names its value (breaking)
 
