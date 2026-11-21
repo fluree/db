@@ -17,11 +17,11 @@ use crate::rebase::{current_asserted_for_key, ConflictStrategy};
 use fluree_db_core::LedgerId;
 use fluree_db_core::{
     commit_to_summary, diff_branches, load_commit_by_id, load_commit_envelope_by_id,
-    walk_commit_summaries, BranchedContentStore, CommitSummary, ConflictKey, ContentId,
-    ContentStore, Flake,
+    trace_first_parent_commits_by_id, walk_commit_summaries, BranchedContentStore, Commit,
+    CommitSummary, ConflictKey, ContentId, ContentStore, Flake,
 };
 use fluree_db_ledger::LedgerState;
-use fluree_db_novelty::{compute_delta_keys_and_changes, delta_keys_of};
+use fluree_db_novelty::{delta_keys_and_changes_of, delta_keys_of};
 use futures::{stream, StreamExt, TryStreamExt};
 use rustc_hash::{FxHashMap, FxHashSet};
 use serde::Serialize;
@@ -584,11 +584,21 @@ impl crate::Fluree {
                     }
                 }
                 // No target head: the change set is the source's whole
-                // history.
+                // history, which the target adopts. A commit staged by value
+                // is read by value, as every reader of it does.
                 (None, Some(s_head)) if need_changes => {
-                    let (keys, net, ns_delta, graph_iris) =
-                        compute_delta_keys_and_changes(source_store.clone(), s_head.clone(), 0)
+                    let mut commits: Vec<Commit> =
+                        trace_first_parent_commits_by_id(source_store.clone(), s_head.clone(), 0)
+                            .try_collect()
                             .await?;
+                    crate::commit_data::Line {
+                        fluree: self,
+                        ledger_id: source_id.as_str(),
+                        strict: true,
+                    }
+                    .resolve(&mut commits)
+                    .await?;
+                    let (keys, net, ns_delta, graph_iris) = delta_keys_and_changes_of(commits);
                     Ok((Some(keys), Some(net), Some((ns_delta, graph_iris))))
                 }
                 _ => Ok((None, None, None)),

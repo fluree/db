@@ -1125,6 +1125,76 @@ async fn reverting_a_v4_delete_restores_every_subtype() {
     assert_eq!(rows(&file(&path), ID, q).await, both, "rebuilt");
 }
 
+/// A preview of merging a branch into one with no commits nets the
+/// branch's whole history, reading a commit staged by value as the target,
+/// which adopts the commits, will: the v4 fixture's replacement of a big
+/// `xsd:unsignedLong` by `5` nets to `5` and the retraction of the
+/// `xsd:unsignedLong` (the newest op on each fact), not to the
+/// `xsd:unsignedLong` held and an `xsd:integer` retracted.
+#[tokio::test]
+async fn a_merge_preview_into_an_empty_branch_reads_a_v4_replacement_by_value() {
+    const NAME: &str = "it/numbig-preview";
+    const MAIN: &str = "it/numbig-preview:main";
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let fluree = file(&path);
+    fluree.create_ledger(MAIN).await.unwrap();
+    for commit in v4_replacement_commits().await {
+        push(&fluree, MAIN, commit).await;
+    }
+    fluree
+        .create_branch(NAME, "dev", None, None)
+        .await
+        .expect("branch");
+    // `main` back to no commits, so `dev` holds the whole history.
+    let main = fluree
+        .nameservice()
+        .lookup(MAIN)
+        .await
+        .unwrap()
+        .expect("main");
+    fluree
+        .branch_admin()
+        .unwrap()
+        .reset_head_fenced(
+            MAIN,
+            fluree_db_nameservice::WriteBasis::fenced(main.fence),
+            fluree_db_nameservice::NsRecordSnapshot {
+                commit_head_id: None,
+                commit_t: 0,
+                index_head_id: None,
+                index_t: 0,
+            },
+        )
+        .await
+        .unwrap();
+
+    let preview = file(&path)
+        .merge_preview_with(
+            NAME,
+            "dev",
+            Some("main"),
+            fluree_db_api::MergePreviewOpts {
+                include_changes: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("preview");
+    assert!(preview.ancestor.is_none(), "no commit on main");
+    let changes = preview.changes.expect("changes");
+    let net: Vec<String> = changes
+        .entries
+        .iter()
+        .flat_map(|e| e.asserts.iter().chain(&e.retracts))
+        .map(|f| {
+            let dt = f.dt.rsplit('#').next().unwrap_or(&f.dt);
+            format!("{}{dt}", if f.op { "+" } else { "-" })
+        })
+        .collect();
+    assert_eq!(net, ["+integer", "-unsignedLong"]);
+}
+
 /// Merging a branch whose delete was written over a v4 index deletes every
 /// subtype of the value on the target: the merge folds what the commit
 /// deleted on the branch, not the `xsd:integer` it names, which the target
