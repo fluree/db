@@ -17,7 +17,8 @@ use once_cell::sync::OnceCell;
 use super::allowance::{reject, DictionaryAllowance, PackSlot, Promotion};
 use super::forward_pack::{
     codec_range, find_page_in_dir, lookup_in_pack_into, page_dir_range, parse_pack_meta,
-    parse_pack_meta_parts, FsstTable, PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
+    parse_pack_meta_parts, with_codes_scratch, with_decode_scratch, FsstTable, PackHeader,
+    PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
 };
 use crate::format::wire_helpers::PackBranchEntry;
 use crate::read::cached_units::{CachedUnits, MissMeter};
@@ -256,11 +257,10 @@ fn ranged_lookup(
     let from = base + data_start + u64::from(lo);
     match table {
         None => units.extend_into(from..from + u64::from(hi - lo), out)?,
-        Some(table) => {
-            let mut codes = Vec::with_capacity((hi - lo) as usize);
-            units.extend_into(from..from + u64::from(hi - lo), &mut codes)?;
-            table.decode_value_into(&codes, out)?;
-        }
+        Some(table) => with_codes_scratch(|codes| {
+            units.extend_into(from..from + u64::from(hi - lo), codes)?;
+            table.decode_value_into(codes, out)
+        })?,
     }
     Ok(true)
 }
@@ -615,10 +615,17 @@ impl ForwardPackReader {
             return Ok(None);
         };
         let (meta, backing) = handle.ensure_loaded(self.load_ctx.as_ref())?;
-        let mut value = Vec::new();
-        if !backing.lookup_into(meta, id, &mut value)? {
+        // A coded value decodes with room for 8 bytes per code; the string
+        // keeps only its own length.
+        let value = with_decode_scratch(|scratch| -> io::Result<Option<Vec<u8>>> {
+            if !backing.lookup_into(meta, id, scratch)? {
+                return Ok(None);
+            }
+            Ok(Some(scratch.to_vec()))
+        })?;
+        let Some(value) = value else {
             return Ok(None);
-        }
+        };
         String::from_utf8(value)
             .map(Some)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))

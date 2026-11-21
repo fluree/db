@@ -253,6 +253,44 @@ impl FsstTable {
     }
 }
 
+/// A scratch buffer this thread keeps past 1 MiB is dropped, so one huge
+/// value doesn't hold its room for the thread's life.
+const SCRATCH_KEEP_BYTES: usize = 1 << 20;
+
+thread_local! {
+    static DECODED: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CODES: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn with_scratch<R>(
+    key: &'static std::thread::LocalKey<std::cell::RefCell<Vec<u8>>>,
+    f: impl FnOnce(&mut Vec<u8>) -> R,
+) -> R {
+    key.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut scratch) => {
+            scratch.clear();
+            let result = f(&mut scratch);
+            if scratch.capacity() > SCRATCH_KEEP_BYTES {
+                *scratch = Vec::new();
+            }
+            result
+        }
+        Err(_) => f(&mut Vec::new()),
+    })
+}
+
+/// Run `f` with this thread's decode buffer, emptied. Decoding reserves
+/// 8 bytes per code, so a value decoded here is copied out at its length
+/// instead of keeping that room.
+pub(crate) fn with_decode_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    with_scratch(&DECODED, f)
+}
+
+/// Run `f` with this thread's buffer for a value's codes, emptied.
+pub(crate) fn with_codes_scratch<R>(f: impl FnOnce(&mut Vec<u8>) -> R) -> R {
+    with_scratch(&CODES, f)
+}
+
 /// How each page of a pack stores its values: runs of pages keyed by their
 /// first page, each raw or FSST-coded over one table. A pack with no codec
 /// section is raw throughout.
@@ -835,11 +873,10 @@ impl<'a> ForwardPack<'a> {
         };
         Ok(Some(match self.meta.codecs.table(page_idx) {
             None => std::borrow::Cow::Borrowed(stored),
-            Some(table) => {
-                let mut value = Vec::new();
-                table.decode_value_into(stored, &mut value)?;
-                std::borrow::Cow::Owned(value)
-            }
+            Some(table) => with_decode_scratch(|scratch| {
+                table.decode_value_into(stored, scratch)?;
+                Ok::<_, io::Error>(std::borrow::Cow::Owned(scratch.to_vec()))
+            })?,
         }))
     }
 
@@ -1681,6 +1718,34 @@ mod tests {
                 .unwrap(),
             Some(String::from_utf8(entries[2].1.clone()).unwrap())
         );
+    }
+
+    /// A decoded value holds its own length, not the decoder's room of 8
+    /// bytes per code: a string a query builds from a coded pack would keep
+    /// that room for as long as it is held.
+    #[test]
+    fn a_decoded_value_holds_only_its_length() {
+        use std::sync::Arc;
+        let entries = text_entries(7, 3_000);
+        let bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        let pack = ForwardPack::from_bytes(&bytes).unwrap();
+        assert!(pack.is_coded());
+        let reader =
+            super::super::pack_reader::ForwardPackReader::from_memory(vec![Arc::from(&bytes[..])])
+                .unwrap();
+        let mut checked = 0;
+        for (id, value) in entries.iter().filter(|(_, v)| v.len() > 20) {
+            let std::borrow::Cow::Owned(found) = pack.lookup(*id).unwrap().unwrap() else {
+                panic!("a coded value is decoded, so owned");
+            };
+            assert_eq!(found, *value);
+            assert_eq!(found.capacity(), found.len(), "{id}");
+            let found = reader.forward_lookup_str(*id).unwrap().unwrap();
+            assert_eq!(found.as_bytes(), value.as_slice());
+            assert_eq!(found.capacity(), found.len(), "{id}");
+            checked += 1;
+        }
+        assert!(checked > 100);
     }
 
     /// A coded value ending in the escape code is damaged (an escape takes
