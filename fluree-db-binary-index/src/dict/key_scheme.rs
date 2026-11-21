@@ -152,11 +152,13 @@ impl KeyScheme {
         (group.to_vec(), prefix_end(group))
     }
 
-    /// The group a key belongs to, by value or hashed: its first
-    /// `prefix_len` bytes, if it is longer than that.
+    /// The group whose key range ([`Self::group_range`]) holds `key`, by
+    /// value or hashed: its first `prefix_len` bytes, if it has that many.
+    /// A value of exactly `prefix_len` bytes is no member of its group, but
+    /// its key spells the group's prefix and lies in its range.
     pub fn key_group(self, key: &[u8]) -> Option<&[u8]> {
         let k = self.prefix_len()?;
-        (key.len() > k).then(|| &key[..k])
+        (key.len() >= k).then(|| &key[..k])
     }
 
     /// The key range `[start, end)` of a group's hashed values.

@@ -1711,6 +1711,40 @@ mod tests {
         assert!(found(&tree, &filler));
     }
 
+    /// The value that spells a listed group's prefix, erased after the
+    /// group's long values, takes the listing with it: the branch keeps no
+    /// copy of it.
+    #[test]
+    fn erasing_the_value_a_group_prefix_spells_stops_listing_it() {
+        let mut tree = HashedTree::new(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let prefix = "groupAAA".to_string();
+        let long: Vec<(String, u64)> = (0..5).map(|i| (format!("{prefix}{i:040}"), i)).collect();
+        let filler: Vec<(String, u64)> =
+            (0..20).map(|i| (format!("group{i:03}"), 100 + i)).collect();
+        tree.add(&[filler.clone(), long.clone(), vec![(prefix.clone(), 50)]].concat());
+        assert!(tree.branch.raw_groups.get(prefix.as_bytes()).is_some());
+
+        // The long values gone: the prefix's own value keeps the group.
+        tree.remove(&long.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert!(tree.branch.raw_groups.get(prefix.as_bytes()).is_some());
+        assert_eq!(tree.lookup(&prefix), Some(50));
+        // It gone too: nothing lists the group, and the branch holds no copy.
+        tree.remove(&[&prefix]);
+        assert!(
+            tree.branch.raw_groups.is_empty(),
+            "{:?}",
+            tree.branch.raw_groups
+        );
+        let encoded = tree.branch.encode();
+        assert!(!encoded
+            .windows(prefix.len())
+            .any(|w| w == prefix.as_bytes()));
+        assert!(filler.iter().all(|(v, id)| tree.lookup(v) == Some(*id)));
+    }
+
     /// A removal that leaves a group keys only inside one leaf, past its
     /// first and last keys, keeps the group listed, and its flag while it
     /// holds a hashed key: only the leaf's own keys show what is left.
