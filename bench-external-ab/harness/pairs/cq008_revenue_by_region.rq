@@ -1,0 +1,6 @@
+# cq008 — corpus q008_revenue_by_region (+ deterministic ORDER BY ?region).
+PREFIX edw: <http://ns.fluree.dev/edw#>
+SELECT ?region (SUM(?tot) AS ?rev)
+WHERE { ?o a edw:Order ; edw:orderTotal ?tot ; edw:customer ?c .
+        ?c edw:geography ?g . ?g edw:region ?region . }
+GROUP BY ?region ORDER BY ?region
