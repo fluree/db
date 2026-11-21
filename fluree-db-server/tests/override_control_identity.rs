@@ -8,8 +8,9 @@
 //! never satisfy the allow-list.
 //!
 //! Config says `f:reasoningModes f:rdfs`; every query here says
-//! `"reasoning": "none"` (or the SPARQL pragma). An entailed row means the
-//! override was denied and config won; no row means it was permitted.
+//! `"reasoning": "none"` (or the SPARQL pragma). No row means the override was
+//! permitted; a 400 means it was denied (the query asked for something the
+//! config won't give it).
 //!
 //! Reasoning, datalog, and SHACL requests carry no policy selection at all:
 //! an ordinary bearer's credential may only narrow policy, never widen it, so
@@ -269,6 +270,17 @@ const SPARQL_REASONING_NONE: &str = "# PRAGMA reasoning: none
 PREFIX ex: <http://example.org/>
 SELECT ?v WHERE { ex:alice ex:name ?v }";
 
+/// A denied `"reasoning": "none"` is a 400 that says why.
+#[track_caller]
+fn assert_override_refused(status: StatusCode, json: &JsonValue, what: &str) {
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{what}: {json}");
+    assert!(
+        json.to_string()
+            .contains("so a query cannot turn reasoning off"),
+        "{what}: {json}"
+    );
+}
+
 fn bindings(json: &JsonValue) -> usize {
     json.get("results")
         .and_then(|r| r.get("bindings"))
@@ -278,7 +290,7 @@ fn bindings(json: &JsonValue) -> usize {
 }
 
 /// A bearer whose verified identity is on the allow-list may override; one
-/// whose verified identity is not gets the configured defaults.
+/// whose verified identity is not is refused with a 400.
 #[tokio::test]
 async fn allow_listed_bearer_may_override_reasoning_defaults() {
     let (_tmp, app) = seeded_app(DataAuthMode::Required).await;
@@ -301,11 +313,10 @@ async fn allow_listed_bearer_may_override_reasoning_defaults() {
         format!("Bearer {}", bearer(Some(OTHER), false)),
     );
     let (status, json) = query(&app, "application/json", body, &[auth]).await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(
-        json,
-        json!(["Alice"]),
-        "a verified identity outside the allow-list is denied; config's rdfs wins"
+    assert_override_refused(
+        status,
+        &json,
+        "a verified identity outside the allow-list is denied",
     );
 }
 
@@ -343,38 +354,35 @@ async fn allow_listed_bearer_may_override_reasoning_defaults_sparql() {
         &[auth],
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(
-        bindings(&json),
-        1,
-        "a verified identity outside the allow-list is denied (SPARQL): {json}"
+    assert_override_refused(
+        status,
+        &json,
+        "a verified identity outside the allow-list is denied (SPARQL)",
     );
 }
 
 /// With no auth layer in play, neither `opts.identity` nor the
 /// `fluree-identity` header naming the allow-listed DID is a verified
-/// identity: the request is anonymous for override purposes and config wins.
+/// identity: the request is anonymous for override purposes and is refused.
 #[tokio::test]
 async fn unverified_identity_in_body_or_header_does_not_authorize_override() {
     let (_tmp, app) = seeded_app(DataAuthMode::None).await;
 
     let body = reasoning_none_body(json!({"identity": ADMIN}));
     let (status, json) = query(&app, "application/json", body, &[]).await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(
-        json,
-        json!(["Alice"]),
-        "opts.identity naming the allow-listed DID must not authorize the override"
+    assert_override_refused(
+        status,
+        &json,
+        "opts.identity naming the allow-listed DID must not authorize the override",
     );
 
     let body = reasoning_none_body(json!({}));
     let header = ("fluree-identity", ADMIN.to_string());
     let (status, json) = query(&app, "application/json", body, &[header]).await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(
-        json,
-        json!(["Alice"]),
-        "a fluree-identity header naming the allow-listed DID must not authorize the override"
+    assert_override_refused(
+        status,
+        &json,
+        "a fluree-identity header naming the allow-listed DID must not authorize the override",
     );
 
     let headers = [("fluree-identity", ADMIN.to_string())];
@@ -385,12 +393,43 @@ async fn unverified_identity_in_body_or_header_does_not_authorize_override() {
         &headers,
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "{json}");
-    assert_eq!(
-        bindings(&json),
-        1,
-        "a fluree-identity header must not authorize the override (SPARQL): {json}"
+    assert_override_refused(
+        status,
+        &json,
+        "a fluree-identity header must not authorize the override (SPARQL)",
     );
+}
+
+/// A mode the configured rdfs leaves out is refused over HTTP too, naming it,
+/// while the configured default still answers a query that asks for nothing.
+#[tokio::test]
+async fn a_reasoning_mode_the_config_does_not_run_is_a_400() {
+    let (_tmp, app) = seeded_app(DataAuthMode::None).await;
+
+    let plain = json!({
+        "@context": {"ex": "http://example.org/"},
+        "select": "?v",
+        "where": {"@id": "ex:alice", "ex:name": "?v"}
+    });
+    let (status, json) = query(&app, "application/json", plain.to_string(), &[]).await;
+    assert_eq!(status, StatusCode::OK, "{json}");
+    assert_eq!(json, json!(["Alice"]), "the configured rdfs answers");
+
+    let mut datalog = plain;
+    datalog["reasoning"] = json!("datalog");
+    let (status, json) = query(&app, "application/json", datalog.to_string(), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{json}");
+    assert!(
+        json.to_string()
+            .contains("so a query cannot turn on 'datalog'"),
+        "{json}"
+    );
+
+    let sparql = "# PRAGMA reasoning: datalog
+PREFIX ex: <http://example.org/>
+SELECT ?v WHERE { ex:alice ex:name ?v }";
+    let (status, json) = query(&app, "application/sparql-query", sparql.to_string(), &[]).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "SPARQL: {json}");
 }
 
 // =============================================================================

@@ -87,10 +87,16 @@ impl From<RecordedReasoningTally> for fluree_db_core::tracking::ReasoningTally {
             duration_ms: r.duration_ms,
             // Not carried: adding them would change the positional wire form
             // of records already in the log. A retried submission reports the
-            // cap without naming its rules.
+            // cap without naming its rules, which rule set ran, or over
+            // which data.
             capped_rules: Vec::new(),
             pending_rules: Vec::new(),
             evaluation_time: None,
+            rules_fired: std::collections::BTreeMap::new(),
+            rule_set: None,
+            rules: Vec::new(),
+            rules_source: None,
+            data: None,
         }
     }
 }
@@ -101,7 +107,7 @@ impl From<&TrackingTally> for RecordedTally {
             time: t.time.clone(),
             fuel: t.fuel,
             policy: t.policy.clone(),
-            reasoning: t.reasoning.as_ref().map(RecordedReasoningTally::from),
+            reasoning: t.reasoning.as_deref().map(RecordedReasoningTally::from),
         }
     }
 }
@@ -116,7 +122,7 @@ impl From<RecordedTally> for TrackingTally {
             // transaction tally, so it is deliberately absent from the recorded
             // mirror — adding a field would shift every postcard byte offset.
             policy_enforcement: None,
-            reasoning: r.reasoning.map(Into::into),
+            reasoning: r.reasoning.map(|r| Box::new(r.into())),
             // Likewise read-path only (SQL pushdown statements, and the count
             // of any the response elided).
             sql: None,

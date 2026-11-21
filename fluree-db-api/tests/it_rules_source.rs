@@ -277,3 +277,186 @@ async fn rule_in_named_graph_without_rules_source_is_ignored() {
          discovered; got an unexpected derived charlie: {results:?}"
     );
 }
+
+/// The tracked `reasoning` block of a grandparent query over `ledger`.
+async fn grandparent_tally(
+    fluree: &fluree_db_api::Fluree,
+    ledger: &fluree_db_api::LedgerState,
+) -> fluree_db_api::ReasoningTally {
+    let view = fluree_db_api::GraphDb::from_ledger_state(ledger);
+    view.query(fluree)
+        .jsonld(&json!({
+            "@context": {"ex": "http://example.org/"},
+            "select": "?grandparent",
+            "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+            "reasoning": "datalog",
+            "opts": {"meta": true}
+        }))
+        .execute_tracked()
+        .await
+        .expect("tracked query")
+        .reasoning
+        .expect("a reasoning query reports its reasoning")
+}
+
+/// A tracked response says what ran: the rule set by content, the facts each
+/// rule derived, and, for rules read from a configured `f:rulesSource` graph
+/// rather than the graph the query reads, that graph and the `t` it was read
+/// at. Rules stored in the queried graph itself report no source.
+#[tokio::test]
+async fn the_tally_names_the_rule_set_and_a_rules_source_graph() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let rules_iri = "http://example.org/governance/rules";
+    let ledger_id = "rules-src/tally:main";
+    let ledger = seed_rules_in_named_graph(&fluree, ledger_id, rules_iri).await;
+    let ledger = insert_family_data(&fluree, ledger).await;
+
+    let tally = grandparent_tally(&fluree, &ledger).await;
+    let source = tally
+        .rules_source
+        .expect("a rules source graph is reported");
+    assert_eq!(source.ledger, ledger_id);
+    assert_eq!(source.graph, rules_iri);
+    assert_eq!(source.t, ledger.t());
+    let configured = tally.rule_set.expect("rule set reported");
+    assert_eq!(configured.len(), 64, "SHA-256 hex: {configured}");
+    assert_eq!(
+        tally.rules_fired.get("http://example.org/grandparentRule"),
+        Some(&1),
+        "{:?}",
+        tally.rules_fired
+    );
+
+    // The same rule stored in the default graph, which the query reads.
+    let local_id = "rules-src/tally-local:main";
+    let local = genesis_ledger(&fluree, local_id);
+    let local = fluree
+        .insert(
+            local,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:grandparentRule",
+                "f:rule": {"@type": "@json", "@value": {
+                    "@context": {"ex": "http://example.org/"},
+                    "where":    {"@id": "?p", "ex:parent": {"ex:parent": "?g"}},
+                    "insert":   {"@id": "?p", "ex:grandparent": {"@id": "?g"}}
+                }}
+            }),
+        )
+        .await
+        .expect("store rule")
+        .ledger;
+    let local = insert_family_data(&fluree, local).await;
+    let tally = grandparent_tally(&fluree, &local).await;
+    assert_eq!(tally.rules_source, None);
+    assert_eq!(
+        tally.rule_set.as_deref(),
+        Some(configured.as_str()),
+        "the same rule, by id and text, is the same rule set wherever it is stored"
+    );
+}
+
+/// The tracked `reasoning` block of a grandparent query whose `from` is
+/// `from` (a ledger address, or several for a dataset).
+async fn grandparent_tally_from(
+    fluree: &fluree_db_api::Fluree,
+    from: serde_json::Value,
+) -> fluree_db_api::ReasoningTally {
+    fluree
+        .query_from()
+        .jsonld(&{
+            let mut q = json!({
+                "@context": {"ex": "http://example.org/"},
+                "select": "?grandparent",
+                "where":  {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
+                "reasoning": "datalog"
+            });
+            // A dataset is given as `{"from": …, "fromNamed": […]}`: rules run
+            // over a default graph of one graph (#2463), so the other ledger is
+            // a named graph, not a second `from`.
+            match &from {
+                serde_json::Value::Object(dataset) => {
+                    for (k, v) in dataset {
+                        q[k] = v.clone();
+                    }
+                }
+                _ => q["from"] = from.clone(),
+            }
+            q
+        })
+        .track_all()
+        .execute_tracked()
+        .await
+        .unwrap_or_else(|e| panic!("tracked query from {from}: {e:?}"))
+        .reasoning
+        .unwrap_or_else(|| panic!("a reasoning query from {from} reports its reasoning"))
+}
+
+/// A tracked response names the data the rules ran over by the commit that
+/// produced the queried `t`: the head's own commit for a query at the head,
+/// and the earlier commit for one pinned by `t` or by commit, on the single
+/// view and the dataset path alike.
+#[tokio::test]
+async fn the_tally_names_the_data_commit_the_rules_ran_over() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let rules_iri = "http://example.org/governance/rules";
+    let ledger_id = "rules-src/data-commit:main";
+    let ledger = seed_rules_in_named_graph(&fluree, ledger_id, rules_iri).await;
+    let family = fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/"},
+                "@graph": [
+                    {"@id": "ex:alice", "ex:parent": {"@id": "ex:bob"}},
+                    {"@id": "ex:bob",   "ex:parent": {"@id": "ex:charlie"}}
+                ]
+            }),
+        )
+        .await
+        .expect("insert family data");
+    let pinned = family.receipt.clone();
+    let head = fluree
+        .insert(
+            family.ledger,
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:dana", "ex:age": 7}),
+        )
+        .await
+        .expect("a later commit")
+        .receipt;
+    assert!(head.t > pinned.t, "{} > {}", head.t, pinned.t);
+    let other_id = "rules-src/data-commit-other:main";
+    fluree
+        .insert(
+            genesis_ledger(&fluree, other_id),
+            &json!({"@context": {"ex": "http://example.org/"}, "@id": "ex:x", "ex:p": 1}),
+        )
+        .await
+        .expect("seed another ledger");
+
+    let named = |receipt: &fluree_db_api::CommitReceipt| fluree_db_api::ReasoningDataTally {
+        ledger: ledger_id.to_string(),
+        t: receipt.t,
+        commit_id: Some(receipt.commit_id.to_string()),
+    };
+    let at_t = format!("{ledger_id}@t:{}", pinned.t);
+    let at_commit = format!("{ledger_id}@commit:{}", pinned.commit_id);
+    for (from, expected, what) in [
+        (json!(ledger_id), named(&head), "the head"),
+        (json!(at_t), named(&pinned), "pinned by t"),
+        (json!(at_commit), named(&pinned), "pinned by commit"),
+        (
+            json!({"from": [ledger_id], "fromNamed": [other_id]}),
+            named(&head),
+            "a dataset at the head",
+        ),
+        (
+            json!({"from": [at_t], "fromNamed": [other_id]}),
+            named(&pinned),
+            "a dataset pinned by t",
+        ),
+    ] {
+        let tally = grandparent_tally_from(&fluree, from).await;
+        assert_eq!(tally.data, Some(expected), "{what}");
+    }
+}

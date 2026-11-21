@@ -71,7 +71,7 @@ pub async fn run_jsonld_subquery(
             fuel: response.fuel,
             policy: response.policy.clone(),
             policy_enforcement: response.policy_enforcement.clone(),
-            reasoning: response.reasoning.clone(),
+            reasoning: response.reasoning.clone().map(Box::new),
             sql: response.sql.clone(),
             sql_elided: response.sql_elided,
         };
@@ -141,7 +141,7 @@ pub async fn run_sparql_subquery(
             fuel: response.fuel,
             policy: response.policy.clone(),
             policy_enforcement: response.policy_enforcement.clone(),
-            reasoning: response.reasoning.clone(),
+            reasoning: response.reasoning.clone().map(Box::new),
             sql: response.sql.clone(),
             sql_elided: response.sql_elided,
         };

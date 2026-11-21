@@ -72,5 +72,5 @@ pub use query::{
     ConstructTemplate, ListEntryVars, PostValues, Query, QueryOutput, Restriction,
     TemplateReification, UngroupedProjection,
 };
-pub use reasoning::{ReasoningConfig, ReasoningModes};
+pub use reasoning::{ReasoningConfig, ReasoningModes, RulesFrom};
 pub use triple::{Ref, Term, TriplePattern};

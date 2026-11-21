@@ -12,6 +12,7 @@ use fluree_db_core::graph_registry::{names_config_graph, txn_meta_graph_iri};
 use fluree_db_core::{ContentId, LedgerId};
 use fluree_db_ledger::LedgerState;
 use fluree_db_policy::PolicyArtifactWire;
+pub use fluree_db_query::datalog_rules::{ImportOrigin, ImportedRule, ImportedRules, RuleLanguage};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -481,55 +482,62 @@ fn literal_to_flake_value(
 
 /// Term-neutral wire form for a datalog rules artifact.
 ///
-/// Rules are JSON-LD documents — IRI references inside `where` /
-/// `insert` patterns are resolved against the data ledger's
-/// snapshot at parse time by
-/// [`fluree_db_query::datalog_rules::parse_query_time_rule`], the
-/// same path query-time rules from `opts.rules` use. We therefore
-/// just carry the raw JSON bodies on the wire; no Sid mapping is
-/// performed up front.
+/// A rule's text names its terms by IRI (a JSON-LD body with its own
+/// `@context`, or a SPARQL `CONSTRUCT` with its `PREFIX`es), and the
+/// query crate parses it against the data ledger's snapshot, so the
+/// wire carries each rule as M stores it: the IRI of its subject, its
+/// language and its source text. No Sid mapping is done up front.
 ///
-/// The materializer scans M's rules graph for `f:rule` flakes
-/// whose object is `FlakeValue::Json` (the only form the rule
-/// extractor recognises) and emits one `String` per rule.
+/// The materializer reads every `f:rule` value on M's rules graph with
+/// [`fluree_db_query::datalog_rules::stored_rule_source`], the same
+/// reading the data ledger's own extractor uses, so a rule runs the
+/// same wherever it is stored, and a value that is neither `@json` nor
+/// `f:sparql` fails the request rather than being skipped.
 #[derive(Debug, Clone)]
 pub struct RulesArtifactWire {
     /// Provenance for diagnostics and cache key derivation.
     pub origin: WireOrigin,
-    /// Raw JSON-LD bodies of each `f:rule` definition discovered
-    /// on M's rules graph. Order preserves the materializer's
-    /// scan order; deduplication is the consumer's concern.
-    pub rules: Vec<String>,
+    /// Each `f:rule` value on M's rules graph. Order preserves the
+    /// materializer's scan order.
+    pub rules: Vec<ImportedRule>,
 }
 
 impl RulesArtifactWire {
-    /// Decode each rule body into a `serde_json::Value` ready for
-    /// `execute_datalog_rules_with_query_rules`'s
-    /// `query_time_rules` slot.
+    /// The rules as a query runs them: stored rules, named by their
+    /// IRI, with the ledger, graph and `t` they were read from, as a
+    /// configured `f:rulesSource` imports them (beside the data ledger's
+    /// own). A query's `rulesFrom` sets
+    /// [`ImportOrigin::RulesFrom`](fluree_db_query::datalog_rules::ImportOrigin::RulesFrom)
+    /// on the result.
     ///
-    /// **Fail-closed**: a single malformed entry returns
-    /// [`super::CrossLedgerError::TranslationFailed`] rather than
-    /// silently dropping the rule. Cross-ledger governance is
-    /// administrator-authored — silently weakening the configured
-    /// reasoning model would be the worst possible behaviour. The
-    /// per-query path that maps `opts.rules` *does* tolerate
-    /// individual bad rules, but that's a self-service surface
-    /// where the author is the requester.
-    pub fn parsed_rules(&self) -> Result<Vec<serde_json::Value>, super::CrossLedgerError> {
-        let mut out = Vec::with_capacity(self.rules.len());
-        for (idx, raw) in self.rules.iter().enumerate() {
-            match serde_json::from_str(raw) {
-                Ok(v) => out.push(v),
-                Err(e) => {
-                    return Err(super::CrossLedgerError::TranslationFailed {
-                        ledger_id: self.origin.model_ledger_id.clone(),
-                        graph_iri: self.origin.graph_iri.clone(),
-                        detail: format!("malformed cross-ledger rule at index {idx}: {e}"),
-                    });
-                }
+    /// **Fail-closed**: a JSON-LD rule whose text is not JSON returns
+    /// [`super::CrossLedgerError::TranslationFailed`] naming the rule,
+    /// rather than dropping it. Cross-ledger governance is
+    /// administrator-authored, and silently weakening the configured
+    /// reasoning model would be the worst possible behaviour. A rule
+    /// that is well-formed but does not parse as a rule fails the query
+    /// when the rule set loads, naming the rule and this ledger.
+    pub fn imported_rules(&self) -> Result<ImportedRules, super::CrossLedgerError> {
+        for rule in &self.rules {
+            if rule.language != RuleLanguage::JsonLd {
+                continue;
+            }
+            if let Err(e) = serde_json::from_str::<serde::de::IgnoredAny>(&rule.source) {
+                return Err(super::CrossLedgerError::TranslationFailed {
+                    ledger_id: self.origin.model_ledger_id.clone(),
+                    graph_iri: self.origin.graph_iri.clone(),
+                    detail: format!("malformed cross-ledger rule <{}>: {e}", rule.id),
+                });
             }
         }
-        Ok(out)
+        Ok(ImportedRules {
+            ledger: self.origin.model_ledger_id.clone(),
+            graph: self.origin.graph_iri.clone(),
+            t: self.origin.resolved_t,
+            commit_id: self.origin.commit_id.as_ref().map(ToString::to_string),
+            rules: self.rules.clone(),
+            origin: ImportOrigin::RulesSource,
+        })
     }
 }
 

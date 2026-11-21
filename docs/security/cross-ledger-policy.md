@@ -27,8 +27,10 @@ cross-ledger references today:
   staged namespace at validation time and rejected/accepted
   transactions on D accordingly.
 - **Cross-ledger datalog rules** (`f:rulesSource` with
-  `f:ledger`) — M's `f:rule` JSON bodies feed D's query-time
-  datalog evaluator alongside any rules D stores locally.
+  `f:ledger`) — M's `f:rule` values (JSON-LD or SPARQL) feed D's
+  query-time datalog evaluator alongside any rules D stores
+  locally. A query can also name a rules graph, at a pin, itself
+  (`rulesFrom`).
 
 This page covers configuration for all five. For the
 underlying design (resolver contract, term-space translation,
@@ -552,10 +554,11 @@ Two related bounds, both off by default:
 
 Configure `f:rulesSource` on D's `#config` under
 `f:datalogDefaults`. When the source carries `f:ledger`, the
-resolver pulls the `f:rule` JSON bodies from M's rules graph at
-query time and merges them into D's query-time datalog evaluator
-alongside any rules D stores locally and any rules supplied via
-the top-level `rules` query field.
+resolver reads the `f:rule` values in M's rules graph at query
+time, in either form D's own rules take (an `@json` rule body or
+an `f:sparql`-typed `CONSTRUCT`), and D's datalog evaluator runs
+them as stored rules alongside any rules D stores locally and any
+rules supplied via the top-level `rules` query field.
 
 ```trig
 # On model ledger M — rules in a named graph
@@ -591,20 +594,76 @@ GRAPH <urn:fluree:data:main#config> {
 
 Specifics:
 
-- Rules are **inherently term-portable** — the JSON body is a
-  JSON-LD document whose IRIs resolve at parse time against
-  D's snapshot, the same way query-time rules from the top-level
-  `rules` field are handled. No term translation step on the
-  wire.
+- Rules are **inherently term-portable**: a rule's text names
+  terms by IRI (a JSON-LD body with its `@context`, or a SPARQL
+  `CONSTRUCT` with its `PREFIX`es), resolved at parse time
+  against D's snapshot. No term translation step on the wire.
+- A rule is read the same way wherever it is stored: M's rules
+  and D's go through one reading of an `f:rule` value, and they
+  are checked as stored rules (a check that depends on what D
+  holds, such as a filter operand in a namespace D has never
+  seen, warns rather than refusing). Errors and the tracked
+  response name each rule by its IRI in M.
 - Engaging the rules still requires datalog reasoning on the
   query: either `"reasoning": "datalog"` on the JSON-LD query
   or `PRAGMA reasoning: datalog` on SPARQL.
-- **Fail-closed on malformed rules.** A bad JSON body in M's
-  rules graph errors the query rather than silently dropping
-  the rule (this differs from query-time `rules` where a single
-  bad entry only logs a warning — cross-ledger rules are
+- **Fail-closed on malformed rules.** An `f:rule` value in M's
+  rules graph that is neither an `@json` body nor an
+  `f:sparql`-typed string, or a JSON body that is not JSON,
+  fails the request (502, naming the rule) rather than being
+  skipped, and a rule that does not parse as a rule fails it
+  with a 400 naming the rule and M: cross-ledger rules are
   admin-authored, so silently weakening the configured
-  reasoning model is the worst failure mode).
+  reasoning model is the worst failure mode. Query-time `rules`
+  fail the same way.
+- **Which rules ran is reported.** The tracked `reasoning`
+  block names the rule set by content (`rule_set`) and where its
+  stored rules came from (`rules_source`: M's ledger id, the
+  graph, and the `t` M was read at), so a run can be recorded as
+  "these rules as of M's `t`, over D as of its `t`" (see
+  [Reasoning](../query/reasoning.md)).
+- M is read at its head for the request; pinning M to an
+  earlier `t` in D's config (`f:atT`) is not yet supported (see
+  Limitations).
+
+### Naming the rules per query: `rulesFrom`
+
+A query can name a rules graph itself, at a pin, instead of
+reading the one D's config names:
+`"rulesFrom": "rules:main@commit:<cid>#http://example.org/rules"`
+(SPARQL: `# PRAGMA rules-from:`). It takes the same resolver and
+the same reading of `f:rule` values as a configured
+`f:rulesSource`, and the rules it names **replace** D's stored
+rules for that query: D's own `f:rule` values and its configured
+`f:rulesSource`, local or cross-ledger, do not run, and a
+configured cross-ledger source is not read. Query-time `rules`
+still run beside them.
+
+- **Pinned or at the head.** `@commit:<cid>` and `@t:N` read M as
+  of that commit or `t` (`@time:` and `@recorded:` work too); with
+  no pin M's head is read, sharing the request's head capture for
+  M with any policy D's config reads from it. A `t` past M's head
+  is refused (400). `rules_source` in the tracked response names
+  M, the graph, the `t` the pin resolved to and the `commit_id` at
+  that `t`.
+- **Admin-only.** A query that names its rules chooses them, so
+  `rulesFrom` is refused (400) where query-time `rules` are: under
+  a non-root view policy, where D's config denies query-time rules
+  to the request (`f:allowQueryTimeRules false`), and where D's
+  config sets the request's reasoning.
+- **Failures.** What `rulesFrom` names is the request's, so a
+  ledger that is not on this instance, or a graph it does not hold
+  at that state, is reported as the same mistake in the query's own
+  `from` is (404, `err:db/LedgerNotFound` / `err:db/GraphNotFound`),
+  not as the 502 a configured source gets for a missing upstream.
+  An `f:rule` value of another datatype fails as it does for a
+  configured source (502, `TranslationFailed`); a rule that does not
+  parse fails with a 400 naming it and M; naming a system graph
+  (`#config`, `#txn-meta`, or either by IRI) is a 400.
+
+See [Datalog rules](../query/datalog-rules.md#3-stored-rules-named-per-query-rulesfrom)
+for the syntax and [Recording a rule run](../query/datalog-rules.md#recording-a-rule-run)
+for pinning a run's rules and data together.
 
 ## Limitations
 
@@ -613,7 +672,7 @@ closed when configured:
 
 | Configuration                              | Outcome |
 |--------------------------------------------|---------|
-| `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. |
+| `f:atT` (temporal pinning of M)            | Request fails with `UnsupportedFeature { feature: "f:atT", phase: "Phase 3" }`. For rules, a query can pin M itself with [`rulesFrom`](#naming-the-rules-per-query-rulesfrom). |
 | `f:trustPolicy` (commit-signer allowlist)  | Request fails with `UnsupportedFeature`. |
 | `f:rollbackGuard` (freshness constraints)  | Request fails with `UnsupportedFeature`. |
 | `opts.identity` + cross-ledger `f:policySource` **with no policy class anywhere** | Request fails with a config error. The identity is bind-only under cross-ledger (see [Identity binding](#identity-binding-under-cross-ledger-policy)) and can't select rules, so a policy class must be named on the request or in D's config. With a class available, identity-carrying requests work normally. Exception: a [virtual graph source](#virtual-graph-sources-iceberg--sql) looks the identity's classes up in M. |

@@ -1712,8 +1712,8 @@ impl Fluree {
     /// the ledger's config-graph defaults, mode precedence, the config
     /// materialization budget, config-graph datalog restrictions, the
     /// query-time rule policy gate, local and cross-ledger `f:rulesSource`,
-    /// and the `f:schemaSource` bundle (local, cross-ledger, and inline
-    /// `opts.ontology`).
+    /// the `f:schemaSource` bundle (local, cross-ledger, and inline
+    /// `opts.ontology`), and a query's `rulesFrom`.
     ///
     /// Config defaults are completed here rather than taken from the view as
     /// received: a view arrives fully prepared, config-attached but
@@ -1721,10 +1721,28 @@ impl Fluree {
     /// completed view is returned, so the caller reads any further config
     /// setting off it without resolving the config again.
     ///
+    /// Reasoning the query asks for that the ledger's config won't run for
+    /// this request is refused with a 400 rather than replaced: a mode the
+    /// config's forced `f:reasoningModes` leave out, `"none"` where they turn
+    /// reasoning on, query-time rules or an inline ontology under them, and
+    /// datalog where `f:datalogEnabled false` applies. A mode the config's
+    /// own defaults supply is not the query's doing and is not refused.
+    ///
     /// `strip_query_rules` is true when a non-root view policy applies —
     /// `!db.is_root()` for a single view, `dataset.any_non_root_policy()`
-    /// for a dataset. It strips *query-supplied* rules only; config-sourced
-    /// rules attach afterwards because they're admin-controlled.
+    /// for a dataset. A query that supplies rules there, or names a
+    /// `rulesFrom`, is refused; config-sourced rules attach afterwards
+    /// because they're admin-controlled.
+    ///
+    /// Which stored rules run is settled here, into the executable's
+    /// `ReasoningConfig` and nowhere else: the ledger's own (its query
+    /// graph's `f:rule` values, or `rules_source_g_id` for a local
+    /// `f:rulesSource`) plus `imported_rules` for a cross-ledger one; or,
+    /// when the query names a `rulesFrom`, only the rules it names, as
+    /// `imported_rules` with `ImportOrigin::RulesFrom`, with
+    /// `rules_source_g_id` cleared and the configured cross-ledger source
+    /// not read. Anything that keys on settled reasoning (the reasoning
+    /// cache, a materialized index) sees the difference there.
     pub(crate) async fn apply_reasoning_to_executable(
         &self,
         db: &GraphDb,
@@ -1735,6 +1753,13 @@ impl Fluree {
         let completed = self.complete_config_defaults(db, server_identity).await?;
         let db = &completed;
 
+        // What the query itself asked for, before the view's and the config's
+        // defaults have their say: a mode the config then won't run is
+        // refused below rather than dropped.
+        let asked = executable.reasoning.modes.mode_names();
+        let asked_none = executable.reasoning.modes.is_disabled();
+        let mut config_forced = false;
+
         // Apply wrapper reasoning if applicable
         if db.reasoning().is_some() {
             // Check query's reasoning state
@@ -1742,25 +1767,74 @@ impl Fluree {
             let query_disabled = executable.reasoning.modes.is_disabled();
 
             // Apply precedence rules. Mode replacement keeps the query's
-            // budget: wrapper modes come from config mode strings and never
-            // carry one, and whether the query budget survives is decided
-            // below by `ConfigReasoningBudget::apply` (override control),
-            // not by mode precedence.
+            // budget and evaluation time: wrapper modes come from config mode
+            // strings and never carry either, and whether the query budget
+            // survives is decided below by `ConfigReasoningBudget::apply`
+            // (override control), not by mode precedence.
             if let Some(effective) = db.effective_reasoning(query_has_reasoning, query_disabled) {
-                // Every budget field the query set has to be carried across
-                // the mode replacement, not just the two that existed first:
-                // wrapper modes come from config mode strings and never carry
-                // a budget, so anything dropped here is silently lost and the
-                // query's own ceiling never applies.
-                let (max_facts, max_seconds, max_memory_mb) = (
+                if db.config_forces_reasoning() {
+                    // The config decides this request's reasoning. Rules or
+                    // axioms the query brings would be replaced with it, so
+                    // the query is refused rather than answered without them.
+                    if !executable.reasoning.modes.rules.is_empty() {
+                        return Err(reasoning_set_by_config(effective, "add query-time rules"));
+                    }
+                    if executable.reasoning.modes.rules_from.is_some() {
+                        return Err(reasoning_set_by_config(
+                            effective,
+                            "name its own rules with rulesFrom",
+                        ));
+                    }
+                    if executable.reasoning.modes.ontology.is_some() {
+                        return Err(reasoning_set_by_config(effective, "add an inline ontology"));
+                    }
+                    config_forced = true;
+                }
+                // Every field the query set that is not a mode selection has
+                // to be carried across the mode replacement: wrapper modes
+                // never carry one, so anything dropped here is silently lost
+                // (the query's budget never applies; `NOW()` in a rule body
+                // reads the commit time instead of the query's
+                // `reasoningTime`).
+                let (max_facts, max_seconds, max_memory_mb, evaluation_time) = (
                     executable.reasoning.modes.max_facts,
                     executable.reasoning.modes.max_seconds,
                     executable.reasoning.modes.max_memory_mb,
+                    executable.reasoning.modes.evaluation_time.take(),
                 );
                 executable.reasoning.modes = effective.clone();
                 executable.reasoning.modes.max_facts = max_facts;
                 executable.reasoning.modes.max_seconds = max_seconds;
                 executable.reasoning.modes.max_memory_mb = max_memory_mb;
+                executable.reasoning.modes.evaluation_time = evaluation_time;
+            }
+        }
+
+        // A mode the query asked for that the config's forced modes leave
+        // out, or `"none"` where the config turns reasoning on, is refused:
+        // answering without it reads as "reasoning derived nothing" (or, for
+        // `none`, passes derived facts off as stored ones). A mode the
+        // config's own defaults supply is not the query's doing and stays
+        // silent.
+        if config_forced {
+            let effective = &executable.reasoning.modes;
+            let running = effective.mode_names();
+            let missing: Vec<&str> = asked
+                .iter()
+                .copied()
+                .filter(|mode| !running.contains(mode))
+                .collect();
+            if !missing.is_empty() {
+                return Err(reasoning_set_by_config(
+                    effective,
+                    &format!("turn on {}", quoted_list(&missing)),
+                ));
+            }
+            if asked_none && effective.has_any_enabled() {
+                return Err(reasoning_set_by_config(
+                    effective,
+                    "turn reasoning off (\"none\")",
+                ));
             }
         }
 
@@ -1776,10 +1850,20 @@ impl Fluree {
         if !db.datalog_override_allowed() {
             // Config override denied — force config settings
             if !db.datalog_enabled() {
+                // Datalog the query asked for (by name, or by supplying rules
+                // or a rulesFrom, which turn it on) is refused; datalog a
+                // reasoning default turned on is switched off without a word.
+                if asked.contains(&"datalog") && executable.reasoning.modes.datalog {
+                    return Err(datalog_not_allowed(CallerRules::of(
+                        &executable.reasoning.modes,
+                    )));
+                }
                 executable.reasoning.modes.datalog = false;
             }
             if !db.query_time_rules_allowed() {
-                executable.reasoning.modes.rules.clear();
+                if let Some(rules) = CallerRules::of(&executable.reasoning.modes) {
+                    return Err(query_time_rules_not_allowed(rules));
+                }
             }
         }
 
@@ -1790,16 +1874,27 @@ impl Fluree {
         // not its provenance, and a caller-invented predicate can't be
         // pre-denied. DB-stored rules and OWL reasoning are admin-controlled and
         // unaffected. See docs/security/policy-in-queries.md (Reasoning).
-        if strip_query_rules && !executable.reasoning.modes.rules.is_empty() {
-            tracing::debug!("stripping query-time datalog rules under non-root view policy");
-            executable.reasoning.modes.rules.clear();
+        //
+        // Refused rather than dropped: dropped, a query reading a derived
+        // predicate came back empty, which reads as "the rules derived nothing".
+        //
+        // A `rulesFrom` is the same grant: the caller picks the rules, here
+        // by naming where they are stored.
+        if strip_query_rules {
+            if let Some(rules) = CallerRules::of(&executable.reasoning.modes) {
+                return Err(query_time_rules_under_policy(rules));
+            }
         }
 
         // Carry the pre-resolved `f:rulesSource` graph id (if any)
         // into the executable so `compute_derived_facts` extracts
         // datalog rules from the configured graph instead of the
-        // query graph.
-        executable.reasoning.rules_source_g_id = db.rules_source_g_id();
+        // query graph. A query's `rulesFrom` replaces it.
+        let rules_from = executable.reasoning.modes.rules_from.clone();
+        executable.reasoning.rules_source_g_id = match rules_from {
+            Some(_) => None,
+            None => db.rules_source_g_id(),
+        };
 
         // Build a single per-request `ResolveCtx` so every
         // cross-ledger artifact (rules, schema, …) captured by this
@@ -1821,12 +1916,22 @@ impl Fluree {
 
         // Cross-ledger `f:rulesSource`: when M is referenced via
         // `f:ledger`, resolve M's rules graph through the
-        // cross-ledger resolver and merge the JSON rule bodies into
-        // `executable.reasoning.rules` so they pass through the
-        // existing query-time rule code path. Same-ledger references
-        // are handled above via `rules_source_g_id`.
-        self.attach_cross_ledger_rules(db, executable, &mut ctx)
-            .await?;
+        // cross-ledger resolver into `executable.reasoning.imported_rules`,
+        // which load as stored rules beside D's own. Same-ledger
+        // references are handled above via `rules_source_g_id`.
+        //
+        // A query's `rulesFrom` takes the same resolver to the rules it
+        // names, which replace the configured ones: the configured
+        // cross-ledger source is not read.
+        match rules_from {
+            Some(rules_from) => {
+                Self::attach_rules_from(&rules_from, executable, &mut ctx).await?;
+            }
+            None => {
+                self.attach_cross_ledger_rules(db, executable, &mut ctx)
+                    .await?;
+            }
+        }
 
         // Resolve `f:schemaSource` + `owl:imports` closure, if configured.
         self.attach_schema_bundle(db, executable, &mut ctx).await?;
@@ -1834,10 +1939,54 @@ impl Fluree {
         Ok(completed)
     }
 
+    /// Read the rules a query's `rulesFrom` names, at its pin (the rules
+    /// ledger's head without one), and settle them as the query's stored
+    /// rules: `executable.reasoning.imported_rules`, marked
+    /// [`ImportOrigin::RulesFrom`](crate::cross_ledger::ImportOrigin::RulesFrom),
+    /// so the ledger's own `f:rule` values are not read beside them. They
+    /// load as stored rules, named by their IRI, like a configured
+    /// cross-ledger source's, and the tally names the ledger, graph, `t` and
+    /// commit they were read at. Skipped when datalog does not run.
+    ///
+    /// What it names is the request's: a ledger that is not on this
+    /// instance, or a graph it does not hold at that `t`, is reported as the
+    /// same mistake in a query's own `from` is (404 `NotFound` /
+    /// `GraphNotFound`), and a pin raises the time-travel errors a query's
+    /// own pin does. A rule value of another datatype stays a cross-ledger
+    /// failure (`ApiError::CrossLedger`, 502), as for a configured source.
+    async fn attach_rules_from(
+        rules_from: &fluree_db_query::ir::RulesFrom,
+        executable: &mut ExecutableQuery,
+        ctx: &mut crate::cross_ledger::ResolveCtx<'_>,
+    ) -> Result<()> {
+        if !executable.reasoning.modes.datalog {
+            return Ok(());
+        }
+        let resolved = crate::cross_ledger::resolve_rules_from(rules_from, ctx).await?;
+        let crate::cross_ledger::GovernanceArtifact::Rules(wire) = &resolved.artifact else {
+            return Err(crate::error::ApiError::CrossLedger(
+                crate::cross_ledger::CrossLedgerError::TranslationFailed {
+                    ledger_id: resolved.model_ledger_id.clone(),
+                    graph_iri: resolved.graph_iri.clone(),
+                    detail: "resolver returned a non-Rules artifact for a rulesFrom request; \
+                             resolver dispatch bug"
+                        .into(),
+                },
+            ));
+        };
+        let mut imported = wire.imported_rules()?;
+        imported.origin = crate::cross_ledger::ImportOrigin::RulesFrom;
+        executable.reasoning.imported_rules = Some(std::sync::Arc::new(imported));
+        Ok(())
+    }
+
     /// If the resolved datalog config carries a cross-ledger
     /// `f:rulesSource`, dispatch through the cross-ledger resolver
-    /// and append the parsed JSON rules to
-    /// `executable.reasoning.rules`. Short-circuits when:
+    /// and attach M's rules, with the ledger, graph and `t` they were
+    /// read at, as `executable.reasoning.imported_rules`. They are not
+    /// query-time rules: the policy gate that strips caller-supplied
+    /// rules does not apply to them, and they parse as stored rules.
+    /// Short-circuits when:
     /// - the view has no resolved config,
     /// - no `f:rulesSource` is configured,
     /// - `f:rulesSource` is purely local (`f:ledger` unset — handled
@@ -1886,11 +2035,7 @@ impl Fluree {
                 },
             ));
         };
-        executable
-            .reasoning
-            .modes
-            .rules
-            .extend(wire.parsed_rules()?);
+        executable.reasoning.imported_rules = Some(std::sync::Arc::new(wire.imported_rules()?));
         Ok(())
     }
 
@@ -2175,9 +2320,11 @@ impl Fluree {
         prepare_config.planning = prepare_config.planning.with_dataset_scope(union.as_ref());
         let prepare_config =
             prepare_config.for_request(Some(tracker), options.cancellation.as_ref());
-        let prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
+        let mut prepared = prepare_execution_with_config(db_ref, executable, &prepare_config)
             .await
             .map_err(|e| e.name_variables(vars))?;
+        // A tracked lane: its tally reaches the caller.
+        name_reasoned_data_commit(db, &mut prepared, tracker).await;
 
         crate::graph_source::pin_graph_source_times([db], r2rml.table_provider)?;
 
@@ -2193,6 +2340,131 @@ impl Fluree {
         config.dataset = union.as_ref();
 
         execute_prepared(db_ref, vars, prepared, config).await
+    }
+}
+
+/// Name the data a tracked reasoning run read by the commit that produced its
+/// `t`, for the tally's `data` block. Only when the request is tracked and its
+/// query materialized: off the head this is an index read, which an untracked
+/// query (whose tally nobody reads) never pays.
+pub(crate) async fn name_reasoned_data_commit(
+    db: &GraphDb,
+    prepared: &mut fluree_db_query::execute::PreparedExecution,
+    tracker: &Tracker,
+) {
+    if tracker.is_enabled() && prepared.reasoning_diagnostics.is_some() {
+        prepared.data_commit_id = db.commit_id_at_t().await.map(|id| id.to_string());
+    }
+}
+
+/// The rules a query brings itself: query-time `rules`, a `rulesFrom` rules
+/// source, or both. Either way the caller picks the rules a run reasons
+/// with, so both are admin-only, refused by the same gates, and turn datalog
+/// on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CallerRules {
+    QueryTime,
+    RulesFrom,
+    Both,
+}
+
+impl CallerRules {
+    pub(crate) fn of(modes: &fluree_db_query::ir::ReasoningModes) -> Option<Self> {
+        match (!modes.rules.is_empty(), modes.rules_from.is_some()) {
+            (false, false) => None,
+            (true, false) => Some(Self::QueryTime),
+            (false, true) => Some(Self::RulesFrom),
+            (true, true) => Some(Self::Both),
+        }
+    }
+
+    /// The rules, as a refusal names them.
+    fn named(self) -> &'static str {
+        match self {
+            Self::QueryTime => "query-time datalog rules",
+            Self::RulesFrom => "rules named with rulesFrom",
+            Self::Both => "query-time datalog rules and rules named with rulesFrom",
+        }
+    }
+
+    /// Why datalog runs, as a refusal says it.
+    fn turn_on_datalog(self) -> &'static str {
+        match self {
+            Self::QueryTime => "query-time rules turn it on",
+            Self::RulesFrom => "rulesFrom turns it on",
+            Self::Both => "query-time rules and rulesFrom turn it on",
+        }
+    }
+}
+
+/// The refusal for query-time `rules`, or a `rulesFrom`, under a view policy.
+/// Query-time rules were dropped without a word, and a query reading a
+/// derived predicate came back empty.
+pub(crate) fn query_time_rules_under_policy(rules: CallerRules) -> ApiError {
+    ApiError::invalid_query(format!(
+        "{} need an unrestricted view: under a view policy, a caller-supplied rule could \
+         derive a visible fact from data the policy hides. Store the rules in the ledger as \
+         f:rule values, which run under policy, or query without a policy",
+        rules.named()
+    ))
+}
+
+/// The refusal for query-time `rules`, or a `rulesFrom`, the ledger's config
+/// does not allow for this request (`f:allowQueryTimeRules false` under an
+/// override control that denies it). Query-time rules were dropped without a
+/// word, too.
+pub(crate) fn query_time_rules_not_allowed(rules: CallerRules) -> ApiError {
+    ApiError::invalid_query(format!(
+        "this ledger's config does not allow {} for this request \
+         (f:allowQueryTimeRules false). Store the rules in the ledger as f:rule values, or \
+         ask with an identity its override control allows",
+        rules.named()
+    ))
+}
+
+/// The refusal for reasoning a query asks for that the ledger's config does
+/// not let it have: the config's `f:reasoningDefaults` apply to this request
+/// under an `f:overrideControl` that does not allow it to change them, and
+/// `asked` (e.g. "turn on 'datalog'") is what the query wanted. It used to be
+/// answered with the config's reasoning instead, without a word.
+fn reasoning_set_by_config(config: &fluree_db_query::ir::ReasoningModes, asked: &str) -> ApiError {
+    let modes = config.mode_names();
+    let modes = if modes.is_empty() {
+        "none".to_string()
+    } else {
+        modes.join(", ")
+    };
+    ApiError::invalid_query(format!(
+        "this ledger's config sets the reasoning for this request (f:reasoningModes {modes}, \
+         under an f:overrideControl that does not allow this request to change it), so a \
+         query cannot {asked}. Leave it out of the query, or ask with an identity the \
+         override control allows"
+    ))
+}
+
+/// The refusal for datalog a query asks for (by name, or with query-time
+/// `rules` or a `rulesFrom`, which turn it on) where the ledger's config turns
+/// datalog off for the request (`f:datalogEnabled false` under an override
+/// control that denies it). It used to be switched off without a word.
+fn datalog_not_allowed(by_rules: Option<CallerRules>) -> ApiError {
+    let how = by_rules.map_or(String::new(), |rules| {
+        format!(" ({})", rules.turn_on_datalog())
+    });
+    ApiError::invalid_query(format!(
+        "this ledger's config does not allow a query to turn on reasoning mode 'datalog'{how} \
+         for this request (f:datalogEnabled false, under an f:overrideControl that does not \
+         allow this request to change it). Leave it out of the query, or ask with an \
+         identity the override control allows"
+    ))
+}
+
+/// `'a'`, `'a' and 'b'`, `'a', 'b' and 'c'`.
+fn quoted_list(items: &[&str]) -> String {
+    let quoted: Vec<String> = items.iter().map(|item| format!("'{item}'")).collect();
+    match quoted.split_last() {
+        None => String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{} and {last}", rest.join(", ")),
     }
 }
 

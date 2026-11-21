@@ -119,12 +119,25 @@ For each setting group independently:
 
 | Ledger-wide | Per-graph | Query (identity) | Effective | Why |
 |-------------|-----------|-------------------|-----------|-----|
-| `modes: [rdfs]`, OverrideNone | (none) | `reasoning: [owl2rl]` (any) | **rdfs** | No overrides |
+| `modes: [rdfs]`, OverrideNone | (none) | (none) (any) | **rdfs** | Config default |
+| `modes: [rdfs]`, OverrideNone | (none) | `reasoning: [rdfs]` (any) | **rdfs** | Asks for what config runs |
+| `modes: [rdfs]`, OverrideNone | (none) | `reasoning: [owl2rl]` (any) | **400** | No overrides; refused, not swapped |
+| `modes: [rdfs]`, OverrideNone | (none) | `reasoning: "none"` (any) | **400** | No overrides; refused, not swapped |
 | `modes: [rdfs]`, OverrideAll | (none) | `reasoning: [owl2rl]` (any) | **owl2rl** | Override allowed |
 | `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2rl]` (alice) | **owl2rl** | Alice authorized |
-| `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2rl]` (bob) | **rdfs** | Bob not authorized |
+| `modes: [rdfs]`, IdentityRestricted({alice}) | (none) | `reasoning: [owl2rl]` (bob) | **400** | Bob not authorized |
 | `modes: [rdfs]`, OverrideAll | `modes: [owl2rl]` | (none) | **owl2rl** | Per-graph overrides |
 | `modes: [rdfs]`, OverrideNone | `modes: [owl2rl]` | (none) | **rdfs** | OverrideNone blocks per-graph |
+
+A query denied an override is refused with a 400 naming what it asked for,
+rather than answered with the configured modes: a mode they leave out,
+`"none"` where they turn reasoning on, or query-time `rules`, a `rulesFrom`
+or an inline `ontology`. A query that asks for no reasoning, or only for modes the config
+runs anyway, gets the configured modes. Likewise, under `f:datalogDefaults`
+with `f:datalogEnabled false`, a denied query that asks for datalog (by name,
+or with `rules` or a `rulesFrom`) is refused. A query's budget (`reasoningBudget`) is not
+refused: where it may not override, the configured budget replaces it, and a
+capped run says so in the tracked `reasoning` block.
 
 ### SHACL (`f:shaclDefaults`)
 

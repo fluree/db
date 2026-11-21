@@ -1096,13 +1096,14 @@ async fn datalog_query_time_rules_merged_with_db_rules() {
 }
 
 /// Security: query-time datalog rule injection is admin-only. Under a non-root
-/// view policy, caller-supplied `rules` are stripped — a rule with a viewable
+/// view policy, caller-supplied `rules` are refused — a rule with a viewable
 /// head could otherwise launder hidden data the policy author never anticipated
 /// (the derived flake is filtered only by its own (s,p,o), not provenance, and
 /// a caller-invented predicate can't be pre-denied). DB-stored rules and OWL
-/// reasoning are admin-controlled and unaffected.
+/// reasoning are admin-controlled and unaffected. Refused rather than dropped:
+/// dropped, the query below answered empty, which reads as "no grandparent".
 #[tokio::test]
-async fn datalog_query_time_rules_stripped_under_non_root_policy() {
+async fn datalog_query_time_rules_refused_under_non_root_policy() {
     let fluree = FlureeBuilder::memory().build_memory();
     let ledger_id = "datalog/query-time-rules-policy";
     let ledger0 = genesis_ledger(&fluree, ledger_id);
@@ -1140,8 +1141,8 @@ async fn datalog_query_time_rules_stripped_under_non_root_policy() {
     );
 
     // Under a permissive but NON-ROOT view policy (allow-all, so base data is
-    // fully visible), the rule is stripped → no derived grandparent. The only
-    // reason it can't fire is the strip, not data filtering.
+    // fully visible), the rule is refused with a 400 that says why. The only
+    // reason it can't run is the policy, not data filtering.
     let policy_q = json!({
         "@context": {"ex": "http://example.org/"},
         "from": ledger_id,
@@ -1152,16 +1153,43 @@ async fn datalog_query_time_rules_stripped_under_non_root_policy() {
         "select": "?grandparent",
         "where": {"@id": "ex:alice", "ex:grandparent": "?grandparent"},
         "reasoning": "datalog",
-        "rules": rules
+        "rules": rules.clone()
     });
-    let policed = fluree
+    let err = fluree
         .query_connection(&policy_q)
         .await
-        .expect("policed query");
-    let policed_rows = normalize_rows(&policed.to_jsonld(&ledger.snapshot).unwrap());
+        .expect_err("query-time rules under a non-root view policy are refused");
+    assert_eq!(err.status_code(), 400, "{err}");
     assert!(
-        !policed_rows.contains(&json!("ex:charlie")),
-        "query-time datalog rules must be stripped under a non-root view policy, got {policed_rows:?}"
+        err.to_string()
+            .contains("query-time datalog rules need an unrestricted view"),
+        "{err}"
+    );
+
+    // The same rule stored in the ledger runs under the same policy.
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    fluree
+        .insert(
+            ledger,
+            &json!({
+                "@context": {"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"},
+                "@id": "ex:grandparentRule",
+                "f:rule": {"@type": "@json", "@value": rules[0]}
+            }),
+        )
+        .await
+        .expect("store rule");
+    let mut stored_q = policy_q;
+    stored_q.as_object_mut().unwrap().remove("rules");
+    let stored = fluree
+        .query_connection(&stored_q)
+        .await
+        .expect("stored rules under policy");
+    let ledger = fluree.ledger(ledger_id).await.unwrap();
+    let stored_rows = normalize_rows(&stored.to_jsonld(&ledger.snapshot).unwrap());
+    assert!(
+        stored_rows.contains(&json!("ex:charlie")),
+        "a stored rule runs under a non-root view policy, got {stored_rows:?}"
     );
 }
 

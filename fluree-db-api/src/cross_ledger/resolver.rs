@@ -15,6 +15,7 @@ use super::types::{
 };
 use super::CrossLedgerError;
 use fluree_db_core::ledger_config::GraphSourceRef;
+use fluree_db_core::TimeSpec;
 use fluree_db_nameservice::NsRecord;
 use std::sync::Arc;
 
@@ -110,30 +111,8 @@ pub async fn resolve_graph_ref(
                 detail: "cross-ledger references require an explicit f:graphSelector".into(),
             })?;
 
-    // (2) Canonicalize via the nameservice. Same-instance is enforced
-    // implicitly: anything outside our nameservice can't be looked
-    // up. (Cross-instance federation would surface here as a separate
-    // resolver path; Phase next.)
-    let ns_record: NsRecord = match ctx.fluree.nameservice().lookup(raw_ledger_ref).await {
-        Ok(Some(record)) if !record.retracted => record,
-        Ok(Some(_retracted)) => {
-            return Err(CrossLedgerError::ModelLedgerMissing {
-                ledger_id: raw_ledger_ref.to_string(),
-            });
-        }
-        Ok(None) => {
-            return Err(CrossLedgerError::ModelLedgerMissing {
-                ledger_id: raw_ledger_ref.to_string(),
-            });
-        }
-        Err(e) => {
-            return Err(CrossLedgerError::TranslationFailed {
-                ledger_id: raw_ledger_ref.to_string(),
-                graph_iri: graph_iri.to_string(),
-                detail: format!("nameservice lookup failed: {e}"),
-            });
-        }
-    };
+    // (2) Canonicalize via the nameservice.
+    let ns_record = model_record(raw_ledger_ref, graph_iri, ctx).await?;
     let canonical_ledger_id = ns_record.ledger_id.clone();
 
     // (3) Reserved-graph guard against the *canonical* id so an alias
@@ -147,18 +126,188 @@ pub async fn resolve_graph_ref(
     // for the duration of the request. Per-model entries are written
     // once and reused; subsequent unpinned references to the same M
     // in the same request hit the cache.
-    let head = ctx
-        .resolved_heads
-        .entry(canonical_ledger_id.clone())
+    let head = captured_head(&ns_record, ctx);
+
+    resolve_at(
+        kind,
+        canonical_ledger_id.as_str(),
+        graph_iri,
+        head,
+        true,
+        ctx,
+    )
+    .await
+}
+
+/// Resolve the graph a query's `rulesFrom` names, in the ledger it names,
+/// at its pin (the head when it has none), to the rules stored there.
+///
+/// It takes the path a configured cross-ledger `f:rulesSource` takes, with
+/// the query's pin: the ledger is canonicalized through the nameservice, a
+/// system graph is refused, and the read is memoized and cached under the
+/// head it resolved to. An unpinned read shares the request's head capture
+/// for that ledger, so policy and rules read one head of it. A pinned read
+/// resolves its own ([`pinned_head`]) and leaves the capture alone.
+///
+/// What it names is the request's, not the config's, so a ledger or graph
+/// that is not there is reported as the same mistake in a query's own `from`
+/// is ([`rules_from_error`]), not as a missing upstream.
+pub(crate) async fn resolve_rules_from(
+    rules_from: &fluree_db_query::ir::RulesFrom,
+    ctx: &mut ResolveCtx<'_>,
+) -> crate::error::Result<Arc<ResolvedGraph>> {
+    let graph_iri = rules_from.graph_iri();
+    let ns_record = model_record(rules_from.ledger().as_str(), graph_iri, ctx)
+        .await
+        .map_err(rules_from_error)?;
+    let canonical_ledger_id = ns_record.ledger_id.clone();
+    reject_if_reserved_graph(&canonical_ledger_id, graph_iri).map_err(rules_from_error)?;
+    let (head, cacheable) = match rules_from.at() {
+        None | Some(TimeSpec::Latest) => (captured_head(&ns_record, ctx), true),
+        Some(spec) => {
+            let head = pinned_head(ctx, &canonical_ledger_id, spec).await?;
+            // Without a commit the key names a `t` alone, which a later
+            // rebase can give other contents: read it, but don't keep it
+            // past this request.
+            let cacheable = head.commit_id.is_some();
+            (head, cacheable)
+        }
+    };
+    resolve_at(
+        ArtifactKind::Rules,
+        canonical_ledger_id.as_str(),
+        graph_iri,
+        head,
+        cacheable,
+        ctx,
+    )
+    .await
+    .map_err(rules_from_error)
+}
+
+/// A resolution failure of a `rulesFrom`, reported as the caller's mistake
+/// where it is one, as a query's own `from` reports it: a ledger that is not
+/// on this instance is `NotFound` (404, `LedgerNotFound`), a graph it does
+/// not hold at the state read is `GraphNotFound` (404), and a system graph
+/// named by its IRI is refused as the `#config` / `#txn-meta` keywords are
+/// (400). A configured `f:rulesSource` names its upstream in the ledger's
+/// config, so the same failures stay 502s there. Any other failure (a rule
+/// value of another datatype, a cycle, a read that fails) is the rules
+/// ledger's, not the request's, and stays a cross-ledger failure.
+fn rules_from_error(e: CrossLedgerError) -> crate::error::ApiError {
+    use crate::error::ApiError;
+    match e {
+        CrossLedgerError::ModelLedgerMissing { ledger_id } => {
+            ApiError::NotFound(format!("{ledger_id} (the ledger rulesFrom names)"))
+        }
+        CrossLedgerError::GraphMissingAtT {
+            ledger_id,
+            graph_iri,
+            resolved_t,
+        } => ApiError::GraphNotFound(format!(
+            "{graph_iri} in ledger '{ledger_id}' at t={resolved_t} (the graph rulesFrom names)"
+        )),
+        CrossLedgerError::ReservedGraphSelected { graph_iri } => ApiError::invalid_query(format!(
+            "rulesFrom names the system graph <{graph_iri}>, which holds no rules; name \
+                 the graph that holds the f:rule values"
+        )),
+        other => ApiError::CrossLedger(other),
+    }
+}
+
+/// The nameservice record of a model ledger named `raw_ledger_ref`.
+/// Same-instance is enforced implicitly: anything outside our nameservice
+/// can't be looked up. (Cross-instance federation would surface here as a
+/// separate resolver path; Phase next.)
+async fn model_record(
+    raw_ledger_ref: &str,
+    graph_iri: &str,
+    ctx: &ResolveCtx<'_>,
+) -> Result<NsRecord, CrossLedgerError> {
+    match ctx.fluree.nameservice().lookup(raw_ledger_ref).await {
+        Ok(Some(record)) if !record.retracted => Ok(record),
+        Ok(_) => Err(CrossLedgerError::ModelLedgerMissing {
+            ledger_id: raw_ledger_ref.to_string(),
+        }),
+        Err(e) => Err(CrossLedgerError::TranslationFailed {
+            ledger_id: raw_ledger_ref.to_string(),
+            graph_iri: graph_iri.to_string(),
+            detail: format!("nameservice lookup failed: {e}"),
+        }),
+    }
+}
+
+/// The request's head for a model ledger: captured on its first reference
+/// and reused by every later unpinned one.
+fn captured_head(ns_record: &NsRecord, ctx: &mut ResolveCtx<'_>) -> ModelHead {
+    ctx.resolved_heads
+        .entry(ns_record.ledger_id.clone())
         .or_insert_with(|| ModelHead {
             t: ns_record.commit_t,
             commit_id: ns_record.commit_head_id.clone(),
         })
-        .clone();
+        .clone()
+}
 
+/// The head a pin names on a model ledger: the `t` it resolves to against
+/// the ledger's current state (`@t:` as given, `@commit:` its commit's `t`,
+/// `@time:` / `@recorded:` the last commit at or before that time), and the
+/// commit at that `t`. A `t` past the head is refused, as reading a ledger
+/// there is. The commit is left out, rather than guessed, where the history
+/// does not name one commit at that `t` (a rebased ledger can hold two).
+async fn pinned_head(
+    ctx: &ResolveCtx<'_>,
+    canonical_ledger_id: &fluree_db_core::LedgerId,
+    spec: &TimeSpec,
+) -> crate::error::Result<ModelHead> {
+    let handle = ctx
+        .fluree
+        .ledger_cached(canonical_ledger_id.as_str())
+        .await?;
+    let view = handle.snapshot().await;
+    let (head_t, head_commit) = (view.t, view.head_commit_id.clone());
+    let state = view.to_ledger_state();
+    let t = crate::time_resolve::resolve_time_spec(&state, spec).await?;
+    if t > head_t {
+        return Err(crate::error::ApiError::Ledger(
+            fluree_db_ledger::LedgerError::future_time(canonical_ledger_id.as_str(), t, head_t),
+        ));
+    }
+    if t < 1 {
+        return Err(crate::error::ApiError::invalid_query(format!(
+            "rulesFrom pins ledger '{canonical_ledger_id}' at t={t}; a ledger's first commit \
+             is t=1"
+        )));
+    }
+    if t == head_t {
+        return Ok(ModelHead {
+            t,
+            commit_id: head_commit,
+        });
+    }
+    let commit_id =
+        crate::ledger_view::resolve_t_to_commit_id(&state.snapshot, &*state.novelty, t, head_t)
+            .await
+            .map_err(|e| tracing::debug!(t, error = %e, "rulesFrom pin names no single commit"))
+            .ok();
+    Ok(ModelHead { t, commit_id })
+}
+
+/// Resolve `graph_iri` of the canonical model ledger at `head` to a `kind`
+/// artifact: memo, governance cache, cycle check, materializer. `cacheable`
+/// false keeps the result out of the per-instance governance cache (it is
+/// still memoized for the request).
+async fn resolve_at(
+    kind: ArtifactKind,
+    canonical_ledger_id: &str,
+    graph_iri: &str,
+    head: ModelHead,
+    cacheable: bool,
+    ctx: &mut ResolveCtx<'_>,
+) -> Result<Arc<ResolvedGraph>, CrossLedgerError> {
     let key: ResolutionKey = (
         kind,
-        canonical_ledger_id.clone().to_string(),
+        canonical_ledger_id.to_string(),
         graph_iri.to_string(),
         head.clone(),
     );
@@ -177,7 +326,10 @@ pub async fn resolve_graph_ref(
     // references the same (M, graph, t). Writeback below on miss.
     // The per-request memo is populated alongside so subsequent
     // resolutions in this same request short-circuit at (5a).
-    if let Some(hit) = ctx.fluree.governance_cache().get(&key) {
+    if let Some(hit) = cacheable
+        .then(|| ctx.fluree.governance_cache().get(&key))
+        .flatten()
+    {
         ctx.memo.insert(key.clone(), hit.clone());
         return Ok(hit);
     }
@@ -189,7 +341,7 @@ pub async fn resolve_graph_ref(
 
     // Materialize. Slice 3 provides the dispatch shape; the actual
     // projector lands in slice 4.
-    let materialize_result = materialize(kind, &canonical_ledger_id, graph_iri, &head, ctx).await;
+    let materialize_result = materialize(kind, canonical_ledger_id, graph_iri, &head, ctx).await;
 
     // Always pop active, even on error, so a failure deeper in the
     // chain doesn't leave stale entries that trip cycle detection
@@ -213,7 +365,9 @@ pub async fn resolve_graph_ref(
     // work, not duplicate semantics. Single-flight is a possible
     // future optimization but not a correctness requirement.
     ctx.memo.insert(key.clone(), arc.clone());
-    ctx.fluree.governance_cache().insert(key, arc.clone());
+    if cacheable {
+        ctx.fluree.governance_cache().insert(key, arc.clone());
+    }
     Ok(arc)
 }
 

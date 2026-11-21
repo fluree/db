@@ -4,11 +4,11 @@
 //! computation for OWL2-RL and datalog rules.
 
 use super::runner::QueryRequest;
-use crate::ir::ReasoningModes;
+use crate::ir::{ReasoningConfig, ReasoningModes};
 use crate::reasoning::{global_reasoning_cache, reason_owl2rl, ReasoningOverlay};
 use crate::Result;
 use fluree_db_binary_index::BinaryIndexStore;
-use fluree_db_core::{overlay::OverlayProvider, GraphDbRef, GraphId};
+use fluree_db_core::{overlay::OverlayProvider, GraphDbRef};
 use fluree_db_reasoner::{
     DerivedFactsBuilder, DerivedFactsOverlay, FrozenSameAs, ReasoningOptions,
 };
@@ -145,16 +145,23 @@ fn refuse_non_monotone_rules_under_rewrites(
 /// A rule that fails to parse or validate is an error: reasoning over an
 /// incomplete rule set answers silently wrong, which is worse than a query
 /// that fails naming the rule.
+///
+/// `config` carries every source of rules: the query's own, this ledger's
+/// (its query graph, or `rules_source_g_id`), and another ledger's
+/// (`imported_rules`). The diagnostics name the rule set that ran
+/// ([`ReasoningDiagnostics::rule_set`](fluree_db_reasoner::ReasoningDiagnostics::rule_set)).
 pub async fn compute_derived_facts(
     base_db: GraphDbRef<'_>,
-    reasoning: &ReasoningModes,
-    rules_source_g_id: Option<GraphId>,
+    config: &ReasoningConfig,
     binary_store: Option<&Arc<BinaryIndexStore>>,
     request: QueryRequest<'_>,
 ) -> crate::error::Result<DerivedFactsOutcome> {
     use crate::datalog_rules::{load_rule_set, run_fixpoint, RuleExecutionEnv};
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
+
+    let reasoning = &config.modes;
+    let rules_source_g_id = config.rules_source_g_id;
 
     // One budget for both reasoning mechanisms — datalog reuses it rather than
     // standing up a second cap.
@@ -170,7 +177,13 @@ pub async fn compute_derived_facts(
 
     // Datalog: load the rule set first so its content can key the cache.
     let (rule_set, datalog_key) = if reasoning.datalog {
-        let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
+        let rule_set = load_rule_set(
+            base_db,
+            &reasoning.rules,
+            rules_source_g_id,
+            config.imported_rules.as_deref(),
+        )
+        .await?;
         // Before the cache: its key leaves out rdfs and owl2ql.
         refuse_non_monotone_rules_under_rewrites(reasoning, &rule_set)?;
         let key = overlay.content_version().map(|overlay_version| {
@@ -413,8 +426,16 @@ pub async fn compute_derived_facts(
                 capped_rules: dl_diag.capped_rules,
                 pending_rules: dl_diag.pending_rules,
                 evaluation_time: dl_diag.evaluation_time,
+                rule_set: None,
+                rule_digests: Vec::new(),
             },
         });
+        // Name the rule set before the result is cached, so a cached run
+        // reports it as this one does.
+        if let Some(diagnostics) = diagnostics.as_mut() {
+            diagnostics.rule_set = Some(rule_set.digest());
+            diagnostics.rule_digests = rule_set.rule_digests();
+        }
         all_flakes.extend(datalog_result.derived_flakes);
     }
 
@@ -453,6 +474,38 @@ pub async fn compute_derived_facts(
     })
 }
 
+/// Where a query's stored datalog rules come from, when not the graph it
+/// reads: another ledger's graph at the `t` the request resolved it to, or
+/// this ledger's own `f:rulesSource` graph at the query's `t`. `None` when no
+/// datalog runs, or the rules live in the graph the query reads.
+pub fn rules_source_tally(
+    config: &ReasoningConfig,
+    db: GraphDbRef<'_>,
+) -> Option<fluree_db_core::RulesSourceTally> {
+    if !config.modes.datalog {
+        return None;
+    }
+    if let Some(imported) = &config.imported_rules {
+        return Some(fluree_db_core::RulesSourceTally {
+            ledger: imported.ledger.clone(),
+            graph: imported.graph.clone(),
+            t: imported.t,
+            commit_id: imported.commit_id.clone(),
+        });
+    }
+    let g_id = config.rules_source_g_id.filter(|g| *g != db.g_id)?;
+    Some(fluree_db_core::RulesSourceTally {
+        ledger: db.snapshot.ledger_id.to_string(),
+        graph: db
+            .snapshot
+            .graph_registry
+            .iri_for_graph_id(g_id)?
+            .to_string(),
+        t: db.t,
+        commit_id: None,
+    })
+}
+
 /// Explain the derived facts `target` names. Materializes as a query with
 /// these reasoning modes would (served from the reasoning cache when it can),
 /// then re-runs each rule that can derive the facts over the result and
@@ -462,8 +515,7 @@ pub async fn compute_derived_facts(
 /// callers must only offer it to unrestricted readers.
 pub async fn explain_derived_facts(
     base_db: GraphDbRef<'_>,
-    reasoning: &ReasoningModes,
-    rules_source_g_id: Option<GraphId>,
+    config: &ReasoningConfig,
     binary_store: Option<&Arc<BinaryIndexStore>>,
     request: QueryRequest<'_>,
     target: &crate::datalog_rules::ExplainTarget,
@@ -472,6 +524,7 @@ pub async fn explain_derived_facts(
         explain_facts, load_rule_set, materialized_facts, Explanation, RuleExecutionEnv,
     };
 
+    let reasoning = &config.modes;
     if !reasoning.datalog {
         return Err(crate::error::QueryError::InvalidQuery(
             "explaining derived facts needs datalog reasoning: set \"reasoning\" to \
@@ -483,9 +536,14 @@ pub async fn explain_derived_facts(
     // what materializing leaves of it bounds the replays.
     let deadline =
         fluree_db_core::clock::Instant::now().checked_add(reasoning_budget(reasoning).max_duration);
-    let outcome =
-        compute_derived_facts(base_db, reasoning, rules_source_g_id, binary_store, request).await?;
-    let rule_set = load_rule_set(base_db, &reasoning.rules, rules_source_g_id).await?;
+    let outcome = compute_derived_facts(base_db, config, binary_store, request).await?;
+    let rule_set = load_rule_set(
+        base_db,
+        &reasoning.rules,
+        config.rules_source_g_id,
+        config.imported_rules.as_deref(),
+    )
+    .await?;
     let diagnostics = outcome.diagnostics.unwrap_or_default();
     let evaluation_time = diagnostics
         .evaluation_time
@@ -526,7 +584,7 @@ pub async fn explain_derived_facts(
     .await?;
     Ok(Explanation {
         t: base_db.t,
-        rule_set: format!("{:016x}", rule_set.content_hash()),
+        rule_set: rule_set.digest(),
         evaluation_time: diagnostics.evaluation_time,
         complete: !diagnostics.capped && replayed,
         facts,

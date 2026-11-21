@@ -13,15 +13,14 @@ use fluree_graph_json_ld::{details_with_vocab_policy, ParsedContext};
 use serde_json::{json, Map, Value as JsonValue};
 use std::sync::Arc;
 
-/// Request keys an explanation's materialization reads, as a query's would.
-const REASONING_KEYS: &[&str] = &[
-    "reasoning",
-    "rules",
-    "ontology",
-    "reasoningBudget",
-    "reasoningTime",
-    "opts",
-];
+/// Request keys an explanation's materialization reads, as a query's would:
+/// the query parser's reasoning keys, and `opts`, where it also reads them.
+fn reasoning_keys() -> impl Iterator<Item = &'static str> {
+    fluree_db_query::parse::options::REASONING_KEYS
+        .iter()
+        .copied()
+        .chain(std::iter::once("opts"))
+}
 
 const RDF_TYPE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#type";
 
@@ -32,7 +31,7 @@ impl Fluree {
     /// solutions an aggregate counted in the row's group.
     ///
     /// `request` carries a query's `@context` and reasoning keys
-    /// (`reasoning`, `rules`, `reasoningTime`, `reasoningBudget`), merged with
+    /// (`reasoning`, `rules`, `rulesFrom`, `reasoningTime`, `reasoningBudget`), merged with
     /// the ledger's reasoning settings as a query's are, and an `explain`
     /// node map naming the facts by subject and one predicate, with an
     /// optional object and `@graph`:
@@ -86,7 +85,7 @@ impl Fluree {
         if let Some(context) = obj.get("@context").or_else(|| obj.get("context")) {
             query.insert("@context".to_string(), context.clone());
         }
-        for &key in REASONING_KEYS {
+        for key in reasoning_keys() {
             if let Some(value) = obj.get(key) {
                 query.insert(key.to_string(), value.clone());
             }
@@ -99,7 +98,10 @@ impl Fluree {
             db.default_context.as_ref(),
             None,
         )?;
-        let executable = self.build_executable_for_view(db, &parsed, None).await?;
+        // The verified identity `f:overrideControl` gates on, as a query has.
+        let executable = self
+            .build_executable_for_view(db, &parsed, options.server_identity.as_ref())
+            .await?;
         let target = explain_target(node, &parsed.context, &db.snapshot)?;
 
         let db_ref = db.as_graph_db_ref();
@@ -115,8 +117,7 @@ impl Fluree {
         let base = GraphDbRef::new(db_ref.snapshot, db_ref.g_id, overlay, db_ref.t);
         Ok(explain_derived_facts(
             base,
-            &executable.reasoning.modes,
-            executable.reasoning.rules_source_g_id,
+            &executable.reasoning,
             db.binary_store.as_ref(),
             QueryRequest {
                 tracker,

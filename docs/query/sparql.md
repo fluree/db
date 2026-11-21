@@ -1484,6 +1484,7 @@ SELECT ?name WHERE { ?person ex:name ?name }
 | `reasoning` | `rdfs`, `owl2ql`, `owl2rl`, `datalog`, `owl-datalog`, `none`, or a list | queries | `reasoning` | — |
 | `reasoning-max-facts`, `reasoning-max-seconds`, `reasoning-max-memory-mb` | integer | queries | `reasoningBudget` | — |
 | `reasoning-time` | ISO 8601 datetime | queries | `reasoningTime` | — |
+| `rules-from` | ledger address, `<ledger>[@<pin>][#<graph IRI>]` ([Datalog rules](datalog-rules.md#3-stored-rules-named-per-query-rulesfrom)) | queries | `rulesFrom` | — |
 | `include-system-facts` | `true` / `false` | queries | `includeSystemFacts` | — |
 | `union-default-graph` | `true` / `false` | queries | `unionDefaultGraph` | — |
 | `min-t` | transaction `t` | queries | `min-t` | `fluree-min-t` |

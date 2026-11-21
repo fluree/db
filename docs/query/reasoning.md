@@ -42,7 +42,10 @@ are active:
 ```
 
 Use `"none"` to override any view- or ledger-wide reasoning defaults for
-this query (with no defaults configured, it is a no-op affirmation).
+this query (with no defaults configured, it is a no-op affirmation). Where
+the ledger's config does not allow the request to override its reasoning
+defaults, `"none"` is refused with a 400, like any mode the config won't
+run; see [Configured reasoning a query may not change](#configured-reasoning-a-query-may-not-change).
 
 ### Valid mode strings
 
@@ -59,8 +62,9 @@ Each mode has exactly one accepted string (case-insensitive):
 
 ### Inside `opts`
 
-The reasoning keys (`reasoning`, `rules`, `ontology`, `reasoningBudget` and
-`reasoningTime`) can also go inside the query's `opts` object. Each key is
+The reasoning keys (`reasoning`, `rules`, `rulesFrom`, `ontology`,
+`reasoningBudget` and `reasoningTime`) can also go inside the query's `opts`
+object. Each key is
 read from the top level when it is there and from `opts` otherwise, so
 
 ```json
@@ -87,6 +91,31 @@ To enable reasoning without setting it per query, configure a default at the
 view level (`GraphDb::with_reasoning(...)` in the Rust API) or in the ledger
 configuration graph (`reasoningModes`). To override such a default for a
 single query, use `"reasoning": "none"`.
+
+### Configured reasoning a query may not change
+
+A ledger's config can decide a request's reasoning: `f:reasoningDefaults`
+under an `f:overrideControl` that does not allow the request to override it
+(`f:OverrideNone`, or an identity list the caller is not on), or
+`f:datalogDefaults` with `f:datalogEnabled false` under one. A query that then
+asks for reasoning the config won't run is refused with a 400 naming what it
+asked for, rather than answered with the config's reasoning:
+
+- a mode the configured modes leave out (`"reasoning": "datalog"`, the same
+  key in `opts`, or `# PRAGMA reasoning: datalog`, under
+  `f:reasoningModes f:rdfs`);
+- `"none"` (or `# PRAGMA reasoning: none`) where the configured modes turn
+  reasoning on;
+- query-time `rules`, a [`rulesFrom`](datalog-rules.md#3-stored-rules-named-per-query-rulesfrom)
+  or an inline `ontology`, which the configured modes would replace;
+- datalog, by name or by supplying `rules` or a `rulesFrom` (which turn it
+  on), where `f:datalogEnabled false` applies.
+
+A query that asks for no reasoning, or only for modes the config runs anyway,
+runs with the configured modes, and a mode the config's own defaults turn on
+is never refused. Ask with an identity the override control allows to
+change the reasoning, or leave the key out. See
+[Override control](../ledger-config/override-control.md).
 
 > **Behavior change**: versions prior to this release auto-enabled RDFS when a
 > schema hierarchy existed in the data (though for imported ledgers the
@@ -247,7 +276,10 @@ see. See [Datalog rules](datalog-rules.md#validation-a-rule-that-cannot-run-is-a
 ## SPARQL
 
 In SPARQL queries, reasoning is controlled via the Fluree-specific
-`PRAGMA reasoning` directive. Property paths (`+`, `*`, `^`) provide a
+`PRAGMA reasoning` directive, with its companions `reasoning-max-facts`,
+`reasoning-max-seconds`, `reasoning-max-memory-mb`, `reasoning-time` and
+`rules-from` (JSON-LD `rulesFrom`, see
+[Datalog rules](datalog-rules.md#3-stored-rules-named-per-query-rulesfrom)). Property paths (`+`, `*`, `^`) provide a
 complementary mechanism for navigating transitive and inverse relationships
 directly in the query pattern — see [SPARQL](sparql.md) for details.
 
@@ -351,7 +383,9 @@ just logged:
   }
   ```
 
-- The same JSON rides the `x-fdb-reasoning` response header.
+- The same JSON rides the `x-fdb-reasoning` response header, without the
+  per-rule lists (`rules_fired`, `rules`), which can name every rule of a
+  program; they stay in the body.
 - `capped_reason` is `"facts"`, `"time"`, `"memory"` or, for datalog,
   `"iterations"` (the fixpoint hit its round limit before converging).
 - `rules_fired` breaks the tally down per rule. It counts derived **facts**
@@ -361,6 +395,61 @@ just logged:
   running when the cap fired and `pending_rules` the rules it kept from
   running. When a rule calls `NOW()` or `TODAY()`, `evaluation_time` is the
   time they returned (see [Datalog rules](datalog-rules.md)).
+- When datalog runs, `rule_set` names the rule set that ran by content: a
+  SHA-256 (hex) over every rule's name and the digest of its text, the same
+  value an [explanation](datalog-rules.md#explaining-a-derived-fact) of a
+  derived fact reports. `rules` lists each rule by name with the SHA-256 of
+  its text, so one rule can be shown unchanged from one run to the next. Both
+  change only when a rule is added, removed or edited, wherever it is stored,
+  and are stable across releases. When the stored rules come from somewhere
+  other than the graph the query reads, `rules_source` says where: another
+  ledger's graph (`f:rulesSource` with `f:ledger`), the `t` that ledger was
+  read at and its `commit_id` there, the graph a query's `rulesFrom` names
+  (with the `t` its pin resolved to and the `commit_id` at that `t`), or this
+  ledger's own `f:rulesSource` graph at the query's `t`. `data`, on any materialization (OWL 2 RL as
+  well), names what the run reasoned over: the queried ledger (a dataset's
+  primary one), the `t` it was read at, and the `commit_id` that produced
+  that `t`. Together that is the record of a run:
+  "rule set `rule_set`, read from `rules_source.ledger` at
+  `rules_source.commit_id`, over `data.ledger` at `data.commit_id`". A ledger
+  rebuilt under the same name reuses its `t` values, so a commit is what
+  names one state; to repeat a run over the same data, pin it by commit
+  (`"from": "data:main@commit:<cid>"`), and pin its rules the same way
+  (`"rulesFrom": "rules:main@commit:<cid>#<graph IRI>"`). `data.commit_id` is left out rather
+  than guessed when the `t` cannot name one commit (a rebased history can
+  hold two at one `t`). At the ledger's head the commit is known already;
+  for an earlier `t` the request looks it up once, which only a tracked
+  request does.
+
+  ```json
+  "reasoning": {
+    "capped": false,
+    "derived_facts": 2,
+    "iterations": 2,
+    "duration_ms": 3,
+    "rules_fired": {"http://example.org/r1": 1, "http://example.org/r2": 1},
+    "rule_set": "9f2c…e41a",
+    "rules": [
+      {"id": "http://example.org/r1", "hash": "3b5d…7c10"},
+      {"id": "http://example.org/r2", "hash": "a81f…0d92"}
+    ],
+    "rules_source": {
+      "ledger": "rules:main",
+      "graph": "http://example.org/rules",
+      "t": 12,
+      "commit_id": "bafy…"
+    },
+    "data": {
+      "ledger": "data:main",
+      "t": 41,
+      "commit_id": "bafy…"
+    }
+  }
+  ```
+
+  The `x-fdb-reasoning` header carries the same block without `rules_fired`
+  and `rules`, which grow with the program.
+
 - The server logs a WARN per capped materialization.
 
 The budget is configurable at three levels (highest precedence first):
@@ -424,7 +513,7 @@ warning appears:
 | RDFS | Negligible — query rewriting only | N/A |
 | OWL 2 QL | Negligible — query rewriting only | N/A |
 | OWL 2 RL | First query materializes derived facts; subsequent queries use cache | LRU cache (16 entries), keyed on database state + reasoning modes + budget |
-| Datalog | Rule bodies run on the query executor; the first query materializes, later queries with the same rule set hit the cache | Same LRU cache as OWL 2 RL, keyed additionally on a content hash of the rule set (stored and query-time rules) |
+| Datalog | Rule bodies run on the query executor; the first query materializes, later queries with the same rule set hit the cache | Same LRU cache as OWL 2 RL, keyed additionally on a content hash of the rule set that ran (stored, `rulesFrom` and query-time rules), so a query naming other rules never reads another's entry |
 
 **Tips:**
 - Start with **RDFS** if you only need class/property hierarchies — it has
@@ -451,9 +540,9 @@ Reasoning composes with view policy, but mind the contract when both are on:
 **Policy reads what the query reads.** In a reasoning query, class policies and `f:query` conditions see derived facts; a query without reasoning is judged on stored facts. Two consequences follow:
 
 - Data a rule or axiom reads is security data. A derived fact can grant access as well as deny it: a rule can place a subject in a class an `f:onClass` policy allows, or satisfy an `f:query` condition, so whoever can write a rule's inputs can open access through it.
-- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off; see [Override control](../ledger-config/override-control.md).
+- A caller who does not ask for reasoning is judged on stored facts, so a deny on a derived class does not reach their plain queries. Where that matters, set the ledger's reasoning defaults (`f:reasoningDefaults`) with `f:overrideControl` `f:OverrideNone`, so a query cannot turn reasoning off (one that asks for `"none"` is refused); see [Override control](../ledger-config/override-control.md).
 
-**Query-time rules are admin-only.** Under a non-root view policy, caller-supplied `rules` are stripped before execution — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data). Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
+**Query-time rules are admin-only.** Under a non-root view policy, a query that supplies `rules` is refused with a 400 — a restricted caller cannot inject inference rules (a rule with a viewable head could launder hidden data) — and so is one whose ledger config denies query-time rules for the request (`f:allowQueryTimeRules false`). A query that names its stored rules with `rulesFrom` chooses the rules too, and is refused in the same places. Database-stored `f:rule` definitions and OWL/RDFS reasoning are administrator-controlled and still apply. See [Policy in queries → Reasoning](../security/policy-in-queries.md#reasoning-rdfs--owl--datalog).
 
 ## Related pages
 

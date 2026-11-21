@@ -2462,7 +2462,7 @@ mod tests {
             // Read-path-only: never set on a transaction tally and deliberately
             // absent from the recorded wire mirror (see `RecordedTally`).
             policy_enforcement: None,
-            reasoning: Some(ReasoningTally {
+            reasoning: Some(Box::new(ReasoningTally {
                 capped: true,
                 capped_reason: Some("budget".to_string()),
                 derived_facts: 42,
@@ -2471,7 +2471,12 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
-            }),
+                rules_fired: std::collections::BTreeMap::new(),
+                rule_set: None,
+                rules: Vec::new(),
+                rules_source: None,
+                data: None,
+            })),
             sql: None,
             sql_elided: None,
         }
@@ -2545,7 +2550,7 @@ mod tests {
             fuel: Some(1.0),
             policy: None,
             policy_enforcement: None,
-            reasoning: Some(ReasoningTally {
+            reasoning: Some(Box::new(ReasoningTally {
                 capped: false,
                 capped_reason: None,
                 derived_facts: 10,
@@ -2554,7 +2559,12 @@ mod tests {
                 capped_rules: Vec::new(),
                 pending_rules: Vec::new(),
                 evaluation_time: None,
-            }),
+                rules_fired: std::collections::BTreeMap::new(),
+                rule_set: None,
+                rules: Vec::new(),
+                rules_source: None,
+                data: None,
+            })),
             sql: None,
             sql_elided: None,
         };
@@ -2820,6 +2830,23 @@ mod tests {
             capped_rules: vec!["ex:rule".to_string()],
             pending_rules: vec!["ex:later".to_string()],
             evaluation_time: Some("2026-01-01T00:00:00Z".to_string()),
+            rules_fired: std::collections::BTreeMap::from([("ex:rule".to_string(), 3)]),
+            rule_set: Some("00000000000000ab".to_string()),
+            rules: vec![fluree_db_core::tracking::RuleTally {
+                id: "ex:rule".to_string(),
+                hash: "00000000000000cd".to_string(),
+            }],
+            rules_source: Some(fluree_db_core::tracking::RulesSourceTally {
+                ledger: "rules:main".to_string(),
+                graph: "http://example.org/rules".to_string(),
+                t: 7,
+                commit_id: Some("bafy-test".to_string()),
+            }),
+            data: Some(fluree_db_core::tracking::ReasoningDataTally {
+                ledger: "data:main".to_string(),
+                t: 3,
+                commit_id: Some("bafy-data".to_string()),
+            }),
         };
         let original_tally = TrackingTally {
             time: Some("12.34ms".to_string()),
@@ -2836,7 +2863,7 @@ mod tests {
                 m
             }),
             policy_enforcement: None,
-            reasoning: Some(original_reasoning),
+            reasoning: Some(Box::new(original_reasoning)),
             sql: None,
             sql_elided: None,
         };
@@ -2906,11 +2933,21 @@ mod tests {
             capped_rules: rt_capped_rules,
             pending_rules: rt_pending_rules,
             evaluation_time: rt_evaluation_time,
-        } = rt_reasoning.expect("reasoning Some on round-trip");
+            rules_fired: rt_rules_fired,
+            rule_set: rt_rule_set,
+            rules: rt_rules,
+            rules_source: rt_rules_source,
+            data: rt_data,
+        } = *rt_reasoning.expect("reasoning Some on round-trip");
         // Not carried by the recorded mirror: adding them would change the
         // wire form of records already in the log.
         assert!(rt_capped_rules.is_empty() && rt_pending_rules.is_empty());
         assert_eq!(rt_evaluation_time, None);
+        assert!(rt_rules_fired.is_empty());
+        assert_eq!(rt_rule_set, None);
+        assert!(rt_rules.is_empty());
+        assert_eq!(rt_rules_source, None);
+        assert_eq!(rt_data, None);
         let original_reasoning = original_tally.reasoning.expect("reasoning populated above");
         assert_eq!(rt_capped, original_reasoning.capped);
         assert_eq!(rt_capped_reason, original_reasoning.capped_reason);
