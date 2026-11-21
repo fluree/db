@@ -1008,7 +1008,12 @@ pub(crate) fn record_read(id: &ContentId, source: &'static str, bytes: &[u8]) {
     if !crate::io_stats::enabled() {
         return;
     }
-    let label = match (id.content_kind(), bytes.get(..4)) {
+    crate::io_stats::record(|| read_label(id, bytes), source, bytes.len());
+}
+
+/// The artifact kind a read of `bytes` under `id` is counted as.
+fn read_label(id: &ContentId, bytes: &[u8]) -> String {
+    match (id.content_kind(), bytes.get(..4)) {
         (Some(ContentKind::DictBlob { .. }), Some(b"FPK1")) => match bytes.get(5) {
             Some(0) => "string-pack".to_string(),
             Some(1) => "subject-pack".to_string(),
@@ -1016,12 +1021,11 @@ pub(crate) fn record_read(id: &ContentId, source: &'static str, bytes: &[u8]) {
             _ => "pack".to_string(),
         },
         (Some(ContentKind::DictBlob { .. }), Some(b"DLR1" | b"DLR2")) => "dict-leaf".to_string(),
-        (Some(ContentKind::DictBlob { .. }), Some(b"DTB1")) => "dict-branch".to_string(),
+        (Some(ContentKind::DictBlob { .. }), Some(b"DTB1" | b"DTB2")) => "dict-branch".to_string(),
         (Some(ContentKind::DictBlob { .. }), _) => "dictblob".to_string(),
         (Some(k), _) => format!("{k:?}").to_lowercase(),
         (None, _) => "unknown".to_string(),
-    };
-    crate::io_stats::record(|| label, source, bytes.len());
+    }
 }
 
 /// `source`, counting each range it serves under `local-range` when read
@@ -2328,6 +2332,20 @@ pub trait StorageCas: Debug + Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Dictionary blobs are counted by their format magic, every branch
+    /// layout as a branch.
+    #[test]
+    fn a_dictionary_read_is_counted_by_its_magic() {
+        let kind = ContentKind::DictBlob {
+            dict: crate::DictKind::StringReverse,
+        };
+        let label = |bytes: &[u8]| read_label(&ContentId::new(kind, bytes), bytes);
+        assert_eq!(label(b"DTB1...."), "dict-branch");
+        assert_eq!(label(b"DTB2...."), "dict-branch");
+        assert_eq!(label(b"DLR2...."), "dict-leaf");
+        assert_eq!(label(b"XXXX...."), "dictblob");
+    }
     use crate::content_kind::DictKind;
     use crate::storage::memory::MemoryStorage;
     use std::sync::Mutex;
