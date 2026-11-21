@@ -702,12 +702,11 @@ impl Fluree {
             // A commit staged by value retracts each big integer it retracts
             // under every subtype stored before it, which need not include
             // the one it names: it holds when it retracts something, and the
-            // others' retractions apply alongside it. Over an earlier
-            // release's index the stored fact is all those subtypes already.
-            let by_value = if c.commit.retracts_big_integers_by_value()
-                && fluree_db_transact::num_big_typing(&evolving_state)
-                    == fluree_db_core::NumBigTyping::Declared
-            {
+            // others' retractions apply alongside it. An earlier release's
+            // index holds a value's subtypes as one fact, but novelty over it
+            // holds a value written since under each subtype, so this holds
+            // whatever the index.
+            let by_value = if c.commit.retracts_big_integers_by_value() {
                 let targets = fluree_db_transact::by_value_targets(
                     &evolving_state,
                     &c.commit.flakes,

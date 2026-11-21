@@ -898,13 +898,14 @@ pub async fn by_value_replaced(
 /// ([`fluree_db_novelty::Novelty::add_by_value_retractions`]). Oldest commit
 /// first, so each reads what the earlier ones retracted.
 ///
-/// Over an earlier release's index nothing is added: it holds every subtype
-/// of a big integer as one fact, which a retraction of any of them retracts.
-/// The retractions are worked out again when an index that keeps subtypes
-/// replaces it.
+/// Over an earlier release's index this adds the retractions of terms
+/// novelty holds: that index holds a value's subtypes as one fact, which a
+/// retraction of any of them retracts, but a value written since is held
+/// under each subtype. The retractions are worked out again when an index
+/// that keeps subtypes replaces it.
 pub async fn resolve_by_value_retractions(ledger: &mut LedgerState) -> Result<()> {
     let typing = num_big_typing(ledger);
-    if typing == NumBigTyping::ByValue || !ledger.novelty.by_value_unresolved(typing) {
+    if !ledger.novelty.by_value_unresolved(typing) {
         return Ok(());
     }
     let mut pending: Vec<Flake> = ledger

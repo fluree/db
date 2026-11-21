@@ -949,6 +949,102 @@ async fn push(fluree: &Fluree, ledger_id: &str, commit: fluree_db_api::Base64Byt
     assert_eq!(accepted, 1);
 }
 
+/// `writes`, committed on a copy of the v4 fixture's `v4/numbig:main`, as
+/// pushed bytes oldest first, the last rewritten as v4.2.8 writes a delete of
+/// a big integer: by value, naming its first retraction's value under
+/// `xsd:integer`, the type that release's index read it back with.
+async fn as_v4_delete(writes: &[String]) -> Vec<fluree_db_api::Base64Bytes> {
+    const ID: &str = "v4/numbig:main";
+    let dir = v4_store();
+    let fluree = file(&dir.path().to_string_lossy());
+    for w in writes {
+        update(&fluree, ID, w).await;
+    }
+    let handle = fluree.ledger_cached(ID).await.expect("source");
+    let mut commits = fluree
+        .export_commit_range(
+            &handle,
+            &fluree_db_api::ExportCommitsRequest {
+                cursor: None,
+                cursor_id: None,
+                limit: Some(writes.len()),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("export")
+        .commits;
+    commits.reverse();
+    let last = commits.pop().expect("the delete");
+    let mut commit = fluree_db_core::commit::codec::read_commit(&last.0).expect("decode");
+    let mut deleted = commit
+        .flakes
+        .iter()
+        .find(|f| !f.op && f.o.is_big_integer())
+        .cloned()
+        .expect("a retraction of a big integer");
+    deleted.dt = fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "integer");
+    commit.flakes = vec![deleted];
+    commit.num_big_typing = fluree_db_core::NumBigTyping::ByValue;
+    commit.id = None;
+    commits.push(fluree_db_api::Base64Bytes(
+        fluree_db_core::commit::codec::write_commit(&commit, true, None)
+            .expect("encode")
+            .bytes,
+    ));
+    commits
+}
+
+/// A v4 client's delete of a big integer, pushed into a ledger whose v4
+/// index predates the value: novelty holds the value under each subtype it
+/// was written with, as separate terms, and the delete, which names it as
+/// `xsd:integer`, deletes it under every one of them, whether or not
+/// `xsd:integer` is among them. It does so live, reloaded and after the
+/// ledger's first v5 build alike.
+#[tokio::test]
+async fn a_v4_delete_pushed_over_a_v4_index_deletes_every_subtype_written_since() {
+    const ID: &str = "v4/numbig:main";
+    const V: &str = "18446744073709551613";
+    for subtypes in [&["unsignedLong", "integer"][..], &["unsignedLong"][..]] {
+        let terms: Vec<String> = subtypes
+            .iter()
+            .map(|dt| format!(r#""{V}"^^xsd:{dt}"#))
+            .collect();
+        let writes = [
+            format!("INSERT DATA {{ ex:y ex:n {} }}", terms.join(" , ")),
+            format!("DELETE DATA {{ ex:y ex:n {} }}", terms[0]),
+        ];
+        let commits = as_v4_delete(&writes).await;
+        let dir = v4_store();
+        let path = dir.path().to_string_lossy().to_string();
+        let fluree = file(&path);
+        for commit in commits {
+            push(&fluree, ID, commit).await;
+        }
+        let y = "SELECT ?o WHERE { ex:y ex:n ?o }";
+        let none = Vec::<String>::new();
+        assert_eq!(
+            cached_rows(&fluree, ID, y, None).await,
+            none,
+            "{subtypes:?} live"
+        );
+        assert_eq!(
+            rows(&file(&path), ID, y).await,
+            none,
+            "{subtypes:?} reloaded"
+        );
+        file(&path)
+            .reindex(ID, ReindexOptions::default())
+            .await
+            .expect("first v5 build");
+        assert_eq!(
+            rows(&file(&path), ID, y).await,
+            none,
+            "{subtypes:?} rebuilt"
+        );
+    }
+}
+
 /// A v4 commit pushed into a ledger whose index keeps subtypes retracts the
 /// stored subtype it does not name, on every path: live, reloaded, on
 /// another instance catching up, at its `t` once it is history, and through
