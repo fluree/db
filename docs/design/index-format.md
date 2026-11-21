@@ -475,8 +475,11 @@ Subjects and strings are large enough to need their own artifacts, and the two
 directions use different structures:
 
 - **Reverse** (value → ID) is a single-level **CoW tree**: a `DTB1` branch
-  mapping key ranges to `DLR1` leaf ContentIds. An incremental update rewrites
-  only the leaves whose key range it touches; untouched leaves keep their CIDs.
+  mapping key ranges to leaf ContentIds, front-coded `DLR2` leaves for subjects
+  and `DLR1` leaves for strings and triple terms. An incremental update rewrites
+  only the leaves whose key range it touches; untouched leaves keep their CIDs,
+  so a subject tree an earlier build wrote can hold `DLR1` leaves beside the
+  `DLR2` leaves written since.
 - **Forward** (ID → value) is a set of **`FPK1` packs** routed by ID range
   directly from the index root — not a tree. See below.
 
@@ -630,6 +633,33 @@ Subject reverse key format is:
 
 The `u16` big-endian prefix ensures that lexicographic byte comparisons match logical `(ns_code, suffix)` ordering.
 
+#### Front-coded reverse dict leaf (`DLR2`)
+
+Subject reverse leaves are written front-coded:
+
+```text
+[magic: 4B "DLR2"]
+[entry_count: u32]
+[restart_count: u32]
+[flags: u8]                          // bit 0: ids stored namespace-relative
+[restart_table: u32 × restart_count] // byte offset of each restart entry in the data section
+[data section]
+  entry := [shared: varint] [unshared_len: varint] [unshared bytes] [id: varint]
+```
+
+- Each key stores only the bytes it does not share with the key before it.
+- Every 16th entry is a restart: `shared` is 0, so its key is whole.
+- A lookup binary-searches the restart keys, then walks at most 15 entries,
+  comparing only the bytes each entry adds.
+- With namespace-relative ids (flag bit 0, set on every subject leaf), an id is
+  stored XORed with the key's `ns_code` in its top 16 bits, which leaves the
+  subject's local id.
+
+A leaf is cut where a `DLR1` leaf of the same entries would reach the target
+size, so it holds the entries it would have held as `DLR1`, in fewer bytes.
+Fenced range reads (encrypted local stores) apply to `DLR1` leaves only: a
+`DLR2` leaf is read whole, once. Readers take either layout, leaf by leaf.
+
 ## Endianness and encoding conventions
 
 - Numeric fields in file formats are **little-endian**, unless explicitly stated otherwise.
@@ -655,7 +685,9 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
   - history sidecar: magic `FHS1`, version `3`/`4` (v4: `1`/`2`)
 - Dictionary tree artifacts:
   - branch: magic `DTB1`
-  - reverse leaves: magic `DLR1`
+  - reverse leaves: magic `DLR2` for subjects (front-coded), `DLR1` for strings and triple
+    terms. A subject `DLR1` leaf an earlier build wrote is read as it is. `v5.0.0-alpha.2` and
+    `alpha.3` refuse a `DLR2` leaf, at the first subject lookup rather than at load
   - forward packs: magic `FPK1`
 - Small dict blobs: magic `FRD1`
 
