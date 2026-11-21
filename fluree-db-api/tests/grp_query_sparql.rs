@@ -22,6 +22,9 @@ mod it_overflow_iri_bound_lookups;
 #[path = "it_correlated_store_ids.rs"]
 mod it_correlated_store_ids;
 
+#[path = "it_subject_lookup_misses.rs"]
+mod it_subject_lookup_misses;
+
 #[path = "it_issue_1721_repro.rs"]
 mod it_issue_1721_repro;
 #[path = "it_issue_1723_sameterm_fold.rs"]

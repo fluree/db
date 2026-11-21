@@ -2714,9 +2714,17 @@ impl BinaryIndexStore {
         }
     }
 
-    fn find_full_iri_subject_fallback(&self, iri: &str) -> io::Result<Option<(u16, u64)>> {
+    /// `missed`, when given, is a key already looked up and not found: it is
+    /// not looked up again.
+    fn find_full_iri_subject_fallback(
+        &self,
+        iri: &str,
+        missed: Option<(u16, &str)>,
+    ) -> io::Result<Option<(u16, u64)>> {
         for ns_code in [namespaces::EMPTY, namespaces::OVERFLOW] {
-            if !self.dicts.subject_forward_packs.contains_key(&ns_code) {
+            if missed == Some((ns_code, iri))
+                || !self.dicts.subject_forward_packs.contains_key(&ns_code)
+            {
                 continue;
             }
             if let Some(s_id) = self.reverse_lookup_subject_key(ns_code, iri.as_bytes())? {
@@ -2732,16 +2740,40 @@ impl BinaryIndexStore {
     /// If not, it only consults full-IRI subject namespaces that are actually
     /// present in the persisted dictionaries.
     pub fn find_subject_id(&self, iri: &str) -> io::Result<Option<u64>> {
+        self.find_subject_id_skipping(iri, None)
+    }
+
+    /// [`Self::find_subject_id`] once [`Self::find_subject_id_by_parts`] has
+    /// missed for `(ns_code, name)`, the parts of a `Sid` naming `iri`. Under
+    /// canonical encoding the IRI's split is usually those parts, and a second
+    /// lookup of that key would search the same leaf for it again, so it is
+    /// skipped; every other key the IRI could be stored under is tried.
+    pub fn find_subject_id_after_parts_miss(
+        &self,
+        ns_code: u16,
+        name: &str,
+        iri: &str,
+    ) -> io::Result<Option<u64>> {
+        self.find_subject_id_skipping(iri, Some((ns_code, name)))
+    }
+
+    fn find_subject_id_skipping(
+        &self,
+        iri: &str,
+        missed: Option<(u16, &str)>,
+    ) -> io::Result<Option<u64>> {
         let (canonical_prefix, canonical_suffix) = canonical_split(iri, self.ns_split_mode);
         if let Some(&ns_code) = self.dicts.namespace_reverse.get(canonical_prefix) {
-            if let Some(s_id) =
-                self.reverse_lookup_subject_key(ns_code, canonical_suffix.as_bytes())?
-            {
-                return Ok(Some(s_id));
+            if missed != Some((ns_code, canonical_suffix)) {
+                if let Some(s_id) =
+                    self.reverse_lookup_subject_key(ns_code, canonical_suffix.as_bytes())?
+                {
+                    return Ok(Some(s_id));
+                }
             }
         }
         Ok(self
-            .find_full_iri_subject_fallback(iri)?
+            .find_full_iri_subject_fallback(iri, missed)?
             .map(|(_ns_code, s_id)| s_id))
     }
 
@@ -2757,7 +2789,7 @@ impl BinaryIndexStore {
             }
         }
         Ok(self
-            .find_full_iri_subject_fallback(iri)?
+            .find_full_iri_subject_fallback(iri, None)?
             .map(|(ns_code, _s_id)| Sid::new(ns_code, iri)))
     }
 
@@ -7859,6 +7891,77 @@ pub(crate) mod tests {
         assert_eq!(
             store.find_subject_sid(full_iri).unwrap(),
             Some(Sid::new(namespaces::OVERFLOW, full_iri))
+        );
+    }
+
+    /// After a by-parts miss, the IRI's other keys are tried and the one that
+    /// missed is not: a subject stored whole, or under the IRI's split, is
+    /// still found, and the split that just missed is not searched again.
+    #[cfg(feature = "test-counters")]
+    #[test]
+    fn a_lookup_after_a_parts_miss_skips_the_key_that_missed() {
+        use crate::dict::reverse_leaf::subject_reverse_key;
+        const EX: u16 = 100;
+        let prefix = "https://example.org/";
+        let whole = "https://example.org/whole";
+        let split = "https://example.org/split";
+        let mut store = empty_store(Arc::new(MemoryContentStore::new()));
+        store.set_ns_split_mode(NsSplitMode::MostGranular);
+        store.dicts_mut().namespace_codes = Arc::new(HashMap::from([(EX, prefix.to_string())]));
+        store.dicts_mut().namespace_reverse = Arc::new(HashMap::from([(prefix.to_string(), EX)]));
+        let whole_id = SubjectId::new(namespaces::OVERFLOW, 7).as_u64();
+        let split_id = SubjectId::new(EX, 8).as_u64();
+        let mut entries = vec![
+            ReverseEntry {
+                key: subject_reverse_key(namespaces::OVERFLOW, whole.as_bytes()),
+                id: whole_id,
+            },
+            ReverseEntry {
+                key: subject_reverse_key(EX, b"split"),
+                id: split_id,
+            },
+        ];
+        entries.sort_by(|a, b| a.key.cmp(&b.key));
+        store.dicts_mut().subject_reverse_tree = Some(Arc::new(build_reverse_reader(entries)));
+        store.dicts_mut().subject_forward_packs.insert(
+            namespaces::OVERFLOW,
+            ForwardPackReader::from_memory(vec![Arc::from(
+                make_subject_pack_bytes(&[(7, whole.as_bytes())]).into_boxed_slice(),
+            )])
+            .unwrap(),
+        );
+
+        let lookups = |f: &dyn Fn() -> Option<u64>| {
+            let before = store.subject_reverse_leaf_lookups();
+            let found = f();
+            (found, store.subject_reverse_leaf_lookups() - before)
+        };
+        // The split missed: only the whole-IRI key is left, and it is absent.
+        // (Both keys sort inside the tree, so each reaches a leaf.)
+        let absent = "https://example.org/unknown";
+        assert_eq!(
+            lookups(&|| store
+                .find_subject_id_after_parts_miss(EX, "unknown", absent)
+                .unwrap()),
+            (None, 1)
+        );
+        assert_eq!(
+            lookups(&|| store.find_subject_id(absent).unwrap()),
+            (None, 2)
+        );
+        // Stored whole: found after the split misses.
+        assert_eq!(
+            lookups(&|| store
+                .find_subject_id_after_parts_miss(EX, "whole", whole)
+                .unwrap()),
+            (Some(whole_id), 1)
+        );
+        // The whole IRI missed: the split is still tried, and finds it.
+        assert_eq!(
+            lookups(&|| store
+                .find_subject_id_after_parts_miss(namespaces::OVERFLOW, split, split)
+                .unwrap()),
+            (Some(split_id), 1)
         );
     }
 

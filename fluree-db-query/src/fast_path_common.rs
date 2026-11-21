@@ -4003,7 +4003,7 @@ pub fn subject_ref_to_s_id(
             }
             if let Some(iri) = snapshot.decode_sid(sid).or_else(|| store.sid_to_iri(sid)) {
                 Ok(store
-                    .find_subject_id(&iri)
+                    .find_subject_id_after_parts_miss(sid.namespace_code, &sid.name, &iri)
                     .map_err(|e| QueryError::Internal(format!("find_subject_id: {e}")))?)
             } else {
                 Ok(None)

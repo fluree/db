@@ -1415,12 +1415,23 @@ impl BinaryScanOperator {
             _ if known_s_id.is_some() => known_s_id,
             (Ref::Iri(iri), _) => store.find_subject_id(iri)?,
             (Ref::Sid(query_sid), Some(sid)) => {
-                if let Some(s_id) = sid_iri::sid_to_store_s_id(store, sid)? {
+                if let Some(s_id) = store.find_subject_id_by_parts(sid.namespace_code, &sid.name)? {
                     Some(s_id)
-                } else if let Some(iri) = snapshot.decode_sid(query_sid) {
-                    store.find_subject_id(&iri)?
                 } else {
-                    None
+                    // The store's namespace table is a subset of the
+                    // snapshot's, so the two decode `sid` alike; the
+                    // snapshot's is for a code minted after the index.
+                    match store
+                        .sid_to_iri(sid)
+                        .or_else(|| snapshot.decode_sid(query_sid))
+                    {
+                        Some(iri) => store.find_subject_id_after_parts_miss(
+                            sid.namespace_code,
+                            &sid.name,
+                            &iri,
+                        )?,
+                        None => None,
+                    }
                 }
             }
             _ => None,
@@ -2881,8 +2892,20 @@ impl Operator for BinaryScanOperator {
         // an upsert-only path: `join.rs` and `optional.rs` rebind a correlated
         // subject to `Ref::Iri` per driving row, so every non-batched probe for a
         // missing subject paid it.
+        //
+        // What the filter has looked up and missed is not looked up again: an
+        // IRI it looked up whole, or the parts of `s_sid`.
         if let Some(target_iri) = self.unresolved_bound_subject_iri.clone() {
-            match store_ref.find_subject_id(&target_iri) {
+            let found = match (&self.pattern.s, s_sid.as_ref()) {
+                (Ref::Iri(_), _) => Ok(None),
+                (_, Some(sid)) => store_ref.find_subject_id_after_parts_miss(
+                    sid.namespace_code,
+                    &sid.name,
+                    &target_iri,
+                ),
+                _ => store_ref.find_subject_id(&target_iri),
+            };
+            match found {
                 Ok(Some(s_id)) => {
                     filter.s_id = Some(s_id);
                     self.unresolved_bound_subject_iri = None;
