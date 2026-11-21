@@ -20,8 +20,8 @@ A binary index build produces:
 - **Shared dictionary artifacts**:
   - small dictionaries (predicates, graphs, datatypes, languages) embedded in the **index root** (CAS) and/or persisted as flat files in local builds
   - large dictionaries (subjects, strings): reverse as **CoW single-level B-tree-like trees**
-    (a branch manifest `DTB1` + `DLR1` leaf blobs, front-coded `DLR2` for subjects), forward as
-    ID-range-routed **`FPK1` packs**
+    (a branch manifest, `DTB1` or for strings `DTB2`, + leaf blobs, front-coded `DLR2` for
+    subjects and strings), forward as ID-range-routed **`FPK1` packs**
 - **Manifests / roots** that describe how to load the above either from a local directory layout
   or from the content store via `IndexRoot` (FIR6 binary format, CID-based).
 
@@ -52,7 +52,7 @@ Fact indexes exist in up to four sort orders (see `RunSortOrder`):
 - **Branch manifest**: maps key ranges to leaf files; used for routing.
 - **Column block**: a separately compressed single-column section inside a leaflet.
 - **History sidecar**: a separate CAS object holding a leaf's time-travel transition log.
-- **Dictionary tree**: a `DTB1` branch + `DLR1` leaves, holding the reverse (value → ID) direction for large keyspaces (subjects/strings). Subject leaves are written front-coded (`DLR2`): each key stores only what it does not share with the one before, restarting every 16 entries, and ids are varints of the local id. Readers take either layout, so a tree may mix them. A new string tree is keyed by prefix and hash: a string longer than 81 bytes is keyed by its first 48 bytes, a `0xFF` marker and its 32-byte SHA-256, and its leaves are front-coded too. A prefix longer than 48 bytes must check each hashed string sharing its first 48 bytes, so those bytes' group hashes at most 32 strings (an import into an existing tree may reach 64 before it notices); past that the branch lists the group, and its new strings are keyed by value. A group listed after it began hashing keeps those strings and is flagged, so a lookup there tries the value key, then the hashed one. Such a tree's branch is `DTB2`, which records the scheme, prefix length, cap and listed groups; a tree an incremental build extends keeps the scheme it has, so an older raw string tree stays raw until a full rebuild.
+- **Dictionary tree**: a branch + leaves holding the reverse (value → ID) direction for large keyspaces (subjects, strings, triple terms). Subject trees have a `DTB1` branch and front-coded `DLR2` leaves: each key stores only what it does not share with the one before, restarting every 16 entries, and ids are varints of the local id. A new string tree keys a string longer than 81 bytes by its first 48 bytes, a `0xFF` marker and its SHA-256, and has a `DTB2` branch, which records that scheme and the groups it keys by value instead, and `DLR2` leaves. Triple-term trees are `DTB1` + `DLR1`. Readers take either leaf layout, so a tree may mix them. See "Large dictionaries" below.
 - **Forward pack**: an `FPK1` blob holding a contiguous ID range of a forward (ID → value) dictionary, routed from the index root.
 - **ContentId**: a CIDv1 value that uniquely identifies a content-addressed artifact by its hash and type. See [ContentId and ContentStore](content-id-and-contentstore.md).
 
@@ -143,7 +143,9 @@ At a high level the root contains:
     14-bit payload, so `dt_id` is at most 16,383. Writes that would need a larger one are refused.
   - `language_tags[]` (lang_id-1 → tag string; `lang_id = index + 1`, 0 = "no tag")
 - **Dictionary ContentIds** (CAS artifacts):
-  - tree blobs: subject/string reverse (`DTB1` branch + `DLR2` subject / `DLR1` string leaves)
+  - tree blobs: subject reverse (`DTB1` branch + `DLR2` leaves) and string reverse (`DTB2`
+    branch + `DLR2` leaves, keyed by prefix and hash; `DTB1` + `DLR1` where an earlier build
+    wrote it)
   - forward packs: subject (per namespace) & string (`FPK1`), routed by ID range
   - optional per-predicate numbig arenas
   - optional per-predicate vector arenas (manifest + shards)
@@ -474,12 +476,15 @@ The forward file itself is a raw concatenation of bytes; access is via `(offset,
 Subjects and strings are large enough to need their own artifacts, and the two
 directions use different structures:
 
-- **Reverse** (value → ID) is a single-level **CoW tree**: a `DTB1` branch
-  mapping key ranges to leaf ContentIds, front-coded `DLR2` leaves for subjects
-  and `DLR1` leaves for strings and triple terms. An incremental update rewrites
-  only the leaves whose key range it touches; untouched leaves keep their CIDs,
-  so a subject tree an earlier build wrote can hold `DLR1` leaves beside the
-  `DLR2` leaves written since.
+- **Reverse** (value → ID) is a single-level **CoW tree**: a branch mapping
+  key ranges to leaf ContentIds. Subject trees have a `DTB1` branch and
+  front-coded `DLR2` leaves; string trees a `DTB2` branch, which records how
+  they key long strings (below), and `DLR2` leaves; triple-term trees a `DTB1`
+  branch and `DLR1` leaves. An incremental update rewrites only the leaves
+  whose key range it touches; untouched leaves keep their CIDs, so a subject
+  tree an earlier build wrote can hold `DLR1` leaves beside the `DLR2` leaves
+  written since. A string tree an earlier build wrote keeps its raw keys,
+  `DTB1` branch and `DLR1` leaves until a full rebuild.
 - **Forward** (ID → value) is a set of **`FPK1` packs** routed by ID range
   directly from the index root — not a tree. See below.
 
@@ -499,6 +504,38 @@ directions use different structures:
 
 Keys are treated as raw bytes and compared lexicographically. For forward trees keyed by numeric ID,
 the branch uses **8-byte big-endian** keys (so lexical order matches numeric order).
+
+#### Keyed dictionary branch (`DTB2`)
+
+A string tree keys a string longer than 81 bytes by its first 48 bytes, a `0xFF` marker and
+its 32-byte SHA-256. UTF-8 never holds `0xFF`, so a hashed key can't be taken for a string, and
+every key keeps its string's first 48 bytes, so a prefix of up to 48 bytes still maps to one key
+range. A string of at most 81 bytes, the hashed key's own length, is keyed by itself.
+
+A longer prefix must check each hashed string sharing its first 48 bytes against its value, so the
+strings sharing those bytes, a *group*, hash at most 32. Past that the branch lists the group, and
+its new strings are keyed by value, where a prefix finds them exactly. A full build counts groups
+first, so a group it lists holds no hashed string; an incremental build counts a group's hashed
+keys before keying; an import into an existing tree may reach 64 before it notices. A group listed
+after it began hashing keeps those keys and is flagged, so a lookup there tries the value key, then
+the hashed one, and a prefix scan checks its hashed range. A removal stops listing a group it
+leaves no key under, and clears the flag on one it leaves no hashed key in.
+
+The branch records the scheme and the listed groups ahead of the `DTB1` layout:
+
+```text
+[magic: 4B "DTB2"] [leaf_count: u32]
+[scheme: u8 = 2] [prefix_len: u8 = 48] [cap: u16 = 32]
+[raw_group_count: u32]
+[raw groups...]  // sorted by prefix
+  group := [flags: u8 (bit 0: also holds hashed strings)] [prefix: prefix_len bytes]
+[offset_table and leaf entries, as in DTB1]
+```
+
+Each listed group costs 49 bytes, and the branch is decoded on every open and rewritten on every
+incremental pass. Text whose first 48 bytes repeat across many strings (templated per-entity text,
+serialized records) lists a group per repeated prefix, so the branch grows with the number of such
+prefixes, not with the strings in them.
 
 #### Forward dict pack (`FPK1`)
 
@@ -635,7 +672,8 @@ The `u16` big-endian prefix ensures that lexicographic byte comparisons match lo
 
 #### Front-coded reverse dict leaf (`DLR2`)
 
-Subject reverse leaves are written front-coded:
+Subject and string reverse leaves are written front-coded (a string tree's only once it keys
+long strings by hash, under a `DTB2` branch):
 
 ```text
 [magic: 4B "DLR2"]
@@ -651,9 +689,9 @@ Subject reverse leaves are written front-coded:
 - Every 16th entry is a restart: `shared` is 0, so its key is whole.
 - A lookup binary-searches the restart keys, then walks at most 15 entries,
   comparing only the bytes each entry adds.
-- With namespace-relative ids (flag bit 0, set on every subject leaf), an id is
-  stored XORed with the key's `ns_code` in its top 16 bits, which leaves the
-  subject's local id.
+- With namespace-relative ids (flag bit 0, set on every subject leaf and on no
+  string leaf), an id is stored XORed with the key's `ns_code` in its top 16
+  bits, which leaves the subject's local id.
 
 A leaf is cut where a `DLR1` leaf of the same entries would reach the target
 size, so it holds the entries it would have held as `DLR1`, in fewer bytes.
@@ -684,10 +722,13 @@ Fenced range reads (encrypted local stores) apply to `DLR1` leaves only: a
   - leaf: magic `FLI3`, version `2` (v4: `1`)
   - history sidecar: magic `FHS1`, version `3`/`4` (v4: `1`/`2`)
 - Dictionary tree artifacts:
-  - branch: magic `DTB1`
-  - reverse leaves: magic `DLR2` for subjects (front-coded), `DLR1` for strings and triple
-    terms. A subject `DLR1` leaf an earlier build wrote is read as it is. `v5.0.0-alpha.2` and
-    `alpha.3` refuse a `DLR2` leaf, at the first subject lookup rather than at load
+  - branch: magic `DTB2` for string trees (keyed by prefix and hash), `DTB1` for subject and
+    triple-term trees. A string tree's `DTB1` branch an earlier build wrote is read as a raw
+    tree. `v5.0.0-alpha.2` and `alpha.3` refuse a `DTB2` branch when they load the index
+  - reverse leaves: magic `DLR2` for subjects and hashed string trees (front-coded), `DLR1` for
+    raw string trees and triple terms. A `DLR1` leaf an earlier build wrote is read as it is.
+    `v5.0.0-alpha.2` and `alpha.3` refuse a `DLR2` leaf, at the first subject lookup rather
+    than at load
   - forward packs: magic `FPK1`
 - Small dict blobs: magic `FRD1`
 
