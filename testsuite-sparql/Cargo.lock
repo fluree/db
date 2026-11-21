@@ -1166,6 +1166,7 @@ dependencies = [
  "tokio",
  "tracing",
  "ulid",
+ "uuid",
  "wasm-bindgen-futures",
  "xxhash-rust",
  "zstd",

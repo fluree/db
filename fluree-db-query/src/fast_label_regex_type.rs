@@ -52,7 +52,9 @@ pub fn label_regex_type_operator(
                 "fast-path: label-regex-type"
             );
 
-            let label_p_id = ref_to_p_id(ctx, store.as_ref(), &label_pred)?;
+            let Some(label_p_id) = ref_to_p_id(ctx, store.as_ref(), &label_pred)? else {
+                return Ok(Some(empty_batch(schema.clone())?));
+            };
 
             // Resolve class subject ID.
             let Some(class_s_id) = term_to_ref_s_id(ctx, store.as_ref(), &class_term)? else {
