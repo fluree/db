@@ -1729,6 +1729,15 @@ impl SharedResolverState {
             else {
                 continue;
             };
+            // A retraction of an attachment slot changes its reifier's link.
+            self.link_synth.observe(
+                &raw_op,
+                &record,
+                &mut self.predicates,
+                &mut self.datatypes,
+                &self.ns_prefixes,
+                chunk,
+            );
             chunk.records.push(record);
             chunk.flake_count += 1;
             added_records += 1;

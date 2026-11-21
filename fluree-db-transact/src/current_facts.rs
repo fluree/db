@@ -933,7 +933,19 @@ pub async fn resolve_by_value_retractions(ledger: &mut LedgerState) -> Result<()
                 Ok((g_id, f))
             })
             .collect::<Result<Vec<_>>>()?;
-        std::sync::Arc::make_mut(&mut ledger.novelty).add_by_value_retractions(routed, typing)?;
+        let links = std::sync::Arc::make_mut(&mut ledger.novelty)
+            .add_by_value_retractions(routed, typing)?;
+        if !links.is_empty() {
+            let store = crate::commit::binary_store(ledger);
+            fluree_db_binary_index::dict_novelty_safe::populate_dict_novelty_safe(
+                std::sync::Arc::make_mut(&mut ledger.dict_novelty),
+                store.as_deref(),
+                links.iter(),
+            )
+            .map_err(|e| {
+                TransactError::FlakeGeneration(format!("populate_dict_novelty_safe: {e}"))
+            })?;
+        }
     }
     Ok(())
 }

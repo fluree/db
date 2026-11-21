@@ -16,6 +16,7 @@ use crate::error::{NoveltyError, Result};
 use crate::{Novelty, Segment};
 use fluree_db_core::flake::FlakeMeta;
 use fluree_db_core::link::{is_attachment_slot, replay_links, AttachmentBase, AttachmentSlots};
+use fluree_db_core::namespaces::rdf_reifies_sid;
 use fluree_db_core::{Flake, FlakeValue, GraphId, IndexType, Sid};
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -176,8 +177,53 @@ impl Novelty {
         Ok(out)
     }
 
+    /// The links `reifiers` derive, from the index's slots and every slot op
+    /// novelty holds for them, that novelty does not hold yet: what slot ops
+    /// added at a `t` whose links were already derived change. Empty while
+    /// links wait for an index, whose base derives them from every op
+    /// novelty then holds.
+    pub(crate) fn missing_links(
+        &self,
+        reifiers: impl IntoIterator<Item = (GraphId, Sid)>,
+    ) -> Result<Vec<(GraphId, Flake)>> {
+        let Some(base) = self.current_link_base() else {
+            return Ok(Vec::new());
+        };
+        let touched: Touched<'_> = reifiers.into_iter().map(|key| (key, Vec::new())).collect();
+        if touched.is_empty() {
+            return Ok(Vec::new());
+        }
+        let derived = self.derive_links(base, &touched, base.t)?;
+        let mut held: BTreeMap<(GraphId, &Sid), Vec<&Flake>> = BTreeMap::new();
+        for (g_id, reifier) in touched.keys() {
+            held.insert(
+                (*g_id, reifier),
+                self.reifier_ops(*g_id, reifier, |p| *p == *rdf_reifies_sid()),
+            );
+        }
+        Ok(derived
+            .into_iter()
+            .filter(|(g_id, link)| {
+                !held[&(*g_id, &link.s)]
+                    .iter()
+                    .any(|h| *h == link && h.t == link.t && h.op == link.op)
+            })
+            .collect())
+    }
+
     /// Every slot op novelty holds for `reifier` in `g_id`.
     fn reifier_slot_history(&self, g_id: GraphId, reifier: &Sid) -> Vec<&Flake> {
+        self.reifier_ops(g_id, reifier, is_attachment_slot)
+    }
+
+    /// Every flake novelty holds for `reifier` in `g_id` whose predicate
+    /// `keep` accepts.
+    fn reifier_ops(
+        &self,
+        g_id: GraphId,
+        reifier: &Sid,
+        keep: impl Fn(&Sid) -> bool,
+    ) -> Vec<&Flake> {
         let first = Flake::new(
             reifier.clone(),
             Sid::min(),
@@ -204,7 +250,7 @@ impl Novelty {
                 }
                 for &local in seg.range(IndexType::Spot, Some(&first), Some(&rhs), false) {
                     let flake = &seg.flakes[local as usize];
-                    if flake.s == *reifier && is_attachment_slot(&flake.p) {
+                    if flake.s == *reifier && keep(&flake.p) {
                         ops.push(flake);
                     }
                 }

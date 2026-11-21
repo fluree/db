@@ -949,18 +949,19 @@ async fn push(fluree: &Fluree, ledger_id: &str, commit: fluree_db_api::Base64Byt
     assert_eq!(accepted, 1);
 }
 
-/// `writes`, committed on a copy of the v4 fixture's `v4/numbig:main`, as
-/// pushed bytes oldest first, the last rewritten as v4.2.8 writes a delete of
-/// a big integer: by value, naming its first retraction's value under
-/// `xsd:integer`, the type that release's index read it back with.
-async fn as_v4_delete(writes: &[String]) -> Vec<fluree_db_api::Base64Bytes> {
-    const ID: &str = "v4/numbig:main";
-    let dir = v4_store();
-    let fluree = file(&dir.path().to_string_lossy());
+/// `writes`, committed on `fluree`'s `ledger_id`, as pushed bytes oldest
+/// first, the last rewritten as v4.2.8 writes a delete of a big integer: by
+/// value, naming its first retraction of one under `xsd:integer`, the type
+/// that release's index read it back with.
+async fn as_v4_delete(
+    fluree: &Fluree,
+    ledger_id: &str,
+    writes: &[String],
+) -> Vec<fluree_db_api::Base64Bytes> {
     for w in writes {
-        update(&fluree, ID, w).await;
+        update(fluree, ledger_id, w).await;
     }
-    let handle = fluree.ledger_cached(ID).await.expect("source");
+    let handle = fluree.ledger_cached(ledger_id).await.expect("source");
     let mut commits = fluree
         .export_commit_range(
             &handle,
@@ -1014,7 +1015,8 @@ async fn a_v4_delete_pushed_over_a_v4_index_deletes_every_subtype_written_since(
             format!("INSERT DATA {{ ex:y ex:n {} }}", terms.join(" , ")),
             format!("DELETE DATA {{ ex:y ex:n {} }}", terms[0]),
         ];
-        let commits = as_v4_delete(&writes).await;
+        let source = v4_store();
+        let commits = as_v4_delete(&file(&source.path().to_string_lossy()), ID, &writes).await;
         let dir = v4_store();
         let path = dir.path().to_string_lossy().to_string();
         let fluree = file(&path);
@@ -1043,6 +1045,103 @@ async fn a_v4_delete_pushed_over_a_v4_index_deletes_every_subtype_written_since(
             "{subtypes:?} rebuilt"
         );
     }
+}
+
+/// A reifier's attachment as v4.2.8 commits held it, slot by slot, its
+/// object a big `xsd:unsignedLong`; then a v4 client's delete of the object
+/// slot, which names the value as `xsd:integer`. Pushed into a ledger whose
+/// index holds the attachment, the delete removes the reifier's
+/// `rdf:reifies` link: live, reloaded and after a full rebuild.
+#[tokio::test]
+async fn a_v4_delete_of_a_reified_big_integer_removes_its_link_on_every_path() {
+    use fluree_db_core::namespaces::{
+        reifies_object_sid, reifies_predicate_sid, reifies_subject_sid,
+    };
+    use fluree_db_core::{Flake, FlakeValue, NumBigTyping};
+    const ID: &str = "it/numbig-link:main";
+
+    // Two commits with this ledger's envelopes, rewritten as v4 wrote them.
+    let triple = format!(r#"ex:claim rdf:reifies <<( ex:s ex:n "{MAX}"^^xsd:unsignedLong )>>"#);
+    let source_dir = tempfile::TempDir::new().unwrap();
+    let source = file(&source_dir.path().to_string_lossy());
+    source.create_ledger(ID).await.unwrap();
+    update(&source, ID, &format!("INSERT DATA {{ {triple} }}")).await;
+    update(&source, ID, &format!("DELETE DATA {{ {triple} }}")).await;
+    let handle = source.ledger_cached(ID).await.expect("source");
+    let mut exported = source
+        .export_commit_range(&handle, &fluree_db_api::ExportCommitsRequest::default())
+        .await
+        .expect("export")
+        .commits;
+    exported.reverse();
+    let mut commits: Vec<fluree_db_api::Base64Bytes> = Vec::new();
+    let mut parent: Option<fluree_db_core::ContentId> = None;
+    for bytes in &exported {
+        let mut commit = fluree_db_core::commit::codec::read_commit(&bytes.0).unwrap();
+        let link = commit.flakes[0].clone();
+        let FlakeValue::TripleTerm(term) = &link.o else {
+            panic!("a link: {link:?}");
+        };
+        let slot = |p: &fluree_db_core::Sid, o: FlakeValue, dt| {
+            Flake::new(link.s.clone(), p.clone(), o, dt, link.t, link.op, None)
+        };
+        let object = slot(reifies_object_sid(), term.o.clone(), term.dt.clone());
+        commit.flakes = if link.op {
+            let id = fluree_db_core::edge::id_datatype_sid();
+            vec![
+                slot(
+                    reifies_subject_sid(),
+                    FlakeValue::Ref(term.s.clone()),
+                    id.clone(),
+                ),
+                slot(reifies_predicate_sid(), FlakeValue::Ref(term.p.clone()), id),
+                object,
+            ]
+        } else {
+            let integer = fluree_db_core::Sid::new(fluree_vocab::namespaces::XSD, "integer");
+            vec![Flake {
+                dt: integer,
+                ..object
+            }]
+        };
+        commit.num_big_typing = NumBigTyping::ByValue;
+        commit.id = None;
+        if let Some(parent) = parent.take() {
+            commit.parents = vec![parent];
+        }
+        let written = fluree_db_core::commit::codec::write_commit(&commit, true, None)
+            .unwrap()
+            .bytes;
+        parent = Some(fluree_db_core::ContentId::new(
+            fluree_db_core::ContentKind::Commit,
+            &written,
+        ));
+        commits.push(fluree_db_api::Base64Bytes(written));
+    }
+
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().to_string_lossy().to_string();
+    let fluree = file(&path);
+    fluree.create_ledger(ID).await.unwrap();
+    let mut commits = commits.into_iter();
+    push(&fluree, ID, commits.next().unwrap()).await;
+    fluree
+        .reindex(ID, ReindexOptions::default())
+        .await
+        .expect("an index holding the attachment");
+    let fluree = file(&path);
+    let link = "SELECT ?t WHERE { ex:claim rdf:reifies ?t }";
+    assert_eq!(rows(&fluree, ID, link).await.len(), 1, "linked");
+    push(&fluree, ID, commits.next().unwrap()).await;
+
+    let none = Vec::<String>::new();
+    assert_eq!(cached_rows(&fluree, ID, link, None).await, none, "live");
+    assert_eq!(rows(&file(&path), ID, link).await, none, "reloaded");
+    file(&path)
+        .reindex(ID, ReindexOptions::default())
+        .await
+        .expect("full rebuild");
+    assert_eq!(rows(&file(&path), ID, link).await, none, "rebuilt");
 }
 
 /// A v4 commit pushed into a ledger whose index keeps subtypes retracts the

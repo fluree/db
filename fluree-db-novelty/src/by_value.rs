@@ -19,8 +19,9 @@
 
 use crate::error::Result;
 use crate::{Novelty, Segment};
+use fluree_db_core::link::is_attachment_slot;
 use fluree_db_core::{Flake, GraphId, NumBigTyping, Sid};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 /// An op on a big integer from a commit staged by value, and the typing of
 /// the index the retractions that go with the commit were worked out against
@@ -69,11 +70,15 @@ impl Novelty {
     /// value that novelty holds, each with its graph, and mark every one of
     /// those commits' retractions worked out under `typing`. A retraction
     /// novelty already holds at its `t` is not added again.
+    ///
+    /// A retraction of an attachment slot changes its reifier's link, from
+    /// its `t` on: returns the links that adds, which the caller's
+    /// dictionary novelty must register.
     pub fn add_by_value_retractions(
         &mut self,
         retractions: Vec<(GraphId, Flake)>,
         typing: NumBigTyping,
-    ) -> Result<()> {
+    ) -> Result<Vec<Flake>> {
         for r in &mut self.by_value {
             r.resolved_under = Some(typing);
         }
@@ -82,6 +87,7 @@ impl Novelty {
             per_graph.entry(g_id).or_default().push(flake);
         }
         let mut added = false;
+        let mut reifiers: BTreeSet<(GraphId, Sid)> = BTreeSet::new();
         for (g_id, mut batch) in per_graph {
             let present: HashSet<usize> = {
                 let slots: HashSet<(&Sid, &Sid, i64)> =
@@ -103,15 +109,30 @@ impl Novelty {
             for flake in &batch {
                 self.fact_state.record(g_id, flake);
                 self.note_list_meta(flake);
+                if is_attachment_slot(&flake.p) {
+                    reifiers.insert((g_id, flake.s.clone()));
+                }
             }
             self.push_segment(g_id, Segment::build(batch, false));
             added = true;
+        }
+        let links = self.missing_links(reifiers)?;
+        let mut per_graph: BTreeMap<GraphId, Vec<Flake>> = BTreeMap::new();
+        for (g_id, link) in &links {
+            per_graph.entry(*g_id).or_default().push(link.clone());
+        }
+        for (g_id, batch) in per_graph {
+            self.check_segment_capacity(g_id)?;
+            for flake in &batch {
+                self.fact_state.record(g_id, flake);
+            }
+            self.push_segment(g_id, Segment::build(batch, false));
         }
         if added {
             self.epoch += 1;
             self.refresh_content_version();
         }
-        Ok(())
+        Ok(links.into_iter().map(|(_, link)| link).collect())
     }
 
     /// Forget the ops of commits at or before `cutoff_t`, which the index now
