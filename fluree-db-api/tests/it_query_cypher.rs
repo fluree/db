@@ -2991,6 +2991,81 @@ async fn cypher_with_aliasing_a_variable_to_itself_keeps_every_row() {
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
+/// `type()` and `startNode()` read the `f:reifies*` metadata, through the
+/// index when there is one. An index that holds no reified edge lacks those
+/// predicates: that reads as no edge (`null`), on the index alone and with
+/// novelty on top, and an edge reified only in novelty is still found.
+#[tokio::test]
+async fn cypher_relationship_metadata_over_an_index_without_reified_edges() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "it/cypher:metadata-no-indexed-reifier";
+    let l = genesis_ledger(&fluree, ledger_id);
+    fluree
+        .transact_cypher(l, r#"CREATE (a:Person {name: "Alice"})"#)
+        .await
+        .expect("seed");
+    rebuild_and_publish_index(&fluree, ledger_id).await;
+    let indexed = fluree.db(ledger_id).await.expect("indexed view");
+
+    let l = fluree.ledger(ledger_id).await.expect("load indexed");
+    let l = fluree
+        .transact_cypher(l, r#"CREATE (b:Person {name: "Bob"})"#)
+        .await
+        .expect("novel node")
+        .ledger;
+    let with_novelty = graphdb_from_ledger(&l);
+    let l = fluree
+        .transact_cypher(
+            l,
+            r#"MATCH (a:Person {name: "Alice"}) CREATE (a)-[:RATED {stars: 5}]->(m:Movie {title: "Inception"})"#,
+        )
+        .await
+        .expect("novel reified edge")
+        .ledger;
+    let novel_edge = graphdb_from_ledger(&l);
+
+    const NODE: &str = "MATCH (a:Person) RETURN type(a) AS t, startNode(a) AS s";
+    let cases = [
+        ("indexed", &indexed, NODE, json!([[null, null]])),
+        (
+            "indexed + novelty",
+            &with_novelty,
+            NODE,
+            json!([[null, null], [null, null]]),
+        ),
+        (
+            "edge reified in novelty",
+            &novel_edge,
+            "MATCH (:Person)-[r:RATED]->(:Movie) RETURN type(r) AS t",
+            json!([["RATED"]]),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (label, db, query, expected) in cases {
+        let rows = match fluree.query_cypher(db, query).await {
+            Ok(r) => {
+                let cj = r
+                    .to_cypher_json_async(db.as_graph_db_ref())
+                    .await
+                    .expect("cypher json");
+                JsonValue::Array(
+                    cj["results"][0]["data"]
+                        .as_array()
+                        .expect("rows")
+                        .iter()
+                        .map(|r| r["row"].clone())
+                        .collect(),
+                )
+            }
+            Err(e) => json!(format!("ERR: {e}")),
+        };
+        if rows != expected {
+            wrong.push(format!("{label}: {query}\n  got {rows}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
+
 #[tokio::test]
 async fn cypher_call_subquery_nested() {
     // A nested CALL sees the variables imported by its enclosing CALL.
