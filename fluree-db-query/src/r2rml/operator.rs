@@ -2526,13 +2526,14 @@ impl R2rmlScanOperator {
         Ok(())
     }
 
-    /// The `LIMIT` budget is met: no more rows, so the in-flight pass's
-    /// deduplication set and any part-emitted window are no longer needed.
+    /// The `LIMIT` budget is met: no more rows, so the in-flight pass is
+    /// dropped now rather than at `close()`: its deduplication set, any
+    /// part-emitted window, and each map's file stream, whose reads still in
+    /// flight would otherwise finish decoding and stay charged to the query.
     fn exhaust_on_budget(&mut self, ctx: &ExecutionContext<'_>) {
         self.state = OperatorState::Exhausted;
-        if let Some(progress) = self.progress.as_mut() {
+        if let Some(mut progress) = self.progress.take() {
             progress.release_seen(ctx);
-            progress.emitting = None;
         }
     }
 
@@ -5431,6 +5432,108 @@ mod tests {
                 "closing the scan returns the window's charge: {} left",
                 cancel.allocated_bytes()
             );
+        }
+
+        /// `EVENTS` again, read as batches of `batch_rows`, by a stream that
+        /// holds a charge of `READ_AHEAD` bytes on the query's memory budget
+        /// until it drops, as the Iceberg reader's decoded files do.
+        #[derive(Debug)]
+        struct ReadAhead {
+            rows: i64,
+            batch_rows: usize,
+        }
+
+        const READ_AHEAD: usize = 1 << 16;
+
+        #[async_trait::async_trait]
+        impl R2rmlTableProvider for ReadAhead {
+            async fn scan_table(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+            ) -> Result<ColumnBatchStream> {
+                unreachable!("the scan reads through scan_table_ordered")
+            }
+
+            async fn scan_table_ordered(
+                &self,
+                _graph_source_id: &str,
+                _table_name: &str,
+                _projection: &[String],
+                _filters: &[crate::r2rml::ScanFilter],
+                _topk: Option<&crate::r2rml::ScanTopK>,
+                _as_of_t: Option<i64>,
+                _order: crate::r2rml::ScanOrder,
+                memory: &QueryCancellation,
+            ) -> Result<ColumnBatchStream> {
+                let field = |name: &str, field_id| FieldInfo {
+                    name: name.to_string(),
+                    field_type: FieldType::Int64,
+                    nullable: true,
+                    field_id,
+                };
+                let schema = Arc::new(BatchSchema::new(vec![field("ID", 1), field("BUCKET", 2)]));
+                let ids: Vec<i64> = (1..=self.rows).collect();
+                let batches: Vec<Result<ColumnBatch>> = ids
+                    .chunks(self.batch_rows)
+                    .map(|chunk| {
+                        Ok(ColumnBatch::new(
+                            Arc::clone(&schema),
+                            vec![
+                                Column::Int64(chunk.iter().copied().map(Some).collect()),
+                                Column::Int64(chunk.iter().map(|_| Some(0)).collect()),
+                            ],
+                        )
+                        .unwrap())
+                    })
+                    .collect();
+                let mut charge = fluree_db_core::MemoryCharge::new(memory);
+                charge.record(READ_AHEAD);
+                Ok(Box::pin(futures::stream::iter(batches).map(move |batch| {
+                    let _held = &charge;
+                    batch
+                })))
+            }
+        }
+
+        /// A scan that meets its `LIMIT` lets go of the rest of the table
+        /// then, not at `close()`: the file stream it was reading, and the
+        /// read-ahead charged to the query with it, drop with the LIMIT's last
+        /// batch, so nothing the query does after that runs with them on its
+        /// budget.
+        #[tokio::test]
+        async fn a_scan_that_meets_its_limit_returns_its_read_ahead() {
+            let provider = ReadAhead {
+                rows: 64,
+                batch_rows: 16,
+            };
+            let snapshot = LedgerSnapshot::genesis("test:main");
+            let vars = VarRegistry::new();
+            let cancel = QueryCancellation::new();
+            let mut ctx = ExecutionContext::new(&snapshot, &vars).with_cancellation(cancel.clone());
+            ctx.r2rml_table_provider = Some(&provider);
+            ctx.batch_size = 16;
+            let mut seed = EmptyOperator::new();
+            seed.open(&ctx).await.unwrap();
+            let mut op = scan(Box::new(seed), A, K);
+            op.set_row_budget(16);
+
+            let batch = op
+                .next_batch(&ctx)
+                .await
+                .unwrap()
+                .expect("the LIMIT's rows");
+            assert_eq!(batch.len(), 16);
+            assert_eq!(
+                cancel.allocated_bytes(),
+                0,
+                "the stream's read-ahead is returned with the LIMIT's last batch"
+            );
+            assert!(op.next_batch(&ctx).await.unwrap().is_none());
         }
 
         /// Every joined row once, however the output is cut: the join run one
