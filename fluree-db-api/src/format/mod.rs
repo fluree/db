@@ -57,6 +57,7 @@ mod rdf_xml;
 mod service_description;
 pub(crate) mod sparql;
 mod sparql_xml;
+mod sparql_xml_previous;
 mod typed;
 
 // Every wildcard formatter (SPARQL JSON, SPARQL XML, JSON-LD, typed,
@@ -417,6 +418,30 @@ fn stream_json(
 /// Format query results to a JSON string
 ///
 /// Convenience function that formats and serializes in one step.
+/// Bench-only: `FLUREE_BENCH_XML_WRITER=previous` selects the SPARQL Results
+/// XML writer as of 4f527e30d, so both writers can be compared in one binary.
+/// Read once; both settings take the same check. Not for merge.
+fn write_sparql_xml(
+    result: &QueryResult,
+    compactor: &IriCompactor,
+    config: &FormatterConfig,
+) -> Result<String> {
+    static PREVIOUS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let previous = *PREVIOUS.get_or_init(|| {
+        let previous = std::env::var("FLUREE_BENCH_XML_WRITER").is_ok_and(|v| v == "previous");
+        tracing::warn!(
+            writer = if previous { "previous" } else { "current" },
+            "bench build: SPARQL XML writer selected"
+        );
+        previous
+    });
+    if previous {
+        sparql_xml_previous::format(result, compactor, config)
+    } else {
+        sparql_xml::format(result, compactor, config)
+    }
+}
+
 /// Respects `config.pretty` for formatting.
 ///
 /// Note: For hydration queries, use `format_results_string_async()` instead.
@@ -434,7 +459,7 @@ pub fn format_results_string(
         OutputFormat::SparqlXml => {
             let compactor = IriCompactor::new(snapshot.shared_namespaces(), context)
                 .with_absolute_iris(config.absolute_iris);
-            return sparql_xml::format(result, &compactor, config);
+            return write_sparql_xml(result, &compactor, config);
         }
         OutputFormat::RdfXml
         | OutputFormat::Turtle
@@ -773,7 +798,7 @@ pub async fn format_results_string_async(
         }
         OutputFormat::SparqlXml => {
             let compactor = IriCompactor::new(db.snapshot.shared_namespaces(), context);
-            return sparql_xml::format(result, &compactor, config);
+            return write_sparql_xml(result, &compactor, config);
         }
         OutputFormat::RdfXml
         | OutputFormat::Turtle
@@ -824,7 +849,7 @@ pub async fn format_results_string_async_dataset(
         }
         OutputFormat::SparqlXml => {
             let compactor = IriCompactor::new(primary_db.snapshot.shared_namespaces(), context);
-            return sparql_xml::format(result, &compactor, config);
+            return write_sparql_xml(result, &compactor, config);
         }
         OutputFormat::RdfXml
         | OutputFormat::Turtle
