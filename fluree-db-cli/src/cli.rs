@@ -3309,7 +3309,9 @@ pub struct TokenCreateArgs {
     #[arg(long, requires = "audiences")]
     pub policy_select: bool,
 
-    /// Grant access to all ledgers (fluree.events.all=true, fluree.storage.all=true)
+    /// Grant full access to all ledgers: events, storage, read and write
+    /// (fluree.events.all, fluree.storage.all, fluree.ledger.read.all,
+    /// fluree.ledger.write.all)
     #[arg(long)]
     pub all: bool,
 
