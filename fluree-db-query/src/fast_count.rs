@@ -1280,13 +1280,17 @@ pub fn count_distinct_position_operator(
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
                 // Distinct objects = lead bytes [0..10] — which excludes p_id,
-                // and so is not an object identity for a NumBig arena handle.
-                // Those terms are counted exactly from the in-memory arenas
-                // (see `count_distinct_numbig_objects`); declining is reserved
-                // for a graph holding vectors, an inconsistent index or the
-                // explicit kill switch.
+                // and so is not an object identity for a NumBig or vector arena
+                // handle. Those terms are counted exactly from their arenas
+                // (see `count_distinct_objects`); declining is reserved for an
+                // inconsistent index or the explicit kill switch.
                 DistinctPosition::Objects => {
-                    let Some(count) = count_distinct_objects(store, ctx.binary_g_id, &ctx.tracker)?
+                    let Some(count) = count_distinct_objects(
+                        store,
+                        ctx.binary_g_id,
+                        &ctx.tracker,
+                        &ctx.cancellation,
+                    )?
                     else {
                         return Ok(None);
                     };
@@ -1339,6 +1343,10 @@ pub(crate) fn count_distinct_lead_groups(
 /// from "counted the arena slice exactly".
 const NUMBIG_EXACT_SITE: &str = "distinct object COUNT (numbig exact)";
 
+/// `fast-path outcome` site the whole-graph distinct-object count stamps when
+/// it counts the graph's vectors from their arenas' identity tables.
+const VECTOR_EXACT_SITE: &str = "distinct object COUNT (vector exact)";
+
 /// Kill switch for the exact NumBig branch: when set, a graph whose NumBig
 /// arenas hold more entries than this in total declines the whole count to
 /// the general pipeline. Unset means no cap.
@@ -1373,10 +1381,13 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// its distinct terms come from [`count_distinct_numbig_objects`], which reads
 /// the arenas rather than the rows.
 ///
-/// A graph that holds vectors declines: a vector's `o_key` is a handle into a
+/// Vectors are left out of the walk too: a vector's `o_key` is a handle into a
 /// per-predicate arena that does not deduplicate, so neither the lead nor the
 /// arena's size counts its distinct values
-/// ([`OType::o_key_is_predicate_identifying`]).
+/// ([`OType::o_key_is_predicate_identifying`]). They are counted from the
+/// arenas' identity tables ([`count_distinct_vector_objects`]). Rows the walk
+/// leaves out that no arena accounts for decline the count
+/// ([`distinct_objects_of_walk`]).
 ///
 /// The per-predicate distinct-object count stays on its fast path for every
 /// other predicate: its 14-byte POST lead starts with `p_id`, which scopes a
@@ -1386,26 +1397,170 @@ pub(crate) fn count_distinct_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
     tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<u64>> {
-    if store.graph_holds_vectors(g_id) {
-        return Ok(None);
-    }
     let Some(walk) =
         count_distinct_lead_groups_inner(store, g_id, RunSortOrder::Opst, true, tracker)?
     else {
         return Ok(None);
     };
-    if walk.tally == 0 {
-        return Ok(Some(walk.count));
-    }
-    let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
-        return Ok(None);
+    distinct_objects_of_walk(
+        &walk,
+        || {
+            let exact = count_distinct_numbig_objects(store, g_id, tracker)?;
+            if exact.is_some() {
+                crate::fast_path_outcome::stamp_fast_path(
+                    NUMBIG_EXACT_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
+            Ok(exact)
+        },
+        || {
+            if !store.graph_holds_vectors(g_id) {
+                return Ok(None);
+            }
+            let exact = count_distinct_vector_objects(store, g_id, tracker, cancellation)?;
+            if exact.is_some() {
+                crate::fast_path_outcome::stamp_fast_path(
+                    VECTOR_EXACT_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
+            Ok(exact)
+        },
+    )
+}
+
+/// The whole-graph distinct-object count from a directory walk and exact
+/// counts of what it left out, the arena-keyed objects, whose keys are not
+/// graph-wide identities. Each kind it skipped counts from its own arenas
+/// (`numbig`, `vectors`; no value of one equals a value of the other); one
+/// that cannot (`None`: no arena to count its rows, as in an inconsistent
+/// index, or a count that declines) declines the whole count rather than
+/// leaving its rows out of it. A kind the walk skipped no rows of is not
+/// counted.
+fn distinct_objects_of_walk(
+    walk: &LeadGroupWalk,
+    numbig: impl FnOnce() -> Result<Option<u64>>,
+    vectors: impl FnOnce() -> Result<Option<u64>>,
+) -> Result<Option<u64>> {
+    let numbig = if walk.skipped_non_identifying_rows > 0 {
+        let Some(exact) = numbig()? else {
+            return Ok(None);
+        };
+        exact
+    } else {
+        0
     };
-    crate::fast_path_outcome::stamp_fast_path(
-        NUMBIG_EXACT_SITE,
-        crate::fast_path_outcome::FastPathOutcome::Proceed,
+    let vectors = if walk.skipped_vector_rows > 0 {
+        let Some(exact) = vectors()? else {
+            return Ok(None);
+        };
+        exact
+    } else {
+        0
+    };
+    Ok(Some(
+        walk.count.saturating_add(numbig).saturating_add(vectors),
+    ))
+}
+
+/// Exact distinct-value count over the graph's vector objects, from the
+/// arenas' identity tables rather than the rows.
+///
+/// A vector arena gives each stored fact its own handle, so its handles are
+/// not values; its identity table gives each handle its value's hash and its
+/// canonical handle (the lowest handle holding an equal vector), so the
+/// distinct canonical handles of an arena's live handles are its distinct
+/// values. Liveness is proved per predicate from POST directories, as for
+/// big numbers ([`count_live_arena_handles`]): an arena keeps the handles of
+/// retracted facts, and only a predicate that holds some pays to read which
+/// handles are live. Across predicates, equal vectors hash alike, so only a
+/// hash that two arenas share needs their components compared, bitwise as
+/// every other vector equality is.
+///
+/// Builds each vector predicate's identity table on first use (once per
+/// store, stopping on `cancellation`; see
+/// [`BinaryIndexStore::vector_identity`]).
+fn count_distinct_vector_objects(
+    store: &BinaryIndexStore,
+    g_id: GraphId,
+    tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
+) -> Result<Option<u64>> {
+    let vector = ArenaRange::of_o_type(OType::VECTOR);
+    // (value hash, predicate, canonical handle): one per distinct value of an
+    // arena once deduplicated.
+    let mut keys: Vec<(u64, u32, u32)> = Vec::new();
+    for p_id in store.vector_predicates(g_id) {
+        let Some(table) = store
+            .vector_identity(g_id, p_id, cancellation)
+            .map_err(|e| QueryError::from_io("vector identity table", e))?
+        else {
+            continue;
+        };
+        let (live, _) = count_live_arena_handles(store, g_id, p_id, vector, tracker)?;
+        if live == 0 {
+            continue;
+        }
+        if live == table.len() as u64 {
+            // Every handle is live, so each canonical handle is one value.
+            keys.extend((0..table.len() as u32).filter_map(|h| {
+                let (hash, canonical) = table.of(h)?;
+                (canonical == h).then_some((hash, p_id, canonical))
+            }));
+            continue;
+        }
+        for (_, h) in live_arena_handles(store, g_id, p_id, vector, tracker)? {
+            let (hash, canonical) = table.of(h).ok_or_else(|| {
+                QueryError::Internal(format!(
+                    "vector handle {h} beyond the identity table for g_id={g_id}, p_id={p_id}"
+                ))
+            })?;
+            keys.push((hash, p_id, canonical));
+        }
+    }
+    keys.sort_unstable();
+    keys.dedup();
+    // A hash two arenas share (or a collision within one) compares its
+    // vectors. On a residency host, record every shard those reads need that
+    // the resident tier lacks before the first of them, so one fetch round
+    // brings them all, rather than one round per shard read in hash order.
+    store.register_missing_vector_shards(
+        g_id,
+        keys.chunk_by(|a, b| a.0 == b.0)
+            .filter(|run| run.len() > 1)
+            .flatten()
+            .map(|&(_, p_id, canonical)| (p_id, canonical)),
     );
-    Ok(Some(walk.count.saturating_add(exact)))
+    let mut count = 0u64;
+    for run in keys.chunk_by(|a, b| a.0 == b.0) {
+        if run.len() == 1 {
+            count += 1;
+            continue;
+        }
+        // One hash in several arenas (or a collision within one): compare.
+        let mut values: Vec<fluree_db_binary_index::arena::vector::VectorSlice> = Vec::new();
+        for &(_, p_id, canonical) in run {
+            let slice = store
+                .vector_slice(g_id, p_id, canonical)
+                .map_err(|e| QueryError::from_io("vector read", e))?
+                .ok_or_else(|| {
+                    QueryError::Internal(format!(
+                        "vector handle {canonical} missing for g_id={g_id}, p_id={p_id}"
+                    ))
+                })?;
+            let same = |held: &fluree_db_binary_index::arena::vector::VectorSlice| {
+                fluree_db_core::value::vector_eq_f32(held.as_f32(), slice.as_f32())
+            };
+            if !values.iter().any(same) {
+                values.push(slice);
+            }
+        }
+        count += values.len() as u64;
+    }
+    Ok(Some(count))
 }
 
 /// Exact distinct-term count over the graph's NumBig objects, answered from
@@ -1465,11 +1620,11 @@ fn count_distinct_numbig_objects(
         return Ok(None);
     }
 
-    let range = NumBigRange::of(store);
+    let range = ArenaRange::numbig(store);
     let mut keys: Vec<(u16, NumBigDistinctKey)> = Vec::new();
     for (p_id, arena) in arenas {
         let normalized = arena.values_are_normalized();
-        let (live, types) = count_live_numbig_handles(store, g_id, p_id, range, tracker)?;
+        let (live, types) = count_live_arena_handles(store, g_id, p_id, range, tracker)?;
         if live == 0 {
             continue;
         }
@@ -1483,7 +1638,7 @@ fn count_distinct_numbig_objects(
             );
             continue;
         }
-        let pairs = live_numbig_handles(store, g_id, p_id, range, tracker)?;
+        let pairs = live_arena_handles(store, g_id, p_id, range, tracker)?;
         let mapped: Result<Vec<(u16, NumBigDistinctKey)>> = pairs
             .par_iter()
             .map(|&(o_type, h)| {
@@ -1561,21 +1716,29 @@ fn i128_from_signed_le(bytes: &[u8]) -> Option<i128> {
     Some(i128::from_le_bytes(buf))
 }
 
-/// The NumBig o_types of a store's typing, as an inclusive o_type range. Every
-/// o_type in it is a NumBig one, so a row's o_type alone says whether it holds
-/// an arena handle.
+/// The o_types of one kind of arena handle, as an inclusive o_type range: a
+/// store typing's NumBig o_types, or the vector o_type alone. Every o_type in
+/// it keys that arena, so a row's o_type alone says whether it holds one of
+/// its handles.
 #[derive(Clone, Copy)]
-struct NumBigRange {
+struct ArenaRange {
     lo: u16,
     hi: u16,
 }
 
-impl NumBigRange {
-    fn of(store: &BinaryIndexStore) -> Self {
+impl ArenaRange {
+    fn numbig(store: &BinaryIndexStore) -> Self {
         let (lo, hi) = store.num_big_typing().o_type_range();
         Self {
             lo: lo.as_u16(),
             hi: hi.as_u16(),
+        }
+    }
+
+    fn of_o_type(o_type: OType) -> Self {
+        Self {
+            lo: o_type.as_u16(),
+            hi: o_type.as_u16(),
         }
     }
 
@@ -1589,35 +1752,35 @@ impl NumBigRange {
     }
 }
 
-/// How one predicate's POST leaflet relates to the NumBig o_types.
-enum NumBigLeaflet {
-    /// Holds no NumBig row, or belongs to another predicate.
+/// How one predicate's POST leaflet relates to an [`ArenaRange`].
+enum ArenaLeaflet {
+    /// Holds no row of the range, or belongs to another predicate.
     Outside,
-    /// Every row has this NumBig o_type: `lead_group_count` is its
+    /// Every row has this o_type of the range: `lead_group_count` is its
     /// distinct-handle count.
     Pure(u16),
-    /// Straddles the NumBig range (or predates `lead_group_count`): rows
-    /// must be decoded to find its NumBig handles.
+    /// Straddles the range (or predates `lead_group_count`): rows must be
+    /// decoded to find its handles.
     Decode,
 }
 
-fn classify_numbig_leaflet(
+fn classify_arena_leaflet(
     entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
     p_id: u32,
-    range: NumBigRange,
-) -> NumBigLeaflet {
+    range: ArenaRange,
+) -> ArenaLeaflet {
     if entry.row_count == 0 || entry.p_const != Some(p_id) {
-        return NumBigLeaflet::Outside;
+        return ArenaLeaflet::Outside;
     }
     match entry.o_type_const {
         Some(o_type) if range.contains(o_type) => {
             return if entry.lead_group_count > 0 {
-                NumBigLeaflet::Pure(o_type)
+                ArenaLeaflet::Pure(o_type)
             } else {
-                NumBigLeaflet::Decode
+                ArenaLeaflet::Decode
             };
         }
-        Some(_) => return NumBigLeaflet::Outside,
+        Some(_) => return ArenaLeaflet::Outside,
         None => {}
     }
     // POST keys sort by `(p_id, o_type, o_key, …)`, so the entry's routing
@@ -1625,14 +1788,14 @@ fn classify_numbig_leaflet(
     let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
     let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
     if lo <= range.hi && range.lo <= hi {
-        NumBigLeaflet::Decode
+        ArenaLeaflet::Decode
     } else {
-        NumBigLeaflet::Outside
+        ArenaLeaflet::Outside
     }
 }
 
-/// The POST group of NumBig handle `handle` under `p_id` and `o_type`.
-fn numbig_group(p_id: u32, o_type: u16, handle: u64) -> LiveGroup {
+/// The POST group of arena handle `handle` under `p_id` and `o_type`.
+fn arena_group(p_id: u32, o_type: u16, handle: u64) -> LiveGroup {
     let rec = RunRecordV2 {
         s_id: SubjectId(0),
         o_key: handle,
@@ -1651,16 +1814,16 @@ fn numbig_group(p_id: u32, o_type: u16, handle: u64) -> LiveGroup {
     LiveGroup::of_key(RunSortOrder::Post, &key)
 }
 
-/// The distinct NumBig `(o_type, handle)` pairs of one decoded POST leaflet:
+/// The distinct `(o_type, handle)` pairs of `range` in one decoded POST leaflet:
 /// their count, the first and last, and the set of o_types among them, or
 /// `None` when it holds none. Rows are sorted by `(o_type, o_key, …)` within
 /// the predicate, so equal pairs are adjacent.
 #[allow(clippy::type_complexity)]
-fn decode_numbig_handle_run(
+fn decode_arena_handle_run(
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     leaflet_idx: usize,
     o_type_const: Option<u16>,
-    range: NumBigRange,
+    range: ArenaRange,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Option<(u64, (u16, u64), (u16, u64), u16)>> {
     let batch = crate::fast_path_common::load_leaflet_columns_charged(
@@ -1691,18 +1854,18 @@ fn decode_numbig_handle_run(
     Ok(first.zip(prev).map(|(f, l)| (count, f, l, types)))
 }
 
-/// Number of distinct NumBig `(o_type, handle)` pairs with a live row under
-/// `p_id`, and the set of o_types among them, from POST leaflet directories:
-/// `lead_group_count` over type-pure NumBig leaflets with seam dedup on the
-/// pair, decoding only a leaflet that straddles the NumBig range or predates
-/// `lead_group_count`. When the pairs share one o_type, comparing the count
+/// Number of distinct `(o_type, handle)` pairs of `range` (big numbers,
+/// vectors) with a live row under `p_id`, and the set of o_types among them,
+/// from POST leaflet directories: `lead_group_count` over type-pure leaflets
+/// with seam dedup on the pair, decoding only a leaflet that straddles the
+/// range or predates `lead_group_count`. When the pairs share one o_type, comparing the count
 /// with the arena's size says whether every arena entry is still live without
 /// reading a row.
-fn count_live_numbig_handles(
+fn count_live_arena_handles(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
-    range: NumBigRange,
+    range: ArenaRange,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<(u64, u16)> {
     use std::sync::atomic::{AtomicU16, Ordering};
@@ -1714,17 +1877,17 @@ fn count_live_numbig_handles(
         leaves,
         tracker,
         |leaf, idx, entry| {
-            Ok(match classify_numbig_leaflet(entry, p_id, range) {
-                NumBigLeaflet::Outside => Role::Skip,
-                NumBigLeaflet::Pure(o_type) => {
+            Ok(match classify_arena_leaflet(entry, p_id, range) {
+                ArenaLeaflet::Outside => Role::Skip,
+                ArenaLeaflet::Pure(o_type) => {
                     types.fetch_or(range.bit(o_type), Ordering::Relaxed);
                     Role::Groups
                 }
-                NumBigLeaflet::Decode => {
+                ArenaLeaflet::Decode => {
                     let handle = store
                         .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
                         .map_err(|e| QueryError::from_io("leaf open", e))?;
-                    match decode_numbig_handle_run(
+                    match decode_arena_handle_run(
                         handle.as_ref(),
                         idx,
                         entry.o_type_const,
@@ -1735,8 +1898,8 @@ fn count_live_numbig_handles(
                             types.fetch_or(run_types, Ordering::Relaxed);
                             Role::Run {
                                 count,
-                                first: numbig_group(p_id, first.0, first.1),
-                                last: numbig_group(p_id, last.0, last.1),
+                                first: arena_group(p_id, first.0, first.1),
+                                last: arena_group(p_id, last.0, last.1),
                             }
                         }
                         None => Role::Skip,
@@ -1751,15 +1914,16 @@ fn count_live_numbig_handles(
     Ok((walk.map_or(0, |w| w.count), types.into_inner()))
 }
 
-/// The set of NumBig `(o_type, handle)` pairs with a live row under `p_id`,
-/// sorted and deduplicated. Reads the `o_type` and `o_key` columns over the
-/// predicate's NumBig leaflets only — the fallback for a predicate whose arena
-/// holds retracted values, or whose handles are live under several o_types.
-fn live_numbig_handles(
+/// The set of `(o_type, handle)` pairs of `range` with a live row under
+/// `p_id`, sorted and deduplicated. Reads the `o_type` and `o_key` columns over
+/// the predicate's leaflets of the range only — the fallback for a predicate
+/// whose arena holds retracted values, or whose handles are live under several
+/// o_types.
+fn live_arena_handles(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
-    range: NumBigRange,
+    range: ArenaRange,
     tracker: &fluree_db_core::Tracker,
 ) -> Result<Vec<(u16, u32)>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
@@ -1779,8 +1943,8 @@ fn live_numbig_handles(
                 .enumerate()
                 .filter(|(_, e)| {
                     !matches!(
-                        classify_numbig_leaflet(e, p_id, range),
-                        NumBigLeaflet::Outside
+                        classify_arena_leaflet(e, p_id, range),
+                        ArenaLeaflet::Outside
                     )
                 })
                 .map(|(i, _)| i)
@@ -1827,30 +1991,56 @@ fn live_numbig_handles(
     Ok(pairs)
 }
 
+/// A directory walk's distinct lead groups, and the rows of leaflets it left
+/// out because their lead is not a graph-wide identity.
+struct LeadGroupWalk {
+    count: u64,
+    /// Skipped rows other than vectors': big numbers, and any leaflet whose
+    /// o_types its keys do not pin to vectors alone.
+    skipped_non_identifying_rows: u64,
+    skipped_vector_rows: u64,
+}
+
 /// Distinct groups of `order` over the graph's dedicated tree. With
 /// `require_identifying_o_key`, leaflets that can hold a non-identifying
-/// `o_key` are left out of the count and their rows tallied instead. They take
-/// no part in boundary dedup either, which is sound because a NumBig group can
-/// never equal a non-NumBig one (the o_type differs in its leading two bytes).
+/// `o_key` are left out of the count and their rows tallied instead, vector
+/// leaflets apart from the rest. They take no part in boundary dedup either,
+/// which is sound because an arena group can never equal a group of another
+/// o_type (the o_type differs in its leading two bytes).
 fn count_distinct_lead_groups_inner(
     store: &BinaryIndexStore,
     g_id: GraphId,
     order: RunSortOrder,
     require_identifying_o_key: bool,
     tracker: &fluree_db_core::Tracker,
-) -> Result<Option<LeadWalk>> {
+) -> Result<Option<LeadGroupWalk>> {
+    use std::sync::atomic::{AtomicU64, Ordering};
     let Some(branch) = store.dedicated_branch(g_id, order) else {
-        return Ok(Some(LeadWalk { count: 0, tally: 0 }));
+        return Ok(Some(LeadGroupWalk {
+            count: 0,
+            skipped_non_identifying_rows: 0,
+            skipped_vector_rows: 0,
+        }));
     };
-    distinct_lead_walk(store, order, &branch.leaves, tracker, |_, _, entry| {
+    let vector_rows = AtomicU64::new(0);
+    let walk = distinct_lead_walk(store, order, &branch.leaves, tracker, |_, _, entry| {
         Ok(if entry.row_count == 0 {
             Role::Skip
         } else if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
+            if leaflet_holds_only_vectors(entry) {
+                vector_rows.fetch_add(u64::from(entry.row_count), Ordering::Relaxed);
+            }
             Role::Tally(u64::from(entry.row_count))
         } else {
             Role::Groups
         })
-    })
+    })?;
+    let skipped_vector_rows = vector_rows.into_inner();
+    Ok(walk.map(|LeadWalk { count, tally }| LeadGroupWalk {
+        count,
+        skipped_non_identifying_rows: tally.saturating_sub(skipped_vector_rows),
+        skipped_vector_rows,
+    }))
 }
 
 /// Whether an OPST leaflet can hold an object key that is not a graph-wide
@@ -1881,6 +2071,14 @@ fn leaflet_may_hold_non_identifying_o_key(
     OType::range_holds_non_globally_identifying(lo, hi)
 }
 
+/// Whether an OPST leaflet's keys pin every row to the vector o_type.
+fn leaflet_holds_only_vectors(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+) -> bool {
+    let vector = OType::VECTOR.as_u16().to_be_bytes();
+    entry.first_key.get(..2) == Some(&vector[..]) && entry.last_key.get(..2) == Some(&vector[..])
+}
+
 /// Count distinct objects `(o_type, o_key)` for one predicate from POST
 /// leaflet directories only: a POST group is the predicate and the object.
 ///
@@ -1894,9 +2092,10 @@ pub(crate) fn count_distinct_objects_for_predicate(
     g_id: GraphId,
     p_id: u32,
     tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<u64>> {
     if !store
-        .objects_keyed_by_value(g_id, p_id)
+        .objects_keyed_by_value(g_id, p_id, cancellation)
         .map_err(|e| QueryError::from_io("vector arena proof", e))?
     {
         return Ok(None);
@@ -2233,6 +2432,37 @@ mod tests {
     use super::*;
     use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
     use fluree_db_core::IndexStats;
+
+    /// Each kind of row the walk leaves out counts from its own arenas, and
+    /// a kind with rows that no arena counts (an inconsistent index: big
+    /// numbers with no arena, vectors with none) declines the whole count
+    /// rather than leave those rows out of it. A kind with no rows left out
+    /// is not counted, so a graph of vectors does not consult big numbers.
+    #[test]
+    fn rows_the_walk_leaves_out_are_counted_or_decline() {
+        let walk = |numbig, vectors| LeadGroupWalk {
+            count: 10,
+            skipped_non_identifying_rows: numbig,
+            skipped_vector_rows: vectors,
+        };
+        let unused =
+            || -> Result<Option<u64>> { panic!("a kind with no rows left out is not counted") };
+        let count = |n: Option<u64>| move || -> Result<Option<u64>> { Ok(n) };
+
+        let all = distinct_objects_of_walk(&walk(0, 0), unused, unused).unwrap();
+        assert_eq!(all, Some(10), "nothing left out");
+        let both = distinct_objects_of_walk(&walk(4, 3), count(Some(2)), count(Some(1))).unwrap();
+        assert_eq!(both, Some(13));
+        let vectors_only = distinct_objects_of_walk(&walk(0, 3), unused, count(Some(1))).unwrap();
+        assert_eq!(vectors_only, Some(11));
+
+        for (numbig, vectors) in [(None, Some(1)), (Some(2), None)] {
+            let declined = distinct_objects_of_walk(&walk(4, 3), count(numbig), count(vectors));
+            assert_eq!(declined.unwrap(), None, "{numbig:?} {vectors:?}");
+        }
+        let numbig_only = distinct_objects_of_walk(&walk(4, 0), count(None), unused).unwrap();
+        assert_eq!(numbig_only, None, "big-number rows with no arena");
+    }
 
     /// An integer threshold selects exactly the doubles the generic lane's
     /// exact comparison does, around and beyond 2^53 where an `i64` has no

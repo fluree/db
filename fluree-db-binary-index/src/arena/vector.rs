@@ -741,6 +741,62 @@ impl LazyVectorArena {
         Ok(shard)
     }
 
+    /// Record every shard the content store's resident tier doesn't hold in
+    /// its miss register, for a reader that reads every shard (an identity
+    /// table's build). It then fails on the first missing shard as before,
+    /// but one retry round fetches the whole arena, rather than one round
+    /// per shard against the retry budget's cap.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    pub(crate) fn register_missing_shards(&self) {
+        self.register_missing(0..self.shard_count());
+    }
+
+    /// Without a residency tier every shard reads from storage directly.
+    #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
+    #[inline]
+    pub(crate) fn register_missing_shards(&self) {}
+
+    /// [`Self::register_missing_shards`] for the shards holding `handles`
+    /// alone, for a reader about to read those vectors in an order of its own
+    /// (a comparison across arenas): one retry round then fetches them all.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    pub fn register_missing_shards_of(&self, handles: impl IntoIterator<Item = u32>) {
+        let mut shards: Vec<usize> = handles
+            .into_iter()
+            .filter_map(|h| self.shard_of(h).map(|(shard, _)| shard))
+            .collect();
+        shards.sort_unstable();
+        shards.dedup();
+        self.register_missing(shards);
+    }
+
+    /// Without a residency tier every shard reads from storage directly.
+    #[cfg(not(any(target_arch = "wasm32", feature = "residency")))]
+    #[inline]
+    pub fn register_missing_shards_of(&self, handles: impl IntoIterator<Item = u32>) {
+        let _ = handles;
+    }
+
+    /// Record each of `shards` the content store's resident tier doesn't
+    /// hold in its miss register.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn register_missing(&self, shards: impl IntoIterator<Item = usize>) {
+        let Some(cs) = self.cas.as_ref() else {
+            return;
+        };
+        let Some(register) = cs.miss_register() else {
+            return;
+        };
+        for shard in shards {
+            let Some(source) = self.shard_sources.get(shard) else {
+                continue;
+            };
+            if let Ok(None) = cs.get_local(&source.cid) {
+                register.record(&source.cid, crate::read::need_fetch::FetchKind::VectorShard);
+            }
+        }
+    }
+
     /// True when the content store carries a sync residency tier.
     #[cfg(any(target_arch = "wasm32", feature = "residency"))]
     fn residency_mode(&self) -> bool {

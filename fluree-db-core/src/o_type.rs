@@ -304,11 +304,18 @@ impl OType {
     /// distinct count, a run-length group over POST order, an object top-k).
     ///
     /// Every o_type that is globally identifying is, and so is every NumBig
-    /// o_type: its arena maps each value to one handle, and the o_type names
-    /// the datatype.
-    /// [`Self::VECTOR`] is not: its arena gives each stored fact its own
-    /// handle, so equal vectors under one predicate carry different keys and
-    /// are not adjacent in POST order.
+    /// o_type: its arena maps each value to one handle as current builds
+    /// write it, and the o_type names the datatype. [`Self::VECTOR`] is not:
+    /// its arena gives each stored fact its own handle, so equal vectors
+    /// under one predicate carry different keys and are not adjacent in POST
+    /// order.
+    ///
+    /// This is a property of the o_type, not of a given arena: a legacy
+    /// decimal arena keeps `1.5` and `1.50` under two handles, and a vector
+    /// arena that holds no value twice does name its values. A caller that
+    /// keys a stored predicate's objects checks
+    /// `BinaryIndexStore::objects_keyed_by_value`, which covers the arena's
+    /// actual contents.
     #[inline]
     pub const fn o_key_is_predicate_identifying(self) -> bool {
         self.0 != Self::VECTOR.0

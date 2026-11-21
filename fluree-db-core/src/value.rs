@@ -971,8 +971,7 @@ impl PartialEq for FlakeValue {
                 (FlakeValue::String(a), FlakeValue::String(b)) => a == b,
                 (FlakeValue::Json(a), FlakeValue::Json(b)) => a == b,
                 (FlakeValue::Vector(a), FlakeValue::Vector(b)) => {
-                    // A decode shares one allocation per distinct value
-                    // (`BinaryGraphView`), so most equal pairs are one `Arc`.
+                    // A cheap identity check before the component compare.
                     Arc::ptr_eq(a, b)
                         || a.len() == b.len()
                             && a.iter()
@@ -1058,6 +1057,12 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
     }
 }
 
+/// `xxh3` over a vector's `f64` bits: the hash [`FlakeValue`]'s `Hash` gives
+/// a decoded vector, consistent with its bitwise equality.
+fn vector_bits_hash(components: &[f64]) -> u64 {
+    xxhash_rust::xxh3::xxh3_64(f64_bytes(components))
+}
+
 /// The hash of a vector's value, for in-memory hash keys. One function for
 /// every form a vector takes: [`vector_value_hash`] for decoded components
 /// and [`vector_value_hash_f32`] for an arena's `f32` slice give equal
@@ -1079,15 +1084,7 @@ fn hash_decimal_canonical<H: std::hash::Hasher>(v: &BigDecimal, state: &mut H) {
 pub fn vector_value_hash(components: &[f64]) -> u64 {
     const CHUNK: usize = 256;
     if !components.iter().all(|&x| narrows_exactly(x)) {
-        // SAFETY: `f64` has no padding and any byte is a valid `u8`; the byte
-        // slice covers exactly `components`' memory and borrows it.
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                components.as_ptr().cast::<u8>(),
-                std::mem::size_of_val(components),
-            )
-        };
-        return xxhash_rust::xxh3::xxh3_64_with_seed(bytes, WIDE_VECTOR_SEED);
+        return xxhash_rust::xxh3::xxh3_64_with_seed(f64_bytes(components), WIDE_VECTOR_SEED);
     }
     if components.len() <= CHUNK {
         let mut narrow = [0f32; CHUNK];
@@ -1143,6 +1140,18 @@ fn narrows_exactly(x: f64) -> bool {
 #[inline]
 fn f32_bytes(components: &[f32]) -> &[u8] {
     // SAFETY: `f32` has no padding and any byte is a valid `u8`; the byte
+    // slice covers exactly `components`' memory and borrows it.
+    unsafe {
+        std::slice::from_raw_parts(
+            components.as_ptr().cast::<u8>(),
+            std::mem::size_of_val(components),
+        )
+    }
+}
+
+#[inline]
+fn f64_bytes(components: &[f64]) -> &[u8] {
+    // SAFETY: `f64` has no padding and any byte is a valid `u8`; the byte
     // slice covers exactly `components`' memory and borrows it.
     unsafe {
         std::slice::from_raw_parts(
@@ -1271,7 +1280,12 @@ impl std::hash::Hash for FlakeValue {
             FlakeValue::Vector(v) => {
                 self.type_discriminant().hash(state);
                 v.len().hash(state);
-                vector_value_hash(v).hash(state);
+                // A table of decoded values (MINUS, the union's fact dedup)
+                // hashes a vector on every probe, so this is one `xxh3` pass
+                // over its bits, which bitwise-equal vectors share. It needn't
+                // agree with [`vector_value_hash`], which keys stored and
+                // decoded vectors against each other and narrows to `f32`.
+                vector_bits_hash(v).hash(state);
             }
             FlakeValue::GeoPoint(bits) => {
                 self.type_discriminant().hash(state);

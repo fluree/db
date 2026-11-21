@@ -627,17 +627,25 @@ async fn object_keyed_lanes_decline_vectors_and_serve_strings() {
         );
     }
 
-    // The whole-graph distinct-object count: this graph holds vectors.
+    // The whole-graph distinct-object count serves a graph that holds
+    // vectors, counting them by value from their arenas' identity tables:
+    // `[0.5,0.5]` twice under `ex:w` is one value, and `ex:f`'s vector under
+    // both `ex:j1` and `ex:j2` is one.
     let before = store.find_events("fast-path outcome").len();
     assert_eq!(
         sparql(&db, "SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }").await,
         ["n=14"]
     );
-    assert!(
-        !served(&store, before, "distinct object COUNT"),
-        "{:?}",
-        stamped(&store, before, "")
-    );
+    for site in [
+        "distinct object COUNT",
+        "distinct object COUNT (vector exact)",
+    ] {
+        assert!(
+            served(&store, before, site),
+            "{site}: {:?}",
+            stamped(&store, before, "")
+        );
+    }
 
     // The partitioned GROUP BY lane: a string key stays on it; a vector key
     // folds by value and stamps the decline.
@@ -832,10 +840,11 @@ fn vector_shard_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
 }
 
 /// Queries that key `ex:j1`'s and `ex:j2`'s vectors into one hash table
-/// (DISTINCT, GROUP BY, COUNT(DISTINCT), a join, MINUS), with their answers.
-/// The two predicates share one vector, each under its own arena, so the
-/// tables meet equal vectors from two arenas. None renders a vector.
-const CROSS_ARENA: [(&str, &[&str]); 5] = [
+/// (DISTINCT, GROUP BY, COUNT(DISTINCT), a join, MINUS, and the EXISTS
+/// semijoin both ways), with their answers. The two predicates share one
+/// vector, each under its own arena, so the tables meet equal vectors from
+/// two arenas. None renders a vector.
+const CROSS_ARENA: [(&str, &[&str]); 7] = [
     (
         "SELECT (COUNT(*) AS ?n) WHERE { SELECT DISTINCT ?v \
          WHERE { { ?s ex:j1 ?v } UNION { ?s ex:j2 ?v } } }",
@@ -857,6 +866,16 @@ const CROSS_ARENA: [(&str, &[&str]); 5] = [
     // MINUS keys a vector by its decoded value, not its arena entry.
     (
         "SELECT ?s WHERE { ?s ex:j1 ?v MINUS { ?t ex:j2 ?v } }",
+        &["s=g"],
+    ),
+    // A failed comparison counted unequal would drop `ex:f` here, and keep
+    // it in the NOT EXISTS form, with no error.
+    (
+        "SELECT ?s WHERE { ?s ex:j1 ?v FILTER EXISTS { ?t ex:j2 ?v } }",
+        &["s=f"],
+    ),
+    (
+        "SELECT ?s WHERE { ?s ex:j1 ?v FILTER NOT EXISTS { ?t ex:j2 ?v } }",
         &["s=g"],
     ),
 ];
@@ -1127,7 +1146,7 @@ async fn union_tables(fluree: &Fluree, build: bool) -> Vec<bool> {
                 .expect("predicate");
             if build {
                 store
-                    .vector_identity(g_id, p_id)
+                    .vector_identity(g_id, p_id, &fluree_db_core::QueryCancellation::disabled())
                     .expect("read the arena")
                     .expect("an arena");
             }

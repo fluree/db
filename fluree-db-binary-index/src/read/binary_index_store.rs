@@ -2054,6 +2054,31 @@ impl BinaryIndexStore {
         arena.lookup_vector(handle)
     }
 
+    /// Record in a residency host's miss register every shard of `g_id`'s
+    /// vector arenas that holds one of `handles` (`(p_id, handle)`) and that
+    /// the resident tier lacks, for a reader about to read those vectors in
+    /// an order of its own: one retry round then fetches them all, rather
+    /// than one round per shard. Without a residency tier, nothing.
+    pub fn register_missing_vector_shards(
+        &self,
+        g_id: GraphId,
+        handles: impl IntoIterator<Item = (u32, u32)>,
+    ) {
+        let Some(gi) = self.graph_indexes.get(&g_id) else {
+            return;
+        };
+        let mut handles = handles.into_iter().peekable();
+        while let Some(&(p_id, _)) = handles.peek() {
+            let mut of_predicate = Vec::new();
+            while let Some((_, handle)) = handles.next_if(|&(p, _)| p == p_id) {
+                of_predicate.push(handle);
+            }
+            if let Some(arena) = gi.vectors.get(&p_id) {
+                arena.register_missing_shards_of(of_predicate);
+            }
+        }
+    }
+
     /// The length of `(g_id, p_id)`'s vectors, from the arena manifest (no
     /// shard is loaded). `None` when the predicate has no vectors in `g_id`.
     pub fn vector_dims(&self, g_id: GraphId, p_id: u32) -> Option<u16> {
@@ -2062,6 +2087,14 @@ impl BinaryIndexStore {
             .and_then(|gi| gi.vectors.get(&p_id))
             .map(crate::arena::vector::LazyVectorArena::dims)
             .filter(|&dims| dims != 0)
+    }
+
+    /// The predicates of `g_id` that have a vector arena.
+    pub fn vector_predicates(&self, g_id: GraphId) -> impl Iterator<Item = u32> + '_ {
+        self.graph_indexes
+            .get(&g_id)
+            .into_iter()
+            .flat_map(|gi| gi.vectors.keys().copied())
     }
 
     /// Whether any predicate of `g_id` has a vector arena, whose object keys
@@ -2951,7 +2984,15 @@ impl BinaryIndexStore {
     /// twice ([`Self::vector_handles_name_values`]); and a legacy NumBig arena
     /// with scale-variant duplicates
     /// ([`Self::graph_numbig_has_duplicate_handles`]).
-    pub fn objects_keyed_by_value(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+    ///
+    /// Building a table reads the whole arena, so it stops, with the
+    /// cancellation's reason as the error, once `cancellation` fires.
+    pub fn objects_keyed_by_value(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        cancellation: &fluree_db_core::QueryCancellation,
+    ) -> io::Result<bool> {
         let Some(gi) = self.graph_indexes.get(&g_id) else {
             return Ok(true);
         };
@@ -2962,7 +3003,7 @@ impl BinaryIndexStore {
         {
             return Ok(false);
         }
-        self.vector_handles_name_values(g_id, p_id)
+        self.vector_handles_name_values(g_id, p_id, cancellation)
     }
 
     /// Whether `(g_id, p_id)`'s vector arena holds no value twice, so within
@@ -2971,9 +3012,14 @@ impl BinaryIndexStore {
     /// it isn't built yet. This certifies the persisted arena only: a caller
     /// that also reads novelty must not rely on it unless it merges novelty
     /// by value.
-    pub fn vector_handles_name_values(&self, g_id: GraphId, p_id: u32) -> io::Result<bool> {
+    pub fn vector_handles_name_values(
+        &self,
+        g_id: GraphId,
+        p_id: u32,
+        cancellation: &fluree_db_core::QueryCancellation,
+    ) -> io::Result<bool> {
         Ok(self
-            .vector_identity(g_id, p_id)?
+            .vector_identity(g_id, p_id, cancellation)?
             .is_none_or(|identity| identity.duplicate_free))
     }
 
@@ -2983,11 +3029,14 @@ impl BinaryIndexStore {
     /// `None` without an arena. The arena is immutable for the store's
     /// lifetime, so the table is too. It is built once: concurrent first
     /// callers wait on that build rather than each read the arena, and a
-    /// build that fails leaves it to the next caller.
+    /// build that fails leaves it to the next caller. A build stops once
+    /// `cancellation` fires, with the cancellation's reason as the error,
+    /// so it too leaves the table to the next caller.
     pub fn vector_identity(
         &self,
         g_id: GraphId,
         p_id: u32,
+        cancellation: &fluree_db_core::QueryCancellation,
     ) -> io::Result<Option<Arc<VectorIdentity>>> {
         let Some(arena) = self
             .graph_indexes
@@ -3009,7 +3058,7 @@ impl BinaryIndexStore {
             #[cfg(test)]
             self.identity_builds
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            VectorIdentity::build(arena).map(Arc::new)
+            VectorIdentity::build(arena, cancellation).map(Arc::new)
         })?;
         Ok(Some(Arc::clone(identity)))
     }
@@ -3981,12 +4030,27 @@ pub struct VectorIdentity {
 }
 
 impl VectorIdentity {
-    fn build(arena: &crate::arena::vector::LazyVectorArena) -> io::Result<Self> {
+    fn build(
+        arena: &crate::arena::vector::LazyVectorArena,
+        cancellation: &fluree_db_core::QueryCancellation,
+    ) -> io::Result<Self> {
+        /// Vectors between two looks at `cancellation`.
+        const CANCEL_CHECK_EVERY: u32 = 1024;
+        // It reads every shard: on a residency host, ask for all the missing
+        // ones at once rather than fail on each in turn.
+        arena.register_missing_shards();
         let len = arena.len() as usize;
         let mut hashes = vec![0u64; len];
         let mut canonical: Vec<u32> = (0..len as u32).collect();
         let mut by_hash: Vec<(u64, u32)> = Vec::with_capacity(len);
+        let mut cancelled = None;
         arena.scan_all(|handle, components| {
+            if handle % CANCEL_CHECK_EVERY == 0 {
+                if let Some(reason) = cancellation.reason() {
+                    cancelled = Some(reason);
+                    return std::ops::ControlFlow::Break(());
+                }
+            }
             let hash = fluree_db_core::value::vector_value_hash_f32(components);
             if let Some(slot) = hashes.get_mut(handle as usize) {
                 *slot = hash;
@@ -3994,11 +4058,17 @@ impl VectorIdentity {
             }
             std::ops::ControlFlow::Continue(())
         })?;
+        if let Some(reason) = cancelled {
+            return Err(io::Error::other(reason));
+        }
         by_hash.sort_unstable();
         let mut duplicate_free = true;
         for run in by_hash.chunk_by(|a, b| a.0 == b.0) {
             if run.len() < 2 {
                 continue;
+            }
+            if let Some(reason) = cancellation.reason() {
+                return Err(io::Error::other(reason));
             }
             // Handles ascend within a run, so the first equal vector met is
             // the canonical one.
@@ -4032,6 +4102,16 @@ impl VectorIdentity {
             *self.hashes.get(handle as usize)?,
             *self.canonical.get(handle as usize)?,
         ))
+    }
+
+    /// How many handles the table covers: the arena's.
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    /// Whether the arena holds no handle.
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
     }
 
     /// Whether no value is held twice: every handle is its own canonical one.
@@ -5709,7 +5789,11 @@ pub(crate) mod tests {
             .collect();
         assert!(off.iter().all(|k| k.canonical().is_none()));
 
-        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+        let table = view
+            .store()
+            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
         assert!(!table.duplicate_free());
         // A fresh view, as a later query has, sees the built table.
         let view = BinaryGraphView::new(view.clone_store(), 0);
@@ -5761,7 +5845,10 @@ pub(crate) mod tests {
                 .map(|_| {
                     scope.spawn(|| {
                         start.wait();
-                        store.vector_identity(0, 7).unwrap().unwrap()
+                        store
+                            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+                            .unwrap()
+                            .unwrap()
                     })
                 })
                 .collect();
@@ -5800,7 +5887,11 @@ pub(crate) mod tests {
             Arc::clone(&cache),
         );
         let view = view_with_vector_arena(7, arena);
-        let table = view.store().vector_identity(0, 7).unwrap().unwrap();
+        let table = view
+            .store()
+            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
 
         cache.invalidate_all();
         for cid in &cids {
@@ -5854,7 +5945,10 @@ pub(crate) mod tests {
         let cache = Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024));
         let arena = vector_arena_cached(&dir, 2, 2, &shards, Arc::clone(&cache));
         let view = view_with_vector_arena(7, arena);
-        view.store().vector_identity(0, 7).unwrap().unwrap();
+        view.store()
+            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
         let store = view.clone_store();
         let query = Arc::new(QueryShardPins::default());
         // Each key through its own view, as a batch-at-a-time operator has.
@@ -5896,8 +5990,14 @@ pub(crate) mod tests {
             (8, vector_arena_of(&dir.join("b"), 2, 2, &b)),
         ]);
         let store = view.clone_store();
-        store.vector_identity(0, 7).unwrap().unwrap();
-        store.vector_identity(0, 8).unwrap().unwrap();
+        store
+            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
+        store
+            .vector_identity(0, 8, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
         let query_view = || {
             BinaryGraphView::new(Arc::clone(&store), 0)
                 .with_shard_pins(Arc::new(QueryShardPins::default()))
@@ -5943,8 +6043,14 @@ pub(crate) mod tests {
             (7, vector_arena_of(&dir.join("a"), 2, 2, &a)),
             (8, vector_arena_of(&dir.join("b"), 3, 2, &b)),
         ]);
-        view.store().vector_identity(0, 7).unwrap().unwrap();
-        view.store().vector_identity(0, 8).unwrap().unwrap();
+        view.store()
+            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
+        view.store()
+            .vector_identity(0, 8, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
         let view = BinaryGraphView::new(view.clone_store(), 0);
         let ka: Vec<ArenaVector> = (0..2)
             .map(|h| view.arena_vector(0, 7, h).unwrap().unwrap())
@@ -5989,8 +6095,14 @@ pub(crate) mod tests {
         let values = |g_id: GraphId| if g_id == 1 { &g1[0] } else { &g2[0] };
         for tabled in [false, true] {
             if tabled {
-                store.vector_identity(1, 7).unwrap().unwrap();
-                store.vector_identity(2, 7).unwrap().unwrap();
+                store
+                    .vector_identity(1, 7, &fluree_db_core::QueryCancellation::disabled())
+                    .unwrap()
+                    .unwrap();
+                store
+                    .vector_identity(2, 7, &fluree_db_core::QueryCancellation::disabled())
+                    .unwrap()
+                    .unwrap();
             }
             let view = TermView::new(Arc::clone(&store), None);
             let mut keys = Vec::new();
@@ -6029,6 +6141,156 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A residency host's vector arena of `shards` shards of two vectors
+    /// each, all stored in `store` and none resident, with the store's miss
+    /// register as its resident tier.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn residency_vector_arena(
+        store: &Arc<crate::read::need_fetch::tests::MissInjectingStore>,
+        shards: u32,
+    ) -> crate::arena::vector::LazyVectorArena {
+        use crate::arena::vector::tests::write_test_shard_in;
+        use crate::arena::vector::{LazyVectorArena, ShardInfo, VectorManifest};
+        let (mut sources, mut infos) = (Vec::new(), Vec::new());
+        for i in 0..shards {
+            let vectors: Vec<Vec<f32>> = (0..2).map(|j| vec![i as f32, j as f32]).collect();
+            let refs: Vec<&[f32]> = vectors.iter().map(Vec::as_slice).collect();
+            sources.push(write_test_shard_in(&store.inner, 2, &refs));
+            infos.push(ShardInfo {
+                cas: format!("s{i}"),
+                count: 2,
+            });
+        }
+        let manifest = VectorManifest {
+            version: 1,
+            dims: 2,
+            dtype: "f32".to_string(),
+            normalized: false,
+            shard_capacity: 2,
+            total_count: 2 * shards,
+            shards: infos,
+        };
+        let cs: Arc<dyn ContentStore> = Arc::clone(store) as Arc<dyn ContentStore>;
+        LazyVectorArena::new(
+            manifest,
+            sources,
+            Arc::new(LeafletCache::with_max_bytes(10 * 1024 * 1024)),
+            Some(cs),
+        )
+    }
+
+    /// Run `read` until it stops failing for want of a fetch, fetching what
+    /// each failure recorded: the retry rounds it took, and its answer.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    fn with_fetch_rounds<T>(
+        store: &Arc<crate::read::need_fetch::tests::MissInjectingStore>,
+        max_rounds: u32,
+        mut read: impl FnMut() -> io::Result<T>,
+    ) -> (u32, T) {
+        use crate::read::need_fetch::{NeedFetch, RetryBudget};
+        let mut rounds = 0;
+        loop {
+            match read() {
+                Ok(answer) => return (rounds, answer),
+                Err(err) => {
+                    assert!(NeedFetch::from_io_error(&err).is_some(), "{err}");
+                    rounds += 1;
+                    assert!(rounds <= max_rounds, "the read never completed");
+                    let fetched = run_sync_on_runtime({
+                        let store = Arc::clone(store);
+                        async move { RetryBudget::default().after_error(store.as_ref(), 4).await }
+                    })
+                    .unwrap();
+                    assert!(fetched, "a retry round fetched nothing");
+                }
+            }
+        }
+    }
+
+    /// On a residency host, a cold identity-table build asks for every shard
+    /// of its arena at once, so one retry round fetches the whole arena.
+    /// Failing on each missing shard in turn took one round per shard, and an
+    /// arena with more shards than the retry budget's cap could not be built.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    #[test]
+    fn a_cold_identity_table_build_fetches_its_arena_in_one_round() {
+        use crate::read::need_fetch::tests::MissInjectingStore;
+        let store = Arc::new(MissInjectingStore::new());
+        let shards = 8u32;
+        let arena = residency_vector_arena(&store, shards);
+        let (rounds, table) = with_fetch_rounds(&store, shards, || {
+            VectorIdentity::build(&arena, &fluree_db_core::QueryCancellation::disabled())
+        });
+        assert_eq!(
+            rounds, 1,
+            "a cold build took {rounds} retry rounds for {shards} shards"
+        );
+        assert!(table.duplicate_free());
+        assert!(table.of(2 * shards - 1).is_some());
+    }
+
+    /// A reader that registers the shards of the vectors it is about to read
+    /// (a comparison across arenas, which reads them in hash order) fetches
+    /// them in one retry round. Reading each shard cold in turn took one
+    /// round per shard.
+    #[cfg(any(target_arch = "wasm32", feature = "residency"))]
+    #[test]
+    fn registered_vector_reads_fetch_their_shards_in_one_round() {
+        use crate::read::need_fetch::tests::MissInjectingStore;
+        let store = Arc::new(MissInjectingStore::new());
+        let shards = 8u32;
+        let arena = residency_vector_arena(&store, shards);
+        // One vector of each shard, in no shard order.
+        let handles: Vec<u32> = [5u32, 0, 7, 2, 6, 1, 4, 3]
+            .iter()
+            .map(|s| 2 * s + 1)
+            .collect();
+        arena.register_missing_shards_of(handles.iter().copied());
+        let (rounds, read) = with_fetch_rounds(&store, shards, || {
+            handles
+                .iter()
+                .map(|&h| {
+                    arena
+                        .lookup_vector(h)
+                        .map(|v| v.map(|v| v.as_f32().to_vec()))
+                })
+                .collect::<io::Result<Vec<_>>>()
+        });
+        assert_eq!(rounds, 1, "{rounds} retry rounds for {shards} shards");
+        assert_eq!(read[0], Some(vec![5.0, 1.0]));
+    }
+
+    /// A build stops once its query is cancelled, with the reason as the
+    /// error, and leaves no table: the next caller builds it.
+    #[test]
+    fn a_cancelled_identity_table_build_stops_and_leaves_no_table() {
+        let dir = std::env::temp_dir().join("fluree_vector_identity_cancelled");
+        std::fs::create_dir_all(&dir).unwrap();
+        let shards: Vec<Vec<Vec<f32>>> = (0..4)
+            .map(|s| (0..4).map(|i| vec![s as f32, i as f32]).collect())
+            .collect();
+        let view = view_with_vector_arena(7, vector_arena_of(&dir, 4, 2, &shards));
+        let store = view.store();
+        let cancelled = fluree_db_core::QueryCancellation::new();
+        cancelled.cancel();
+        let Err(err) = store.vector_identity(0, 7, &cancelled) else {
+            panic!("a cancelled build answered");
+        };
+        assert_eq!(
+            err.get_ref()
+                .and_then(|e| e.downcast_ref::<fluree_db_core::QueryCancellationReason>()),
+            Some(&fluree_db_core::QueryCancellationReason::Cancelled),
+            "{err}"
+        );
+        assert!(store.built_vector_identity(0, 7).is_none());
+        let table = store
+            .vector_identity(0, 7, &fluree_db_core::QueryCancellation::disabled())
+            .unwrap()
+            .unwrap();
+        assert!(table.duplicate_free());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The identity table hashes each vector with the function a decoded
     /// vector's key uses, gives equal vectors one canonical handle, and is
     /// duplicate-free exactly when no vector repeats.
@@ -6043,7 +6305,8 @@ pub(crate) mod tests {
             vec![vec![0.0, 1.0], vec![1.0, 0.0]],
         ];
         let arena = vector_arena_of(&dir, 2, 2, &shards);
-        let table = VectorIdentity::build(&arena).unwrap();
+        let table =
+            VectorIdentity::build(&arena, &fluree_db_core::QueryCancellation::disabled()).unwrap();
         assert!(!table.duplicate_free());
         assert_eq!(table.of(3).unwrap().1, 1, "a repeat's canonical handle");
         assert_eq!(table.of(1).unwrap().1, 1);
@@ -6055,7 +6318,11 @@ pub(crate) mod tests {
         assert_eq!(table.heap_bytes(), 4 * 12);
 
         let distinct = vector_arena_of(&dir, 2, 2, &shards[..1]);
-        assert!(VectorIdentity::build(&distinct).unwrap().duplicate_free());
+        assert!(
+            VectorIdentity::build(&distinct, &fluree_db_core::QueryCancellation::disabled())
+                .unwrap()
+                .duplicate_free()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

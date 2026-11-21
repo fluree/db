@@ -121,6 +121,7 @@ impl EphemeralR2rmlProvider {
         table_name: &str,
         projection: &[String],
         order: ScanOrder,
+        memory: &fluree_db_core::QueryCancellation,
     ) -> QueryResult<ColumnBatchStream> {
         // The engine passes the mapping's logical table name for every scan: a
         // table, or an `rr:sqlQuery` map's alias, which reads its FROM table
@@ -136,7 +137,7 @@ impl EphemeralR2rmlProvider {
             } => load_from_catalog(conn, client.as_ref(), identity, table_name).await?,
             ProvisionalTables::Local(dirs) => load_local(dirs, table_name).await?,
         };
-        scan_loaded_table(&logical, storage, &metadata, projection, order).await
+        scan_loaded_table(&logical, storage, &metadata, projection, order, memory).await
     }
 }
 
@@ -236,6 +237,7 @@ async fn scan_loaded_table(
     metadata: &TableMetadata,
     projection: &[String],
     order: ScanOrder,
+    memory: &fluree_db_core::QueryCancellation,
 ) -> QueryResult<ColumnBatchStream> {
     let table_name = logical.table.as_str();
     let schema = metadata.current_schema().ok_or_else(|| {
@@ -316,6 +318,7 @@ async fn scan_loaded_table(
         tasks,
         super::r2rml::EmitOrder::for_query(order),
         concurrency,
+        memory.clone(),
         move |task| {
             let storage = Arc::clone(&storage);
             async move {
@@ -358,8 +361,13 @@ impl R2rmlTableProvider for EphemeralR2rmlProvider {
         _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
         _as_of_t: Option<i64>,
     ) -> QueryResult<ColumnBatchStream> {
-        self.scan_provisional_table(table_name, projection, ScanOrder::Deterministic)
-            .await
+        self.scan_provisional_table(
+            table_name,
+            projection,
+            ScanOrder::Deterministic,
+            &fluree_db_core::QueryCancellation::disabled(),
+        )
+        .await
     }
 
     async fn scan_table_ordered(
@@ -371,8 +379,9 @@ impl R2rmlTableProvider for EphemeralR2rmlProvider {
         _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
         _as_of_t: Option<i64>,
         order: ScanOrder,
+        memory: &fluree_db_core::QueryCancellation,
     ) -> QueryResult<ColumnBatchStream> {
-        self.scan_provisional_table(table_name, projection, order)
+        self.scan_provisional_table(table_name, projection, order, memory)
             .await
     }
 }
@@ -556,6 +565,7 @@ mod tests {
             _topk: Option<&fluree_db_query::r2rml::ScanTopK>,
             _as_of_t: Option<i64>,
             order: ScanOrder,
+            _memory: &fluree_db_core::QueryCancellation,
         ) -> QResult<ColumnBatchStream> {
             self.orders.lock().unwrap().push(Some(order));
             let batches = self.tables.get(table).cloned().unwrap_or_default();

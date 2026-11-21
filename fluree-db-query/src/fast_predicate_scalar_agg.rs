@@ -177,7 +177,14 @@ pub fn predicate_scalar_agg_operator(
             // aggregate over a POST overlay cursor instead.
             let has_overlay = crate::fast_path_common::overlay_has_novelty(ctx);
             let result = if !has_overlay && ctx.to_t == store.max_t() {
-                scan_predicate_scalar_agg(store, ctx.binary_g_id, &predicate, kind, &ctx.tracker)?
+                scan_predicate_scalar_agg(
+                    store,
+                    ctx.binary_g_id,
+                    &predicate,
+                    kind,
+                    &ctx.tracker,
+                    &ctx.cancellation,
+                )?
             } else {
                 scan_predicate_scalar_agg_overlay(ctx, store, ctx.binary_g_id, &predicate, kind)?
             };
@@ -391,6 +398,7 @@ pub(crate) fn scan_predicate_scalar_agg(
     predicate: &Ref,
     kind: ScalarAggKind,
     tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<AggOutput>> {
     let pred_sid = normalize_pred_sid(store, predicate)?;
     let Some(p_id) = store.sid_to_p_id(&pred_sid) else {
@@ -401,9 +409,13 @@ pub(crate) fn scan_predicate_scalar_agg(
     // reads, every object type). The per-row scan below remains the fallback
     // for leaves that predate `lead_group_count` and handles IRI refs only.
     if matches!(kind, ScalarAggKind::CountDistinctObject) {
-        if let Some(distinct) =
-            crate::fast_count::count_distinct_objects_for_predicate(store, g_id, p_id, tracker)?
-        {
+        if let Some(distinct) = crate::fast_count::count_distinct_objects_for_predicate(
+            store,
+            g_id,
+            p_id,
+            tracker,
+            cancellation,
+        )? {
             return Ok(Some(AggOutput::Integer(count_to_i64(
                 distinct,
                 "COUNT(DISTINCT)",
