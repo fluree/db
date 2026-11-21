@@ -480,6 +480,7 @@ fn compute_clean(
                     subjects,
                     accessor.as_ref(),
                     &ctx.tracker,
+                    &ctx.cancellation,
                 )?
                 else {
                     return Ok(None);
@@ -927,18 +928,26 @@ fn compute_histogram(
 ) -> Result<Option<Batch>> {
     // Bound the output (one batch) and guarantee the top-K walk keeps every
     // group: the directory-level distinct-object count must fit the cap.
-    match count_distinct_objects_for_predicate(store, ctx.binary_g_id, accessor.p_id)? {
+    match count_distinct_objects_for_predicate(
+        store,
+        ctx.binary_g_id,
+        accessor.p_id,
+        &ctx.cancellation,
+    )? {
         Some(distinct) if (distinct as usize) <= HISTOGRAM_MAX_GROUPS => {}
         _ => return Ok(None),
     }
-    let Ok(groups) = crate::fast_group_count_firsts::group_count_v6(
-        store,
-        ctx.binary_g_id,
-        &accessor.pred,
-        HISTOGRAM_MAX_GROUPS,
-        &ctx.cancellation,
-        &ctx.tracker,
-    ) else {
+    let Some(groups) = crate::fast_path_common::answer_or_decline(
+        crate::fast_group_count_firsts::group_count_v6(
+            store,
+            ctx.binary_g_id,
+            &accessor.pred,
+            HISTOGRAM_MAX_GROUPS,
+            &ctx.cancellation,
+            &ctx.tracker,
+        ),
+    )?
+    else {
         return Ok(None);
     };
 
@@ -1018,6 +1027,7 @@ fn compute_task(
     subjects: u64,
     accessor: Option<&AccessorCounts>,
     tracker: &fluree_db_core::Tracker,
+    cancellation: &fluree_db_core::QueryCancellation,
 ) -> Result<Option<Binding>> {
     if task.needs_accessor() && accessor.is_none() {
         return Ok(None);
@@ -1040,7 +1050,12 @@ fn compute_task(
         AggTask::CountSubjects => int(subjects),
         AggTask::CountProp => int(accessor.unwrap().rows),
         AggTask::CountDistinctProp => {
-            match count_distinct_objects_for_predicate(store, g_id, accessor.unwrap().p_id)? {
+            match count_distinct_objects_for_predicate(
+                store,
+                g_id,
+                accessor.unwrap().p_id,
+                cancellation,
+            )? {
                 Some(distinct) => int(distinct),
                 None => Ok(None),
             }
@@ -1063,7 +1078,14 @@ fn compute_task(
             } else {
                 ScalarAggKind::Sum(SumExprI64::Identity)
             };
-            match scan_predicate_scalar_agg(store, g_id, &accessor.unwrap().pred, kind, tracker)? {
+            match scan_predicate_scalar_agg(
+                store,
+                g_id,
+                &accessor.unwrap().pred,
+                kind,
+                tracker,
+                cancellation,
+            )? {
                 Some(output) => Ok(Some(output.into_binding())),
                 None => Ok(None),
             }
