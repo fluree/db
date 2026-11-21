@@ -312,6 +312,7 @@ pub fn read_commit_envelope_v3(bytes: &[u8]) -> Result<CommitEnvelope, CommitCod
         graph_delta: std::collections::HashMap::new(),
         graph_drops: Vec::new(),
         ns_split_mode: env.ns_split_mode,
+        num_big_typing: header.num_big_typing(),
     })
 }
 

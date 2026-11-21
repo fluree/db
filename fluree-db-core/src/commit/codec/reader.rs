@@ -212,6 +212,7 @@ pub(crate) fn read_commit_envelope_v4(bytes: &[u8]) -> Result<CommitEnvelope, Co
         graph_delta: env.graph_delta,
         graph_drops: env.graph_drops,
         ns_split_mode: env.ns_split_mode,
+        num_big_typing: header.num_big_typing(),
     })
 }
 

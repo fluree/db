@@ -254,22 +254,22 @@ where
                 tracing::debug_span!("commit_chain_walk", commits = tracing::field::Empty)
                     .entered();
             let walk_started = std::time::Instant::now();
-            let (commit_cids, ledger_split_mode, lifecycles) = {
+            let (commit_cids, ledger_split_mode, lifecycles, last_by_value_t) = {
                 // stop_at_t=0 collects all commits (t starts at 1).
-                let (dag, split_mode, lifecycles) =
-                    fluree_db_core::collect_first_parent_cids_with_split_mode(
-                        &content_store,
-                        &head_commit_id,
-                        0,
-                    )
-                    .await?;
+                let walk = fluree_db_core::collect_first_parent_cids_with_split_mode(
+                    &content_store,
+                    &head_commit_id,
+                    0,
+                )
+                .await?;
 
                 // Sorted by t descending; reverse for chronological (genesis-first).
-                let cids: Vec<ContentId> = dag.into_iter().rev().map(|(_, cid)| cid).collect();
+                let cids: Vec<ContentId> =
+                    walk.commits.into_iter().rev().map(|(_, cid)| cid).collect();
                 // Graph lifecycles, likewise oldest first.
                 let lifecycles: Vec<fluree_db_core::CommitGraphLifecycle> =
-                    lifecycles.into_iter().rev().collect();
-                (cids, split_mode, lifecycles)
+                    walk.lifecycles.into_iter().rev().collect();
+                (cids, walk.split_mode, lifecycles, walk.last_by_value_t)
             };
             _span_a.record("commits", commit_cids.len());
             tracing::info!(
@@ -347,8 +347,12 @@ where
             // Enable schema hierarchy extraction during resolution.
             shared.schema_hook = Some(crate::stats::SchemaExtractor::new());
             // Every commit is read in order, so the retractions of big
-            // integers staged by value can be told what they retract.
-            shared.big_integers = Some(Default::default());
+            // integers staged by value can be told what they retract. Kept
+            // through the last such commit only; a ledger with none (any
+            // ledger this release created) keeps nothing.
+            if last_by_value_t.is_some() {
+                shared.big_integers = Some(Default::default());
+            }
 
             // What a graph held before its latest drop is not indexed: the
             // commits keep it, the index does not (see `Commit::graph_drops`).
@@ -419,6 +423,10 @@ where
                         }
                         e => IndexerError::StorageRead(e.to_string()),
                     })?;
+
+                if last_by_value_t.is_some_and(|last| i64::from(resolved.t) >= last) {
+                    shared.big_integers = None;
+                }
 
                 // Accumulate totals
                 total_commit_size += resolved.size;

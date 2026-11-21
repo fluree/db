@@ -10,31 +10,94 @@
 //! commit's own. Novelty applies the same retractions alongside the commit
 //! (`fluree_db_transact::by_value_retractions`).
 //!
-//! Only big integers are kept, so the table stays small.
+//! The rebuild keeps the table only through the last commit staged by value
+//! ([`fluree_db_core::FirstParentWalk::last_by_value_t`]). It grows with the
+//! big integers live at each slot, so a slot is kept as a digest and its
+//! subtypes as ids: a few dozen bytes each.
 
 use fluree_db_core::commit::codec::raw_reader::is_big_integer_lexical;
 use fluree_db_core::commit::codec::{RawObject, RawOp};
 use rustc_hash::FxHashMap;
+use sha2::{Digest, Sha256};
 
 /// A big integer's slot: graph, subject, predicate, list place, and the
-/// value in canonical lexical form.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct Slot {
-    g: (u16, String),
-    s: (u16, String),
-    p: (u16, String),
-    place: Option<(u32, i32)>,
-    value: String,
+/// value in canonical lexical form, as the first 16 bytes of their SHA-256.
+type SlotKey = [u8; 16];
+
+fn slot_key(op: &RawOp<'_>, value: &str) -> SlotKey {
+    let mut h = Sha256::new();
+    for (ns_code, name) in [
+        (op.g_ns_code, op.g_name),
+        (op.s_ns_code, op.s_name),
+        (op.p_ns_code, op.p_name),
+    ] {
+        h.update(ns_code.to_le_bytes());
+        h.update((name.len() as u64).to_le_bytes());
+        h.update(name.as_bytes());
+    }
+    match op.place {
+        None => h.update([0]),
+        Some((list, index)) => {
+            h.update([1]);
+            h.update(list.to_le_bytes());
+            h.update(index.to_le_bytes());
+        }
+    }
+    h.update(value.as_bytes());
+    let digest = h.finalize();
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&digest[..16]);
+    key
 }
 
 /// A datatype, as a commit names it.
 type Datatype = (u16, String);
 
+/// The datatypes a value is stored under at one slot, as indexes into
+/// [`BigIntegerTerms::datatypes`]. Nearly every slot holds one.
+#[derive(Clone, Debug)]
+enum Datatypes {
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl Datatypes {
+    fn ids(&self) -> &[u32] {
+        match self {
+            Self::One(dt) => std::slice::from_ref(dt),
+            Self::Many(dts) => dts,
+        }
+    }
+
+    fn insert(&mut self, dt: u32) {
+        match self {
+            Self::One(held) if *held != dt => *self = Self::Many(vec![*held, dt]),
+            Self::Many(dts) if !dts.contains(&dt) => dts.push(dt),
+            _ => {}
+        }
+    }
+
+    /// Remove `dt`; whether any datatype is left.
+    fn remove(&mut self, dt: u32) -> bool {
+        match self {
+            Self::One(held) => *held != dt,
+            Self::Many(dts) => {
+                dts.retain(|d| *d != dt);
+                !dts.is_empty()
+            }
+        }
+    }
+}
+
 /// A retraction of a big integer, owned, to emit again under another
 /// datatype once its commit has been read.
 #[derive(Clone, Debug)]
 pub(crate) struct Retraction {
-    slot: Slot,
+    key: SlotKey,
+    g: (u16, String),
+    s: (u16, String),
+    p: (u16, String),
+    place: Option<(u32, i32)>,
     lexical: String,
 }
 
@@ -42,18 +105,18 @@ impl Retraction {
     /// The op that retracts this retraction's value under `dt`.
     pub(crate) fn under<'a>(&'a self, dt: &'a Datatype) -> RawOp<'a> {
         RawOp {
-            g_ns_code: self.slot.g.0,
-            g_name: &self.slot.g.1,
-            s_ns_code: self.slot.s.0,
-            s_name: &self.slot.s.1,
-            p_ns_code: self.slot.p.0,
-            p_name: &self.slot.p.1,
+            g_ns_code: self.g.0,
+            g_name: &self.g.1,
+            s_ns_code: self.s.0,
+            s_name: &self.s.1,
+            p_ns_code: self.p.0,
+            p_name: &self.p.1,
             dt_ns_code: dt.0,
             dt_name: &dt.1,
             o: RawObject::BigIntStr(&self.lexical),
             op: false,
             lang: None,
-            place: self.slot.place,
+            place: self.place,
         }
     }
 }
@@ -62,16 +125,31 @@ impl Retraction {
 /// commit read, and what the commit being read does to them.
 #[derive(Default)]
 pub(crate) struct BigIntegerTerms {
-    stored: FxHashMap<Slot, Vec<Datatype>>,
+    /// Every datatype a big integer has been noted under, in order first
+    /// seen.
+    datatypes: Vec<Datatype>,
+    stored: FxHashMap<SlotKey, Datatypes>,
     /// The current commit's ops on big integers, in order: retractions and
     /// assertions, each with its datatype.
-    ops: Vec<(Slot, Datatype, bool)>,
+    ops: Vec<(SlotKey, u32, bool)>,
     /// The current commit's retractions of big integers, when it was staged
     /// by value.
     by_value: Vec<Retraction>,
 }
 
 impl BigIntegerTerms {
+    fn datatype_id(&mut self, ns_code: u16, name: &str) -> u32 {
+        if let Some(at) = self
+            .datatypes
+            .iter()
+            .position(|(n, d)| *n == ns_code && d == name)
+        {
+            return at as u32;
+        }
+        self.datatypes.push((ns_code, name.to_string()));
+        (self.datatypes.len() - 1) as u32
+    }
+
     /// Note `op` of the commit being read, staged by value when `by_value`.
     /// Ops on anything but an integer too large for 64 bits are passed over.
     pub(crate) fn note(&mut self, op: &RawOp<'_>, by_value: bool) {
@@ -85,21 +163,19 @@ impl BigIntegerTerms {
             Ok(v) => v.to_string(),
             Err(_) => return,
         };
-        let slot = Slot {
-            g: (op.g_ns_code, op.g_name.to_string()),
-            s: (op.s_ns_code, op.s_name.to_string()),
-            p: (op.p_ns_code, op.p_name.to_string()),
-            place: op.place,
-            value,
-        };
-        let dt = (op.dt_ns_code, op.dt_name.to_string());
+        let key = slot_key(op, &value);
+        let dt = self.datatype_id(op.dt_ns_code, op.dt_name);
         if by_value && !op.op {
             self.by_value.push(Retraction {
-                slot: slot.clone(),
+                key,
+                g: (op.g_ns_code, op.g_name.to_string()),
+                s: (op.s_ns_code, op.s_name.to_string()),
+                p: (op.p_ns_code, op.p_name.to_string()),
+                place: op.place,
                 lexical: lexical.to_string(),
             });
         }
-        self.ops.push((slot, dt, op.op));
+        self.ops.push((key, dt, op.op));
     }
 
     /// End the commit being read: the retractions it adds to its own, each
@@ -110,15 +186,15 @@ impl BigIntegerTerms {
     /// assertion holds (`fluree_db_core::same_t`), so a term it asserts is
     /// not retracted at all. Assertions apply after retractions.
     pub(crate) fn end_commit(&mut self) -> Vec<(Retraction, Datatype)> {
-        let mut added: Vec<(Retraction, Datatype)> = Vec::new();
+        let mut added: Vec<(Retraction, u32)> = Vec::new();
         for r in std::mem::take(&mut self.by_value) {
-            let Some(stored) = self.stored.get(&r.slot) else {
+            let Some(stored) = self.stored.get(&r.key) else {
                 continue;
             };
-            for dt in stored.clone() {
-                let named = |slot: &Slot, d: &Datatype| *slot == r.slot && *d == dt;
-                if self.ops.iter().any(|(s, d, _)| named(s, d))
-                    || added.iter().any(|(a, d)| named(&a.slot, d))
+            for &dt in stored.ids() {
+                let named = |key: &SlotKey, d: u32| *key == r.key && d == dt;
+                if self.ops.iter().any(|(k, d, _)| named(k, *d))
+                    || added.iter().any(|(a, d)| named(&a.key, *d))
                 {
                     continue;
                 }
@@ -129,23 +205,25 @@ impl BigIntegerTerms {
         let retractions = ops
             .iter()
             .filter(|(_, _, op)| !op)
-            .map(|(s, d, _)| (s, d))
-            .chain(added.iter().map(|(r, d)| (&r.slot, d)));
-        for (slot, dt) in retractions {
-            if let Some(stored) = self.stored.get_mut(slot) {
-                stored.retain(|d| d != dt);
-                if stored.is_empty() {
-                    self.stored.remove(slot);
+            .map(|(k, d, _)| (*k, *d))
+            .chain(added.iter().map(|(r, d)| (r.key, *d)));
+        for (key, dt) in retractions {
+            if let Some(stored) = self.stored.get_mut(&key) {
+                if !stored.remove(dt) {
+                    self.stored.remove(&key);
                 }
             }
         }
-        for (slot, dt, _) in ops.into_iter().filter(|(_, _, op)| *op) {
-            let stored = self.stored.entry(slot).or_default();
-            if !stored.contains(&dt) {
-                stored.push(dt);
-            }
+        for (key, dt, _) in ops.into_iter().filter(|(_, _, op)| *op) {
+            self.stored
+                .entry(key)
+                .and_modify(|stored| stored.insert(dt))
+                .or_insert(Datatypes::One(dt));
         }
         added
+            .into_iter()
+            .map(|(r, dt)| (r, self.datatypes[dt as usize].clone()))
+            .collect()
     }
 }
 
@@ -239,6 +317,41 @@ mod tests {
             terms.note(&op("integer", false, BIG), true);
             assert_eq!(names(&terms.end_commit()), ["nonNegativeInteger"]);
         }
+    }
+
+    /// A retraction by value retracts only its own slot's terms: another
+    /// subject, predicate, list place or value keeps its own.
+    #[test]
+    fn a_retraction_by_value_keeps_to_its_slot() {
+        let mut terms = BigIntegerTerms::default();
+        let others = [
+            RawOp {
+                s_name: "t",
+                ..op("unsignedLong", true, BIG)
+            },
+            RawOp {
+                p_name: "q",
+                ..op("unsignedLong", true, BIG)
+            },
+            RawOp {
+                place: Some((0, 1)),
+                ..op("unsignedLong", true, BIG)
+            },
+            op("unsignedLong", true, "18446744073709551616"),
+        ];
+        for other in &others {
+            terms.note(other, false);
+        }
+        terms.end_commit();
+        terms.note(&op("integer", false, BIG), true);
+        assert!(terms.end_commit().is_empty());
+    }
+
+    /// A stored slot is a digest and its datatype ids, so the table holds a
+    /// few dozen bytes per live big integer.
+    #[test]
+    fn a_stored_slot_is_a_digest_and_datatype_ids() {
+        assert!(std::mem::size_of::<(SlotKey, Datatypes)>() <= 40);
     }
 
     /// Only integers too large for 64 bits are kept, per value and slot.

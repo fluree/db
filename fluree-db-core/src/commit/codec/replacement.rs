@@ -204,6 +204,7 @@ pub(crate) fn read_envelope_replacement(bytes: &[u8]) -> Result<CommitEnvelope, 
         graph_delta: env.graph_delta,
         graph_drops: env.graph_drops,
         ns_split_mode: env.ns_split_mode,
+        num_big_typing: r.header.num_big_typing(),
     })
 }
 

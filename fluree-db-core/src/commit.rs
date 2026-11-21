@@ -446,6 +446,10 @@ pub struct CommitEnvelope {
     /// Ledger-fixed split mode for canonical IRI encoding.
     /// Set once in the genesis commit; absent in subsequent commits.
     pub ns_split_mode: Option<crate::ns_encoding::NsSplitMode>,
+
+    /// How the commit names big integers it retracts; see
+    /// [`Commit::num_big_typing`]. Read from the header.
+    pub num_big_typing: crate::NumBigTyping,
 }
 
 impl CommitEnvelope {
@@ -726,14 +730,11 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-) -> Result<(
-    Vec<(i64, ContentId)>,
-    crate::ns_encoding::NsSplitMode,
-    Vec<CommitGraphLifecycle>,
-)> {
+) -> Result<FirstParentWalk> {
     let mut result = Vec::new();
     let mut split_mode = crate::ns_encoding::NsSplitMode::default();
     let mut lifecycles = Vec::new();
+    let mut last_by_value_t = None;
     let mut next = Some(head_id.clone());
 
     while let Some(cid) = next {
@@ -756,6 +757,9 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         if let Some(mode) = envelope.ns_split_mode {
             split_mode = mode;
         }
+        if envelope.num_big_typing == crate::NumBigTyping::ByValue {
+            last_by_value_t.get_or_insert(envelope.t);
+        }
         if !envelope.graph_drops.is_empty() || !envelope.graph_delta.is_empty() {
             lifecycles.push(CommitGraphLifecycle {
                 t: envelope.t,
@@ -774,7 +778,28 @@ async fn walk_first_parent<C: ContentStore + ?Sized>(
         result.push((envelope.t, cid));
     }
 
-    Ok((result, split_mode, lifecycles))
+    Ok(FirstParentWalk {
+        commits: result,
+        split_mode,
+        lifecycles,
+        last_by_value_t,
+    })
+}
+
+/// What [`collect_first_parent_cids_with_split_mode`] reads from a
+/// first-parent lineage's envelopes.
+#[derive(Debug, Clone)]
+pub struct FirstParentWalk {
+    /// `(t, ContentId)` of each commit, newest first.
+    pub commits: Vec<(i64, ContentId)>,
+    /// The lineage's `NsSplitMode`, from its genesis commit.
+    pub split_mode: crate::ns_encoding::NsSplitMode,
+    /// Newest first, the graph lifecycle of every commit that drops or
+    /// registers a graph.
+    pub lifecycles: Vec<CommitGraphLifecycle>,
+    /// The `t` of the newest commit staged by value
+    /// ([`Commit::num_big_typing`]), if any.
+    pub last_by_value_t: Option<i64>,
 }
 
 /// One commit's graph lifecycle, as the first-parent walk reads it from the
@@ -810,23 +835,18 @@ pub async fn collect_first_parent_cids<C: ContentStore + ?Sized>(
     head_id: &ContentId,
     stop_at_t: i64,
 ) -> Result<Vec<(i64, ContentId)>> {
-    let (cids, _split_mode, _lifecycles) = walk_first_parent(store, head_id, stop_at_t).await?;
-    Ok(cids)
+    Ok(walk_first_parent(store, head_id, stop_at_t).await?.commits)
 }
 
 /// Like [`collect_first_parent_cids`], and also return the authoritative
-/// `NsSplitMode` for the lineage and, newest first, the graph lifecycle of
-/// every commit that drops or registers a graph — what a rebuild needs to
-/// leave out what the drops took.
+/// `NsSplitMode` for the lineage, newest first the graph lifecycle of every
+/// commit that drops or registers a graph (what a rebuild needs to leave out
+/// what the drops took), and the newest commit staged by value.
 pub async fn collect_first_parent_cids_with_split_mode<C: ContentStore + ?Sized>(
     store: &C,
     head_id: &ContentId,
     stop_at_t: i64,
-) -> Result<(
-    Vec<(i64, ContentId)>,
-    crate::ns_encoding::NsSplitMode,
-    Vec<CommitGraphLifecycle>,
-)> {
+) -> Result<FirstParentWalk> {
     walk_first_parent(store, head_id, stop_at_t).await
 }
 
@@ -1803,6 +1823,7 @@ mod tests {
             graph_delta: HashMap::new(),
             graph_drops: Vec::new(),
             ns_split_mode: None,
+            num_big_typing: crate::NumBigTyping::Declared,
         };
 
         assert_eq!(envelope.t, 5);
@@ -2830,6 +2851,42 @@ mod tests {
         // Only the merge commit has two parents; nothing from branch_b streamed.
         assert_eq!(commits[0].parents.len(), 2);
         assert!(commits[1..].iter().all(|c| c.parents.len() <= 1));
+    }
+
+    /// The walk reports the newest commit staged by value, read from each
+    /// envelope's header: the commit a rebuild keeps its big-integer table
+    /// through.
+    #[cfg(feature = "credential")]
+    #[tokio::test]
+    async fn test_first_parent_walk_reports_the_last_commit_staged_by_value() {
+        use crate::NumBigTyping::{ByValue, Declared};
+
+        async fn head_of(store: &MemoryContentStore, typings: &[crate::NumBigTyping]) -> ContentId {
+            let mut parent: Option<ContentId> = None;
+            for (t, typing) in (1..).zip(typings) {
+                let mut commit = Commit::new(t, vec![make_test_flake(1, 1, t, t)]);
+                commit.num_big_typing = *typing;
+                if let Some(p) = parent.take() {
+                    commit = commit.with_parent(p);
+                }
+                parent = Some(store_commit(store, &commit).await);
+            }
+            parent.expect("a commit")
+        }
+
+        let store = MemoryContentStore::new();
+        for (typings, last) in [
+            (vec![ByValue, ByValue, Declared], Some(2)),
+            (vec![Declared, ByValue, Declared], Some(2)),
+            (vec![ByValue, Declared, ByValue], Some(3)),
+            (vec![Declared, Declared], None),
+        ] {
+            let head = head_of(&store, &typings).await;
+            let walk = collect_first_parent_cids_with_split_mode(&store, &head, 0)
+                .await
+                .unwrap();
+            assert_eq!(walk.last_by_value_t, last, "{typings:?}");
+        }
     }
 
     #[cfg(feature = "credential")]
