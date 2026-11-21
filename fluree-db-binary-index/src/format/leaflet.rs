@@ -10,13 +10,13 @@
 //! |-------|-----------|-------------|----------|
 //! | POST  | `p_const` | `o_key, s_id, t` | `o_type` (when mixed), `o_i` |
 //! | PSOT  | `p_const` | `s_id, o_key, t` | `o_type` (when mixed), `o_i` |
-//! | SPOT  | (none)    | `s_id, p_id, o_key, t` | `o_type` (when mixed), `o_i` |
+//! | SPOT  | (none)    | `s_id, p_id, o_type, o_key, t` | `o_i` |
 //! | OPST  | `o_type_const` | `o_key, p_id, s_id, t` | `o_i` |
 //!
-//! When a leaflet has a single `o_type` value for all rows (common for
-//! predicate-homogeneous POST/PSOT leaflets), the `o_type` column is omitted
+//! When a POST or PSOT leaflet has a single `o_type` value for all rows
+//! (common for a single-datatype predicate), the `o_type` column is omitted
 //! and `o_type_const` is set in the directory entry. Readers use the constant
-//! instead of decoding a column block.
+//! instead of decoding a column block. OPST always hoists it; SPOT never does.
 
 use super::column_block::{
     encode_column_u16, encode_column_u32, encode_column_u64, ColumnBlockRef, ColumnId,

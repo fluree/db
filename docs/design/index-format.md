@@ -275,7 +275,7 @@ lead_group_count: u32          // distinct values of the leading sort key
 first_key: [u8; 26]            // ORDERED_KEY_V2_SIZE, order-specific routing key
 last_key:  [u8; 26]
 p_const:      Option<u32>      // POST/PSOT: the leaflet's constant predicate
-o_type_const: Option<u16>      // OPST always; other orders when single-typed
+o_type_const: Option<u16>      // OPST always; POST/PSOT when single-typed
 flags: u32                     // HAS_O_I | HAS_O_TYPE_COL
 column_refs: [ColumnBlockRef]  // one per column actually stored
 ```
@@ -285,7 +285,7 @@ column_refs: [ColumnBlockRef]  // one per column actually stored
 ```text
 col_id: u16          // SId=0, PId=1, OType=2, OKey=3, OI=4, T=5
 codec: u8            // currently always Zstd
-elem_width: u8       // 1, 2, 4, or 8 bytes
+elem_width: u8       // 2, 4, or 8 bytes, fixed per column
 offset: u32          // relative to leaflet payload start
 compressed_len: u32
 uncompressed_len: u32
@@ -298,8 +298,9 @@ entirely when its value is constant for the leaflet or absent for every row:
 
 - **POST / PSOT** leaflets are predicate-homogeneous, so `p_id` is hoisted to `p_const`.
 - **OPST** leaflets are type-homogeneous by segmentation design, so `o_type` is always
-  hoisted to `o_type_const`. Other orders hoist it too when the leaflet is single-typed
+  hoisted to `o_type_const`. POST and PSOT hoist it too when the leaflet is single-typed
   (common for a single-datatype predicate); `HAS_O_TYPE_COL` marks the mixed case.
+  SPOT always stores the `o_type` column.
 - **`o_i`** (list index) is only materialized when at least one row is a list member —
   `HAS_O_I`.
 
@@ -317,13 +318,14 @@ columns are stored densely. Constants are hoisted out of the block set entirely:
 
 | Order | Hoisted constant | Columns stored |
 |-------|------------------|----------------|
-| SPOT  | (none)           | `SId`, `PId`, `OKey`, `T` (+ `OType` when mixed, `OI` when present) |
+| SPOT  | (none)           | `SId`, `PId`, `OType`, `OKey`, `T` (+ `OI` when present) |
 | PSOT  | `p_const`        | `SId`, `OKey`, `T` (+ `OType` when mixed, `OI` when present) |
 | POST  | `p_const`        | `OKey`, `SId`, `T` (+ `OType` when mixed, `OI` when present) |
 | OPST  | `o_type_const`   | `OKey`, `PId`, `SId`, `T` (+ `OI` when present) |
 
-Element width per column is carried in `ColumnBlockRef.elem_width`, so a column narrows
-to the smallest type that fits its dictionary cardinality rather than paying a fixed width.
+Each column has a fixed element width, recorded in `ColumnBlockRef.elem_width`: 8 bytes
+for `SId` and `OKey`, 4 for `PId`, `T` and `OI`, and 2 for `OType`. Each block is then
+zstd-compressed.
 
 ## History sidecar (FHS1)
 
