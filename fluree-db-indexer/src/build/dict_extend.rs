@@ -1498,6 +1498,7 @@ mod tests {
         ForwardPack::from_bytes(&bytes)
             .unwrap()
             .lookup(id)
+            .unwrap()
             .map(std::borrow::Cow::into_owned)
     }
 

@@ -232,12 +232,24 @@ impl FsstTable {
     }
 
     /// Append the value `codes` stand for to `out`.
-    pub(crate) fn decode_value_into(&self, codes: &[u8], out: &mut Vec<u8>) {
+    ///
+    /// Codes ending in the escape code are damaged: an escape takes the
+    /// literal byte after it, and a literal `0xFF` never occurs in UTF-8.
+    /// The decoder would panic on an escape at the end, so they are refused
+    /// here.
+    pub(crate) fn decode_value_into(&self, codes: &[u8], out: &mut Vec<u8>) -> io::Result<()> {
+        if codes.last() == Some(&fsst::ESCAPE_CODE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "forward pack: a coded value ends in the escape code",
+            ));
+        }
         let decompressor = fsst::Decompressor::new(&self.symbols, &self.lengths);
         out.reserve(decompressor.max_decompression_capacity(codes));
         let written = decompressor.decompress_into(codes, out.spare_capacity_mut());
         // SAFETY: the decompressor initialized `written` bytes past the length.
         unsafe { out.set_len(out.len() + written) };
+        Ok(())
     }
 }
 
@@ -558,10 +570,18 @@ pub(crate) struct ParsedPackMeta {
 impl ParsedPackMeta {
     /// Append page `page_idx`'s `stored` value, decoded, to `out`.
     #[inline]
-    pub(crate) fn decode_into(&self, page_idx: usize, stored: &[u8], out: &mut Vec<u8>) {
+    pub(crate) fn decode_into(
+        &self,
+        page_idx: usize,
+        stored: &[u8],
+        out: &mut Vec<u8>,
+    ) -> io::Result<()> {
         match self.codecs.table(page_idx) {
             Some(table) => table.decode_value_into(stored, out),
-            None => out.extend_from_slice(stored),
+            None => {
+                out.extend_from_slice(stored);
+                Ok(())
+            }
         }
     }
 }
@@ -718,22 +738,22 @@ pub(crate) fn lookup_in_pack_into(
     meta: &ParsedPackMeta,
     id: u64,
     out: &mut Vec<u8>,
-) -> bool {
+) -> io::Result<bool> {
     if id < meta.first_id || id > meta.last_id {
-        return false;
+        return Ok(false);
     }
     let Some(page_idx) = find_page_in_dir(&meta.directory, id) else {
-        return false;
+        return Ok(false);
     };
     let dir = &meta.directory[page_idx];
     let page_data =
         &data[dir.page_offset as usize..dir.page_offset as usize + dir.page_len as usize];
     let page = ForwardPage::from_bytes_unchecked(page_data, dir.page_first_id);
     let Some(stored) = page.lookup(id) else {
-        return false;
+        return Ok(false);
     };
-    meta.decode_into(page_idx, stored, out);
-    true
+    meta.decode_into(page_idx, stored, out)?;
+    Ok(true)
 }
 
 /// Binary search a page directory for the page containing `id`.
@@ -797,34 +817,40 @@ impl<'a> ForwardPack<'a> {
     }
 
     /// Look up a value by ID: borrowed from a raw page, decoded from a coded
-    /// one. `None` if not found.
-    pub fn lookup(&self, id: u64) -> Option<std::borrow::Cow<'a, [u8]>> {
+    /// one. `None` if not found; an error if its codes are damaged.
+    pub fn lookup(&self, id: u64) -> io::Result<Option<std::borrow::Cow<'a, [u8]>>> {
         if id < self.header.first_id || id > self.header.last_id {
-            return None;
+            return Ok(None);
         }
-        let page_idx = find_page_in_dir(&self.meta.directory, id)?;
+        let Some(page_idx) = find_page_in_dir(&self.meta.directory, id) else {
+            return Ok(None);
+        };
         let dir = &self.meta.directory[page_idx];
         let page_data =
             &self.data[dir.page_offset as usize..dir.page_offset as usize + dir.page_len as usize];
-        let stored = ForwardPage::from_bytes_unchecked(page_data, dir.page_first_id).lookup(id)?;
-        Some(match self.meta.codecs.table(page_idx) {
+        let Some(stored) =
+            ForwardPage::from_bytes_unchecked(page_data, dir.page_first_id).lookup(id)
+        else {
+            return Ok(None);
+        };
+        Ok(Some(match self.meta.codecs.table(page_idx) {
             None => std::borrow::Cow::Borrowed(stored),
             Some(table) => {
                 let mut value = Vec::new();
-                table.decode_value_into(stored, &mut value);
+                table.decode_value_into(stored, &mut value)?;
                 std::borrow::Cow::Owned(value)
             }
-        })
+        }))
     }
 
     /// Append value bytes to `out`. Returns `true` if found.
-    pub fn lookup_into(&self, id: u64, out: &mut Vec<u8>) -> bool {
+    pub fn lookup_into(&self, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
         lookup_in_pack_into(self.data, &self.meta, id, out)
     }
 
     /// Look up and return as a UTF-8 string.
     pub fn lookup_str(&self, id: u64) -> io::Result<Option<String>> {
-        match self.lookup(id) {
+        match self.lookup(id)? {
             Some(bytes) => String::from_utf8(bytes.into_owned())
                 .map(Some)
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e)),
@@ -1138,7 +1164,7 @@ pub fn blank_forward_entries(
     if header.page_count > 0 {
         values.reserve((header.last_id - header.first_id + 1) as usize);
         for id in header.first_id..=header.last_id {
-            let value = pack.lookup(id).ok_or_else(|| {
+            let value = pack.lookup(id)?.ok_or_else(|| {
                 io::Error::new(io::ErrorKind::InvalidData, format!("pack has no id {id}"))
             })?;
             values.push((
@@ -1341,7 +1367,7 @@ mod tests {
         let pack = ForwardPack::from_bytes(&blanked).unwrap();
         for (id, value) in &entries {
             let expected: &[u8] = if [42, 77].contains(id) { &[] } else { value };
-            assert_eq!(pack.lookup(*id).as_deref(), Some(expected), "{id}");
+            assert_eq!(pack.lookup(*id).unwrap().as_deref(), Some(expected), "{id}");
         }
         assert!(!blanked.windows(b"value_42".len()).any(|w| w == b"value_42"));
     }
@@ -1359,13 +1385,13 @@ mod tests {
         assert_eq!(pack.total_entries(), 10);
 
         for &(id, ref value) in &entries {
-            let found = pack.lookup(id).unwrap();
+            let found = pack.lookup(id).unwrap().unwrap();
             assert_eq!(found, value.as_slice(), "mismatch at id={id}");
         }
 
         // Out of range
-        assert!(pack.lookup(10).is_none());
-        assert!(pack.lookup(100).is_none());
+        assert!(pack.lookup(10).unwrap().is_none());
+        assert!(pack.lookup(100).unwrap().is_none());
     }
 
     #[test]
@@ -1387,13 +1413,14 @@ mod tests {
         for &(id, ref value) in &entries {
             let found = pack
                 .lookup(id)
+                .unwrap()
                 .unwrap_or_else(|| panic!("should find id={id}"));
             assert_eq!(found, value.as_slice());
         }
 
         // Boundary checks.
-        assert!(pack.lookup(99).is_none());
-        assert!(pack.lookup(600).is_none());
+        assert!(pack.lookup(99).unwrap().is_none());
+        assert!(pack.lookup(600).unwrap().is_none());
     }
 
     #[test]
@@ -1404,16 +1431,16 @@ mod tests {
         let pack = ForwardPack::from_bytes(&pack_bytes).unwrap();
 
         let mut out = Vec::new();
-        assert!(pack.lookup_into(3, &mut out));
+        assert!(pack.lookup_into(3, &mut out).unwrap());
         assert_eq!(out, b"value_3");
 
         // Append to existing data.
-        assert!(pack.lookup_into(0, &mut out));
+        assert!(pack.lookup_into(0, &mut out).unwrap());
         assert_eq!(out, b"value_3value_0");
 
         // Miss.
         let prev_len = out.len();
-        assert!(!pack.lookup_into(999, &mut out));
+        assert!(!pack.lookup_into(999, &mut out).unwrap());
         assert_eq!(out.len(), prev_len);
     }
 
@@ -1435,7 +1462,7 @@ mod tests {
 
         assert_eq!(pack.page_count(), 0);
         assert_eq!(pack.total_entries(), 0);
-        assert!(pack.lookup(0).is_none());
+        assert!(pack.lookup(0).unwrap().is_none());
     }
 
     #[test]
@@ -1451,6 +1478,7 @@ mod tests {
         for id in [0, 1, 999, 50_000, 99_999] {
             let val = pack
                 .lookup(id)
+                .unwrap()
                 .unwrap_or_else(|| panic!("should find id={id}"));
             assert_eq!(val, format!("value_{id}").as_bytes());
         }
@@ -1523,10 +1551,10 @@ mod tests {
         assert_eq!(pack.header().first_id, 1000);
         assert_eq!(pack.header().last_id, 1049);
 
-        assert!(pack.lookup(999).is_none());
-        assert_eq!(&*pack.lookup(1000).unwrap(), b"value_1000");
-        assert_eq!(&*pack.lookup(1049).unwrap(), b"value_1049");
-        assert!(pack.lookup(1050).is_none());
+        assert!(pack.lookup(999).unwrap().is_none());
+        assert_eq!(&*pack.lookup(1000).unwrap().unwrap(), b"value_1000");
+        assert_eq!(&*pack.lookup(1049).unwrap().unwrap(), b"value_1049");
+        assert!(pack.lookup(1050).unwrap().is_none());
     }
 
     #[test]
@@ -1536,10 +1564,10 @@ mod tests {
         let pack_bytes = encode_forward_pack(&entries, KIND_STRING_FWD, 0, 1024 * 1024).unwrap();
         let pack = ForwardPack::from_bytes(&pack_bytes).unwrap();
 
-        assert_eq!(&*pack.lookup(0).unwrap(), b"");
-        assert_eq!(&*pack.lookup(1).unwrap(), b"hello");
-        assert_eq!(&*pack.lookup(2).unwrap(), b"");
-        assert_eq!(&*pack.lookup(3).unwrap(), b"world");
+        assert_eq!(&*pack.lookup(0).unwrap().unwrap(), b"");
+        assert_eq!(&*pack.lookup(1).unwrap().unwrap(), b"hello");
+        assert_eq!(&*pack.lookup(2).unwrap().unwrap(), b"");
+        assert_eq!(&*pack.lookup(3).unwrap().unwrap(), b"world");
     }
 
     #[test]
@@ -1578,12 +1606,12 @@ mod tests {
         let mut found = Vec::new();
         for &(id, ref value) in &entries {
             found.clear();
-            assert!(lookup_in_pack_into(&pack_bytes, &meta, id, &mut found));
+            assert!(lookup_in_pack_into(&pack_bytes, &meta, id, &mut found).unwrap());
             assert_eq!(found, value.as_slice(), "mismatch at id={id}");
         }
 
-        assert!(!lookup_in_pack_into(&pack_bytes, &meta, 99, &mut found));
-        assert!(!lookup_in_pack_into(&pack_bytes, &meta, 600, &mut found));
+        assert!(!lookup_in_pack_into(&pack_bytes, &meta, 99, &mut found).unwrap());
+        assert!(!lookup_in_pack_into(&pack_bytes, &meta, 600, &mut found).unwrap());
     }
 
     // ---- Coded string packs ----
@@ -1611,13 +1639,20 @@ mod tests {
         let meta = parse_pack_meta(bytes).unwrap();
         let mut out = Vec::new();
         for (id, value) in entries {
-            assert_eq!(pack.lookup(*id).as_deref(), Some(value.as_slice()), "{id}");
+            assert_eq!(
+                pack.lookup(*id).unwrap().as_deref(),
+                Some(value.as_slice()),
+                "{id}"
+            );
             out.clear();
-            assert!(lookup_in_pack_into(bytes, &meta, *id, &mut out), "{id}");
+            assert!(
+                lookup_in_pack_into(bytes, &meta, *id, &mut out).unwrap(),
+                "{id}"
+            );
             assert_eq!(out, *value, "{id}");
         }
         let last = entries.last().unwrap().0;
-        assert!(pack.lookup(last + 1).is_none());
+        assert!(pack.lookup(last + 1).unwrap().is_none());
     }
 
     #[test]
@@ -1645,6 +1680,42 @@ mod tests {
                 .lookup_str(9)
                 .unwrap(),
             Some(String::from_utf8(entries[2].1.clone()).unwrap())
+        );
+    }
+
+    /// A coded value ending in the escape code is damaged (an escape takes
+    /// the byte after it, and UTF-8 never holds `0xFF`): a lookup of it is an
+    /// error, not a panic in the decoder, and its neighbours still read.
+    #[test]
+    fn a_coded_value_ending_in_the_escape_code_is_refused() {
+        let entries = text_entries(7, 3_000);
+        let mut bytes = encode_forward_pack(&as_refs(&entries), KIND_STRING_FWD, 0, 4096).unwrap();
+        let at = entries.iter().position(|(_, v)| v.len() > 20).unwrap();
+        let id = entries[at].0;
+        let last_code = {
+            let pack = ForwardPack::from_bytes(&bytes).unwrap();
+            assert!(pack.is_coded());
+            let page_idx = find_page_in_dir(&pack.meta.directory, id).unwrap();
+            let dir = &pack.meta.directory[page_idx];
+            let page = &bytes[dir.page_offset as usize..][..dir.page_len as usize];
+            let stored = ForwardPage::from_bytes_unchecked(page, dir.page_first_id)
+                .lookup(id)
+                .unwrap();
+            stored.as_ptr() as usize - bytes.as_ptr() as usize + stored.len() - 1
+        };
+        bytes[last_code] = fsst::ESCAPE_CODE;
+
+        let pack = ForwardPack::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            pack.lookup(id).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let meta = parse_pack_meta(&bytes).unwrap();
+        assert!(lookup_in_pack_into(&bytes, &meta, id, &mut Vec::new()).is_err());
+        let (next, value) = &entries[at + 1];
+        assert_eq!(
+            pack.lookup(*next).unwrap().as_deref(),
+            Some(value.as_slice())
         );
     }
 
@@ -1786,7 +1857,7 @@ mod tests {
         assert!(pack.is_coded());
         for (id, value) in &entries {
             let expected: &[u8] = if [1, 6].contains(id) { &[] } else { value };
-            assert_eq!(pack.lookup(*id).as_deref(), Some(expected), "{id}");
+            assert_eq!(pack.lookup(*id).unwrap().as_deref(), Some(expected), "{id}");
         }
     }
 
@@ -2017,7 +2088,11 @@ mod tests {
         assert_eq!(a.header().last_id, b.header().last_id);
         assert_eq!(a.page_count(), b.page_count());
         for id in 0..=119u64 {
-            assert_eq!(a.lookup(id), b.lookup(id), "mismatch at id={id}");
+            assert_eq!(
+                a.lookup(id).unwrap(),
+                b.lookup(id).unwrap(),
+                "mismatch at id={id}"
+            );
         }
     }
 }

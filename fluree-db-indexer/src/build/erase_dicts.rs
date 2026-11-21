@@ -125,11 +125,11 @@ pub(crate) async fn remove_strings(
         let pack = ForwardPack::from_bytes(&bytes).map_err(read_err)?;
         // `ids` were found through the reverse tree, which no blanked id
         // is in: an empty value is the empty string's.
-        keys.extend(
-            mine.iter()
-                .filter_map(|id| pack.lookup(*id))
-                .map(std::borrow::Cow::into_owned),
-        );
+        for id in &mine {
+            if let Some(value) = pack.lookup(*id).map_err(read_err)? {
+                keys.push(value.into_owned());
+            }
+        }
         let blanked =
             blank_forward_entries(&bytes, &mine, DEFAULT_TARGET_PAGE_BYTES).map_err(read_err)?;
         let cid = content_store

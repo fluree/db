@@ -109,7 +109,7 @@ impl AdaptivePack {
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
         if let Some(whole) = &*self.slot.load() {
             whole.mark_used();
-            return Ok(lookup_whole(whole, meta, id, out));
+            return lookup_whole(whole, meta, id, out);
         }
         if id < meta.first_id || id > meta.last_id {
             return Ok(false);
@@ -259,13 +259,18 @@ fn ranged_lookup(
         Some(table) => {
             let mut codes = Vec::with_capacity((hi - lo) as usize);
             units.extend_into(from..from + u64::from(hi - lo), &mut codes)?;
-            table.decode_value_into(&codes, out);
+            table.decode_value_into(&codes, out)?;
         }
     }
     Ok(true)
 }
 
-fn lookup_whole(bytes: &[u8], meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> bool {
+fn lookup_whole(
+    bytes: &[u8],
+    meta: &ParsedPackMeta,
+    id: u64,
+    out: &mut Vec<u8>,
+) -> io::Result<bool> {
     lookup_in_pack_into(bytes, meta, id, out)
 }
 
@@ -273,7 +278,7 @@ impl PackBacking {
     /// Append `id`'s value bytes to `out`; `false` when the pack lacks it.
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
         match self {
-            PackBacking::Whole(bytes) => Ok(lookup_whole(bytes, meta, id, out)),
+            PackBacking::Whole(bytes) => lookup_whole(bytes, meta, id, out),
             PackBacking::Adaptive(pack) => pack.lookup_into(meta, id, out),
         }
     }
