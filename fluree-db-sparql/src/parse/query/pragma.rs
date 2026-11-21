@@ -105,6 +105,14 @@ impl Request<'_> {
             });
         };
         match (form, self.is_update) {
+            // A write evaluates no reasoning: say so, since an update whose
+            // WHERE names a derived fact otherwise just matches nothing.
+            (Form::Query, true) if name.starts_with("reasoning") => {
+                return Err(format!(
+                    "pragma `{name}` applies to queries, not updates: a write does not \
+                     evaluate reasoning, so an update's WHERE matches stored facts only"
+                ))
+            }
             (Form::Query, true) => {
                 return Err(format!("pragma `{name}` applies to queries, not updates"))
             }

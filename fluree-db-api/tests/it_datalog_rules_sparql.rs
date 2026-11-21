@@ -294,3 +294,155 @@ async fn sparql_rule_head_with_annotation_or_missing_graph_rejected() {
         );
     }
 }
+
+/// A write evaluates no reasoning. An update whose where names a fact only a
+/// rule derives used to accept `"reasoning": "datalog"`, ignore it, match
+/// nothing and commit, which read exactly like "the rules derived nothing".
+/// Each placement, the same option on an insert, and the SPARQL pragma are
+/// now a 400 that says a write does not evaluate reasoning, and the ledger is
+/// left as it was; `"reasoning": "none"`, which asks for what a write does
+/// anyway, still commits.
+#[tokio::test]
+async fn writes_refuse_reasoning() {
+    let fluree = FlureeBuilder::memory().build_memory();
+    let ledger_id = "datalog/write-refuses-reasoning:main";
+    fluree
+        .create_ledger(ledger_id)
+        .await
+        .expect("create ledger");
+    let graph = fluree.graph(ledger_id);
+    let ctx = json!({"ex": "http://example.org/", "f": "https://ns.flur.ee/db#"});
+    let seed = json!({
+        "@context": ctx,
+        "@graph": [
+            {"@id": "ex:alice", "@type": "ex:Account"},
+            {"@id": "ex:bob", "@type": "ex:Account"},
+            {
+                "@id": "ex:r2",
+                "f:rule": {
+                    "@type": "f:sparql",
+                    "@value": "PREFIX ex: <http://example.org/> \
+                               CONSTRUCT { ?a a ex:SparqlCandidate } WHERE { ?a a ex:Account }"
+                }
+            }
+        ]
+    });
+    graph.transact().insert(&seed).commit().await.expect("seed");
+
+    let select = |where_: serde_json::Value, reasoning: bool| {
+        let mut q = json!({"@context": ctx, "select": "?a", "where": where_});
+        if reasoning {
+            q["reasoning"] = json!("datalog");
+        }
+        q
+    };
+    let rows = |q: serde_json::Value| {
+        let graph = &graph;
+        async move {
+            let rows = graph
+                .query()
+                .jsonld(&q)
+                .execute_formatted()
+                .await
+                .expect("query");
+            let mut rows: Vec<String> = rows
+                .as_array()
+                .unwrap_or_else(|| panic!("rows: {rows}"))
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect();
+            rows.sort();
+            rows
+        }
+    };
+    let candidates = json!({"@id": "?a", "@type": "ex:SparqlCandidate"});
+    assert_eq!(
+        rows(select(candidates.clone(), true)).await,
+        ["ex:alice", "ex:bob"],
+        "a query under reasoning reads the derived candidates"
+    );
+    let t_before = fluree.ledger(ledger_id).await.unwrap().t();
+
+    let update = |extra: serde_json::Value| {
+        let mut doc = json!({
+            "@context": ctx,
+            "where": candidates,
+            "insert": {"@id": "?a", "ex:flagged": true}
+        });
+        doc.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        doc
+    };
+    let mut refusals = Vec::new();
+    for (surface, extra) in [
+        ("update, top level", json!({"reasoning": "datalog"})),
+        ("update, opts", json!({"opts": {"reasoning": "datalog"}})),
+        ("update, rules", json!({"rules": []})),
+    ] {
+        let err = graph
+            .transact()
+            .update(&update(extra))
+            .commit()
+            .await
+            .expect_err(surface);
+        refusals.push((surface, err));
+    }
+    let insert = json!({
+        "@context": ctx,
+        "opts": {"reasoning": "datalog"},
+        "@id": "ex:carol",
+        "@type": "ex:Account"
+    });
+    let err = graph
+        .transact()
+        .insert(&insert)
+        .commit()
+        .await
+        .expect_err("insert, opts");
+    refusals.push(("insert, opts", err));
+    let err = graph
+        .transact()
+        .sparql_update(
+            "# PRAGMA reasoning: datalog\n\
+             PREFIX ex: <http://example.org/>\n\
+             INSERT { ?a ex:flagged true } WHERE { ?a a ex:SparqlCandidate }",
+        )
+        .commit()
+        .await
+        .expect_err("SPARQL reasoning pragma");
+    refusals.push(("SPARQL pragma", err));
+    for (surface, err) in refusals {
+        assert_eq!(err.status_code(), 400, "{surface}: {err}");
+        let message = err.to_string();
+        assert!(
+            message.contains("applies to queries, not updates")
+                && message.contains("does not evaluate reasoning"),
+            "{surface}: {message}"
+        );
+    }
+    assert_eq!(
+        fluree.ledger(ledger_id).await.unwrap().t(),
+        t_before,
+        "a refused write commits nothing"
+    );
+
+    // `"reasoning": "none"` asks for what a write does: its where reads
+    // stored facts, so it flags the stored accounts.
+    let none = json!({
+        "@context": ctx,
+        "where": {"@id": "?a", "@type": "ex:Account"},
+        "insert": {"@id": "?a", "ex:flagged": true},
+        "reasoning": "none"
+    });
+    graph
+        .transact()
+        .update(&none)
+        .commit()
+        .await
+        .expect("reasoning none");
+    assert_eq!(
+        rows(select(json!({"@id": "?a", "ex:flagged": true}), false)).await,
+        ["ex:alice", "ex:bob"]
+    );
+}
