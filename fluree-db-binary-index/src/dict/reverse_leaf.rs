@@ -626,13 +626,13 @@ impl<'a> ReverseLeaf<'a> {
         expected == self.data.len()
     }
 
-    /// The leaf's [`Fences`] at `spacing` bytes. A `DLR1` layout only: see
-    /// [`Self::is_sequential`].
-    pub fn fences(&self, spacing: usize) -> Fences {
-        debug_assert!(
-            self.front_coded.is_none(),
-            "front-coded leaves are not fenced"
-        );
+    /// The leaf's [`Fences`] at `spacing` bytes, or `None` when its layout
+    /// is not one a fenced scan reads ([`Self::is_sequential`]), as no
+    /// front-coded leaf's is.
+    pub fn fences(&self, spacing: usize) -> Option<Fences> {
+        if !self.is_sequential() {
+            return None;
+        }
         let (mut keys, mut key_ends, mut entries) = (Vec::new(), Vec::new(), Vec::new());
         let mut last: Option<usize> = None;
         for index in 0..self.entry_count as usize {
@@ -644,11 +644,11 @@ impl<'a> ReverseLeaf<'a> {
                 last = Some(offset);
             }
         }
-        Fences {
+        Some(Fences {
             keys: keys.into(),
             key_ends: key_ends.into(),
             entries: entries.into(),
-        }
+        })
     }
 
     /// [`Self::lookup`] narrowed by `fences` to the entries from the last
@@ -842,7 +842,7 @@ mod tests {
         let keys: Vec<&[u8]> = entries.iter().map(|e| e.key.as_slice()).collect();
         let entry_end = |i: usize| leaf.entry_offset(i) + ENTRY_OVERHEAD + keys[i].len();
         for unit in [512usize, 4096, 65536] {
-            let fences = leaf.fences(unit);
+            let fences = leaf.fences(unit).unwrap();
             assert!((1..fences.len()).all(|i| fences.key(i - 1) < fences.key(i)));
             assert!(
                 (0..fences.len()).all(|i| fences.key(i) == keys[fences.index(i) as usize]
@@ -1068,6 +1068,7 @@ mod tests {
                 let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
                 assert!(leaf.is_front_coded());
                 assert!(!leaf.is_sequential());
+                assert!(leaf.fences(4096).is_none(), "not fenced");
                 assert_eq!(leaf.entry_count(), plain.entry_count());
                 assert_eq!(leaf.first_key(), plain.first_key(), "{n}");
                 assert_eq!(leaf.last_key(), plain.last_key(), "{n}");

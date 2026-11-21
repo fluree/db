@@ -47,10 +47,9 @@ impl FencedLeaf {
             .read_range(0..len)
             .map_err(|e| io::Error::other(e.to_string()))?;
         let leaf = ReverseLeaf::from_bytes(&bytes)?;
-        if !leaf.is_sequential() {
+        let Some(fences) = leaf.fences(spacing.max(1) as usize) else {
             return Ok(Err(bytes));
-        }
-        let fences = leaf.fences(spacing.max(1) as usize);
+        };
         fluree_db_core::io_stats::record_work("reverse leaf fenced", bytes.len());
         Ok(Ok(Self {
             entry_count: leaf.entry_count(),
@@ -1585,7 +1584,7 @@ mod tests {
                 assert_eq!(memory.leaves, 1);
                 assert_eq!(
                     memory.fence_bytes,
-                    leaf.fences(spacing as usize).heap_bytes() as u64
+                    leaf.fences(spacing as usize).unwrap().heap_bytes() as u64
                 );
                 assert_eq!(memory.source_charge, 1024, "the test source's charge");
                 cache
@@ -1597,8 +1596,8 @@ mod tests {
             };
             let (wide, close) = (weigh(4096), weigh(256));
             let (wide_index, close_index) = (
-                leaf.fences(4096).heap_bytes() as u64,
-                leaf.fences(256).heap_bytes() as u64,
+                leaf.fences(4096).unwrap().heap_bytes() as u64,
+                leaf.fences(256).unwrap().heap_bytes() as u64,
             );
             assert!(close_index > 8 * wide_index);
             assert!(wide > wide_index + 1024, "fences and source handle: {wide}");
@@ -1733,7 +1732,7 @@ mod tests {
             // Fences at the 4 KiB read unit, and closer, so a stretch ends
             // inside a unit.
             for spacing in [4096usize, 512] {
-                let fences = leaf.fences(spacing);
+                let fences = leaf.fences(spacing).unwrap();
                 let at = fences.offset(1) as usize;
                 let mut bad = blob.clone();
                 bad[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
