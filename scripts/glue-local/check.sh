@@ -44,7 +44,7 @@ observe() {
   if grep -qi '^error' <<<"$out"; then echo "ERR: $(grep -im1 '^error' <<<"$out" | cut -c1-160)"; return; fi
   out="$("$FLUREE" query "$name" "$query" 2>&1)"   # table format: graph-source targets refuse csv
   if grep -qi '^error' <<<"$out"; then echo "ERR: $(grep -im1 '^error' <<<"$out" | cut -c1-160)"; return; fi
-  local n; n="$(grep -oE '^\| *[0-9]+ *\|' <<<"$out" | head -1 | tr -dc '0-9')"
+  local n; n="$(grep -oE '^(\||│) *[0-9]+ *(\||│)' <<<"$out" | head -1 | tr -dc '0-9')"
   [ -n "$n" ] && echo "$n" || echo "UNPARSED: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
 }
 
