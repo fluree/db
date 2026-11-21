@@ -3355,6 +3355,57 @@ async fn publish_erasure(fluree: &Fluree, id: &str, request: ErasureRequest) {
     assert_eq!(fluree.run_erasure_pass(id).await.unwrap().published, 1);
 }
 
+/// Long strings sharing their first 48 bytes past the hashing cap are
+/// keyed by value, and the string tree's branch lists them by that prefix.
+/// Erasing every one of them, leaf by leaf, leaves the prefix nowhere, the
+/// branch included.
+#[tokio::test]
+async fn an_erased_group_of_long_strings_leaves_its_prefix_nowhere() {
+    use std::time::Duration;
+
+    let dir = tempfile::tempdir().unwrap();
+    let fluree = erasing(&dir, Arc::new(NativeProver::default()));
+    let id = ledger(&fluree, "it/purge-listed-group").await;
+    let notes: Vec<String> = (0..40)
+        .map(|i| {
+            format!(
+                "Patient Jane Q. Example, DOB 1980-01-01, MRN 4417: visit {i:02}, {}",
+                "notes ".repeat(8)
+            )
+        })
+        .collect();
+    insert(
+        &fluree,
+        &id,
+        json!({"@context": ctx(), "@graph": [
+            {"@id": "ex:patient", "ex:note": notes},
+            {"@id": "ex:other", "ex:note": "unrelated"}
+        ]}),
+    )
+    .await;
+    let patient_notes = ErasureRequest {
+        matching: vec![FactSelector {
+            subject: "http://example.org/patient".into(),
+            predicate: "http://example.org/note".into(),
+            graph: None,
+            object: None,
+        }],
+        ..Default::default()
+    };
+    publish_erasure(&fluree, &id, patient_notes).await;
+
+    let report = fluree.run_purge_pass(&id, Duration::ZERO).await.unwrap();
+    assert_eq!((report.purged, report.leafwise), (1, 1), "{report:?}");
+    assert_eq!(
+        files_holding(dir.path(), "Jane Q. Example, DOB 1980"),
+        Vec::<std::path::PathBuf>::new()
+    );
+    assert_eq!(
+        objects(&fluree, &id, "ex:other", "ex:note").await,
+        vec![json!("unrelated")]
+    );
+}
+
 /// An erased reference whose IRI nothing else uses is purged leaf by leaf:
 /// the IRI, an identifier, stays only in the index dictionaries.
 #[tokio::test]

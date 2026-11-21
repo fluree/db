@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use super::branch::DictBranch;
+use super::key_scheme::KeyScheme;
 use super::reverse_leaf::{Fenced, Fences, ReverseLeaf};
 
 use crate::read::cached_units::{CachedUnits, UnitCursor};
@@ -493,8 +494,30 @@ impl DictTreeReader {
         self.global_cache.is_some()
     }
 
-    /// Reverse lookup: find ID by key bytes.
-    pub fn reverse_lookup(&self, key: &[u8]) -> io::Result<Option<u64>> {
+    /// How this tree's keys are made from its values.
+    pub fn key_scheme(&self) -> KeyScheme {
+        self.branch.key_scheme
+    }
+
+    /// How this tree keys values, down to the groups it keys by value.
+    pub fn key_rules(&self) -> super::key_scheme::KeyRules<'_> {
+        self.branch.keys()
+    }
+
+    /// Reverse lookup: find the ID of `value`, under each key the tree may
+    /// hold it by.
+    pub fn reverse_lookup(&self, value: &[u8]) -> io::Result<Option<u64>> {
+        let keys = self.branch.keys().lookup_keys(value);
+        if let Some(id) = self.lookup_key(&keys.first)? {
+            return Ok(Some(id));
+        }
+        match keys.then() {
+            Some(key) => self.lookup_key(&key),
+            None => Ok(None),
+        }
+    }
+
+    fn lookup_key(&self, key: &[u8]) -> io::Result<Option<u64>> {
         const SLOW_LOOKUP_WARN_MS: u64 = 250;
 
         let mut clock = DebugClock::start();
@@ -548,21 +571,38 @@ impl DictTreeReader {
         Ok(result)
     }
 
-    /// Distinct leaf `address`es the given keys map to, via the in-memory
+    /// Distinct leaf `address`es the given values map to, via the in-memory
     /// branch routing (no I/O). Lets a caller learn which leaves a batched
     /// reverse lookup will touch so it can prewarm them concurrently before
     /// the sync lookup runs. Preserves first-seen order; deduplicated.
-    pub fn touched_leaf_addresses<'a, I>(&self, keys: I) -> Vec<&str>
+    pub fn touched_leaf_addresses<'a, I>(&self, values: I) -> Vec<&str>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        let rules = self.branch.keys();
+        let keys: Vec<_> = values
+            .into_iter()
+            .map(|value| rules.lookup_keys(value))
+            .collect();
+        self.touched_leaf_addresses_keyed(&keys)
+    }
+
+    /// [`Self::touched_leaf_addresses`] for keys computed already by this
+    /// tree's [`Self::key_rules`].
+    pub fn touched_leaf_addresses_keyed(
+        &self,
+        keys: &[super::key_scheme::LookupKeys<'_>],
+    ) -> Vec<&str> {
         let mut seen = vec![false; self.branch.leaves.len()];
         let mut addresses = Vec::new();
-        for key in keys {
-            if let Some(leaf_idx) = self.branch.find_leaf(key) {
-                if !seen[leaf_idx] {
-                    seen[leaf_idx] = true;
-                    addresses.push(self.branch.leaves[leaf_idx].address.as_str());
+        for keys in keys {
+            let then = keys.then();
+            for key in std::iter::once(keys.first.as_ref()).chain(then.as_deref()) {
+                if let Some(leaf_idx) = self.branch.find_leaf(key) {
+                    if !seen[leaf_idx] {
+                        seen[leaf_idx] = true;
+                        addresses.push(self.branch.leaves[leaf_idx].address.as_str());
+                    }
                 }
             }
         }
@@ -579,16 +619,50 @@ impl DictTreeReader {
         }
     }
 
-    /// Batched reverse lookup: find IDs by key bytes while loading each touched
-    /// leaf at most once for the batch.
-    pub fn reverse_lookup_many<'a, I>(&self, keys: I) -> io::Result<Vec<Option<u64>>>
+    /// Batched reverse lookup: find the IDs of `values` while loading each
+    /// touched leaf at most once for each of the (at most two) keys a value
+    /// may be held under.
+    pub fn reverse_lookup_many<'a, I>(&self, values: I) -> io::Result<Vec<Option<u64>>>
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        let rules = self.branch.keys();
+        let keys: Vec<_> = values
+            .into_iter()
+            .map(|value| rules.lookup_keys(value))
+            .collect();
+        self.reverse_lookup_keyed(&keys)
+    }
+
+    /// [`Self::reverse_lookup_many`] for keys computed already by this tree's
+    /// [`Self::key_rules`], so a caller can compute them as it sees fit (in
+    /// parallel, say) and keep their hashes.
+    pub fn reverse_lookup_keyed(
+        &self,
+        keys: &[super::key_scheme::LookupKeys<'_>],
+    ) -> io::Result<Vec<Option<u64>>> {
+        let firsts: Vec<&[u8]> = keys.iter().map(|k| k.first.as_ref()).collect();
+        let mut results = self.lookup_keys_batched(&firsts)?;
+
+        // Only the values `first` missed are hashed for their fallback key.
+        let retry: Vec<(usize, Vec<u8>)> = (0..keys.len())
+            .filter(|&i| results[i].is_none())
+            .filter_map(|i| Some((i, keys[i].then()?)))
+            .collect();
+        if !retry.is_empty() {
+            let thens: Vec<&[u8]> = retry.iter().map(|(_, key)| key.as_slice()).collect();
+            let found = self.lookup_keys_batched(&thens)?;
+            for ((i, _), found) in retry.iter().zip(found) {
+                results[*i] = found;
+            }
+        }
+        Ok(results)
+    }
+
+    fn lookup_keys_batched(&self, key_refs: &[&[u8]]) -> io::Result<Vec<Option<u64>>> {
         const SLOW_BATCH_WARN_MS: u64 = 250;
 
         let mut clock = DebugClock::start();
-        let key_refs: Vec<&[u8]> = keys.into_iter().collect();
         if key_refs.is_empty() {
             return Ok(Vec::new());
         }
@@ -644,6 +718,7 @@ impl DictTreeReader {
     ///
     /// Scans across multiple B-tree leaves as needed. Returns `(key_bytes, id)` pairs
     /// in sorted key order. Used for subject prefix scans (e.g., commit SHA lookup).
+    /// Bounds and results are keys, not values: see [`KeyScheme::prefix_ranges`].
     pub fn reverse_range_scan(
         &self,
         start_key: &[u8],
@@ -1050,6 +1125,7 @@ mod tests {
     ) -> crate::format::wire_helpers::DictTreeRefs {
         let branch = DictBranch {
             leaves: leaves.iter().map(|(bl, _)| bl.clone()).collect(),
+            ..Default::default()
         };
         let branch_cid = cs
             .put(
@@ -1694,7 +1770,8 @@ mod tests {
                 ns_relative_ids: false,
             };
             let built =
-                builder::build_reverse_tree_as(entries.clone(), usize::MAX, format).unwrap();
+                builder::build_reverse_tree_as(entries.clone(), usize::MAX, format, KeyScheme::Raw)
+                    .unwrap();
             assert_eq!(built.branch.leaves.len(), 1);
             let address = built.branch.leaves[0].address.clone();
             let blob = built.leaves[0].bytes.clone();

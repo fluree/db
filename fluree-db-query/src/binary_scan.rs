@@ -4504,24 +4504,24 @@ pub(crate) fn resolve_subject_v3(
     ))
 }
 
-/// Resolve a string value to a string_id using persisted dict then DictNovelty.
-/// Look up `value`'s string-dict id across the persisted and novelty dicts.
+/// Look up `value`'s string-dict id across the novelty and persisted dicts.
 ///
 /// `Ok(None)` is a genuine miss — the value is in neither dict — and carries no
 /// allocation, so callers on hot paths (every novelty duration flake) pay
 /// nothing to distinguish it. `Err` is a real dict/mmap I/O error propagated
 /// verbatim from `find_string_id`, so a corrupt dictionary surfaces as an error
 /// instead of being conflated with a miss.
+///
+/// DictNovelty first: it holds only strings the persisted tree doesn't, so
+/// the order changes no answer, and a novelty string, which overlay
+/// translation meets once per novelty flake, skips the persisted lookup
+/// (for a long string, a hash and a probe for a key the tree can't hold).
 fn find_string_id_v3(
     value: &str,
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<Option<u32>> {
-    // 1. Persisted
-    if let Some(id) = store.find_string_id(value)? {
-        return Ok(Some(id));
-    }
-    // 2. DictNovelty
+    // 1. DictNovelty
     if let Some(dn) = dict_novelty {
         if dn.is_initialized() {
             if let Some(id) = dn.strings.find_string(value) {
@@ -4529,7 +4529,8 @@ fn find_string_id_v3(
             }
         }
     }
-    Ok(None)
+    // 2. Persisted
+    store.find_string_id(value)
 }
 
 /// [`find_string_id_v3`] for callers that treat "not in dict" as an error,

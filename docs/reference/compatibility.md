@@ -716,6 +716,16 @@ Warm queries that name subjects the index holds run about as fast as before. Loo
 
 For Rust embedders: `ReverseLeaf::iter`, `scan_range`, `first_key` and `last_key` return `Cow<[u8]>` keys, owned for a front-coded leaf, and `ReverseLeaf::fences` returns `Option<Fences>`, `None` for a leaf a fenced scan can't read.
 
+#### Long strings are keyed by prefix and hash (breaking for earlier 5.0 alphas)
+
+A full build now writes the string dictionary's reverse tree with short keys for long strings: a string longer than 81 bytes is keyed by its first 48 bytes and its SHA-256, so the tree no longer holds a second copy of every long literal. Where more than 32 long strings share their first 48 bytes, the tree keys them by value instead, so a prefix search stays exact. Queries answer as before, including `STRSTARTS` and other prefix matches. A ledger whose strings are long, such as descriptions and review text, takes noticeably less storage. Looking a long string up by value hashes it, so those lookups cost a little more.
+
+A string tree an earlier release wrote keeps its keys through incremental builds and imports, and is rekeyed at the next full rebuild ([`fluree reindex`](../cli/reindex.md)).
+
+As with front-coded subject leaves, the change is one-way within the 5.0 alphas: `v5.0.0-alpha.2` and `alpha.3` refuse an index this release wrote when they load it, and going back to one of them means a full reindex there.
+
+For Rust embedders: `LeafFormat::for_dict(dict)` is now `LeafFormat::for_tree(dict, scheme)`. `DictTreeReader::reverse_lookup`, `reverse_lookup_many` and `touched_leaf_addresses` take values and key them by the tree's own scheme; `reverse_range_scan` still takes and returns keys. `BinaryIndexStore::find_strings_by_prefix` returns ids in no particular order. `DictBranch` has `key_scheme` and `raw_groups` fields, so a struct literal needs `..Default::default()`.
+
 #### Old index versions are kept by age, with a ceiling of 10
 
 Garbage collection used to keep at least 5 old index versions whatever their age, and with no upper bound every version superseded within the last 15 minutes. The floor is now 0 and a ceiling of 10 applies. A ledger that publishes slowly keeps no old version once its last one has been superseded for 15 minutes. One that publishes fast keeps at most 10 old versions, so a query still reading an older version can lose its files. Time travel does not depend on old versions. To keep a floor, set `--gc-max-old-indexes` (`FLUREE_GC_MAX_OLD_INDEXES`, `gc_max_old_indexes`). For ledgers that publish fast and serve long queries, raise `--gc-hard-max-old-indexes`. See [Index Retention](../indexing-and-search/background-indexing.md#index-retention).

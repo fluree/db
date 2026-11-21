@@ -16,10 +16,13 @@
 //! old (real) and new (`pending:hash`) addresses — caller finalizes via
 //! [`super::builder::finalize_branch`] after CAS upload.
 
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use super::branch::{BranchLeafEntry, DictBranch};
 use super::builder::LeafArtifact;
+use super::key_scheme::{KeyRules, KeyScheme};
 use super::pack_builder::{
     build_string_forward_packs, PackArtifact, DEFAULT_TARGET_PACK_BYTES, DEFAULT_TARGET_PAGE_BYTES,
 };
@@ -333,6 +336,8 @@ pub struct IncrementalTreeResult {
 /// [`super::builder::finalize_branch`] after CAS upload to set real addresses.
 ///
 /// Rewritten leaves are written in `format`, whatever format they were read in.
+/// `new_entries` are keyed by `existing_branch.key_scheme`, which the result
+/// keeps, empty tree or not.
 pub fn update_reverse_tree(
     existing_branch: &DictBranch,
     new_entries: &[ReverseEntry],
@@ -342,7 +347,7 @@ pub fn update_reverse_tree(
 ) -> io::Result<IncrementalTreeResult> {
     // Empty branch: build from scratch using new entries only
     if existing_branch.leaves.is_empty() {
-        return build_fresh_tree(new_entries, target_leaf_bytes, format);
+        return build_fresh_tree(new_entries, target_leaf_bytes, format, existing_branch);
     }
 
     if new_entries.is_empty() {
@@ -365,7 +370,7 @@ pub fn update_reverse_tree(
             // Fetch, decode, merge, re-encode
             let leaf_bytes = fetch_leaf(i)?;
             let decoded = ReverseLeaf::from_bytes(&leaf_bytes)?;
-            let merged = merge_leaf_entries(&decoded, slice);
+            let merged = merge_leaf_entries(&decoded, slice)?;
 
             let split_threshold = (target_leaf_bytes as f64 * SPLIT_FACTOR) as usize;
             let estimated_bytes = estimate_leaf_bytes(&merged);
@@ -390,6 +395,8 @@ pub fn update_reverse_tree(
 
     let branch = DictBranch {
         leaves: branch_entries,
+        key_scheme: existing_branch.key_scheme,
+        raw_groups: existing_branch.raw_groups.clone(),
     };
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
@@ -414,6 +421,10 @@ pub fn update_reverse_tree(
 
 /// Remove `keys` (sorted ascending) from a reverse dictionary tree. Leaves
 /// holding none of them keep their addresses; a leaf left empty is dropped.
+///
+/// A listed group the removal leaves no key under is no longer listed, and
+/// one left with no hashed key no longer says it holds some: the branch
+/// keeps no prefix of values the tree no longer holds.
 pub fn remove_from_reverse_tree(
     existing_branch: &DictBranch,
     keys: &[Vec<u8>],
@@ -431,10 +442,24 @@ pub fn remove_from_reverse_tree(
         })
         .collect();
     let slices = slice_entries_to_leaves(&probes, &existing_branch.leaves);
+    let touched = touched_groups(existing_branch, keys);
 
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
     let mut new_leaves: Vec<LeafArtifact> = Vec::new();
     let mut replaced_indices: Vec<usize> = Vec::new();
+    // Each leaf read, by its place in the new branch, with the keys it keeps
+    // under a touched group: all the pruning needs, and nothing when the
+    // removal touches no listed group.
+    let mut read: BTreeMap<usize, Vec<Vec<u8>>> = BTreeMap::new();
+    let k = existing_branch.key_scheme.prefix_len();
+    let under_touched = |kept: &[ReverseEntry]| -> Vec<Vec<u8>> {
+        kept.iter()
+            .filter(|e| {
+                k.is_some_and(|k| e.key.len() >= k && touched.binary_search(&&e.key[..k]).is_ok())
+            })
+            .map(|e| e.key.clone())
+            .collect()
+    };
     for (i, existing_leaf) in existing_branch.leaves.iter().enumerate() {
         let slice = slices[i];
         if slice.is_empty() {
@@ -456,18 +481,27 @@ pub fn remove_from_reverse_tree(
             })
             .collect();
         if kept.len() as u32 == existing_leaf.entry_count {
+            if !touched.is_empty() {
+                read.insert(branch_entries.len(), under_touched(&kept));
+            }
             branch_entries.push(existing_leaf.clone());
             continue;
         }
         if !kept.is_empty() {
+            if !touched.is_empty() {
+                read.insert(branch_entries.len(), under_touched(&kept));
+            }
             branch_entries.push(encode_and_track(&kept, format, &mut new_leaves));
         }
         replaced_indices.push(i);
     }
 
-    let branch = DictBranch {
+    let mut branch = DictBranch {
         leaves: branch_entries,
+        key_scheme: existing_branch.key_scheme,
+        raw_groups: existing_branch.raw_groups.clone(),
     };
+    prune_raw_groups(&mut branch, &touched, &read);
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
     Ok(IncrementalTreeResult {
@@ -477,6 +511,239 @@ pub fn remove_from_reverse_tree(
         new_leaves,
         replaced_leaf_indices: replaced_indices,
     })
+}
+
+/// The listed groups `keys`, removed from `branch`, belong to: sorted, each
+/// once.
+fn touched_groups<'k>(branch: &DictBranch, keys: &'k [Vec<u8>]) -> Vec<&'k [u8]> {
+    let scheme = branch.key_scheme;
+    let mut touched: Vec<&[u8]> = keys
+        .iter()
+        .filter_map(|key| scheme.key_group(key))
+        .filter(|group| branch.raw_groups.get(group).is_some())
+        .collect();
+    touched.dedup();
+    touched
+}
+
+/// After a removal, stop listing each `touched` group the tree holds no key
+/// under, and clear `hashed` on one with no hashed key left. `read` holds,
+/// for each leaf the removal read, by its place in `branch`, its keys under
+/// the touched groups.
+///
+/// A leaf the removal did not read holds its first and last keys. The one
+/// leaf that can hold a group's whole range with neither of them in it is
+/// the leaf every key in the range routes to, which the removal read: a
+/// removed key of the group lies in that range.
+fn prune_raw_groups(
+    branch: &mut DictBranch,
+    touched: &[&[u8]],
+    read: &BTreeMap<usize, Vec<Vec<u8>>>,
+) {
+    let scheme = branch.key_scheme;
+    let holds = |branch: &DictBranch, (start, end): (Vec<u8>, Option<Vec<u8>>)| {
+        let within = |key: &[u8]| key >= start.as_slice() && end.as_deref().is_none_or(|e| key < e);
+        branch.leaves_overlapping(&start, end.as_deref()).any(|i| {
+            let leaf = &branch.leaves[i];
+            within(&leaf.first_key)
+                || within(&leaf.last_key)
+                || read
+                    .get(&i)
+                    .is_none_or(|keys| keys.iter().any(|key| within(key)))
+        })
+    };
+    for &group in touched {
+        if !holds(branch, scheme.group_range(group)) {
+            branch.raw_groups.remove(group);
+        } else if branch.raw_groups.get(group).is_some_and(|g| g.hashed)
+            && !holds(branch, scheme.hashed_range(group))
+        {
+            branch.raw_groups.clear_hashed(group);
+        }
+    }
+}
+
+/// Which groups of a [`KeyScheme::PrefixHash`] tree one write of new values
+/// fills: those whose hashed values, with the ones the tree holds, would
+/// pass the cap. List them ([`Self::fill`]) before keying the new values
+/// ([`key_new_values`]), so their values are keyed by value.
+pub struct GroupPlan<'v> {
+    scheme: KeyScheme,
+    /// Each group the new values would hash into and how many they add,
+    /// sorted by group.
+    groups: Vec<(&'v [u8], usize)>,
+}
+
+impl<'v> GroupPlan<'v> {
+    pub fn new(rules: KeyRules<'_>, values: impl IntoIterator<Item = &'v [u8]>) -> Self {
+        let mut hashed: Vec<&'v [u8]> = values
+            .into_iter()
+            .filter_map(|value| rules.scheme.group(value))
+            .filter(|group| rules.raw.get(group).is_none())
+            .collect();
+        hashed.sort_unstable();
+        let mut groups: Vec<(&'v [u8], usize)> = Vec::new();
+        for group in hashed {
+            match groups.last_mut() {
+                Some((last, added)) if *last == group => *added += 1,
+                _ => groups.push((group, 1)),
+            }
+        }
+        Self {
+            scheme: rules.scheme,
+            groups,
+        }
+    }
+
+    /// Each group with its hashed range and the leaves of `branch` that
+    /// range overlaps: groups and leaves are both sorted, and the ranges
+    /// disjoint, so one walk over both finds them.
+    fn group_leaves<'p>(
+        &'p self,
+        branch: &'p DictBranch,
+    ) -> impl Iterator<Item = GroupLeaves<'v>> + 'p {
+        let mut lo = 0usize;
+        self.groups.iter().map(move |&(group, added)| {
+            let (start, end) = self.scheme.hashed_range(group);
+            let leaves = &branch.leaves;
+            while lo < leaves.len() && leaves[lo].last_key.as_slice() < start.as_slice() {
+                lo += 1;
+            }
+            let mut hi = lo;
+            while hi < leaves.len()
+                && end
+                    .as_deref()
+                    .is_none_or(|end| leaves[hi].first_key.as_slice() < end)
+            {
+                hi += 1;
+            }
+            GroupLeaves {
+                group,
+                added,
+                start,
+                end,
+                leaves: lo..hi,
+            }
+        })
+    }
+
+    /// The leaves of `branch` that hold these groups' hashed values.
+    pub fn leaves(&self, branch: &DictBranch) -> BTreeSet<usize> {
+        self.group_leaves(branch)
+            .flat_map(|group| group.leaves)
+            .collect()
+    }
+
+    /// The groups the write would take past the cap, each with whether it
+    /// holds hashed keys already, counting those it holds in the leaves
+    /// [`Self::leaves`] names, which `leaf` gives by index. Only each leaf's
+    /// keys in a group's hashed range are read, and none is copied.
+    pub fn fill<'l>(
+        &self,
+        branch: &DictBranch,
+        leaf: impl Fn(usize) -> Option<&'l [u8]>,
+    ) -> io::Result<Vec<(Vec<u8>, bool)>> {
+        let mut decoded: BTreeMap<usize, ReverseLeaf<'l>> = BTreeMap::new();
+        let mut listed = Vec::new();
+        for GroupLeaves {
+            group,
+            added,
+            start,
+            end,
+            leaves,
+        } in self.group_leaves(branch)
+        {
+            let mut held = 0;
+            for i in leaves {
+                let leaf = match decoded.entry(i) {
+                    std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(e) => {
+                        let bytes = leaf(i).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "reverse leaf {i} holding a group's hashed keys was not read"
+                                ),
+                            )
+                        })?;
+                        e.insert(ReverseLeaf::from_bytes(bytes)?)
+                    }
+                };
+                held += match &end {
+                    Some(end) => leaf.count_range(&start, end),
+                    None => leaf
+                        .iter()
+                        .filter(|(k, _)| k.as_ref() >= start.as_slice())
+                        .count(),
+                };
+            }
+            if held + added > self.scheme.cap() {
+                listed.push((group.to_vec(), held > 0));
+            }
+        }
+        Ok(listed)
+    }
+}
+
+/// A group of a [`GroupPlan`]: how many hashed values the write adds, its
+/// hashed key range `[start, end)`, and the leaves that range overlaps.
+struct GroupLeaves<'v> {
+    group: &'v [u8],
+    added: usize,
+    start: Vec<u8>,
+    end: Option<Vec<u8>>,
+    leaves: std::ops::Range<usize>,
+}
+
+/// Key `values`, new to `branch`, for an update of it: list each group in
+/// `listed` ([`GroupPlan::fill`]) on the branch, then key every value by the
+/// branch's rules, in key order, taking a value's hash from `hash_of` when
+/// it has one ([`super::key_scheme::LookupKeys::hash`]). Two values sharing a
+/// key are refused.
+pub fn key_new_values(
+    branch: &mut DictBranch,
+    listed: Vec<(Vec<u8>, bool)>,
+    mut values: Vec<ReverseEntry>,
+    hash_of: impl Fn(&ReverseEntry) -> Option<[u8; super::key_scheme::KEY_HASH_LEN]>,
+) -> io::Result<Vec<ReverseEntry>> {
+    for (group, hashed) in listed {
+        branch.raw_groups.insert(&group, hashed);
+    }
+    let rules = branch.keys();
+    for entry in &mut values {
+        if let Cow::Owned(key) = rules.key_hashed(&entry.key, hash_of(entry)) {
+            entry.key = key;
+        }
+    }
+    values.sort_by(|a, b| a.key.cmp(&b.key));
+    if values.windows(2).any(|w| w[0].key == w[1].key) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "two new values share a reverse-tree key",
+        ));
+    }
+    Ok(values)
+}
+
+/// The keys to remove `values` from a tree keyed by `rules` under: every key
+/// a lookup of each would try, in key order, each once.
+pub fn removal_keys(
+    rules: KeyRules<'_>,
+    values: impl IntoIterator<Item = Vec<u8>>,
+) -> Vec<Vec<u8>> {
+    let mut keys = Vec::new();
+    for value in values {
+        if !rules.scheme.reorders() {
+            keys.push(value);
+            continue;
+        }
+        let found = rules.lookup_keys(&value);
+        keys.extend(found.then());
+        keys.push(found.first.into_owned());
+    }
+    keys.sort();
+    keys.dedup();
+    keys
 }
 
 // ============================================================================
@@ -512,7 +779,14 @@ fn slice_entries_to_leaves<'a>(
 }
 
 /// Merge new entries into a decoded leaf, producing a sorted combined list.
-fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<ReverseEntry> {
+///
+/// A new entry whose key the leaf already holds under another id is an
+/// error: two values sharing a key, or one value given two ids, never
+/// overwrites what the tree holds.
+fn merge_leaf_entries(
+    leaf: &ReverseLeaf<'_>,
+    new: &[ReverseEntry],
+) -> io::Result<Vec<ReverseEntry>> {
     // Collect existing entries via iterator
     let existing: Vec<ReverseEntry> = leaf
         .iter()
@@ -537,8 +811,16 @@ fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<Rever
                 ni += 1;
             }
             std::cmp::Ordering::Equal => {
-                // New entry replaces existing (shouldn't happen for new IDs, but safe)
-                result.push(new[ni].clone());
+                if existing[ei].id != new[ni].id {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "reverse tree: a new entry's key is already held under id {}, not {}",
+                            existing[ei].id, new[ni].id
+                        ),
+                    ));
+                }
+                result.push(existing[ei].clone());
                 ei += 1;
                 ni += 1;
             }
@@ -548,7 +830,7 @@ fn merge_leaf_entries(leaf: &ReverseLeaf<'_>, new: &[ReverseEntry]) -> Vec<Rever
     // Drain remaining
     result.extend_from_slice(&existing[ei..]);
     result.extend_from_slice(&new[ni..]);
-    result
+    Ok(result)
 }
 
 /// Estimate a set of entries' size as a `DLR1` leaf, the measure leaves are
@@ -589,12 +871,20 @@ fn build_fresh_tree(
     entries: &[ReverseEntry],
     target_leaf_bytes: usize,
     format: LeafFormat,
+    existing_branch: &DictBranch,
 ) -> io::Result<IncrementalTreeResult> {
-    let tree = super::builder::build_reverse_tree_as(entries.to_vec(), target_leaf_bytes, format)?;
+    let mut tree = super::builder::build_reverse_tree_as(
+        entries.to_vec(),
+        target_leaf_bytes,
+        format,
+        existing_branch.key_scheme,
+    )?;
+    tree.branch.raw_groups = existing_branch.raw_groups.clone();
+    let branch_bytes = tree.branch.encode();
     Ok(IncrementalTreeResult {
+        branch_hash: fluree_db_core::sha256_hex(&branch_bytes),
         branch: tree.branch,
-        branch_bytes: tree.branch_bytes,
-        branch_hash: tree.branch_hash,
+        branch_bytes,
         new_leaves: tree.leaves,
         replaced_leaf_indices: vec![],
     })
@@ -827,7 +1117,7 @@ mod tests {
 
     #[test]
     fn test_reverse_tree_update_empty_branch() {
-        let branch = DictBranch { leaves: vec![] };
+        let branch = DictBranch::default();
         let new_entries = vec![
             make_reverse_entry("hello", 1),
             make_reverse_entry("world", 2),
@@ -1048,6 +1338,34 @@ mod tests {
         assert!(leaf.is_front_coded());
         assert_eq!(leaf.lookup(&gone), None);
         assert_eq!(leaf.lookup(&added[1].key), Some(added[1].id));
+    }
+
+    /// A new entry whose key the tree already holds under another id is
+    /// refused rather than replacing it; under the same id it is a no-op.
+    #[test]
+    fn an_existing_key_under_another_id_is_refused() {
+        let entries: Vec<ReverseEntry> = ["alpha", "beta", "gamma"]
+            .iter()
+            .enumerate()
+            .map(|(i, k)| make_reverse_entry(k, i as u64 + 1))
+            .collect();
+        let tree = build_reverse_tree(entries, DEFAULT_TARGET_LEAF_BYTES).unwrap();
+        let leaf = tree.leaves[0].bytes.clone();
+        let update = |id| {
+            update_reverse_tree(
+                &tree.branch,
+                &[make_reverse_entry("beta", id)],
+                DEFAULT_TARGET_LEAF_BYTES,
+                LeafFormat::Plain,
+                &mut |_| Ok(leaf.clone()),
+            )
+        };
+        let err = update(9).err().expect("a second id for one key is refused");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        let same = update(2).unwrap();
+        let rewritten = ReverseLeaf::from_bytes(&same.new_leaves[0].bytes).unwrap();
+        assert_eq!(rewritten.entry_count(), 3);
+        assert_eq!(rewritten.lookup(b"beta"), Some(2));
     }
 
     #[test]
@@ -1274,6 +1592,322 @@ mod tests {
             rewritten < total * 4,
             "rewrote {rewritten} bytes for {total} bytes of data"
         );
+    }
+
+    /// A tree written the way the indexer writes one: the groups a write
+    /// would take past the cap are listed before its values are keyed.
+    struct HashedTree {
+        branch: DictBranch,
+        leaves: std::collections::HashMap<String, Vec<u8>>,
+        target: usize,
+    }
+
+    impl HashedTree {
+        /// A few entries to a leaf, so a group's hashed range spans leaves.
+        const TARGET: usize = 160;
+        const FORMAT: LeafFormat = LeafFormat::FrontCoded {
+            ns_relative_ids: false,
+        };
+
+        fn new(key_scheme: KeyScheme) -> Self {
+            Self {
+                branch: DictBranch {
+                    key_scheme,
+                    ..Default::default()
+                },
+                leaves: Default::default(),
+                target: Self::TARGET,
+            }
+        }
+
+        /// One leaf for everything, so a group's keys sit inside it, past
+        /// its first and last keys.
+        fn in_one_leaf(key_scheme: KeyScheme) -> Self {
+            Self {
+                target: usize::MAX / 4,
+                ..Self::new(key_scheme)
+            }
+        }
+
+        fn leaf(&self, i: usize) -> io::Result<Vec<u8>> {
+            Ok(self.leaves[&self.branch.leaves[i].address].clone())
+        }
+
+        fn apply(&mut self, result: IncrementalTreeResult) {
+            let mut addresses = std::collections::HashMap::new();
+            for leaf in result.new_leaves {
+                let address = format!("leaf:{}", leaf.hash);
+                addresses.insert(leaf.hash, address.clone());
+                self.leaves.insert(address, leaf.bytes);
+            }
+            self.branch = super::super::builder::finalize_branch(result.branch, &addresses)
+                .unwrap()
+                .0;
+        }
+
+        fn add(&mut self, values: &[(String, u64)]) {
+            let values: Vec<ReverseEntry> = values
+                .iter()
+                .map(|(v, id)| ReverseEntry {
+                    key: v.as_bytes().to_vec(),
+                    id: *id,
+                })
+                .collect();
+            let plan = GroupPlan::new(self.branch.keys(), values.iter().map(|e| e.key.as_slice()));
+            let held: std::collections::HashMap<usize, Vec<u8>> = plan
+                .leaves(&self.branch)
+                .into_iter()
+                .map(|i| (i, self.leaf(i).unwrap()))
+                .collect();
+            let listed = plan
+                .fill(&self.branch, |i| held.get(&i).map(Vec::as_slice))
+                .unwrap();
+            let mut branch = self.branch.clone();
+            let entries = key_new_values(&mut branch, listed, values, |_| None).unwrap();
+            let result =
+                update_reverse_tree(&branch, &entries, self.target, Self::FORMAT, &mut |i| {
+                    self.leaf(i)
+                })
+                .unwrap();
+            self.apply(result);
+        }
+
+        fn remove(&mut self, values: &[&String]) {
+            let keys = removal_keys(
+                self.branch.keys(),
+                values.iter().map(|v| v.as_bytes().to_vec()),
+            );
+            let result =
+                remove_from_reverse_tree(&self.branch, &keys, Self::FORMAT, &mut |i| self.leaf(i))
+                    .unwrap();
+            self.apply(result);
+        }
+
+        fn lookup(&self, value: &str) -> Option<u64> {
+            let keys = self.branch.keys().lookup_keys(value.as_bytes());
+            let then = keys.then();
+            std::iter::once(keys.first.into_owned())
+                .chain(then)
+                .find_map(|key| {
+                    let bytes = self.leaf(self.branch.find_leaf(&key)?).unwrap();
+                    ReverseLeaf::from_bytes(&bytes).unwrap().lookup(&key)
+                })
+        }
+
+        fn hashed_in(&self, group: &[u8]) -> usize {
+            (0..self.branch.leaves.len())
+                .map(|i| {
+                    let bytes = self.leaf(i).unwrap();
+                    ReverseLeaf::from_bytes(&bytes)
+                        .unwrap()
+                        .iter()
+                        .filter(|(key, _)| {
+                            self.branch.key_scheme.hashed_key_group(key) == Some(group)
+                        })
+                        .count()
+                })
+                .sum()
+        }
+    }
+
+    /// A removal stops listing a group it leaves no key under, and clears
+    /// `hashed` on one it leaves no hashed key in, so the branch keeps no
+    /// prefix of values the tree no longer holds. A group left any key stays
+    /// listed, and its values stay findable.
+    #[test]
+    fn a_removal_stops_listing_the_groups_it_empties() {
+        use super::super::key_scheme::RawGroup;
+        let mut tree = HashedTree::new(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let long = |group: &str, i: u64| format!("{group}{i:040}");
+        let (a, b) = ("groupAAA", "groupBBB");
+        let filler: Vec<(String, u64)> =
+            (0..30).map(|i| (format!("group{i:03}"), 100 + i)).collect();
+        // `a` hashes three values, then is listed with them when two more
+        // would pass the cap; `b` is listed from its first write.
+        let a_hashed: Vec<(String, u64)> = (0..3).map(|i| (long(a, i), i)).collect();
+        let a_listed: Vec<(String, u64)> = (3..5).map(|i| (long(a, i), i)).collect();
+        let b_all: Vec<(String, u64)> = (0..5).map(|i| (long(b, i), 10 + i)).collect();
+        tree.add(&[filler.clone(), a_hashed.clone(), b_all.clone()].concat());
+        tree.add(&a_listed);
+        let listed = |tree: &HashedTree, g: &str| tree.branch.raw_groups.get(g.as_bytes()).cloned();
+        let raw = |g: &str, hashed| RawGroup {
+            prefix: g.as_bytes().to_vec(),
+            hashed,
+        };
+        assert_eq!(listed(&tree, a), Some(raw(a, true)));
+        assert_eq!(listed(&tree, b), Some(raw(b, false)));
+        assert!(tree.branch.leaves.len() > 5);
+
+        let found = |tree: &HashedTree, values: &[(String, u64)]| {
+            values.iter().all(|(v, id)| tree.lookup(v) == Some(*id))
+        };
+        // Some of `b` gone: still listed.
+        tree.remove(&[&b_all[0].0, &b_all[1].0]);
+        assert_eq!(listed(&tree, b), Some(raw(b, false)));
+        assert!(found(&tree, &b_all[2..]));
+        // `a`'s hashed values gone: listed, holding none hashed.
+        tree.remove(&a_hashed.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert_eq!(tree.hashed_in(a.as_bytes()), 0);
+        assert_eq!(listed(&tree, a), Some(raw(a, false)));
+        assert!(found(&tree, &a_listed));
+        // Every value of each gone: neither is listed.
+        tree.remove(&a_listed.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        tree.remove(&b_all[2..].iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert!(
+            tree.branch.raw_groups.is_empty(),
+            "{:?}",
+            tree.branch.raw_groups
+        );
+        assert!(found(&tree, &filler));
+    }
+
+    /// The value that spells a listed group's prefix, erased after the
+    /// group's long values, takes the listing with it: the branch keeps no
+    /// copy of it.
+    #[test]
+    fn erasing_the_value_a_group_prefix_spells_stops_listing_it() {
+        let mut tree = HashedTree::new(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let prefix = "groupAAA".to_string();
+        let long: Vec<(String, u64)> = (0..5).map(|i| (format!("{prefix}{i:040}"), i)).collect();
+        let filler: Vec<(String, u64)> =
+            (0..20).map(|i| (format!("group{i:03}"), 100 + i)).collect();
+        tree.add(&[filler.clone(), long.clone(), vec![(prefix.clone(), 50)]].concat());
+        assert!(tree.branch.raw_groups.get(prefix.as_bytes()).is_some());
+
+        // The long values gone: the prefix's own value keeps the group.
+        tree.remove(&long.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert!(tree.branch.raw_groups.get(prefix.as_bytes()).is_some());
+        assert_eq!(tree.lookup(&prefix), Some(50));
+        // It gone too: nothing lists the group, and the branch holds no copy.
+        tree.remove(&[&prefix]);
+        assert!(
+            tree.branch.raw_groups.is_empty(),
+            "{:?}",
+            tree.branch.raw_groups
+        );
+        let encoded = tree.branch.encode();
+        assert!(!encoded
+            .windows(prefix.len())
+            .any(|w| w == prefix.as_bytes()));
+        assert!(filler.iter().all(|(v, id)| tree.lookup(v) == Some(*id)));
+    }
+
+    /// A removal that leaves a group keys only inside one leaf, past its
+    /// first and last keys, keeps the group listed, and its flag while it
+    /// holds a hashed key: only the leaf's own keys show what is left.
+    #[test]
+    fn a_removal_reads_what_a_leaf_keeps_of_a_group() {
+        use super::super::key_scheme::RawGroup;
+        let mut tree = HashedTree::in_one_leaf(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let long = |i: u64| format!("groupAAA{i:040}");
+        let around: Vec<(String, u64)> = vec![("aaaa".into(), 100), ("zzzz".into(), 101)];
+        let hashed: Vec<(String, u64)> = (0..3).map(|i| (long(i), i)).collect();
+        let listed: Vec<(String, u64)> = (3..6).map(|i| (long(i), i)).collect();
+        tree.add(&[around.clone(), hashed.clone()].concat());
+        tree.add(&listed);
+        assert_eq!(tree.branch.leaves.len(), 1);
+        let group = |tree: &HashedTree| tree.branch.raw_groups.get(b"groupAAA").cloned();
+        let flagged = |hashed| {
+            Some(RawGroup {
+                prefix: b"groupAAA".to_vec(),
+                hashed,
+            })
+        };
+        assert_eq!(group(&tree), flagged(true));
+
+        // A value-keyed one gone: listed, still holding hashed keys.
+        tree.remove(&[&listed[0].0]);
+        assert_eq!(group(&tree), flagged(true));
+        // The hashed ones gone: listed, holding none.
+        tree.remove(&hashed.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert_eq!(group(&tree), flagged(false));
+        for (v, id) in &listed[1..] {
+            assert_eq!(tree.lookup(v), Some(*id), "{v}");
+        }
+    }
+
+    /// A group takes hashed values up to the cap, counting what it already
+    /// holds across writes and leaves; the write that would pass the cap
+    /// lists it and keys its values by value. Every value stays findable,
+    /// and erasure takes out either kind of key.
+    #[test]
+    fn a_group_fills_across_writes_and_every_value_stays_findable() {
+        use super::super::key_scheme::RawGroup;
+        let mut tree = HashedTree::new(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let long = |group: &str, i: u64| format!("{group}{i:040}");
+        let (a, b) = ("groupAAA", "groupBBB");
+        let mut next_id = 0u64;
+        let mut written: Vec<(String, u64)> = Vec::new();
+        let mut write = |tree: &mut HashedTree, values: Vec<String>| {
+            let batch: Vec<(String, u64)> = values
+                .into_iter()
+                .map(|v| {
+                    next_id += 1;
+                    (v, next_id)
+                })
+                .collect();
+            tree.add(&batch);
+            written.extend(batch);
+        };
+
+        // Short values around both groups; three of `a`, and five of `b`,
+        // which passes the cap in a single write.
+        let mut first: Vec<String> = (0..30).map(|i| format!("group{i:03}")).collect();
+        first.extend((0..3).map(|i| long(a, i)));
+        first.extend((0..5).map(|i| long(b, i)));
+        write(&mut tree, first);
+        assert!(tree.branch.leaves.len() > 5);
+        assert_eq!(tree.hashed_in(a.as_bytes()), 3);
+        assert!(tree.branch.raw_groups.get(a.as_bytes()).is_none());
+        assert_eq!(
+            tree.branch.raw_groups.get(b.as_bytes()),
+            Some(&RawGroup {
+                prefix: b.as_bytes().to_vec(),
+                hashed: false
+            })
+        );
+        assert_eq!(tree.hashed_in(b.as_bytes()), 0);
+
+        // `a` reaches the cap, then would pass it.
+        write(&mut tree, vec![long(a, 3)]);
+        assert_eq!(tree.hashed_in(a.as_bytes()), 4);
+        assert!(tree.branch.raw_groups.get(a.as_bytes()).is_none());
+        write(&mut tree, vec![long(a, 4)]);
+        assert_eq!(tree.hashed_in(a.as_bytes()), 4);
+        assert!(tree.branch.raw_groups.get(a.as_bytes()).unwrap().hashed);
+        write(&mut tree, (5..9).map(|i| long(a, i)).collect());
+        write(&mut tree, (5..9).map(|i| long(b, i)).collect());
+        assert_eq!(tree.hashed_in(a.as_bytes()), 4);
+        assert_eq!(tree.hashed_in(b.as_bytes()), 0);
+
+        for (value, id) in &written {
+            assert_eq!(tree.lookup(value), Some(*id), "{value}");
+        }
+        for group in [a, b] {
+            assert_eq!(tree.lookup(&long(group, 99)), None);
+        }
+
+        // One hashed and one value-keyed value of `a`, and one of `b`.
+        let gone = [&written[30], &written[40], &written[34]];
+        assert_eq!(gone.map(|(v, _)| &v[..8]), [a, a, b]);
+        tree.remove(&gone.map(|(v, _)| v));
+        for (value, id) in &written {
+            let erased = gone.iter().any(|(v, _)| v == value);
+            assert_eq!(tree.lookup(value), (!erased).then_some(*id), "{value}");
+        }
+        assert_eq!(tree.hashed_in(a.as_bytes()), 3);
     }
 }
 
