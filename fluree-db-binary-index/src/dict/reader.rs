@@ -675,7 +675,7 @@ impl DictTreeReader {
             let leaf = ReverseLeaf::from_bytes(&leaf_data)?;
 
             for (key, id) in leaf.scan_range(start_key, end_key) {
-                results.push((key.to_vec(), id));
+                results.push((key.into_owned(), id));
             }
         }
 
