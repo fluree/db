@@ -4520,3 +4520,99 @@ async fn a_failed_source_lookup_still_fails_the_query() {
         ["d=http://example.org/d t=default graph title"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// A join on few keys is emitted a batch at a time
+// ---------------------------------------------------------------------------
+
+/// `buckets.events`: an event per row, in the bucket its `bucket` column
+/// names.
+const BUCKETS_R2RML: &str = r#"
+    @prefix rr: <http://www.w3.org/ns/r2rml#> .
+    @prefix ex: <http://example.org/> .
+
+    <http://example.org/mapping#Event>
+        a rr:TriplesMap ;
+        rr:logicalTable [ rr:tableName "buckets.events" ] ;
+        rr:subjectMap [ rr:template "http://example.org/event/{id}" ] ;
+        rr:predicateObjectMap [
+            rr:predicate ex:bucket ;
+            rr:objectMap [ rr:template "http://example.org/bucket/{bucket}" ; rr:termType rr:IRI ]
+        ] .
+"#;
+
+/// `?b ex:bucket ?k` in the SQL source `buckets-sql`, joined to a `VALUES`
+/// block of `misses` outer rows in a bucket no event is in, then `hits` in
+/// the bucket all 100 events are in: each hit meets every event. The block's
+/// filter keeps every event, but the statement cannot run it, so it stays in
+/// the engine and keeps a `LIMIT` there too: each statement reads all 100.
+fn bucket_join(misses: usize, hits: usize, limit: &str, pragma: &str) -> String {
+    let rows: String = (0..misses + hits)
+        .map(|i| {
+            let bucket = if i < misses { 99 } else { 1 };
+            format!("(<http://example.org/a/{i}> <http://example.org/bucket/{bucket}>) ")
+        })
+        .collect();
+    format!(
+        "{pragma}PREFIX ex: <http://example.org/>\n\
+         SELECT ?a ?b FROM NAMED <buckets-sql:main> WHERE {{ \
+         VALUES (?a ?k) {{ {rows}}} \
+         GRAPH <buckets-sql:main> {{ ?b ex:bucket ?k FILTER(REGEX(STR(?b), \"[0-9]$\")) }} }} {limit}"
+    )
+}
+
+/// A statement page whose rows share their key with many outer rows, and
+/// an outer batch against a cached branch whose rows all share one key,
+/// each join to far more rows than they hold. Both are emitted one output
+/// batch at a time: a `LIMIT 1` over them is answered within a fuel limit
+/// of 5,000 emitted rows, where emitting each join whole (10,000 rows from
+/// the page, 100,000 from the cached rows) spent it before the first batch.
+/// Past `LIMIT`, the joins cut into batches still emit every row once.
+#[tokio::test]
+async fn a_join_on_few_keys_is_emitted_a_batch_at_a_time() {
+    let _lock = KILL_SWITCH.lock().await;
+    let events = (1..=100).map(|id| vec![json!(id), json!(1)]).collect();
+    let server = FakeSql::new()
+        .table(Table::new(
+            "buckets.events",
+            &[("id", "bigint"), ("bucket", "bigint")],
+            events,
+        ))
+        .mount()
+        .await;
+    let fluree = FlureeBuilder::memory().build_memory();
+    fluree
+        .create_sql_graph_source(SqlCreateConfig::new(
+            "buckets-sql",
+            server.uri(),
+            BUCKETS_R2RML.to_string(),
+        ))
+        .await
+        .expect("create sql source");
+    let (store, _tracing_guard) = span_capture::init_test_tracing();
+
+    // The dialect seeds up to 2,000 outer rows; past that the branch is
+    // cached, so 2,000 misses put the hits after them on the cached rows.
+    for (path, misses, hits) in [("seeded", 0, 100), ("cached", 2_000, 1_000)] {
+        let before = store.find_events("fast-path outcome").len();
+        let sparql = bucket_join(misses, hits, "LIMIT 1", "# PRAGMA max-fuel: 5\n");
+        let rows = fluree
+            .query_from()
+            .sparql(&sparql)
+            .execute_formatted()
+            .await
+            .unwrap_or_else(|e| panic!("{path}: {e}"));
+        assert_eq!(rows_of(&rows).len(), 1, "{path}");
+        assert!(
+            proceeded_sites(&store, before).iter().any(|s| s == SITE),
+            "{path}: the block ran on the SQL lane"
+        );
+    }
+
+    for (path, misses, hits) in [("seeded", 0, 30), ("cached", 2_001, 30)] {
+        let rows = rows_of(&query(&fluree, &bucket_join(misses, hits, "", "")).await);
+        assert_eq!(rows.len(), hits * 100, "{path}: every joined row");
+        let distinct: std::collections::BTreeSet<&String> = rows.iter().collect();
+        assert_eq!(distinct.len(), rows.len(), "{path}: each row once");
+    }
+}
