@@ -3394,6 +3394,15 @@ impl BinaryIndexStore {
             .map_or(0, |tree| tree.leaf_lookups())
     }
 
+    /// String value → id lookups since load that searched a dictionary leaf.
+    #[cfg(feature = "test-counters")]
+    pub fn string_reverse_leaf_lookups(&self) -> u64 {
+        self.dicts
+            .string_reverse_tree
+            .as_ref()
+            .map_or(0, |tree| tree.leaf_lookups())
+    }
+
     pub fn find_subject_id_by_parts(&self, ns_code: u16, suffix: &str) -> io::Result<Option<u64>> {
         match &self.dicts.subject_reverse_tree {
             Some(tree) => {
