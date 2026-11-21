@@ -122,9 +122,9 @@ apply to all of them:
   [environment variables that disable them](../troubleshooting/debugging-queries.md#isolating-an-optimizer-change)
   for comparison.
 - **Resource limits still apply.** Specialized operators check cancellation and
-  fuel. The buffering operators (the hash-join build, `GROUP BY`, `MINUS`, and
-  the semijoin) charge the memory they retain against the query's budget; other
-  lanes bound their state with row caps.
+  fuel. Several operators that hold intermediate state, including the hash-join
+  build, the streaming `GROUP BY` aggregate, `MINUS`, the semijoin and buffered
+  subquery rows, charge that memory against the query's budget.
 - **Changes are measured and gated.** Each change is justified with before/after
   measurements and a result check in its pull request. Criterion benchmarks in
   [BENCHMARKING.md](../../BENCHMARKING.md) guard against later regressions.
