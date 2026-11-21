@@ -279,20 +279,26 @@ impl LookupKeys<'_> {
 }
 
 impl KeyRules<'_> {
+    /// Whether a new `value` is keyed by its hash: a long value of a group
+    /// the tree doesn't key by value.
+    pub fn hashes(&self, value: &[u8]) -> bool {
+        self.scheme
+            .group(value)
+            .is_some_and(|group| self.raw.get(group).is_none())
+    }
+
     /// The key a new `value` is written under.
     pub fn key<'v>(&self, value: &'v [u8]) -> Cow<'v, [u8]> {
-        match self.scheme.group(value) {
-            Some(group) if self.raw.get(group).is_none() => {
-                Cow::Owned(self.scheme.hashed_key(value))
-            }
-            _ => Cow::Borrowed(value),
+        if self.hashes(value) {
+            Cow::Owned(self.scheme.hashed_key(value))
+        } else {
+            Cow::Borrowed(value)
         }
     }
 
     /// The hash a new `value` is keyed by, if it is keyed by one.
     pub fn key_hash(&self, value: &[u8]) -> Option<[u8; KEY_HASH_LEN]> {
-        let group = self.scheme.group(value)?;
-        self.raw.get(group).is_none().then(|| digest(value))
+        self.hashes(value).then(|| digest(value))
     }
 
     /// The keys `value` may be held under.
