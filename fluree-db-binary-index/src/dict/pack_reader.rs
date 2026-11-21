@@ -16,8 +16,9 @@ use once_cell::sync::OnceCell;
 
 use super::allowance::{reject, DictionaryAllowance, PackSlot, Promotion};
 use super::forward_pack::{
-    find_page_in_dir, lookup_in_pack, page_dir_range, parse_pack_meta, parse_pack_meta_parts,
-    PackHeader, PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
+    codec_range, find_page_in_dir, lookup_in_pack_into, page_dir_range, parse_pack_meta,
+    parse_pack_meta_parts, with_codes_scratch, with_decode_scratch, FsstTable, PackHeader,
+    PageDirEntry, ParsedPackMeta, PACK_HEADER_SIZE,
 };
 use crate::format::wire_helpers::PackBranchEntry;
 use crate::read::cached_units::{CachedUnits, MissMeter};
@@ -109,7 +110,7 @@ impl AdaptivePack {
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
         if let Some(whole) = &*self.slot.load() {
             whole.mark_used();
-            return Ok(lookup_whole(whole, meta, id, out));
+            return lookup_whole(whole, meta, id, out);
         }
         if id < meta.first_id || id > meta.last_id {
             return Ok(false);
@@ -121,6 +122,7 @@ impl AdaptivePack {
             &self.units,
             &self.checked[page_idx],
             &meta.directory[page_idx],
+            meta.codecs.table(page_idx),
             id,
             out,
         )?;
@@ -213,13 +215,15 @@ impl UnitRead for CachedUnits {
 }
 
 /// Look `id` up in page `dir` of a ranged pack, appending its value to
-/// `out`. Reads the page's two offsets for `id` and then the value; on the
-/// page's first visit also its entry count and final offset, which must
-/// agree with the directory. Offsets are bounds-checked on every lookup.
+/// `out`, decoded over `table` when the page is coded. Reads the page's two
+/// offsets for `id` and then the value; on the page's first visit also its
+/// entry count and final offset, which must agree with the directory.
+/// Offsets are bounds-checked on every lookup.
 fn ranged_lookup(
     units: &impl UnitRead,
     checked: &AtomicBool,
     dir: &PageDirEntry,
+    table: Option<&FsstTable>,
     id: u64,
     out: &mut Vec<u8>,
 ) -> io::Result<bool> {
@@ -251,25 +255,30 @@ fn ranged_lookup(
         return Err(invalid("value offsets out of order or out of bounds"));
     }
     let from = base + data_start + u64::from(lo);
-    units.extend_into(from..from + u64::from(hi - lo), out)?;
+    match table {
+        None => units.extend_into(from..from + u64::from(hi - lo), out)?,
+        Some(table) => with_codes_scratch(|codes| {
+            units.extend_into(from..from + u64::from(hi - lo), codes)?;
+            table.decode_value_into(codes, out)
+        })?,
+    }
     Ok(true)
 }
 
-fn lookup_whole(bytes: &[u8], meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> bool {
-    match lookup_in_pack(bytes, meta, id) {
-        Some(value) => {
-            out.extend_from_slice(value);
-            true
-        }
-        None => false,
-    }
+fn lookup_whole(
+    bytes: &[u8],
+    meta: &ParsedPackMeta,
+    id: u64,
+    out: &mut Vec<u8>,
+) -> io::Result<bool> {
+    lookup_in_pack_into(bytes, meta, id, out)
 }
 
 impl PackBacking {
     /// Append `id`'s value bytes to `out`; `false` when the pack lacks it.
     fn lookup_into(&self, meta: &ParsedPackMeta, id: u64, out: &mut Vec<u8>) -> io::Result<bool> {
         match self {
-            PackBacking::Whole(bytes) => Ok(lookup_whole(bytes, meta, id, out)),
+            PackBacking::Whole(bytes) => lookup_whole(bytes, meta, id, out),
             PackBacking::Adaptive(pack) => pack.lookup_into(meta, id, out),
         }
     }
@@ -606,10 +615,17 @@ impl ForwardPackReader {
             return Ok(None);
         };
         let (meta, backing) = handle.ensure_loaded(self.load_ctx.as_ref())?;
-        let mut value = Vec::new();
-        if !backing.lookup_into(meta, id, &mut value)? {
+        // A coded value decodes with room for 8 bytes per code; the string
+        // keeps only its own length.
+        let value = with_decode_scratch(|scratch| -> io::Result<Option<Vec<u8>>> {
+            if !backing.lookup_into(meta, id, scratch)? {
+                return Ok(None);
+            }
+            Ok(Some(scratch.to_vec()))
+        })?;
+        let Some(value) = value else {
             return Ok(None);
-        }
+        };
         String::from_utf8(value)
             .map(Some)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
@@ -807,12 +823,18 @@ fn loaded_adaptive(
     };
     let header_bytes = read(0..PACK_HEADER_SIZE as u64)?;
     let header = PackHeader::decode(&header_bytes)?;
+    let codecs = codec_range(&header, source.len())?;
+    let codec_bytes = if codecs.is_empty() {
+        Default::default()
+    } else {
+        read(codecs)?
+    };
     let dir_bytes = read(page_dir_range(&header, source.len())?)?;
-    let meta = parse_pack_meta_parts(&header, &dir_bytes, source.len())?;
+    let meta = parse_pack_meta_parts(&header, &codec_bytes, &dir_bytes, source.len())?;
     validate_lazy_meta(&meta, expected_first_id, expected_last_id, ctx)?;
     fluree_db_core::io_stats::record_work(
         "pack opened paged",
-        header_bytes.len() + dir_bytes.len(),
+        header_bytes.len() + codec_bytes.len() + dir_bytes.len(),
     );
     let checked = meta
         .directory
@@ -1665,13 +1687,34 @@ mod tests {
             format!("value-{id:08}").into_bytes()
         }
 
+        /// A raw pack: these tests read its page layout by range.
         fn pack_with_pages(first: u64, page_bytes: usize) -> Vec<u8> {
             let entries: Vec<(u64, Vec<u8>)> = (first..first + COUNT as u64)
                 .map(|id| (id, value(id)))
                 .collect();
             let refs: Vec<(u64, &[u8])> =
                 entries.iter().map(|(id, v)| (*id, v.as_slice())).collect();
-            encode_forward_pack(&refs, KIND_STRING_FWD, 0, page_bytes).unwrap()
+            crate::dict::forward_pack::encode_forward_pack_raw(
+                &refs,
+                KIND_STRING_FWD,
+                0,
+                page_bytes,
+            )
+            .unwrap()
+        }
+
+        /// A pack as a string pack is written: FSST-coded.
+        fn coded_pack_with_pages(first: u64, page_bytes: usize) -> Vec<u8> {
+            let entries: Vec<(u64, Vec<u8>)> = (first..first + COUNT as u64)
+                .map(|id| (id, value(id)))
+                .collect();
+            let refs: Vec<(u64, &[u8])> =
+                entries.iter().map(|(id, v)| (*id, v.as_slice())).collect();
+            let pack = encode_forward_pack(&refs, KIND_STRING_FWD, 0, page_bytes).unwrap();
+            assert!(crate::dict::forward_pack::ForwardPack::from_bytes(&pack)
+                .unwrap()
+                .is_coded());
+            pack
         }
 
         /// A pack of a few large pages, so a page spans many read units.
@@ -1810,6 +1853,40 @@ mod tests {
                 "a neighbour reads nothing new"
             );
             assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+        }
+
+        /// A coded pack's codec section is read once, when the pack opens;
+        /// each value is then read by range and decoded.
+        #[test]
+        fn coded_values_read_back_by_range() {
+            for pack in [
+                coded_pack_with_pages(FIRST, 512),
+                coded_pack_with_pages(FIRST, 32 * 1024),
+            ] {
+                let cs = SegmentedContentStore::new(true);
+                let reader = reader_of(&cs, &pack, FIRST, Some(ranged_cache()), KIND_STRING_FWD);
+                assert_eq!(lookup(&reader, FIRST), Some(value(FIRST)));
+                assert_eq!(
+                    cs.reads()[..3],
+                    [
+                        0..PACK_HEADER_SIZE as u64,
+                        codec_range(&PackHeader::decode(&pack).unwrap(), pack.len() as u64)
+                            .unwrap(),
+                        page_dir_range(&PackHeader::decode(&pack).unwrap(), pack.len() as u64)
+                            .unwrap(),
+                    ],
+                    "header, codec section, directory"
+                );
+                read_all(&reader, FIRST);
+                assert_eq!(lookup(&reader, FIRST + COUNT as u64), None);
+                assert_eq!(cs.whole_reads.load(AtomicOrdering::SeqCst), 0);
+
+                let whole = SegmentedContentStore::new(false);
+                read_all(
+                    &reader_of(&whole, &pack, FIRST, None, KIND_STRING_FWD),
+                    FIRST,
+                );
+            }
         }
 
         #[test]

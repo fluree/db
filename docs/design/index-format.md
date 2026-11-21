@@ -547,9 +547,14 @@ Forward dictionaries are paged packs, each covering a contiguous ID range:
 
 ```text
 Header (40 bytes):
-  [magic: 4B "FPK1"] [version: u8=1] [kind: u8] [ns_code: u16 LE]
+  [magic: 4B "FPK1"] [version: u8] [kind: u8] [ns_code: u16 LE]
   [first_id: u64 LE] [last_id: u64 LE]
-  [page_count: u32 LE] [page_dir_offset: u64 LE] [reserved: u32=0]
+  [page_count: u32 LE] [page_dir_offset: u64 LE] [codecs_len: u32 LE]
+
+Codec section (version 2 only, codecs_len bytes):
+  [run_count: u32 LE], then per run, ascending from page 0:
+  [first_page: u32 LE] [codec: u8 (0 raw, 1 FSST)]
+  FSST: [symbol_count: u8] [lengths: u8 × n] [symbols: u64 LE × n]
 
 Pages (concatenated):
   page := [entry_count: u32 LE] [offsets: u32 LE × (entry_count+1)] [value bytes]
@@ -560,10 +565,18 @@ Page directory (at page_dir_offset, 20 bytes per entry):
 ```
 
 IDs within a page are contiguous, so a lookup binary-searches the page
-directory and then indexes directly: `value = data[offsets[local]..offsets[local+1]]`.
+directory and then indexes directly: `stored = data[offsets[local]..offsets[local+1]]`.
 `kind` is `0` for the single global string stream and `1` for subject packs,
 which are per-namespace (`ns_code`). Targets are **512 KiB** per page and
-**16 MiB** per pack.
+**16 MiB** per pack, measured before coding.
+
+A string pack is written as version 2: its values are FSST codes over one
+symbol table trained on the pack (at most 255 symbols of 1–8 bytes, code 255
+escaping a literal byte), so any one value decodes on its own. On BSBM 100M
+this halves the string packs (4.2 → 2.15 GB) for about 340 ns more per
+lookup. A pack whose codes would not be smaller is written as version 1, as
+are subject and triple-term packs. A reader that opens a pack by range reads
+the codec section with the header, once.
 
 Because the encoded length is `page_dir_offset + page_count * 20`, a pack can
 be sized from its 40-byte header alone — a range read, not a full fetch.
@@ -584,7 +597,8 @@ stream: scanning left to right for the longest contiguous run that fits the
 16 MiB target and whose members are either all small (≤ 64 KiB) or within a 4×
 size ratio of each other, requiring either 8 packs or a group already at half
 the target. Merging preserves input pages verbatim, rebasing their offsets —
-no dictionary value is decoded.
+no dictionary value is decoded. Each input's codec runs move with its pages,
+so a merged pack can hold several tables, and raw runs for version 1 inputs.
 
 Runs rather than suffixes, because a merge output is larger than the packs
 around it. Anchoring candidates at the newest pack means that once a merge

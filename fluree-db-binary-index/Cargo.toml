@@ -29,6 +29,7 @@ tracing.workspace = true
 
 # Index format dependencies
 zstd.workspace = true
+fsst-rs = "0.7"
 rustc-hash = "2"
 ciborium = "0.2"
 

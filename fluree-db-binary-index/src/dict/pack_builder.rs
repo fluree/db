@@ -362,7 +362,7 @@ mod tests {
             let pack = ForwardPack::from_bytes(&pack_artifact.bytes).unwrap();
             for id in pack_artifact.first_id..=pack_artifact.last_id {
                 assert!(
-                    pack.lookup(id).is_some(),
+                    pack.lookup(id).unwrap().is_some(),
                     "missing id {} in pack [{}, {}]",
                     id,
                     pack_artifact.first_id,
