@@ -1200,6 +1200,263 @@ mod tests {
         assert!(!branch.raw_groups.get(&group('b')).unwrap().hashed);
     }
 
+    /// A hashed string tree written through each path the indexer takes:
+    /// imports, incremental writes and erasures. It checks after each step
+    /// that every string it holds resolves to its id, singly and batched,
+    /// that erased ones don't, and that the listed groups describe the
+    /// hashed keys: an unlisted group holds at most the cap, and a listed
+    /// one holding any says so.
+    struct StringTree {
+        cs: std::sync::Arc<dyn ContentStore>,
+        dir: tempfile::TempDir,
+        refs: DictTreeRefs,
+        live: std::collections::BTreeMap<Vec<u8>, u64>,
+        erased: Vec<Vec<u8>>,
+        next_id: u64,
+        imports: usize,
+    }
+
+    impl StringTree {
+        async fn new() -> Self {
+            let cs: std::sync::Arc<dyn ContentStore> =
+                std::sync::Arc::new(MemoryContentStore::new());
+            let kind = ContentKind::DictBlob {
+                dict: DictKind::StringReverse,
+            };
+            let refs = DictTreeRefs {
+                branch: cs.put(kind, &DictBranch::default().encode()).await.unwrap(),
+                leaves: Vec::new(),
+            };
+            Self {
+                cs,
+                dir: tempfile::tempdir().unwrap(),
+                refs,
+                live: Default::default(),
+                erased: Vec::new(),
+                next_id: 0,
+                imports: 0,
+            }
+        }
+
+        /// The values not yet held, each with a new id, in value order.
+        fn fresh(&mut self, mut values: Vec<Vec<u8>>) -> Vec<(u64, Vec<u8>)> {
+            values.sort();
+            values.dedup();
+            values.retain(|v| !self.live.contains_key(v) && !self.erased.contains(v));
+            values
+                .into_iter()
+                .map(|v| {
+                    self.next_id += 1;
+                    (self.next_id, v)
+                })
+                .collect()
+        }
+
+        async fn import(&mut self, values: Vec<Vec<u8>>, leaf_bytes: usize) {
+            let batch = self.fresh(values);
+            if batch.is_empty() {
+                return;
+            }
+            self.imports += 1;
+            let new_terms = terms(
+                self.dir.path(),
+                &format!("strings.{}", self.imports),
+                &batch,
+            );
+            self.refs = extend_reverse_tree(
+                self.cs.as_ref(),
+                DictKind::StringReverse,
+                &self.refs,
+                &new_terms,
+                string_key,
+                leaf_bytes,
+            )
+            .await
+            .unwrap()
+            .tree_refs;
+            self.live.extend(batch.into_iter().map(|(id, v)| (v, id)));
+        }
+
+        async fn write(&mut self, values: Vec<Vec<u8>>) {
+            let batch = self.fresh(values);
+            if batch.is_empty() {
+                return;
+            }
+            let strings = batch
+                .iter()
+                .map(|(id, v)| (*id as u32, v.clone()))
+                .collect();
+            self.refs = super::super::dicts::upload_incremental_reverse_tree_async_strings(
+                self.cs.as_ref(),
+                DictKind::StringReverse,
+                &self.refs,
+                strings,
+                None,
+            )
+            .await
+            .unwrap()
+            .tree_refs;
+            self.live.extend(batch.into_iter().map(|(id, v)| (v, id)));
+        }
+
+        async fn erase(&mut self, mut values: Vec<Vec<u8>>) {
+            values.retain(|v| self.live.contains_key(v));
+            values.sort();
+            values.dedup();
+            if values.is_empty() {
+                return;
+            }
+            self.refs = super::super::dicts::remove_from_reverse_tree_async(
+                self.cs.as_ref(),
+                DictKind::StringReverse,
+                &self.refs,
+                values.clone(),
+            )
+            .await
+            .unwrap()
+            .tree_refs;
+            for v in values {
+                self.live.remove(&v);
+                self.erased.push(v);
+            }
+        }
+
+        async fn check(&self, step: &str) {
+            use fluree_db_binary_index::dict::key_scheme::DEFAULT_GROUP_HASH_CAP;
+            use fluree_db_binary_index::dict::reader::DictTreeReader;
+            let cap = usize::from(DEFAULT_GROUP_HASH_CAP);
+            let branch =
+                DictBranch::decode(&self.cs.get(&self.refs.branch).await.unwrap()).unwrap();
+            let entries = if self.refs.leaves.is_empty() {
+                Vec::new()
+            } else {
+                read_tree(self.cs.as_ref(), &self.refs).await.0
+            };
+            assert_eq!(entries.len(), self.live.len(), "{step}: entries");
+            let mut hashed = std::collections::BTreeMap::<Vec<u8>, usize>::new();
+            for (key, _) in &entries {
+                if let Some(g) = branch.key_scheme.hashed_key_group(key) {
+                    *hashed.entry(g.to_vec()).or_default() += 1;
+                }
+            }
+            for (g, count) in &hashed {
+                match branch.raw_groups.get(g) {
+                    None => assert!(*count <= cap, "{step}: unlisted group holds {count}"),
+                    Some(listed) => assert!(
+                        listed.hashed && *count <= 2 * cap,
+                        "{step}: listed group holds {count}, flagged {}",
+                        listed.hashed
+                    ),
+                }
+            }
+            let reader = DictTreeReader::from_refs(&self.cs, &self.refs, None)
+                .await
+                .unwrap();
+            for (value, id) in &self.live {
+                assert_eq!(reader.reverse_lookup(value).unwrap(), Some(*id), "{step}");
+            }
+            let values: Vec<&[u8]> = self.live.keys().map(Vec::as_slice).collect();
+            let found = reader.reverse_lookup_many(values.iter().copied()).unwrap();
+            assert!(
+                found
+                    .iter()
+                    .zip(self.live.values())
+                    .all(|(f, id)| *f == Some(*id)),
+                "{step}: batched"
+            );
+            for value in &self.erased {
+                assert_eq!(
+                    reader.reverse_lookup(value).unwrap(),
+                    None,
+                    "{step}: erased"
+                );
+            }
+        }
+    }
+
+    /// A value of `group` (48 bytes): long, keyed by hash unless the group
+    /// is listed, or of middling length, always keyed by value.
+    fn grouped(group: u8, i: u64, long: bool) -> Vec<u8> {
+        let mut v = vec![b'g'; 47];
+        v.push(b'0' + group);
+        v.extend(format!("{i:06}").bytes());
+        if long {
+            v.extend(std::iter::repeat_n(b'x', 40));
+        }
+        v
+    }
+
+    /// An import that alone takes a group past the cap lists it, and keeps
+    /// the hashed keys the tree already holds findable: in one leaf the
+    /// merge reads, and in small leaves it doesn't, past value keys of the
+    /// group that sit between the new values and the hashed range.
+    #[tokio::test]
+    async fn an_import_past_the_cap_keeps_the_hashed_keys_the_tree_holds() {
+        use fluree_db_binary_index::dict::key_scheme::DEFAULT_GROUP_HASH_CAP;
+        let cap = u64::from(DEFAULT_GROUP_HASH_CAP);
+        for leaf_bytes in [1 << 20, LEAF] {
+            let mut tree = StringTree::new().await;
+            let mut first: Vec<Vec<u8>> = (0..200).map(key).collect();
+            first.extend((0..cap - 12).map(|i| grouped(0, i, true)));
+            first.extend((0..40).map(|i| grouped(0, 500 + i, false)));
+            tree.import(first, leaf_bytes).await;
+            tree.check("first import").await;
+            tree.import(
+                (100..100 + cap + 8).map(|i| grouped(0, i, true)).collect(),
+                leaf_bytes,
+            )
+            .await;
+            tree.check(&format!("second import, {leaf_bytes}-byte leaves"))
+                .await;
+        }
+    }
+
+    /// A seeded run of imports, incremental writes and erasures over small
+    /// leaves, mixing long and middling values of a few groups with short
+    /// ones, checked after every step.
+    #[tokio::test]
+    async fn a_seeded_mix_of_writes_keeps_every_string_findable() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move |n: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % n
+        };
+        let mut tree = StringTree::new().await;
+        let mut serial = 0u64;
+        for step in 0..60 {
+            let mut values = Vec::new();
+            for _ in 0..=next(30) {
+                serial += 1;
+                values.push(match next(4) {
+                    0 => key(serial as u32),
+                    1 => grouped(next(3) as u8, serial, false),
+                    _ => grouped(next(3) as u8, serial, true),
+                });
+            }
+            let what = match next(3) {
+                0 => {
+                    tree.import(values, LEAF).await;
+                    "import"
+                }
+                1 => {
+                    tree.write(values).await;
+                    "write"
+                }
+                _ => {
+                    let held: Vec<Vec<u8>> = tree.live.keys().cloned().collect();
+                    let gone = (0..=next(12))
+                        .filter_map(|_| held.get(next(held.len().max(1) as u64) as usize).cloned())
+                        .collect();
+                    tree.erase(gone).await;
+                    "erase"
+                }
+            };
+            tree.check(&format!("step {step} ({what})")).await;
+        }
+    }
+
     #[tokio::test]
     async fn a_term_the_tree_already_holds_is_refused() {
         let cs = MemoryContentStore::new();
