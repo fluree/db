@@ -423,8 +423,9 @@ where
 /// Build the subject reverse tree by draining `next_entry`. Entries must arrive
 /// in reverse-tree key order (`(ns_code, suffix)`). Key = `[ns_code BE][suffix]`.
 ///
-/// Leaves are front-coded, cut where a `DLR1` leaf of the same entries would
-/// reach the target size.
+/// Leaves are written in the subject tree's format
+/// (`LeafFormat::for_dict`), cut where a `DLR1` leaf of the same entries
+/// would reach the target size.
 async fn build_subject_reverse_tree<F>(
     content_store: &dyn ContentStore,
     fwd: &[u8],
@@ -435,7 +436,7 @@ where
 {
     use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
     use fluree_db_binary_index::dict::builder;
-    use fluree_db_binary_index::dict::reverse_leaf::FrontCodedLeafWriter;
+    use fluree_db_binary_index::dict::reverse_leaf::LeafFormat;
     use fluree_db_core::{ContentKind, DictKind};
 
     let kind = ContentKind::DictBlob {
@@ -444,7 +445,7 @@ where
     let mut leaf_cids: Vec<ContentId> = Vec::new();
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
 
-    let mut writer = FrontCodedLeafWriter::new(true);
+    let mut writer = LeafFormat::for_dict(DictKind::SubjectReverse).writer();
     let mut chunk_bytes: usize = 0;
     let mut first_key: Option<Vec<u8>> = None;
     let mut key: Vec<u8> = Vec::new();

@@ -108,6 +108,57 @@ impl LeafFormat {
             }
         }
     }
+
+    /// A writer that streams sorted entries into leaves of this format.
+    pub fn writer(self) -> LeafWriter {
+        LeafWriter(match self {
+            Self::Plain => LeafWriterInner::Plain(Vec::new()),
+            Self::FrontCoded { ns_relative_ids } => {
+                LeafWriterInner::FrontCoded(FrontCodedLeafWriter::new(ns_relative_ids))
+            }
+        })
+    }
+}
+
+/// Streams sorted entries into leaves of one [`LeafFormat`], one leaf per
+/// [`Self::finish`].
+pub struct LeafWriter(LeafWriterInner);
+
+enum LeafWriterInner {
+    Plain(Vec<ReverseEntry>),
+    FrontCoded(FrontCodedLeafWriter),
+}
+
+impl LeafWriter {
+    pub fn entry_count(&self) -> u32 {
+        match &self.0 {
+            LeafWriterInner::Plain(entries) => entries.len() as u32,
+            LeafWriterInner::FrontCoded(writer) => writer.entry_count(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entry_count() == 0
+    }
+
+    /// Append an entry. Keys must arrive strictly ascending.
+    pub fn push(&mut self, key: &[u8], id: u64) {
+        match &mut self.0 {
+            LeafWriterInner::Plain(entries) => entries.push(ReverseEntry {
+                key: key.to_vec(),
+                id,
+            }),
+            LeafWriterInner::FrontCoded(writer) => writer.push(key, id),
+        }
+    }
+
+    /// The leaf's bytes. The writer is left empty, ready for the next leaf.
+    pub fn finish(&mut self) -> Vec<u8> {
+        match &mut self.0 {
+            LeafWriterInner::Plain(entries) => encode_reverse_leaf(&std::mem::take(entries)),
+            LeafWriterInner::FrontCoded(writer) => writer.finish(),
+        }
+    }
 }
 
 /// The key's namespace code in an id's top 16 bits; 0 for a key too short
@@ -1106,27 +1157,41 @@ mod tests {
         }
     }
 
-    /// One writer cuts consecutive leaves: `finish` leaves nothing of the
-    /// previous leaf behind, so a leaf's first key is stored whole.
+    /// One writer cuts consecutive leaves of its format: `finish` leaves
+    /// nothing of the previous leaf behind, so each leaf is the one
+    /// [`LeafFormat::encode`] writes for its entries alone (a front-coded
+    /// leaf's first key stored whole).
     #[test]
-    fn front_coded_writer_starts_each_leaf_fresh() {
+    fn a_leaf_writer_starts_each_leaf_fresh() {
         let entries = subject_like_entries(100);
         let (a, b) = entries.split_at(37);
-        let mut writer = FrontCodedLeafWriter::new(true);
-        for e in a {
-            writer.push(&e.key, e.id);
-        }
-        let first = writer.finish();
-        assert!(writer.is_empty());
-        for e in b {
-            writer.push(&e.key, e.id);
-        }
-        let second = writer.finish();
-        for (blob, part) in [(first, a), (second, b)] {
-            let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
-            let got: Vec<_> = leaf.iter().map(|(k, id)| (k.into_owned(), id)).collect();
-            let want: Vec<_> = part.iter().map(|e| (e.key.clone(), e.id)).collect();
-            assert_eq!(got, want);
+        for format in [
+            LeafFormat::Plain,
+            LeafFormat::FrontCoded {
+                ns_relative_ids: true,
+            },
+            LeafFormat::FrontCoded {
+                ns_relative_ids: false,
+            },
+        ] {
+            let mut writer = format.writer();
+            for e in a {
+                writer.push(&e.key, e.id);
+            }
+            assert_eq!(writer.entry_count(), a.len() as u32);
+            let first = writer.finish();
+            assert!(writer.is_empty());
+            for e in b {
+                writer.push(&e.key, e.id);
+            }
+            let second = writer.finish();
+            for (blob, part) in [(first, a), (second, b)] {
+                assert_eq!(blob, format.encode(part), "{format:?}");
+                let leaf = ReverseLeaf::from_bytes(&blob).unwrap();
+                let got: Vec<_> = leaf.iter().map(|(k, id)| (k.into_owned(), id)).collect();
+                let want: Vec<_> = part.iter().map(|e| (e.key.clone(), e.id)).collect();
+                assert_eq!(got, want, "{format:?}");
+            }
         }
     }
 
