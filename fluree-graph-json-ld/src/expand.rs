@@ -374,7 +374,7 @@ fn parse_node_value(
 
             // Check for @value
             if map.contains_key("@value") || map.contains_key("value") {
-                return parse_value_object(map, entry, context, strict);
+                return parse_value_object(map, entry, context, path, strict);
             }
 
             // Check for @container: @language
@@ -472,6 +472,7 @@ fn parse_value_object(
     map: &Map<String, JsonValue>,
     entry: Option<&ContextEntry>,
     context: &ParsedContext,
+    path: &Path<'_>,
     strict: bool,
 ) -> Result<Vec<JsonValue>> {
     let val = map.get("@value").or_else(|| map.get("value")).unwrap();
@@ -506,6 +507,18 @@ fn parse_value_object(
             _ => None,
         }),
     };
+    // A value object typed `@id` gets its own message below, which names
+    // its fix: a string IRI.
+    if (val.is_array() || val.is_object())
+        && type_iri.as_deref() != Some("@id")
+        && !holds_structured_value(type_iri.as_deref(), val)
+    {
+        return Err(JsonLdError::InvalidValueObject {
+            at: path.to_json(),
+            reason: "a value object whose @value is an array or a map needs \"@type\": \
+                     \"@json\" (or \"@vector\" for an array)",
+        });
+    }
     let lang = match type_iri {
         Some(_) => None,
         None => explicit_language
@@ -518,8 +531,8 @@ fn parse_value_object(
 
     if type_iri.as_deref() == Some("@id") {
         let Some(iri) = val.as_str() else {
-            return Err(JsonLdError::InvalidKeywordValue {
-                keyword: "@value",
+            return Err(JsonLdError::InvalidValueObject {
+                at: path.to_json(),
                 reason: "a value object typed @id names an IRI, so its @value must be a string",
             });
         };
@@ -535,7 +548,34 @@ fn parse_value_object(
         }
     }
 
+    // `{"@value": …, "@annotation": {…}}`: the annotation describes a
+    // reifier of the triple this value completes, and expands as a node does.
+    // `@edge` is a transaction's alias for it, kept under its own name as it
+    // is on a node reference.
+    for key in ["@annotation", "@edge"] {
+        if let Some(annotation) = map.get(key) {
+            let expanded = match expand_node_internal(annotation, context, &path.key(key), strict)?
+            {
+                JsonValue::Array(nodes) => nodes,
+                node => vec![node],
+            };
+            obj.insert(key.to_string(), JsonValue::Array(expanded));
+        }
+    }
+
     Ok(vec![JsonValue::Object(obj)])
+}
+
+/// Whether a value object typed `type_iri` may hold `val`, an array or a map:
+/// a JSON literal holds either, a vector only an array. Refused here, a map
+/// under a vector type fails every reader alike; a bulk import reaches no
+/// vector parser to refuse it.
+fn holds_structured_value(type_iri: Option<&str>, val: &JsonValue) -> bool {
+    match type_iri {
+        Some("@json" | fluree_vocab::rdf::JSON) => true,
+        Some("@vector" | fluree_vocab::fluree::EMBEDDING_VECTOR) => val.is_array(),
+        _ => false,
+    }
 }
 
 /// Parse @type values and return expanded types with potentially updated context
@@ -667,8 +707,7 @@ fn guard_depth(path: &Path<'_>) -> Result<()> {
 
 /// Where expansion is in the document: the array indexes and property keys
 /// from the root. Each step borrows its parent, so descending costs no
-/// allocation; the steps are collected only to report a
-/// [`JsonLdError::NestedSequence`].
+/// allocation; the steps are collected only to report an error.
 struct Path<'a> {
     depth: usize,
     last: Option<(&'a Path<'a>, Step<'a>)>,
@@ -715,6 +754,11 @@ impl<'a> Path<'a> {
         }
         steps.reverse();
         steps
+    }
+
+    /// The steps from the root as a JSON array's text, for a message.
+    fn to_json(&self) -> String {
+        JsonValue::Array(self.to_vec()).to_string()
     }
 }
 
@@ -1944,5 +1988,87 @@ mod tests {
                 json!([{"@value": document, "@type": "@json"}])
             );
         }
+    }
+
+    /// An array or map `@value` needs a `@json` or `@vector` type, its own or
+    /// its term's: without one it has no literal to stand for.
+    #[test]
+    fn structured_value_object_needs_a_json_or_vector_type() {
+        let p = EX.to_owned() + "p";
+        for (term, value) in [
+            (json!(p), json!({"@value": [0.5]})),
+            (json!(p), json!({"@value": {"a": 1}})),
+            (json!(p), json!({"@value": [0.5], "@type": XSD_INTEGER})),
+            (
+                json!({"@id": p, "@type": XSD_INTEGER}),
+                json!({"@value": [0.5]}),
+            ),
+            // A vector holds an array only.
+            (json!(p), json!({"@value": {"a": 1}, "@type": "@vector"})),
+            (
+                json!(p),
+                json!({"@value": {"a": 1}, "@type": fluree_vocab::fluree::EMBEDDING_VECTOR}),
+            ),
+            (
+                json!({"@id": p, "@type": "@vector"}),
+                json!({"@value": {"a": 1}}),
+            ),
+        ] {
+            let ctx = json!({"p": term});
+            let err = crate::expand(&json!({"@context": ctx, "p": value}))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(r#""@type": "@json""#), "{ctx} {value}: {err}");
+        }
+
+        let ctx = json!({"f": "https://ns.flur.ee/db#", "p": p});
+        for (value, ty) in [
+            (json!([0.5]), "@vector"),
+            (json!([0.5]), "f:embeddingVector"),
+            (json!([0.5]), "@json"),
+            (json!({"a": 1}), "@json"),
+        ] {
+            let expanded =
+                values_of_p(json!({"@context": ctx, "p": {"@value": value, "@type": ty}}));
+            assert_eq!(expanded[0]["@value"], value, "{ty}");
+        }
+
+        // Typed `@id`, an array or a map is told the IRI must be a string.
+        for value in [json!(["ex:a"]), json!({"@id": "ex:a"})] {
+            let doc = json!({"@context": {"p": p}, "p": {"@value": value, "@type": "@id"}});
+            let err = crate::expand(&doc).unwrap_err().to_string();
+            assert!(err.contains("must be a string"), "{value}: {err}");
+        }
+
+        let vector = json!({"p": {"@id": p, "@type": "@vector"}});
+        assert_eq!(
+            values_of_p(json!({"@context": vector, "p": {"@value": [0.5]}}))[0]["@value"],
+            json!([0.5])
+        );
+    }
+
+    /// A value object the expander refuses is named by where it is: the keys
+    /// and indexes from the root, so a refusal in one node of many, as in a
+    /// bulk import's chunk, points at that node.
+    #[test]
+    fn a_refused_value_object_names_where_it_is() {
+        let refused = |doc: JsonValue| match crate::expand(&doc) {
+            Err(JsonLdError::InvalidValueObject { at, .. }) => at,
+            other => panic!("{doc}: {other:?}"),
+        };
+        let structured = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@graph": [
+                {"@id": "ex:a", "ex:p": 1},
+                {"@id": "ex:b", "ex:p": {"@value": [1, 2]}}
+            ]
+        });
+        assert_eq!(refused(structured), r#"["@graph",1,"ex:p"]"#);
+        let typed_id = json!({
+            "@context": {"ex": "http://example.org/"},
+            "@id": "ex:s",
+            "ex:q": ["ex:o", {"@value": 3, "@type": "@id"}]
+        });
+        assert_eq!(refused(typed_id), r#"["ex:q",1]"#);
     }
 }

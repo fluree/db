@@ -142,26 +142,85 @@ fn detect_container_memory_bytes() -> Option<usize> {
 }
 use std::sync::{Arc, Mutex};
 
-/// Key for the per-query constant→`s_id` memo.
+/// Key for the per-query constant→`s_id` memo ([`ConstSidMemo`]).
 ///
 /// A FILTER like `<iri> != ?var` (or `sid != ?var`) resolves the constant side
 /// to an internal subject id via a dictionary reverse-lookup. That result is
 /// invariant across rows, so it is memoized once per query rather than redone
 /// per row (a dominant cost on selective-filter workloads such as BSBM Explore).
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub enum ConstSidKey {
-    /// A constant full IRI.
-    Iri(Box<str>),
+///
+/// Every key is the constant itself, never where its expression lives. A
+/// correlated UNION, MINUS or OPTIONAL builds an operator tree per input row,
+/// each with its own copy of the FILTER expression, and drops it before the
+/// next; an address-based key could then read back a constant freed with an
+/// earlier tree (#2385). Borrowed, so a lookup allocates nothing.
+#[derive(Clone, Copy, Debug)]
+pub enum ConstSidKey<'a> {
+    /// An `IRI("…")` operand (how SPARQL and JSON-LD lower an IRI constant),
+    /// by the string it names, read off the expression before evaluating it.
+    /// Kept apart from [`Self::Iri`]: its value is whatever the operand
+    /// evaluates to (a SID when the snapshot knows the namespace), not always a
+    /// lookup by full IRI.
+    IriLiteral(&'a str),
+    /// A constant full IRI, as evaluated.
+    Iri(&'a str),
     /// A constant SID: namespace code + name.
-    Sid(u16, Box<str>),
-    /// Identity (address) of a variable-free operand expression, so its s_id can
-    /// be resolved once and reused without re-evaluating/re-encoding it per row.
-    ///
-    /// Safe as a key only because this memo lives exactly as long as the query
-    /// (and the expression tree it points into): the pointer is stable across
-    /// rows and the memo is dropped before any expression could be freed, so a
-    /// stale/reused address can never be observed.
-    ExprPtr(usize),
+    Sid(u16, &'a str),
+}
+
+/// The per-query constant→`s_id` memo; see [`ConstSidKey`].
+#[derive(Debug, Default)]
+pub struct ConstSidMemo {
+    iri_literals: FxHashMap<Box<str>, Option<u64>>,
+    iris: FxHashMap<Box<str>, Option<u64>>,
+    sids: FxHashMap<u16, FxHashMap<Box<str>, Option<u64>>>,
+}
+
+impl ConstSidMemo {
+    /// The memoized `s_id` for `key`: `Some(None)` when the constant was
+    /// resolved and isn't an indexed subject, `None` when it isn't memoized.
+    pub fn get(&self, key: ConstSidKey<'_>) -> Option<Option<u64>> {
+        match key {
+            ConstSidKey::IriLiteral(iri) => self.iri_literals.get(iri),
+            ConstSidKey::Iri(iri) => self.iris.get(iri),
+            ConstSidKey::Sid(ns, name) => self.sids.get(&ns).and_then(|names| names.get(name)),
+        }
+        .copied()
+    }
+
+    pub fn insert(&mut self, key: ConstSidKey<'_>, s_id: Option<u64>) {
+        match key {
+            ConstSidKey::IriLiteral(iri) => self.iri_literals.insert(iri.into(), s_id),
+            ConstSidKey::Iri(iri) => self.iris.insert(iri.into(), s_id),
+            ConstSidKey::Sid(ns, name) => {
+                self.sids.entry(ns).or_default().insert(name.into(), s_id)
+            }
+        };
+    }
+
+    /// The `s_id` memoized in `cache` for `key`, or on a miss the one
+    /// `resolve` returns, memoized before it's handed back. The lock is
+    /// released while `resolve` runs, so a resolver that evaluates an
+    /// expression or reads the dictionary never holds it. An error is
+    /// returned as is and memoizes nothing.
+    pub fn get_or_resolve(
+        cache: &Mutex<Self>,
+        key: ConstSidKey<'_>,
+        resolve: impl FnOnce() -> Result<Option<u64>, QueryError>,
+    ) -> Result<Option<u64>, QueryError> {
+        let lock = || {
+            cache
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        let cached = lock().get(key);
+        if let Some(s_id) = cached {
+            return Ok(s_id);
+        }
+        let s_id = resolve()?;
+        lock().insert(key, s_id);
+        Ok(s_id)
+    }
 }
 
 /// Per-query memo for constant subject-id resolution (see [`ConstSidKey`]).
@@ -169,7 +228,7 @@ pub enum ConstSidKey {
 /// Owned by the [`ExecutionContext`], which holds exactly one store/snapshot, so
 /// the memo is correctly scoped — no cross-ledger aliasing. `Arc<Mutex<…>>` so
 /// derived per-graph contexts can share it and the context stays `Send + Sync`.
-pub type ConstSidCache = Arc<Mutex<FxHashMap<ConstSidKey, Option<u64>>>>;
+pub type ConstSidCache = Arc<Mutex<ConstSidMemo>>;
 
 /// Per-query memo: binding-level `lang_id` → resolved language tag. Shared
 /// across per-graph context derivations like [`ConstSidCache`], so a
@@ -291,6 +350,17 @@ pub struct ExecutionContext<'a> {
     pub tracker: Tracker,
     /// Optional cooperative cancellation handle.
     pub cancellation: QueryCancellation,
+    /// The query's slot for a read failure met while building or comparing
+    /// a hash-table key, which couldn't be returned. Every graph view the query keys
+    /// through records there ([`Self::graph_view`]), the contexts derived
+    /// from this one share it, and [`Self::checkpoint`] fails the query once
+    /// it holds an error.
+    pub key_read_errors: Arc<fluree_db_binary_index::KeyReadErrors>,
+    /// The vector shards this query's key comparisons have pinned. Every
+    /// graph view the query keys through pins there, and the contexts
+    /// derived from this one share it, so the query reads each shard at most
+    /// once and holds none once it ends.
+    pub vector_shard_pins: Arc<fluree_db_binary_index::QueryShardPins>,
     /// When true, bind evaluation errors are treated as query errors.
     pub strict_bind_errors: bool,
     /// When true, scan operators bypass the variable-predicate filter
@@ -567,6 +637,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -634,6 +706,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -705,6 +779,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -765,6 +841,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -824,6 +902,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -885,6 +965,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: Tracker::disabled(),
             cancellation: QueryCancellation::disabled(),
+            key_read_errors: Arc::default(),
+            vector_shard_pins: Arc::default(),
             strict_bind_errors: false,
             include_system_facts: false,
             cypher_vocab: None,
@@ -1012,6 +1094,19 @@ impl<'a> ExecutionContext<'a> {
         }
     }
 
+    /// Return the read failure recorded while building or comparing a
+    /// hash-table key ([`Self::key_read_errors`]), if any. Such a key or
+    /// comparison stood in for the value, so the rows built since are not an
+    /// answer: an operator that keys rows checks this after each batch it
+    /// keys, before it emits.
+    #[inline]
+    pub fn check_key_reads(&self) -> Result<(), QueryError> {
+        match self.key_read_errors.first() {
+            Some(err) => Err(QueryError::from_io_ref("reading a key's value", err)),
+            None => Ok(()),
+        }
+    }
+
     /// Record `bytes` of retained query memory into the query-scoped counter shared by
     /// this context and every per-graph context derived from it (the derived contexts
     /// clone the same cancellation handle). Called where a buffering post-scan operator
@@ -1039,8 +1134,9 @@ impl<'a> ExecutionContext<'a> {
 
     /// Cooperative checkpoint: the single guard the buffering post-scan operators
     /// (hash-join build, GROUP BY fold, fused dim-map build) poll at batch granularity.
-    /// Aborts if the query was cancelled/timed out, or if the recorded retained memory
-    /// has crossed the budget.
+    /// Aborts if the query was cancelled/timed out, if building or comparing a key
+    /// failed to read ([`check_key_reads`](Self::check_key_reads)), or if the
+    /// recorded retained memory has crossed the budget.
     ///
     /// Cancellation is checked first, so an external timeout or RSS-watchdog signal
     /// maps to [`QueryError::Cancelled`] (408 at the API boundary) while an
@@ -1051,6 +1147,7 @@ impl<'a> ExecutionContext<'a> {
     #[inline]
     pub fn checkpoint(&self) -> Result<(), QueryError> {
         self.check_cancelled()?;
+        self.check_key_reads()?;
         let budget = self
             .cancellation
             .memory_limit()
@@ -1486,7 +1583,9 @@ impl<'a> ExecutionContext<'a> {
         let view = store
             .graph_with_novelty(self.binary_g_id, self.dict_novelty.clone())
             .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
-            .with_tracker(self.tracker.clone());
+            .with_tracker(self.tracker.clone())
+            .with_key_read_errors(Arc::clone(&self.key_read_errors))
+            .with_shard_pins(Arc::clone(&self.vector_shard_pins));
         Some(view)
     }
 
@@ -1510,9 +1609,14 @@ impl<'a> ExecutionContext<'a> {
             return None;
         }
         let store = self.binary_store.as_ref()?;
+        // Keys built through it record the reads they can't return in the
+        // query's slot, which the operators that key rows check, and pin the
+        // shards their comparisons read in the query's pins.
         let terms = TermView::new(Arc::clone(store), self.dict_novelty.clone())
             .with_namespace_codes_fallback(self.namespace_codes_fallback.clone())
-            .with_tracker(self.tracker.clone());
+            .with_tracker(self.tracker.clone())
+            .with_key_read_errors(Arc::clone(&self.key_read_errors))
+            .with_shard_pins(Arc::clone(&self.vector_shard_pins));
         Some(terms)
     }
 
@@ -1804,6 +1908,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph,
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
+            key_read_errors: Arc::clone(&self.key_read_errors),
+            vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
@@ -1874,6 +1980,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
+            key_read_errors: Arc::clone(&self.key_read_errors),
+            vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),
@@ -1945,6 +2053,8 @@ impl<'a> ExecutionContext<'a> {
             active_graph: ActiveGraph::Default,
             tracker: self.tracker.clone(),
             cancellation: self.cancellation.clone(),
+            key_read_errors: Arc::clone(&self.key_read_errors),
+            vector_shard_pins: Arc::clone(&self.vector_shard_pins),
             strict_bind_errors: self.strict_bind_errors,
             include_system_facts: self.include_system_facts,
             cypher_vocab: self.cypher_vocab.clone(),

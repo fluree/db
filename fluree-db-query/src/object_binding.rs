@@ -777,6 +777,19 @@ pub(crate) fn same_term(
             if let Some(same) = gv.and_then(|gv| encoded_against_decoded_subject(a, b, gv)) {
                 return Ok(same);
             }
+            // Vectors compare by value through their keys: a stored one reads
+            // its arena slice in place rather than decoding.
+            if crate::group_aggregate::is_vector_binding(a)
+                || crate::group_aggregate::is_vector_binding(b)
+            {
+                use crate::group_aggregate::VectorKey;
+                return match (VectorKey::of_binding(a, gv)?, VectorKey::of_binding(b, gv)?) {
+                    (Some(x), Some(y)) => x
+                        .same_value(&y)
+                        .map_err(|err| crate::error::QueryError::from_io("vector comparison", err)),
+                    _ => Ok(false),
+                };
+            }
             let (dicts, gv) = EqualityNorm::parts(norm);
             normalize_for_key_cow(a, dicts, gv)? == normalize_for_key_cow(b, dicts, gv)?
         }
@@ -839,8 +852,7 @@ pub(crate) fn same_term_in(
 
 /// The answer [`same_term`] gives without canonicalizing: `true` for equal
 /// bindings, `false` for two of one form (other than arena-backed literals),
-/// `None` for a
-/// pair of forms that must be canonicalized to compare.
+/// `None` for a pair of forms that must be canonicalized to compare.
 #[inline]
 fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
     if a == b {
@@ -854,7 +866,9 @@ fn one_form_answer(a: &Binding, b: &Binding) -> Option<bool> {
 
 /// True if this is an encoded literal whose key is a handle into a per-graph,
 /// per-predicate arena (a big number or a vector): the handle names a value
-/// only within the graph that bound it.
+/// only within the graph and predicate that bound it, and is not the value's
+/// only handle there (the vector arena does not deduplicate), so equality
+/// surfaces key it by decoded value.
 #[inline]
 pub(crate) fn is_arena_encoded(binding: &Binding) -> bool {
     matches!(

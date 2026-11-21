@@ -23,6 +23,7 @@
 //! - Cypher writes `Binding::Poisoned`, its null: any later pattern that uses
 //!   the variable matches nothing.
 
+use crate::binary_scan::ResolvedIds;
 use crate::binding::{Batch, Binding, UnmatchedOptional};
 use crate::context::ExecutionContext;
 use crate::error::{QueryError, Result};
@@ -621,8 +622,9 @@ impl PatternOptionalBuilder {
         required_batch: &Batch,
         row: usize,
         ctx: &ExecutionContext<'_>,
-    ) -> Result<Option<TriplePattern>> {
+    ) -> Result<Option<(TriplePattern, Option<ResolvedIds>)>> {
         let mut pattern = self.pattern.clone();
+        let mut resolved = None;
         // Built only when a row carries an encoded value: decoded rows (the
         // novelty lane) never need it.
         let mut view: Option<Option<fluree_db_binary_index::TermView>> = None;
@@ -643,13 +645,13 @@ impl PatternOptionalBuilder {
             } else {
                 None
             };
-            if substitute_binding(&mut pattern, instr.position, binding, view)?
+            if substitute_binding(&mut pattern, instr.position, binding, view, &mut resolved)?
                 == Substitution::Unmatchable
             {
                 return Ok(None);
             }
         }
-        Ok(Some(pattern))
+        Ok(Some((pattern, resolved)))
     }
 }
 
@@ -801,17 +803,21 @@ impl OptionalBuilder for PatternOptionalBuilder {
         }
 
         // Substitute bindings into pattern and create scan operator
-        let Some(bound_pattern) = self.substitute_pattern(required_batch, row, ctx)? else {
+        let Some((bound_pattern, resolved)) = self.substitute_pattern(required_batch, row, ctx)?
+        else {
             return Ok(None);
         };
         Ok(Some(Box::new(
-            crate::dataset_operator::DatasetOperator::scan(
-                bound_pattern,
-                None,
-                Vec::new(),
-                crate::binary_scan::EmitMask::ALL,
-                None,
-                self.planning.mode(),
+            crate::dataset_operator::DatasetOperator::from_scan(
+                crate::dataset_operator::ScanDatasetBuilder::new(
+                    bound_pattern,
+                    None,
+                    Vec::new(),
+                    crate::binary_scan::EmitMask::ALL,
+                    None,
+                    self.planning.mode(),
+                )
+                .with_resolved_ids(resolved),
             ),
         )))
     }

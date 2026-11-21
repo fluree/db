@@ -71,7 +71,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
     } else {
         PackHeader::commits_only(Some(missing_commits.len() as u32), true)
     };
-    encode_header_frame(&header, &mut out);
+    encode_header_frame(&header, &mut out).unwrap();
 
     let mut buf = Vec::new();
     let mut txn_cids_sent = HashSet::new();
@@ -80,7 +80,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
         let raw_bytes = content_store.get(commit_cid).await.expect("read commit");
 
         buf.clear();
-        encode_data_frame(commit_cid, &raw_bytes, &mut buf);
+        encode_data_frame(commit_cid, &raw_bytes, &mut buf).unwrap();
         out.extend_from_slice(&buf);
 
         // Decode envelope to find txn blob CID.
@@ -93,7 +93,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
                     if txn_cids_sent.insert(txn_cid.clone()) {
                         let txn_bytes = content_store.get(txn_cid).await.expect("read txn blob");
                         buf.clear();
-                        encode_data_frame(txn_cid, &txn_bytes, &mut buf);
+                        encode_data_frame(txn_cid, &txn_bytes, &mut buf).unwrap();
                         out.extend_from_slice(&buf);
                     }
                 }
@@ -110,7 +110,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
             "root_id": index_root_id.to_string(),
             "artifact_count": artifacts.len(),
         });
-        encode_manifest_frame(&manifest, &mut buf);
+        encode_manifest_frame(&manifest, &mut buf).unwrap();
         out.extend_from_slice(&buf);
 
         for artifact_cid in artifacts {
@@ -119,7 +119,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
                 .await
                 .expect("read artifact");
             buf.clear();
-            encode_data_frame(artifact_cid, &artifact_bytes, &mut buf);
+            encode_data_frame(artifact_cid, &artifact_bytes, &mut buf).unwrap();
             out.extend_from_slice(&buf);
         }
     }
@@ -136,7 +136,7 @@ async fn export_ledger_to_bytes(fluree: &fluree_db_api::Fluree, ledger_id: &str)
         "index_head_id": ns_record.index_head_id.as_ref().map(ToString::to_string),
         "index_t": ns_record.index_t,
     });
-    encode_manifest_frame(&ns_manifest, &mut buf);
+    encode_manifest_frame(&ns_manifest, &mut buf).unwrap();
     out.extend_from_slice(&buf);
 
     // End frame.
@@ -1014,4 +1014,88 @@ async fn flpack_stream_structure_is_valid() {
         Some("End"),
         "last frame should be End"
     );
+}
+
+/// What `archive_ledger_to_path` leaves in `dir`: every entry's file name.
+fn dir_entries(dir: &std::path::Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .expect("read dir")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+/// `archive_ledger_to_path` only ever leaves a finished archive under the
+/// name asked for: a failed archive writes nothing there and keeps a file
+/// that was already there, a finished one replaces it, and neither leaves its
+/// `.partial` file behind.
+#[tokio::test]
+async fn archive_to_path_lands_only_a_finished_archive() {
+    let src_dir = tempfile::TempDir::new().expect("src tempdir");
+    let out_dir = tempfile::TempDir::new().expect("out tempdir");
+    let ledger = "flpack-test/to-path:main";
+
+    let fluree = FlureeBuilder::file(src_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build");
+    let genesis = fluree_db_core::LedgerSnapshot::genesis(ledger);
+    let state = fluree_db_api::LedgerState::new(genesis, fluree_db_api::Novelty::new(0));
+    let insert =
+        json!({ "@context": {"ex": "http://example.org/ns/"}, "@id": "ex:a", "ex:v": "1" });
+    fluree.insert(state, &insert).await.expect("insert");
+
+    // A failed archive to a fresh path leaves nothing at all.
+    let fresh = out_dir.path().join("fresh.flpack");
+    assert!(fluree
+        .archive_ledger_to_path("flpack-test/missing:main", true, &fresh)
+        .await
+        .is_err());
+    assert_eq!(dir_entries(out_dir.path()), Vec::<String>::new());
+
+    // A failed archive over an existing file keeps it byte for byte.
+    let existing = out_dir.path().join("existing.flpack");
+    std::fs::write(&existing, b"an earlier archive").expect("seed");
+    assert!(fluree
+        .archive_ledger_to_path("flpack-test/missing:main", true, &existing)
+        .await
+        .is_err());
+    assert_eq!(
+        std::fs::read(&existing).expect("read"),
+        b"an earlier archive"
+    );
+    assert_eq!(dir_entries(out_dir.path()), vec!["existing.flpack"]);
+
+    // A finished archive replaces it with the same bytes `archive_ledger`
+    // streams, and restores.
+    let stats = fluree
+        .archive_ledger_to_path(ledger, true, &existing)
+        .await
+        .expect("archive to path");
+    assert!(stats.commits_sent >= 1);
+    assert_eq!(dir_entries(out_dir.path()), vec!["existing.flpack"]);
+    let mut streamed: Vec<u8> = Vec::new();
+    fluree
+        .archive_ledger(ledger, true, &mut streamed)
+        .await
+        .expect("archive to bytes");
+    let written = std::fs::read(&existing).expect("read archive");
+    assert_eq!(written, streamed);
+
+    let dst_dir = tempfile::TempDir::new().expect("dst tempdir");
+    let dst = FlureeBuilder::file(dst_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build destination");
+    let mut reader = std::io::Cursor::new(written);
+    let restored = dst
+        .restore_ledger("flpack-test/to-path-restored:main", &mut reader)
+        .await
+        .expect("restore");
+    assert_eq!(restored.commit_t, 1);
 }

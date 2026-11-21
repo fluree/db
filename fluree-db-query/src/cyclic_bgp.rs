@@ -26,7 +26,6 @@ use fluree_db_binary_index::format::column_block::ColumnId;
 use fluree_db_binary_index::format::run_record::RunSortOrder;
 use fluree_db_binary_index::{BinaryGraphView, ColumnProjection};
 use fluree_db_core::o_type::{DecodeKind, OType};
-use fluree_db_core::value_id::ObjKind;
 use fluree_db_core::{GraphId, PropertyStatData, StatsView};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{HashSet, VecDeque};
@@ -239,6 +238,15 @@ pub(crate) fn analyze_cyclic_bgp(
     })
 }
 
+/// The bail reason for an object row [`EncObj::encode`] cannot carry.
+fn object_bail_reason(o_type: u16) -> &'static str {
+    if OType::from_u16(o_type).o_key_is_globally_identifying() {
+        "unsupported-object-binding"
+    } else {
+        "arena-literal-object"
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct RawEdgeRow {
     subject: u64,
@@ -249,8 +257,11 @@ struct RawEdgeRow {
 
 /// Join identity of an encoded object value, mirroring the term equality the
 /// fallback operator tree computes for the same rows: refs compare by s_id,
-/// blank nodes by handle, literals by `(o_type, o_key)` with `p_id`
-/// participating only for NUM_BIG (per-predicate arena).
+/// blank nodes by handle, literals by `(o_type, o_key)`. An arena-backed
+/// literal (a big number or a vector) never gets one: its `o_key` is a
+/// per-predicate handle, and the vector arena does not deduplicate, so the
+/// pair is not its identity (see [`OType::o_key_is_globally_identifying`]);
+/// such rows decline the operator to the fallback, which compares by value.
 ///
 /// Keying literals on `o_type` matches `Binding` equality, in two layers:
 ///
@@ -279,11 +290,7 @@ struct RawEdgeRow {
 enum EncIdentity {
     Ref(u64),
     Blank(u64),
-    Lit {
-        o_type: u16,
-        o_key: u64,
-        num_big_p_id: u32,
-    },
+    Lit { o_type: u16, o_key: u64 },
 }
 
 /// Copy-able encoded object for the cyclic join data plane. Hash/Eq/Ord use
@@ -346,8 +353,18 @@ impl EncObj {
     /// materializer still decides which non-string o_types are join-safe, so
     /// the decline set (booleans, `xsd:int`/`xsd:short`/…, the minor
     /// temporals, geo/spatial) cannot drift from the scan path's.
-    fn encode(o_type: u16, o_key: u64, p_id: u32) -> Option<Self> {
+    /// `predicate_keyed`: every edge binding this object reads one predicate
+    /// of one graph whose arenas hold each value under one handle, so an
+    /// o_type whose key identifies its term within a predicate
+    /// ([`OType::o_key_is_predicate_identifying`], a big number) keys the
+    /// join too. Otherwise only a graph-wide key does.
+    fn encode(o_type: u16, o_key: u64, p_id: u32, predicate_keyed: bool) -> Option<Self> {
         let ot = OType::from_u16(o_type);
+        if !ot.o_key_is_globally_identifying()
+            && !(predicate_keyed && ot.o_key_is_predicate_identifying())
+        {
+            return None;
+        }
         if ot.decode_kind() == DecodeKind::BlankNode {
             // Blank handles compare by o_key; skip the per-row label format!.
             return Some(Self {
@@ -367,15 +384,7 @@ impl EncObj {
             fluree_db_core::NO_ARENA_GRAPH,
         ) {
             Some(Binding::EncodedSid { s_id, .. }) => EncIdentity::Ref(s_id),
-            Some(Binding::EncodedLit { o_kind, .. }) => EncIdentity::Lit {
-                o_type,
-                o_key,
-                num_big_p_id: if o_kind == ObjKind::NUM_BIG.as_u8() {
-                    p_id
-                } else {
-                    0
-                },
-            },
+            Some(Binding::EncodedLit { .. }) => EncIdentity::Lit { o_type, o_key },
             // The materializer only builds other variants for blank nodes,
             // handled above.
             Some(_) => return None,
@@ -383,11 +392,9 @@ impl EncObj {
             // They have no `EncodedLit` form, but `(o_type, o_key)` is their
             // full term identity within this store view, so they stay in the
             // join; the rows that survive it decode at emit.
-            None if ot.decode_kind() == DecodeKind::StringDict => EncIdentity::Lit {
-                o_type,
-                o_key,
-                num_big_p_id: 0,
-            },
+            None if ot.decode_kind() == DecodeKind::StringDict => {
+                EncIdentity::Lit { o_type, o_key }
+            }
             None => return None,
         };
         Some(Self {
@@ -816,15 +823,37 @@ impl CyclicBgpOperator {
         self.plan.edges.iter().any(|edge| edge.subject == v)
     }
 
-    fn encode_object_for_edge(&self, edge: &CyclicEdge, raw: RawEdgeRow) -> Option<EncObj> {
+    fn encode_object_for_edge(
+        &self,
+        edge: &CyclicEdge,
+        raw: RawEdgeRow,
+        predicate_keyed: bool,
+    ) -> Option<EncObj> {
         if self.var_is_subject(edge.object) {
             if raw.o_type != OType::IRI_REF.as_u16() {
                 return None;
             }
             Some(EncObj::from_ref(raw.object))
         } else {
-            EncObj::encode(raw.o_type, raw.object, raw.p_id)
+            EncObj::encode(raw.o_type, raw.object, raw.p_id, predicate_keyed)
         }
+    }
+
+    /// Whether the join may key `edge`'s objects within their predicate
+    /// ([`EncObj::encode`]): every edge that binds the object variable reads
+    /// `edge`'s predicate, so equal objects are equal keys of one arena, and
+    /// the member's big-number arenas hold each value under one handle (a
+    /// legacy arena keeps `1.5` and `1.50` apart).
+    fn objects_keyed_in_predicate(&self, read: &MemberRead<'_, '_>, edge: &CyclicEdge) -> bool {
+        self.plan
+            .edges
+            .iter()
+            .filter(|other| other.object == edge.object)
+            .all(|other| other.predicate == edge.predicate)
+            && !read
+                .member
+                .store()
+                .graph_numbig_has_duplicate_handles(read.member.g_id())
     }
 
     /// The predicate's id in the member's store: `Ok(None)` for no rows (a
@@ -1003,7 +1032,7 @@ impl CyclicBgpOperator {
                 }
             }
         }
-        self.encode_raw_rows(edge, raw_rows, &span)
+        self.encode_raw_rows(read, edge, raw_rows, &span)
     }
 
     /// Encode a relation's raw rows for the join, or `None` (logged) for a
@@ -1012,10 +1041,12 @@ impl CyclicBgpOperator {
     /// in its own graph.
     fn encode_raw_rows(
         &self,
+        read: &MemberRead<'_, '_>,
         edge: &CyclicEdge,
         raw_rows: Vec<RawEdgeRow>,
         span: &tracing::Span,
     ) -> Result<Option<Vec<(u64, EncObj)>>> {
+        let predicate_keyed = self.objects_keyed_in_predicate(read, edge);
         let mut rows = Vec::with_capacity(raw_rows.len());
         for raw in raw_rows {
             if self.graphs > 1 && is_arena_o_type(raw.o_type) {
@@ -1026,8 +1057,8 @@ impl CyclicBgpOperator {
                 );
                 return Ok(None);
             }
-            let Some(object) = self.encode_object_for_edge(edge, raw) else {
-                self.log_fast_path_bail("unsupported-object-binding", Some(edge));
+            let Some(object) = self.encode_object_for_edge(edge, raw, predicate_keyed) else {
+                self.log_fast_path_bail(object_bail_reason(raw.o_type), Some(edge));
                 return Ok(None);
             };
             rows.push((raw.subject, object));
@@ -1121,7 +1152,7 @@ impl CyclicBgpOperator {
             }
         }
 
-        self.encode_raw_rows(edge, raw_rows, &span)
+        self.encode_raw_rows(read, edge, raw_rows, &span)
     }
 
     /// O(1) upper bound on the frontier size for `var`: the smallest distinct
@@ -3149,6 +3180,7 @@ mod tests {
                 object: 42,
                 p_id: 7,
             },
+            false,
         );
 
         let object = object.expect("encoded literal object should be accepted");
@@ -3179,6 +3211,7 @@ mod tests {
                 object: 12_345,
                 p_id: 7,
             },
+            false,
         );
 
         let object = object.expect("encoded temporal object should be accepted");
@@ -3217,6 +3250,7 @@ mod tests {
                     object: o_key,
                     p_id: 7,
                 },
+                false,
             )
         };
 
@@ -3274,6 +3308,27 @@ mod tests {
         );
     }
 
+    /// An arena handle names a value only per predicate (and a vector's is
+    /// not its only handle even there), so the join keys on one only where
+    /// every edge binding it reads that predicate, and never on a vector's;
+    /// otherwise it declines, under a reason of its own.
+    #[test]
+    fn arena_literal_objects_decline_the_join() {
+        for o_type in [OType::VECTOR, OType::NUM_BIG_OVERFLOW] {
+            assert!(
+                EncObj::encode(o_type.as_u16(), 0, 7, false).is_none(),
+                "{o_type:?}"
+            );
+            assert_eq!(object_bail_reason(o_type.as_u16()), "arena-literal-object");
+        }
+        assert!(EncObj::encode(OType::VECTOR.as_u16(), 0, 7, true).is_none());
+        assert!(EncObj::encode(OType::NUM_BIG_OVERFLOW.as_u16(), 0, 7, true).is_some());
+        assert_eq!(
+            object_bail_reason(OType::XSD_BOOLEAN.as_u16()),
+            "unsupported-object-binding"
+        );
+    }
+
     #[test]
     fn subject_bridge_cycle_vars_still_require_ref_objects() {
         let triples = vec![triple(0, "p1", 1), triple(1, "p2", 2), triple(2, "p3", 0)];
@@ -3288,6 +3343,7 @@ mod tests {
                 object: 42,
                 p_id: 7,
             },
+            false,
         );
         assert!(literal.is_none());
 
@@ -3299,6 +3355,7 @@ mod tests {
                 object: 99,
                 p_id: 7,
             },
+            false,
         );
         assert!(matches!(
             iri,
@@ -3484,6 +3541,7 @@ mod tests {
                     object: 42,
                     p_id: 7,
                 },
+                false,
             )
             .expect("object-only var accepts encoded literals");
         let lit_rel = RelationIndex::new(op.plan.edges[0].clone(), vec![(1, lit)]);
@@ -3562,7 +3620,7 @@ mod tests {
     #[test]
     fn set_union_of_encoded_objects_keys_on_term_identity() {
         let string = |o_key| {
-            EncObj::encode(OType::XSD_STRING.as_u16(), o_key, 7).expect("xsd:string encodes")
+            EncObj::encode(OType::XSD_STRING.as_u16(), o_key, 7, false).expect("xsd:string encodes")
         };
         let mut rows = vec![
             (1, string(10)),

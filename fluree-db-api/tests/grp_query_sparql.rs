@@ -16,12 +16,20 @@ mod it_graph_scope_streams;
 #[path = "it_novelty_subject_iri_formats.rs"]
 mod it_novelty_subject_iri_formats;
 
+#[path = "it_overflow_iri_bound_lookups.rs"]
+mod it_overflow_iri_bound_lookups;
+
+#[path = "it_correlated_store_ids.rs"]
+mod it_correlated_store_ids;
+
 #[path = "it_issue_1721_repro.rs"]
 mod it_issue_1721_repro;
 #[path = "it_issue_1723_sameterm_fold.rs"]
 mod it_issue_1723_sameterm_fold;
 #[path = "it_issue_1738_scan_narrowing.rs"]
 mod it_issue_1738_scan_narrowing;
+#[path = "it_issue_2385_filter_const_per_branch.rs"]
+mod it_issue_2385_filter_const_per_branch;
 #[path = "it_property_join_filters.rs"]
 mod it_property_join_filters;
 #[path = "it_query_ask.rs"]

@@ -199,23 +199,27 @@ impl OType {
 
     /// Whether `(o_type, o_key)` identifies an object term **graph-wide**.
     ///
-    /// For almost every o_type it does: `o_key` is an inline value, a subject
-    /// dictionary id, or a handle into a graph-scoped arena, so two rows share
-    /// an `(o_type, o_key)` pair iff they carry the same object term.
+    /// For almost every o_type it does: `o_key` is an inline value or a
+    /// graph-wide dictionary id, so two rows share an `(o_type, o_key)` pair
+    /// iff they carry the same object term.
     ///
-    /// [`Self::NUM_BIG_OVERFLOW`] is the exception, and it is the whole reason
-    /// this predicate exists. Its `o_key` is a handle into a **per-predicate**
-    /// arena (`fluree-db-binary-index`, `arena::numbig` — "Per-predicate
-    /// equality-only arena") whose handles are allocated from 0 within each
-    /// `(g_id, p_id)`. The first big value under one predicate and the first
-    /// under another are both handle `0`, so the pair is an identity only once
-    /// `p_id` is fixed. Every `xsd:decimal` lands there unconditionally, as does
-    /// any `xsd:integer` too large for `i64`.
+    /// The exceptions are the o_types whose `o_key` is a handle into a
+    /// **per-predicate** arena, allocated from 0 within each `(g_id, p_id)`:
+    /// the first value under one predicate and the first under another are
+    /// both handle `0`.
+    ///
+    /// - [`Self::NUM_BIG_OVERFLOW`] (`arena::numbig`, "Per-predicate
+    ///   equality-only arena"). Every `xsd:decimal` lands there
+    ///   unconditionally, as does any `xsd:integer` too large for `i64`. The
+    ///   arena deduplicates, so the pair is an identity once `p_id` is fixed.
+    /// - [`Self::VECTOR`] (`arena::vector`). This arena does not deduplicate:
+    ///   one vector stored on two subjects of a predicate has two handles, so
+    ///   the pair is not an identity even with `p_id` fixed — see
+    ///   [`Self::o_key_is_predicate_identifying`].
     ///
     /// Call this before using an `(o_type, o_key)` prefix as an object identity
     /// in any whole-graph structure — a distinct count, a group key, a dedup
-    /// set. Per-predicate consumers are unaffected: their key already carries
-    /// the `p_id` that scopes the handle.
+    /// set, a join across predicates.
     #[inline]
     pub const fn o_key_is_globally_identifying(self) -> bool {
         let mut i = 0;
@@ -232,7 +236,21 @@ impl OType {
     /// graph. Single source of truth for [`Self::o_key_is_globally_identifying`]
     /// and [`Self::range_holds_non_globally_identifying`], so the point test and
     /// the range test cannot drift apart.
-    const NOT_GLOBALLY_IDENTIFYING: [Self; 1] = [Self::NUM_BIG_OVERFLOW];
+    const NOT_GLOBALLY_IDENTIFYING: [Self; 2] = [Self::VECTOR, Self::NUM_BIG_OVERFLOW];
+
+    /// Whether `(o_type, o_key)` identifies an object term **within one
+    /// predicate**, the identity a per-predicate consumer keys on (a POST
+    /// distinct count, a run-length group over POST order, an object top-k).
+    ///
+    /// Every o_type that is globally identifying is, and so is
+    /// [`Self::NUM_BIG_OVERFLOW`], whose arena maps each value to one handle.
+    /// [`Self::VECTOR`] is not: its arena gives each stored fact its own
+    /// handle, so equal vectors under one predicate carry different keys and
+    /// are not adjacent in POST order.
+    #[inline]
+    pub const fn o_key_is_predicate_identifying(self) -> bool {
+        self.0 != Self::VECTOR.0
+    }
 
     /// Whether the inclusive o_type range `[lo, hi]` can hold a row whose
     /// `o_key` is not a graph-wide identity.
@@ -791,18 +809,35 @@ mod tests {
             assert!(OType::range_holds_non_globally_identifying(t, t));
         }
         // A range that straddles an exception reports it; one that stops short
-        // does not.
-        let ex = OType::NUM_BIG_OVERFLOW;
-        let below = OType::from_u16(ex.as_u16() - 1);
-        let above = OType::from_u16(ex.as_u16() + 1);
-        assert!(OType::range_holds_non_globally_identifying(below, above));
+        // does not. FULLTEXT sits between the two exceptions.
+        let between = OType::FULLTEXT;
+        assert_eq!(between.as_u16(), OType::VECTOR.as_u16() + 1);
+        assert_eq!(between.as_u16(), OType::NUM_BIG_OVERFLOW.as_u16() - 1);
+        let below = OType::from_u16(OType::VECTOR.as_u16() - 1);
+        let above = OType::from_u16(OType::NUM_BIG_OVERFLOW.as_u16() + 1);
+        assert!(OType::range_holds_non_globally_identifying(below, between));
+        assert!(OType::range_holds_non_globally_identifying(between, above));
         assert!(!OType::range_holds_non_globally_identifying(
             OType::XSD_STRING,
             below
         ));
+        assert!(!OType::range_holds_non_globally_identifying(
+            between, between
+        ));
         assert!(!OType::range_holds_non_globally_identifying(above, above));
         assert!(below.o_key_is_globally_identifying());
+        assert!(between.o_key_is_globally_identifying());
         assert!(above.o_key_is_globally_identifying());
+    }
+
+    /// Within one predicate only the vector arena's handles fail to identify
+    /// a value; the NumBig arena maps each value to one handle.
+    #[test]
+    fn predicate_identifying_excludes_only_vectors() {
+        assert!(!OType::VECTOR.o_key_is_predicate_identifying());
+        assert!(OType::NUM_BIG_OVERFLOW.o_key_is_predicate_identifying());
+        assert!(OType::XSD_STRING.o_key_is_predicate_identifying());
+        assert!(OType::IRI_REF.o_key_is_predicate_identifying());
     }
 
     #[test]

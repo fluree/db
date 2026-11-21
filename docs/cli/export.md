@@ -39,6 +39,8 @@ Exports the full native ledger — all commits, transaction blobs, indexes, and 
 
 The `.flpack` format uses the `fluree-pack-v1` binary wire protocol (the same format used by `fluree clone` and `fluree pull` for network transfers).
 
+With `-o`, the archive is written to a hidden `.partial` file beside the target and renamed into place only once it's complete, so a failed export leaves no file under that name and keeps any archive already there. (A target that isn't a regular file, such as `/dev/stdout` or a FIFO, is written in place.)
+
 All formats (Turtle, N-Triples, N-Quads, TriG, JSON-LD) read directly from the binary SPOT index with a novelty overlay, so export always includes the latest committed transactions — even those not yet persisted to index. Memory usage stays constant regardless of dataset size. JSON-LD streams one subject at a time, so memory is O(largest subject), not O(dataset).
 
 ### Named graphs
@@ -104,14 +106,16 @@ JSON-LD's `@type` holds IRIs only, so an annotated type, like a list of types, i
 
 A ledger that has never carried an annotation pays nothing for any of this: export reads one flag on the snapshot and runs the scan it always ran.
 
-**Known limit.** Annotations written *inside a named graph* are resolved correctly when export reads them from the sealed annotation arena or from the novelty overlay. They are dropped when export falls back to the **base-index scan**, which is blind to them — the fallback taken by a ledger whose index reports annotations but for which no arena was sealed. SPARQL reads them in every case. Export says so rather than dropping them quietly:
+Annotations written *inside a named graph* export like any other.
+
+When export does suppress an annotation it cannot then represent — a bundle the decoder rejects as malformed — it says so rather than dropping it quietly:
 
 ```
   warning: 1 edge annotations could not be resolved and are NOT in the output;
            re-run with --raw-reifies to emit them as f:reifies* triples
 ```
 
-`FLUREE_EXPORT_ANNOTATION_SCAN=1` forces the base-index scan in place of the sealed annotation arena — how to compare the two sources without rebuilding an index. They agree except on annotations inside a named graph, which the arena resolves and the scan cannot see; forcing the scan on such a ledger produces the warning above.
+`FLUREE_EXPORT_ANNOTATION_SCAN=1` forces the base-index scan in place of the sealed annotation arena. The two sources should agree; this is how to check without rebuilding an index.
 
 ### Prefixes / Context
 

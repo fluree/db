@@ -949,6 +949,7 @@ fn txn_meta_sid_after(
         &fluree_db_core::txn_meta_graph_iri(state.ledger_id()),
         mode,
         |prefix| namespaces.get_code(prefix),
+        || namespaces.is_full(),
     ))
 }
 

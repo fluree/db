@@ -131,6 +131,7 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
             interval.tick().await;
             let used = cache.weighted_size_bytes();
             let entries = cache.entry_count();
+            let shards = cache.shard_count();
 
             let used_gib = (used as f64) / (1024.0 * 1024.0 * 1024.0);
             let budget_gib = (budget_bytes as f64) / (1024.0 * 1024.0 * 1024.0);
@@ -142,6 +143,7 @@ fn spawn_leaflet_cache_stats_logger(fluree: &Arc<Fluree>) -> tokio::task::JoinHa
 
             tracing::info!(
                 cache_entries = entries,
+                cache_shards = shards,
                 cache_weighted_bytes = used,
                 cache_weighted_gib = used_gib,
                 cache_budget_mb = budget_mb,
@@ -537,6 +539,12 @@ async fn build_direct_fluree(
     if config.storage_lock && config.owns_storage_root() && wal_owner.is_none() {
         builder = builder.with_storage_lock();
     }
+    // A shared-storage peer reads its transaction server's root: the
+    // nameservice, WAL, staging files and indexes are the writer's.
+    let reader = config.is_peer_mode();
+    if reader {
+        builder = builder.read_only();
+    }
     // Which host identities graph sources may borrow is the operator's call
     // (FLUREE_GRAPH_SOURCE_HOST_IDENTITIES / _AMBIENT_BUCKETS).
     #[cfg(feature = "iceberg")]
@@ -562,7 +570,7 @@ async fn build_direct_fluree(
     if let Some(bus) = event_bus {
         builder = builder.with_event_bus(bus);
     }
-    if config.indexing_enabled {
+    if config.indexing_enabled && !reader {
         let max_bytes = config
             .reindex_max_bytes
             .unwrap_or_else(fluree_db_api::server_defaults::default_reindex_max_bytes);

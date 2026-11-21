@@ -1245,6 +1245,51 @@ async fn import_jsonld_user_authored_expanded_reifies_iri_is_rejected() {
     );
 }
 
+/// Import `contents` as `file_name` into a new ledger, expecting a refusal:
+/// its message.
+async fn refused_import(file_name: &str, contents: &str) -> String {
+    let db_dir = tempfile::tempdir().expect("db tmpdir");
+    let data_dir = tempfile::tempdir().expect("data tmpdir");
+    let file_path = data_dir.path().join(file_name);
+    std::fs::write(&file_path, contents).unwrap();
+    let fluree = FlureeBuilder::file(db_dir.path().to_string_lossy().to_string())
+        .build()
+        .expect("build file-backed Fluree");
+    fluree
+        .create("test/import-reserved:main")
+        .import(&file_path)
+        .cleanup(false)
+        .execute()
+        .await
+        .expect_err("an import naming an f:reifies* predicate must be refused")
+        .to_string()
+}
+
+/// A reserved predicate the file never spells out is refused by the IRI the
+/// expander resolves: one assembled from a prefix, and one an NDJSON
+/// file's shared context defines as a term. Neither file contains the text
+/// `reifies`.
+#[tokio::test]
+async fn import_refuses_a_reserved_predicate_however_it_is_spelled() {
+    let assembled = refused_import(
+        "prefix.jsonld",
+        r#"{
+            "@context": {"fx": "https://ns.flur.ee/db#rei"},
+            "@id": "http://example.org/ns/alice",
+            "fx:fiesSubject": {"@id": "http://example.org/ns/bob"}
+        }"#,
+    )
+    .await;
+    assert!(assembled.contains("system-controlled"), "{assembled}");
+
+    let ndjson = concat!(
+        "{\"@context\":{\"fx\":\"https://ns.flur.ee/db#rei\",\"x\":\"fx:fiesSubject\"}}\n",
+        "{\"@id\":\"http://example.org/ns/alice\",\"x\":{\"@id\":\"http://example.org/ns/bob\"}}\n",
+    );
+    let scoped = refused_import("shared.jsonl", ndjson).await;
+    assert!(scoped.contains("system-controlled"), "{scoped}");
+}
+
 /// End-to-end: imported annotation-bearing ledger → follow-up
 /// `fluree.reindex(...)` (the same call the CLI's
 /// `fluree create --import` auto-seal step makes) seals the
