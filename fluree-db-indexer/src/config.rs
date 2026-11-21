@@ -280,6 +280,11 @@ pub struct IndexerConfig {
     /// data. Default: [`DEFAULT_LEAFLET_ROWS`].
     pub leaflet_rows: usize,
 
+    /// The size a NumBig arena chunk grows to before the next value starts a
+    /// new one. Tests shrink it to split an arena with little data. Default:
+    /// [`NUMBIG_CHUNK_TARGET_BYTES`](fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES).
+    pub numbig_chunk_bytes: usize,
+
     /// Target rows per leaf blob, whatever the leaflet size. Default:
     /// [`DEFAULT_LEAF_ROWS`], the size bulk import uses, so rebuilds and
     /// incremental merges keep the leaf size an import produced.
@@ -430,6 +435,7 @@ impl Default for IndexerConfig {
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: DEFAULT_LEAFLET_ROWS,
+            numbig_chunk_bytes: fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
@@ -470,6 +476,7 @@ impl IndexerConfig {
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: DEFAULT_LEAFLET_ROWS,
+            numbig_chunk_bytes: fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
@@ -503,6 +510,7 @@ impl IndexerConfig {
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: DEFAULT_LEAFLET_ROWS,
+            numbig_chunk_bytes: fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
@@ -536,6 +544,7 @@ impl IndexerConfig {
             incremental_max_concurrency: DEFAULT_INCREMENTAL_MAX_CONCURRENCY,
             incremental_leaf_upload_concurrency: DEFAULT_INCREMENTAL_LEAF_UPLOAD_CONCURRENCY,
             leaflet_rows: DEFAULT_LEAFLET_ROWS,
+            numbig_chunk_bytes: fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
             leaf_rows: DEFAULT_LEAF_ROWS,
             incremental_max_commit_bytes: None,
             incremental_retype_max_subjects: DEFAULT_INCREMENTAL_RETYPE_MAX_SUBJECTS,
@@ -572,6 +581,11 @@ impl IndexerConfig {
 
     pub fn with_leaflet_rows(mut self, rows: usize) -> Self {
         self.leaflet_rows = rows.max(1);
+        self
+    }
+
+    pub fn with_numbig_chunk_bytes(mut self, bytes: usize) -> Self {
+        self.numbig_chunk_bytes = bytes.max(1);
         self
     }
 

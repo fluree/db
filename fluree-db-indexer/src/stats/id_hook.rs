@@ -238,6 +238,13 @@ fn otype_to_value_type_tag(ot: fluree_db_core::o_type::OType) -> ValueTypeTag {
     if ot.is_lang_string() {
         return ValueTypeTag::LANG_STRING;
     }
+    // A typed NumBig o_type counts as its declared datatype, as the runtime
+    // stats count the same value from novelty. The by-value
+    // `NUM_BIG_OVERFLOW` of a `main` root holds integers and decimals alike,
+    // so it stays UNKNOWN.
+    if let Some(datatype) = ot.inline_twin() {
+        return otype_to_value_type_tag(datatype);
+    }
 
     match ot {
         OType::XSD_BOOLEAN => ValueTypeTag::BOOLEAN,
@@ -257,18 +264,7 @@ fn otype_to_value_type_tag(ot: fluree_db_core::o_type::OType) -> ValueTypeTag {
         OType::XSD_DOUBLE => ValueTypeTag::DOUBLE,
         OType::XSD_FLOAT => ValueTypeTag::FLOAT,
         OType::XSD_DECIMAL => ValueTypeTag::DECIMAL,
-        // Inline exact decimals (v3 roots) unambiguously carry only
-        // `FlakeValue::Decimal` — unlike NUM_BIG_OVERFLOW below — so they map
-        // straight to DECIMAL here.
         OType::XSD_DECIMAL_INLINE => ValueTypeTag::DECIMAL,
-        // NUM_BIG_OVERFLOW is intentionally NOT mapped here: it carries both
-        // `FlakeValue::Decimal` (arbitrary-precision xsd:decimal) and
-        // `FlakeValue::BigInt` (xsd:integer overflow > i64) — they share
-        // `ObjKind::NUM_BIG`. Disambiguating requires inspecting the NumBig
-        // arena entry (`StoredBigValue::BigDec` vs `BigInt`), which is not
-        // available here. Falling through to UNKNOWN is the honest answer
-        // until the collector is plumbed with arena access or the semantic
-        // dt tag is preserved alongside the o_type byte.
         OType::XSD_DATE => ValueTypeTag::DATE,
         OType::XSD_TIME => ValueTypeTag::TIME,
         OType::XSD_DATE_TIME => ValueTypeTag::DATE_TIME,
@@ -1036,6 +1032,38 @@ impl IdStatsHook {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// An arena-stored number counts as its declared datatype, the tag the
+    /// runtime stats give the same value from novelty (#1321).
+    #[test]
+    fn num_big_o_types_count_as_their_declared_datatype() {
+        use fluree_db_core::o_type::OType;
+        assert_eq!(
+            otype_to_value_type_tag(OType::NUM_BIG_UNSIGNED_LONG),
+            ValueTypeTag::UNSIGNED_LONG
+        );
+        assert_eq!(
+            otype_to_value_type_tag(OType::NUM_BIG_INTEGER),
+            ValueTypeTag::INTEGER
+        );
+        assert_eq!(
+            otype_to_value_type_tag(OType::NUM_BIG_DECIMAL),
+            ValueTypeTag::DECIMAL
+        );
+        for ot in OType::NUM_BIG_TYPED {
+            let tag = otype_to_value_type_tag(ot);
+            assert_ne!(tag, ValueTypeTag::UNKNOWN, "{ot:?}");
+            assert_eq!(
+                tag,
+                otype_to_value_type_tag(ot.inline_twin().unwrap()),
+                "{ot:?}"
+            );
+        }
+        assert_eq!(
+            otype_to_value_type_tag(OType::NUM_BIG_OVERFLOW),
+            ValueTypeTag::UNKNOWN
+        );
+    }
 
     #[test]
     fn test_id_stats_hook_with_prior_properties() {

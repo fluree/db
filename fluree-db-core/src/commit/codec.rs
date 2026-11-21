@@ -97,6 +97,18 @@ fn detect_version(bytes: &[u8]) -> Result<CommitBlobVersion, CommitCodecError> {
     }
 }
 
+/// Whether a commit blob retracts an integer too large for 64 bits by value
+/// ([`Commit::num_big_typing`]): a commit whose header says it names each
+/// term is answered from the header alone.
+pub fn retracts_big_integers_by_value(bytes: &[u8]) -> Result<bool, CommitCodecError> {
+    if detect_version(bytes)? == CommitBlobVersion::V4
+        && format::CommitHeader::read_from(bytes)?.num_big_typing() == crate::NumBigTyping::Declared
+    {
+        return Ok(false);
+    }
+    load_commit_ops(bytes)?.retracts_big_integers_by_value()
+}
+
 /// Read a commit blob and return a full `Commit` (with flakes).
 ///
 /// Dispatches to the v3 or v4 reader based on the blob's header version

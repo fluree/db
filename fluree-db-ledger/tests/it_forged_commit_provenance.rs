@@ -61,6 +61,7 @@ fn commit_carrying(flakes: Vec<Flake>) -> Commit {
         graph_delta: std::collections::HashMap::new(),
         ns_split_mode: None,
         graph_drops: Vec::new(),
+        num_big_typing: fluree_db_core::NumBigTyping::Declared,
     }
 }
 

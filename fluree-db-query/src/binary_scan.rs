@@ -1561,10 +1561,10 @@ impl BinaryScanOperator {
     /// Check whether this row matches the triple pattern's datatype constraint (if any).
     ///
     /// Runs *before* object decode, so the datatype is resolved from `o_type`
-    /// alone on the common path (zero decode cost). `NUM_BIG_OVERFLOW` names no
-    /// single datatype — its arena holds both `xsd:integer` (BigInt) and
-    /// `xsd:decimal` (BigDecimal) — so in that one ambiguous case decode the
-    /// value to disambiguate. Without this, a value-object query like
+    /// alone on the common path (zero decode cost). The by-value
+    /// `NUM_BIG_OVERFLOW` of a `main` root names no single datatype — it holds
+    /// both `xsd:integer` (BigInt) and `xsd:decimal` (BigDecimal) — so in that
+    /// one ambiguous case decode the value to disambiguate. Without this, a value-object query like
     /// `{"@value":"?p","@type":"xsd:decimal"}` silently dropped indexed big
     /// numerics while novelty copies passed (issue #1329).
     #[inline]
@@ -2667,11 +2667,12 @@ impl Operator for BinaryScanOperator {
                 None
             };
 
-            // Indexed NumBig statistics deliberately use UNKNOWN: arena handles
-            // can hold either decimals or overflow integers. Prove both the row
-            // encoding and arena contents instead of interpreting UNKNOWN as a
-            // datatype. Limit this additional proof to current, indexed reads;
-            // novelty and historical reads retain the general numeric matcher.
+            // Statistics can't prove a property holds only arena decimals:
+            // `DECIMAL` also counts inline decimals, and a `main` root's NumBig
+            // statistics are UNKNOWN. Prove the row encoding (and, by value,
+            // the arena contents) instead. Limit this additional proof to
+            // current, indexed reads; novelty and historical reads retain the
+            // general numeric matcher.
             if graph_local_ok
                 && dt_sid.is_none()
                 && inferred_dt_sid.is_none()
@@ -3440,6 +3441,7 @@ impl Operator for BinaryScanOperator {
                 g_id: self.g_id,
                 index: self.index,
                 decimal_encoding: store_arc.decimal_encoding(),
+                num_big_typing: store_arc.num_big_typing(),
             };
 
             let warm_whole_product = || -> Option<Arc<TranslatedOverlayOps>> {
@@ -3950,6 +3952,9 @@ pub struct GlobalTranslationKey {
     /// XSD_DECIMAL_INLINE); keying on the policy prevents serving a stale
     /// arena-keyed translation against an inline root (or vice versa).
     pub decimal_encoding: fluree_db_core::DecimalEncoding,
+    /// The base store's NumBig typing, for the same reason: the two roots type
+    /// a novelty big number by value and by declared datatype.
+    pub num_big_typing: fluree_db_core::NumBigTyping,
 }
 
 /// Cross-query LRU of translated overlay ops.
@@ -4737,20 +4742,21 @@ pub(crate) fn value_to_otype_okey(
         FlakeValue::GeoPoint(bits) => Ok((OType::GEO_POINT, bits.0)),
         // Big numerics mirror the resolver: i64-fitting integers are inline;
         // everything else is keyed by a per-(graph, predicate) NumBig arena
-        // handle, resolvable read-only for values the index has seen. A value
-        // absent from the arena (asserted only in novelty) has no handle —
-        // Unsupported, so callers take the raw-flake / decline path.
+        // handle, resolvable read-only for values the index has seen, under the
+        // o_type the root types it by. A value absent from the arena (asserted
+        // only in novelty) has no handle — Unsupported, so callers take the
+        // raw-flake / decline path.
         FlakeValue::BigInt(bi) => {
+            let ot = dt_otype.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "datatype not resolvable to OType for BigInt value",
+                )
+            })?;
             if let Some(v) = num_traits::ToPrimitive::to_i64(bi.as_ref()) {
-                let ot = dt_otype.ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Unsupported,
-                        "datatype not resolvable to OType for BigInt value",
-                    )
-                })?;
                 return Ok((ot, ObjKey::encode_i64(v).as_u64()));
             }
-            find_numbig_okey(val, store, numbig_ctx)
+            find_numbig_okey(val, ot, store, numbig_ctx)
         }
         FlakeValue::Decimal(bd) => {
             // Mirror the resolver exactly: under InlineWhenFits a decimal that
@@ -4762,7 +4768,7 @@ pub(crate) fn value_to_otype_okey(
                     return Ok((OType::XSD_DECIMAL_INLINE, key.as_u64()));
                 }
             }
-            find_numbig_okey(val, store, numbig_ctx)
+            find_numbig_okey(val, OType::XSD_DECIMAL, store, numbig_ctx)
         }
         FlakeValue::TripleTerm(term) => compose_term_handle(term, store, dict_novelty),
         // Not handled: Vector (arena + HNSW identity; raw-merge is the
@@ -4774,17 +4780,20 @@ pub(crate) fn value_to_otype_okey(
     }
 }
 
-/// Resolve a big numeric value to its `(NUM_BIG_OVERFLOW, arena handle)`
-/// encoding, or `Unsupported` when the value is not in the arena / no
-/// `(g_id, p_id)` context is available.
+/// Resolve a big numeric value to its `(NumBig o_type, arena handle)`
+/// encoding, or `Unsupported` when the value is not in the arena, no
+/// `(g_id, p_id)` context is available, or its datatype has no NumBig form.
+/// `datatype` is the inline o_type of the value's declared datatype.
 fn find_numbig_okey(
     val: &FlakeValue,
+    datatype: OType,
     store: &BinaryIndexStore,
     numbig_ctx: Option<(GraphId, u32)>,
 ) -> std::io::Result<(OType, u64)> {
-    numbig_ctx
-        .and_then(|(g_id, p_id)| store.find_numbig_handle(g_id, p_id, val))
-        .map(|handle| (OType::NUM_BIG_OVERFLOW, handle as u64))
+    let o_type = store.num_big_typing().o_type_for(datatype);
+    o_type
+        .zip(numbig_ctx.and_then(|(g_id, p_id)| store.find_numbig_handle(g_id, p_id, val)))
+        .map(|(o_type, handle)| (o_type, handle as u64))
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -4843,12 +4852,19 @@ fn predicate_is_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32)
 /// `None` when a leaf directory can't be read: decline without caching.
 fn prove_decimal_only(store: &BinaryIndexStore, g_id: GraphId, p_id: u32) -> Option<bool> {
     use fluree_db_binary_index::format::run_record::RunSortOrder;
-    if !store.numbig_is_decimal_only(g_id, p_id)
+    let typing = store.num_big_typing();
+    let Some(decimal_type) = typing.o_type_for(OType::XSD_DECIMAL) else {
+        return Some(false);
+    };
+    // A by-value o_type holds integers too, so the arena must hold none. A
+    // typed decimal o_type holds only decimals.
+    if (typing == fluree_db_core::NumBigTyping::ByValue
+        && !store.numbig_is_decimal_only(g_id, p_id))
         || store.dedicated_branch(g_id, RunSortOrder::Post).is_none()
     {
         return Some(false);
     }
-    let decimal_type = OType::NUM_BIG_OVERFLOW.as_u16();
+    let decimal_type = decimal_type.as_u16();
     for leaf in
         crate::fast_path_common::leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id)
     {
@@ -4890,7 +4906,13 @@ fn decimal_object_key(
             std::io::ErrorKind::NotFound,
             "decimal absent from predicate arena",
         )),
-        Some(handles) if handles.len() == 1 => Ok((OType::NUM_BIG_OVERFLOW, u64::from(handles[0]))),
+        Some(handles) if handles.len() == 1 => store
+            .num_big_typing()
+            .o_type_for(OType::XSD_DECIMAL)
+            .map(|o_type| (o_type, u64::from(handles[0])))
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::Unsupported, "no NumBig decimal o_type")
+            }),
         _ => Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             "decimal arena unavailable or has multiple equal-value handles",
@@ -5116,10 +5138,12 @@ const NUMERIC_TAGS: [fluree_db_core::ValueTypeTag; 15] = {
 /// `f64` holds it exactly, and a double has integer slices only when it is
 /// integral.
 ///
-/// Decimals may use inline keys; remaining decimals and big integers
-/// (`DECIMAL` / `UNKNOWN`, or unknown datatypes) use NumBig arena handles;
-/// see [`numbig_slices`]. `p_id: None` searches
-/// every predicate's arena.
+/// Decimals may use inline keys. A decimal that doesn't fit inline, and an
+/// integer beyond `i64`, live in the NumBig arena under the o_type of their
+/// datatype ([`fluree_db_core::NumBigTyping`]): an integer tag reaches its
+/// NumBig o_type when the value is an integer beyond `i64`, `DECIMAL` reaches
+/// the decimal one, and `UNKNOWN` (or unknown datatypes) every NumBig o_type;
+/// see [`numbig_slices`]. `p_id: None` searches every predicate's arena.
 ///
 /// `None` for a non-finite value, so the caller scans unnarrowed under the
 /// decoded-value filter. `Some(vec![])` means no row can hold the value.
@@ -5151,15 +5175,43 @@ pub(crate) fn untyped_numeric_slices(
         }
         _ => return None,
     };
+    // An arena integer lies outside `i64`, so only a value that is an integer
+    // beyond `i64` can equal one.
+    let big_int = match value {
+        FlakeValue::BigInt(b) if as_i64.is_none() => Some((**b).clone()),
+        FlakeValue::Decimal(d) if as_i64.is_none() && d.is_integer() => {
+            num_bigint::ToBigInt::to_bigint(&**d)
+        }
+        FlakeValue::Double(d) if as_i64.is_none() && d.fract() == 0.0 => {
+            bigdecimal::BigDecimal::try_from(*d)
+                .ok()
+                .and_then(|d| num_bigint::ToBigInt::to_bigint(&d))
+        }
+        _ => None,
+    };
 
-    let mut numbig = observed.is_none();
+    let typing = store.num_big_typing();
+    let mut wanted = NumBigWanted::default();
+    if observed.is_none() {
+        wanted.all(typing);
+    }
     let mut slices = Vec::new();
     for &tag in observed.unwrap_or(&NUMERIC_TAGS) {
-        if tag == ValueTypeTag::DECIMAL || tag == ValueTypeTag::UNKNOWN {
-            numbig = true;
+        if tag == ValueTypeTag::UNKNOWN {
+            wanted.all(typing);
+            continue;
+        }
+        if tag == ValueTypeTag::DECIMAL {
+            wanted.decimal = typing.o_type_for(OType::XSD_DECIMAL);
             continue;
         }
         let key = if tag.is_integer_type() {
+            if big_int.is_some() {
+                let datatype = numeric_tag_o_type(tag);
+                wanted
+                    .integer
+                    .extend(datatype.and_then(|ot| typing.o_type_for(ot)));
+            }
             as_i64.map(|n| ObjKey::encode_i64(n).as_u64())
         } else if tag.is_float_type() {
             as_f64.map(|f| ObjKey::encode_f64(f).as_u64())
@@ -5170,36 +5222,65 @@ pub(crate) fn untyped_numeric_slices(
             slices.push((numeric_tag_o_type(tag)?, Some(key)));
         }
     }
-    if numbig {
-        // Decimal rows can now be inline as well as arena-backed. Keep main's
-        // per-datatype seeks, adding the exact decimal representation a bare
-        // number can equal under FlakeValue::numeric_cmp.
-        if store.decimal_encoding().inlines() {
-            // The inline key is canonical, so one slice holds every scale of
-            // the value (`1.5`, `1.50`).
-            let decimal = match value {
-                FlakeValue::Long(n) => Some(bigdecimal::BigDecimal::from(*n)),
-                FlakeValue::Double(d) => bigdecimal::BigDecimal::try_from(*d).ok(),
-                FlakeValue::Decimal(d) => Some((**d).clone()),
-                FlakeValue::BigInt(b) => Some(bigdecimal::BigDecimal::from((**b).clone())),
-                _ => None,
-            };
-            if let Some(key) = decimal.as_ref().and_then(ObjKey::encode_decimal) {
-                slices.push((OType::XSD_DECIMAL_INLINE, Some(key.as_u64())));
-            }
-        }
-        slices.extend(numbig_slices(
-            store,
-            g_id,
-            p_id,
-            value,
-            as_i64,
-            arena_is_current,
-        ));
+    if typing == fluree_db_core::NumBigTyping::ByValue && wanted.any() {
+        // One o_type holds every arena value, so a seek reaching it looks for
+        // the value both as a decimal and as an integer.
+        wanted.all(typing);
     }
+    if wanted.decimal.is_some() && store.decimal_encoding().inlines() {
+        // Decimal rows can be inline as well as arena-backed. The inline key
+        // is canonical, so one slice holds every scale of the value (`1.5`,
+        // `1.50`).
+        let decimal = match value {
+            FlakeValue::Long(n) => Some(bigdecimal::BigDecimal::from(*n)),
+            FlakeValue::Double(d) => bigdecimal::BigDecimal::try_from(*d).ok(),
+            FlakeValue::Decimal(d) => Some((**d).clone()),
+            FlakeValue::BigInt(b) => Some(bigdecimal::BigDecimal::from((**b).clone())),
+            _ => None,
+        };
+        if let Some(key) = decimal.as_ref().and_then(ObjKey::encode_decimal) {
+            slices.push((OType::XSD_DECIMAL_INLINE, Some(key.as_u64())));
+        }
+    }
+    slices.extend(numbig_slices(
+        store,
+        g_id,
+        p_id,
+        value,
+        big_int.as_ref(),
+        &wanted,
+        arena_is_current,
+    ));
     slices.sort_unstable();
     slices.dedup();
     Some(slices)
+}
+
+/// The NumBig o_types a bare number may be stored under: the decimal one, and
+/// one per integer datatype that can hold an integer beyond `i64`. Under
+/// [`fluree_db_core::NumBigTyping::ByValue`] both name the one by-value
+/// o_type.
+#[derive(Default)]
+struct NumBigWanted {
+    decimal: Option<OType>,
+    integer: Vec<OType>,
+}
+
+impl NumBigWanted {
+    /// Every NumBig o_type of `typing`.
+    fn all(&mut self, typing: fluree_db_core::NumBigTyping) {
+        self.decimal = typing.o_type_for(OType::XSD_DECIMAL);
+        self.integer = typing
+            .o_types()
+            .iter()
+            .copied()
+            .filter(|ot| ot.inline_twin().is_none_or(OType::is_integer))
+            .collect();
+    }
+
+    fn any(&self) -> bool {
+        self.decimal.is_some() || !self.integer.is_empty()
+    }
 }
 
 /// `value` as an `i64`, when it is one exactly.
@@ -5234,68 +5315,88 @@ pub(crate) fn observed_datatypes(
         .filter(|observed| !observed.is_empty())
 }
 
-/// NumBig rows a bare number can equal. Arena handles reflect the index at
-/// `max_t`, so they are consulted only for a current read; a value the index
-/// has not seen has no handle, and its novelty rows reach the scan through the
-/// raw-flake lane. Otherwise the whole NumBig o_type is one slice.
+/// NumBig rows a bare number can equal, under the o_types `wanted` names. Arena
+/// handles reflect the index at `max_t`, so they are consulted only for a
+/// current read; a value the index has not seen has no handle, and its novelty
+/// rows reach the scan through the raw-flake lane. Otherwise each wanted
+/// o_type is one whole slice.
 fn numbig_slices(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: Option<u32>,
     value: &FlakeValue,
-    as_i64: Option<i64>,
+    big_int: Option<&num_bigint::BigInt>,
+    wanted: &NumBigWanted,
     arena_is_current: bool,
 ) -> Vec<ObjectSlice> {
-    // Arena integers lie outside `i64`, so only an integral double beyond it
-    // can equal one; for a double the handle lookup covers decimals only.
+    // An arena integer lies outside `i64`, so the integer o_types are sought
+    // only for an integer beyond `i64`, and the value as a decimal only under
+    // the decimal o_type.
+    let integer: &[OType] = if big_int.is_some() {
+        &wanted.integer
+    } else {
+        &[]
+    };
+    let big_int = big_int.filter(|_| !integer.is_empty());
     let decimal = match value {
         FlakeValue::Long(n) => Some(bigdecimal::BigDecimal::from(*n)),
-        FlakeValue::Double(d) if as_i64.is_some() || d.fract() != 0.0 => {
-            bigdecimal::BigDecimal::try_from(*d).ok()
-        }
+        FlakeValue::Double(d) => bigdecimal::BigDecimal::try_from(*d).ok(),
         FlakeValue::Decimal(d) => Some((**d).clone()),
         FlakeValue::BigInt(b) => Some(bigdecimal::BigDecimal::from((**b).clone())),
         _ => None,
+    }
+    .filter(|_| wanted.decimal.is_some());
+    let whole = || -> Vec<ObjectSlice> {
+        wanted
+            .decimal
+            .iter()
+            .chain(integer)
+            .map(|&ot| (ot, None))
+            .collect()
     };
-    // A decimal or big integer beyond `i64` that is integral can also equal an
-    // arena integer, which the decimal lookup does not find.
-    let big_int = match value {
-        FlakeValue::BigInt(b) if as_i64.is_none() => Some((**b).clone()),
-        FlakeValue::Decimal(d) if as_i64.is_none() && d.is_integer() => {
-            num_bigint::ToBigInt::to_bigint(&**d)
+    if !arena_is_current || decimal_seeks_disabled() {
+        return whole();
+    }
+    let mut slices = Vec::new();
+    let mut push = |o_types: &[OType], handles: Vec<u32>| {
+        for handle in handles {
+            slices.extend(o_types.iter().map(|&ot| (ot, Some(u64::from(handle)))));
         }
-        _ => None,
     };
-    let Some(decimal) = decimal.filter(|_| arena_is_current && !decimal_seeks_disabled()) else {
-        return vec![(OType::NUM_BIG_OVERFLOW, None)];
-    };
-    let handles: Vec<u32> = match p_id {
+    let decimal_types: Vec<OType> = wanted.decimal.into_iter().collect();
+    let big_int_value = big_int.map(|b| FlakeValue::BigInt(Box::new(b.clone())));
+    match p_id {
         Some(p_id) => {
-            let mut handles = store
-                .find_decimal_handles(g_id, p_id, &decimal)
-                .unwrap_or_default();
-            if let Some(big_int) = &big_int {
-                handles.extend(store.find_numbig_handle(
-                    g_id,
-                    p_id,
-                    &FlakeValue::BigInt(Box::new(big_int.clone())),
-                ));
+            if let Some(decimal) = &decimal {
+                push(
+                    &decimal_types,
+                    store
+                        .find_decimal_handles(g_id, p_id, decimal)
+                        .unwrap_or_default(),
+                );
             }
-            handles
+            if let Some(big_int) = &big_int_value {
+                push(
+                    integer,
+                    store
+                        .find_numbig_handle(g_id, p_id, big_int)
+                        .into_iter()
+                        .collect(),
+                );
+            }
         }
-        None => store
-            .numbig_arenas(g_id)
-            .flat_map(|(_, arena)| {
-                let mut handles = arena.find_bigdec_handles(&decimal);
-                handles.extend(big_int.as_ref().and_then(|b| arena.find_bigint(b)));
-                handles
-            })
-            .collect(),
-    };
-    handles
-        .into_iter()
-        .map(|handle| (OType::NUM_BIG_OVERFLOW, Some(u64::from(handle))))
-        .collect()
+        None => {
+            for (_, arena) in store.numbig_arenas(g_id) {
+                if let Some(decimal) = &decimal {
+                    push(&decimal_types, arena.find_bigdec_handles(decimal));
+                }
+                if let Some(big_int) = big_int {
+                    push(integer, arena.find_bigint(big_int).into_iter().collect());
+                }
+            }
+        }
+    }
+    slices
 }
 
 fn numeric_tag_o_type(tag: fluree_db_core::ValueTypeTag) -> Option<OType> {
@@ -5395,7 +5496,7 @@ pub(crate) fn term_object_key(
     store: &BinaryIndexStore,
     dict_novelty: Option<&Arc<fluree_db_core::dict_novelty::DictNovelty>>,
 ) -> std::io::Result<(OType, u64)> {
-    let Some((o_type, form)) = fluree_db_core::triple_term::lexical_term_object(value) else {
+    let Some((o_type, form)) = fluree_db_core::triple_term::lexical_term_object(value, dt) else {
         return value_to_otype_okey(value, dt, lang, store, dict_novelty, None);
     };
     match store.find_string_id(&form)? {
@@ -6178,7 +6279,9 @@ mod bounded_overlay_walk_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fluree_db_core::{stats_view::GraphPropertyStatData, StatsView, ValueTypeTag};
+    use fluree_db_core::{
+        stats_view::GraphPropertyStatData, NumBigTyping, StatsView, ValueTypeTag,
+    };
 
     #[test]
     fn string_not_found_error_preserves_short_values_and_truncates_ascii() {
@@ -6247,8 +6350,23 @@ mod tests {
         value: FlakeValue,
         arena_is_current: bool,
     ) -> Option<Vec<ObjectSlice>> {
-        let store = BinaryIndexStore::empty();
+        typed_slices_for(NumBigTyping::Declared, observed, value, arena_is_current)
+    }
+
+    /// [`slices_for`] on an index of `typing`.
+    fn typed_slices_for(
+        typing: NumBigTyping,
+        observed: Option<&[ValueTypeTag]>,
+        value: FlakeValue,
+        arena_is_current: bool,
+    ) -> Option<Vec<ObjectSlice>> {
+        let mut store = BinaryIndexStore::empty();
+        store.set_num_big_typing_for_test(typing);
         untyped_numeric_slices(&store, 0, Some(7), observed, &value, arena_is_current)
+    }
+
+    fn big_int(s: &str) -> FlakeValue {
+        FlakeValue::BigInt(Box::new(s.parse().unwrap()))
     }
 
     fn int_key(n: i64) -> Option<u64> {
@@ -6329,61 +6447,122 @@ mod tests {
 
     #[test]
     fn numbig_datatypes_seek_arena_handles_or_the_whole_numbig_type() {
-        for tag in [ValueTypeTag::DECIMAL, ValueTypeTag::UNKNOWN] {
-            let observed = [ValueTypeTag::INTEGER, tag];
+        for typing in [NumBigTyping::ByValue, NumBigTyping::Declared] {
+            let decimal = typing.o_type_for(OType::XSD_DECIMAL).unwrap();
+            for tag in [ValueTypeTag::DECIMAL, ValueTypeTag::UNKNOWN] {
+                let observed = [ValueTypeTag::INTEGER, tag];
+                assert_eq!(
+                    typed_slices_for(typing, Some(&observed), FlakeValue::Long(25), true),
+                    Some(vec![(OType::XSD_INTEGER, int_key(25))]),
+                    "{typing:?} {tag:?}: no arena holds the value"
+                );
+                // An arena integer lies outside `i64`, so 25 can equal only an
+                // arena decimal.
+                assert_eq!(
+                    typed_slices_for(typing, Some(&observed), FlakeValue::Long(25), false),
+                    Some(vec![(OType::XSD_INTEGER, int_key(25)), (decimal, None)]),
+                    "{typing:?} {tag:?}: arena handles only prove a current read"
+                );
+            }
+            // An integral double beyond i64 is looked up as a decimal (and,
+            // where an integer o_type is sought, as an integer).
             assert_eq!(
-                slices_for(Some(&observed), FlakeValue::Long(25), true),
-                Some(vec![(OType::XSD_INTEGER, int_key(25))]),
-                "{tag:?}: no arena holds the value"
+                typed_slices_for(
+                    typing,
+                    Some(&[ValueTypeTag::DECIMAL]),
+                    FlakeValue::Double(1e19),
+                    true
+                ),
+                Some(vec![]),
+                "{typing:?}: no arena holds the value"
             );
             assert_eq!(
-                slices_for(Some(&observed), FlakeValue::Long(25), false),
-                Some(vec![
-                    (OType::XSD_INTEGER, int_key(25)),
-                    (OType::NUM_BIG_OVERFLOW, None),
-                ]),
-                "{tag:?}: arena handles only prove a current read"
+                typed_slices_for(
+                    typing,
+                    Some(&[ValueTypeTag::DECIMAL]),
+                    FlakeValue::Double(1e19),
+                    false
+                ),
+                Some(vec![(decimal, None)]),
+                "{typing:?}"
             );
+            for value in [f64::NAN, f64::INFINITY] {
+                assert_eq!(
+                    typed_slices_for(
+                        typing,
+                        Some(&[ValueTypeTag::DOUBLE]),
+                        FlakeValue::Double(value),
+                        true
+                    ),
+                    None
+                );
+            }
         }
-        // An integral double beyond i64 can equal an arena integer, which the
-        // handle lookup doesn't cover.
+    }
+
+    /// An integer beyond `i64` counts under its declared integer tag, so that
+    /// tag must reach its NumBig o_type: an `xsd:unsignedLong` above
+    /// `i64::MAX` is found under `UNSIGNED_LONG`, not only under `UNKNOWN`
+    /// (#1321). By value, every arena value shares one o_type.
+    #[test]
+    fn an_integer_tag_seeks_its_num_big_o_type_for_a_big_integer() {
+        let max_u64 = big_int("18446744073709551615");
+        assert_eq!(
+            slices_for(Some(&[ValueTypeTag::UNSIGNED_LONG]), max_u64.clone(), false),
+            Some(vec![(OType::NUM_BIG_UNSIGNED_LONG, None)])
+        );
         assert_eq!(
             slices_for(
-                Some(&[ValueTypeTag::DECIMAL]),
-                FlakeValue::Double(1e19),
-                true
+                Some(&[ValueTypeTag::INTEGER, ValueTypeTag::UNSIGNED_LONG]),
+                max_u64.clone(),
+                false
+            ),
+            Some(vec![
+                (OType::NUM_BIG_INTEGER, None),
+                (OType::NUM_BIG_UNSIGNED_LONG, None),
+            ])
+        );
+        // A type whose values all fit `i64` holds no arena value.
+        assert_eq!(
+            slices_for(Some(&[ValueTypeTag::LONG]), max_u64.clone(), false),
+            Some(vec![])
+        );
+        assert_eq!(
+            typed_slices_for(
+                NumBigTyping::ByValue,
+                Some(&[ValueTypeTag::INTEGER]),
+                max_u64,
+                false
             ),
             Some(vec![(OType::NUM_BIG_OVERFLOW, None)])
         );
-        for value in [f64::NAN, f64::INFINITY] {
-            assert_eq!(
-                slices_for(
-                    Some(&[ValueTypeTag::DOUBLE]),
-                    FlakeValue::Double(value),
-                    true
-                ),
-                None
-            );
-        }
     }
 
     #[test]
     fn unknown_datatypes_seek_every_numeric_datatype() {
-        let slices = slices_for(None, FlakeValue::Long(25), false).unwrap();
-        assert_eq!(slices.len(), NUMERIC_TAGS.len() + 1);
-        assert!(slices.contains(&(OType::XSD_UNSIGNED_BYTE, int_key(25))));
-        assert!(slices.contains(&(OType::XSD_FLOAT, f64_key(25.0))));
-        assert_eq!(slices.last(), Some(&(OType::NUM_BIG_OVERFLOW, None)));
-        assert!(slices.windows(2).all(|w| w[0] < w[1]), "in o_type order");
+        for typing in [NumBigTyping::ByValue, NumBigTyping::Declared] {
+            let decimal = typing.o_type_for(OType::XSD_DECIMAL).unwrap();
+            let slices = typed_slices_for(typing, None, FlakeValue::Long(25), false).unwrap();
+            assert_eq!(slices.len(), NUMERIC_TAGS.len() + 1, "{typing:?}");
+            assert!(slices.contains(&(OType::XSD_UNSIGNED_BYTE, int_key(25))));
+            assert!(slices.contains(&(OType::XSD_FLOAT, f64_key(25.0))));
+            assert_eq!(slices.last(), Some(&(decimal, None)), "{typing:?}");
+            assert!(slices.windows(2).all(|w| w[0] < w[1]), "in o_type order");
 
-        assert_eq!(
-            slices_for(None, FlakeValue::Double(2.5), false),
-            Some(vec![
-                (OType::XSD_DOUBLE, f64_key(2.5)),
-                (OType::XSD_FLOAT, f64_key(2.5)),
-                (OType::NUM_BIG_OVERFLOW, None),
-            ])
-        );
+            assert_eq!(
+                typed_slices_for(typing, None, FlakeValue::Double(2.5), false),
+                Some(vec![
+                    (OType::XSD_DOUBLE, f64_key(2.5)),
+                    (OType::XSD_FLOAT, f64_key(2.5)),
+                    (decimal, None),
+                ])
+            );
+        }
+        // Every NumBig o_type can hold an integer beyond `i64`'s value.
+        let slices = slices_for(None, big_int("-18446744073709551616"), false).unwrap();
+        for ot in OType::NUM_BIG_TYPED {
+            assert!(slices.contains(&(ot, None)), "{ot:?}");
+        }
     }
 
     #[test]

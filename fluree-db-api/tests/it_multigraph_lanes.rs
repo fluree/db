@@ -443,9 +443,9 @@ async fn per_predicate_count_union_read_below_its_index() {
 
 /// Big numbers in the per-predicate count over several graphs. A big number
 /// is a handle into an arena per graph and predicate, so the count keys each
-/// by its value: `1.5` and `1.50` are one value; a big integer is keyed by
-/// value whatever XSD subtype wrote it; a decimal and an integer of equal
-/// magnitude are two values; a value in one member stays its own. The
+/// by its value and datatype: `1.5` and `1.50` are one value; a big integer
+/// under two XSD subtypes is two terms, as is a decimal and an integer of
+/// equal magnitude; a value in one member stays its own. The
 /// ledger's default graph is empty, so the union default graph has a member
 /// the index holds nothing for, which the count leaves out.
 const NUMBIG_LEDGER: &str = "it/mg-lanes-numbig:main";
@@ -556,7 +556,7 @@ async fn numbig_counts(
 }
 
 #[tokio::test(flavor = "current_thread")]
-async fn per_predicate_count_union_keys_big_numbers_by_value() {
+async fn per_predicate_count_union_keys_big_numbers_by_value_and_datatype() {
     use fluree_db_api::{set_fast_paths_disabled, FlureeBuilder, GraphDb, ReindexOptions};
     let fluree = FlureeBuilder::memory().without_indexing().build_memory();
     fluree
@@ -588,12 +588,12 @@ async fn per_predicate_count_union_keys_big_numbers_by_value() {
         ),
         (
             &["urn:g1", "urn:g2"],
-            want(&["big=1", "dec=1", "mag=2", "one=1"]),
+            want(&["big=2", "dec=1", "mag=2", "one=1"]),
             true,
         ),
         // The union default graph: g0 (empty: the index holds nothing for
         // it), g1 and g2.
-        (&[], want(&["big=1", "dec=1", "mag=2", "one=1"]), true),
+        (&[], want(&["big=2", "dec=1", "mag=2", "one=1"]), true),
     ];
     let _switch = multigraph::switch().lock().await;
     let mut failures = Vec::new();

@@ -339,7 +339,8 @@ mode), which `EXPLAIN` deliberately does not do.
 ### Whole-graph distinct object counts
 
 For `SELECT (COUNT(DISTINCT ?o) AS ?n) WHERE { ?s ?p ?o }`, the indexed fast
-path counts overflow integers and decimals exactly using their NumBig arenas.
+path counts overflow integers and decimals exactly using their NumBig arenas,
+one term per value and datatype.
 `FLUREE_NUMBIG_EXACT_MAX_ENTRIES` optionally caps the total arena entries in
 the queried graph, including stale entries and values repeated across
 predicates. It is unset by default. Setting it to `0` forces queries with

@@ -244,9 +244,10 @@ impl LinkSynth {
                 let mut o_key = record.o_key;
                 let mut o_kind = ObjKind::from_u8(record.o_kind);
                 if is_arena_kind(o_kind) || o_kind == ObjKind::NUM_DEC {
+                    let dt_sid = fluree_db_core::Sid::new(raw.dt_ns_code, raw.dt_name);
                     let Some((_, form)) = FlakeValue::try_from(raw.o.clone())
                         .ok()
-                        .and_then(|o| lexical_term_object(&o))
+                        .and_then(|o| lexical_term_object(&o, &dt_sid))
                     else {
                         return;
                     };
@@ -453,7 +454,7 @@ mod tests {
         };
         assert_eq!(
             object.typed(&OTypeRegistry::new(&[])),
-            (OType::NUM_BIG_OVERFLOW.as_u16(), 23)
+            (OType::NUM_BIG_DECIMAL.as_u16(), 23)
         );
     }
 }

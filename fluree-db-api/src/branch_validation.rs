@@ -431,6 +431,7 @@ impl crate::Fluree {
         &self,
         base: FastForwardBase,
         source_branch: &str,
+        source_id: &str,
         source_store: &impl fluree_db_core::ContentStore,
         diff: &fluree_db_core::BranchDiff,
     ) -> Result<Option<BranchOpValidation>> {
@@ -439,6 +440,11 @@ impl crate::Fluree {
             &diff.source.commits,
             &diff.source.own,
             &mut crate::commit_data::ConfigGraphs::for_target(&base.state),
+            &crate::commit_data::Line {
+                fluree: self,
+                ledger_id: source_id,
+                strict: false,
+            },
         )
         .await?;
         if !base.governed && !carries_config_settings(&base.state, &data) {

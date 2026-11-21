@@ -18,7 +18,8 @@
 
 use fluree_db_core::commit::codec::envelope::encode_envelope_fields;
 use fluree_db_core::commit::codec::format::{
-    CommitFooter, CommitHeader, DictLocation, FLAG_ZSTD, FOOTER_LEN, HEADER_LEN, VERSION,
+    CommitFooter, CommitHeader, DictLocation, FLAG_NUM_BIG_DECLARED, FLAG_ZSTD, FOOTER_LEN,
+    HEADER_LEN, VERSION,
 };
 use fluree_db_core::commit::codec::op_codec::{encode_op, CommitDicts};
 use fluree_db_core::commit::codec::{CodecEnvelope, CommitCodecError};
@@ -175,8 +176,9 @@ impl StreamingCommitWriter {
             + FOOTER_LEN;
         let mut output = Vec::with_capacity(total_size);
 
-        // 5. Write header
-        let mut flags = 0u8;
+        // 5. Write header. An import names each term it writes, as a commit
+        // staged against an index that keeps big integers' subtypes does.
+        let mut flags = FLAG_NUM_BIG_DECLARED;
         if is_compressed {
             flags |= FLAG_ZSTD;
         }
@@ -305,6 +307,11 @@ mod tests {
         assert_eq!(decoded.flakes[0].s.name.as_ref(), "Alice");
         assert!(matches!(&decoded.flakes[0].o, FlakeValue::String(s) if s == "Alice Smith"));
         assert!(matches!(&decoded.flakes[1].o, FlakeValue::Long(30)));
+        // An import names each term, as a commit built here does.
+        assert_eq!(
+            decoded.num_big_typing,
+            fluree_db_core::NumBigTyping::Declared
+        );
     }
 
     #[test]

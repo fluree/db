@@ -25,6 +25,7 @@
 //! ObjKey)` but different types (e.g., `xsd:integer 3` vs `xsd:long 3`)
 //! remain distinguishable.
 
+use crate::o_type::OType;
 use crate::Sid;
 use fluree_vocab::{jsonld_names, namespaces, rdf_names, xsd_names};
 use std::fmt;
@@ -242,6 +243,60 @@ impl DecimalEncoding {
     #[inline]
     pub const fn inlines(self) -> bool {
         matches!(self, Self::InlineWhenFits)
+    }
+}
+
+// ============================================================================
+// NumBigTyping
+// ============================================================================
+
+/// How an index root types the numbers it keeps in the NumBig arena: integers
+/// too large for `i64`, and decimals that don't fit inline.
+///
+/// Like [`DecimalEncoding`], fixed per root: `(o_type, o_key)` is persisted
+/// fact identity, so a constant or a novelty fact must be encoded the way the
+/// root it is matched against stores the same term.
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug, Default)]
+pub enum NumBigTyping {
+    /// `main`'s (v2) roots: every arena value is
+    /// [`OType::NUM_BIG_OVERFLOW`], and its datatype is read from the decoded
+    /// value (`xsd:integer` or `xsd:decimal`). A declared subtype such as
+    /// `xsd:unsignedLong` is not kept, and two subtypes of one value share a
+    /// key.
+    ByValue,
+    /// v5 roots: an arena value is stored under the o_type of its declared
+    /// datatype, one of [`OType::NUM_BIG_TYPED`].
+    #[default]
+    Declared,
+}
+
+impl NumBigTyping {
+    /// The o_type of an arena value whose declared datatype's inline o_type is
+    /// `datatype` (`XSD_INTEGER`, `XSD_UNSIGNED_LONG`, `XSD_DECIMAL`, …).
+    /// By value, every arena value has one o_type whatever its datatype;
+    /// declared, `None` for a datatype with no arena form.
+    pub const fn o_type_for(self, datatype: OType) -> Option<OType> {
+        match self {
+            Self::ByValue => Some(OType::NUM_BIG_OVERFLOW),
+            Self::Declared => datatype.num_big_twin(),
+        }
+    }
+
+    /// Every NumBig o_type a root of this typing can hold.
+    pub const fn o_types(self) -> &'static [OType] {
+        match self {
+            Self::ByValue => &[OType::NUM_BIG_OVERFLOW],
+            Self::Declared => &OType::NUM_BIG_TYPED,
+        }
+    }
+
+    /// The inclusive o_type range holding every NumBig o_type of this typing
+    /// and no other o_type.
+    pub const fn o_type_range(self) -> (OType, OType) {
+        match self {
+            Self::ByValue => (OType::NUM_BIG_OVERFLOW, OType::NUM_BIG_OVERFLOW),
+            Self::Declared => (OType::NUM_BIG_INTEGER, OType::NUM_BIG_NEGATIVE_INTEGER),
+        }
     }
 }
 

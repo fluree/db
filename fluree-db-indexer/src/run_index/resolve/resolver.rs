@@ -1149,6 +1149,10 @@ pub struct SharedResolverState {
     /// The earliest `t` among the resolved commits whose txn-meta carries
     /// retention input ([`fluree_vocab::txn_meta::is_retention_input`]).
     pub retention_input_from_t: Option<i64>,
+    /// Set for a full rebuild, which reads every commit in order: the terms
+    /// of each big integer stored at each slot, for what the retractions of
+    /// commits staged by value retract (see [`super::big_integers`]).
+    pub(crate) big_integers: Option<super::big_integers::BigIntegerTerms>,
 }
 
 impl SharedResolverState {
@@ -1201,6 +1205,7 @@ impl SharedResolverState {
             graph_floors: HashMap::new(),
             graph_floor_ids: HashMap::new(),
             retention_input_from_t: None,
+            big_integers: None,
         }
     }
 
@@ -1356,6 +1361,7 @@ impl SharedResolverState {
             graph_floors: HashMap::new(),
             graph_floor_ids: HashMap::new(),
             retention_input_from_t: None,
+            big_integers: None,
         })
     }
 
@@ -1596,6 +1602,7 @@ impl SharedResolverState {
         })?;
         let mut asserts = 0u32;
         let mut retracts = 0u32;
+        let by_value = commit_ops.num_big_typing == fluree_db_core::NumBigTyping::ByValue;
 
         // A failure to resolve an op's content is a property of the commit.
         // `for_each_op` can only return a codec error, so the failure is noted
@@ -1642,6 +1649,10 @@ impl SharedResolverState {
                     return Err(e);
                 }
             };
+
+            if let Some(terms) = self.big_integers.as_mut() {
+                terms.note(&raw_op, by_value);
+            }
 
             self.link_synth.observe(
                 &raw_op,
@@ -1700,6 +1711,38 @@ impl SharedResolverState {
             });
         }
 
+        // A retraction of a big integer staged by value retracts every other
+        // term of its value stored before the commit too. These are records
+        // of the index, not ops of the commit: the commit's counts, which its
+        // metadata reports, leave them out.
+        let added = self
+            .big_integers
+            .as_mut()
+            .map(super::big_integers::BigIntegerTerms::end_commit)
+            .unwrap_or_default();
+        let mut added_records = 0u32;
+        for (retraction, dt) in &added {
+            let raw_op = retraction.under(dt);
+            let Some(record) = self
+                .resolve_op_chunk(&raw_op, t, chunk)
+                .map_err(|e| ResolverError::Unindexable(e.to_string()))?
+            else {
+                continue;
+            };
+            // A retraction of an attachment slot changes its reifier's link.
+            self.link_synth.observe(
+                &raw_op,
+                &record,
+                &mut self.predicates,
+                &mut self.datatypes,
+                &self.ns_prefixes,
+                chunk,
+            );
+            chunk.records.push(record);
+            chunk.flake_count += 1;
+            added_records += 1;
+        }
+
         // Emit txn-meta records into the same chunk. Its failures are about
         // the envelope's content too.
         let meta_count = match commit_hash_hex {
@@ -1720,7 +1763,7 @@ impl SharedResolverState {
         };
 
         Ok(ResolvedCommit {
-            total_records: asserts + retracts + meta_count,
+            total_records: asserts + retracts + added_records + meta_count,
             t,
             size: commit_size,
             asserts,
@@ -1811,7 +1854,8 @@ impl SharedResolverState {
             RawObject::BigIntStr(_) | RawObject::DecimalStr(_) | RawObject::Vector(_) => {
                 let value = fluree_db_core::FlakeValue::try_from(term.o.clone())
                     .map_err(|e| e.to_string())?;
-                fluree_db_core::triple_term::lexical_term_object(&value)
+                let dt_sid = fluree_db_core::Sid::new(term.dt.0, term.dt.1);
+                fluree_db_core::triple_term::lexical_term_object(&value, &dt_sid)
             }
             _ => None,
         };

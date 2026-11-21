@@ -600,6 +600,7 @@ pub async fn upload_dicts_from_disk(
         run_dir,
         namespace_codes,
         trust_sorted_order_invariants,
+        fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
     )
     .await
 }

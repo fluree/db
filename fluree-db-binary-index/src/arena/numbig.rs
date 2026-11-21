@@ -319,13 +319,19 @@ const REPR_TAG_BIGDEC: u8 = 1;
 ///   repr_bytes: [u8; repr_len]
 /// ```
 pub fn write_numbig_arena_to_bytes(arena: &NumBigArena) -> io::Result<Vec<u8>> {
+    write_numbig_entries_to_bytes(&arena.values)
+}
+
+/// NBA1 bytes of `entries`, in order.
+fn write_numbig_entries_to_bytes(entries: &[StoredBigValue]) -> io::Result<Vec<u8>> {
     use std::io::Write;
 
-    let mut buf = Vec::new();
+    let mut buf =
+        Vec::with_capacity(NBA_HEADER_LEN + entries.iter().map(entry_wire_len).sum::<usize>());
     buf.write_all(&NBA_MAGIC)?;
-    buf.write_all(&(arena.values().len() as u32).to_le_bytes())?;
+    buf.write_all(&(entries.len() as u32).to_le_bytes())?;
 
-    for entry in arena.values() {
+    for entry in entries {
         match entry {
             StoredBigValue::BigInt(bytes) => {
                 buf.write_all(&[REPR_TAG_BIGINT])?;
@@ -346,6 +352,93 @@ pub fn write_numbig_arena_to_bytes(arena: &NumBigArena) -> io::Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Bytes an NBA1 buffer spends on its header.
+const NBA_HEADER_LEN: usize = 8;
+
+/// Bytes `entry` takes in an NBA1 buffer: tag, length and repr.
+fn entry_wire_len(entry: &StoredBigValue) -> usize {
+    1 + 4
+        + match entry {
+            StoredBigValue::BigInt(bytes) => bytes.len(),
+            StoredBigValue::BigDec { unscaled, .. } => 4 + unscaled.len() + 8,
+        }
+}
+
+// ============================================================================
+// Chunks
+// ============================================================================
+
+/// The size a NumBig arena chunk grows to before the next entry starts a new
+/// one, the size of a forward dictionary pack. An entry larger than this is a
+/// chunk of its own.
+///
+/// An arena is stored as chunks of consecutive handles so that no object
+/// grows with its predicate: an arena kept as one object reached the archive
+/// frame limit at tens of millions of values (#2417), and an incremental build
+/// rewrote all of it to add one value.
+pub const NUMBIG_CHUNK_TARGET_BYTES: usize = 16 * 1024 * 1024;
+
+/// Chunks of one arena read at once when it loads: on remote storage an
+/// arena of many chunks otherwise waits on each read in turn.
+pub const NUMBIG_CHUNK_FETCH_WIDTH: usize = 8;
+
+/// One chunk of an arena: an NBA1 buffer holding consecutive handles, and how
+/// many.
+pub struct NumBigChunk {
+    pub bytes: Vec<u8>,
+    pub entries: u32,
+}
+
+/// Split `arena`'s handles from `start` on into chunks of at most `max_bytes`
+/// (or one entry, if that alone is larger).
+///
+/// The split is greedy from `start`: a chunk closes when the next entry would
+/// take it past `max_bytes`. So once a chunk closes, appending to the arena
+/// never changes it, and re-splitting from the start of an arena's last chunk
+/// gives the chunks a split of the whole arena would end with. An incremental
+/// build keeps every other chunk.
+pub fn write_numbig_arena_chunks(
+    arena: &NumBigArena,
+    start: usize,
+    max_bytes: usize,
+) -> io::Result<Vec<NumBigChunk>> {
+    let entries = arena.values.get(start..).unwrap_or_default();
+    let mut chunks = Vec::new();
+    let mut from = 0;
+    let mut size = NBA_HEADER_LEN;
+    for (i, entry) in entries.iter().enumerate() {
+        let len = entry_wire_len(entry);
+        if i > from && size + len > max_bytes {
+            chunks.push(chunk_of(&entries[from..i])?);
+            from = i;
+            size = NBA_HEADER_LEN;
+        }
+        size += len;
+    }
+    if from < entries.len() {
+        chunks.push(chunk_of(&entries[from..])?);
+    }
+    Ok(chunks)
+}
+
+fn chunk_of(entries: &[StoredBigValue]) -> io::Result<NumBigChunk> {
+    Ok(NumBigChunk {
+        bytes: write_numbig_entries_to_bytes(entries)?,
+        entries: entries.len() as u32,
+    })
+}
+
+/// Read an arena from its chunks, in handle order.
+pub fn read_numbig_arena_from_chunks<'a>(
+    chunks: impl IntoIterator<Item = &'a [u8]>,
+) -> io::Result<NumBigArena> {
+    let mut arena = NumBigArena::new();
+    for chunk in chunks {
+        append_numbig_entries(&mut arena, chunk)?;
+    }
+    Ok(arena)
+}
+
 /// Write a NumBigArena to a binary NBA1 file.
 pub fn write_numbig_arena(path: &std::path::Path, arena: &NumBigArena) -> io::Result<()> {
     let bytes = write_numbig_arena_to_bytes(arena)?;
@@ -357,6 +450,22 @@ pub fn write_numbig_arena(path: &std::path::Path, arena: &NumBigArena) -> io::Re
 /// Entries are inserted in file order, so handles are preserved
 /// (entry 0 = handle 0, etc.).
 pub fn read_numbig_arena_from_bytes(data: &[u8]) -> io::Result<NumBigArena> {
+    read_numbig_arena_from_chunks([data])
+}
+
+/// The number of entries an NBA1 buffer holds, read from its header.
+pub fn numbig_entry_count(data: &[u8]) -> io::Result<u32> {
+    if data.len() < NBA_HEADER_LEN || data[0..4] != NBA_MAGIC {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "numbig arena: invalid header",
+        ));
+    }
+    Ok(u32::from_le_bytes(data[4..8].try_into().unwrap()))
+}
+
+/// Append an NBA1 buffer's entries to `arena`, giving them the next handles.
+fn append_numbig_entries(arena: &mut NumBigArena, data: &[u8]) -> io::Result<()> {
     if data.len() < 8 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -371,7 +480,6 @@ pub fn read_numbig_arena_from_bytes(data: &[u8]) -> io::Result<NumBigArena> {
     }
 
     let count = u32::from_le_bytes(data[4..8].try_into().unwrap()) as usize;
-    let mut arena = NumBigArena::new();
     let mut pos = 8;
 
     for _ in 0..count {
@@ -457,7 +565,7 @@ pub fn read_numbig_arena_from_bytes(data: &[u8]) -> io::Result<NumBigArena> {
         }
     }
 
-    Ok(arena)
+    Ok(())
 }
 
 /// Read a NumBigArena from a binary NBA1 file.
@@ -741,5 +849,100 @@ mod tests {
         }
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An arena of `n` values of growing width, alternating integers and
+    /// decimals.
+    fn mixed_arena(n: usize) -> NumBigArena {
+        let mut arena = NumBigArena::new();
+        for i in 0..n {
+            let digits = "9".repeat(20 + i % 40);
+            if i % 2 == 0 {
+                arena.get_or_insert_bigint(&format!("{digits}{i}").parse().unwrap());
+            } else {
+                arena.get_or_insert_bigdec(&format!("{digits}.{i}7").parse().unwrap());
+            }
+        }
+        arena
+    }
+
+    fn chunked(arena: &NumBigArena, start: usize, max: usize) -> Vec<NumBigChunk> {
+        write_numbig_arena_chunks(arena, start, max).unwrap()
+    }
+
+    #[test]
+    fn chunks_hold_consecutive_handles_within_the_bound() {
+        let arena = mixed_arena(200);
+        let max = 1_000;
+        let chunks = chunked(&arena, 0, max);
+        assert!(chunks.len() > 5, "{} chunks", chunks.len());
+        for chunk in &chunks {
+            assert!(chunk.bytes.len() <= max, "{}", chunk.bytes.len());
+            assert_eq!(numbig_entry_count(&chunk.bytes).unwrap(), chunk.entries);
+            assert!(chunk.entries > 0);
+        }
+        assert_eq!(
+            chunks.iter().map(|c| c.entries as usize).sum::<usize>(),
+            arena.len()
+        );
+        let back = read_numbig_arena_from_chunks(chunks.iter().map(|c| &c.bytes[..])).unwrap();
+        assert_eq!(back.len(), arena.len());
+        for h in 0..arena.len() as u32 {
+            let value = arena.get_by_handle(h).unwrap().to_flake_value();
+            assert_eq!(back.get_by_handle(h).unwrap().to_flake_value(), value);
+            let found = match &value {
+                fluree_db_core::value::FlakeValue::BigInt(b) => back.find_bigint(b),
+                fluree_db_core::value::FlakeValue::Decimal(d) => back.find_bigdec(d),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(found, Some(h), "handle {h}");
+        }
+        // One chunk under a large bound is the arena's own NBA1 bytes.
+        let whole = chunked(&arena, 0, NUMBIG_CHUNK_TARGET_BYTES);
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].bytes, write_numbig_arena_to_bytes(&arena).unwrap());
+    }
+
+    #[test]
+    fn an_entry_past_the_bound_is_a_chunk_of_its_own() {
+        let mut arena = NumBigArena::new();
+        arena.get_or_insert_bigint(&"12345678901234567890123".parse().unwrap());
+        arena.get_or_insert_bigint(&"9".repeat(500).parse().unwrap());
+        arena.get_or_insert_bigint(&"98765432109876543210987".parse().unwrap());
+        let chunks = chunked(&arena, 0, 100);
+        assert_eq!(
+            chunks.iter().map(|c| c.entries).collect::<Vec<_>>(),
+            [1, 1, 1]
+        );
+        assert!(chunks[1].bytes.len() > 100);
+    }
+
+    /// A chunk closes only when the next entry doesn't fit, so appending never
+    /// changes a closed chunk, and re-splitting from the last chunk's start
+    /// gives what splitting the whole arena gives. This is what lets an
+    /// incremental build keep every chunk but the last.
+    #[test]
+    fn appending_keeps_every_chunk_but_the_last() {
+        let max = 1_000;
+        let mut arena = mixed_arena(100);
+        let before = chunked(&arena, 0, max);
+        for i in 0..60 {
+            arena.get_or_insert_bigint(&format!("77777777777777777777777{i}").parse().unwrap());
+        }
+        let after = chunked(&arena, 0, max);
+        let (_, closed) = before.split_last().unwrap();
+        for (old, new) in closed.iter().zip(&after) {
+            assert_eq!(old.bytes, new.bytes);
+        }
+        let start: usize = closed.iter().map(|c| c.entries as usize).sum();
+        let resumed = chunked(&arena, start, max);
+        assert_eq!(
+            closed
+                .iter()
+                .chain(&resumed)
+                .map(|c| &c.bytes)
+                .collect::<Vec<_>>(),
+            after.iter().map(|c| &c.bytes).collect::<Vec<_>>()
+        );
     }
 }

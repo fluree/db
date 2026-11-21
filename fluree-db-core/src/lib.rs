@@ -116,8 +116,9 @@ pub use commit::{
     load_commit_by_id, load_commit_envelope_by_id, plan_commit_transfer, plan_commit_transfer_page,
     trace_commit_envelopes_by_id, trace_commits_by_id, trace_first_parent_commits_by_id,
     walk_commit_summaries, BranchDiff, Commit, CommitEnvelope, CommitGraphLifecycle, CommitSummary,
-    CommitTransferPage, CommitTransferPlan, CommonAncestor, GraphRegistrationProbe, Redaction,
-    TxnMetaEntry, TxnMetaValue, TxnSignature, MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
+    CommitTransferPage, CommitTransferPlan, CommonAncestor, FirstParentWalk,
+    GraphRegistrationProbe, Redaction, TxnMetaEntry, TxnMetaValue, TxnSignature,
+    MAX_TXN_META_BYTES, MAX_TXN_META_ENTRIES,
 };
 pub use comparator::IndexType;
 pub use conflict_key::ConflictKey;
@@ -260,7 +261,9 @@ pub use value::{
     parse_decimal, parse_decimal_string, parse_double, parse_integer, parse_integer_string,
     FlakeValue, GeoPointBits, TripleTermValue,
 };
-pub use value_id::{DecimalEncoding, ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag};
+pub use value_id::{
+    DecimalEncoding, NumBigTyping, ObjKey, ObjKeyError, ObjKind, ObjPair, ValueTypeTag,
+};
 pub use verified_identity::VerifiedIdentity;
 
 /// Prelude module for convenient imports of storage traits and common types.

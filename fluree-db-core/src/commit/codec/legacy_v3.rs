@@ -260,6 +260,8 @@ pub fn read_commit_v3(bytes: &[u8]) -> Result<Commit, CommitCodecError> {
         graph_drops: envelope.graph_drops,
         ns_split_mode: envelope.ns_split_mode,
         redaction: None,
+        // Written by a release that keyed big integers by value.
+        num_big_typing: crate::NumBigTyping::ByValue,
     })
 }
 
@@ -310,6 +312,7 @@ pub fn read_commit_envelope_v3(bytes: &[u8]) -> Result<CommitEnvelope, CommitCod
         graph_delta: std::collections::HashMap::new(),
         graph_drops: Vec::new(),
         ns_split_mode: env.ns_split_mode,
+        num_big_typing: header.num_big_typing(),
     })
 }
 

@@ -852,6 +852,18 @@ pub async fn stage_with_graph_delta(
             }
         }
 
+        // Over an earlier release's index this commit is staged by value: its
+        // retraction of a big integer stands for every subtype of the value
+        // at that slot. That index holds a value's subtypes as one fact, but
+        // novelty keeps a value the index doesn't hold under each subtype, so
+        // the others' retractions are staged here, as that release staged
+        // them, for policy and the staged view to see.
+        if crate::current_facts::num_big_typing(&ledger) == fluree_db_core::NumBigTyping::ByValue {
+            let extras =
+                crate::current_facts::by_value_retractions(&ledger, &flakes, new_t).await?;
+            flakes.extend(extras);
+        }
+
         // Charge 1 micro-fuel per staged flake. Matches query-side scan fuel,
         // which also charges per flake without filtering schema flakes.
         // Fuel exhaustion returns an error so transactions exceeding fuel

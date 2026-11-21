@@ -193,7 +193,11 @@ pub(crate) async fn splice_graph_into_index(
             ))
         })?;
     let (numbig, vectors) = tokio::try_join!(
-        fluree_db_indexer::upload_numbig_arenas_from_disk(cs.as_ref(), graph.run_dir),
+        fluree_db_indexer::upload_numbig_arenas_from_disk(
+            cs.as_ref(),
+            graph.run_dir,
+            fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_TARGET_BYTES,
+        ),
         fluree_db_indexer::upload_vector_arenas_from_disk(cs.as_ref(), graph.run_dir),
     )
     .map_err(upload_error)?;
@@ -285,7 +289,7 @@ pub(crate) async fn splice_graph_into_index(
             if a.g_id != seed.g_id {
                 return true;
             }
-            replaced_cids.extend(a.numbig.iter().map(|(_, cid)| cid.clone()));
+            replaced_cids.extend(a.numbig.iter().flat_map(|nb| nb.cids().cloned()));
             for v in &a.vectors {
                 replaced_cids.push(v.manifest.clone());
                 replaced_cids.extend(v.shards.iter().cloned());

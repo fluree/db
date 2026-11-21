@@ -90,10 +90,9 @@ impl OType {
     pub const XSD_DOUBLE: Self = Self(0x0010);
     /// `xsd:float`
     pub const XSD_FLOAT: Self = Self(0x0011);
-    /// `xsd:decimal`. Reserved: the indexer routes **every** typed
-    /// `xsd:decimal` to the NumBig arena under [`Self::NUM_BIG_OVERFLOW`]
-    /// (`resolver.rs`, `RawObject::DecimalStr` — there is no inline branch), so
-    /// no stored row carries this o_type.
+    /// `xsd:decimal`. No stored row carries it: a decimal is stored inline as
+    /// [`Self::XSD_DECIMAL_INLINE`] or in the NumBig arena. It names the
+    /// datatype, e.g. as the [`Self::inline_twin`] of [`Self::NUM_BIG_DECIMAL`].
     pub const XSD_DECIMAL: Self = Self(0x0012);
 
     // -- Temporal (various order-preserving encodings in o_key) --
@@ -162,7 +161,12 @@ impl OType {
     pub const VECTOR: Self = Self(0x8009);
     /// `@fulltext` — `o_key` is a string dictionary ID (+ BM25 BoW index).
     pub const FULLTEXT: Self = Self(0x800A);
-    /// NumBig overflow — `o_key` is a NumBig arena handle (per-predicate).
+    /// A NumBig arena value typed by its decoded value, the only NumBig
+    /// o_type of a `main` (v2) root: an integer reads as `xsd:integer` and a
+    /// decimal as `xsd:decimal`, whatever datatype it was written with.
+    /// `o_key` is a NumBig arena handle (per-predicate). v5 roots never hold
+    /// it; they type arena values by declared datatype, `NUM_BIG_INTEGER`
+    /// through `NUM_BIG_NEGATIVE_INTEGER`.
     pub const NUM_BIG_OVERFLOW: Self = Self(0x800B);
     /// Spatial (complex geometry) — `o_key` is a spatial arena handle.
     pub const SPATIAL_COMPLEX: Self = Self(0x800C);
@@ -170,7 +174,43 @@ impl OType {
     /// (`(inner p_id << 32) | seq`, see `fluree_db_core::triple_term`).
     pub const TRIPLE_TERM: Self = Self(0x800D);
 
-    // Tag `10` payload range 0x800E–0xBFFF reserved for future Fluree domains.
+    // -- NumBig arena values, typed by declared datatype (v5) --
+    //
+    // `o_key` is a NumBig arena handle (per-predicate). The arena stores the
+    // number only and deduplicates by value, so one handle can be live under
+    // several of these o_types: the o_type is what keeps an
+    // `xsd:unsignedLong` apart from an `xsd:integer` of the same value.
+    // Handles are allocated in arrival order, so `o_key` is not
+    // value-ordered.
+
+    /// `xsd:integer` too large for `i64`.
+    pub const NUM_BIG_INTEGER: Self = Self(0x800E);
+    /// `xsd:decimal` that does not fit [`Self::XSD_DECIMAL_INLINE`].
+    pub const NUM_BIG_DECIMAL: Self = Self(0x800F);
+    /// `xsd:unsignedLong` above `i64::MAX`.
+    pub const NUM_BIG_UNSIGNED_LONG: Self = Self(0x8010);
+    /// `xsd:nonNegativeInteger` above `i64::MAX`.
+    pub const NUM_BIG_NON_NEGATIVE_INTEGER: Self = Self(0x8011);
+    /// `xsd:positiveInteger` above `i64::MAX`.
+    pub const NUM_BIG_POSITIVE_INTEGER: Self = Self(0x8012);
+    /// `xsd:nonPositiveInteger` below `i64::MIN`.
+    pub const NUM_BIG_NON_POSITIVE_INTEGER: Self = Self(0x8013);
+    /// `xsd:negativeInteger` below `i64::MIN`.
+    pub const NUM_BIG_NEGATIVE_INTEGER: Self = Self(0x8014);
+
+    /// Every o_type a v5 root stores a NumBig arena value under, in o_type
+    /// order.
+    pub const NUM_BIG_TYPED: [Self; 7] = [
+        Self::NUM_BIG_INTEGER,
+        Self::NUM_BIG_DECIMAL,
+        Self::NUM_BIG_UNSIGNED_LONG,
+        Self::NUM_BIG_NON_NEGATIVE_INTEGER,
+        Self::NUM_BIG_POSITIVE_INTEGER,
+        Self::NUM_BIG_NON_POSITIVE_INTEGER,
+        Self::NUM_BIG_NEGATIVE_INTEGER,
+    ];
+
+    // Tag `10` payload range 0x8015–0xBFFF reserved for future Fluree domains.
 
     // ── Tag `11` — rdf:langString ──────────────────────────────────────
 
@@ -219,10 +259,10 @@ impl OType {
     /// the first value under one predicate and the first under another are
     /// both handle `0`.
     ///
-    /// - [`Self::NUM_BIG_OVERFLOW`] (`arena::numbig`, "Per-predicate
-    ///   equality-only arena"). Every `xsd:decimal` lands there
-    ///   unconditionally, as does any `xsd:integer` too large for `i64`. The
-    ///   arena deduplicates, so the pair is an identity once `p_id` is fixed.
+    /// - The NumBig o_types ([`Self::is_num_big`]: `arena::numbig`,
+    ///   "Per-predicate equality-only arena"), which hold integers too large
+    ///   for `i64` and decimals that don't fit inline. The arena deduplicates,
+    ///   so the pair is an identity once `p_id` is fixed.
     /// - [`Self::VECTOR`] (`arena::vector`). This arena does not deduplicate:
     ///   one vector stored on two subjects of a predicate has two handles, so
     ///   the pair is not an identity even with `p_id` fixed — see
@@ -247,14 +287,25 @@ impl OType {
     /// graph. Single source of truth for [`Self::o_key_is_globally_identifying`]
     /// and [`Self::range_holds_non_globally_identifying`], so the point test and
     /// the range test cannot drift apart.
-    const NOT_GLOBALLY_IDENTIFYING: [Self; 2] = [Self::VECTOR, Self::NUM_BIG_OVERFLOW];
+    const NOT_GLOBALLY_IDENTIFYING: [Self; 9] = [
+        Self::VECTOR,
+        Self::NUM_BIG_OVERFLOW,
+        Self::NUM_BIG_INTEGER,
+        Self::NUM_BIG_DECIMAL,
+        Self::NUM_BIG_UNSIGNED_LONG,
+        Self::NUM_BIG_NON_NEGATIVE_INTEGER,
+        Self::NUM_BIG_POSITIVE_INTEGER,
+        Self::NUM_BIG_NON_POSITIVE_INTEGER,
+        Self::NUM_BIG_NEGATIVE_INTEGER,
+    ];
 
     /// Whether `(o_type, o_key)` identifies an object term **within one
     /// predicate**, the identity a per-predicate consumer keys on (a POST
     /// distinct count, a run-length group over POST order, an object top-k).
     ///
-    /// Every o_type that is globally identifying is, and so is
-    /// [`Self::NUM_BIG_OVERFLOW`], whose arena maps each value to one handle.
+    /// Every o_type that is globally identifying is, and so is every NumBig
+    /// o_type: its arena maps each value to one handle, and the o_type names
+    /// the datatype.
     /// [`Self::VECTOR`] is not: its arena gives each stored fact its own
     /// handle, so equal vectors under one predicate carry different keys and
     /// are not adjacent in POST order.
@@ -371,6 +422,53 @@ impl OType {
         self.is_integer() || self.is_float() || self.0 == Self::XSD_DECIMAL_INLINE.0
     }
 
+    /// True if `o_key` is a NumBig arena handle: the legacy
+    /// [`Self::NUM_BIG_OVERFLOW`] or one of [`Self::NUM_BIG_TYPED`]. The value
+    /// is numeric, but the handle is not ordered by it.
+    #[inline]
+    pub const fn is_num_big(self) -> bool {
+        self.0 == Self::NUM_BIG_OVERFLOW.0 || self.is_num_big_typed()
+    }
+
+    /// True if this is a NumBig o_type that names its datatype, one of
+    /// [`Self::NUM_BIG_TYPED`].
+    #[inline]
+    pub const fn is_num_big_typed(self) -> bool {
+        self.0 >= Self::NUM_BIG_INTEGER.0 && self.0 <= Self::NUM_BIG_NEGATIVE_INTEGER.0
+    }
+
+    /// The NumBig o_type that holds a value of the datatype whose inline
+    /// o_type is `self` when the value doesn't fit inline. `None` for a
+    /// datatype whose values always fit, or that isn't numeric.
+    pub const fn num_big_twin(self) -> Option<Self> {
+        match self.0 {
+            0x0003 => Some(Self::NUM_BIG_INTEGER),
+            0x0012 | 0x0020 => Some(Self::NUM_BIG_DECIMAL),
+            0x0008 => Some(Self::NUM_BIG_UNSIGNED_LONG),
+            0x000C => Some(Self::NUM_BIG_NON_NEGATIVE_INTEGER),
+            0x000D => Some(Self::NUM_BIG_POSITIVE_INTEGER),
+            0x000E => Some(Self::NUM_BIG_NON_POSITIVE_INTEGER),
+            0x000F => Some(Self::NUM_BIG_NEGATIVE_INTEGER),
+            _ => None,
+        }
+    }
+
+    /// The o_type naming the datatype of a typed NumBig o_type: an integer
+    /// subtype, or [`Self::XSD_DECIMAL`]. `None` for any other o_type,
+    /// [`Self::NUM_BIG_OVERFLOW`] included, which names no datatype.
+    pub const fn inline_twin(self) -> Option<Self> {
+        match self.0 {
+            0x800E => Some(Self::XSD_INTEGER),
+            0x800F => Some(Self::XSD_DECIMAL),
+            0x8010 => Some(Self::XSD_UNSIGNED_LONG),
+            0x8011 => Some(Self::XSD_NON_NEGATIVE_INTEGER),
+            0x8012 => Some(Self::XSD_POSITIVE_INTEGER),
+            0x8013 => Some(Self::XSD_NON_POSITIVE_INTEGER),
+            0x8014 => Some(Self::XSD_NEGATIVE_INTEGER),
+            _ => None,
+        }
+    }
+
     /// True if this is a temporal type (date/time/dateTime/gYear/etc./durations).
     #[inline]
     pub const fn is_temporal(self) -> bool {
@@ -461,6 +559,7 @@ impl OType {
             0x800B => DecodeKind::NumBigArena,
             0x800C => DecodeKind::SpatialArena,
             0x800D => DecodeKind::TripleTermDict,
+            0x800E..=0x8014 => DecodeKind::NumBigArena,
             _ => DecodeKind::Sentinel, // future Fluree domains
         }
     }
@@ -614,6 +713,13 @@ impl fmt::Debug for OType {
             0x800B => write!(f, "OType::NUM_BIG_OVERFLOW"),
             0x800C => write!(f, "OType::SPATIAL_COMPLEX"),
             0x800D => write!(f, "OType::TRIPLE_TERM"),
+            0x800E => write!(f, "OType::NUM_BIG_INTEGER"),
+            0x800F => write!(f, "OType::NUM_BIG_DECIMAL"),
+            0x8010 => write!(f, "OType::NUM_BIG_UNSIGNED_LONG"),
+            0x8011 => write!(f, "OType::NUM_BIG_NON_NEGATIVE_INTEGER"),
+            0x8012 => write!(f, "OType::NUM_BIG_POSITIVE_INTEGER"),
+            0x8013 => write!(f, "OType::NUM_BIG_NON_POSITIVE_INTEGER"),
+            0x8014 => write!(f, "OType::NUM_BIG_NEGATIVE_INTEGER"),
             v if self.is_lang_string() => write!(f, "OType::LANG_STRING({})", v & 0x3FFF),
             v if self.is_customer_datatype() => {
                 write!(f, "OType::CUSTOMER({})", v & 0x3FFF)
@@ -883,5 +989,45 @@ mod tests {
         assert_eq!(OType::XSD_UNSIGNED_INT.decode_kind(), DecodeKind::I64);
         assert_eq!(OType::XSD_UNSIGNED_SHORT.decode_kind(), DecodeKind::I64);
         assert_eq!(OType::XSD_UNSIGNED_BYTE.decode_kind(), DecodeKind::I64);
+    }
+
+    #[test]
+    fn typed_num_big_family() {
+        for ot in OType::NUM_BIG_TYPED {
+            assert!(ot.is_num_big() && ot.is_num_big_typed(), "{ot:?}");
+            assert_eq!(ot.decode_kind(), DecodeKind::NumBigArena, "{ot:?}");
+            assert!(!ot.o_key_is_globally_identifying(), "{ot:?}");
+            assert!(ot.o_key_is_predicate_identifying(), "{ot:?}");
+            assert!(!ot.is_numeric(), "{ot:?}: handles are not value-ordered");
+            let twin = ot
+                .inline_twin()
+                .expect("a typed NumBig o_type names a datatype");
+            assert_eq!(twin.num_big_twin(), Some(ot), "{ot:?}");
+            assert!(
+                !format!("{ot:?}").starts_with("OType(0x"),
+                "{ot:?} is named"
+            );
+        }
+        assert!(OType::NUM_BIG_OVERFLOW.is_num_big());
+        assert!(!OType::NUM_BIG_OVERFLOW.is_num_big_typed());
+        assert_eq!(OType::NUM_BIG_OVERFLOW.inline_twin(), None);
+        assert_eq!(
+            OType::XSD_DECIMAL_INLINE.num_big_twin(),
+            Some(OType::NUM_BIG_DECIMAL)
+        );
+        // Datatypes whose values always fit inline have no NumBig twin.
+        for ot in [
+            OType::XSD_LONG,
+            OType::XSD_INT,
+            OType::XSD_UNSIGNED_INT,
+            OType::XSD_DOUBLE,
+        ] {
+            assert_eq!(ot.num_big_twin(), None, "{ot:?}");
+        }
+        assert!(OType::range_holds_non_globally_identifying(
+            OType::NUM_BIG_DECIMAL,
+            OType::NUM_BIG_DECIMAL
+        ));
+        assert_eq!(OType::from_u16(0x8015).decode_kind(), DecodeKind::Sentinel);
     }
 }

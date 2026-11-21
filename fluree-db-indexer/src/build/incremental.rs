@@ -2093,27 +2093,50 @@ pub(crate) async fn index_novelty(
                         continue;
                     }
 
-                    let bytes =
-                        fluree_db_binary_index::arena::numbig::write_numbig_arena_to_bytes(arena)
-                            .map_err(|e| {
-                            IndexerError::StorageWrite(format!("numbig arena serialize: {e}"))
-                        })?;
-                    let dict_kind = fluree_db_core::DictKind::NumBig { p_id };
-                    let cid = upload_dict_blob_cached(
-                        content_store.as_ref(),
-                        dict_kind,
-                        &bytes,
-                        "incremental V6 numbig arena uploaded",
+                    // New values are appended: keep the base's closed chunks
+                    // and split the rest.
+                    let pos = ga.numbig.iter().position(|nb| nb.p_id == p_id);
+                    let base_chunks = pos.map(|i| ga.numbig[i].chunks.clone()).unwrap_or_default();
+                    let (closed, start) = pos
+                        .map(|i| ga.numbig[i].closed_chunks())
+                        .unwrap_or_default();
+                    let mut chunks = closed.to_vec();
+                    let tail = fluree_db_binary_index::arena::numbig::write_numbig_arena_chunks(
+                        arena,
+                        start,
+                        config.numbig_chunk_bytes,
                     )
-                    .await?;
+                    .map_err(|e| IndexerError::StorageWrite(format!("numbig chunks: {e}")))?;
+                    for chunk in tail {
+                        let cid = upload_dict_blob_cached(
+                            content_store.as_ref(),
+                            fluree_db_core::DictKind::NumBig { p_id },
+                            &chunk.bytes,
+                            "incremental V6 numbig arena chunk uploaded",
+                        )
+                        .await?;
+                        chunks.push(fluree_db_binary_index::NumBigChunkRef {
+                            cid,
+                            entries: chunk.entries,
+                        });
+                    }
+                    // A re-split chunk can come out byte-identical to the one
+                    // it replaces: only a CID the root no longer names is
+                    // garbage.
+                    let replaced: Vec<ContentId> = base_chunks
+                        .iter()
+                        .map(|c| c.cid.clone())
+                        .filter(|cid| !chunks.iter().any(|c| &c.cid == cid))
+                        .collect();
+                    root_builder.add_replaced_cids(replaced);
 
-                    if let Some(pos) = ga.numbig.iter().position(|(pid, _)| *pid == p_id) {
-                        let old_cid = ga.numbig[pos].1.clone();
-                        root_builder.add_replaced_cids(vec![old_cid]);
-                        ga.numbig[pos].1 = cid;
-                    } else {
-                        ga.numbig.push((p_id, cid));
-                        ga.numbig.sort_by_key(|(pid, _)| *pid);
+                    match pos {
+                        Some(i) => ga.numbig[i].chunks = chunks,
+                        None => {
+                            ga.numbig
+                                .push(fluree_db_binary_index::NumBigArenaRef { p_id, chunks });
+                            ga.numbig.sort_by_key(|nb| nb.p_id);
+                        }
                     }
                 }
             }

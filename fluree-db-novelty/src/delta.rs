@@ -4,23 +4,17 @@
 //! modified between two points, producing a set of [`ConflictKey`]s that
 //! can be checked against branch commits to detect overlapping changes.
 
-use crate::{trace_first_parent_commits_by_id, Result};
+use crate::Result;
 use fluree_db_core::list_index::ListPlace;
 use fluree_db_core::same_t::supersedes;
 use fluree_db_core::{
-    load_commit_by_id, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
+    load_commit_by_id, Commit, ConflictKey, ContentId, ContentStore, Flake, FlakeValue, Sid,
 };
-use futures::TryStreamExt;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeSet, HashMap};
 
-/// Full identity of a fact — every [`Flake`] component except `t` and `op`,
-/// and the datatype of a value the index keys by value alone
-/// ([`FlakeValue::index_keys_by_value`]): storage holds an integer too large
-/// for 64 bits as one fact whatever XSD subtype each op writes it with, so
-/// netting it per term would replay a retraction under one subtype and an
-/// assertion under another at one `t`, which a commit may not hold.
+/// Full identity of a fact — every [`Flake`] component except `t` and `op`.
 ///
 /// This is deliberately NOT `Flake`'s own `Eq`/`Hash` (which ignore `g` by
 /// design — flake identity is graph-independent for index purposes). Netting
@@ -33,7 +27,7 @@ pub struct FactKey {
     s: Sid,
     p: Sid,
     o: FlakeValue,
-    dt: Option<Sid>,
+    dt: Sid,
     lang: Option<String>,
     place: Option<ListPlace>,
 }
@@ -46,7 +40,7 @@ impl FactKey {
             s: flake.s.clone(),
             p: flake.p.clone(),
             o: flake.o.clone(),
-            dt: (!flake.o.index_keys_by_value()).then(|| flake.dt.clone()),
+            dt: flake.dt.clone(),
             lang: flake.m.as_ref().and_then(|m| m.lang.clone()),
             place: flake.m.as_ref().and_then(fluree_db_core::FlakeMeta::place),
         }
@@ -157,37 +151,34 @@ pub async fn delta_keys_of<C: ContentStore + ?Sized>(
     Ok(keys)
 }
 
-/// Walk the first-parent lineage from `head_id` back to `stop_at_t`,
-/// collecting the (subject, predicate, graph) tuples those commits changed
-/// and netting their flakes into the aggregate change set the range applies
-/// (see [`NetChangeAccumulator`] for the netting contract).
+/// The (subject, predicate, graph) tuples `commits` changed, and their
+/// flakes netted into the aggregate change set the range applies (see
+/// [`NetChangeAccumulator`] for the netting contract). `commits` run newest
+/// first, each as the ops it made: a commit staged by value
+/// ([`fluree_db_core::Commit::num_big_typing`]) is read by value first, as
+/// every reader of it does.
 ///
-/// One walk serves every output, so callers that need conflict keys *and*
-/// the change set (merge preview) replay the source chain once instead of
-/// twice. The third element is the union of the range's namespace deltas,
-/// earliest commit winning on a code collision: the codes a consumer needs
-/// to make the change set's terms encodable before the range is committed.
-/// The fourth is every named graph the range's commits list, by IRI: the
-/// graphs a consumer must route before staging the change set elsewhere.
-pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
-    store: C,
-    head_id: ContentId,
-    stop_at_t: i64,
-) -> Result<(
+/// One pass serves every output, so callers that need conflict keys *and*
+/// the change set (merge preview) fold the range once. The third element is
+/// the union of the range's namespace deltas, earliest commit winning on a
+/// code collision: the codes a consumer needs to make the change set's terms
+/// encodable before the range is committed. The fourth is every named graph
+/// the range's commits list, by IRI: the graphs a consumer must route before
+/// staging the change set elsewhere.
+pub fn delta_keys_and_changes_of(
+    commits: impl IntoIterator<Item = Commit>,
+) -> (
     FxHashSet<ConflictKey>,
     Vec<Flake>,
     HashMap<u16, String>,
     BTreeSet<String>,
-)> {
-    let stream = trace_first_parent_commits_by_id(store, head_id, stop_at_t);
-    futures::pin_mut!(stream);
-
+) {
     let mut keys = FxHashSet::default();
     let mut acc = NetChangeAccumulator::default();
     let mut namespace_delta: HashMap<u16, String> = HashMap::new();
     let mut graph_iris: BTreeSet<String> = BTreeSet::new();
 
-    while let Some(commit) = stream.try_next().await? {
+    for commit in commits {
         graph_iris.extend(commit.graph_delta.into_values());
         // Commits stream newest-first, so a plain insert leaves the oldest
         // commit's prefix in place for a colliding code.
@@ -207,7 +198,7 @@ pub async fn compute_delta_keys_and_changes<C: ContentStore + Clone + 'static>(
         }
     }
 
-    Ok((keys, acc.finish(), namespace_delta, graph_iris))
+    (keys, acc.finish(), namespace_delta, graph_iris)
 }
 
 #[cfg(test)]
@@ -378,42 +369,25 @@ mod tests {
         assert_eq!(out.len(), 2);
     }
 
-    /// An integer too large for 64 bits is one fact whatever subtype each op
-    /// writes it with, so a delete under one subtype and a write under
-    /// another net to the write alone. A value that fits 64 bits keeps its
-    /// datatype in the key.
+    /// A value's datatype is part of its fact, for an integer too large for
+    /// 64 bits as for one that fits: a delete under one subtype and a write
+    /// under another are two facts, as the index keeps them.
     #[test]
-    fn a_big_integer_nets_by_value_across_subtypes() {
-        let big = |dt: &str, t: i64, op: bool| {
-            Flake::new(
-                sid("a"),
-                sid("pred"),
-                FlakeValue::BigInt(Box::new(
-                    "123456789012345678901234567890".parse().expect("big"),
-                )),
-                sid(dt),
-                t,
-                op,
-                None,
-            )
-        };
-        let out = net(&[big("integer", 1, false), big("nonNegativeInteger", 2, true)]);
-        assert_eq!(out.len(), 1);
-        assert!(out[0].op);
-        assert_eq!(out[0].dt, sid("nonNegativeInteger"));
-
-        let long = |dt: &str, t: i64, op: bool| {
-            Flake::new(
-                sid("a"),
-                sid("pred"),
-                FlakeValue::Long(7),
-                sid(dt),
-                t,
-                op,
-                None,
-            )
-        };
-        let out = net(&[long("integer", 1, false), long("int", 2, true)]);
-        assert_eq!(out.len(), 2);
+    fn an_integer_nets_per_subtype() {
+        for value in [
+            FlakeValue::BigInt(Box::new(
+                "123456789012345678901234567890".parse().expect("big"),
+            )),
+            FlakeValue::Long(7),
+        ] {
+            let flake = |dt: &str, t: i64, op: bool| {
+                Flake::new(sid("a"), sid("pred"), value.clone(), sid(dt), t, op, None)
+            };
+            let out = net(&[
+                flake("integer", 1, false),
+                flake("nonNegativeInteger", 2, true),
+            ]);
+            assert_eq!(out.len(), 2, "{value:?}");
+        }
     }
 }

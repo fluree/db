@@ -443,11 +443,10 @@ impl SequentialStager {
     /// identity the fold keyed the fact by. Every retraction that stays
     /// retracts the fact as the base stores it, under every term the base
     /// holds it by: an earlier operation may have written the value with
-    /// more detail than the index keeps, and novelty holds the subtypes of
-    /// one big integer apart until the next index build, so the fold's one
-    /// retraction can stand for several stored terms. A fact whose first op
-    /// retracted is that first retraction again, which staging read from the
-    /// base; a big integer's is also asked again, for its other terms.
+    /// more detail than the index keeps (a `main` root keeps no big integer
+    /// subtype), so the fold's one retraction can stand for several stored
+    /// terms. A fact whose first op retracted is that first retraction
+    /// again, which staging read from the base.
     ///
     /// [`CurrentFacts::all_named_by`]: fluree_db_transact::CurrentFacts::all_named_by
     async fn drop_reversed_facts(&mut self) -> Result<()> {
@@ -459,7 +458,7 @@ impl SequentialStager {
         let asked: Vec<usize> = (0..self.folded.len())
             .filter(|&i| {
                 let f = &self.folded[i];
-                f.op != self.first_ops[i] || (!f.op && f.o.index_keys_by_value())
+                f.op != self.first_ops[i]
             })
             .collect();
         if asked.is_empty() {

@@ -9,7 +9,7 @@
 //!
 //! 1. Root type: `IndexRoot` (shared `DictRefs` for dict trees)
 //! 2. Output records: `Vec<RunRecordV2>` + `Vec<u8>` (parallel ops)
-//! 3. `OTypeRegistry` built from root's `datatype_iris` + `language_tags`
+//! 3. `OTypeRegistry` built from the root's `datatype_iris` and the window's
 
 use crate::run_index::resolve::link_synth::SlotValue;
 use fluree_db_binary_index::format::run_record::LIST_INDEX_NONE;
@@ -18,7 +18,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::stream::StreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 
 use fluree_db_binary_index::dict::DictTreeReader;
 use fluree_db_binary_index::format::index_root::IndexRoot;
@@ -273,9 +273,9 @@ pub async fn resolve_incremental_commits_v6(
         "V6 incremental resolve: loaded base root"
     );
 
-    // 2. Build OTypeRegistry from root's datatype and language metadata.
-    let custom_dt_iris = custom_datatype_iris(&root.datatype_iris)?;
-    let o_type_registry = OTypeRegistry::new(&custom_dt_iris);
+    // 2. Check the root's datatype list. The `OTypeRegistry` is built once
+    //    the window's datatypes are known (below).
+    custom_datatype_iris(&root.datatype_iris)?;
 
     // 3. Load subject + string reverse dict trees (same DictRefs as V5).
     let (subject_tree, string_tree, t_dict_load_ms) = {
@@ -334,20 +334,30 @@ pub async fn resolve_incremental_commits_v6(
                 continue;
             }
             let nb_map = shared.numbigs.entry(ga.g_id).or_default();
-            for (p_id, cid) in &ga.numbig {
-                let bytes = fetch_cached_or_get(
-                    cs.as_ref(),
-                    cid,
-                    format!("numbig arena load for g_id={}, p_id={}", ga.g_id, p_id),
+            for nb in &ga.numbig {
+                let fetches: Vec<_> = nb
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        let cs = Arc::clone(&cs);
+                        let cid = chunk.cid.clone();
+                        let context =
+                            format!("numbig arena load for g_id={}, p_id={}", ga.g_id, nb.p_id);
+                        async move { fetch_cached_or_get(cs.as_ref(), &cid, context).await }
+                    })
+                    .collect();
+                let chunks: Vec<Vec<u8>> = futures::stream::iter(fetches)
+                    .buffered(fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_FETCH_WIDTH)
+                    .try_collect()
+                    .await?;
+                let arena = fluree_db_binary_index::arena::numbig::read_numbig_arena_from_chunks(
+                    chunks.iter().map(std::convert::AsRef::as_ref),
                 )
-                .await?;
-                let arena =
-                    fluree_db_binary_index::arena::numbig::read_numbig_arena_from_bytes(&bytes)
-                        .map_err(|e| {
-                            IncrementalResolveError::RootLoad(format!("numbig arena decode: {e}"))
-                        })?;
-                base_numbig_counts.insert((ga.g_id, *p_id), arena.len());
-                nb_map.insert(*p_id, arena);
+                .map_err(|e| {
+                    IncrementalResolveError::RootLoad(format!("numbig arena decode: {e}"))
+                })?;
+                base_numbig_counts.insert((ga.g_id, nb.p_id), arena.len());
+                nb_map.insert(nb.p_id, arena);
             }
         }
 
@@ -515,7 +525,22 @@ pub async fn resolve_incremental_commits_v6(
         "V6 incremental resolve: setup and commit-chain walk finished"
     );
 
-    // 6. Resolve commits into chunk, leaving out what a drop later in the
+    // 6. A commit staged by value retracts a big integer under every subtype
+    // stored before it (`Commit::num_big_typing`), which only a replay from
+    // the first commit knows.
+    for (index, walked) in walked_commits.iter().enumerate() {
+        if Some(index) != derived_index
+            && fluree_db_core::commit::codec::retracts_big_integers_by_value(&walked.bytes)
+                .map_err(|e| IncrementalResolveError::Resolve(e.into()))?
+        {
+            return Err(IncrementalResolveError::NeedsRebuild(format!(
+                "commit {} retracts big integers by value",
+                walked.cid
+            )));
+        }
+    }
+
+    // 6.1 Resolve commits into chunk, leaving out what a drop later in the
     // window took (see `Commit::graph_drops`).
     let lifecycles = window_lifecycles(&walked_commits)?;
     shared.set_graph_floors(graph_floors(&lifecycles, &shared));
@@ -793,6 +818,17 @@ pub async fn resolve_incremental_commits_v6(
         )
         .await
         .map_err(IncrementalResolveError::Io)?
+    };
+    // The registry knows every datatype the window wrote, as a full
+    // rebuild's does: one first written since the base index has an id past
+    // the root's list, and resolved against the root's list alone it read
+    // as a custom datatype (an `xsd:int` decoded as a string id).
+    let o_type_registry = {
+        let reserved = fluree_db_core::DatatypeDictId::RESERVED_COUNT as usize;
+        let custom: Vec<String> = (reserved..shared.datatypes.len() as usize)
+            .filter_map(|i| shared.datatypes.resolve(i as u32).map(str::to_string))
+            .collect();
+        OTypeRegistry::new(&custom)
     };
     let (new_terms, term_watermarks) = {
         let base_refs = root.term_dict.as_ref();
@@ -1644,56 +1680,68 @@ async fn base_attachment_states(
                 let Some(slot) = slots.iter().position(|s| *s == Some(p_id)) else {
                     continue;
                 };
-                state[slot] = match slot {
-                    0 if o_type == iri_ref => Some(SlotValue::Subject(o_key)),
-                    // A read failure or a predicate the dictionary does not
-                    // hold must fail the build: treated as "no predicate", an
-                    // object-only re-point would replay from and to an
-                    // incomplete attachment and leave the old link in place.
-                    1 if o_type == iri_ref => {
-                        let p_id = match predicate_ids.get(&o_key) {
-                            Some(&p_id) => p_id,
-                            None => {
-                                let iri = store.resolve_subject_iri(o_key)?;
-                                let p_id = predicates.get(&iri).ok_or_else(|| {
+                state[slot] =
+                    match slot {
+                        0 if o_type == iri_ref => Some(SlotValue::Subject(o_key)),
+                        // A read failure or a predicate the dictionary does not
+                        // hold must fail the build: treated as "no predicate", an
+                        // object-only re-point would replay from and to an
+                        // incomplete attachment and leave the old link in place.
+                        1 if o_type == iri_ref => {
+                            let p_id = match predicate_ids.get(&o_key) {
+                                Some(&p_id) => p_id,
+                                None => {
+                                    let iri = store.resolve_subject_iri(o_key)?;
+                                    let p_id = predicates.get(&iri).ok_or_else(|| {
+                                        io::Error::new(
+                                            io::ErrorKind::InvalidData,
+                                            format!(
+                                                "reifier {ann} is attached to predicate {iri}, \
+                                             which the dictionary does not hold"
+                                            ),
+                                        )
+                                    })?;
+                                    predicate_ids.insert(o_key, p_id);
+                                    p_id
+                                }
+                            };
+                            Some(SlotValue::Predicate(p_id))
+                        }
+                        // An arena handle names the value only within this graph
+                        // and slot predicate; the window's ops carry the form.
+                        2 if is_lexical_term_object(OType::from_u16(o_type))
+                            || o_type == OType::XSD_DECIMAL_INLINE.as_u16() =>
+                        {
+                            let value = store.decode_value_v3(o_type, o_key, p_id, g_id)?;
+                            let dt = store
+                                .resolve_datatype_sid_for_value(o_type, &value)
+                                .ok_or_else(|| {
                                     io::Error::new(
                                         io::ErrorKind::InvalidData,
                                         format!(
-                                            "reifier {ann} is attached to predicate {iri}, \
-                                             which the dictionary does not hold"
+                                            "reifier {ann}: arena object {value:?} has no datatype"
                                         ),
                                     )
                                 })?;
-                                predicate_ids.insert(o_key, p_id);
-                                p_id
-                            }
-                        };
-                        Some(SlotValue::Predicate(p_id))
-                    }
-                    // An arena handle names the value only within this graph
-                    // and slot predicate; the window's ops carry the form.
-                    2 if is_lexical_term_object(OType::from_u16(o_type))
-                        || o_type == OType::XSD_DECIMAL_INLINE.as_u16() =>
-                    {
-                        let value = store.decode_value_v3(o_type, o_key, p_id, g_id)?;
-                        let (term_o_type, form) = lexical_term_object(&value).ok_or_else(|| {
-                            io::Error::new(
+                            let (term_o_type, form) =
+                                lexical_term_object(&value, &dt).ok_or_else(|| {
+                                    io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("reifier {ann}: arena object {value:?} has no term form"),
                             )
-                        })?;
-                        let id = match store.find_string_id(&form)? {
-                            Some(id) => id,
-                            None => strings.intern(form),
-                        };
-                        Some(SlotValue::Object(ObjectId::Typed {
-                            o_type: term_o_type.as_u16(),
-                            o_key: u64::from(id),
-                        }))
-                    }
-                    2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
-                    _ => None,
-                };
+                                })?;
+                            let id = match store.find_string_id(&form)? {
+                                Some(id) => id,
+                                None => strings.intern(form),
+                            };
+                            Some(SlotValue::Object(ObjectId::Typed {
+                                o_type: term_o_type.as_u16(),
+                                o_key: u64::from(id),
+                            }))
+                        }
+                        2 => Some(SlotValue::Object(ObjectId::Typed { o_type, o_key })),
+                        _ => None,
+                    };
             }
             states.insert((g_id, ann), state);
         }

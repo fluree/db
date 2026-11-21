@@ -158,7 +158,7 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
             let numbig_cid = |root: &fluree_db_binary_index::format::index_root::IndexRoot,
                               g_id: fluree_db_core::GraphId,
                               p_id: u32|
-             -> fluree_db_core::ContentId {
+             -> Vec<fluree_db_core::ContentId> {
                 let ga = root
                     .graph_arenas
                     .iter()
@@ -166,8 +166,8 @@ async fn trigger_index_second_run_uses_incremental_not_full_rebuild() {
                     .unwrap_or_else(|| panic!("missing graph_arenas entry for g_id={g_id}"));
                 ga.numbig
                     .iter()
-                    .find(|(pid, _)| *pid == p_id)
-                    .map(|(_, cid)| cid.clone())
+                    .find(|nb| nb.p_id == p_id)
+                    .map(|nb| nb.cids().cloned().collect())
                     .unwrap_or_else(|| {
                         panic!("missing numbig arena for g_id={g_id}, p_id={p_id} (predicate likely not parsed as BigInt/Decimal)")
                     })

@@ -425,6 +425,7 @@ mod tests {
             o_type_table: IndexRoot::build_o_type_table(&[], &[]),
             ns_split_mode: NsSplitMode::default(),
             decimal_encoding: fluree_db_core::DecimalEncoding::ArenaOnly,
+            num_big_typing: fluree_db_core::NumBigTyping::Declared,
             pool: None,
         }
     }

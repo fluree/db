@@ -176,13 +176,15 @@ Result: nothing is committed. Each value's retraction and re-assertion cancel,
 so the transaction stages no flakes and the ledger stays at t=1. This holds
 for language-tagged values, lists, and the payload's blank nodes too.
 
-This makes upserts safe to retry, including for a value stored with less
-detail than it was written: an integer too large for 64 bits written with an
-XSD subtype such as `xsd:nonNegativeInteger` (the index keeps no subtype). The
-upsert retracts such a value as stored and asserts it as written, and storage
-holds the two as one fact, so they cancel as an unchanged value does. Graph
-sync behaves the same way. (A `dateTime` or `time` keeps six fractional digits
-from the moment it is written; see [Datatypes](../concepts/datatypes.md).)
+This makes upserts safe to retry, including for an integer too large for 64
+bits written with an XSD subtype such as `xsd:nonNegativeInteger`: the index
+keeps the subtype, so the stored term is the one the upsert writes. On a
+ledger whose index an earlier release built (a v4 index, which keeps no such
+subtype), the upsert retracts the value as stored and asserts it as written,
+and storage holds the two as one fact, so they cancel as an unchanged value
+does. Graph sync behaves the same way. (A `dateTime` or `time` keeps six
+fractional digits from the moment it is written; see
+[Datatypes](../concepts/datatypes.md).)
 
 ## Comparison: Insert vs Update vs Upsert
 

@@ -932,11 +932,19 @@ fn decode_fir6_metadata(bytes: &[u8]) -> std::io::Result<LedgerSnapshotMetadata>
         // Matches `write_graph_arenas_v5` in binary-index.
         let _g_id = read_graph_width(bytes, pos, version)?;
 
-        // numbig
+        // numbig: v5 lists each arena's chunks with their entry counts.
         let nb_count = read_u16(bytes, pos)? as usize;
         for _ in 0..nb_count {
             let _p_id = read_u32(bytes, pos)?;
-            skip_cid(bytes, pos)?;
+            if version >= 4 {
+                let chunk_count = read_u32(bytes, pos)?;
+                for _ in 0..chunk_count {
+                    let _entries = read_u32(bytes, pos)?;
+                    skip_cid(bytes, pos)?;
+                }
+            } else {
+                skip_cid(bytes, pos)?;
+            }
         }
         // vectors
         let vec_count = read_u16(bytes, pos)? as usize;

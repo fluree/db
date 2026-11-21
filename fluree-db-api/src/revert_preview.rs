@@ -278,9 +278,17 @@ impl crate::Fluree {
             if opts.include_validation && !opts.conflict_strategy.aborts_on(conflicts.count) {
                 let mut commits = Vec::with_capacity(plan.ordered_commits.len());
                 for commit_id in plan.ordered_commits.iter().rev() {
-                    let mut commit = load_commit_by_id(&branch_store, commit_id).await?;
+                    commits.push(load_commit_by_id(&branch_store, commit_id).await?);
+                }
+                crate::commit_data::Line {
+                    fluree: self,
+                    ledger_id: branch_id.as_str(),
+                    strict: true,
+                }
+                .resolve(&mut commits)
+                .await?;
+                for commit in &mut commits {
                     config.flakes(&mut commit.flakes);
-                    commits.push(commit);
                 }
                 let CollectedCommitData {
                     net: undo,

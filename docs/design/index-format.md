@@ -147,7 +147,7 @@ At a high level the root contains:
     branch + `DLR2` leaves, keyed by prefix and hash; `DTB1` + `DLR1` where an earlier build
     wrote it)
   - forward packs: subject (per namespace) & string (`FPK1`), routed by ID range
-  - optional per-predicate numbig arenas
+  - optional per-predicate numbig arenas: each a list of chunks (see below)
   - optional per-predicate vector arenas (manifest + shards)
 - **Default graph routing** (inline leaf entries per sort order)
 - **Named graph routing** (branch CIDs per sort order per graph)
@@ -701,6 +701,34 @@ A leaf is cut where a `DLR1` leaf of the same entries would reach the target
 size, so it holds the entries it would have held as `DLR1`, in fewer bytes.
 Fenced range reads (encrypted local stores) apply to `DLR1` leaves only: a
 `DLR2` leaf is read whole, once. Readers take either layout, leaf by leaf.
+
+### NumBig arena
+
+Integers beyond `i64` and decimals that don't fit the inline encoding are kept in a
+per-(graph, predicate) arena. A row's `o_key` is the value's handle there, assigned in
+arrival order (so not value-ordered), and its `o_type` names the declared datatype:
+`NUM_BIG_INTEGER`, `NUM_BIG_DECIMAL`, and one per integer subtype that reaches past `i64`
+(`NUM_BIG_UNSIGNED_LONG`, `NUM_BIG_NON_NEGATIVE_INTEGER`, `NUM_BIG_POSITIVE_INTEGER`,
+`NUM_BIG_NON_POSITIVE_INTEGER`, `NUM_BIG_NEGATIVE_INTEGER`; `0x800E`–`0x8014`). The arena
+deduplicates by value, so one handle can be live under several of them. A v4 index types
+every arena row `NUM_BIG_OVERFLOW` (`0x800B`) and reads its datatype from the decoded
+value; a v5 index never writes that o_type.
+
+An arena is stored as chunks of consecutive handles, each an `NBA1` blob:
+
+```text
+[magic: 4B "NBA1"]
+[entry_count: u32 LE]
+entry := [repr_tag: u8 (0 BigInt, 1 BigDec)] [repr_len: u32 LE] [repr_bytes]
+```
+
+The root lists each arena as `p_id: u32`, `chunk_count: u32`, then per chunk
+`entries: u32` and its CID. A v4 root lists one CID per arena with no count. Chunks are
+cut greedily: one closes when the next entry would take it past the target size (16 MiB;
+an entry larger than that is a chunk of its own). A closed chunk never changes as values
+are appended, so an incremental build keeps every chunk but the last and splits from the
+start of the last one. The counts let a reader find the chunk holding a handle without
+decoding the others.
 
 ## Endianness and encoding conventions
 

@@ -9,17 +9,22 @@ use crate::Sid;
 /// Reserved datatypes hold fixed dictionary IDs. Every other datatype takes
 /// a new ID the first time a ledger uses it, up to [`DatatypeDictId::MAX`].
 pub fn is_reserved_datatype(dt: &Sid) -> bool {
+    // Compare the canonical IRI with `RESERVED_IRIS`, so this check agrees
+    // with that list by construction.
+    known_datatype(dt).is_some_and(|k| DatatypeDictId::RESERVED_IRIS.contains(&k.canonical_form()))
+}
+
+/// The datatype Fluree knows `dt` as, in any of the forms a datatype `Sid`
+/// takes; `None` for a custom datatype.
+pub fn known_datatype(dt: &Sid) -> Option<fluree_vocab::datatype::KnownDatatype> {
     use fluree_vocab::{datatype::KnownDatatype, namespaces};
-    let known = match dt.namespace_code {
+    match dt.namespace_code {
         // The full IRI lives in `name` for these two.
         namespaces::EMPTY | namespaces::OVERFLOW => {
             KnownDatatype::from_canonical_form(dt.name_str())
         }
         code => KnownDatatype::from_ns_and_local(code, dt.name_str()),
-    };
-    // Compare the canonical IRI with `RESERVED_IRIS`, so this check agrees
-    // with that list by construction.
-    known.is_some_and(|k| DatatypeDictId::RESERVED_IRIS.contains(&k.canonical_form()))
+    }
 }
 
 /// Whether `dt` is `xsd:string`, in any of the forms a datatype `Sid` takes.

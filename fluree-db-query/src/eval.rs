@@ -265,11 +265,36 @@ impl Expression {
         // Return it directly so reuse preserves the structured value — e.g.
         // `UNWIND ?listVar`, the collect→unwind round-trip, and nesting a map
         // var inside another value (`WITH properties(n) AS p RETURN {props: p}`).
-        // Scalars fall through to the comparable path so normalization is
-        // unchanged.
+        // Other scalars than integers fall through to the comparable path so
+        // their normalization is unchanged.
         if let Expression::Var(v) = self {
-            if let Some(b @ (Binding::List(_) | Binding::Map(_))) = row.get(*v) {
-                return Ok(b.clone());
+            match row.get(*v) {
+                Some(b @ (Binding::List(_) | Binding::Map(_))) => return Ok(b.clone()),
+                // An integer forwards its term. The comparable path keeps its
+                // value but no XSD subtype, so `BIND(?o AS ?v)` over an
+                // `xsd:unsignedLong` bound an `xsd:integer`: another term,
+                // which a DELETE naming `?v` would not retract (#2058). Like
+                // every computed binding it carries no fact's `t` or op,
+                // however the source is held.
+                Some(Binding::Lit {
+                    val: val @ (FlakeValue::Long(_) | FlakeValue::BigInt(_)),
+                    dtc,
+                    ..
+                }) => return Ok(integer_term(val.clone(), dtc.clone())),
+                Some(b @ Binding::EncodedLit { o_kind, .. })
+                    if *o_kind == fluree_db_core::ObjKind::NUM_INT.as_u8()
+                        || *o_kind == fluree_db_core::ObjKind::NUM_BIG.as_u8() =>
+                {
+                    let terms = ctx.and_then(ExecutionContext::term_view);
+                    if let Some(terms) = terms {
+                        if let Binding::Lit { val, dtc, .. } =
+                            crate::group_aggregate::materialize_encoded(b, Some(&terms))?
+                        {
+                            return Ok(integer_term(val, dtc));
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -407,6 +432,18 @@ pub fn passes_filters(
 /// sibling). Returns `None` for anything that is not a stored-float binding —
 /// including a decode failure on the encoded path, which falls back to the
 /// generic (error-raising) evaluation.
+/// An integer term bound by an expression: its value and datatype, and no
+/// fact's `t`, op or predicate.
+fn integer_term(val: FlakeValue, dtc: DatatypeConstraint) -> Binding {
+    Binding::Lit {
+        val,
+        dtc,
+        t: None,
+        op: None,
+        p_id: None,
+    }
+}
+
 pub(crate) fn stored_float_f64<R: RowAccess>(
     row: &R,
     var: VarId,
@@ -860,6 +897,66 @@ mod tests {
     use crate::binding::Batch;
     use crate::var_registry::VarId;
     use fluree_db_core::{FlakeValue, Sid};
+
+    /// A bare variable bound to an integer evaluates to its term, and to none
+    /// of the fact's metadata, whether the row holds the value decoded or
+    /// encoded: `T` of a `BIND` alias is unbound either way.
+    #[test]
+    fn an_integer_variable_evaluates_to_its_term_without_fact_metadata() {
+        use crate::binding::BindingRow;
+        use crate::var_registry::VarRegistry;
+        use fluree_db_binary_index::arena::numbig::NumBigArena;
+        use fluree_db_binary_index::BinaryIndexStore;
+        use fluree_db_core::o_type::OType;
+        use fluree_db_core::{list_index, LedgerSnapshot};
+
+        const P_ID: u32 = 7;
+        let big: num_bigint::BigInt = "18446744073709551615".parse().unwrap();
+        let mut arena = NumBigArena::new();
+        let handle = arena.get_or_insert_bigint(&big);
+        let mut store = BinaryIndexStore::empty();
+        store.set_num_big_typing_for_test(fluree_db_core::NumBigTyping::ByValue);
+        store.set_numbig_arena_for_test(0, P_ID, arena);
+        let snapshot = LedgerSnapshot::genesis("test:main");
+        let vars = VarRegistry::new();
+        let ctx = ExecutionContext::new(&snapshot, &vars).with_binary_store(Arc::new(store), 0);
+
+        let value = FlakeValue::BigInt(Box::new(big));
+        let schema = [VarId(0)];
+        let decoded = [Binding::from_object_with_t_op(
+            value.clone(),
+            Sid::xsd_integer(),
+            None,
+            42,
+            true,
+        )];
+        let encoded = [crate::object_binding::late_materialized_object_binding(
+            OType::NUM_BIG_OVERFLOW.as_u16(),
+            u64::from(handle),
+            P_ID,
+            42,
+            list_index::NONE,
+            None,
+            0,
+        )
+        .expect("an encoded big integer")];
+        let var = Expression::Var(VarId(0));
+        for (form, row) in [("decoded", &decoded), ("encoded", &encoded)] {
+            assert_eq!(row[0].t(), Some(42), "{form}: the fact's t");
+            let bound = var
+                .try_eval_to_binding(&BindingRow::new(&schema, row), Some(&ctx))
+                .unwrap();
+            assert_eq!((bound.t(), bound.op()), (None, None), "{form}: {bound:?}");
+            match bound {
+                Binding::Lit {
+                    val,
+                    dtc: DatatypeConstraint::Explicit(dt),
+                    ..
+                } => assert_eq!((val, dt), (value.clone(), Sid::xsd_integer()), "{form}"),
+                other => panic!("{form}: {other:?}"),
+            }
+        }
+    }
 
     fn make_test_batch() -> Batch {
         let schema: Arc<[crate::var_registry::VarId]> =

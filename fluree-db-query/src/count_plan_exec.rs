@@ -3803,7 +3803,7 @@ fn so_rows<'a>(ec: &ExecCtx<'a, '_>, pred: &Ref) -> Result<Option<SoRows<'a>>> {
 ///   overlay flake failed to translate;
 /// - either predicate fails
 ///   [`predicate_unsafe_for_cross_predicate_o_key_join`] (#1652): an
-///   arena-backed object's `o_key` (`NUM_BIG_OVERFLOW`, `VECTOR`) is a
+///   arena-backed object's `o_key` (NumBig, `VECTOR`) is a
 ///   per-predicate arena handle, so cross-predicate `o_key` equality is not
 ///   value equality — equal values under the two predicates would never
 ///   match, and equal handles naming different values would; list rows join

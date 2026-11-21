@@ -430,13 +430,14 @@ fn count_rows_for_predicate_numeric_compare_post(
 /// o_types whose `o_key` order equals numeric order, so a `?o <cmp> K` scan can
 /// compare encoded keys directly:
 /// - **all inline integer subtypes** (`is_integer`): every inline integer is
-///   `encode_i64`-ordered; values that overflow `i64` carry the arena
-///   `NUM_BIG_OVERFLOW` o_type instead, so an integer-subtype o_type guarantees
-///   an inline, order-preserving key.
+///   `encode_i64`-ordered; values that overflow `i64` carry a NumBig arena
+///   o_type instead, so an integer-subtype o_type guarantees an inline,
+///   order-preserving key.
 /// - **`xsd:double` / `xsd:float`**: `encode_f64` is total-order.
 /// - **inline decimals** (`XSD_DECIMAL_INLINE`): order-preserving base-10 float.
 ///
-/// Arena `NUM_BIG_OVERFLOW` is numeric but equality-only, so it is excluded.
+/// The NumBig o_types ([`OType::is_num_big`]) are numeric but equality-only,
+/// so they are excluded.
 pub(crate) fn otype_okey_order_comparable(ot: OType) -> bool {
     ot.is_integer()
         || ot == OType::XSD_DOUBLE
@@ -447,12 +448,11 @@ pub(crate) fn otype_okey_order_comparable(ot: OType) -> bool {
 /// True if this o_type is numeric but NOT o_key-order-comparable, so rows of it
 /// force the numeric-COUNT lanes to defer. With all inline integer subtypes,
 /// `xsd:double`/`xsd:float`, and inline decimals now comparable
-/// ([`otype_okey_order_comparable`]), this is the arena `NUM_BIG_OVERFLOW` lane
+/// ([`otype_okey_order_comparable`]), this is the NumBig arena lanes
 /// (equality-only) and the dormant lossy-f64 `XSD_DECIMAL` lane.
 fn otype_unsupported_numeric(raw: u16) -> bool {
     let ot = OType::from_u16(raw);
-    (ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW || ot == OType::XSD_DECIMAL_INLINE)
-        && !otype_okey_order_comparable(ot)
+    (ot.is_numeric() || ot.is_num_big()) && !otype_okey_order_comparable(ot)
 }
 
 /// The single `o_type` shared by every row of `p_id` in POST order, or `None`
@@ -833,7 +833,7 @@ fn count_numeric_compare_overlay_parallel(
             match tk_for(ot) {
                 Some(Some(_)) => {}            // comparable, threshold encodes → proceed
                 Some(None) => return Ok(None), // comparable family but threshold didn't encode
-                None if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => return Ok(None),
+                None if ot.is_numeric() || ot.is_num_big() => return Ok(None),
                 None => {} // non-numeric uniform → every row a non-match, fine
             }
         } else if otype_unsupported_numeric(min_ot) || otype_unsupported_numeric(max_ot) {
@@ -865,7 +865,7 @@ fn count_numeric_compare_overlay_parallel(
                     saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
-                None if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
+                None if ot.is_numeric() || ot.is_num_big() => {
                     saw_unsupported_numeric.store(true, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
@@ -1360,8 +1360,8 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// when the count cannot be established without the general pipeline.
 ///
 /// The 10-byte OPST lead is `o_type(2) + o_key(8)` and stops immediately before
-/// `p_id` (bytes `[14..18]`). For a `NUM_BIG_OVERFLOW` row that lead is a
-/// per-predicate arena handle, so the first big value under one predicate and
+/// `p_id` (bytes `[14..18]`). For a NumBig row that lead is a per-predicate
+/// arena handle, so the first big value under one predicate and
 /// the first under another share a lead and collapse into one group — see
 /// [`OType::o_key_is_globally_identifying`]. Because handles are allocated from
 /// 0 within each predicate, the result would be the *max* over predicates of
@@ -1408,37 +1408,44 @@ pub(crate) fn count_distinct_objects(
     Ok(Some(walk.count.saturating_add(exact)))
 }
 
-/// Exact distinct-term count over the graph's `NUM_BIG_OVERFLOW` objects,
-/// answered from the arenas rather than the rows.
+/// Exact distinct-term count over the graph's NumBig objects, answered from
+/// the arenas rather than the rows.
+///
+/// A NumBig term is its o_type and its value: the o_type names the datatype
+/// (`xsd:unsignedLong` and `xsd:integer` of one value are two terms), and the
+/// value is an arena entry. A `main` root's by-value o_type holds both kinds;
+/// there the value's own kind (BigInt or BigDecimal) is its datatype.
 ///
 /// Every NumBig arena is resident in memory from store open and keyed on a
-/// normalized value repr, so the union of the arenas' entries *is* the set of
-/// distinct big-numeric terms the index has ever held — with one catch: an
-/// arena keeps a handle for a value whose rows have since been retracted (a
-/// full rebuild replays retractions through the same insert path), so arena
-/// membership alone over-counts. Liveness is proved per predicate from POST
-/// directory metadata: the number of distinct live handles under `p` is the
-/// predicate's lead-group count over its NumBig leaflets, and when that equals
-/// the arena's size every entry is live and nothing is read beyond directories.
-/// Only a predicate with stale handles pays for a column read, and only over
-/// its own NumBig rows, to learn *which* handles survive.
+/// normalized value repr, so the union of the arenas' entries holds every
+/// value the index has ever held — with two catches. An arena keeps a handle
+/// for a value whose rows have since been retracted (a full rebuild replays
+/// retractions through the same insert path), and one handle can be live
+/// under several o_types. Liveness is proved per predicate from POST directory
+/// metadata: the number of distinct live `(o_type, handle)` pairs under `p` is
+/// the predicate's lead-group count over its NumBig leaflets. When those pairs
+/// share one o_type and their count equals the arena's size, every entry is
+/// live under that o_type and nothing is read beyond directories. Any other
+/// predicate pays for a column read over its own NumBig rows, to learn which
+/// pairs survive.
 ///
-/// Dedup keys on the normalized repr, exactly as the general pipeline keys
-/// these rows (normalized decimal lexical, BigInt separate from BigDecimal), so
-/// the same value under two predicates — two handles in two arenas — and a
-/// legacy arena's scale-variant duplicates each count once. A BigInt entry that
-/// happens to fit `i64` is keyed as a big value here and as `Long` by the
-/// general pipeline; the resolver never routes such a value to the arena, so
-/// this cannot arise on a written index.
+/// Dedup keys on the o_type and the normalized repr, exactly as the general
+/// pipeline keys these rows (normalized decimal lexical, BigInt separate from
+/// BigDecimal), so the same value under two predicates — two handles in two
+/// arenas — and a legacy arena's scale-variant duplicates each count once. A
+/// BigInt entry that happens to fit `i64` is keyed as a big value here and as
+/// `Long` by the general pipeline; the resolver never routes such a value to
+/// the arena, so this cannot arise on a written index.
 ///
 /// Returns `None` when the index is inconsistent (NumBig rows with no arena to
 /// decode them) or when [`numbig_exact_max_entries`] is set and exceeded.
 ///
 /// Keys are built and sorted on every execution; the count is not cached.
 /// Before cross-predicate dedup, the vector holds one key per live arena
-/// entry, including repeated values across predicates. On typical 64-bit targets
-/// each key occupies 48 bytes, plus allocations for wide values and temporary
-/// buffers. Legacy arenas also pay for normalization during key construction.
+/// entry and o_type, including repeated values across predicates. On typical
+/// 64-bit targets each key occupies 56 bytes, plus allocations for wide values
+/// and temporary buffers. Legacy arenas also pay for normalization during key
+/// construction.
 fn count_distinct_numbig_objects(
     store: &BinaryIndexStore,
     g_id: GraphId,
@@ -1458,29 +1465,31 @@ fn count_distinct_numbig_objects(
         return Ok(None);
     }
 
-    let mut keys: Vec<NumBigDistinctKey> = Vec::new();
+    let range = NumBigRange::of(store);
+    let mut keys: Vec<(u16, NumBigDistinctKey)> = Vec::new();
     for (p_id, arena) in arenas {
         let normalized = arena.values_are_normalized();
-        let live = count_live_numbig_handles(store, g_id, p_id, tracker)?;
+        let (live, types) = count_live_numbig_handles(store, g_id, p_id, range, tracker)?;
         if live == 0 {
             continue;
         }
-        if live == arena.len() as u64 {
+        if types.count_ones() == 1 && live == arena.len() as u64 {
+            let o_type = range.lo + types.trailing_zeros() as u16;
             keys.par_extend(
                 arena
                     .values()
                     .par_iter()
-                    .map(|v| NumBigDistinctKey::from_stored(v, normalized)),
+                    .map(|v| (o_type, NumBigDistinctKey::from_stored(v, normalized))),
             );
             continue;
         }
-        let handles = live_numbig_handles(store, g_id, p_id, tracker)?;
-        let mapped: Result<Vec<NumBigDistinctKey>> = handles
+        let pairs = live_numbig_handles(store, g_id, p_id, range, tracker)?;
+        let mapped: Result<Vec<(u16, NumBigDistinctKey)>> = pairs
             .par_iter()
-            .map(|&h| {
+            .map(|&(o_type, h)| {
                 arena
                     .get_by_handle(h)
-                    .map(|v| NumBigDistinctKey::from_stored(v, normalized))
+                    .map(|v| (o_type, NumBigDistinctKey::from_stored(v, normalized)))
                     .ok_or_else(|| {
                         QueryError::Internal(format!(
                             "NumBig handle {h} beyond arena for g_id={g_id}, p_id={p_id}"
@@ -1552,12 +1561,41 @@ fn i128_from_signed_le(bytes: &[u8]) -> Option<i128> {
     Some(i128::from_le_bytes(buf))
 }
 
-/// How one predicate's POST leaflet relates to the `NUM_BIG_OVERFLOW` range.
+/// The NumBig o_types of a store's typing, as an inclusive o_type range. Every
+/// o_type in it is a NumBig one, so a row's o_type alone says whether it holds
+/// an arena handle.
+#[derive(Clone, Copy)]
+struct NumBigRange {
+    lo: u16,
+    hi: u16,
+}
+
+impl NumBigRange {
+    fn of(store: &BinaryIndexStore) -> Self {
+        let (lo, hi) = store.num_big_typing().o_type_range();
+        Self {
+            lo: lo.as_u16(),
+            hi: hi.as_u16(),
+        }
+    }
+
+    fn contains(self, o_type: u16) -> bool {
+        (self.lo..=self.hi).contains(&o_type)
+    }
+
+    /// `o_type`'s bit in a set of this range's o_types.
+    fn bit(self, o_type: u16) -> u16 {
+        1 << (o_type - self.lo)
+    }
+}
+
+/// How one predicate's POST leaflet relates to the NumBig o_types.
 enum NumBigLeaflet {
     /// Holds no NumBig row, or belongs to another predicate.
     Outside,
-    /// Every row is NumBig: `lead_group_count` is its distinct-handle count.
-    Pure,
+    /// Every row has this NumBig o_type: `lead_group_count` is its
+    /// distinct-handle count.
+    Pure(u16),
     /// Straddles the NumBig range (or predates `lead_group_count`): rows
     /// must be decoded to find its NumBig handles.
     Decode,
@@ -1566,15 +1604,15 @@ enum NumBigLeaflet {
 fn classify_numbig_leaflet(
     entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
     p_id: u32,
+    range: NumBigRange,
 ) -> NumBigLeaflet {
     if entry.row_count == 0 || entry.p_const != Some(p_id) {
         return NumBigLeaflet::Outside;
     }
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
     match entry.o_type_const {
-        Some(o_type) if o_type == numbig => {
+        Some(o_type) if range.contains(o_type) => {
             return if entry.lead_group_count > 0 {
-                NumBigLeaflet::Pure
+                NumBigLeaflet::Pure(o_type)
             } else {
                 NumBigLeaflet::Decode
             };
@@ -1586,22 +1624,22 @@ fn classify_numbig_leaflet(
     // interval bounds every o_type its rows hold.
     let lo = read_ordered_key_v2(RunSortOrder::Post, &entry.first_key).o_type;
     let hi = read_ordered_key_v2(RunSortOrder::Post, &entry.last_key).o_type;
-    if lo <= numbig && numbig <= hi {
+    if lo <= range.hi && range.lo <= hi {
         NumBigLeaflet::Decode
     } else {
         NumBigLeaflet::Outside
     }
 }
 
-/// The POST group of NumBig handle `handle` under `p_id`.
-fn numbig_group(p_id: u32, handle: u64) -> LiveGroup {
+/// The POST group of NumBig handle `handle` under `p_id` and `o_type`.
+fn numbig_group(p_id: u32, o_type: u16, handle: u64) -> LiveGroup {
     let rec = RunRecordV2 {
         s_id: SubjectId(0),
         o_key: handle,
         p_id,
         t: 0,
         o_i: LIST_INDEX_NONE,
-        o_type: OType::NUM_BIG_OVERFLOW.as_u16(),
+        o_type,
         g_id: 0,
     };
     let mut key = [0u8; fluree_db_binary_index::format::run_record_v2::ORDERED_KEY_V2_SIZE];
@@ -1613,16 +1651,18 @@ fn numbig_group(p_id: u32, handle: u64) -> LiveGroup {
     LiveGroup::of_key(RunSortOrder::Post, &key)
 }
 
-/// Distinct NumBig handles in one decoded POST leaflet: `(count, first, last)`
-/// over its NumBig rows only, or `None` when it holds none. Rows are sorted by
-/// `(o_type, o_key, …)` within the predicate, so equal handles are adjacent.
+/// The distinct NumBig `(o_type, handle)` pairs of one decoded POST leaflet:
+/// their count, the first and last, and the set of o_types among them, or
+/// `None` when it holds none. Rows are sorted by `(o_type, o_key, …)` within
+/// the predicate, so equal pairs are adjacent.
+#[allow(clippy::type_complexity)]
 fn decode_numbig_handle_run(
     handle: &dyn fluree_db_binary_index::read::leaf_access::LeafHandle,
     leaflet_idx: usize,
     o_type_const: Option<u16>,
+    range: NumBigRange,
     tracker: &fluree_db_core::Tracker,
-) -> Result<Option<(u64, u64, u64)>> {
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
+) -> Result<Option<(u64, (u16, u64), (u16, u64), u16)>> {
     let batch = crate::fast_path_common::load_leaflet_columns_charged(
         handle,
         leaflet_idx,
@@ -1632,33 +1672,41 @@ fn decode_numbig_handle_run(
     )?;
     let o_type_default = o_type_const.unwrap_or(0);
     let mut count = 0u64;
+    let mut types = 0u16;
     let mut first = None;
     let mut prev = None;
     for row in 0..batch.row_count {
-        if batch.o_type.get_or(row, o_type_default) != numbig {
+        let o_type = batch.o_type.get_or(row, o_type_default);
+        if !range.contains(o_type) {
             continue;
         }
-        let k = batch.o_key.get(row);
-        if prev != Some(k) {
+        let pair = (o_type, batch.o_key.get(row));
+        if prev != Some(pair) {
             count += 1;
-            prev = Some(k);
-            first.get_or_insert(k);
+            types |= range.bit(o_type);
+            prev = Some(pair);
+            first.get_or_insert(pair);
         }
     }
-    Ok(first.zip(prev).map(|(f, l)| (count, f, l)))
+    Ok(first.zip(prev).map(|(f, l)| (count, f, l, types)))
 }
 
-/// Number of distinct NumBig handles with a live row under `p_id`, from POST
-/// leaflet directories: `lead_group_count` over type-pure NumBig leaflets with
-/// seam dedup on the handle, decoding only a leaflet that straddles the NumBig
-/// range or predates `lead_group_count`. Compared against the arena's size, this
-/// says whether every arena entry is still live without reading a row.
+/// Number of distinct NumBig `(o_type, handle)` pairs with a live row under
+/// `p_id`, and the set of o_types among them, from POST leaflet directories:
+/// `lead_group_count` over type-pure NumBig leaflets with seam dedup on the
+/// pair, decoding only a leaflet that straddles the NumBig range or predates
+/// `lead_group_count`. When the pairs share one o_type, comparing the count
+/// with the arena's size says whether every arena entry is still live without
+/// reading a row.
 fn count_live_numbig_handles(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    range: NumBigRange,
     tracker: &fluree_db_core::Tracker,
-) -> Result<u64> {
+) -> Result<(u64, u16)> {
+    use std::sync::atomic::{AtomicU16, Ordering};
+    let types = AtomicU16::new(0);
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     let walk = distinct_lead_walk(
         store,
@@ -1666,9 +1714,12 @@ fn count_live_numbig_handles(
         leaves,
         tracker,
         |leaf, idx, entry| {
-            Ok(match classify_numbig_leaflet(entry, p_id) {
+            Ok(match classify_numbig_leaflet(entry, p_id, range) {
                 NumBigLeaflet::Outside => Role::Skip,
-                NumBigLeaflet::Pure => Role::Groups,
+                NumBigLeaflet::Pure(o_type) => {
+                    types.fetch_or(range.bit(o_type), Ordering::Relaxed);
+                    Role::Groups
+                }
                 NumBigLeaflet::Decode => {
                     let handle = store
                         .open_leaf_handle(&leaf.leaf_cid, leaf.sidecar_cid.as_ref(), false)
@@ -1677,13 +1728,17 @@ fn count_live_numbig_handles(
                         handle.as_ref(),
                         idx,
                         entry.o_type_const,
+                        range,
                         tracker,
                     )? {
-                        Some((count, first, last)) => Role::Run {
-                            count,
-                            first: numbig_group(p_id, first),
-                            last: numbig_group(p_id, last),
-                        },
+                        Some((count, first, last, run_types)) => {
+                            types.fetch_or(run_types, Ordering::Relaxed);
+                            Role::Run {
+                                count,
+                                first: numbig_group(p_id, first.0, first.1),
+                                last: numbig_group(p_id, last.0, last.1),
+                            }
+                        }
                         None => Role::Skip,
                     }
                 }
@@ -1691,29 +1746,29 @@ fn count_live_numbig_handles(
         },
     )?;
     // A leaflet without `lead_group_count` is decoded, so the walk never
-    // declines. Were it to, fewer live handles than arena entries sends the
-    // caller to the exact column read, which is correct either way.
-    Ok(walk.map_or(0, |w| w.count))
+    // declines. Were it to, a zero count with no o_type sends the caller past
+    // the predicate, and any other mismatch to the exact column read.
+    Ok((walk.map_or(0, |w| w.count), types.into_inner()))
 }
 
-/// The set of NumBig handles with a live row under `p_id`, sorted and
-/// deduplicated. Reads the `o_key` column (plus `o_type` for a straddling
-/// leaflet) over the predicate's NumBig leaflets only — the fallback for a
-/// predicate whose arena holds retracted values.
+/// The set of NumBig `(o_type, handle)` pairs with a live row under `p_id`,
+/// sorted and deduplicated. Reads the `o_type` and `o_key` columns over the
+/// predicate's NumBig leaflets only — the fallback for a predicate whose arena
+/// holds retracted values, or whose handles are live under several o_types.
 fn live_numbig_handles(
     store: &BinaryIndexStore,
     g_id: GraphId,
     p_id: u32,
+    range: NumBigRange,
     tracker: &fluree_db_core::Tracker,
-) -> Result<Vec<u32>> {
+) -> Result<Vec<(u16, u32)>> {
     let leaves = leaf_entries_for_predicate(store, g_id, RunSortOrder::Post, p_id);
     if leaves.is_empty() {
         return Ok(Vec::new());
     }
-    let numbig = OType::NUM_BIG_OVERFLOW.as_u16();
 
-    let map = |chunk: &[LeafEntry]| -> Result<Option<Vec<u32>>> {
-        let mut handles: Vec<u32> = Vec::new();
+    let map = |chunk: &[LeafEntry]| -> Result<Option<Vec<(u16, u32)>>> {
+        let mut pairs: Vec<(u16, u32)> = Vec::new();
         for leaf_entry in chunk {
             let dir = store
                 .open_leaf_dir(&leaf_entry.leaf_cid)
@@ -1723,7 +1778,10 @@ fn live_numbig_handles(
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| {
-                    !matches!(classify_numbig_leaflet(e, p_id), NumBigLeaflet::Outside)
+                    !matches!(
+                        classify_numbig_leaflet(e, p_id, range),
+                        NumBigLeaflet::Outside
+                    )
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -1744,28 +1802,29 @@ fn live_numbig_handles(
                 )?;
                 let o_type_default = entry.o_type_const.unwrap_or(0);
                 for row in 0..batch.row_count {
-                    if batch.o_type.get_or(row, o_type_default) != numbig {
+                    let o_type = batch.o_type.get_or(row, o_type_default);
+                    if !range.contains(o_type) {
                         continue;
                     }
-                    let h = batch.o_key.get(row) as u32;
-                    if handles.last() != Some(&h) {
-                        handles.push(h);
+                    let pair = (o_type, batch.o_key.get(row) as u32);
+                    if pairs.last() != Some(&pair) {
+                        pairs.push(pair);
                     }
                 }
             }
         }
-        Ok(Some(handles))
+        Ok(Some(pairs))
     };
 
     let parallel = leaves.len() >= crate::fast_path_common::parallel_dir_walk_min_leaves();
-    let mut handles = parallel_leaf_chunk_reduce(leaves, parallel, map, |mut l, r| {
+    let mut pairs = parallel_leaf_chunk_reduce(leaves, parallel, map, |mut l, r| {
         l.extend(r);
         l
     })?
     .unwrap_or_default();
-    handles.sort_unstable();
-    handles.dedup();
-    Ok(handles)
+    pairs.sort_unstable();
+    pairs.dedup();
+    Ok(pairs)
 }
 
 /// Distinct groups of `order` over the graph's dedicated tree. With
@@ -1971,9 +2030,9 @@ pub fn count_literal_objects_operator(
 ///
 /// Returns `None` (caller falls back to the leaflet walk) unless the stats
 /// provably attribute every row in the graph:
-/// - an `UNKNOWN` bucket means unattributable rows — the index-build mapping
-///   sends both blank-node objects (not literals) and NumBig overflow values
-///   (literals) to `UNKNOWN`;
+/// - an `UNKNOWN` bucket means unattributable rows — the index build sends a
+///   `main` root's by-value NumBig values, geo points, triple terms and
+///   custom datatypes there;
 /// - each property's datatype counts must sum to its row count, and property
 ///   counts must sum to the graph's flake total (guards stale/partial stats);
 /// - a zero result defers so the leaflet walk (cheap when empty) confirms it.

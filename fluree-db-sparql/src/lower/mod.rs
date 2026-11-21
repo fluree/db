@@ -1499,6 +1499,53 @@ mod tests {
         assert_eq!(n.to_string(), "123456789012345678901234567890");
     }
 
+    /// A constant of any XSD integer subtype is the number it spells, as a
+    /// write stores it under that subtype, and one outside the subtype's
+    /// range is refused as a write refuses it.
+    #[test]
+    fn test_typed_integer_subtype_literal_is_its_number() {
+        let lower = |lexical: &str, datatype: &str| {
+            lower_query(&format!(
+                "PREFIX ex: <http://example.org/>
+                 PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+                 SELECT ?s WHERE {{ ?s ex:n \"{lexical}\"^^xsd:{datatype} }}"
+            ))
+        };
+        for (lexical, datatype) in [
+            ("5", "short"),
+            ("5", "unsignedLong"),
+            ("5", "nonNegativeInteger"),
+            ("-5", "negativeInteger"),
+        ] {
+            let query = lower(lexical, datatype).unwrap();
+            let want = lexical.parse::<i64>().unwrap();
+            assert!(
+                matches!(object_of(&query, 0), Term::Value(fluree_db_core::FlakeValue::Long(n)) if *n == want),
+                "{lexical}^^xsd:{datatype}: {:?}",
+                object_of(&query, 0)
+            );
+        }
+        let query = lower("18446744073709551615", "unsignedLong").unwrap();
+        assert!(matches!(
+            object_of(&query, 0),
+            Term::Value(fluree_db_core::FlakeValue::BigInt(_))
+        ));
+        for (lexical, datatype) in [
+            ("70000", "short"),
+            ("-1", "unsignedLong"),
+            ("0", "positiveInteger"),
+            ("x", "short"),
+        ] {
+            assert!(
+                matches!(
+                    lower(lexical, datatype),
+                    Err(LowerError::InvalidLiteral { .. })
+                ),
+                "{lexical}^^xsd:{datatype}"
+            );
+        }
+    }
+
     #[test]
     fn test_bare_decimal_literal_is_exact() {
         let query = lower_query(

@@ -297,6 +297,10 @@ impl DatatypeDictId {
     /// A custom datatype is persisted as `OType::customer_datatype(id)`,
     /// whose payload is 14 bits wide.
     pub const MAX: u16 = crate::o_type::OType::MAX_PAYLOAD;
+    /// Not a datatype: the id a by-value NumBig `EncodedLit` (a `main` root's
+    /// `OType::NUM_BIG_OVERFLOW` row) carries, whose datatype is read from
+    /// its decoded value. Past [`Self::MAX`], so no stored datatype has it.
+    pub const NUM_BIG_BY_VALUE: Self = Self(u16::MAX);
 
     /// Convert a datatype dictionary ID to a `DatatypeDictId`.
     ///

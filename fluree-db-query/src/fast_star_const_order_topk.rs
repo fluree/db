@@ -358,7 +358,7 @@ where
 /// o_type this lane can't compare by `o_key` against this threshold —
 /// `XSD_INTEGER`, `XSD_DOUBLE`, and order-preserving inline decimals
 /// (`XSD_DECIMAL_INLINE`, when the threshold encodes to a decimal key) are
-/// comparable. Arena `NUM_BIG_OVERFLOW` (and decimals under a double threshold)
+/// comparable. Arena NumBig o_types (and decimals under a double threshold)
 /// would be silently dropped by a naive `_ => false`, undercounting the filter;
 /// declining keeps the result correct via the general path.
 fn filter_subjects_by_numeric_gt(
@@ -430,7 +430,7 @@ fn filter_subjects_by_numeric_gt(
                 },
                 // Numeric but not o_key-comparable (arena big numerics, other
                 // integer widths/floats): can't decide here.
-                _ if ot.is_numeric() || ot == OType::NUM_BIG_OVERFLOW => {
+                _ if ot.is_numeric() || ot.is_num_big() => {
                     saw_uncomparable_numeric = true;
                     false
                 }

@@ -310,17 +310,19 @@ impl<E: IriEncoder> LoweringContext<'_, E> {
 
         match dt_iri.as_str() {
             xsd::STRING => Ok(FlakeValue::String(value.to_string())),
-            // xsd:integer is unbounded: promote past i64 instead of erroring.
-            xsd::INTEGER => match value.parse::<i64>() {
-                Ok(i) => Ok(FlakeValue::Long(i)),
-                Err(_) => parse_big_integer_value(value, datatype.span),
-            },
-            // xsd:int / xsd:long are bounded; out-of-range is a lexical error.
-            xsd::INT | xsd::LONG => {
-                let i: i64 = value
-                    .parse()
-                    .map_err(|_| LowerError::invalid_integer(value, datatype.span))?;
-                Ok(FlakeValue::Long(i))
+            // The write surfaces' parser, so a constant of any integer
+            // subtype names the value a transaction stores under it, and one
+            // outside the subtype's range is refused as a write refuses it.
+            dt if xsd::is_integer_family(dt) => {
+                fluree_db_core::coerce::coerce_string_value(value, dt).map_err(|e| {
+                    let name = xsd::datatype_local_name(dt).unwrap_or(dt);
+                    LowerError::invalid_literal(
+                        value,
+                        format!("xsd:{name}"),
+                        e.message,
+                        datatype.span,
+                    )
+                })
             }
             xsd::DECIMAL => parse_decimal_value(value, datatype.span),
             // The write surfaces' parser, so a query literal accepts exactly
