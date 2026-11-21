@@ -294,7 +294,7 @@ fn bench_string_lookup(c: &mut Criterion) {
                     let leaf = ReverseLeaf::from_bytes(black_box(&blob)).unwrap();
                     let found = leaf
                         .lookup(&keys.first)
-                        .or_else(|| keys.then.as_deref().and_then(|key| leaf.lookup(key)));
+                        .or_else(|| keys.then().and_then(|key| leaf.lookup(&key)));
                     hits += usize::from(found.is_some());
                 }
                 black_box(hits)

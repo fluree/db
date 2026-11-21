@@ -258,8 +258,24 @@ pub struct KeyRules<'a> {
 #[derive(Debug, PartialEq, Eq)]
 pub struct LookupKeys<'v> {
     pub first: Cow<'v, [u8]>,
-    /// The hashed key of a value whose group filled after it began hashing.
-    pub then: Option<Vec<u8>>,
+    /// The value, when its group filled after it began hashing, so it may
+    /// be held under its hashed key instead.
+    fallback: Option<(KeyScheme, &'v [u8])>,
+}
+
+impl LookupKeys<'_> {
+    /// Whether the value may also be held under [`Self::then`].
+    pub fn has_then(&self) -> bool {
+        self.fallback.is_some()
+    }
+
+    /// The key to try when `first` misses: the hashed key of a value whose
+    /// group filled after it began hashing. Hashed on asking, so a hit on
+    /// `first` never hashes the value.
+    pub fn then(&self) -> Option<Vec<u8>> {
+        self.fallback
+            .map(|(scheme, value)| scheme.hashed_key(value))
+    }
 }
 
 impl KeyRules<'_> {
@@ -284,17 +300,17 @@ impl KeyRules<'_> {
         let Some(group) = self.scheme.group(value) else {
             return LookupKeys {
                 first: Cow::Borrowed(value),
-                then: None,
+                fallback: None,
             };
         };
         match self.raw.get(group) {
             None => LookupKeys {
                 first: Cow::Owned(self.scheme.hashed_key(value)),
-                then: None,
+                fallback: None,
             },
             Some(raw) => LookupKeys {
                 first: Cow::Borrowed(value),
-                then: raw.hashed.then(|| self.scheme.hashed_key(value)),
+                fallback: raw.hashed.then_some((self.scheme, value)),
             },
         }
     }
@@ -635,7 +651,8 @@ mod tests {
 
         let probe = |v: &[u8]| {
             let keys = rules.lookup_keys(v);
-            (keys.first.into_owned(), keys.then)
+            let then = keys.then();
+            (keys.first.into_owned(), then)
         };
         assert_eq!(probe(&pure), (pure.clone(), None));
         assert_eq!(

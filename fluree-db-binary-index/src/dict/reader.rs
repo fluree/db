@@ -511,7 +511,7 @@ impl DictTreeReader {
         if let Some(id) = self.lookup_key(&keys.first)? {
             return Ok(Some(id));
         }
-        match keys.then {
+        match keys.then() {
             Some(key) => self.lookup_key(&key),
             None => Ok(None),
         }
@@ -584,7 +584,8 @@ impl DictTreeReader {
         let rules = self.branch.keys();
         for value in values {
             let keys = rules.lookup_keys(value);
-            for key in std::iter::once(keys.first.as_ref()).chain(keys.then.as_deref()) {
+            let then = keys.then();
+            for key in std::iter::once(keys.first.as_ref()).chain(then.as_deref()) {
                 if let Some(leaf_idx) = self.branch.find_leaf(key) {
                     if !seen[leaf_idx] {
                         seen[leaf_idx] = true;
@@ -621,16 +622,16 @@ impl DictTreeReader {
         let firsts: Vec<&[u8]> = keys.iter().map(|k| k.first.as_ref()).collect();
         let mut results = self.lookup_keys_batched(&firsts)?;
 
-        let retry: Vec<usize> = (0..keys.len())
-            .filter(|&i| results[i].is_none() && keys[i].then.is_some())
+        // Only the values `first` missed are hashed for their fallback key.
+        let retry: Vec<(usize, Vec<u8>)> = (0..keys.len())
+            .filter(|&i| results[i].is_none())
+            .filter_map(|i| Some((i, keys[i].then()?)))
             .collect();
         if !retry.is_empty() {
-            let thens: Vec<&[u8]> = retry
-                .iter()
-                .map(|&i| keys[i].then.as_deref().expect("filtered"))
-                .collect();
-            for (i, found) in retry.into_iter().zip(self.lookup_keys_batched(&thens)?) {
-                results[i] = found;
+            let thens: Vec<&[u8]> = retry.iter().map(|(_, key)| key.as_slice()).collect();
+            let found = self.lookup_keys_batched(&thens)?;
+            for ((i, _), found) in retry.iter().zip(found) {
+                results[*i] = found;
             }
         }
         Ok(results)

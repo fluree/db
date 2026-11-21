@@ -687,7 +687,7 @@ pub fn removal_keys(
             continue;
         }
         let found = rules.lookup_keys(&value);
-        keys.extend(found.then);
+        keys.extend(found.then());
         keys.push(found.first.into_owned());
     }
     keys.sort();
@@ -1633,8 +1633,9 @@ mod tests {
 
         fn lookup(&self, value: &str) -> Option<u64> {
             let keys = self.branch.keys().lookup_keys(value.as_bytes());
+            let then = keys.then();
             std::iter::once(keys.first.into_owned())
-                .chain(keys.then)
+                .chain(then)
                 .find_map(|key| {
                     let bytes = self.leaf(self.branch.find_leaf(&key)?).unwrap();
                     ReverseLeaf::from_bytes(&bytes).unwrap().lookup(&key)
