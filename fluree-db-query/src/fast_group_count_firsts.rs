@@ -56,9 +56,8 @@ fn check_cancelled(cancellation: &QueryCancellation) -> Result<()> {
 /// Uses only per-leaflet uncompressed "FIRST" headers to skip decoding entire leaflets when
 /// `FIRST(i).(p,o) == FIRST(i+1).(p,o)` (boundary-equality implies the whole leaflet is that (p,o) in POST order).
 ///
-/// If stats indicate this predicate has exactly one datatype for this graph, the operator never
-/// decodes Region 2 (dt/lang are treated as constant). Otherwise it falls back to decoding Region 2
-/// and grouping by full RDF literal identity (dt/lang).
+/// A leaflet whose directory records one `o_type` is read without its `OType` column; other
+/// leaflets decode it and group by full RDF literal identity (dt/lang).
 ///
 /// Requires:
 /// - POST order access

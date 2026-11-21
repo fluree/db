@@ -4435,8 +4435,8 @@ pub(crate) fn for_each_object_probe_match(
     // also needs `T`, so `replay_leaflet_at_t` can detect base rows that
     // postdate `to_t`. The overlay merge needs `OI`: CORE lacks it, and a fate
     // check reading `o_i` as a default would mis-reconcile retracts on
-    // multi-entry (`@list`) refs. The leaflet cache keys on the decoded column
-    // set, so the narrow entry never collides with a wider one.
+    // multi-entry (`@list`) refs. The leaflet cache widens an entry that lacks
+    // a requested column, so this narrow read and a wider one share one entry.
     let proj = if need_replay {
         ColumnProjection::all()
     } else if probe_ops.is_some() {
@@ -4736,8 +4736,8 @@ fn for_each_object_probe_match_by_fact(
                     internal: ColumnSet::EMPTY,
                 }
             };
-            // The cache keys on the decoded column set, so this narrow
-            // entry never collides with a wider one.
+            // The cache widens an entry that lacks a requested column, so
+            // this narrow read and a wider one share one entry.
             let batch = leaf.load_leaflet(store, leaflet_idx, &proj, replay_to, &ctx.tracker)?;
             ctx.check_cancelled()?;
 
