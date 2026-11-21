@@ -385,7 +385,7 @@ where
 /// in reverse-tree key order (`(ns_code, suffix)`). Key = `[ns_code BE][suffix]`.
 ///
 /// Leaves are written in the subject tree's format
-/// (`LeafFormat::for_dict`), cut where a `DLR1` leaf of the same entries
+/// (`LeafFormat::for_tree`), cut where a `DLR1` leaf of the same entries
 /// would reach the target size.
 async fn build_subject_reverse_tree<F>(
     content_store: &dyn ContentStore,
@@ -397,6 +397,7 @@ where
 {
     use fluree_db_binary_index::dict::branch::{BranchLeafEntry, DictBranch};
     use fluree_db_binary_index::dict::builder;
+    use fluree_db_binary_index::dict::key_scheme::KeyScheme;
     use fluree_db_binary_index::dict::reverse_leaf::LeafFormat;
     use fluree_db_core::{ContentKind, DictKind};
 
@@ -406,7 +407,7 @@ where
     let mut leaf_cids: Vec<ContentId> = Vec::new();
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
 
-    let mut writer = LeafFormat::for_dict(DictKind::SubjectReverse).writer();
+    let mut writer = LeafFormat::for_tree(DictKind::SubjectReverse, KeyScheme::Raw).writer();
     let mut chunk_bytes: usize = 0;
     let mut first_key: Option<Vec<u8>> = None;
     let mut key: Vec<u8> = Vec::new();
