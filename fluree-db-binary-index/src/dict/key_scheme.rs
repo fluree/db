@@ -145,6 +145,19 @@ impl KeyScheme {
         hashed_key(group, &digest(value))
     }
 
+    /// The key range `[start, end)` of every key starting with `group`:
+    /// its values of any length, by value or hashed.
+    pub fn group_range(self, group: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
+        (group.to_vec(), prefix_end(group))
+    }
+
+    /// The group a key belongs to, by value or hashed: its first
+    /// `prefix_len` bytes, if it is longer than that.
+    pub fn key_group(self, key: &[u8]) -> Option<&[u8]> {
+        let k = self.prefix_len()?;
+        (key.len() > k).then(|| &key[..k])
+    }
+
     /// The key range `[start, end)` of a group's hashed values.
     pub fn hashed_range(self, group: &[u8]) -> (Vec<u8>, Option<Vec<u8>>) {
         let mut start = group.to_vec();
@@ -201,6 +214,20 @@ impl RawGroups {
                     hashed,
                 },
             ),
+        }
+    }
+
+    /// Stop listing `prefix`.
+    pub fn remove(&mut self, prefix: &[u8]) {
+        if let Ok(i) = self.0.binary_search_by(|g| g.prefix.as_slice().cmp(prefix)) {
+            self.0.remove(i);
+        }
+    }
+
+    /// Record that `prefix`, listed, holds no hashed value.
+    pub fn clear_hashed(&mut self, prefix: &[u8]) {
+        if let Ok(i) = self.0.binary_search_by(|g| g.prefix.as_slice().cmp(prefix)) {
+            self.0[i].hashed = false;
         }
     }
 

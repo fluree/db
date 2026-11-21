@@ -421,6 +421,10 @@ pub fn update_reverse_tree(
 
 /// Remove `keys` (sorted ascending) from a reverse dictionary tree. Leaves
 /// holding none of them keep their addresses; a leaf left empty is dropped.
+///
+/// A listed group the removal leaves no key under is no longer listed, and
+/// one left with no hashed key no longer says it holds some: the branch
+/// keeps no prefix of values the tree no longer holds.
 pub fn remove_from_reverse_tree(
     existing_branch: &DictBranch,
     keys: &[Vec<u8>],
@@ -442,6 +446,8 @@ pub fn remove_from_reverse_tree(
     let mut branch_entries: Vec<BranchLeafEntry> = Vec::new();
     let mut new_leaves: Vec<LeafArtifact> = Vec::new();
     let mut replaced_indices: Vec<usize> = Vec::new();
+    // The keys of each leaf read, by its place in the new branch.
+    let mut read: BTreeMap<usize, Vec<ReverseEntry>> = BTreeMap::new();
     for (i, existing_leaf) in existing_branch.leaves.iter().enumerate() {
         let slice = slices[i];
         if slice.is_empty() {
@@ -463,20 +469,23 @@ pub fn remove_from_reverse_tree(
             })
             .collect();
         if kept.len() as u32 == existing_leaf.entry_count {
+            read.insert(branch_entries.len(), kept);
             branch_entries.push(existing_leaf.clone());
             continue;
         }
         if !kept.is_empty() {
             branch_entries.push(encode_and_track(&kept, format, &mut new_leaves));
+            read.insert(branch_entries.len() - 1, kept);
         }
         replaced_indices.push(i);
     }
 
-    let branch = DictBranch {
+    let mut branch = DictBranch {
         leaves: branch_entries,
         key_scheme: existing_branch.key_scheme,
         raw_groups: existing_branch.raw_groups.clone(),
     };
+    prune_raw_groups(&mut branch, keys, &read);
     let branch_bytes = branch.encode();
     let branch_hash = fluree_db_core::sha256_hex(&branch_bytes);
     Ok(IncrementalTreeResult {
@@ -486,6 +495,49 @@ pub fn remove_from_reverse_tree(
         new_leaves,
         replaced_leaf_indices: replaced_indices,
     })
+}
+
+/// After a removal of `keys`, stop listing each group it touched that the
+/// tree holds no key under, and clear `hashed` on one with no hashed key
+/// left. `read` holds the keys of each leaf the removal read, by its place in
+/// `branch`.
+///
+/// A leaf the removal did not read holds its first and last keys. The one
+/// leaf that can hold a group's whole range with neither of them in it is
+/// the leaf every key in the range routes to, which the removal read: a
+/// removed key of the group lies in that range.
+fn prune_raw_groups(
+    branch: &mut DictBranch,
+    keys: &[Vec<u8>],
+    read: &BTreeMap<usize, Vec<ReverseEntry>>,
+) {
+    let scheme = branch.key_scheme;
+    let mut touched: Vec<&[u8]> = keys
+        .iter()
+        .filter_map(|key| scheme.key_group(key))
+        .filter(|group| branch.raw_groups.get(group).is_some())
+        .collect();
+    touched.dedup();
+    let holds = |branch: &DictBranch, (start, end): (Vec<u8>, Option<Vec<u8>>)| {
+        let within = |key: &[u8]| key >= start.as_slice() && end.as_deref().is_none_or(|e| key < e);
+        branch.leaves_overlapping(&start, end.as_deref()).any(|i| {
+            let leaf = &branch.leaves[i];
+            within(&leaf.first_key)
+                || within(&leaf.last_key)
+                || read
+                    .get(&i)
+                    .is_none_or(|entries| entries.iter().any(|e| within(&e.key)))
+        })
+    };
+    for group in touched {
+        if !holds(branch, scheme.group_range(group)) {
+            branch.raw_groups.remove(group);
+        } else if branch.raw_groups.get(group).is_some_and(|g| g.hashed)
+            && !holds(branch, scheme.hashed_range(group))
+        {
+            branch.raw_groups.clear_hashed(group);
+        }
+    }
 }
 
 /// Which groups of a [`KeyScheme::PrefixHash`] tree one write of new values
@@ -1548,6 +1600,60 @@ mod tests {
                 })
                 .sum()
         }
+    }
+
+    /// A removal stops listing a group it leaves no key under, and clears
+    /// `hashed` on one it leaves no hashed key in, so the branch keeps no
+    /// prefix of values the tree no longer holds. A group left any key stays
+    /// listed, and its values stay findable.
+    #[test]
+    fn a_removal_stops_listing_the_groups_it_empties() {
+        use super::super::key_scheme::RawGroup;
+        let mut tree = HashedTree::new(KeyScheme::PrefixHash {
+            prefix_len: 8,
+            cap: 4,
+        });
+        let long = |group: &str, i: u64| format!("{group}{i:040}");
+        let (a, b) = ("groupAAA", "groupBBB");
+        let filler: Vec<(String, u64)> =
+            (0..30).map(|i| (format!("group{i:03}"), 100 + i)).collect();
+        // `a` hashes three values, then is listed with them when two more
+        // would pass the cap; `b` is listed from its first write.
+        let a_hashed: Vec<(String, u64)> = (0..3).map(|i| (long(a, i), i)).collect();
+        let a_listed: Vec<(String, u64)> = (3..5).map(|i| (long(a, i), i)).collect();
+        let b_all: Vec<(String, u64)> = (0..5).map(|i| (long(b, i), 10 + i)).collect();
+        tree.add(&[filler.clone(), a_hashed.clone(), b_all.clone()].concat());
+        tree.add(&a_listed);
+        let listed = |tree: &HashedTree, g: &str| tree.branch.raw_groups.get(g.as_bytes()).cloned();
+        let raw = |g: &str, hashed| RawGroup {
+            prefix: g.as_bytes().to_vec(),
+            hashed,
+        };
+        assert_eq!(listed(&tree, a), Some(raw(a, true)));
+        assert_eq!(listed(&tree, b), Some(raw(b, false)));
+        assert!(tree.branch.leaves.len() > 5);
+
+        let found = |tree: &HashedTree, values: &[(String, u64)]| {
+            values.iter().all(|(v, id)| tree.lookup(v) == Some(*id))
+        };
+        // Some of `b` gone: still listed.
+        tree.remove(&[&b_all[0].0, &b_all[1].0]);
+        assert_eq!(listed(&tree, b), Some(raw(b, false)));
+        assert!(found(&tree, &b_all[2..]));
+        // `a`'s hashed values gone: listed, holding none hashed.
+        tree.remove(&a_hashed.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert_eq!(tree.hashed_in(a.as_bytes()), 0);
+        assert_eq!(listed(&tree, a), Some(raw(a, false)));
+        assert!(found(&tree, &a_listed));
+        // Every value of each gone: neither is listed.
+        tree.remove(&a_listed.iter().map(|(v, _)| v).collect::<Vec<_>>());
+        tree.remove(&b_all[2..].iter().map(|(v, _)| v).collect::<Vec<_>>());
+        assert!(
+            tree.branch.raw_groups.is_empty(),
+            "{:?}",
+            tree.branch.raw_groups
+        );
+        assert!(found(&tree, &filler));
     }
 
     /// A group takes hashed values up to the cap, counting what it already
