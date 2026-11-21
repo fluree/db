@@ -302,7 +302,9 @@ pub(crate) fn policy_config_of(
 /// cross-ledger path unchanged and the R2RML policy gate sees
 /// hierarchy-expanded targets. `default_allow` fills a request that left it
 /// unset, exactly as a native ledger's `f:defaultAllow` does. `None` when the
-/// record sets neither.
+/// record sets neither. The override control is left at its default here;
+/// the caller fills it from the model ledger's own config
+/// ([`crate::Fluree::graph_source_model_config`]).
 pub(crate) fn source_resolved_config(
     model: Option<&str>,
     default_allow: Option<bool>,
