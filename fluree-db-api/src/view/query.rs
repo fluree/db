@@ -5,8 +5,9 @@
 
 use crate::query::helpers::{
     build_query_result, charge_query_floor, input_fuel_limit, limits_tracker, lower_sparql_ast,
-    parse_and_validate_sparql, parse_cypher_to_ir, parse_jsonld_query, prepare_for_execution,
-    sparql_ast_has_dataset, tracked_query_tracker, tracker_for_input_limits,
+    parse_and_validate_sparql, parse_and_validate_sparql_from, parse_cypher_to_ir,
+    parse_jsonld_query, prepare_for_execution, sparql_ast_has_dataset, tracked_query_tracker,
+    tracker_for_input_limits,
 };
 use crate::view::{DataSetDb, GraphDb, QueryInput};
 use crate::{
@@ -464,7 +465,11 @@ impl Fluree {
         let parse_start = fluree_db_core::clock::Instant::now();
         let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
-            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql(sparql, params)?),
+            QueryInput::Sparql(sparql) => Some(parse_and_validate_sparql_from(
+                options.sparql_parse(),
+                sparql,
+                params,
+            )?),
             QueryInput::JsonLd(_) => None,
         };
 
@@ -920,7 +925,7 @@ impl Fluree {
         let params = options.sparql_params(&input)?;
         let mut sparql_ast = match input {
             QueryInput::Sparql(sparql) => {
-                let ast = parse_and_validate_sparql(sparql, params)?;
+                let ast = parse_and_validate_sparql_from(options.sparql_parse(), sparql, params)?;
                 if sparql_ast_has_dataset(&ast) {
                     return Err(single_ledger_dataset_clause_error());
                 }
@@ -1114,7 +1119,7 @@ impl Fluree {
         };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let ast = match parse_and_validate_sparql(sparql, params) {
+            let ast = match parse_and_validate_sparql_from(options.sparql_parse(), sparql, params) {
                 Ok(ast) => ast,
                 Err(e) => {
                     let tracker = tracked_query_tracker(&input, &tracking_override, None);
@@ -1288,7 +1293,7 @@ impl Fluree {
         };
         let mut sparql_ast = None;
         if let QueryInput::Sparql(sparql) = input {
-            let parsed = parse_and_validate_sparql(sparql, params);
+            let parsed = parse_and_validate_sparql_from(options.sparql_parse(), sparql, params);
             let tracker = tracked_query_tracker(&input, &tracking_override, parsed.as_ref().ok());
             let ast = match parsed {
                 Ok(ast) => ast,
@@ -1617,8 +1622,12 @@ impl Fluree {
     /// build a within-ledger dataset via
     /// [`build_within_ledger_dataset_from_ast`](Self::build_within_ledger_dataset_from_ast)
     /// and only reject cross-ledger clause IRIs.
-    pub(crate) fn validate_sparql_for_view(&self, sparql: &str) -> Result<()> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+    pub(crate) fn validate_sparql_for_view(
+        &self,
+        parsed: Option<&crate::query::helpers::SparqlParse>,
+        sparql: &str,
+    ) -> Result<()> {
+        let ast = parse_and_validate_sparql_from(parsed, sparql, None)?;
         if sparql_ast_has_dataset(&ast) {
             return Err(single_ledger_dataset_clause_error());
         }

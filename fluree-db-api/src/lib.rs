@@ -227,7 +227,9 @@ pub use policy_view::{
 pub use query::builder::{
     DatasetQueryBuilder, FromQueryBuilder, GraphSourceMode, ViewQueryBuilder,
 };
-pub use query::helpers::{parse_sparql_shared, sparql_pragma_tracking, SharedSparqlParse};
+pub use query::helpers::{
+    parse_sparql_shared, sparql_pragma_tracking, SharedSparqlParse, SparqlParse,
+};
 pub use query::nameservice_builder::NameserviceQueryBuilder;
 pub use query::result_cache::{
     jsonld_requests_result_cache, ResultCacheOutcome, ResultCacheStatus,

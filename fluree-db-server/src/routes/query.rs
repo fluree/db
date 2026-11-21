@@ -827,24 +827,25 @@ pub async fn query(
         let qc_opts = crate::routes::policy_auth::bound_governance(headers.identity.as_deref(), &headers)?;
 
         // Parse once and reuse across the format branches below (#1473): the
-        // agent-json and plain paths both need the AST, and the advisory header
-        // is derived from the same parse rather than a third one.
+        // agent-json and plain paths both need the AST, the advisory header is
+        // derived from the same parse rather than a third one, and each
+        // execution below is handed it rather than parsing again.
         let parsed = fluree_db_api::parse_sparql_shared(&sparql);
-        let warn_headers = sparql_dataset_warning_headers(parsed.ast.as_ref());
+        let warn_headers = sparql_dataset_warning_headers(parsed.ast());
 
         // AgentJson: connection-scoped SPARQL with agent-optimized envelope
         if headers.wants_agent_json() {
             // AgentJson is a solution-table envelope; a CONSTRUCT/DESCRIBE graph
             // has no such form, so reject rather than mislabel a JSON-LD graph
             // as AgentJson (issue #1274).
-            if is_graph_query(parsed.ast.as_ref()) {
+            if is_graph_query(parsed.ast()) {
                 return Err(ServerError::not_acceptable(
                     "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
                      use the default JSON-LD, Turtle, N-Triples or RDF/XML"
                         .to_string(),
                 ));
             }
-            let from_count = parsed.ast.as_ref()
+            let from_count = parsed.ast()
                 .and_then(|ast| match &ast.body {
                     fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
                     fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
@@ -879,7 +880,11 @@ pub async fn query(
                     .connection_opts(qc_opts.clone())
                     .format(config)
                     .tracking(tracking_opts)
-                    .execution_options(params.execution_options(&state))
+                    .execution_options(
+                params
+                    .execution_options(&state)
+                    .with_sparql_parse(std::sync::Arc::clone(&parsed)),
+            )
                     .execute_tracked()
                     .await;
                 return match response {
@@ -925,7 +930,11 @@ pub async fn query(
                 .sparql(&sparql)
                 .connection_opts(qc_opts.clone())
                 .format(config)
-                .execution_options(params.execution_options(&state))
+                .execution_options(
+                params
+                    .execution_options(&state)
+                    .with_sparql_parse(std::sync::Arc::clone(&parsed)),
+            )
                 .execute_formatted()
                 .await;
             return match result {
@@ -952,7 +961,11 @@ pub async fn query(
                 .sparql(&sparql)
                 .connection_opts(qc_opts.clone())
                 .tracking(tracking_opts)
-                .execution_options(params.execution_options(&state))
+                .execution_options(
+                params
+                    .execution_options(&state)
+                    .with_sparql_parse(std::sync::Arc::clone(&parsed)),
+            )
                 .execute_tracked()
                 .await;
             let response = match response {
@@ -987,14 +1000,18 @@ pub async fn query(
         }
 
         let (fmt_config, content_type) =
-            sparql_json_response_format(parsed.ast.as_ref(), &headers);
+            sparql_json_response_format(parsed.ast(), &headers);
         match state
             .fluree
             .query_from()
             .sparql(&sparql)
             .connection_opts(qc_opts.clone())
             .format(fmt_config)
-            .execution_options(params.execution_options(&state))
+            .execution_options(
+                params
+                    .execution_options(&state)
+                    .with_sparql_parse(std::sync::Arc::clone(&parsed)),
+            )
             .execute_formatted()
             .await
         {
@@ -3563,8 +3580,14 @@ async fn execute_sparql_ledger(
     );
     async move {
         let span = tracing::Span::current();
-        let execution =
-            || params.bind(query_execution_options(state).with_rdf_list_view(headers.rdf_list_view));
+        // One parse for routing below and for execution: each execution
+        // option set hands it to the run.
+        let parsed = fluree_db_api::parse_sparql_shared(sparql);
+        let execution = || {
+            params
+                .bind(query_execution_options(state).with_rdf_list_view(headers.rdf_list_view))
+                .with_sparql_parse(std::sync::Arc::clone(&parsed))
+        };
 
         // If the SPARQL includes FROM/FROM NAMED, interpret them as dataset clauses
         // selecting named graphs *within this ledger* (multi-named-graph support).
@@ -3575,11 +3598,7 @@ async fn execute_sparql_ledger(
         // - `FROM NAMED <graphIRI>` makes that named graph available via GRAPH <graphIRI>.
         //
         // If a FROM IRI looks like another ledger ID, reject with a ledger mismatch error.
-        //
-        // The shared parse is the one the execution below reads, so routing
-        // the request does not cost a second parse.
-        let parsed = fluree_db_api::parse_sparql_shared(sparql);
-        let dataset_clause = parsed.ast.as_ref().and_then(|ast| match &ast.body {
+        let dataset_clause = parsed.ast().and_then(|ast| match &ast.body {
             fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
             fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
             fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
@@ -3602,7 +3621,7 @@ async fn execute_sparql_ledger(
             tracing::warn!(error = %e, "invalid fluree-policy-values header");
         })?;
 
-        let graph_format = sparql_graph_format(parsed.ast.as_ref(), headers)?;
+        let graph_format = sparql_graph_format(parsed.ast(), headers)?;
         let wants_sparql_xml = graph_format.is_none() && headers.wants_sparql_results_xml();
         let delimited = delimited.filter(|_| graph_format.is_none());
 
@@ -3611,7 +3630,7 @@ async fn execute_sparql_ledger(
         // `Accept: application/ld+json` (issue #1274). XML / delimited / AgentJson
         // are negotiated separately on their own branches and ignore this.
         let (json_fmt_config, json_content_type) =
-            sparql_json_response_format(parsed.ast.as_ref(), headers);
+            sparql_json_response_format(parsed.ast(), headers);
 
         // Policy-scoped queries (identity or explicit policy inputs) without a
         // dataset clause go through the connection path (returns pre-formatted
@@ -3704,7 +3723,7 @@ async fn execute_sparql_ledger(
 
             let spec = match (dc, pin) {
                 (Some(_), _) => {
-                    let clause = resolved_sparql_dataset(parsed.ast.as_ref())?
+                    let clause = resolved_sparql_dataset(parsed.ast())?
                         .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
                     let registry = scope_registry(state, &path.id).await?;
                     ledger_scoped_sparql_dataset_spec(&path.id, &clause, pin, &registry)?
@@ -3715,7 +3734,7 @@ async fn execute_sparql_ledger(
                 }
             };
             let warn_headers = dc
-                .map(|dc| dataset_semantics_warning_headers(dc, parsed.ast.as_ref()))
+                .map(|dc| dataset_semantics_warning_headers(dc, parsed.ast()))
                 .unwrap_or_default();
             // A pinned query with no dataset clause stands in for the
             // single-graph path, which honours `default-context`.
@@ -3777,7 +3796,7 @@ async fn execute_sparql_ledger(
                 // SPARQL Results XML serializes a solution table, not a graph;
                 // reject CONSTRUCT/DESCRIBE here (406) instead of executing and
                 // surfacing the formatter's 400 (issue #1274).
-                if is_graph_query(parsed.ast.as_ref()) {
+                if is_graph_query(parsed.ast()) {
                     return Err(ServerError::not_acceptable(
                         "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
                          CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD, \
@@ -3826,7 +3845,7 @@ async fn execute_sparql_ledger(
 
             // AgentJson: dataset query with agent-optimized envelope
             if headers.wants_agent_json() {
-                if is_graph_query(parsed.ast.as_ref()) {
+                if is_graph_query(parsed.ast()) {
                     return Err(ServerError::not_acceptable(
                         "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
                          use the default JSON-LD, Turtle, N-Triples or RDF/XML"
@@ -4016,7 +4035,7 @@ async fn execute_sparql_ledger(
             // CSV/TSV serialize a solution table; a CONSTRUCT/DESCRIBE graph has
             // no such form, so reject with 406 rather than producing malformed
             // rows or a 500 (issue #1274).
-            if is_graph_query(parsed.ast.as_ref()) {
+            if is_graph_query(parsed.ast()) {
                 return Err(ServerError::not_acceptable(format!(
                     "{} is only available for SPARQL SELECT/ASK queries; \
                      CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD, \
@@ -4057,7 +4076,7 @@ async fn execute_sparql_ledger(
         if wants_sparql_xml {
             // Graph queries have no solution-table XML form — reject with 406
             // rather than executing into the formatter's 400 (issue #1274).
-            if is_graph_query(parsed.ast.as_ref()) {
+            if is_graph_query(parsed.ast()) {
                 return Err(ServerError::not_acceptable(
                     "SPARQL Results XML is only available for SPARQL SELECT/ASK queries; \
                      CONSTRUCT/DESCRIBE return a graph (use the default JSON-LD, \
@@ -4118,7 +4137,7 @@ async fn execute_sparql_ledger(
 
         // AgentJson: execute with agent-optimized envelope format
         if headers.wants_agent_json() {
-            if is_graph_query(parsed.ast.as_ref()) {
+            if is_graph_query(parsed.ast()) {
                 return Err(ServerError::not_acceptable(
                     "AgentJson is not available for SPARQL CONSTRUCT/DESCRIBE queries; \
                      use the default JSON-LD, Turtle, N-Triples or RDF/XML"

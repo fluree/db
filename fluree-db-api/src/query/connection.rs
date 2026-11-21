@@ -281,7 +281,11 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql_from(
+            options.sparql_parse(),
+            sparql,
+            None,
+        )?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -756,7 +760,11 @@ impl Fluree {
         sparql: &str,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql_from(
+            options.sparql_parse(),
+            sparql,
+            None,
+        )?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -776,7 +784,11 @@ impl Fluree {
         policy: &PolicyContext,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql_from(
+            options.sparql_parse(),
+            sparql,
+            None,
+        )?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -809,7 +821,11 @@ impl Fluree {
         r2rml: Option<crate::R2rmlProviders<'_>>,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql_from(
+            options.sparql_parse(),
+            sparql,
+            None,
+        )?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {
@@ -845,7 +861,11 @@ impl Fluree {
         r2rml_table_provider: &dyn R2rmlTableProvider,
         options: QueryExecutionOptions,
     ) -> Result<QueryResult> {
-        let ast = parse_and_validate_sparql(sparql, None)?;
+        let ast = crate::query::helpers::parse_and_validate_sparql_from(
+            options.sparql_parse(),
+            sparql,
+            None,
+        )?;
         let spec = connection_sparql_dataset_spec(&ast, &options)?;
 
         if spec.is_empty() {

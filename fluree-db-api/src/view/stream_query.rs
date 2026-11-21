@@ -113,8 +113,9 @@ impl Fluree {
                 )?
             }
             QueryInput::Sparql(sparql) => {
-                self.validate_sparql_for_view(sparql)?;
+                self.validate_sparql_for_view(options.sparql_parse(), sparql)?;
                 crate::query::helpers::parse_sparql_to_ir(
+                    options.sparql_parse(),
                     sparql,
                     &db.snapshot,
                     db.default_context.as_ref(),
@@ -398,6 +399,7 @@ impl Fluree {
                 dataset,
             )?,
             QueryInput::Sparql(sparql) => crate::query::helpers::parse_sparql_to_ir(
+                options.sparql_parse(),
                 sparql,
                 &primary.snapshot,
                 primary.default_context.as_ref(),

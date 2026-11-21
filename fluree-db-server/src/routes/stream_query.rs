@@ -142,15 +142,16 @@ async fn stream_query_connection_inner(
         // nothing here would otherwise look at the clause — leaving the one
         // surface whose caller is least likely to notice a short result set as
         // the only silent one.
-        warn_headers = crate::routes::query::sparql_dataset_warning_headers(
-            fluree_db_api::parse_sparql_shared(&sparql).ast.as_ref(),
-        );
+        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
+        warn_headers = crate::routes::query::sparql_dataset_warning_headers(parsed.ast());
 
         // The auth-layer-verified identity gates `f:overrideControl` on the
         // ledgers' reasoning defaults, so planning carries it too.
-        let plan_options = params.bind(crate::query_control::options_for_identity(
-            headers.server_identity.as_ref(),
-        ));
+        let plan_options = params
+            .bind(crate::query_control::options_for_identity(
+                headers.server_identity.as_ref(),
+            ))
+            .with_sparql_parse(std::sync::Arc::clone(&parsed));
         let dataset = fluree
             .build_stream_dataset_for_sparql(
                 &sparql,
@@ -298,20 +299,22 @@ async fn stream_query_inner(
                 return Err(ServerError::not_found("Ledger not found"));
             }
         }
+        // One parse for the dataset-clause check below and for planning,
+        // which is handed it.
+        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
         // Resolve identity + policy the same way /query's SPARQL path does:
         // SPARQL has no body `opts`, so policy arrives via the resolved identity
         // (bearer/header), the server default policy class, and the
         // `Fluree-Policy*` / `Fluree-Default-Allow` headers.
-        let plan_options = params.bind(crate::query_control::options_for_identity(
-            headers.server_identity.as_ref(),
-        ));
+        let plan_options = params
+            .bind(crate::query_control::options_for_identity(
+                headers.server_identity.as_ref(),
+            ))
+            .with_sparql_parse(std::sync::Arc::clone(&parsed));
         let identity = headers.identity.clone();
         let qc_opts = crate::routes::policy_auth::bound_governance(identity.as_deref(), &headers)?;
 
-        // Detect FROM/FROM NAMED dataset clauses (through the parse the plan
-        // below reads).
-        let parsed = fluree_db_api::parse_sparql_shared(&sparql);
-        let dataset_clause = parsed.ast.as_ref().and_then(|ast| match &ast.body {
+        let dataset_clause = parsed.ast().and_then(|ast| match &ast.body {
             fluree_db_sparql::ast::QueryBody::Select(q) => q.dataset.as_ref(),
             fluree_db_sparql::ast::QueryBody::Construct(q) => q.dataset.as_ref(),
             fluree_db_sparql::ast::QueryBody::Ask(q) => q.dataset.as_ref(),
@@ -345,11 +348,9 @@ async fn stream_query_inner(
             }
             let spec = if has_dataset {
                 let dc = dataset_clause.expect("has_dataset implies a clause");
-                warn_headers = crate::routes::query::dataset_semantics_warning_headers(
-                    dc,
-                    parsed.ast.as_ref(),
-                );
-                let clause = crate::routes::query::resolved_sparql_dataset(parsed.ast.as_ref())?
+                warn_headers =
+                    crate::routes::query::dataset_semantics_warning_headers(dc, parsed.ast());
+                let clause = crate::routes::query::resolved_sparql_dataset(parsed.ast())?
                     .ok_or_else(|| ServerError::bad_request("Invalid SPARQL dataset clause"))?;
                 let registry = crate::routes::query::scope_registry(&state, &path.id).await?;
                 crate::routes::query::ledger_scoped_sparql_dataset_spec(
