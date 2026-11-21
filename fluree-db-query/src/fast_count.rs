@@ -1450,6 +1450,17 @@ fn count_distinct_vector_objects(
     }
     keys.sort_unstable();
     keys.dedup();
+    // A hash two arenas share (or a collision within one) compares its
+    // vectors. On a residency host, record every shard those reads need that
+    // the resident tier lacks before the first of them, so one fetch round
+    // brings them all, rather than one round per shard read in hash order.
+    store.register_missing_vector_shards(
+        g_id,
+        keys.chunk_by(|a, b| a.0 == b.0)
+            .filter(|run| run.len() > 1)
+            .flatten()
+            .map(|&(_, p_id, canonical)| (p_id, canonical)),
+    );
     let mut count = 0u64;
     for run in keys.chunk_by(|a, b| a.0 == b.0) {
         if run.len() == 1 {
