@@ -18,7 +18,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Instant;
 
-use futures::stream::StreamExt;
+use futures::stream::{StreamExt, TryStreamExt};
 
 use fluree_db_binary_index::dict::DictTreeReader;
 use fluree_db_binary_index::format::index_root::IndexRoot;
@@ -335,17 +335,21 @@ pub async fn resolve_incremental_commits_v6(
             }
             let nb_map = shared.numbigs.entry(ga.g_id).or_default();
             for nb in &ga.numbig {
-                let mut chunks = Vec::with_capacity(nb.chunks.len());
-                for chunk in &nb.chunks {
-                    chunks.push(
-                        fetch_cached_or_get(
-                            cs.as_ref(),
-                            &chunk.cid,
-                            format!("numbig arena load for g_id={}, p_id={}", ga.g_id, nb.p_id),
-                        )
-                        .await?,
-                    );
-                }
+                let fetches: Vec<_> = nb
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        let cs = Arc::clone(&cs);
+                        let cid = chunk.cid.clone();
+                        let context =
+                            format!("numbig arena load for g_id={}, p_id={}", ga.g_id, nb.p_id);
+                        async move { fetch_cached_or_get(cs.as_ref(), &cid, context).await }
+                    })
+                    .collect();
+                let chunks: Vec<Vec<u8>> = futures::stream::iter(fetches)
+                    .buffered(fluree_db_binary_index::arena::numbig::NUMBIG_CHUNK_FETCH_WIDTH)
+                    .try_collect()
+                    .await?;
                 let arena = fluree_db_binary_index::arena::numbig::read_numbig_arena_from_chunks(
                     chunks.iter().map(std::convert::AsRef::as_ref),
                 )

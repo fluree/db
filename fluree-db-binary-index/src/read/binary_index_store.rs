@@ -5253,9 +5253,25 @@ async fn load_per_graph_arenas(
         let mut numbig = HashMap::new();
         for nb in &ga.numbig {
             let phase = Instant::now();
+            let fetched: Vec<_> = {
+                use futures::stream::{StreamExt, TryStreamExt};
+                let fetches: Vec<_> = nb
+                    .chunks
+                    .iter()
+                    .map(|chunk| {
+                        let cs = Arc::clone(&cs);
+                        let cid = chunk.cid.clone();
+                        async move { cs.get(&cid).await }
+                    })
+                    .collect();
+                futures::stream::iter(fetches)
+                    .buffered(crate::arena::numbig::NUMBIG_CHUNK_FETCH_WIDTH)
+                    .try_collect()
+                    .await
+                    .map_err(storage_io_error)?
+            };
             let mut chunks = Vec::with_capacity(nb.chunks.len());
-            for chunk in &nb.chunks {
-                let bytes = cs.get(&chunk.cid).await.map_err(storage_io_error)?;
+            for (chunk, bytes) in nb.chunks.iter().zip(fetched) {
                 let held = crate::arena::numbig::numbig_entry_count(&bytes)?;
                 if chunk.entries != 0 && held != chunk.entries {
                     return Err(io::Error::new(

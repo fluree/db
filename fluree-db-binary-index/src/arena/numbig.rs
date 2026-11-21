@@ -378,6 +378,10 @@ fn entry_wire_len(entry: &StoredBigValue) -> usize {
 /// rewrote all of it to add one value.
 pub const NUMBIG_CHUNK_TARGET_BYTES: usize = 16 * 1024 * 1024;
 
+/// Chunks of one arena read at once when it loads: on remote storage an
+/// arena of many chunks otherwise waits on each read in turn.
+pub const NUMBIG_CHUNK_FETCH_WIDTH: usize = 8;
+
 /// One chunk of an arena: an NBA1 buffer holding consecutive handles, and how
 /// many.
 pub struct NumBigChunk {
