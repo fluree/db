@@ -1395,8 +1395,9 @@ the `f:overrideControl` on the model's `f:policyDefaults` (see [Override
 control](../ledger-config/override-control.md)) decides whether a request may
 replace the source's policy defaults, exactly as a native ledger's own does,
 and a server-verified identity it lists is permitted as on that ledger. With
-`f:OverrideNone`, a request's `identity`, `policy-class`, inline `policy` or
-`default-allow: true` does not replace the source's defaults. This matters
+`f:OverrideNone`, a request's `policy-class`, inline `policy` or
+`default-allow: true` does not replace the source's defaults; its `identity`
+still selects the class the model assigns it. This matters
 because a request identity the model assigns no `f:policyClass` selects no
 rules, and `default-allow` alone then decides what it reads, on a native
 ledger and a source alike. A model with no `f:overrideControl` allows
