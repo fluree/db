@@ -2431,3 +2431,79 @@ async fn a_governed_source_and_its_native_twin_agree_under_override_control() {
     eprintln!("OVERRIDE-TWIN\n{}", table.join("\n"));
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
+
+/// A governed source's view reads its model at one version: the policies a
+/// request applies to it come from the model version its override control was
+/// read at, though the model commits after the view is resolved. A view
+/// resolved after the commit reads the new version.
+#[tokio::test]
+async fn a_governed_source_view_reads_its_model_at_one_version() {
+    use fluree_db_api::{GovernanceOptions, GraphSnapshotQueryBuilder};
+    let fluree = setup().await;
+    let model = "one-version-model:main";
+    override_model(&fluree, model, None).await;
+    let known = GovernanceOptions {
+        identity: Some("did:example:known".to_string()),
+        ..Default::default()
+    };
+    let names = json!({
+        "@context": context(),
+        "select": ["?s", "?n"],
+        "where": { "@id": "?s", "ex:name": "?n" }
+    });
+    let rows = |view| {
+        let (fluree, known, names) = (&fluree, &known, &names);
+        async move {
+            let view = fluree.wrap_policy(view, known).await.expect("wrap policy");
+            GraphSnapshotQueryBuilder::new_from_parts(fluree, &view)
+                .jsonld(names)
+                .with_r2rml()
+                .execute()
+                .await
+                .expect("query")
+                .row_count()
+        }
+    };
+
+    let sources = sources_with_model(&fluree, "one-version-gs", model).await;
+    let mut before = Vec::new();
+    for source in &sources {
+        before.push(
+            fluree
+                .db_or_graph_source(source)
+                .await
+                .expect("source view"),
+        );
+    }
+
+    // The model withdraws the grant of `ex:name` to the identity's class.
+    let ledger = fluree.ledger(model).await.expect("model ledger");
+    fluree
+        .update(
+            ledger,
+            &json!({
+                "@context": { "ex": "http://example.org/" },
+                "where": { "@id": "ex:readNames", "?p": "?o" },
+                "delete": { "@id": "ex:readNames", "?p": "?o" }
+            }),
+        )
+        .await
+        .expect("withdraw grant");
+
+    for (source, view) in sources.iter().zip(before) {
+        assert_eq!(
+            rows(view).await,
+            5,
+            "{source}: view resolved before the commit"
+        );
+        let after = fluree
+            .db_or_graph_source(source)
+            .await
+            .expect("source view");
+        assert_eq!(
+            rows(after).await,
+            0,
+            "{source}: view resolved after the commit"
+        );
+    }
+}

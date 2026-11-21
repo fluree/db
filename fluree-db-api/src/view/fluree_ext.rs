@@ -64,6 +64,9 @@ fn head_drops(snap: &LedgerView) -> Option<fluree_db_ledger::HeadDrops<'_>> {
     fluree_db_ledger::HeadDrops::of(snap.head_commit_id.as_ref(), &snap.snapshot.graph_registry)
 }
 
+/// A model ledger and the version of it a governed source's view reads.
+type ModelVersion = (fluree_db_core::LedgerId, crate::cross_ledger::ModelHead);
+
 fn graph_db_from_cached_head(snap: LedgerView) -> GraphDb {
     let binary_store = snap.binary_store.clone();
     let ledger = snap.to_ledger_state();
@@ -831,49 +834,76 @@ impl Fluree {
     /// governs whether a request may replace the source's policy defaults, as
     /// a native ledger's does for it. A model that sets none leaves the
     /// default (overrides allowed). No other model setting is taken.
+    ///
+    /// Also returns the model version the override control was read at, for
+    /// the view to carry: the source's policies are then read at that version
+    /// too.
     pub(crate) async fn graph_source_model_config(
         &self,
         record: &fluree_db_nameservice::GraphSourceRecord,
-    ) -> Result<Option<fluree_db_core::ledger_config::ResolvedConfig>> {
+    ) -> Result<(
+        Option<fluree_db_core::ledger_config::ResolvedConfig>,
+        Option<ModelVersion>,
+    )> {
         #[cfg(feature = "iceberg")]
         {
             let (model, default_allow) = crate::graph_source::r2rml::policy_config_of(record);
             let mut config =
                 crate::graph_source::r2rml::source_resolved_config(model.as_deref(), default_allow);
+            let mut version = None;
             if let (Some(model), Some(policy)) = (
                 model.as_deref(),
                 config.as_mut().and_then(|c| c.policy.as_mut()),
             ) {
-                policy.override_control = Box::pin(self.model_override_control(model)).await?;
+                let (override_control, read_at) =
+                    Box::pin(self.model_override_control(model)).await?;
+                policy.override_control = override_control;
+                version = read_at;
             }
-            Ok(config)
+            Ok((config, version))
         }
         #[cfg(not(feature = "iceberg"))]
         {
             let _ = record;
-            Ok(None)
+            Ok((None, None))
         }
     }
 
     /// The override control the model ledger `model` configures for its
-    /// policy defaults, resolved at its head as for any query of it. A model
-    /// that is not a ledger yet resolves to the default: the source's policy
-    /// cannot be read from it either, so a governed request fails there.
+    /// policy defaults, resolved at its head as for any query of it, and the
+    /// version it was read at. A model that is not a ledger yet resolves to
+    /// the default, at no version: the source's policy cannot be read from it
+    /// either, so a governed request fails there.
     #[cfg(feature = "iceberg")]
     async fn model_override_control(
         &self,
         model: &str,
-    ) -> Result<fluree_db_core::ledger_config::OverrideControl> {
-        let view = match self.db(model).await {
-            Ok(view) => view,
-            Err(e) if e.is_not_found() => return Ok(Default::default()),
+    ) -> Result<(
+        fluree_db_core::ledger_config::OverrideControl,
+        Option<ModelVersion>,
+    )> {
+        let handle = match self.ledger_cached(model).await {
+            Ok(handle) => handle,
+            Err(e) if e.is_not_found() => return Ok((Default::default(), None)),
             Err(e) => return Err(e),
         };
-        Ok(view
+        let head = handle.snapshot().await;
+        let version = (
+            head.snapshot.ledger_id.clone(),
+            crate::cross_ledger::ModelHead {
+                t: head.t,
+                commit_id: head.head_commit_id.clone(),
+            },
+        );
+        let view = self
+            .resolve_and_attach_config(graph_db_from_cached_head(head))
+            .await?;
+        let override_control = view
             .resolved_config()
             .and_then(|config| config.policy.as_ref())
             .map(|policy| policy.override_control.clone())
-            .unwrap_or_default())
+            .unwrap_or_default();
+        Ok((override_control, Some(version)))
     }
 
     /// Validate a graph source's `--model` reference at registration and
@@ -1040,7 +1070,12 @@ impl Fluree {
         // The default graph routes to the virtual provider and uses its model
         // configuration. Shared graph selection removes both when selecting an
         // empty system graph, for fragments and explicit dataset selectors alike.
-        db.resolved_config = self.graph_source_model_config(&record).await?;
+        let (config, model_version) = self.graph_source_model_config(&record).await?;
+        db.resolved_config = config;
+        if let Some((model, head)) = model_version {
+            db.cross_ledger_resolved_heads =
+                Arc::new(std::collections::HashMap::from([(model, head)]));
+        }
         db.graph_source_id = Some(gs_id.to_string().into());
         db.graph_source_time = graph_source_time;
         db.over_graph_source = true;
