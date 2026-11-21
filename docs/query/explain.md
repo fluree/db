@@ -171,7 +171,10 @@ Explain returns a JSON object `{ "query": <echo>, "plan": { ... } }`. The
 The `original` and `optimized` arrays are a flattened, triple-level view. The
 `optimized` order is produced by the **same** `reorder_patterns` routine the
 executor uses, so the order shown is the order that runs — there is no separate
-explain-only ordering algorithm.
+explain-only ordering algorithm. The exception is a non-root policy: EXPLAIN then
+plans without statistics, so a scoped caller cannot learn cardinalities it may not
+see, while execution still plans with them. The plan's `reason` says so, and the
+order and estimates shown can differ from the ones that run.
 
 ### The `logical` plan
 
