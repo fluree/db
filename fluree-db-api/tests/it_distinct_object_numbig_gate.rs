@@ -598,7 +598,15 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
     ] {
         let (_db, _data, fluree, ledger_id) = build_indexed(ttl, slug).await;
         let ctx = json!({"ex": "http://ex/", "xsd": "http://www.w3.org/2001/XMLSchema#"});
-        check_liveness(&fluree, &ledger_id, initial, slug, &mut failures).await;
+        check_liveness(
+            &fluree,
+            &ledger_id,
+            EXACT_SITE,
+            initial,
+            slug,
+            &mut failures,
+        )
+        .await;
 
         // Retract 5.5 (p1 only: the term is gone) and p2's 9.9 (the term
         // survives under p1). Decimal union 8 → 7, plus the mixed fixture's
@@ -621,6 +629,7 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
         check_liveness(
             &fluree,
             &ledger_id,
+            EXACT_SITE,
             rebuilt,
             &format!("{slug} after rebuild"),
             &mut failures,
@@ -648,6 +657,7 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
         check_liveness(
             &fluree,
             &ledger_id,
+            EXACT_SITE,
             incremental,
             &format!("{slug} after incremental"),
             &mut failures,
@@ -663,11 +673,12 @@ async fn distinct_object_count_counts_numbig_object_keys_exactly() {
 }
 
 /// Fast lane and general pipeline must both answer `truth`, and the fast lane
-/// must have taken the exact branch — a decline here would pass on the answer
-/// alone while silently losing the lane.
+/// must have taken the exact branch `exact_site` — a decline here would pass
+/// on the answer alone while silently losing the lane.
 async fn check_liveness(
     fluree: &fluree_db_api::Fluree,
     ledger_id: &str,
+    exact_site: &str,
     truth: &str,
     when: &str,
     failures: &mut Vec<String>,
@@ -693,7 +704,7 @@ async fn check_liveness(
             "{when}: generic pipeline = {generic}, expected {truth}"
         ));
     }
-    for site in [OBJECT_SITE, EXACT_SITE] {
+    for site in [OBJECT_SITE, exact_site] {
         if !sites.iter().any(|s| s == site) {
             failures.push(format!(
                 "{when}: expected `{site}` to proceed on the reindexed ledger \
@@ -737,7 +748,15 @@ async fn distinct_object_count_counts_vectors_by_value() {
     let vector =
         |v: [f64; 2]| json!({"@value": v, "@type": "https://ns.flur.ee/db#embeddingVector"});
     let mut failures = Vec::new();
-    check_count(&fluree, &ledger_id, "4", "imported", &mut failures).await;
+    check_liveness(
+        &fluree,
+        &ledger_id,
+        VECTOR_EXACT_SITE,
+        "4",
+        "imported",
+        &mut failures,
+    )
+    .await;
 
     // `[1, 0]` is gone; `[0.5, 0.5]` survives under v1.
     let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
@@ -755,7 +774,15 @@ async fn distinct_object_count_counts_vectors_by_value() {
         .await
         .expect("retract two vectors");
     support::rebuild_and_publish_index(&fluree, &ledger_id).await;
-    check_count(&fluree, &ledger_id, "3", "after rebuild", &mut failures).await;
+    check_liveness(
+        &fluree,
+        &ledger_id,
+        VECTOR_EXACT_SITE,
+        "3",
+        "after rebuild",
+        &mut failures,
+    )
+    .await;
 
     // v2 keeps no live vector.
     let ledger = fluree.ledger(&ledger_id).await.expect("load ledger");
@@ -770,42 +797,19 @@ async fn distinct_object_count_counts_vectors_by_value() {
         .await
         .expect("retract v2");
     support::build_and_publish_index(&fluree, &ledger_id).await;
-    check_count(&fluree, &ledger_id, "2", "after incremental", &mut failures).await;
+    check_liveness(
+        &fluree,
+        &ledger_id,
+        VECTOR_EXACT_SITE,
+        "2",
+        "after incremental",
+        &mut failures,
+    )
+    .await;
 
     assert!(
         failures.is_empty(),
         "distinct-object vector count failures:\n  {}",
         failures.join("\n  ")
     );
-}
-
-/// [`check_liveness`] for the vector branch.
-async fn check_count(
-    fluree: &fluree_db_api::Fluree,
-    ledger_id: &str,
-    truth: &str,
-    when: &str,
-    failures: &mut Vec<String>,
-) {
-    let ledger = fluree.ledger(ledger_id).await.expect("load ledger");
-    let (store, tracing_guard) = span_capture::init_test_tracing();
-    set_fast_paths_disabled(false);
-    let fast = scalar(&run(fluree, &ledger, Q_COUNT).await);
-    let sites = proceeded(&store, 0);
-    drop(tracing_guard);
-    set_fast_paths_disabled(true);
-    let generic = scalar(&run(fluree, &ledger, Q_COUNT).await);
-    set_fast_paths_disabled(false);
-    if fast != truth || generic != truth {
-        failures.push(format!(
-            "{when}: fast {fast}, generic {generic}, expected {truth} [proceeded: {sites:?}]"
-        ));
-    }
-    for site in [OBJECT_SITE, VECTOR_EXACT_SITE] {
-        if !sites.iter().any(|s| s == site) {
-            failures.push(format!(
-                "{when}: `{site}` did not proceed [proceeded: {sites:?}]"
-            ));
-        }
-    }
 }

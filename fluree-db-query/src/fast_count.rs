@@ -1479,11 +1479,7 @@ fn count_distinct_vector_objects(
                     ))
                 })?;
             let same = |held: &fluree_db_binary_index::arena::vector::VectorSlice| {
-                let (a, b) = (held.as_f32(), slice.as_f32());
-                a.len() == b.len()
-                    && a.iter()
-                        .map(|x| x.to_bits())
-                        .eq(b.iter().map(|x| x.to_bits()))
+                fluree_db_core::value::vector_eq_f32(held.as_f32(), slice.as_f32())
             };
             if !values.iter().any(same) {
                 values.push(slice);
