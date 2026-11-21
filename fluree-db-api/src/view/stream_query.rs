@@ -113,8 +113,9 @@ impl Fluree {
                 )?
             }
             QueryInput::Sparql(sparql) => {
-                self.validate_sparql_for_view(sparql)?;
+                self.validate_sparql_for_view(options.sparql_parse(), sparql)?;
                 crate::query::helpers::parse_sparql_to_ir(
+                    options.sparql_parse(),
                     sparql,
                     &db.snapshot,
                     db.default_context.as_ref(),
@@ -348,7 +349,24 @@ impl Fluree {
         sparql: &str,
         qc_opts: &crate::GovernanceOptions,
     ) -> Result<DataSetDb> {
-        let ast = crate::query::helpers::parse_and_validate_sparql(sparql, None)?;
+        self.build_stream_dataset_for_sparql_with_options(
+            sparql,
+            qc_opts,
+            &QueryExecutionOptions::default(),
+        )
+        .await
+    }
+
+    /// [`Self::build_stream_dataset_for_sparql`], reading the parse `options`
+    /// hands over (see [`QueryExecutionOptions::with_sparql_parse`]) rather
+    /// than parsing the text again.
+    pub async fn build_stream_dataset_for_sparql_with_options(
+        &self,
+        sparql: &str,
+        qc_opts: &crate::GovernanceOptions,
+        options: &QueryExecutionOptions,
+    ) -> Result<DataSetDb> {
+        let ast = options.parse_sparql(sparql, None)?;
         let spec = crate::query::helpers::extract_sparql_dataset_spec(&ast)?;
         if spec.is_empty() {
             return Err(ApiError::invalid_query(
@@ -398,6 +416,7 @@ impl Fluree {
                 dataset,
             )?,
             QueryInput::Sparql(sparql) => crate::query::helpers::parse_sparql_to_ir(
+                options.sparql_parse(),
                 sparql,
                 &primary.snapshot,
                 primary.default_context.as_ref(),

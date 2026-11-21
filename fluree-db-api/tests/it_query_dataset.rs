@@ -4698,6 +4698,7 @@ fn the_embedder_surface_on_the_hard_keep_list_still_compiles() {
         from_count: 1,
         iso_timestamp: None,
         resume_limit: 100,
+        binds_params: false,
     };
 
     // Paths, including the stats graph selector (a different type from
