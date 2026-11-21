@@ -176,9 +176,10 @@ const CHANGES: &str = r#"DELETE DATA { ex:s ex:n "18446744073709551615"^^xsd:non
 INSERT DATA { ex:t ex:m "18446744073709551615"^^xsd:integer } ;
 DELETE { ex:k ex:n ?v } WHERE { ex:k ex:n ?o BIND(?o AS ?v) }"#;
 
-/// A probe matching a value under one datatype. A typed constant in a triple
-/// pattern or an expression loses an integer subtype at lowering (on v4.2.8
-/// too, inline values included), so the probe filters on `DATATYPE`.
+/// A probe matching a value under one datatype. A numeric constant in an
+/// expression compares by value, across numeric datatypes, so the probe
+/// filters on `DATATYPE`; `check` also names each term with a typed constant
+/// in the triple pattern.
 fn typed(value: &str, datatype: &str) -> String {
     format!(
         "SELECT ?s WHERE {{ ?s ex:n ?o FILTER(DATATYPE(?o) = xsd:{datatype} && ?o = {value}) }}"
@@ -251,8 +252,8 @@ fn probes() -> Vec<(String, Option<Vec<String>>)> {
     ]
 }
 
-/// The subjects a JSON-LD value object matches under `ex:n`: the twin of the
-/// typed SPARQL probes.
+/// The subjects a JSON-LD value object matches under `ex:n`: the twin of a
+/// typed constant in a SPARQL triple pattern.
 async fn jsonld_subjects(
     fluree: &Fluree,
     ledger_id: &str,
@@ -295,6 +296,8 @@ async fn check(
         (MAX, "unsignedLong", vec!["s"]),
         (MAX, "nonNegativeInteger", vec![]),
         (MAX, "integer", vec!["t"]),
+        ("9223372036854775807", "unsignedLong", vec!["i"]),
+        ("9223372036854775807", "integer", vec![]),
         ("9223372036854775808", "unsignedLong", vec!["j"]),
     ] {
         let got = jsonld_subjects(fluree, ledger_id, value, datatype).await;
@@ -302,6 +305,12 @@ async fn check(
             failures.push(format!(
                 "{stage}: JSON-LD {value}^^{datatype}\n  got  {got:?}\n  want {want:?}"
             ));
+        }
+        let q = format!(r#"SELECT ?s WHERE {{ ?s ex:n "{value}"^^xsd:{datatype} }}"#);
+        let got = rows(fluree, ledger_id, &q).await;
+        let want: Vec<String> = want.iter().map(|s| format!("s={s}")).collect();
+        if got != want {
+            failures.push(format!("{stage}: {q}\n  got  {got:?}\n  want {want:?}"));
         }
     }
     let mut answers = Vec::new();
