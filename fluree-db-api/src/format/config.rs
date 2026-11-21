@@ -149,6 +149,11 @@ pub struct AgentJsonContext {
     pub iso_timestamp: Option<String>,
     /// Row limit to use in resume queries (defaults to 100)
     pub resume_limit: usize,
+    /// Whether the request bound variables outside the query text (SPARQL
+    /// `params`). A resume query is generated from the text alone, so it
+    /// would run unbound: a truncated response then gives no resume query
+    /// and says to re-send the same `params` instead.
+    pub binds_params: bool,
 }
 
 impl Default for AgentJsonContext {
@@ -158,6 +163,7 @@ impl Default for AgentJsonContext {
             from_count: 0,
             iso_timestamp: None,
             resume_limit: 100,
+            binds_params: false,
         }
     }
 }

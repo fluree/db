@@ -352,6 +352,13 @@ impl SparqlParams {
         self.bind(query_execution_options(state))
     }
 
+    /// Whether this request binds any variable through `params`.
+    pub(crate) fn binds_params(&self) -> bool {
+        self.params
+            .as_ref()
+            .is_some_and(|params| !params.is_empty())
+    }
+
     /// `options` with this request's `params` bound.
     pub(crate) fn bind(&self, options: QueryExecutionOptions) -> QueryExecutionOptions {
         match &self.params {
@@ -859,6 +866,7 @@ pub async fn query(
                 sparql_text: Some(sparql.to_string()),
                 from_count,
                 iso_timestamp: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                binds_params: params.binds_params(),
                 ..Default::default()
             };
             let mut config = fluree_db_api::FormatterConfig::agent_json()
@@ -3857,6 +3865,7 @@ async fn execute_sparql_ledger(
                     sparql_text: Some(sparql.to_string()),
                     from_count,
                     iso_timestamp: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                    binds_params: params.binds_params(),
                     ..Default::default()
                 };
                 let mut config = fluree_db_api::FormatterConfig::agent_json()
@@ -4151,6 +4160,7 @@ async fn execute_sparql_ledger(
                 sparql_text: Some(sparql.to_string()),
                 from_count,
                 iso_timestamp: Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)),
+                binds_params: params.binds_params(),
                 ..Default::default()
             };
             let mut config = fluree_db_api::FormatterConfig::agent_json()

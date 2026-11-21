@@ -350,6 +350,113 @@ async fn stream_route_binds_params() {
     assert!(!body.contains(S1) && !body.contains(S2), "{body}");
 }
 
+/// Categories for the AgentJson cases: two subjects in `ex:c1` and one in
+/// `ex:c2`, in the default graph and in graph `g1`.
+const CATEGORY_TRIG: &str = r"
+@prefix ex: <http://ex.org/> .
+
+ex:s1 ex:cat ex:c1 .
+ex:s2 ex:cat ex:c1 .
+ex:s3 ex:cat ex:c2 .
+
+<http://ex.org/g1> {
+    ex:s4 ex:cat ex:c1 .
+    ex:s5 ex:cat ex:c1 .
+    ex:s6 ex:cat ex:c2 .
+}
+";
+
+/// The AgentJson lanes bind `params`, and a response the byte budget cuts
+/// gives no resume query: one built from the text alone would run unbound and
+/// answer a wider question on the next page. It says to re-send the `params`.
+#[tokio::test]
+async fn agent_json_lanes_bind_params_and_withhold_the_resume_query() {
+    let (_tmp, app) = seeded_app().await;
+    let (status, body) = send(
+        &app,
+        Request::builder()
+            .method("POST")
+            .uri(format!("/v1/fluree/upsert/{LEDGER}"))
+            .header("content-type", "application/trig")
+            .body(Body::from(CATEGORY_TRIG))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "category upsert: {body}");
+
+    let by_cat = |from: &str| {
+        format!("PREFIX ex: <http://ex.org/> SELECT ?s {from} WHERE {{ ?s ex:cat ?c }} ORDER BY ?s")
+    };
+    // (lane, path, query, the bound query's subjects in order)
+    let cases = [
+        (
+            "connection",
+            "/v1/fluree/query".to_string(),
+            by_cat(&format!("FROM <{LEDGER}>")),
+            ["ex:s1", "ex:s2"],
+        ),
+        ("ledger", ledger_path(), by_cat(""), ["ex:s1", "ex:s2"]),
+        (
+            "ledger dataset",
+            ledger_path(),
+            by_cat("FROM <http://ex.org/g1>"),
+            ["ex:s4", "ex:s5"],
+        ),
+    ];
+    let subjects = |lane: &str, json: &JsonValue| -> Vec<String> {
+        json["rows"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{lane}: expected AgentJson rows, got {json}"))
+            .iter()
+            .map(|row| row["?s"].as_str().unwrap_or_default().to_string())
+            .collect()
+    };
+    let agent_json = |path: &str, sparql: &str, tracked: bool, max_bytes: Option<&str>| {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri(format!(
+                "{path}?query={}&params={}",
+                enc(sparql),
+                enc(r#"{"c": {"@id": "http://ex.org/c1"}}"#)
+            ))
+            .header("accept", "application/vnd.fluree.agent+json");
+        if tracked {
+            request = request.header("fluree-track-fuel", "true");
+        }
+        if let Some(max_bytes) = max_bytes {
+            request = request.header("fluree-max-bytes", max_bytes);
+        }
+        request.body(Body::empty()).unwrap()
+    };
+
+    // The connection route also has a tracked AgentJson lane; on the ledger
+    // route a tracked request answers in the tracking envelope instead.
+    let runs = cases
+        .iter()
+        .map(|case| (case, false))
+        .chain(std::iter::once((&cases[0], true)));
+    for ((lane, path, sparql, bound), tracked) in runs {
+        let lane = format!("{lane}{}", if tracked { ", tracked" } else { "" });
+        let (status, json) = send(&app, agent_json(path, sparql, tracked, None)).await;
+        assert_eq!(status, StatusCode::OK, "{lane}: {json}");
+        assert_eq!(subjects(&lane, &json), bound, "{lane}: {json}");
+
+        let (status, json) = send(&app, agent_json(path, sparql, tracked, Some("1"))).await;
+        assert_eq!(status, StatusCode::OK, "{lane}: {json}");
+        assert_eq!(subjects(&lane, &json), bound[..1], "{lane}: {json}");
+        assert_eq!(json["hasMore"], JsonValue::Bool(true), "{lane}: {json}");
+        assert!(
+            json.get("resume").is_none(),
+            "{lane} gave an unbound resume query: {json}"
+        );
+        let message = json["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("re-send this query with the same params"),
+            "{lane}: {json}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Refusals
 // ---------------------------------------------------------------------------

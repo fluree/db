@@ -186,9 +186,11 @@ Fluree-Max-Bytes: 32768
 | `iso` | Always | ISO-8601 wallclock timestamp at query time |
 | `hasMore` | Always | Whether more rows exist beyond the byte budget |
 | `message` | When truncated | Human-readable truncation explanation |
-| `resume` | When truncated, single-FROM only | Ready-to-execute SPARQL with `@t:` pinning and OFFSET |
+| `resume` | When truncated, single-FROM only, no `params` | Ready-to-execute SPARQL with `@t:` pinning and OFFSET |
 
 **Multi-ledger queries:** The `t` field is omitted (each ledger has its own timeline). The `resume` field is also omitted; instead, the `message` instructs the caller to use `@time:` on each FROM clause for time-pinning.
+
+**Queries sent with `params`:** The `resume` field is omitted. It is built from the query text, which does not carry the request's [`params`](sparql.md#parameters), so running it would answer the unbound query. The `message` instead says to re-send the query with the same `params`, the `@t:` (or `@time:`) pin, and the next `OFFSET` and `LIMIT`.
 
 **Byte budget:** Set via the `Fluree-Max-Bytes` header. When the cumulative serialized size of rows exceeds this limit, the formatter stops adding rows and sets `hasMore: true`. The budget applies to row data only (schema and envelope overhead are excluded from the count).
 
