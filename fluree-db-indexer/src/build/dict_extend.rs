@@ -1288,11 +1288,21 @@ mod tests {
                 .iter()
                 .map(|(id, v)| (*id as u32, v.clone()))
                 .collect();
+            // The hashes the resolver would carry: those of the values it
+            // looks up by their hashed keys.
+            let branch =
+                DictBranch::decode(&self.cs.get(&self.refs.branch).await.unwrap()).unwrap();
+            let rules = branch.keys();
+            let hashes: super::super::dicts::StringHashes = batch
+                .iter()
+                .filter_map(|(id, v)| Some((*id as u32, rules.lookup_keys(v).hash()?)))
+                .collect();
             self.refs = super::super::dicts::upload_incremental_reverse_tree_async_strings(
                 self.cs.as_ref(),
                 DictKind::StringReverse,
                 &self.refs,
                 strings,
+                &hashes,
                 None,
             )
             .await
@@ -1767,6 +1777,7 @@ mod tests {
                 1,
                 &new_subjects,
                 &new_strings,
+                &Default::default(),
                 None,
                 &mut super::super::incremental::CompactionBudget::for_cycle(),
             )

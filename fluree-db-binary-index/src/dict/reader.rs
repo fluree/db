@@ -579,11 +579,23 @@ impl DictTreeReader {
     where
         I: IntoIterator<Item = &'a [u8]>,
     {
+        let rules = self.branch.keys();
+        let keys: Vec<_> = values
+            .into_iter()
+            .map(|value| rules.lookup_keys(value))
+            .collect();
+        self.touched_leaf_addresses_keyed(&keys)
+    }
+
+    /// [`Self::touched_leaf_addresses`] for keys computed already by this
+    /// tree's [`Self::key_rules`].
+    pub fn touched_leaf_addresses_keyed(
+        &self,
+        keys: &[super::key_scheme::LookupKeys<'_>],
+    ) -> Vec<&str> {
         let mut seen = vec![false; self.branch.leaves.len()];
         let mut addresses = Vec::new();
-        let rules = self.branch.keys();
-        for value in values {
-            let keys = rules.lookup_keys(value);
+        for keys in keys {
             let then = keys.then();
             for key in std::iter::once(keys.first.as_ref()).chain(then.as_deref()) {
                 if let Some(leaf_idx) = self.branch.find_leaf(key) {
@@ -619,6 +631,16 @@ impl DictTreeReader {
             .into_iter()
             .map(|value| rules.lookup_keys(value))
             .collect();
+        self.reverse_lookup_keyed(&keys)
+    }
+
+    /// [`Self::reverse_lookup_many`] for keys computed already by this tree's
+    /// [`Self::key_rules`], so a caller can compute them as it sees fit (in
+    /// parallel, say) and keep their hashes.
+    pub fn reverse_lookup_keyed(
+        &self,
+        keys: &[super::key_scheme::LookupKeys<'_>],
+    ) -> io::Result<Vec<Option<u64>>> {
         let firsts: Vec<&[u8]> = keys.iter().map(|k| k.first.as_ref()).collect();
         let mut results = self.lookup_keys_batched(&firsts)?;
 

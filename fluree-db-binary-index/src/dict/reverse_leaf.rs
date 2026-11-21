@@ -777,18 +777,43 @@ impl<'a> ReverseLeaf<'a> {
         }
     }
 
-    /// Collect all entries whose key is in `[start_key, end_key)`.
-    ///
-    /// Uses binary search to find the starting position, then scans forward.
+    /// Entries with `start_key <= key < end_key`, in key order. A
+    /// front-coded leaf's keys come back owned.
     pub fn scan_range(&self, start_key: &[u8], end_key: &[u8]) -> Vec<(Cow<'a, [u8]>, u64)> {
+        let mut results = Vec::new();
+        self.walk_range(start_key, end_key, |key, id| {
+            results.push((
+                match key {
+                    RangeKey::Leaf(key) => Cow::Borrowed(key),
+                    RangeKey::Built(key) => Cow::Owned(key.to_vec()),
+                },
+                id,
+            ));
+        });
+        results
+    }
+
+    /// How many entries have `start_key <= key < end_key`, copying no key.
+    pub fn count_range(&self, start_key: &[u8], end_key: &[u8]) -> usize {
+        let mut count = 0;
+        self.walk_range(start_key, end_key, |_, _| count += 1);
+        count
+    }
+
+    /// Visit the entries with `start_key <= key < end_key`, in key order.
+    fn walk_range(
+        &self,
+        start_key: &[u8],
+        end_key: &[u8],
+        mut visit: impl FnMut(RangeKey<'a, '_>, u64),
+    ) {
         if self.entry_count == 0 {
-            return Vec::new();
+            return;
         }
 
         if let Some(fc) = self.front_coded {
             let block = self.block_for(fc, start_key).unwrap_or(0);
             let mut cursor = FcCursor::at(self.entry_offset(block));
-            let mut results = Vec::new();
             while cursor.pos < self.data.len() {
                 let id = cursor.advance(self, fc);
                 if cursor.key.as_slice() < start_key {
@@ -797,9 +822,9 @@ impl<'a> ReverseLeaf<'a> {
                 if cursor.key.as_slice() >= end_key {
                     break;
                 }
-                results.push((Cow::Owned(cursor.key.clone()), id));
+                visit(RangeKey::Built(&cursor.key), id);
             }
-            return results;
+            return;
         }
 
         // Binary search for the first entry >= start_key.
@@ -814,18 +839,21 @@ impl<'a> ReverseLeaf<'a> {
                 hi = mid;
             }
         }
-
-        // Scan forward collecting entries while key < end_key.
-        let mut results = Vec::new();
         for i in lo..n {
             let key = self.key_at(i);
             if key >= end_key {
                 break;
             }
-            results.push((Cow::Borrowed(key), self.id_at(i)));
+            visit(RangeKey::Leaf(key), self.id_at(i));
         }
-        results
     }
+}
+
+/// A key a range walk visits: in the leaf's bytes, or rebuilt by a
+/// front-coded walk.
+enum RangeKey<'a, 'k> {
+    Leaf(&'a [u8]),
+    Built(&'k [u8]),
 }
 
 /// Iterator over reverse leaf entries.

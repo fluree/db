@@ -367,6 +367,7 @@ pub(crate) async fn splice_graph_into_index(
         shared,
         new_subjects: Vec::new(),
         new_strings: Vec::new(),
+        new_string_hashes: Default::default(),
         max_t: graph.final_t,
         delta_commit_size: graph.total_commit_size,
         delta_asserts: graph.total_asserts,

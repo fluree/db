@@ -1890,6 +1890,7 @@ pub(crate) async fn index_novelty(
         base_root.index_t,
         &novelty.new_subjects,
         &novelty.new_strings,
+        &novelty.new_string_hashes,
         warm_cache.as_deref(),
         &mut compaction_budget,
     )
@@ -4749,12 +4750,14 @@ pub struct DictNoveltyUpdate {
 /// by id, each id above the base watermark, as an
 /// [`IncrementalNovelty`] holds them. `base_index_t` rotates which untouched
 /// streams this cycle's leftover compaction budget sweeps.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn apply_dict_novelty(
     content_store: &dyn ContentStore,
     base_dict_refs: &fluree_db_binary_index::DictRefs,
     base_index_t: i64,
     new_subjects: &[(u16, u64, Vec<u8>)],
     new_strings: &[(u32, Vec<u8>)],
+    new_string_hashes: &super::dicts::StringHashes,
     warm_cache: Option<&LeafletCache>,
     compaction_budget: &mut CompactionBudget,
 ) -> Result<DictNoveltyUpdate> {
@@ -4792,6 +4795,7 @@ pub(super) async fn apply_dict_novelty(
             fluree_db_core::DictKind::StringReverse,
             &base_dict_refs.string_reverse,
             new_strings.to_vec(),
+            new_string_hashes,
             warm_cache,
         )
         .await?;

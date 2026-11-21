@@ -261,9 +261,17 @@ pub struct LookupKeys<'v> {
     /// The value, when its group filled after it began hashing, so it may
     /// be held under its hashed key instead.
     fallback: Option<(KeyScheme, &'v [u8])>,
+    /// The value's hash, when `first` is its hashed key.
+    hash: Option<[u8; KEY_HASH_LEN]>,
 }
 
 impl LookupKeys<'_> {
+    /// The value's hash, when the value is looked up by its hashed key: a
+    /// write of the value, under the same rules, is keyed by it too.
+    pub fn hash(&self) -> Option<[u8; KEY_HASH_LEN]> {
+        self.hash
+    }
+
     /// Whether the value may also be held under [`Self::then`].
     pub fn has_then(&self) -> bool {
         self.fallback.is_some()
@@ -289,10 +297,23 @@ impl KeyRules<'_> {
 
     /// The key a new `value` is written under.
     pub fn key<'v>(&self, value: &'v [u8]) -> Cow<'v, [u8]> {
-        if self.hashes(value) {
-            Cow::Owned(self.scheme.hashed_key(value))
-        } else {
-            Cow::Borrowed(value)
+        self.key_hashed(value, None)
+    }
+
+    /// [`Self::key`], given the value's hash when it was computed already
+    /// ([`LookupKeys::hash`]); `None` computes it here if needed.
+    pub fn key_hashed<'v>(
+        &self,
+        value: &'v [u8],
+        hash: Option<[u8; KEY_HASH_LEN]>,
+    ) -> Cow<'v, [u8]> {
+        match self.scheme.group(value) {
+            Some(group) if self.raw.get(group).is_none() => {
+                let hash = hash.unwrap_or_else(|| digest(value));
+                debug_assert_eq!(hash, digest(value), "a value's own hash");
+                Cow::Owned(hashed_key(group, &hash))
+            }
+            _ => Cow::Borrowed(value),
         }
     }
 
@@ -307,16 +328,22 @@ impl KeyRules<'_> {
             return LookupKeys {
                 first: Cow::Borrowed(value),
                 fallback: None,
+                hash: None,
             };
         };
         match self.raw.get(group) {
-            None => LookupKeys {
-                first: Cow::Owned(self.scheme.hashed_key(value)),
-                fallback: None,
-            },
+            None => {
+                let hash = digest(value);
+                LookupKeys {
+                    first: Cow::Owned(hashed_key(group, &hash)),
+                    fallback: None,
+                    hash: Some(hash),
+                }
+            }
             Some(raw) => LookupKeys {
                 first: Cow::Borrowed(value),
                 fallback: raw.hashed.then_some((self.scheme, value)),
+                hash: None,
             },
         }
     }

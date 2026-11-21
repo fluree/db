@@ -33,6 +33,7 @@ pub(crate) async fn upload_incremental_reverse_tree_async(
         dict,
         existing_refs,
         entries,
+        None,
         warm_cache,
         false,
     )
@@ -44,20 +45,24 @@ pub(crate) async fn upload_incremental_reverse_tree_async(
 /// Builds `ReverseEntry` from `(string_id, value)`, pre-fetches affected
 /// leaves, runs the CPU-bound CoW update in `spawn_blocking`, then
 /// async-uploads new artifacts.
+///
+/// `hashes` holds, by string id, the hash of a new string the resolver
+/// looked up by its hashed key, so keying it doesn't hash it again.
 pub(crate) async fn upload_incremental_reverse_tree_async_strings(
     content_store: &dyn ContentStore,
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
     new_strings: Vec<(u32, Vec<u8>)>,
+    hashes: &StringHashes,
     warm_cache: Option<&LeafletCache>,
 ) -> Result<UpdatedReverseTree> {
     use fluree_db_binary_index::dict::reverse_leaf::ReverseEntry;
 
     let mut entries: Vec<ReverseEntry> = new_strings
-        .iter()
+        .into_iter()
         .map(|(string_id, value)| ReverseEntry {
-            key: value.clone(),
-            id: *string_id as u64,
+            key: value,
+            id: string_id as u64,
         })
         .collect();
     entries.sort_by(|a, b| a.key.cmp(&b.key));
@@ -67,11 +72,17 @@ pub(crate) async fn upload_incremental_reverse_tree_async_strings(
         dict,
         existing_refs,
         entries,
+        Some(hashes),
         warm_cache,
         false,
     )
     .await
 }
+
+/// The hashes of new strings, by string id, that the resolver computed
+/// looking them up ([`fluree_db_binary_index::dict::key_scheme::LookupKeys::hash`]).
+pub(crate) type StringHashes =
+    rustc_hash::FxHashMap<u32, [u8; fluree_db_binary_index::dict::key_scheme::KEY_HASH_LEN]>;
 
 /// Core async reverse tree upload: pre-fetch affected leaves, spawn_blocking
 /// for CoW update, async-upload new artifacts.
@@ -119,6 +130,7 @@ pub(crate) async fn upload_incremental_reverse_tree_async_terms(
         fluree_db_core::DictKind::TermReverse,
         existing_refs,
         entries,
+        None,
         warm_cache,
         false,
     )
@@ -138,8 +150,16 @@ pub(crate) async fn remove_from_reverse_tree_async(
         .into_iter()
         .map(|key| ReverseEntry { key, id: 0 })
         .collect();
-    upload_incremental_reverse_tree_core(content_store, dict, existing_refs, entries, None, true)
-        .await
+    upload_incremental_reverse_tree_core(
+        content_store,
+        dict,
+        existing_refs,
+        entries,
+        None,
+        None,
+        true,
+    )
+    .await
 }
 
 /// `remove`: take `entries`' keys out of the tree instead of inserting them.
@@ -153,10 +173,11 @@ async fn upload_incremental_reverse_tree_core(
     dict: fluree_db_core::DictKind,
     existing_refs: &DictTreeRefs,
     mut entries: Vec<fluree_db_binary_index::dict::reverse_leaf::ReverseEntry>,
+    hashes: Option<&StringHashes>,
     warm_cache: Option<&LeafletCache>,
     remove: bool,
 ) -> Result<UpdatedReverseTree> {
-    use fluree_db_binary_index::dict::incremental::{removal_keys, GroupPlan};
+    use fluree_db_binary_index::dict::incremental::{key_new_values, removal_keys, GroupPlan};
     use fluree_db_binary_index::dict::key_scheme::KeyScheme;
     use fluree_db_binary_index::dict::reverse_leaf::{LeafFormat, ReverseEntry};
 
@@ -197,20 +218,21 @@ async fn upload_incremental_reverse_tree_core(
             .map(|key| ReverseEntry { key, id: 0 })
             .collect();
     } else if scheme.reorders() {
-        let plan = GroupPlan::new(
-            existing_branch.keys(),
-            entries.iter().map(|e| e.key.as_slice()),
-        );
-        for idx in plan.leaves(&existing_branch) {
-            prefetched.insert(idx, fetch(idx).await?);
-        }
-        entries = plan
-            .key(
-                &mut existing_branch,
-                |i| prefetched.get(&i).map(Vec::as_slice),
-                entries,
-            )
-            .map_err(|e| IndexerError::StorageWrite(format!("key new {dict:?} values: {e}")))?;
+        let listed = {
+            let plan = GroupPlan::new(
+                existing_branch.keys(),
+                entries.iter().map(|e| e.key.as_slice()),
+            );
+            for idx in plan.leaves(&existing_branch) {
+                prefetched.insert(idx, fetch(idx).await?);
+            }
+            plan.fill(&existing_branch, |i| prefetched.get(&i).map(Vec::as_slice))
+                .map_err(|e| IndexerError::StorageRead(format!("count hashed keys: {e}")))?
+        };
+        entries = key_new_values(&mut existing_branch, listed, entries, |entry| {
+            hashes.and_then(|h| h.get(&(entry.id as u32)).copied())
+        })
+        .map_err(|e| IndexerError::StorageWrite(format!("key new {dict:?} values: {e}")))?;
     }
 
     // 2. Build address→CID map for existing leaves.
