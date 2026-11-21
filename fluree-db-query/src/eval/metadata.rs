@@ -310,15 +310,14 @@ fn lookup_ref_objects(
             ctx,
             store,
         )? {
-            let p_id = store
+            // A predicate the index doesn't hold may still have rows in
+            // novelty; the range path reads both.
+            let Some(p_id) = store
                 .sid_to_p_id(predicate)
                 .or_else(|| store.find_predicate_id(&predicate.name))
-                .ok_or_else(|| {
-                    QueryError::execution(format!(
-                        "metadata lookup: unknown predicate {}",
-                        predicate.name
-                    ))
-                })?;
+            else {
+                return lookup_ref_objects_via_range(ctx, subject, predicate);
+            };
             let ref_s_ids =
                 subject_ref_object_keys_merged(ctx, store, predicate, p_id, subject_s_id)?;
             let mut out = Vec::with_capacity(ref_s_ids.len());
