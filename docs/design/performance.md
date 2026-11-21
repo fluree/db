@@ -232,10 +232,10 @@ frequency-aware memory budget
 ([`LeafletCache`](../../fluree-db-binary-index/src/read/leaflet_cache.rs)), keyed
 by content-addressed leaf identity and leaflet index. Entries hold base columns
 only; overlay merging and time-travel replay run after the cache, so one entry
-serves every `t` and overlay. The budget is split by key hash into up to one
-shard per core, capped so that each shard holds at least 256 MiB (a small budget
-stays one pool), so cache hits on different cores do not contend on one shared
-structure. Each shard enforces its share at its own housekeeping pass, so
+serves every `t` and overlay. The budget is split by key hash into about one
+shard per core (the core count rounded up to a power of two), capped so that each
+shard holds at least 256 MiB (a small budget stays one pool), so cache hits on
+different cores do not contend on one shared structure. Each shard enforces its share at its own housekeeping pass, so
 between passes a burst of inserts can run the pool over budget by more as the
 shard count grows. Remote blobs are fetched through a single-flight disk cache
 ([`disk_cache.rs`](../../fluree-db-core/src/disk_cache.rs)), so concurrent
