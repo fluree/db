@@ -253,7 +253,8 @@ impl BinaryCursor {
     ///
     /// For a plain current-time scan this drops `t` (and any other unprojected
     /// column), so its `Block` is neither decoded nor allocated. The leaflet
-    /// cache keys on this set, keeping narrow and full batches distinct.
+    /// cache keys on the leaflet alone and widens an entry that lacks a
+    /// requested column, so a narrow read shares the entry a wider one fills.
     fn leaflet_decode_set(&self, has_ov: bool) -> ColumnSet {
         if has_ov {
             return ColumnSet::ALL;
