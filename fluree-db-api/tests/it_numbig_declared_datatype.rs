@@ -848,6 +848,50 @@ async fn a_delete_over_a_v4_index_stays_deleted_through_its_first_v5_build() {
     );
 }
 
+/// Over a v4 index, novelty keeps a value that index doesn't hold under each
+/// subtype. Deleting it under one of them still deletes every one, as v4.2.8
+/// did, so the ledger's first v5 build, which reads the commit by value,
+/// answers as the v4 index did.
+#[tokio::test]
+async fn a_delete_over_a_v4_index_of_a_value_written_since_deletes_every_subtype() {
+    const ID: &str = "v4/numbig:main";
+    const V: &str = "18446744073709551613";
+    let dir = v4_store();
+    let path = dir.path().to_string_lossy().to_string();
+    let fluree = file(&path);
+    update(
+        &fluree,
+        ID,
+        &format!(r#"INSERT DATA {{ ex:y ex:n "{V}"^^xsd:unsignedLong , "{V}"^^xsd:integer }}"#),
+    )
+    .await;
+    update(
+        &fluree,
+        ID,
+        &format!(r#"DELETE DATA {{ ex:y ex:n "{V}"^^xsd:unsignedLong }}"#),
+    )
+    .await;
+    let head = head_commit(&fluree, ID).await;
+    assert_eq!(head.num_big_typing, fluree_db_core::NumBigTyping::ByValue);
+    assert_eq!(commit_retracts(&fluree, ID, head.t).await, [2]);
+    let y = "SELECT ?o WHERE { ex:y ex:n ?o }";
+    assert_eq!(
+        rows(&file(&path), ID, y).await,
+        Vec::<String>::new(),
+        "over the v4 index"
+    );
+
+    fluree
+        .reindex(ID, ReindexOptions::default())
+        .await
+        .expect("first v5 build");
+    assert_eq!(
+        rows(&file(&path), ID, y).await,
+        Vec::<String>::new(),
+        "rebuilt"
+    );
+}
+
 /// The v4 fixture's commits, oldest first: a big `xsd:unsignedLong`, then
 /// its replacement by `5`, staged by value.
 async fn v4_replacement_commits() -> Vec<fluree_db_api::Base64Bytes> {
