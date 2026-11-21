@@ -1183,11 +1183,10 @@ pub fn count_distinct_position_operator(
                 ),
                 // OPST key layout: o_type(2) + o_key(8) + o_i(4) + p_id(4) + s_id(8).
                 // Distinct objects = lead bytes [0..10] — which excludes p_id,
-                // and so is not an object identity for a NumBig arena handle.
-                // Those terms are counted exactly from the in-memory arenas
-                // (see `count_distinct_numbig_objects`); declining is reserved
-                // for a graph holding vectors, an inconsistent index or the
-                // explicit kill switch.
+                // and so is not an object identity for a NumBig or vector arena
+                // handle. Those terms are counted exactly from their arenas
+                // (see `count_distinct_objects`); declining is reserved for an
+                // inconsistent index or the explicit kill switch.
                 DistinctPosition::Objects => {
                     let Some(count) = count_distinct_objects(
                         store,
@@ -1237,9 +1236,11 @@ struct LeadGroupPartial {
     first_lead: Vec<u8>,
     last_lead: Vec<u8>,
     /// Rows in leaflets excluded from `count` because their key range can hold
-    /// an object key that is not a graph-wide identity. Only ever non-zero for
-    /// the OPST object walk.
+    /// an object key that is not a graph-wide identity, other than vector
+    /// leaflets. Only ever non-zero for the OPST object walk.
     skipped_rows: u64,
+    /// Rows in excluded leaflets that hold vectors alone.
+    skipped_vector_rows: u64,
 }
 
 /// Count distinct lead groups across all leaflets in a given sort order.
@@ -1308,10 +1309,13 @@ fn numbig_exact_max_entries() -> Option<u64> {
 /// its distinct terms come from [`count_distinct_numbig_objects`], which reads
 /// the arenas rather than the rows.
 ///
-/// A graph that holds vectors declines: a vector's `o_key` is a handle into a
+/// Vectors are left out of the walk too: a vector's `o_key` is a handle into a
 /// per-predicate arena that does not deduplicate, so neither the lead nor the
 /// arena's size counts its distinct values
-/// ([`OType::o_key_is_predicate_identifying`]).
+/// ([`OType::o_key_is_predicate_identifying`]). They are counted from the
+/// arenas' identity tables ([`count_distinct_vector_objects`]). Rows the walk
+/// leaves out that no arena accounts for decline the count
+/// ([`distinct_objects_of_walk`]).
 ///
 /// The per-predicate distinct-object count stays on its fast path for every
 /// other predicate: its 14-byte POST lead starts with `p_id`, which scopes a
@@ -1327,32 +1331,59 @@ pub(crate) fn count_distinct_objects(
     else {
         return Ok(None);
     };
-    if walk.skipped_non_identifying_rows == 0 {
-        return Ok(Some(walk.count));
-    }
-    // The walk left out the arena-keyed objects (big numbers and vectors),
-    // whose keys are not graph-wide identities; each kind counts exactly
-    // from its arenas. No value of one kind equals a value of the other.
-    let numbig = if store.numbig_arenas(g_id).any(|(_, a)| !a.is_empty()) {
-        let Some(exact) = count_distinct_numbig_objects(store, g_id, tracker)? else {
+    distinct_objects_of_walk(
+        &walk,
+        || {
+            let exact = count_distinct_numbig_objects(store, g_id, tracker)?;
+            if exact.is_some() {
+                crate::fast_path_outcome::stamp_fast_path(
+                    NUMBIG_EXACT_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
+            Ok(exact)
+        },
+        || {
+            if !store.graph_holds_vectors(g_id) {
+                return Ok(None);
+            }
+            let exact = count_distinct_vector_objects(store, g_id, tracker, cancellation)?;
+            if exact.is_some() {
+                crate::fast_path_outcome::stamp_fast_path(
+                    VECTOR_EXACT_SITE,
+                    crate::fast_path_outcome::FastPathOutcome::Proceed,
+                );
+            }
+            Ok(exact)
+        },
+    )
+}
+
+/// The whole-graph distinct-object count from a directory walk and exact
+/// counts of what it left out, the arena-keyed objects, whose keys are not
+/// graph-wide identities. Each kind it skipped counts from its own arenas
+/// (`numbig`, `vectors`; no value of one equals a value of the other); one
+/// that cannot (`None`: no arena to count its rows, as in an inconsistent
+/// index, or a count that declines) declines the whole count rather than
+/// leaving its rows out of it. A kind the walk skipped no rows of is not
+/// counted.
+fn distinct_objects_of_walk(
+    walk: &LeadGroupWalk,
+    numbig: impl FnOnce() -> Result<Option<u64>>,
+    vectors: impl FnOnce() -> Result<Option<u64>>,
+) -> Result<Option<u64>> {
+    let numbig = if walk.skipped_non_identifying_rows > 0 {
+        let Some(exact) = numbig()? else {
             return Ok(None);
         };
-        crate::fast_path_outcome::stamp_fast_path(
-            NUMBIG_EXACT_SITE,
-            crate::fast_path_outcome::FastPathOutcome::Proceed,
-        );
         exact
     } else {
         0
     };
-    let vectors = if store.graph_holds_vectors(g_id) {
-        let Some(exact) = count_distinct_vector_objects(store, g_id, tracker, cancellation)? else {
+    let vectors = if walk.skipped_vector_rows > 0 {
+        let Some(exact) = vectors()? else {
             return Ok(None);
         };
-        crate::fast_path_outcome::stamp_fast_path(
-            VECTOR_EXACT_SITE,
-            crate::fast_path_outcome::FastPathOutcome::Proceed,
-        );
         exact
     } else {
         0
@@ -1862,7 +1893,10 @@ fn live_arena_handles(
 /// lead is not a graph-wide identity.
 struct LeadGroupWalk {
     count: u64,
+    /// Skipped rows other than vectors': big numbers, and any leaflet whose
+    /// o_types its keys do not pin to vectors alone.
     skipped_non_identifying_rows: u64,
+    skipped_vector_rows: u64,
 }
 
 /// Walks leaflet directories only. With `require_identifying_o_key`, leaflets
@@ -1881,6 +1915,7 @@ fn count_distinct_lead_groups_inner(
         return Ok(Some(LeadGroupWalk {
             count: 0,
             skipped_non_identifying_rows: 0,
+            skipped_vector_rows: 0,
         }));
     };
 
@@ -1890,6 +1925,7 @@ fn count_distinct_lead_groups_inner(
             first_lead: Vec::new(),
             last_lead: Vec::new(),
             skipped_rows: 0,
+            skipped_vector_rows: 0,
         };
         for leaf_entry in chunk {
             let dir = store
@@ -1912,7 +1948,11 @@ fn count_distinct_lead_groups_inner(
                 // entry's own `[first, last]` interval says whether the leaflet
                 // can hold a non-identifying object key — no payload read.
                 if require_identifying_o_key && leaflet_may_hold_non_identifying_o_key(entry) {
-                    partial.skipped_rows += u64::from(entry.row_count);
+                    if leaflet_holds_only_vectors(entry) {
+                        partial.skipped_vector_rows += u64::from(entry.row_count);
+                    } else {
+                        partial.skipped_rows += u64::from(entry.row_count);
+                    }
                     continue;
                 }
 
@@ -1934,15 +1974,20 @@ fn count_distinct_lead_groups_inner(
         // Fold the tally before the empty-side short-circuits: a chunk with no
         // counted leaflets may still have skipped some.
         let skipped_rows = left.skipped_rows.saturating_add(right.skipped_rows);
+        let skipped_vector_rows = left
+            .skipped_vector_rows
+            .saturating_add(right.skipped_vector_rows);
         if right.first_lead.is_empty() {
             return LeadGroupPartial {
                 skipped_rows,
+                skipped_vector_rows,
                 ..left
             };
         }
         if left.first_lead.is_empty() {
             return LeadGroupPartial {
                 skipped_rows,
+                skipped_vector_rows,
                 ..right
             };
         }
@@ -1955,6 +2000,7 @@ fn count_distinct_lead_groups_inner(
             first_lead: left.first_lead,
             last_lead: right.last_lead,
             skipped_rows,
+            skipped_vector_rows,
         }
     };
 
@@ -1964,10 +2010,12 @@ fn count_distinct_lead_groups_inner(
         Some(p) => LeadGroupWalk {
             count: p.count,
             skipped_non_identifying_rows: p.skipped_rows,
+            skipped_vector_rows: p.skipped_vector_rows,
         },
         None => LeadGroupWalk {
             count: 0,
             skipped_non_identifying_rows: 0,
+            skipped_vector_rows: 0,
         },
     }))
 }
@@ -1999,6 +2047,14 @@ fn leaflet_may_hold_non_identifying_o_key(
         return !lo.o_key_is_globally_identifying();
     }
     OType::range_holds_non_globally_identifying(lo, hi)
+}
+
+/// Whether an OPST leaflet's keys pin every row to the vector o_type.
+fn leaflet_holds_only_vectors(
+    entry: &fluree_db_binary_index::format::leaf::LeafletDirEntryV3,
+) -> bool {
+    let vector = OType::VECTOR.as_u16().to_be_bytes();
+    entry.first_key.get(..2) == Some(&vector[..]) && entry.last_key.get(..2) == Some(&vector[..])
 }
 
 /// Per-chunk partial for the per-predicate distinct-object count: the same
@@ -2440,6 +2496,37 @@ mod tests {
     use super::*;
     use fluree_db_core::index_stats::{GraphPropertyStatEntry, GraphStatsEntry};
     use fluree_db_core::IndexStats;
+
+    /// Each kind of row the walk leaves out counts from its own arenas, and
+    /// a kind with rows that no arena counts (an inconsistent index: big
+    /// numbers with no arena, vectors with none) declines the whole count
+    /// rather than leave those rows out of it. A kind with no rows left out
+    /// is not counted, so a graph of vectors does not consult big numbers.
+    #[test]
+    fn rows_the_walk_leaves_out_are_counted_or_decline() {
+        let walk = |numbig, vectors| LeadGroupWalk {
+            count: 10,
+            skipped_non_identifying_rows: numbig,
+            skipped_vector_rows: vectors,
+        };
+        let unused =
+            || -> Result<Option<u64>> { panic!("a kind with no rows left out is not counted") };
+        let count = |n: Option<u64>| move || -> Result<Option<u64>> { Ok(n) };
+
+        let all = distinct_objects_of_walk(&walk(0, 0), unused, unused).unwrap();
+        assert_eq!(all, Some(10), "nothing left out");
+        let both = distinct_objects_of_walk(&walk(4, 3), count(Some(2)), count(Some(1))).unwrap();
+        assert_eq!(both, Some(13));
+        let vectors_only = distinct_objects_of_walk(&walk(0, 3), unused, count(Some(1))).unwrap();
+        assert_eq!(vectors_only, Some(11));
+
+        for (numbig, vectors) in [(None, Some(1)), (Some(2), None)] {
+            let declined = distinct_objects_of_walk(&walk(4, 3), count(numbig), count(vectors));
+            assert_eq!(declined.unwrap(), None, "{numbig:?} {vectors:?}");
+        }
+        let numbig_only = distinct_objects_of_walk(&walk(4, 0), count(None), unused).unwrap();
+        assert_eq!(numbig_only, None, "big-number rows with no arena");
+    }
 
     /// An integer threshold selects exactly the doubles the generic lane's
     /// exact comparison does, around and beyond 2^53 where an `i64` has no
