@@ -380,8 +380,10 @@ right scan with a bound object. The nested-loop join answers that from the
 predicate's POST partition, reading each leaf at most once and searching it for
 each driving object. The hash join instead builds a table from the small side and
 probes it with one scan of the large predicate's partition. It is chosen when
-statistics show the probe predicate is large, but no more than
-`HASH_JOIN_MAX_SCAN_RATIO` times the driving side's estimate.
+statistics show the probe predicate is no more than `HASH_JOIN_MAX_SCAN_RATIO`
+times the driving side's estimate and has at least 50,000 rows, or at least 1,000
+when the driving side is small (up to 20,000 rows) or medium (up to 250,000, and
+no smaller than the probe).
 
 **`PropertyJoinOperator`** evaluates same-subject multi-predicate stars anchored
 by a bound object or a range filter (`?s a :Person ; :name ?n ; :email ?e`) as a
