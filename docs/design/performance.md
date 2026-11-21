@@ -139,7 +139,9 @@ to performance are:
 **Four covering permutations:** `SPOT`, `PSOT`, `POST`, and `OPST`
 ([`fluree-db-core/src/comparator.rs`](../../fluree-db-core/src/comparator.rs)).
 Every triple pattern shape except one resolves to a contiguous range scan on one
-of them (see [Limits](#limits-and-deliberate-trade-offs)).
+of them (see [Limits](#limits-and-deliberate-trade-offs)). The pooled tree that
+small named graphs share keeps the same four with the graph compared last
+(`SPOT-g` and so on), plus `GSPO`, where each graph's rows are contiguous.
 
 `OPST` holds **all object types**, not only references. Because it leads with the
 object, its leaflets are segmented by `o_type`: IRI references form one
@@ -157,16 +159,19 @@ keys. Joins, grouping, and deduplication operate on integers. A query that does
 not project a value does not decode it.
 
 **Order-preserving encodings.** Integer (within `i64`), floating-point, temporal,
-and boolean objects are encoded so that `o_key` byte order matches value order
-within each `o_type`. This allows `ORDER BY DESC(?o) LIMIT k`, `MIN`, and `MAX`
-to be answered without a full scan (Layer 5). `xsd:decimal` values and integers
-outside `i64` are stored as arena handles, which carry no value order.
+and boolean objects, and `xsd:decimal` values of up to 17 significant digits, are
+encoded so that `o_key` byte order matches value order within each `o_type`. This
+allows `ORDER BY DESC(?o) LIMIT k`, `MIN`, and `MAX` to be answered without a full
+scan (Layer 5). Longer decimals and integers outside `i64` are stored as arena
+handles, which carry no value order.
 
 **Independently compressed per-column blocks.** A V3 leaflet stores one zstd
-block per column (`SId`, `PId`, `OType`, `OKey`, `OI`, `T`), each with its own
-`ColumnBlockRef`. The cursor decodes only the columns in its projection. The
-generic scan requests the four identity columns plus `OI`; fast paths and join
-probes request narrower sets. `T` is skipped on a current-time read of a leaf
+block per column (`SId`, `PId`, `OType`, `OKey`, `OI`, `T`, and `GId` in the
+pooled tree), each with its own `ColumnBlockRef`. The cursor decodes only the
+columns in its projection. The generic scan requests the four identity columns
+(and `GId` in the pooled tree); it adds `OI` only to hide list members, read
+history, or record a union member's facts. Fast paths and join probes request
+narrower sets. `T` is skipped on a current-time read of a leaf
 the overlay does not touch.
 
 Three columns can be omitted from the block set. POST/PSOT leaflets are
@@ -174,13 +179,15 @@ predicate-homogeneous, so `p_id` is stored once as `p_const`. OPST leaflets are
 type-homogeneous by segmentation, so `o_type` is stored as `o_type_const`, and
 POST/PSOT leaflets do the same when they are single-typed; SPOT leaflets always
 carry an `OType` column. The `OI` block is omitted when no row is a list member.
-Each column has a fixed width (`u64` for `SId` and `OKey`, `u32` for `PId`, `T`
-and `OI`, `u16` for `OType`), and zstd removes the redundancy.
+Each column has a fixed width (`u64` for `SId`, `OKey` and `OI`, `u32` for `PId`
+and `T`, `u16` for `OType`), and zstd removes the redundancy. The pooled tree's
+`GId` column is 2 bytes wide, or 4 in a leaflet holding a graph id past `u16`.
 
 **History is stored outside the leaflet.** Time-travel data is a separate
 content-addressed object, the per-leaf **history sidecar** (`FHS1`), located via
 `LeafEntry.sidecar_cid` on the branch manifest. It holds per-leaflet segments of
-31-byte `HistEntryV2` transition records sorted newest-first. A current-state
+36-byte `HistEntryV2` transition records (40 in the pooled tree, which records
+each entry's graph) sorted newest-first. A current-state
 query does not fetch, decompress, or cache any history data, and the leaflet
 cache excludes sidecar data. Time-travel support therefore adds no cost to
 current-state queries.
@@ -227,21 +234,27 @@ therefore a property of the scan layer for every operator that reads through the
 cursor. The batched join and cyclic-BGP probes read leaflets directly and
 reconcile novelty through `ProbeOps`, which mirrors the cursor's merge.
 
-Graph scoping is enforced at the same boundary. Each graph has its own branch
-manifests, so a scan reads only that graph's leaves, and `BinaryGraphView`
-decodes arena-backed values through that graph's arenas.
+Graph scoping is enforced at the same boundary. A graph with a tree of its own
+has its own branch manifests, so a scan reads only that graph's leaves. Small
+named graphs share the pooled tree, and a scan of one filters that tree's rows on
+their graph column. `BinaryGraphView` decodes arena-backed values through the
+graph's arenas.
 
 **Caching.** Decoded leaflet regions and dictionary leaves share one
 frequency-aware memory budget
 ([`LeafletCache`](../../fluree-db-binary-index/src/read/leaflet_cache.rs)), keyed
 by content-addressed leaf identity and leaflet index. Entries hold base columns
 only; overlay merging and time-travel replay run after the cache, so one entry
-serves every `t` and overlay. The budget is split by key hash into about one
-shard per core (the core count rounded up to a power of two), capped so that each
-shard holds at least 256 MiB (a small budget stays one pool), so cache hits on
-different cores do not contend on one shared structure. Each shard enforces its share at its own housekeeping pass, so
-between passes a burst of inserts can run the pool over budget by more as the
-shard count grows. Remote blobs are fetched through a single-flight disk cache
+serves every `t` and overlay. On encrypted storage, part of the budget is first
+reserved for whole decrypted dictionary packs (`cache_dictionary_max_mb`, 60% by
+default) and for fenced reverse dictionary leaves; each reservation goes back to
+the leaflet pool as far as the data opened cannot use it. The leaflet pool is
+split by key hash into about one shard per core (the core count rounded up to a
+power of two), capped so that each shard holds at least 256 MiB (a small budget
+stays one pool), so cache hits on different cores do not contend on one shared
+structure. Each shard enforces its share at its own housekeeping pass, so between
+passes a burst of inserts can run the pool over budget by more as the shard count
+grows. Remote blobs are fetched through a single-flight disk cache
 ([`disk_cache.rs`](../../fluree-db-core/src/disk_cache.rs)), so concurrent
 requests for the same blob share one fetch.
 
@@ -375,6 +388,8 @@ plan an optimization replaced, use the
 The default is `NestedLoopJoinOperator`, which binds each left row into the right
 pattern. For a fixed predicate correlated on its subject or its object, and for a
 subject-bound existence check, it batches distinct left-side keys into one probe.
+In the pooled tree only the subject lane batches, and only where the indexed rows
+are the whole answer; other shapes bind row by row.
 The planner selects a specialized operator when the shape warrants it.
 
 **`HashJoinOperator`** ([`hash_join.rs`](../../fluree-db-query/src/hash_join.rs))
@@ -632,10 +647,12 @@ immediately; they do not wait for index maintenance. Background indexing is
 threshold-driven (`reindex-min-bytes` as a soft trigger, `reindex-max-bytes` for
 backpressure). Normally it resolves only the commits in the novelty window and
 merges them into the affected leaf blobs **copy-on-write**, leaving the rest of
-the index unchanged, and publishes the new root atomically. It falls back to a
-full rebuild when there is no prior index, when the window spans more than
-`incremental_max_commits` commits (10,000 by default), or when the incremental
-pass aborts. See
+the index unchanged, and publishes the new root atomically. The pooled tree's
+graph-last orders instead append the window as a delta run, which a compaction
+later folds in. It falls back to a full rebuild when there is no prior index,
+when the published index is of an earlier format, when the window spans more
+than `incremental_max_commits` commits (10,000 by default), or when the
+incremental pass fails with a retryable error. See
 [Background indexing](../indexing-and-search/background-indexing.md).
 
 Because an incremental reindex reuses unchanged blobs by address, it rewrites
@@ -724,8 +741,9 @@ ledger without a non-root policy; composite paths and the other cases traverse
 node by node, still from the bound endpoint but more slowly. Bind an endpoint
 where the query allows it.
 
-**Fast paths have preconditions.** All require single-ledger execution and no
-`from_t`. Most require root or no policy; single-predicate fast paths also run
+**Fast paths have preconditions.** All require single-ledger execution, no
+`from_t`, and a graph with index trees of its own; a small named graph in the
+pooled tree takes the generic pipeline. Most require root or no policy; single-predicate fast paths also run
 under a policy that provably does not cover their predicate. Fast paths that
 read only the index directory need a current index, with no unindexed novelty.
 Cursor-based ones tolerate novelty, and the count planner and `+`-path counts

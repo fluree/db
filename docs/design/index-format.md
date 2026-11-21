@@ -317,9 +317,9 @@ column_refs: [ColumnBlockRef]  // one per column actually stored
 `ColumnBlockRef`:
 
 ```text
-col_id: u16          // SId=0, PId=1, OType=2, OKey=3, OI=4, T=5
+col_id: u16          // SId=0, PId=1, OType=2, OKey=3, OI=4, T=5, GId=6
 codec: u8            // currently always Zstd
-elem_width: u8       // 2, 4, or 8 bytes, fixed per column
+elem_width: u8       // 2, 4, or 8 bytes
 offset: u32          // relative to leaflet payload start
 compressed_len: u32
 uncompressed_len: u32
@@ -361,8 +361,10 @@ columns are stored densely. Constants are hoisted out of the block set entirely:
 | OPST  | `o_type_const`   | `OKey`, `PId`, `SId`, `T` (+ `OI` when present) |
 
 Each column has a fixed element width, recorded in `ColumnBlockRef.elem_width`: 8 bytes
-for `SId` and `OKey`, 4 for `PId`, `T` and `OI`, and 2 for `OType`. Each block is then
-zstd-compressed.
+for `SId`, `OKey` and `OI`, 4 for `PId` and `T`, and 2 for `OType`. A leaf from a v4
+index stores `OI` in 4 bytes. Pooled-tree leaflets also carry a `GId` column, each row's
+graph, 2 bytes wide unless the leaflet holds a graph id past `u16`, then 4. Each block is
+then zstd-compressed.
 
 ## History sidecar (FHS1)
 
